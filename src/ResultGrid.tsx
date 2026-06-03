@@ -1,0 +1,618 @@
+import { createSignal, createMemo, createEffect, on, For, Show, type Accessor } from "solid-js";
+import { type Dataset, toTSV, toCSV, toJSON, toMarkdown } from "./formats";
+import { clipWrite } from "./clipboard";
+import { type MenuItem } from "./ContextMenu";
+import { type GridView, type SortKey, type Filter } from "./tabs";
+
+// Hand-rolled, two-axis-virtualized, read-only result grid. Uses a synchronized-pane
+// layout (header + gutter are transform-translated siblings of the body scroller, NOT
+// position:sticky) for reliable frozen header/gutter in WKWebView. Selection, keyboard
+// nav, multi-format copy, resize/autofit/reorder/hide, and server sort/filter affordances.
+
+const ROW_H = 28;
+const HEAD_H = 30;
+const FILTER_H = 30;
+const GUTTER_W = 56;
+const DEFAULT_COL_W = 180;
+const MIN_COL_W = 48;
+const MAX_COL_W = 900;
+const ROW_OVERSCAN = 8;
+const COL_OVERSCAN = 2;
+const GRID_FONT = '12px "JetBrains Mono","SF Mono",Menlo,Consolas,monospace';
+
+type SelMode = "none" | "cell" | "range" | "rows" | "cols";
+type Sel = { mode: SelMode; ar: number; ac: number; fr: number; fc: number }; // col = display index
+const EMPTY_SEL: Sel = { mode: "none", ar: -1, ac: -1, fr: -1, fc: -1 };
+
+export type ResultGridProps = {
+  columns: Accessor<string[]>;
+  rows: Accessor<(string | null)[][]>;
+  done: Accessor<boolean>;
+  view: Accessor<GridView>;
+  setView: (patch: Partial<GridView>) => void;
+  activeTabId: Accessor<string>;
+  /** Bumped on each new query (not on append) — grid resets scroll/selection. */
+  epoch: Accessor<number>;
+  onLoadMore: () => void;
+  onSortFilter: (sorts: SortKey[], filters: Filter[]) => void;
+  onMenu: (x: number, y: number, items: MenuItem[]) => void;
+  onViewValue: (col: string, val: string | null) => void;
+  onStatus: (text: string) => void;
+  canSortFilter: Accessor<boolean>;
+};
+
+export function ResultGrid(props: ResultGridProps) {
+  let scroller: HTMLDivElement | undefined;
+  let root: HTMLDivElement | undefined;
+  const [scrollTop, setScrollTop] = createSignal(0);
+  const [scrollLeft, setScrollLeft] = createSignal(0);
+  const [viewportH, setViewportH] = createSignal(500);
+  const [viewportW, setViewportW] = createSignal(800);
+  const [sel, setSel] = createSignal<Sel>(EMPTY_SEL);
+  const [reorderTo, setReorderTo] = createSignal<number | null>(null);
+
+  const headTop = () => HEAD_H + (props.view().filterRowOpen ? FILTER_H : 0);
+
+  // --- display-column mapping (recomputes only on order/hidden change) ---
+  const displayCols = createMemo(() => {
+    const hidden = new Set(props.view().hidden);
+    const order = props.view().order;
+    return order.filter((oi) => !hidden.has(oi));
+  });
+  const colWidth = (oi: number) => props.view().widths[oi] ?? DEFAULT_COL_W;
+  const offsets = createMemo(() => {
+    const dc = displayCols();
+    const out = new Array(dc.length + 1);
+    out[0] = 0;
+    for (let k = 0; k < dc.length; k++) out[k + 1] = out[k] + colWidth(dc[k]);
+    return out;
+  });
+  const contentW = () => offsets()[offsets().length - 1] || 0;
+  const totalH = createMemo(() => props.rows().length * ROW_H);
+
+  function colAt(x: number): number {
+    const o = offsets();
+    let lo = 0,
+      hi = o.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (o[mid + 1] <= x) lo = mid + 1;
+      else hi = mid;
+    }
+    return Math.min(lo, Math.max(0, o.length - 2));
+  }
+
+  const visRows = createMemo(() => {
+    const start = Math.max(0, Math.floor(scrollTop() / ROW_H) - ROW_OVERSCAN);
+    const end = Math.min(props.rows().length, start + Math.ceil(viewportH() / ROW_H) + ROW_OVERSCAN * 2);
+    return { start, end };
+  });
+  const visCols = createMemo(() => {
+    const n = displayCols().length;
+    if (!n) return { start: 0, end: 0 };
+    const start = Math.max(0, colAt(scrollLeft()) - COL_OVERSCAN);
+    const end = Math.min(n, colAt(scrollLeft() + viewportW()) + 1 + COL_OVERSCAN);
+    return { start, end };
+  });
+  const range = (a: number, b: number) => Array.from({ length: Math.max(0, b - a) }, (_, i) => a + i);
+
+  // --- scroll handling (rAF-coalesced) + persist into the tab's view ---
+  let rafPending = false;
+  function onScroll() {
+    if (!scroller || rafPending) return;
+    rafPending = true;
+    requestAnimationFrame(() => {
+      rafPending = false;
+      if (!scroller) return;
+      const st = scroller.scrollTop,
+        sl = scroller.scrollLeft;
+      setScrollTop(st);
+      setScrollLeft(sl);
+      props.setView({ scrollTop: st, scrollLeft: sl });
+      const gap = totalH() - (st + scroller.clientHeight);
+      if (!props.done() && gap < viewportH() * 1.5) props.onLoadMore();
+    });
+  }
+  function mountScroller(el: HTMLDivElement) {
+    scroller = el;
+    const measure = () => {
+      setViewportH(el.clientHeight);
+      setViewportW(el.clientWidth);
+    };
+    requestAnimationFrame(measure);
+    new ResizeObserver(measure).observe(el);
+  }
+
+  // Tab switch → restore that tab's saved scroll; new query in the same tab → reset to top.
+  // Keyed on `${tabId}:${epoch}` so we can tell the two apart. NOTE: a sort/filter re-run
+  // bumps epoch on purpose — it re-streams from the top, so the old scroll/selection point
+  // at now-irrelevant rows; resetting them is the intended behavior (don't "fix" this).
+  const resultKey = () => `${props.activeTabId()}:${props.epoch()}`;
+  createEffect(
+    on(resultKey, (key, prev) => {
+      setSel(EMPTY_SEL);
+      const tab = key.split(":")[0];
+      const switched = !prev || prev.split(":")[0] !== tab;
+      const top = switched ? props.view().scrollTop : 0;
+      const left = switched ? props.view().scrollLeft : 0;
+      queueMicrotask(() => {
+        if (!scroller) return;
+        scroller.scrollTop = top;
+        scroller.scrollLeft = left;
+        setScrollTop(top);
+        setScrollLeft(left);
+      });
+      if (!switched) props.setView({ scrollTop: 0, scrollLeft: 0 });
+    }),
+  );
+
+  // --- selection ---
+  const rect = () => {
+    const s = sel();
+    return {
+      r0: Math.min(s.ar, s.fr),
+      r1: Math.max(s.ar, s.fr),
+      c0: Math.min(s.ac, s.fc),
+      c1: Math.max(s.ac, s.fc),
+    };
+  };
+  function isSel(r: number, dc: number): boolean {
+    const s = sel();
+    if (s.mode === "none") return false;
+    const { r0, r1, c0, c1 } = rect();
+    if (s.mode === "rows") return r >= r0 && r <= r1;
+    if (s.mode === "cols") return dc >= c0 && dc <= c1;
+    return r >= r0 && r <= r1 && dc >= c0 && dc <= c1;
+  }
+  const isActive = (r: number, dc: number) => sel().fr === r && sel().fc === dc;
+  const focusGrid = () => root?.focus();
+
+  function scrollCellIntoView(r: number, dc: number) {
+    const sc = scroller;
+    if (!sc) return;
+    const top = r * ROW_H;
+    if (top < sc.scrollTop) sc.scrollTop = top;
+    else if (top + ROW_H > sc.scrollTop + sc.clientHeight) sc.scrollTop = top + ROW_H - sc.clientHeight;
+    const o = offsets();
+    if (dc < o.length - 1) {
+      if (o[dc] < sc.scrollLeft) sc.scrollLeft = o[dc];
+      else if (o[dc + 1] > sc.scrollLeft + sc.clientWidth) sc.scrollLeft = o[dc + 1] - sc.clientWidth;
+    }
+  }
+
+  // --- mouse drag (cells + rows) with edge auto-scroll ---
+  let dragMode: null | "cell" | "rows" = null;
+  let lastPtr = { x: 0, y: 0 };
+  let autoRAF = 0;
+  function cellFromPtr(cx: number, cy: number) {
+    const sc = scroller!;
+    const b = sc.getBoundingClientRect();
+    const r = Math.max(0, Math.min(props.rows().length - 1, Math.floor((cy - b.top + sc.scrollTop) / ROW_H)));
+    const c = Math.max(0, Math.min(displayCols().length - 1, colAt(cx - b.left + sc.scrollLeft)));
+    return { r, c };
+  }
+  function beginDrag(e: MouseEvent) {
+    e.preventDefault();
+    document.body.style.userSelect = "none";
+    lastPtr = { x: e.clientX, y: e.clientY };
+    window.addEventListener("mousemove", onDragMove);
+    window.addEventListener("mouseup", endDrag);
+  }
+  function onDragMove(e: MouseEvent) {
+    lastPtr = { x: e.clientX, y: e.clientY };
+    updateDragFocus();
+    autoScroll(e.clientX, e.clientY);
+  }
+  function updateDragFocus() {
+    const { r, c } = cellFromPtr(lastPtr.x, lastPtr.y);
+    const s = sel();
+    if (dragMode === "rows") setSel({ ...s, mode: "rows", fr: r });
+    else setSel({ ...s, mode: s.ar === r && s.ac === c ? "cell" : "range", fr: r, fc: c });
+  }
+  function autoScroll(cx: number, cy: number) {
+    const sc = scroller!;
+    const b = sc.getBoundingClientRect();
+    const EDGE = 30,
+      STEP = 20;
+    let dx = 0,
+      dy = 0;
+    if (cy < b.top + EDGE) dy = -STEP;
+    else if (cy > b.bottom - EDGE) dy = STEP;
+    if (cx < b.left + EDGE) dx = -STEP;
+    else if (cx > b.right - EDGE) dx = STEP;
+    cancelAnimationFrame(autoRAF);
+    if (dx || dy) {
+      const tick = () => {
+        sc.scrollTop += dy;
+        sc.scrollLeft += dx;
+        updateDragFocus();
+        autoRAF = requestAnimationFrame(tick);
+      };
+      autoRAF = requestAnimationFrame(tick);
+    }
+  }
+  function endDrag() {
+    dragMode = null;
+    cancelAnimationFrame(autoRAF);
+    autoRAF = 0;
+    document.body.style.userSelect = "";
+    window.removeEventListener("mousemove", onDragMove);
+    window.removeEventListener("mouseup", endDrag);
+  }
+  function onCellDown(e: MouseEvent, r: number, dc: number) {
+    if (e.button !== 0) return;
+    focusGrid();
+    if (e.shiftKey) setSel({ ...sel(), mode: "range", fr: r, fc: dc });
+    else setSel({ mode: "cell", ar: r, ac: dc, fr: r, fc: dc });
+    dragMode = "cell";
+    beginDrag(e);
+  }
+  function onGutterDown(e: MouseEvent, r: number) {
+    if (e.button !== 0) return;
+    focusGrid();
+    const n = displayCols().length;
+    if (e.shiftKey) setSel({ ...sel(), mode: "rows", fr: r, fc: n - 1 });
+    else setSel({ mode: "rows", ar: r, ac: 0, fr: r, fc: n - 1 });
+    dragMode = "rows";
+    beginDrag(e);
+  }
+  function selectAll() {
+    const nr = props.rows().length,
+      nc = displayCols().length;
+    if (!nr || !nc) return;
+    setSel({ mode: "range", ar: 0, ac: 0, fr: nr - 1, fc: nc - 1 });
+  }
+
+  // --- keyboard ---
+  function onKeyDown(e: KeyboardEvent) {
+    if ((e.target as HTMLElement).tagName === "INPUT") return;
+    const nr = props.rows().length,
+      nc = displayCols().length;
+    if (!nr || !nc) return;
+    const s = sel();
+    const fr = s.fr < 0 ? 0 : s.fr,
+      fc = s.fc < 0 ? 0 : s.fc;
+    const mod = e.metaKey || e.ctrlKey;
+    const move = (r: number, c: number) => {
+      r = Math.max(0, Math.min(nr - 1, r));
+      c = Math.max(0, Math.min(nc - 1, c));
+      if (e.shiftKey) setSel({ ...sel(), mode: "range", fr: r, fc: c });
+      else setSel({ mode: "cell", ar: r, ac: c, fr: r, fc: c });
+      scrollCellIntoView(r, c);
+      if (r > nr - 30) props.onLoadMore();
+      e.preventDefault();
+    };
+    switch (e.key) {
+      case "ArrowDown": move(fr + 1, fc); break;
+      case "ArrowUp": move(fr - 1, fc); break;
+      case "ArrowLeft": move(fr, fc - 1); break;
+      case "ArrowRight": move(fr, fc + 1); break;
+      case "Home": mod ? move(0, 0) : move(fr, 0); break;
+      case "End": mod ? move(nr - 1, nc - 1) : move(fr, nc - 1); break;
+      case "PageDown": move(fr + Math.floor(viewportH() / ROW_H), fc); break;
+      case "PageUp": move(fr - Math.floor(viewportH() / ROW_H), fc); break;
+      case "Escape": setSel({ mode: "cell", ar: fr, ac: fc, fr, fc }); break;
+      case "a": if (mod) { selectAll(); e.preventDefault(); } break;
+      case "c": if (mod) { void copySelection("tsv"); e.preventDefault(); } break;
+    }
+  }
+
+  // --- copy ---
+  function selectionDataset(): Dataset {
+    const dc = displayCols();
+    const R = props.rows();
+    const names = props.columns();
+    const s = sel();
+    let r0 = 0,
+      r1 = R.length - 1,
+      cols = dc;
+    if (s.mode === "cell" || s.mode === "range" || s.mode === "rows") {
+      const re = rect();
+      r0 = Math.max(0, re.r0);
+      r1 = Math.min(R.length - 1, re.r1);
+    }
+    if (s.mode === "cell" || s.mode === "range" || s.mode === "cols") {
+      const re = rect();
+      cols = dc.slice(Math.max(0, re.c0), Math.min(dc.length, re.c1 + 1));
+    }
+    return {
+      columns: cols.map((oi) => names[oi]),
+      rows: R.slice(r0, r1 + 1).map((row) => cols.map((oi) => row[oi] ?? null)),
+    };
+  }
+  async function copySelection(fmt: "tsv" | "csv" | "json" | "md") {
+    const d = selectionDataset();
+    const cells = d.rows.length * d.columns.length;
+    if (cells > 5_000_000) props.onStatus(`copying ${cells.toLocaleString()} cells…`);
+    const text = fmt === "csv" ? toCSV(d) : fmt === "json" ? toJSON(d) : fmt === "md" ? toMarkdown(d) : toTSV(d);
+    const ok = await clipWrite(text);
+    props.onStatus(ok ? `copied ${d.rows.length}×${d.columns.length}` : "clipboard unavailable");
+  }
+  async function copyText(t: string, msg: string) {
+    const ok = await clipWrite(t);
+    props.onStatus(ok ? msg : "clipboard unavailable");
+  }
+  const columnDataset = (oi: number): Dataset => ({
+    columns: [props.columns()[oi]],
+    rows: props.rows().map((row) => [row[oi] ?? null]),
+  });
+
+  // --- context menus ---
+  function onCellContext(e: MouseEvent, r: number, dc: number, oi: number, val: string | null) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!isSel(r, dc)) setSel({ mode: "cell", ar: r, ac: dc, fr: r, fc: dc });
+    const name = props.columns()[oi];
+    props.onMenu(e.clientX, e.clientY, [
+      { label: "Copy", icon: "📋", onClick: () => void copySelection("tsv") },
+      { label: "Copy as CSV", icon: "📋", onClick: () => void copySelection("csv") },
+      { label: "Copy as JSON", icon: "📋", onClick: () => void copySelection("json") },
+      { label: "Copy as Markdown", icon: "📋", onClick: () => void copySelection("md") },
+      { sep: true },
+      { label: val === null ? "Copy value (NULL→empty)" : "Copy cell value", icon: "📋", onClick: () => void copyText(val ?? "", "copied value") },
+      { label: "Copy column", icon: "📋", onClick: () => void copyText(toTSV(columnDataset(oi)), "copied column") },
+      { label: "View value…", icon: "🔍", onClick: () => props.onViewValue(name, val) },
+    ]);
+  }
+  function onHeaderContext(e: MouseEvent, oi: number, dc: number) {
+    e.preventDefault();
+    e.stopPropagation();
+    const items: MenuItem[] = [];
+    if (props.canSortFilter()) {
+      items.push(
+        { label: "Sort ascending", icon: "▲", onClick: () => setSort(oi, "asc") },
+        { label: "Sort descending", icon: "▼", onClick: () => setSort(oi, "desc") },
+        { label: "Clear sort", icon: "✕", onClick: () => clearSort(oi) },
+        { label: props.view().filterRowOpen ? "Hide filter row" : "Filter…", icon: "⌕", onClick: () => props.setView({ filterRowOpen: !props.view().filterRowOpen }) },
+        { sep: true },
+      );
+    }
+    items.push(
+      { label: "Autofit column", icon: "↔", onClick: () => autofit(oi) },
+      { label: "Hide column", icon: "🙈", onClick: () => hideCol(oi) },
+    );
+    const hidden = props.view().hidden;
+    if (hidden.length) {
+      items.push({ sep: true });
+      for (const h of hidden) items.push({ label: `Show "${props.columns()[h]}"`, icon: "👁", onClick: () => showCol(h) });
+      items.push({ label: "Show all columns", icon: "👁", onClick: () => props.setView({ hidden: [] }) });
+    }
+    items.push({ sep: true }, { label: "Copy column", icon: "📋", onClick: () => void copyText(toTSV(columnDataset(oi)), "copied column") });
+    void dc;
+    props.onMenu(e.clientX, e.clientY, items);
+  }
+
+  // --- sort / filter ---
+  function setSort(oi: number, dir: "asc" | "desc") {
+    const next: SortKey[] = [{ col: oi, dir }];
+    props.setView({ sorts: next });
+    props.onSortFilter(next, props.view().filters);
+  }
+  function clearSort(oi: number) {
+    const next = props.view().sorts.filter((s) => s.col !== oi);
+    props.setView({ sorts: next });
+    props.onSortFilter(next, props.view().filters);
+  }
+  function cycleSort(oi: number, additive: boolean) {
+    if (!props.canSortFilter()) return;
+    const cur = props.view().sorts;
+    const existing = cur.find((s) => s.col === oi);
+    const cycled = !existing ? "asc" : existing.dir === "asc" ? "desc" : null;
+    let next: SortKey[];
+    if (additive) {
+      next = cur.filter((s) => s.col !== oi);
+      if (cycled) next.push({ col: oi, dir: cycled });
+    } else {
+      next = cycled ? [{ col: oi, dir: cycled }] : [];
+    }
+    props.setView({ sorts: next });
+    props.onSortFilter(next, props.view().filters);
+  }
+  const sortFor = (oi: number) => props.view().sorts.find((s) => s.col === oi);
+  const sortIndex = (oi: number) => props.view().sorts.findIndex((s) => s.col === oi);
+
+  let filterTimer: ReturnType<typeof setTimeout> | undefined;
+  function onFilterInput(oi: number, text: string) {
+    const filters = props.view().filters.filter((f) => f.col !== oi);
+    if (text.trim() !== "") filters.push({ col: oi, text });
+    props.setView({ filters });
+    clearTimeout(filterTimer);
+    filterTimer = setTimeout(() => props.onSortFilter(props.view().sorts, filters), 300);
+  }
+  const filterFor = (oi: number) => props.view().filters.find((f) => f.col === oi)?.text ?? "";
+
+  // --- resize / autofit / reorder / hide ---
+  function startResize(e: MouseEvent, oi: number) {
+    e.preventDefault();
+    e.stopPropagation();
+    const startX = e.clientX,
+      startW = colWidth(oi);
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "col-resize";
+    const mv = (ev: MouseEvent) =>
+      props.setView({ widths: { ...props.view().widths, [oi]: Math.max(MIN_COL_W, Math.min(MAX_COL_W, startW + ev.clientX - startX)) } });
+    const up = () => {
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+      window.removeEventListener("mousemove", mv);
+      window.removeEventListener("mouseup", up);
+    };
+    window.addEventListener("mousemove", mv);
+    window.addEventListener("mouseup", up);
+  }
+  let measureCtx: CanvasRenderingContext2D | null = null;
+  function autofit(oi: number) {
+    if (!measureCtx) measureCtx = document.createElement("canvas").getContext("2d");
+    if (!measureCtx) return;
+    measureCtx.font = GRID_FONT;
+    let max = measureCtx.measureText(props.columns()[oi]).width + 34;
+    const R = props.rows();
+    const { start, end } = visRows();
+    for (let r = start; r < end; r++) {
+      const v = R[r]?.[oi];
+      if (v != null) max = Math.max(max, measureCtx.measureText(v).width + 22);
+    }
+    props.setView({ widths: { ...props.view().widths, [oi]: Math.max(MIN_COL_W, Math.min(MAX_COL_W, Math.ceil(max))) } });
+  }
+  function hideCol(oi: number) {
+    props.setView({ hidden: [...props.view().hidden, oi] });
+  }
+  function showCol(oi: number) {
+    props.setView({ hidden: props.view().hidden.filter((h) => h !== oi) });
+  }
+  function moveColumn(fromDisp: number, toDisp: number) {
+    const dc = displayCols();
+    if (fromDisp === toDisp || toDisp === fromDisp + 1) return;
+    const movingOi = dc[fromDisp];
+    const remaining = dc.filter((_, i) => i !== fromDisp);
+    const insertAt = toDisp > fromDisp ? toDisp - 1 : toDisp;
+    remaining.splice(insertAt, 0, movingOi);
+    props.setView({ order: [...remaining, ...props.view().hidden] });
+  }
+  function insertionIndex(x: number): number {
+    const o = offsets();
+    for (let k = 0; k < o.length - 1; k++) if (x < (o[k] + o[k + 1]) / 2) return k;
+    return o.length - 1;
+  }
+
+  // header label mousedown: distinguish click (sort + select) vs drag (reorder)
+  let headerDown: { dc: number; oi: number; x: number; shift: boolean; moved: boolean } | null = null;
+  function onHeaderDown(e: MouseEvent, dc: number, oi: number) {
+    if (e.button !== 0) return;
+    focusGrid();
+    headerDown = { dc, oi, x: e.clientX, shift: e.shiftKey, moved: false };
+    window.addEventListener("mousemove", onHeaderMove);
+    window.addEventListener("mouseup", onHeaderUp);
+  }
+  function onHeaderMove(e: MouseEvent) {
+    if (!headerDown) return;
+    if (!headerDown.moved && Math.abs(e.clientX - headerDown.x) > 4) {
+      headerDown.moved = true;
+      document.body.style.userSelect = "none";
+    }
+    if (headerDown.moved) {
+      const b = scroller!.getBoundingClientRect();
+      setReorderTo(insertionIndex(e.clientX - b.left + scroller!.scrollLeft));
+    }
+  }
+  function onHeaderUp() {
+    if (!headerDown) return;
+    if (headerDown.moved) {
+      const to = reorderTo();
+      if (to != null) moveColumn(headerDown.dc, to);
+    } else {
+      const nr = props.rows().length;
+      setSel({ mode: "cols", ar: 0, ac: headerDown.dc, fr: nr - 1, fc: headerDown.dc });
+      cycleSort(headerDown.oi, headerDown.shift);
+    }
+    setReorderTo(null);
+    document.body.style.userSelect = "";
+    headerDown = null;
+    window.removeEventListener("mousemove", onHeaderMove);
+    window.removeEventListener("mouseup", onHeaderUp);
+  }
+
+  return (
+    <div class="rg" ref={root} tabindex={0} onKeyDown={onKeyDown}>
+      {/* corner: select-all */}
+      <div class="rg-corner" style={{ width: `${GUTTER_W}px`, height: `${headTop()}px` }} onClick={selectAll} title="Select all (⌘/Ctrl+A)" />
+
+      {/* header (+ optional filter row), translated horizontally */}
+      <div class="rg-headwrap" style={{ left: `${GUTTER_W}px`, height: `${headTop()}px` }}>
+        <div class="rg-head" style={{ width: `${contentW()}px`, transform: `translateX(${-scrollLeft()}px)` }}>
+          <For each={range(visCols().start, visCols().end)}>
+            {(k) => {
+              const oi = () => displayCols()[k];
+              const s = () => sortFor(oi());
+              return (
+                <div
+                  class="rg-headcell"
+                  classList={{ sel: sel().mode === "cols" && isSel(0, k) }}
+                  style={{ left: `${offsets()[k]}px`, width: `${colWidth(oi())}px`, height: `${HEAD_H}px` }}
+                  title={props.columns()[oi()]}
+                  onMouseDown={(e) => onHeaderDown(e, k, oi())}
+                  onContextMenu={(e) => onHeaderContext(e, oi(), k)}
+                >
+                  <span class="rg-headname">{props.columns()[oi()]}</span>
+                  <Show when={s()}>
+                    {(sk) => <span class="rg-sort">{sk().dir === "asc" ? "▲" : "▼"}{props.view().sorts.length > 1 ? sortIndex(oi()) + 1 : ""}</span>}
+                  </Show>
+                  <div class="rg-resize" onMouseDown={(e) => startResize(e, oi())} onDblClick={(e) => (e.stopPropagation(), autofit(oi()))} />
+                </div>
+              );
+            }}
+          </For>
+          <Show when={props.view().filterRowOpen}>
+            <div class="rg-filter" style={{ top: `${HEAD_H}px`, width: `${contentW()}px`, height: `${FILTER_H}px` }}>
+              <For each={range(visCols().start, visCols().end)}>
+                {(k) => {
+                  const oi = () => displayCols()[k];
+                  return (
+                    <input
+                      class="rg-filter-input"
+                      style={{ left: `${offsets()[k]}px`, width: `${colWidth(oi()) - 6}px` }}
+                      placeholder="filter…"
+                      value={filterFor(oi())}
+                      onInput={(e) => onFilterInput(oi(), e.currentTarget.value)}
+                    />
+                  );
+                }}
+              </For>
+            </div>
+          </Show>
+          <Show when={reorderTo() != null}>
+            <div class="rg-reorder" style={{ left: `${offsets()[reorderTo()!] ?? contentW()}px`, height: `${headTop()}px` }} />
+          </Show>
+        </div>
+      </div>
+
+      {/* gutter: row numbers, translated vertically */}
+      <div class="rg-gutwrap" style={{ width: `${GUTTER_W}px`, top: `${headTop()}px` }}>
+        <div class="rg-gut" style={{ height: `${totalH()}px`, transform: `translateY(${-scrollTop()}px)` }}>
+          <For each={range(visRows().start, visRows().end)}>
+            {(r) => (
+              <div
+                class="rg-gutnum"
+                classList={{ sel: sel().mode === "rows" && isSel(r, 0) }}
+                style={{ top: `${r * ROW_H}px`, height: `${ROW_H}px` }}
+                onMouseDown={(e) => onGutterDown(e, r)}
+              >
+                {r + 1}
+              </div>
+            )}
+          </For>
+        </div>
+      </div>
+
+      {/* body scroller */}
+      <div class="rg-scroll" ref={mountScroller} style={{ top: `${headTop()}px`, left: `${GUTTER_W}px` }} onScroll={onScroll}>
+        <div class="rg-sizer" style={{ width: `${contentW()}px`, height: `${totalH()}px` }}>
+          <For each={range(visRows().start, visRows().end)}>
+            {(r) => (
+              <div class="rg-row" style={{ top: `${r * ROW_H}px`, height: `${ROW_H}px`, width: `${contentW()}px` }}>
+                <For each={range(visCols().start, visCols().end)}>
+                  {(k) => {
+                    const oi = () => displayCols()[k];
+                    const val = () => props.rows()[r]?.[oi()] ?? null;
+                    return (
+                      <div
+                        class="rg-cell"
+                        classList={{ sel: isSel(r, k), active: isActive(r, k) }}
+                        style={{ left: `${offsets()[k]}px`, width: `${colWidth(oi())}px` }}
+                        onMouseDown={(e) => onCellDown(e, r, k)}
+                        onDblClick={() => props.onViewValue(props.columns()[oi()], val())}
+                        onContextMenu={(e) => onCellContext(e, r, k, oi(), val())}
+                      >
+                        {val() === null ? <span class="null">NULL</span> : val()}
+                      </div>
+                    );
+                  }}
+                </For>
+              </div>
+            )}
+          </For>
+        </div>
+      </div>
+    </div>
+  );
+}

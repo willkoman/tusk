@@ -5,7 +5,9 @@ import { SqlEditor, type EditorApi } from "./SqlEditor";
 import { type DialectId } from "./sql/dialects";
 import { type CursorInfo, type EditorPrefs, type ServerDiag } from "./editor/types";
 import { prefsStore, tabsStore, type PersistedTabs } from "./store";
-import { makeTab, basename, type Tab, type ResultSnapshot } from "./tabs";
+import { makeTab, basename, gridViewFor, type Tab, type ResultSnapshot, type GridView, type SortKey, type Filter } from "./tabs";
+import { ResultGrid } from "./ResultGrid";
+import { wrapQuery, wrappableQuery, stripTrailingSemi } from "./grid/query";
 import { type Dataset, parseCSV, parseJSON, formatWithOptions } from "./formats";
 import { ExportDialog } from "./forms/ExportDialog";
 import { FORMAT_EXT, type ExportOptions, type ExportScope } from "./export";
@@ -38,9 +40,7 @@ type QueryOutcome =
   | { kind: "exec"; message: string };
 type FetchResult = { rows: (string | null)[][]; done: boolean };
 
-const ROW_H = 28;
 const PAGE = 1000;
-const COL_W = 180;
 const DDL_RE = /^\s*(create|alter|drop|truncate|comment|grant|revoke)\b/i;
 
 function errMsg(e: unknown): string {
@@ -170,13 +170,7 @@ function App() {
 
   function switchTab(id: string) {
     if (id === activeTabId()) return;
-    patchResult(activeTabId(), { scrollTop: scroller?.scrollTop ?? 0 });
-    setActiveTabId(id);
-    requestAnimationFrame(() => {
-      const top = activeTab().result.scrollTop;
-      if (scroller) scroller.scrollTop = top;
-      setScrollTop(top);
-    });
+    setActiveTabId(id); // ResultGrid restores its own scroll/selection on the tab change
   }
 
   function openNewTab() {
@@ -278,10 +272,12 @@ function App() {
   const [importBusy, setImportBusy] = createSignal(false);
   const [importMsg, setImportMsg] = createSignal("");
 
-  // virtualization
-  const [scrollTop, setScrollTop] = createSignal(0);
-  const [viewportH, setViewportH] = createSignal(500);
-  let scroller: HTMLDivElement | undefined;
+  // result grid: per-tab view + sort/filter re-run, Load-all
+  const gridView = () => activeTab().gridView;
+  const setGridView = (patch: Partial<GridView>) => patchTab(activeTabId(), { gridView: { ...activeTab().gridView, ...patch } });
+  const canSortFilter = () => wrappableQuery(activeTab().result.baseQuery);
+  const [loadingAll, setLoadingAll] = createSignal(false);
+  let cancelAll = false;
   let importFileInput: HTMLInputElement | undefined;
   let loadingMore = false;
   let runTimer: ReturnType<typeof setInterval> | undefined;
@@ -557,46 +553,46 @@ function App() {
     for (const { schema, name } of loadedRels.values()) await loadDetail(schema, name, true);
   }
 
-  async function doRun(override?: string) {
+  const sameColumns = (a: string[], b: string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
+
+  // Shared query executor. `mode:"base"` = a user-issued query (resets sorts/filters,
+  // fresh grid view if the column set changed); `mode:"wrapped"` = a sort/filter re-run
+  // (keep the grid view — its sorts/filters drive the wrap).
+  async function executeQuery(sqlToRun: string, base: string, mode: "base" | "wrapped") {
     const c = conn();
-    if (!c || running()) return;
-    const runText = override ?? editorApi()?.getRunText() ?? sql();
-    if (!runText.trim()) return;
+    if (!c || running() || !sqlToRun.trim()) return;
     const runTabId = activeTabId();
-    const runSchema = activeTab().searchSchema; // capture now — bound to this run's tab
-    // Running here rolls back any other tab's open cursor server-side — freeze that
-    // tab's snapshot at the rows it already fetched.
+    const runSchema = activeTab().searchSchema;
     if (cursorOwnerTabId && cursorOwnerTabId !== runTabId) patchResult(cursorOwnerTabId, { done: true });
     cursorOwnerTabId = null;
-    patchResult(runTabId, { lastQuery: runText, runErr: "", status: "" });
+    patchResult(runTabId, { runErr: "", status: "" });
     setRunning(true);
     const t0 = performance.now();
     setRunMs(0);
     runTimer = setInterval(() => setRunMs(performance.now() - t0), 200);
     try {
-      const out = await invoke<QueryOutcome>("run_query", {
-        connectionId: c.id,
-        sql: runText,
-        pageSize: PAGE,
-        searchPath: runSchema,
-      });
+      const out = await invoke<QueryOutcome>("run_query", { connectionId: c.id, sql: sqlToRun, pageSize: PAGE, searchPath: runSchema });
+      const rt = tabs().find((t) => t.id === runTabId);
+      const epoch = (rt?.result.epoch ?? 0) + 1;
       if (out.kind === "rows") {
+        const prevCols = rt?.result.columns ?? [];
         patchResult(runTabId, {
-          columns: out.columns,
-          rows: out.rows,
-          done: out.done,
-          scrollTop: 0,
+          columns: out.columns, rows: out.rows, done: out.done, lastQuery: sqlToRun, baseQuery: base, epoch,
           status: `${out.rows.length}${out.done ? "" : "+"} rows`,
         });
-        if (!out.done) cursorOwnerTabId = runTabId;
-        if (runTabId === activeTabId()) {
-          if (scroller) scroller.scrollTop = 0;
-          setScrollTop(0);
+        if (mode === "base") {
+          patchTab(runTabId, {
+            gridView: sameColumns(prevCols, out.columns)
+              ? { ...(rt?.gridView ?? gridViewFor(out.columns.length)), sorts: [], filters: [] }
+              : gridViewFor(out.columns.length),
+          });
         }
+        if (!out.done) cursorOwnerTabId = runTabId;
       } else {
-        patchResult(runTabId, { columns: [], rows: [], done: true, status: out.message });
+        patchResult(runTabId, { columns: [], rows: [], done: true, lastQuery: sqlToRun, baseQuery: base, epoch, status: out.message });
+        if (mode === "base") patchTab(runTabId, { gridView: gridViewFor(0) });
       }
-      if (out.kind === "exec" || DDL_RE.test(runText)) void loadSchema(); // refresh after scripts/DDL
+      if (out.kind === "exec" || DDL_RE.test(sqlToRun)) void loadSchema();
     } catch (e) {
       patchResult(runTabId, { runErr: errMsg(e), columns: [], rows: [], done: true });
     } finally {
@@ -604,6 +600,19 @@ function App() {
       setRunning(false);
       patchResult(runTabId, { elapsed: Math.round(performance.now() - t0) });
     }
+  }
+
+  function doRun(override?: string) {
+    const runText = override ?? editorApi()?.getRunText() ?? sql();
+    void executeQuery(runText, stripTrailingSemi(runText), "base");
+  }
+
+  // Re-stream the active tab's result sorted/filtered (server ORDER BY / WHERE).
+  function onSortFilter(sorts: SortKey[], filters: Filter[]) {
+    setGridView({ sorts, filters });
+    const base = activeTab().result.baseQuery;
+    if (!wrappableQuery(base)) return;
+    void executeQuery(wrapQuery(base, sorts, filters, activeTab().result.columns), base, "wrapped");
   }
 
   async function loadMore() {
@@ -628,18 +637,17 @@ function App() {
     }
   }
 
-  function onScroll(e: Event) {
-    const el = e.currentTarget as HTMLDivElement;
-    setScrollTop(el.scrollTop);
-    setViewportH(el.clientHeight);
-    patchResult(activeTabId(), { scrollTop: el.scrollTop });
-    if (el.scrollTop + el.clientHeight > el.scrollHeight - ROW_H * 50) loadMore();
-  }
-
-  function mountScroller(el: HTMLDivElement) {
-    scroller = el;
-    requestAnimationFrame(() => setViewportH(el.clientHeight));
-    new ResizeObserver(() => setViewportH(el.clientHeight)).observe(el);
+  // Drain the cursor to completion (or cancel). Yields between pages to stay responsive.
+  async function loadAll() {
+    if (loadingAll()) { cancelAll = true; return; }
+    const id = activeTabId();
+    setLoadingAll(true);
+    cancelAll = false;
+    while (!cancelAll && !done() && cursorOwnerTabId === id && activeTabId() === id) {
+      await loadMore();
+      await new Promise((r) => setTimeout(r));
+    }
+    setLoadingAll(false);
   }
 
   function tableNameFromSql(s: string): string {
@@ -761,17 +769,6 @@ function App() {
     window.addEventListener("mouseup", onUp);
     document.body.style.userSelect = "none";
   }
-
-  const totalH = createMemo(() => rows().length * ROW_H);
-  const gridW = createMemo(() => Math.max(columns().length * COL_W, COL_W));
-  const visible = createMemo(() => {
-    const start = Math.max(0, Math.floor(scrollTop() / ROW_H) - 8);
-    const count = Math.ceil(viewportH() / ROW_H) + 16;
-    const end = Math.min(rows().length, start + count);
-    return rows()
-      .slice(start, end)
-      .map((row, k) => ({ row, idx: start + k }));
-  });
 
   function runTable(schemaName: string, name: string) {
     const q = `SELECT * FROM ${qualifyIn(schemaName, name, schemaName)}`;
@@ -1061,50 +1058,7 @@ function App() {
     return items;
   }
 
-  // --- result grid menus ---
-  const rowJSON = (row: (string | null)[]) =>
-    JSON.stringify(Object.fromEntries(columns().map((c, i) => [c, row[i]])));
-  const columnValues = (ci: number) => rows().map((r) => r[ci] ?? "").join("\n");
-  const columnJSON = (ci: number) => JSON.stringify(rows().map((r) => r[ci]));
-  const allRowsTSV = () =>
-    [columns().join("\t"), ...rows().map((r) => r.map((x) => x ?? "").join("\t"))].join("\n");
-  const allRowsJSON = () =>
-    JSON.stringify(rows().map((r) => Object.fromEntries(columns().map((c, i) => [c, r[i]]))));
-
-  function openCellMenu(e: MouseEvent, row: (string | null)[], ci: number, val: string | null) {
-    e.preventDefault();
-    setMenu({
-      x: e.clientX,
-      y: e.clientY,
-      items: [
-        { label: val === null ? "Copy value (NULL)" : "Copy value", icon: "📋", onClick: () => copyText(val ?? "", "copied cell") },
-        { label: "Copy row (TSV)", icon: "📋", onClick: () => copyText(row.map((x) => x ?? "").join("\t"), "copied row") },
-        { label: "Copy row (JSON)", icon: "📋", onClick: () => copyText(rowJSON(row), "copied row") },
-        { sep: true },
-        { label: "Copy column", icon: "📋", onClick: () => copyText(columnValues(ci), "copied column") },
-        { label: "Copy column (JSON)", icon: "📋", onClick: () => copyText(columnJSON(ci), "copied column") },
-        { sep: true },
-        { label: "View value…", icon: "🔍", onClick: () => setCellView({ col: columns()[ci], val }) },
-        { label: "Copy column name", icon: "📋", onClick: () => copyText(columns()[ci], "copied name") },
-      ],
-    });
-  }
-
-  function openHeaderMenu(e: MouseEvent, ci: number, colName: string) {
-    e.preventDefault();
-    setMenu({
-      x: e.clientX,
-      y: e.clientY,
-      items: [
-        { label: "Copy column name", icon: "📋", onClick: () => copyText(colName, "copied name") },
-        { label: "Copy column", icon: "📋", onClick: () => copyText(columnValues(ci), "copied column") },
-        { label: "Copy column (JSON)", icon: "📋", onClick: () => copyText(columnJSON(ci), "copied column") },
-        { sep: true },
-        { label: `Copy all rows (TSV)`, icon: "📋", onClick: () => copyText(allRowsTSV(), `copied ${rows().length} rows`) },
-        { label: "Copy all rows (JSON)", icon: "📋", onClick: () => copyText(allRowsJSON(), `copied ${rows().length} rows`) },
-      ],
-    });
-  }
+  // (Result-grid cell/header menus + copy now live in ResultGrid.tsx.)
 
   // --- SQL editor menu ---
   function openEditorMenu(e: MouseEvent) {
@@ -1385,34 +1339,21 @@ function App() {
             <div class="result">
               <Show when={runErr()}><div class="error result-error">{runErr()}</div></Show>
               <Show when={columns().length > 0} fallback={<div class="result-empty">{status() || "no results"}</div>}>
-                <div class="grid-scroll" ref={mountScroller} onScroll={onScroll}>
-                  <div class="grid-header" style={{ width: `${gridW()}px` }}>
-                    <For each={columns()}>
-                      {(c, i) => (
-                        <div class="cell head" style={{ width: `${COL_W}px` }} onContextMenu={(e) => openHeaderMenu(e, i(), c)}>{c}</div>
-                      )}
-                    </For>
-                  </div>
-                  <div class="grid-body" style={{ height: `${totalH()}px`, width: `${gridW()}px` }}>
-                    <For each={visible()}>
-                      {(item) => (
-                        <div class="grid-row" style={{ top: `${item.idx * ROW_H}px`, width: `${gridW()}px` }}>
-                          <For each={item.row}>
-                            {(cell, i) => (
-                              <div
-                                class="cell"
-                                style={{ width: `${COL_W}px` }}
-                                onContextMenu={(e) => openCellMenu(e, item.row, i(), cell)}
-                              >
-                                {cell === null ? <span class="null">NULL</span> : cell}
-                              </div>
-                            )}
-                          </For>
-                        </div>
-                      )}
-                    </For>
-                  </div>
-                </div>
+                <ResultGrid
+                  columns={columns}
+                  rows={rows}
+                  done={done}
+                  view={gridView}
+                  setView={setGridView}
+                  activeTabId={activeTabId}
+                  epoch={() => activeTab().result.epoch}
+                  onLoadMore={loadMore}
+                  onSortFilter={onSortFilter}
+                  onMenu={(x, y, items) => setMenu({ x, y, items })}
+                  onViewValue={(col, val) => setCellView({ col, val })}
+                  onStatus={setStatus}
+                  canSortFilter={canSortFilter}
+                />
               </Show>
             </div>
 
@@ -1428,7 +1369,10 @@ function App() {
                   </span>
                 )}
               </Show>
-              <Show when={!done()}><span class="streaming">streaming…</span></Show>
+              <Show when={!done()}>
+                <button class="ghost export-btn" onClick={loadAll}>{loadingAll() ? "Cancel" : "Load all"}</button>
+                <span class="streaming">streaming…</span>
+              </Show>
               <Show when={lastQuery() || columns().length > 0}>
                 <button class="ghost export-btn" onClick={openExport}>Export…</button>
               </Show>

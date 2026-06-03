@@ -11,7 +11,10 @@ export type ResultSnapshot = {
   runErr: string;
   elapsed: number;
   lastQuery: string;
-  scrollTop: number;
+  /** The user's original wrappable query (';'-stripped) that sort/filter re-wrap from. */
+  baseQuery: string;
+  /** Bumped on each NEW query (not on streaming append) so the grid resets scroll/selection. */
+  epoch: number;
 };
 
 export const EMPTY_RESULT: ResultSnapshot = {
@@ -22,8 +25,45 @@ export const EMPTY_RESULT: ResultSnapshot = {
   runErr: "",
   elapsed: 0,
   lastQuery: "",
-  scrollTop: 0,
+  baseQuery: "",
+  epoch: 0,
 };
+
+// --- result-grid display state (per tab, ephemeral — not persisted) ---
+export type SortKey = { col: number; dir: "asc" | "desc" }; // col = ORIGINAL column index
+export type Filter = { col: number; text: string };
+
+export type GridView = {
+  /** origIdx -> px width (sparse; absent = default). */
+  widths: Record<number, number>;
+  /** display order: a permutation of original column indices. */
+  order: number[];
+  /** original indices hidden (display-only). */
+  hidden: number[];
+  /** multi-sort keys, in priority order (server ORDER BY). */
+  sorts: SortKey[];
+  /** per-column filters (server WHERE ILIKE). */
+  filters: Filter[];
+  filterRowOpen: boolean;
+  scrollTop: number;
+  scrollLeft: number;
+};
+
+export const EMPTY_GRID_VIEW: GridView = {
+  widths: {},
+  order: [],
+  hidden: [],
+  sorts: [],
+  filters: [],
+  filterRowOpen: false,
+  scrollTop: 0,
+  scrollLeft: 0,
+};
+
+/** Fresh grid view sized to a column count (display order 0..n-1). */
+export function gridViewFor(ncols: number): GridView {
+  return { ...EMPTY_GRID_VIEW, order: Array.from({ length: ncols }, (_, i) => i) };
+}
 
 export type Tab = {
   id: string;
@@ -34,6 +74,8 @@ export type Tab = {
   /** Active schema for this console (Postgres search_path); null = connection default. */
   searchSchema: string | null;
   result: ResultSnapshot;
+  /** Display overlay over the result (widths/order/hidden/sorts/filters). */
+  gridView: GridView;
 };
 
 let counter = 0;
@@ -53,5 +95,6 @@ export function makeTab(init?: Partial<Tab>): Tab {
     dirty: init?.dirty ?? false,
     searchSchema: init?.searchSchema ?? null,
     result: init?.result ?? { ...EMPTY_RESULT },
+    gridView: init?.gridView ?? { ...EMPTY_GRID_VIEW },
   };
 }
