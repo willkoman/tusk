@@ -202,6 +202,13 @@ button.ghost { background: transparent; }
 .spinner-sm { display: inline-block; width: 12px; height: 12px; border-radius: 50%; border: 2px solid currentColor; border-top-color: transparent; animation: tusk-spin 0.7s linear infinite; vertical-align: -2px; opacity: 0.85; margin-right: 6px; }
 /* Statement-gutter spinner that replaces the ▶ on the running block. */
 .cm-run-spinner { display: inline-block; width: 11px; height: 11px; border-radius: 50%; border: 2px solid var(--border); border-top-color: var(--accent); animation: tusk-spin 0.7s linear infinite; }
+/* Dialog bodies wrapped in a <fieldset> so a single `disabled` greys + disables every
+   control while an export/import runs (only the Cancel button stays live). Reset the
+   element's native chrome so it lays out like the plain container it replaced. */
+.export-fieldset, .import-fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+.export-fieldset:disabled, .import-fieldset:disabled { opacity: 0.5; }
+.busy-label, .import-busy { display: inline-flex; align-items: center; color: var(--muted); }
+.import-busy { justify-content: center; padding: 6px 0; }
 
 /* Result grid (ResultGrid.tsx): synchronized panes (header/gutter transform-translated,
    not sticky) + two-axis virtualization. Inline styles set sizes/offsets/transforms. */

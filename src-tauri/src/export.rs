@@ -483,11 +483,21 @@ pub async fn run_export_query(
         return Err(e.into());
     }
 
-    let result = stream_to_sink(client, opts, path).await;
-
-    let _ = client.batch_execute(&format!("CLOSE {EXPORT_CURSOR}")).await;
-    let _ = client.batch_execute("COMMIT").await;
-    result
+    match stream_to_sink(client, opts, path).await {
+        Ok(n) => {
+            let _ = client.batch_execute(&format!("CLOSE {EXPORT_CURSOR}")).await;
+            let _ = client.batch_execute("COMMIT").await;
+            Ok(n)
+        }
+        Err(e) => {
+            // Cancelled mid-stream or failed: roll the read transaction back and remove
+            // the partial file (text formats create + stream lazily; xlsx writes only at
+            // finish, so there's nothing on disk yet in that case).
+            let _ = client.batch_execute("ROLLBACK").await;
+            let _ = tokio::fs::remove_file(path).await;
+            Err(e)
+        }
+    }
 }
 
 async fn stream_to_sink(client: &Client, opts: &ExportOptions, path: &str) -> Result<u64, AppError> {

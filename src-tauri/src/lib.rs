@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use tokio::sync::Mutex as AsyncMutex;
-use tokio_postgres::SimpleQueryMessage;
+use tokio_postgres::{CancelToken, SimpleQueryMessage};
 
 use db::{
     AppError, ConnState, ConnectResult, ConnectionConfig, FetchResult, QueryOutcome, CURSOR_NAME,
@@ -23,6 +23,13 @@ type Conn = Arc<AsyncMutex<ConnState>>;
 #[derive(Default)]
 struct AppState {
     conns: Mutex<HashMap<String, Conn>>,
+    // Cancel handles for the *currently running* cancellable operation (export/import)
+    // on a connection, keyed by connection id. Kept OUTSIDE the per-connection async
+    // Mutex (which the long operation holds for its whole duration) so `cancel_operation`
+    // can reach it without blocking. The `CancelToken` opens its own short-lived
+    // connection to issue a Postgres CancelRequest; the config is stored so we can build
+    // a matching TLS connector for it.
+    cancels: Mutex<HashMap<String, (CancelToken, ConnectionConfig)>>,
     next_id: AtomicU64,
 }
 
@@ -34,6 +41,18 @@ impl AppState {
             .get(id)
             .cloned()
             .ok_or_else(|| AppError::new("no such connection"))
+    }
+
+    /// Arm cancellation for an operation about to run on `id` (call after `ensure_alive`,
+    /// with the *current* client's token). `disarm_cancel` must be called when it ends.
+    fn arm_cancel(&self, id: &str, token: CancelToken, cfg: ConnectionConfig) {
+        self.cancels.lock().unwrap().insert(id.to_string(), (token, cfg));
+    }
+    fn disarm_cancel(&self, id: &str) {
+        self.cancels.lock().unwrap().remove(id);
+    }
+    fn cancel_handle(&self, id: &str) -> Option<(CancelToken, ConnectionConfig)> {
+        self.cancels.lock().unwrap().get(id).cloned()
     }
 
     fn register(&self, client: tokio_postgres::Client, config: ConnectionConfig) -> String {
@@ -148,6 +167,7 @@ async fn disconnect(
     state: tauri::State<'_, AppState>,
     connection_id: String,
 ) -> Result<(), AppError> {
+    state.disarm_cancel(&connection_id);
     let removed = state.conns.lock().unwrap().remove(&connection_id);
     if let Some(conn) = removed {
         let mut c = conn.lock().await;
@@ -544,6 +564,22 @@ async fn object_ddl(
     ddl::object_ddl(&c.client, &kind, &schema, &name).await
 }
 
+/// Immediately cancel the cancellable operation in flight on a connection (a streaming
+/// export or an import). Sends a Postgres CancelRequest over a fresh connection, which
+/// interrupts the running query; the operation's own command then rolls back (and an
+/// export deletes its partial file). A no-op if nothing is armed.
+#[tauri::command]
+async fn cancel_operation(
+    state: tauri::State<'_, AppState>,
+    connection_id: String,
+) -> Result<(), AppError> {
+    if let Some((token, cfg)) = state.cancel_handle(&connection_id) {
+        let tls = db::make_tls(&cfg)?;
+        token.cancel_query(tls).await?;
+    }
+    Ok(())
+}
+
 /// Export to a file with a full options payload. Either streams a query
 /// (scope=all, needs a connection) or formats inline rows (scope=loaded).
 #[tauri::command]
@@ -583,7 +619,11 @@ async fn export_to_file(
         if sqls.len() != 1 {
             return Err(AppError::new("export streams a single query — select one statement"));
         }
-        export::run_export_query(&c.client, &sqls[0], &options, &path).await
+        // Arm cancellation for the duration of the stream, then always disarm.
+        state.arm_cancel(&id, c.client.cancel_token(), c.config.clone());
+        let result = export::run_export_query(&c.client, &sqls[0], &options, &path).await;
+        state.disarm_cancel(&id);
+        result
     } else if let (Some(cols), Some(rs)) = (columns, rows) {
         export::run_export_rows(&cols, &rs, &options, &path).await
     } else {
@@ -611,10 +651,28 @@ async fn import_rows(
         let _ = c.client.batch_execute("ROLLBACK").await;
         c.cursor_open = false;
     }
-    if create {
-        db::create_table_text(&c.client, &schema, &table, &columns).await?;
+    // Run create + copy in one transaction so a cancel (or any error) rolls the whole
+    // import back — no half-created table, no partial rows. Cancellable via the token.
+    state.arm_cancel(&connection_id, c.client.cancel_token(), c.config.clone());
+    let res = async {
+        c.client.batch_execute("BEGIN").await?;
+        if create {
+            db::create_table_text(&c.client, &schema, &table, &columns).await?;
+        }
+        db::copy_rows(&c.client, &schema, &table, &columns, &rows).await
     }
-    db::copy_rows(&c.client, &schema, &table, &columns, &rows).await
+    .await;
+    state.disarm_cancel(&connection_id);
+    match res {
+        Ok(n) => {
+            c.client.batch_execute("COMMIT").await?;
+            Ok(n)
+        }
+        Err(e) => {
+            let _ = c.client.batch_execute("ROLLBACK").await;
+            Err(e)
+        }
+    }
 }
 
 /// Read a UTF-8 text file by absolute path (the path comes from a native open dialog,
@@ -655,6 +713,7 @@ pub fn run() {
             table_detail,
             object_ddl,
             export_to_file,
+            cancel_operation,
             import_rows,
             read_text_file,
             write_text_file

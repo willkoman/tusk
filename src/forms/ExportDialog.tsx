@@ -19,6 +19,8 @@ export function ExportDialog(props: {
   onClose: () => void;
   onExportFile: (opts: ExportOptions, scope: ExportScope) => Promise<void>;
   onExportClipboard: (opts: ExportOptions) => Promise<void>;
+  /** Immediately cancel + roll back an in-flight (streaming) export. */
+  onCancel?: () => void | Promise<void>;
 }) {
   const [opts, setOpts] = createSignal<ExportOptions>(defaultExportOptions(props.defaultTable));
   const [scope, setScope] = createSignal<ExportScope>("all");
@@ -79,15 +81,16 @@ export function ExportDialog(props: {
       else await props.onExportFile(finalOpts(), scope());
       props.onClose();
     } catch (e) {
-      setErr(e instanceof Object && "message" in e ? String((e as any).message) : String(e));
+      const m = e instanceof Object && "message" in e ? String((e as any).message) : String(e);
+      setErr(/cancel/i.test(m) ? "Export cancelled — rolled back." : m);
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <Dialog title="Export" onClose={props.onClose} width={620}>
-      <div class="export-grid">
+    <Dialog title="Export" onClose={props.onClose} width={620} dismissable={!busy()}>
+      <fieldset class="export-grid export-fieldset" disabled={busy()}>
         <section class="export-sec">
           <div class="export-label">Format</div>
           <select value={fmt()} onChange={(e) => pickFormat(e.currentTarget.value as ExportOptions["format"])}>
@@ -228,12 +231,23 @@ export function ExportDialog(props: {
         <Show when={isXlsx()}>
           <div class="export-note">Excel buffers the whole file in memory; rows past 1,048,576 roll into additional sheets.</div>
         </Show>
-      </div>
+      </fieldset>
 
       <Show when={err()}><div class="error">{err()}</div></Show>
       <div class="form-actions">
-        <button class="ghost" onClick={props.onClose}>Cancel</button>
-        <button class="run" disabled={busy()} onClick={run}>{busy() ? "Exporting…" : dest() === "clipboard" ? "Copy" : "Export"}</button>
+        <Show
+          when={busy()}
+          fallback={
+            <>
+              <button class="ghost" onClick={props.onClose}>Cancel</button>
+              <button class="run" onClick={run}>{dest() === "clipboard" ? "Copy" : "Export"}</button>
+            </>
+          }
+        >
+          <span class="busy-label"><span class="spinner-sm" />{dest() === "clipboard" ? "Copying…" : "Exporting…"}</span>
+          <span class="spacer" />
+          <button class="ghost" onClick={() => void props.onCancel?.()}>Cancel &amp; roll back</button>
+        </Show>
       </div>
     </Dialog>
   );
