@@ -281,7 +281,9 @@ function App() {
   const [schemaLoading, setSchemaLoading] = createSignal(false);
   let cancelAll = false;
   let importFileInput: HTMLInputElement | undefined;
-  let loadingMore = false;
+  // Reactive so the "streaming…" spinner spins only during an actual in-flight fetch
+  // (not merely while more rows remain, i.e. !done()).
+  const [fetchingMore, setFetchingMore] = createSignal(false);
   let runTimer: ReturnType<typeof setInterval> | undefined;
 
   onMount(async () => {
@@ -625,9 +627,9 @@ function App() {
   async function loadMore() {
     const c = conn();
     const id = activeTabId();
-    if (!c || done() || loadingMore) return;
+    if (!c || done() || fetchingMore()) return;
     if (cursorOwnerTabId !== id) return; // this tab doesn't own the live cursor
-    loadingMore = true;
+    setFetchingMore(true);
     try {
       const r = await invoke<FetchResult>("fetch_more", { connectionId: c.id, pageSize: PAGE });
       // Read the captured tab's rows (the user may have switched tabs during the fetch).
@@ -643,7 +645,7 @@ function App() {
       patchResult(id, { runErr: msg, status: `streaming stopped — ${msg}`, done: true });
       cursorOwnerTabId = null;
     } finally {
-      loadingMore = false;
+      setFetchingMore(false);
     }
   }
 
@@ -1397,7 +1399,11 @@ function App() {
               </Show>
               <Show when={!done()}>
                 <button class="ghost export-btn" onClick={loadAll}>{loadingAll() ? <><span class="spinner-sm" />Cancel</> : "Load all"}</button>
-                <span class="streaming"><span class="spinner-sm" />streaming…</span>
+                <span class="streaming">
+                  <Show when={fetchingMore() || loadingAll()} fallback={"more rows"}>
+                    <span class="spinner-sm" />streaming…
+                  </Show>
+                </span>
               </Show>
               <Show when={lastQuery() || columns().length > 0}>
                 <button class="ghost export-btn" onClick={openExport}>Export…</button>
