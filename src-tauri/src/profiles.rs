@@ -23,6 +23,9 @@ pub struct Profile {
     pub sslmode: Option<String>,
     #[serde(default)]
     pub read_only: bool,
+    /// Auto-connect to this profile on app launch (at most one profile).
+    #[serde(default)]
+    pub default_connect: bool,
 }
 
 fn store_path(app: &tauri::AppHandle) -> Result<PathBuf, AppError> {
@@ -81,6 +84,12 @@ pub fn upsert(
     }
 
     let mut list = load_all(app)?;
+    // Only one profile may be the default — clear the flag on all others.
+    if p.default_connect {
+        for x in list.iter_mut() {
+            x.default_connect = false;
+        }
+    }
     if let Some(existing) = list.iter_mut().find(|x| x.id == p.id) {
         *existing = p.clone();
     } else {

@@ -12,6 +12,7 @@ import {
   history,
   historyKeymap,
   indentWithTab,
+  toggleComment,
 } from "@codemirror/commands";
 import { sql } from "@codemirror/lang-sql";
 import {
@@ -28,7 +29,18 @@ import { getDialect, type DialectId } from "./sql/dialects";
 import { makeSqlCompletion, type Table } from "./sql/completion";
 
 /** Imperative handle exposed to the parent. */
-export type EditorApi = { getRunText: () => string };
+export type EditorApi = {
+  getRunText: () => string;
+  /** Insert text at the cursor (does not clobber the buffer) and focus the editor. */
+  insertAtCursor: (text: string) => void;
+  focus: () => void;
+  /** Current selection text ("" when nothing is selected). */
+  getSelection: () => string;
+  /** Replace the current selection (or insert at cursor) with text. */
+  replaceSelection: (text: string) => void;
+  selectAll: () => void;
+  toggleComment: () => void;
+};
 
 /**
  * Live auto-capitalization of SQL keywords. When a word boundary is typed right
@@ -86,6 +98,7 @@ export function SqlEditor(props: {
   tables: Table[];
   dialect?: DialectId;
   onReady?: (api: EditorApi) => void;
+  onContextMenu?: (e: MouseEvent) => void;
 }) {
   let host: HTMLDivElement | undefined;
   let view: EditorView | undefined;
@@ -94,6 +107,37 @@ export function SqlEditor(props: {
     if (!view) return props.value;
     const sel = view.state.selection.main;
     return sel.empty ? view.state.doc.toString() : view.state.sliceDoc(sel.from, sel.to);
+  };
+
+  const insertAtCursor = (text: string) => {
+    if (!view) return;
+    const pos = view.state.selection.main.head;
+    view.dispatch({
+      changes: { from: pos, insert: text },
+      selection: { anchor: pos + text.length },
+    });
+    view.focus();
+  };
+
+  const focus = () => view?.focus();
+
+  const getSelection = () => {
+    if (!view) return "";
+    const sel = view.state.selection.main;
+    return view.state.sliceDoc(sel.from, sel.to);
+  };
+  const replaceSelection = (text: string) => {
+    if (!view) return;
+    view.dispatch(view.state.replaceSelection(text));
+    view.focus();
+  };
+  const selectAll = () => {
+    if (!view) return;
+    view.dispatch({ selection: { anchor: 0, head: view.state.doc.length } });
+    view.focus();
+  };
+  const toggle = () => {
+    if (view) toggleComment(view);
   };
 
   onMount(() => {
@@ -146,7 +190,15 @@ export function SqlEditor(props: {
       ],
     });
     view = new EditorView({ state, parent: host! });
-    props.onReady?.({ getRunText });
+    props.onReady?.({
+      getRunText,
+      insertAtCursor,
+      focus,
+      getSelection,
+      replaceSelection,
+      selectAll,
+      toggleComment: toggle,
+    });
   });
 
   onCleanup(() => view?.destroy());
@@ -159,5 +211,5 @@ export function SqlEditor(props: {
     }
   });
 
-  return <div class="cm-host" ref={host} />;
+  return <div class="cm-host" ref={host} onContextMenu={(e) => props.onContextMenu?.(e)} />;
 }

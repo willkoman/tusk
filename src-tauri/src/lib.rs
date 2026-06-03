@@ -1,4 +1,5 @@
 mod db;
+mod ddl;
 mod export;
 mod profiles;
 mod script;
@@ -35,16 +36,29 @@ impl AppState {
             .ok_or_else(|| AppError::new("no such connection"))
     }
 
-    fn register(&self, client: tokio_postgres::Client, read_only: bool) -> String {
+    fn register(&self, client: tokio_postgres::Client, config: ConnectionConfig) -> String {
         let id = format!("conn-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let conn = Arc::new(AsyncMutex::new(ConnState {
             client,
             cursor_open: false,
-            read_only,
+            read_only: config.read_only,
+            config,
         }));
         self.conns.lock().unwrap().insert(id.clone(), conn);
         id
     }
+}
+
+/// Re-open the connection if the client was dropped — idle timeout, server restart,
+/// or a network drop that TCP keepalives surfaced as `is_closed`. Resets cursor
+/// state since a fresh connection has none. Never caps query duration.
+async fn ensure_alive(c: &mut ConnState) -> Result<(), AppError> {
+    if c.client.is_closed() {
+        let (client, _version) = db::open(&c.config).await?;
+        c.client = client;
+        c.cursor_open = false;
+    }
+    Ok(())
 }
 
 /// Only plain read queries can be wrapped in a server-side cursor for streaming.
@@ -73,9 +87,11 @@ async fn connect(
     config: ConnectionConfig,
 ) -> Result<ConnectResult, AppError> {
     let (client, server_version) = db::open(&config).await?;
+    let read_only = config.read_only;
     Ok(ConnectResult {
-        connection_id: state.register(client, config.read_only),
+        connection_id: state.register(client, config),
         server_version,
+        read_only,
     })
 }
 
@@ -104,10 +120,12 @@ async fn connect_profile(
         sslmode: p.sslmode,
         read_only: p.read_only,
     };
+    let read_only = config.read_only;
     let (client, server_version) = db::open(&config).await?;
     Ok(ConnectResult {
-        connection_id: state.register(client, config.read_only),
+        connection_id: state.register(client, config),
         server_version,
+        read_only,
     })
 }
 
@@ -156,18 +174,35 @@ async fn run_query(
     let conn = state.get(&connection_id)?;
     let mut c = conn.lock().await;
     let page = page_size.unwrap_or(1000);
-
-    // Abandon any previously open cursor/transaction before starting a new query.
-    if c.cursor_open {
-        let _ = c.client.batch_execute("ROLLBACK").await;
-        c.cursor_open = false;
-    }
+    ensure_alive(&mut c).await?;
 
     let items = script::split(sql.trim());
     if items.is_empty() {
         return Ok(QueryOutcome::Exec {
             message: "OK (nothing to run)".to_string(),
         });
+    }
+
+    match exec_items(&mut c, &items, page).await {
+        Ok(out) => Ok(out),
+        // If the connection dropped mid-query, reconnect and retry once.
+        Err(_) if c.client.is_closed() => {
+            ensure_alive(&mut c).await?;
+            exec_items(&mut c, &items, page).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn exec_items(
+    c: &mut db::ConnState,
+    items: &[script::Item],
+    page: u32,
+) -> Result<QueryOutcome, AppError> {
+    // Abandon any previously open cursor/transaction before starting a new query.
+    if c.cursor_open {
+        let _ = c.client.batch_execute("ROLLBACK").await;
+        c.cursor_open = false;
     }
 
     // A single plain statement runs interactively (streaming result grid).
@@ -179,12 +214,12 @@ async fn run_query(
                     "connection is read-only — writes and DDL are blocked",
                 ));
             }
-            return run_single_stmt(&mut c, trimmed, page).await;
+            return run_single_stmt(c, trimmed, page).await;
         }
     }
 
     // Multiple statements (or a COPY block) run as a script.
-    let msg = script::run(&c.client, &items, c.read_only).await?;
+    let msg = script::run(&c.client, items, c.read_only).await?;
     Ok(QueryOutcome::Exec { message: msg })
 }
 
@@ -252,6 +287,7 @@ async fn fetch_more(
 ) -> Result<FetchResult, AppError> {
     let conn = state.get(&connection_id)?;
     let mut c = conn.lock().await;
+    ensure_alive(&mut c).await?;
     let page = page_size.unwrap_or(1000);
     if !c.cursor_open {
         return Ok(FetchResult {
@@ -294,6 +330,7 @@ async fn list_schema(
 ) -> Result<Vec<TableInfo>, AppError> {
     let conn = state.get(&connection_id)?;
     let mut c = conn.lock().await;
+    ensure_alive(&mut c).await?;
     if c.cursor_open {
         let _ = c.client.batch_execute("ROLLBACK").await;
         c.cursor_open = false;
@@ -332,11 +369,47 @@ async fn db_tree(
 ) -> Result<tree::DbTree, AppError> {
     let conn = state.get(&connection_id)?;
     let mut c = conn.lock().await;
+    ensure_alive(&mut c).await?;
     if c.cursor_open {
         let _ = c.client.batch_execute("ROLLBACK").await;
         c.cursor_open = false;
     }
-    tree::build(&c.client).await
+    tree::build_shallow(&c.client).await
+}
+
+#[tauri::command]
+async fn table_detail(
+    state: tauri::State<'_, AppState>,
+    connection_id: String,
+    schema: String,
+    name: String,
+) -> Result<tree::RelationDetail, AppError> {
+    let conn = state.get(&connection_id)?;
+    let mut c = conn.lock().await;
+    ensure_alive(&mut c).await?;
+    if c.cursor_open {
+        let _ = c.client.batch_execute("ROLLBACK").await;
+        c.cursor_open = false;
+    }
+    tree::table_detail(&c.client, &schema, &name).await
+}
+
+#[tauri::command]
+async fn object_ddl(
+    state: tauri::State<'_, AppState>,
+    connection_id: String,
+    kind: String,
+    schema: String,
+    name: String,
+) -> Result<String, AppError> {
+    let conn = state.get(&connection_id)?;
+    let mut c = conn.lock().await;
+    ensure_alive(&mut c).await?;
+    if c.cursor_open {
+        let _ = c.client.batch_execute("ROLLBACK").await;
+        c.cursor_open = false;
+    }
+    ddl::object_ddl(&c.client, &kind, &schema, &name).await
 }
 
 #[tauri::command]
@@ -350,6 +423,7 @@ async fn export_to_file(
 ) -> Result<u64, AppError> {
     let conn = state.get(&connection_id)?;
     let mut c = conn.lock().await;
+    ensure_alive(&mut c).await?;
     if c.cursor_open {
         let _ = c.client.batch_execute("ROLLBACK").await;
         c.cursor_open = false;
@@ -370,6 +444,7 @@ async fn import_rows(
 ) -> Result<u64, AppError> {
     let conn = state.get(&connection_id)?;
     let mut c = conn.lock().await;
+    ensure_alive(&mut c).await?;
     if c.read_only {
         return Err(AppError::new("connection is read-only — import blocked"));
     }
@@ -400,6 +475,8 @@ pub fn run() {
             fetch_more,
             list_schema,
             db_tree,
+            table_detail,
+            object_ddl,
             export_to_file,
             import_rows
         ])

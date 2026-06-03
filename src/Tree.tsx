@@ -1,4 +1,5 @@
-import { createSignal, For, Show } from "solid-js";
+import { createSignal, For, Show, type JSX } from "solid-js";
+import { Icon, type IconName } from "./Icons";
 
 export type Column = {
   name: string;
@@ -7,12 +8,15 @@ export type Column = {
   is_pk: boolean;
   is_fk: boolean;
   default: string | null;
+  comment: string | null;
 };
 export type Idx = { name: string; unique: boolean; primary: boolean; def: string };
 export type Con = { name: string; kind: string; def: string };
-export type Relation = {
+export type RelStub = { name: string; kind: string; comment: string | null };
+export type RelationDetail = {
   name: string;
   kind: string;
+  comment: string | null;
   columns: Column[];
   indexes: Idx[];
   constraints: Con[];
@@ -20,19 +24,79 @@ export type Relation = {
 export type Func = { name: string; args: string; returns: string };
 export type SchemaT = {
   name: string;
-  tables: Relation[];
-  views: Relation[];
+  tables: RelStub[];
+  views: RelStub[];
   sequences: string[];
   functions: Func[];
 };
 export type DbTree = { database: string; databases: string[]; schemas: SchemaT[] };
 
-const conIcon = (k: string) =>
-  k === "primary_key" ? "🔑" : k === "foreign_key" ? "🔗" : k === "unique" ? "🔒" : k === "check" ? "✓" : "•";
+export type NodeKind =
+  | "database"
+  | "schema"
+  | "table"
+  | "view"
+  | "matview"
+  | "column"
+  | "index"
+  | "constraint"
+  | "sequence"
+  | "function";
 
-export function Tree(props: { tree: DbTree; onRunTable: (schema: string, name: string) => void }) {
+/** Identifies a tree node for the context menu / actions. */
+export type NodeDescriptor = {
+  kind: NodeKind;
+  schema?: string; // owning schema (also set to its own name when kind === "schema")
+  table?: string; // owning relation (for column/index/constraint)
+  name: string; // the object's own name (db name when kind === "database")
+  detail?: RelationDetail; // loaded relation detail, when available
+  column?: Column; // for kind === "column"
+};
+
+/** Stable identity key for selection/highlight (ignores transient `detail`). */
+export const nodeKey = (n: NodeDescriptor) => `${n.kind}|${n.schema ?? ""}|${n.table ?? ""}|${n.name}`;
+
+const conIconName = (k: string): IconName =>
+  k === "primary_key" ? "key" : k === "foreign_key" ? "link" : k === "unique" ? "hash" : k === "check" ? "check" : "dot";
+
+export function Tree(props: {
+  tree: DbTree;
+  details: Record<string, RelationDetail>;
+  filter?: string;
+  selectedKey?: string;
+  onRunTable: (schema: string, name: string) => void;
+  onExpandTable: (schema: string, name: string) => void;
+  onContext: (e: MouseEvent, node: NodeDescriptor) => void;
+  onSelect: (node: NodeDescriptor) => void;
+}) {
   const [open, setOpen] = createSignal<Set<string>>(new Set(["db", "s:public", "c:public:tables"]));
-  const isOpen = (k: string) => open().has(k);
+  const f = () => (props.filter ?? "").trim().toLowerCase();
+  const match = (s: string) => s.toLowerCase().includes(f());
+  // While filtering, auto-expand structural containers (db / schema / category) so
+  // matches are visible — but NOT relations (that would show endless "loading…").
+  const isOpen = (k: string) => {
+    if (f() && (k === "db" || k.startsWith("s:") || k.startsWith("c:"))) return true;
+    return open().has(k);
+  };
+
+  // Schemas/objects narrowed by the filter. A schema whose own name matches keeps
+  // all its children; otherwise only matching children are shown.
+  const shownSchemas = (): SchemaT[] => {
+    if (!f()) return props.tree.schemas;
+    return props.tree.schemas
+      .map((s) =>
+        match(s.name)
+          ? s
+          : {
+              ...s,
+              tables: s.tables.filter((r) => match(r.name)),
+              views: s.views.filter((r) => match(r.name)),
+              sequences: s.sequences.filter(match),
+              functions: s.functions.filter((fn) => match(fn.name)),
+            },
+      )
+      .filter((s) => match(s.name) || s.tables.length || s.views.length || s.sequences.length || s.functions.length);
+  };
   const toggle = (k: string) => {
     const s = new Set(open());
     s.has(k) ? s.delete(k) : s.add(k);
@@ -41,102 +105,154 @@ export function Tree(props: { tree: DbTree; onRunTable: (schema: string, name: s
 
   function Row(p: {
     depth: number;
-    icon: string;
+    icon: JSX.Element;
     label: string;
     detail?: string;
     title?: string;
     muted?: boolean;
+    header?: boolean;
     expandable?: boolean;
     open?: boolean;
+    selected?: boolean;
     onToggle?: () => void;
     onActivate?: () => void;
+    onContext?: (e: MouseEvent) => void;
+    onSelect?: () => void;
   }) {
     return (
       <div
         class="tw-row"
-        classList={{ muted: p.muted }}
+        classList={{ muted: p.muted, selected: p.selected, "is-header": p.header }}
         title={p.title}
-        style={{ "padding-left": `${p.depth * 13 + 6}px` }}
-        onClick={() => (p.expandable ? p.onToggle?.() : p.onActivate?.())}
+        style={{ "padding-left": `${p.depth * 13 + 6}px`, "--d": p.depth }}
+        onClick={() => {
+          p.onSelect?.();
+          p.expandable ? p.onToggle?.() : p.onActivate?.();
+        }}
         onDblClick={() => p.onActivate?.()}
+        onContextMenu={(e) => {
+          e.stopPropagation();
+          p.onSelect?.();
+          p.onContext?.(e);
+        }}
       >
         <span class="tw-caret">{p.expandable ? (p.open ? "▾" : "▸") : ""}</span>
         <span class="tw-icon">{p.icon}</span>
         <span class="tw-label">{p.label}</span>
         <Show when={p.detail}>
-          <span class="tw-detail">{p.detail}</span>
+          <span class="tw-detail" classList={{ "is-count": /^\d+$/.test(p.detail!) }}>{p.detail}</span>
         </Show>
       </div>
     );
   }
 
-  const relation = (schema: string, rel: Relation, depth: number) => {
-    const tk = `t:${schema}:${rel.name}`;
+  const colTitle = (c: Column) =>
+    [c.default ? `default: ${c.default}` : null, c.comment ? `💬 ${c.comment}` : null]
+      .filter(Boolean)
+      .join("\n") || undefined;
+
+  const relation = (schema: string, rel: RelStub, depth: number) => {
+    const isView = rel.kind === "view" || rel.kind === "matview";
+    const kind = rel.kind as NodeKind;
+    const tk = `${isView ? "view" : "tbl"}:${schema}:${rel.name}`;
     const ck = `${tk}:cols`;
     const ik = `${tk}:idx`;
     const xk = `${tk}:con`;
-    const isView = rel.kind === "view" || rel.kind === "matview";
+    const dkey = `${schema}.${rel.name}`;
+    const det = () => props.details[dkey] as RelationDetail | undefined;
+    const openRel = () => {
+      const willOpen = !isOpen(tk);
+      toggle(tk);
+      if (willOpen) props.onExpandTable(schema, rel.name);
+    };
     return (
       <>
         <Row
           depth={depth}
-          icon={isView ? "👁️" : "🔲"}
+          icon={<Icon name={isView ? "eye" : "table"} />}
           label={rel.name}
-          detail={`${rel.columns.length}`}
+          detail={det() ? `${det()!.columns.length}` : undefined}
+          title={rel.comment ?? undefined}
           expandable
           open={isOpen(tk)}
-          onToggle={() => toggle(tk)}
+          selected={props.selectedKey === nodeKey({ kind, schema, name: rel.name })}
+          onToggle={openRel}
           onActivate={() => props.onRunTable(schema, rel.name)}
+          onSelect={() => props.onSelect({ kind, schema, name: rel.name, detail: det() })}
+          onContext={(e) => props.onContext(e, { kind, schema, name: rel.name, detail: det() })}
         />
         <Show when={isOpen(tk)}>
-          <Row depth={depth + 1} icon="▦" label="Columns" detail={`${rel.columns.length}`} expandable open={isOpen(ck)} onToggle={() => toggle(ck)} />
-          <Show when={isOpen(ck)}>
-            <For each={rel.columns}>
-              {(c) => (
-                <Row
-                  depth={depth + 2}
-                  icon={c.is_pk ? "🔑" : c.is_fk ? "🔗" : "•"}
-                  label={c.name}
-                  detail={c.data_type + (c.nullable ? "" : " ·NN")}
-                  title={c.default ? `default: ${c.default}` : undefined}
-                />
-              )}
-            </For>
-          </Show>
-          <Show when={rel.indexes.length}>
-            <Row depth={depth + 1} icon="📑" label="Indexes" detail={`${rel.indexes.length}`} expandable open={isOpen(ik)} onToggle={() => toggle(ik)} />
-            <Show when={isOpen(ik)}>
-              <For each={rel.indexes}>
-                {(x) => (
-                  <Row
-                    depth={depth + 2}
-                    icon={x.primary ? "🔑" : x.unique ? "🔒" : "📑"}
-                    label={x.name}
-                    detail={x.primary ? "pk" : x.unique ? "unique" : ""}
-                    title={x.def}
-                  />
-                )}
-              </For>
-            </Show>
-          </Show>
-          <Show when={rel.constraints.length}>
-            <Row depth={depth + 1} icon="🔗" label="Constraints" detail={`${rel.constraints.length}`} expandable open={isOpen(xk)} onToggle={() => toggle(xk)} />
-            <Show when={isOpen(xk)}>
-              <For each={rel.constraints}>
-                {(cn) => <Row depth={depth + 2} icon={conIcon(cn.kind)} label={cn.name} detail={cn.kind.replace("_", " ")} title={cn.def} />}
-              </For>
-            </Show>
+          <Show when={det()} fallback={<Row depth={depth + 1} icon={<Icon name="dot" />} label="loading…" muted />}>
+            {(d) => (
+              <>
+                <Row depth={depth + 1} header icon={<Icon name="columns" />} label="Columns" detail={`${d().columns.length}`} expandable open={isOpen(ck)} onToggle={() => toggle(ck)} />
+                <Show when={isOpen(ck)}>
+                  <For each={d().columns}>
+                    {(c) => (
+                      <Row
+                        depth={depth + 2}
+                        icon={<Icon name={c.is_pk ? "key" : c.is_fk ? "link" : "dot"} />}
+                        label={c.name}
+                        detail={c.data_type + (c.nullable ? "" : " ·NN")}
+                        title={colTitle(c)}
+                        selected={props.selectedKey === nodeKey({ kind: "column", schema, table: rel.name, name: c.name })}
+                        onSelect={() => props.onSelect({ kind: "column", schema, table: rel.name, name: c.name, column: c })}
+                        onContext={(e) => props.onContext(e, { kind: "column", schema, table: rel.name, name: c.name, column: c })}
+                      />
+                    )}
+                  </For>
+                </Show>
+                <Show when={d().indexes.length}>
+                  <Row depth={depth + 1} header icon={<Icon name="index" />} label="Indexes" detail={`${d().indexes.length}`} expandable open={isOpen(ik)} onToggle={() => toggle(ik)} />
+                  <Show when={isOpen(ik)}>
+                    <For each={d().indexes}>
+                      {(x) => (
+                        <Row
+                          depth={depth + 2}
+                          icon={<Icon name={x.primary ? "key" : x.unique ? "hash" : "index"} />}
+                          label={x.name}
+                          detail={x.primary ? "pk" : x.unique ? "unique" : ""}
+                          title={x.def}
+                          selected={props.selectedKey === nodeKey({ kind: "index", schema, table: rel.name, name: x.name })}
+                          onSelect={() => props.onSelect({ kind: "index", schema, table: rel.name, name: x.name })}
+                          onContext={(e) => props.onContext(e, { kind: "index", schema, table: rel.name, name: x.name })}
+                        />
+                      )}
+                    </For>
+                  </Show>
+                </Show>
+                <Show when={d().constraints.length}>
+                  <Row depth={depth + 1} header icon={<Icon name="shield" />} label="Constraints" detail={`${d().constraints.length}`} expandable open={isOpen(xk)} onToggle={() => toggle(xk)} />
+                  <Show when={isOpen(xk)}>
+                    <For each={d().constraints}>
+                      {(cn) => (
+                        <Row
+                          depth={depth + 2}
+                          icon={<Icon name={conIconName(cn.kind)} />}
+                          label={cn.name}
+                          detail={cn.kind.replace("_", " ")}
+                          title={cn.def}
+                          selected={props.selectedKey === nodeKey({ kind: "constraint", schema, table: rel.name, name: cn.name })}
+                          onSelect={() => props.onSelect({ kind: "constraint", schema, table: rel.name, name: cn.name })}
+                          onContext={(e) => props.onContext(e, { kind: "constraint", schema, table: rel.name, name: cn.name })}
+                        />
+                      )}
+                    </For>
+                  </Show>
+                </Show>
+              </>
+            )}
           </Show>
         </Show>
       </>
     );
   };
 
-  const category = (schema: string, cat: string, icon: string, label: string, rels: Relation[]) => {
+  const category = (schema: string, cat: string, icon: IconName, label: string, rels: RelStub[]) => {
     const k = `c:${schema}:${cat}`;
     return (
       <>
-        <Row depth={2} icon={icon} label={label} detail={`${rels.length}`} expandable open={isOpen(k)} onToggle={() => toggle(k)} />
+        <Row depth={2} header icon={<Icon name={icon} />} label={label} detail={`${rels.length}`} expandable open={isOpen(k)} onToggle={() => toggle(k)} />
         <Show when={isOpen(k)}>
           <For each={rels}>{(rel) => relation(schema, rel, 3)}</For>
         </Show>
@@ -150,21 +266,53 @@ export function Tree(props: { tree: DbTree; onRunTable: (schema: string, name: s
     const fnK = `c:${s.name}:fn`;
     return (
       <>
-        <Row depth={1} icon="📂" label={s.name} expandable open={isOpen(sk)} onToggle={() => toggle(sk)} />
+        <Row
+          depth={1}
+          icon={<Icon name="folder" />}
+          label={s.name}
+          expandable
+          open={isOpen(sk)}
+          selected={props.selectedKey === nodeKey({ kind: "schema", schema: s.name, name: s.name })}
+          onToggle={() => toggle(sk)}
+          onSelect={() => props.onSelect({ kind: "schema", schema: s.name, name: s.name })}
+          onContext={(e) => props.onContext(e, { kind: "schema", schema: s.name, name: s.name })}
+        />
         <Show when={isOpen(sk)}>
-          <Show when={s.tables.length}>{category(s.name, "tables", "📋", "Tables", s.tables)}</Show>
-          <Show when={s.views.length}>{category(s.name, "views", "👁️", "Views", s.views)}</Show>
+          <Show when={s.tables.length}>{category(s.name, "tables", "table", "Tables", s.tables)}</Show>
+          <Show when={s.views.length}>{category(s.name, "views", "eye", "Views", s.views)}</Show>
           <Show when={s.sequences.length}>
-            <Row depth={2} icon="🔢" label="Sequences" detail={`${s.sequences.length}`} expandable open={isOpen(seqK)} onToggle={() => toggle(seqK)} />
+            <Row depth={2} header icon={<Icon name="hash" />} label="Sequences" detail={`${s.sequences.length}`} expandable open={isOpen(seqK)} onToggle={() => toggle(seqK)} />
             <Show when={isOpen(seqK)}>
-              <For each={s.sequences}>{(sq) => <Row depth={3} icon="#️⃣" label={sq} />}</For>
+              <For each={s.sequences}>
+                {(sq) => (
+                  <Row
+                    depth={3}
+                    icon={<Icon name="hash" />}
+                    label={sq}
+                    selected={props.selectedKey === nodeKey({ kind: "sequence", schema: s.name, name: sq })}
+                    onSelect={() => props.onSelect({ kind: "sequence", schema: s.name, name: sq })}
+                    onContext={(e) => props.onContext(e, { kind: "sequence", schema: s.name, name: sq })}
+                  />
+                )}
+              </For>
             </Show>
           </Show>
           <Show when={s.functions.length}>
-            <Row depth={2} icon="ƒ" label="Functions" detail={`${s.functions.length}`} expandable open={isOpen(fnK)} onToggle={() => toggle(fnK)} />
+            <Row depth={2} header icon={<Icon name="func" />} label="Functions" detail={`${s.functions.length}`} expandable open={isOpen(fnK)} onToggle={() => toggle(fnK)} />
             <Show when={isOpen(fnK)}>
               <For each={s.functions}>
-                {(f) => <Row depth={3} icon="ƒ" label={f.name} detail={f.returns} title={`${f.name}(${f.args}) → ${f.returns}`} />}
+                {(fn) => (
+                  <Row
+                    depth={3}
+                    icon={<Icon name="func" />}
+                    label={fn.name}
+                    detail={fn.returns}
+                    title={`${fn.name}(${fn.args}) → ${fn.returns}`}
+                    selected={props.selectedKey === nodeKey({ kind: "function", schema: s.name, name: fn.name })}
+                    onSelect={() => props.onSelect({ kind: "function", schema: s.name, name: fn.name })}
+                    onContext={(e) => props.onContext(e, { kind: "function", schema: s.name, name: fn.name })}
+                  />
+                )}
               </For>
             </Show>
           </Show>
@@ -180,9 +328,20 @@ export function Tree(props: { tree: DbTree; onRunTable: (schema: string, name: s
           const cur = dbn === props.tree.database;
           return (
             <>
-              <Row depth={0} icon="🗄️" label={dbn} muted={!cur} expandable={cur} open={isOpen("db")} onToggle={() => toggle("db")} />
+              <Row
+                depth={0}
+                icon={<Icon name="database" />}
+                label={dbn}
+                muted={!cur}
+                expandable={cur}
+                open={isOpen("db")}
+                selected={props.selectedKey === nodeKey({ kind: "database", name: dbn })}
+                onToggle={() => toggle("db")}
+                onSelect={() => props.onSelect({ kind: "database", name: dbn })}
+                onContext={(e) => props.onContext(e, { kind: "database", name: dbn })}
+              />
               <Show when={cur && isOpen("db")}>
-                <For each={props.tree.schemas}>{(s) => schemaBlock(s)}</For>
+                <For each={shownSchemas()}>{(s) => schemaBlock(s)}</For>
               </Show>
             </>
           );

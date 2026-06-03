@@ -11,6 +11,7 @@ pub struct Column {
     pub is_pk: bool,
     pub is_fk: bool,
     pub default: Option<String>,
+    pub comment: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -28,15 +29,6 @@ pub struct Constraint {
     pub def: String,
 }
 
-#[derive(Serialize)]
-pub struct Relation {
-    pub name: String,
-    pub kind: String, // table | view | matview
-    pub columns: Vec<Column>,
-    pub indexes: Vec<Index>,
-    pub constraints: Vec<Constraint>,
-}
-
 #[derive(Serialize, Clone)]
 pub struct Func {
     pub name: String,
@@ -44,11 +36,31 @@ pub struct Func {
     pub returns: String,
 }
 
+/// Lightweight relation entry for the shallow tree — no columns/indexes/constraints
+/// (those are fetched lazily per-table via `table_detail`).
+#[derive(Serialize)]
+pub struct RelStub {
+    pub name: String,
+    pub kind: String, // table | view | matview
+    pub comment: Option<String>,
+}
+
+/// Full per-relation detail, fetched on expand.
+#[derive(Serialize)]
+pub struct RelationDetail {
+    pub name: String,
+    pub kind: String,
+    pub comment: Option<String>,
+    pub columns: Vec<Column>,
+    pub indexes: Vec<Index>,
+    pub constraints: Vec<Constraint>,
+}
+
 #[derive(Serialize)]
 pub struct Schema {
     pub name: String,
-    pub tables: Vec<Relation>,
-    pub views: Vec<Relation>,
+    pub tables: Vec<RelStub>,
+    pub views: Vec<RelStub>,
     pub sequences: Vec<String>,
     pub functions: Vec<Func>,
 }
@@ -71,7 +83,9 @@ async fn query(client: &Client, sql: &str) -> Result<Vec<Vec<Option<String>>>, A
 
 const NS: &str = "n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') AND n.nspname NOT LIKE 'pg_temp%' AND n.nspname NOT LIKE 'pg_toast_temp%'";
 
-pub async fn build(client: &Client) -> Result<DbTree, AppError> {
+/// Shallow object tree: databases, schemas, and each schema's object names + kinds.
+/// Fast on connect (~4 catalog queries, no per-table column/index/constraint scan).
+pub async fn build_shallow(client: &Client) -> Result<DbTree, AppError> {
     let database = query(client, "SELECT current_database()")
         .await?
         .into_iter()
@@ -88,87 +102,55 @@ pub async fn build(client: &Client) -> Result<DbTree, AppError> {
     .filter_map(|r| r.into_iter().next().flatten())
     .collect();
 
+    // All non-system schemas — so empty schemas still show (needed for "create object here").
+    let ns_rows = query(
+        client,
+        &format!("SELECT n.nspname FROM pg_namespace n WHERE {NS} ORDER BY n.nspname"),
+    )
+    .await?;
+
     let rel_rows = query(client, &format!(
-        "SELECT n.nspname, c.relname, c.relkind::text FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace \
+        "SELECT n.nspname, c.relname, c.relkind::text, obj_description(c.oid,'pg_class') \
+         FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace \
          WHERE c.relkind IN ('r','p','v','m','S') AND {NS} ORDER BY n.nspname, c.relname")).await?;
-
-    let col_rows = query(client, &format!(
-        "SELECT n.nspname, c.relname, a.attname, format_type(a.atttypid,a.atttypmod), (NOT a.attnotnull)::text, pg_get_expr(d.adbin,d.adrelid) \
-         FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace \
-         LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum \
-         WHERE a.attnum>0 AND NOT a.attisdropped AND c.relkind IN ('r','p','v','m') AND {NS} \
-         ORDER BY n.nspname, c.relname, a.attnum")).await?;
-
-    let pk_rows = query(client, &format!(
-        "SELECT n.nspname, c.relname, a.attname FROM pg_constraint con \
-         JOIN pg_class c ON c.oid=con.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace \
-         JOIN pg_attribute a ON a.attrelid=con.conrelid AND a.attnum=ANY(con.conkey) \
-         WHERE con.contype='p' AND {NS}")).await?;
-
-    let fk_rows = query(client, &format!(
-        "SELECT n.nspname, c.relname, a.attname FROM pg_constraint con \
-         JOIN pg_class c ON c.oid=con.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace \
-         JOIN pg_attribute a ON a.attrelid=con.conrelid AND a.attnum=ANY(con.conkey) \
-         WHERE con.contype='f' AND {NS}")).await?;
-
-    let idx_rows = query(client, &format!(
-        "SELECT n.nspname, c.relname, ic.relname, i.indisunique::text, i.indisprimary::text, pg_get_indexdef(i.indexrelid) \
-         FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid JOIN pg_class ic ON ic.oid=i.indexrelid \
-         JOIN pg_namespace n ON n.oid=c.relnamespace WHERE {NS} ORDER BY n.nspname, c.relname, ic.relname")).await?;
-
-    let con_rows = query(client, &format!(
-        "SELECT n.nspname, c.relname, con.conname, con.contype::text, pg_get_constraintdef(con.oid) \
-         FROM pg_constraint con JOIN pg_class c ON c.oid=con.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace \
-         WHERE con.contype IN ('p','f','u','c') AND {NS} ORDER BY n.nspname, c.relname, con.contype, con.conname")).await?;
 
     let fn_rows = query(client, &format!(
         "SELECT n.nspname, p.proname, pg_get_function_arguments(p.oid), pg_get_function_result(p.oid) \
          FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE {NS} ORDER BY n.nspname, p.proname")).await?;
 
-    let key3 = |r: &Vec<Option<String>>| (cell(r, 0), cell(r, 1), cell(r, 2));
-    let pk: HashSet<(String, String, String)> = pk_rows.iter().map(key3).collect();
-    let fk: HashSet<(String, String, String)> = fk_rows.iter().map(key3).collect();
-
-    let mut cols: HashMap<(String, String), Vec<Column>> = HashMap::new();
-    for r in &col_rows {
-        let (s, t, name) = (cell(r, 0), cell(r, 1), cell(r, 2));
-        let is_pk = pk.contains(&(s.clone(), t.clone(), name.clone()));
-        let is_fk = fk.contains(&(s.clone(), t.clone(), name.clone()));
-        cols.entry((s, t)).or_default().push(Column {
-            name,
-            data_type: cell(r, 3),
-            nullable: cell(r, 4) == "t",
-            is_pk,
-            is_fk,
-            default: r.get(5).and_then(|v| v.clone()),
-        });
+    let mut schema_names: BTreeSet<String> = BTreeSet::new();
+    for r in &ns_rows {
+        schema_names.insert(cell(r, 0));
     }
 
-    let mut idxs: HashMap<(String, String), Vec<Index>> = HashMap::new();
-    for r in &idx_rows {
-        idxs.entry((cell(r, 0), cell(r, 1))).or_default().push(Index {
-            name: cell(r, 2),
-            unique: cell(r, 3) == "t",
-            primary: cell(r, 4) == "t",
-            def: cell(r, 5),
-        });
-    }
-
-    let kind_of = |c: &str| match c {
-        "p" => "primary_key",
-        "f" => "foreign_key",
-        "u" => "unique",
-        "c" => "check",
-        _ => "other",
-    }
-    .to_string();
-    let mut cons: HashMap<(String, String), Vec<Constraint>> = HashMap::new();
-    for r in &con_rows {
-        cons.entry((cell(r, 0), cell(r, 1))).or_default().push(Constraint {
-            name: cell(r, 2),
-            kind: kind_of(&cell(r, 3)),
-            def: cell(r, 4),
-        });
+    let mut tables: HashMap<String, Vec<RelStub>> = HashMap::new();
+    let mut views: HashMap<String, Vec<RelStub>> = HashMap::new();
+    let mut seqs: HashMap<String, Vec<String>> = HashMap::new();
+    for r in &rel_rows {
+        let s = cell(r, 0);
+        let name = cell(r, 1);
+        let kind = cell(r, 2);
+        let comment = r.get(3).and_then(|v| v.clone());
+        schema_names.insert(s.clone());
+        match kind.as_str() {
+            "r" | "p" => tables.entry(s).or_default().push(RelStub {
+                name,
+                kind: "table".into(),
+                comment,
+            }),
+            "v" => views.entry(s).or_default().push(RelStub {
+                name,
+                kind: "view".into(),
+                comment,
+            }),
+            "m" => views.entry(s).or_default().push(RelStub {
+                name,
+                kind: "matview".into(),
+                comment,
+            }),
+            "S" => seqs.entry(s).or_default().push(name),
+            _ => {}
+        }
     }
 
     let mut funcs: HashMap<String, Vec<Func>> = HashMap::new();
@@ -179,52 +161,18 @@ pub async fn build(client: &Client) -> Result<DbTree, AppError> {
             returns: cell(r, 3),
         });
     }
-
-    let mut schema_names: BTreeSet<String> = BTreeSet::new();
-    let mut rels: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    for r in &rel_rows {
-        let s = cell(r, 0);
-        schema_names.insert(s.clone());
-        rels.entry(s).or_default().push((cell(r, 1), cell(r, 2)));
-    }
     for k in funcs.keys() {
         schema_names.insert(k.clone());
     }
 
     let mut schemas = Vec::new();
     for s in schema_names {
-        let mut tables = Vec::new();
-        let mut views = Vec::new();
-        let mut sequences = Vec::new();
-        if let Some(list) = rels.get(&s) {
-            for (name, kind) in list {
-                let key = (s.clone(), name.clone());
-                match kind.as_str() {
-                    "r" | "p" => tables.push(Relation {
-                        name: name.clone(),
-                        kind: "table".into(),
-                        columns: cols.get(&key).cloned().unwrap_or_default(),
-                        indexes: idxs.get(&key).cloned().unwrap_or_default(),
-                        constraints: cons.get(&key).cloned().unwrap_or_default(),
-                    }),
-                    "v" | "m" => views.push(Relation {
-                        name: name.clone(),
-                        kind: if kind == "m" { "matview".into() } else { "view".into() },
-                        columns: cols.get(&key).cloned().unwrap_or_default(),
-                        indexes: Vec::new(),
-                        constraints: Vec::new(),
-                    }),
-                    "S" => sequences.push(name.clone()),
-                    _ => {}
-                }
-            }
-        }
         schemas.push(Schema {
-            name: s.clone(),
-            tables,
-            views,
-            sequences,
-            functions: funcs.get(&s).cloned().unwrap_or_default(),
+            tables: tables.remove(&s).unwrap_or_default(),
+            views: views.remove(&s).unwrap_or_default(),
+            sequences: seqs.remove(&s).unwrap_or_default(),
+            functions: funcs.remove(&s).unwrap_or_default(),
+            name: s,
         });
     }
 
@@ -232,5 +180,117 @@ pub async fn build(client: &Client) -> Result<DbTree, AppError> {
         database,
         databases,
         schemas,
+    })
+}
+
+/// Columns + indexes + constraints + comments for one relation, fetched on expand.
+/// The user-supplied `schema`/`name` are bound as parameters (no string interpolation);
+/// the resolved OID is a trusted integer, reused in the detail queries.
+pub async fn table_detail(
+    client: &Client,
+    schema: &str,
+    name: &str,
+) -> Result<RelationDetail, AppError> {
+    let rows = client
+        .query(
+            "SELECT c.oid, c.relkind::text FROM pg_class c \
+             JOIN pg_namespace n ON n.oid=c.relnamespace \
+             WHERE n.nspname=$1 AND c.relname=$2",
+            &[&schema, &name],
+        )
+        .await?;
+    let row = rows.first().ok_or_else(|| AppError::new("relation not found"))?;
+    let oid: u32 = row.get(0);
+    let relkind: String = row.get(1);
+    let kind = match relkind.as_str() {
+        "v" => "view",
+        "m" => "matview",
+        _ => "table",
+    }
+    .to_string();
+
+    // NOTE: do NOT cast booleans to ::text — `bool::text` yields 'true'/'false',
+    // but the text protocol returns 't'/'f' for a bare bool (which `== "t"` expects).
+    let col_rows = query(client, &format!(
+        "SELECT a.attname, format_type(a.atttypid,a.atttypmod), (NOT a.attnotnull), \
+         pg_get_expr(d.adbin,d.adrelid), col_description(a.attrelid,a.attnum) \
+         FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum \
+         WHERE a.attrelid={oid} AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum")).await?;
+
+    let pk_rows = query(client, &format!(
+        "SELECT a.attname FROM pg_constraint con \
+         JOIN pg_attribute a ON a.attrelid=con.conrelid AND a.attnum=ANY(con.conkey) \
+         WHERE con.conrelid={oid} AND con.contype='p'")).await?;
+    let fk_rows = query(client, &format!(
+        "SELECT a.attname FROM pg_constraint con \
+         JOIN pg_attribute a ON a.attrelid=con.conrelid AND a.attnum=ANY(con.conkey) \
+         WHERE con.conrelid={oid} AND con.contype='f'")).await?;
+    let pk: HashSet<String> = pk_rows.iter().map(|r| cell(r, 0)).collect();
+    let fk: HashSet<String> = fk_rows.iter().map(|r| cell(r, 0)).collect();
+
+    let columns = col_rows
+        .iter()
+        .map(|r| {
+            let nm = cell(r, 0);
+            Column {
+                is_pk: pk.contains(&nm),
+                is_fk: fk.contains(&nm),
+                name: nm,
+                data_type: cell(r, 1),
+                nullable: cell(r, 2) == "t",
+                default: r.get(3).and_then(|v| v.clone()),
+                comment: r.get(4).and_then(|v| v.clone()),
+            }
+        })
+        .collect();
+
+    // Indexes — fetched for tables and materialized views (both can have them).
+    let idx_rows = query(client, &format!(
+        "SELECT ic.relname, i.indisunique, i.indisprimary, pg_get_indexdef(i.indexrelid) \
+         FROM pg_index i JOIN pg_class ic ON ic.oid=i.indexrelid \
+         WHERE i.indrelid={oid} ORDER BY ic.relname")).await?;
+    let indexes = idx_rows
+        .iter()
+        .map(|r| Index {
+            name: cell(r, 0),
+            unique: cell(r, 1) == "t",
+            primary: cell(r, 2) == "t",
+            def: cell(r, 3),
+        })
+        .collect();
+
+    let con_rows = query(client, &format!(
+        "SELECT con.conname, con.contype::text, pg_get_constraintdef(con.oid) FROM pg_constraint con \
+         WHERE con.conrelid={oid} AND con.contype IN ('p','f','u','c') ORDER BY con.contype, con.conname")).await?;
+    let kind_of = |c: &str| match c {
+        "p" => "primary_key",
+        "f" => "foreign_key",
+        "u" => "unique",
+        "c" => "check",
+        _ => "other",
+    }
+    .to_string();
+    let constraints = con_rows
+        .iter()
+        .map(|r| Constraint {
+            name: cell(r, 0),
+            kind: kind_of(&cell(r, 1)),
+            def: cell(r, 2),
+        })
+        .collect();
+
+    let comment = query(client, &format!("SELECT obj_description({oid},'pg_class')"))
+        .await?
+        .into_iter()
+        .next()
+        .and_then(|r| r.into_iter().next().flatten());
+
+    Ok(RelationDetail {
+        name: name.to_string(),
+        kind,
+        comment,
+        columns,
+        indexes,
+        constraints,
     })
 }

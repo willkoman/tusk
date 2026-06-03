@@ -38,7 +38,7 @@ impl From<tokio_postgres::Error> for AppError {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ConnectionConfig {
     pub host: String,
     pub port: u16,
@@ -58,6 +58,7 @@ pub struct ConnectionConfig {
 pub struct ConnectResult {
     pub connection_id: String,
     pub server_version: String,
+    pub read_only: bool,
 }
 
 /// Result of a query: either a page of rows (reads) or a status message (writes/DDL).
@@ -81,10 +82,13 @@ pub struct FetchResult {
 }
 
 /// A live connection plus whether a streaming cursor is open and whether it is read-only.
+/// `config` is retained (server-side only, never sent to the frontend) so a dropped
+/// connection — e.g. an idle timeout — can be transparently re-opened.
 pub struct ConnState {
     pub client: Client,
     pub cursor_open: bool,
     pub read_only: bool,
+    pub config: ConnectionConfig,
 }
 
 /// Name of the server-side cursor used for streaming reads. One per connection.
@@ -116,7 +120,17 @@ pub async fn open(cfg: &ConnectionConfig) -> Result<(Client, String), AppError> 
         .user(&cfg.user)
         .password(&cfg.password)
         .dbname(&cfg.dbname)
-        .ssl_mode(ssl_mode);
+        .ssl_mode(ssl_mode)
+        // Fail fast on a real network/host problem without ever capping query
+        // duration: a 10s connect timeout bounds the open path, and aggressive TCP
+        // keepalives (+ user-timeout) drop a *dead* connection in ~10-15s — while a
+        // slow-but-alive query keeps getting ACKs and runs as long as it needs.
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .tcp_user_timeout(std::time::Duration::from_secs(15))
+        .keepalives(true)
+        .keepalives_idle(std::time::Duration::from_secs(5))
+        .keepalives_interval(std::time::Duration::from_secs(2))
+        .keepalives_retries(3);
 
     let (client, connection) = pgcfg.connect(tls).await?;
 
