@@ -629,8 +629,11 @@ function App() {
       patchResult(id, { rows: merged, done: r.done, status: `${merged.length}${r.done ? "" : "+"} rows` });
       if (r.done) cursorOwnerTabId = null;
     } catch (e) {
-      console.error(e);
-      patchResult(id, { done: true });
+      // Streaming broke (e.g. connection dropped mid-fetch). Surface it instead of
+      // silently marking the result complete — show the error banner over the rows
+      // fetched so far, and stop paging so we don't hammer a dead cursor.
+      const msg = errMsg(e);
+      patchResult(id, { runErr: msg, status: `streaming stopped — ${msg}`, done: true });
       cursorOwnerTabId = null;
     } finally {
       loadingMore = false;
