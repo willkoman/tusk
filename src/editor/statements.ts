@@ -59,11 +59,18 @@ function buildActive(state: EditorState): DecorationSet {
   const at = statementAt(stmts, state.selection.main.head);
   if (!at) return Decoration.none;
   const len = state.doc.length;
-  const from = Math.max(0, Math.min(at.stmt.from, len));
-  const to = Math.max(from, Math.min(at.stmt.to, len));
+  const doc = state.doc.toString();
+  // A statement span starts right after the previous ';' (still on its closing line)
+  // and may include leading blank lines. Trim whitespace to both ends so the highlight
+  // covers only the statement's own lines.
+  let from = Math.max(0, Math.min(at.stmt.from, len));
+  let to = Math.max(from, Math.min(at.stmt.to, len));
+  while (from < to && /\s/.test(doc[from])) from++;
+  while (to > from && /\s/.test(doc[to - 1])) to--;
+  if (to <= from) return Decoration.none;
   const builder = new RangeSetBuilder<Decoration>();
   let pos = state.doc.lineAt(from).from;
-  const end = state.doc.lineAt(to).to;
+  const end = state.doc.lineAt(to - 1).to;
   while (pos <= end) {
     const line = state.doc.lineAt(pos);
     builder.add(line.from, line.from, Decoration.line({ class: "cm-activeStatement" }));
