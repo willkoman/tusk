@@ -63,6 +63,20 @@ impl Capabilities {
             permissions: false,
         }
     }
+    pub fn sqlite() -> Self {
+        Self {
+            kind: "sqlite",
+            server_cursor: false,
+            bulk_copy: false,
+            export: false,
+            schemas: false, // single schema
+            search_path: false,
+            transactional_ddl: true,
+            tls: false,
+            keychain: false,
+            permissions: false,
+        }
+    }
 }
 
 /// A query-cancel handle usable without holding the connection lock. PG = libpq cancel
@@ -71,6 +85,8 @@ impl Capabilities {
 pub enum CancelHandle {
     Pg(CancelToken),
     Duck(Arc<duckdb::InterruptHandle>),
+    /// No out-of-band cancel (e.g. SQLite) — queries are local and short.
+    None,
 }
 
 impl CancelHandle {
@@ -85,6 +101,7 @@ impl CancelHandle {
                 handle.interrupt();
                 Ok(())
             }
+            CancelHandle::None => Ok(()),
         }
     }
 }
@@ -116,10 +133,26 @@ impl DuckConn {
     }
 }
 
+/// A live embedded SQLite connection. Same LIMIT/OFFSET pager model as DuckDB; the
+/// `Connection` is `!Sync` so it's wrapped in a `Mutex`.
+pub struct SqliteConn {
+    pub conn: Mutex<rusqlite::Connection>,
+    pub config: ConnectionConfig,
+    pub stream_sql: Option<String>,
+    pub offset: usize,
+}
+
+impl SqliteConn {
+    fn lock(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// One connected database, dispatched by driver.
 pub enum Backend {
     Pg(PgConn),
     Duck(DuckConn),
+    Sqlite(SqliteConn),
 }
 
 /// Open a connection for the configured driver. PG = network (TLS); DuckDB = a local
@@ -138,6 +171,7 @@ pub async fn connect(config: &ConnectionConfig) -> Result<(Backend, String), App
             ))
         }
         "duckdb" => DuckConn::open(config),
+        "sqlite" => SqliteConn::open(config),
         other => Err(AppError::new(format!("unknown driver: {other}"))),
     }
 }
@@ -147,6 +181,7 @@ impl Backend {
         match self {
             Backend::Pg(_) => Capabilities::postgres(),
             Backend::Duck(_) => Capabilities::duckdb(),
+            Backend::Sqlite(_) => Capabilities::sqlite(),
         }
     }
 
@@ -154,13 +189,14 @@ impl Backend {
         match self {
             Backend::Pg(p) => &p.config,
             Backend::Duck(d) => &d.config,
+            Backend::Sqlite(s) => &s.config,
         }
     }
 
     pub fn is_closed(&self) -> bool {
         match self {
             Backend::Pg(p) => p.client.is_closed(),
-            Backend::Duck(_) => false, // embedded — never "drops"
+            _ => false, // embedded — never "drops"
         }
     }
 
@@ -168,6 +204,7 @@ impl Backend {
         match self {
             Backend::Pg(p) => p.cursor_open,
             Backend::Duck(d) => d.stream_sql.is_some(),
+            Backend::Sqlite(s) => s.stream_sql.is_some(),
         }
     }
 
@@ -175,6 +212,7 @@ impl Backend {
         match self {
             Backend::Pg(p) => CancelHandle::Pg(p.client.cancel_token()),
             Backend::Duck(d) => CancelHandle::Duck(d.lock().interrupt_handle()),
+            Backend::Sqlite(_) => CancelHandle::None,
         }
     }
 
@@ -183,8 +221,8 @@ impl Backend {
     pub fn pg(&self) -> Result<&Client, AppError> {
         match self {
             Backend::Pg(p) => Ok(&p.client),
-            Backend::Duck(_) => Err(AppError::new(
-                "this operation isn't supported on DuckDB yet",
+            _ => Err(AppError::new(
+                "this operation isn't supported on this driver yet",
             )),
         }
     }
@@ -205,6 +243,13 @@ impl Backend {
                 }
                 Ok(())
             }
+            Backend::Sqlite(s) => {
+                let (backend, _v) = SqliteConn::open(&s.config)?;
+                if let Backend::Sqlite(ns) = backend {
+                    *s = ns;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -220,7 +265,7 @@ impl Backend {
                 };
                 p.client.batch_execute(&sql).await.map_err(Into::into)
             }
-            Backend::Duck(_) => Ok(()),
+            _ => Ok(()), // embedded drivers have no per-session search_path
         }
     }
 
@@ -236,6 +281,10 @@ impl Backend {
             Backend::Duck(d) => {
                 d.stream_sql = None;
                 d.offset = 0;
+            }
+            Backend::Sqlite(s) => {
+                s.stream_sql = None;
+                s.offset = 0;
             }
         }
     }
@@ -261,6 +310,18 @@ impl Backend {
                 d.lock().execute_batch(&sql).map_err(de)?;
                 Ok("OK".to_string())
             }
+            Backend::Sqlite(s) => {
+                let sql = items
+                    .iter()
+                    .filter_map(|it| match it {
+                        script::Item::Sql(s) => Some(s.trim()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(";\n");
+                s.lock().execute_batch(&sql).map_err(de)?;
+                Ok("OK".to_string())
+            }
         }
     }
 
@@ -274,6 +335,7 @@ impl Backend {
         match self {
             Backend::Pg(p) => p.run_single(trimmed, page, cursorable).await,
             Backend::Duck(d) => d.run_single(trimmed, page, cursorable),
+            Backend::Sqlite(s) => s.run_single(trimmed, page, cursorable),
         }
     }
 
@@ -282,6 +344,7 @@ impl Backend {
         match self {
             Backend::Pg(p) => p.fetch_page(page).await,
             Backend::Duck(d) => d.fetch_page(page),
+            Backend::Sqlite(s) => s.fetch_page(page),
         }
     }
 
@@ -296,14 +359,16 @@ impl Backend {
                 Ok(db::collect_rows(&m))
             }
             Backend::Duck(d) => duck_query(&d.lock(), sql),
+            Backend::Sqlite(s) => sqlite_query(&s.lock(), sql),
         }
     }
 
-    /// Shallow object tree (sidebar). PG = rich pg_catalog; DuckDB = information_schema.
+    /// Shallow object tree (sidebar). PG = rich pg_catalog; embedded = catalog views.
     pub async fn build_tree(&self) -> Result<tree::DbTree, AppError> {
         match self {
             Backend::Pg(p) => tree::build_shallow(&p.client).await,
             Backend::Duck(d) => duck_build_tree(&d.lock()),
+            Backend::Sqlite(s) => sqlite_build_tree(&s.lock()),
         }
     }
 
@@ -316,11 +381,16 @@ impl Backend {
         match self {
             Backend::Pg(p) => tree::table_detail(&p.client, schema, name).await,
             Backend::Duck(d) => duck_table_detail(&d.lock(), schema, name),
+            Backend::Sqlite(s) => sqlite_table_detail(&s.lock(), name),
         }
     }
 
     /// Flat schema/table/column list that feeds frontend autocomplete.
     pub async fn list_tables(&self) -> Result<Vec<tree::TableInfo>, AppError> {
+        // SQLite has no information_schema — build from sqlite_master + PRAGMA.
+        if let Backend::Sqlite(s) = self {
+            return sqlite_list_tables(&s.lock());
+        }
         let sql = "SELECT table_schema, table_name, column_name, data_type \
                    FROM information_schema.columns \
                    WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
@@ -510,6 +580,221 @@ impl DuckConn {
     }
 }
 
+impl SqliteConn {
+    fn open(config: &ConnectionConfig) -> Result<(Backend, String), AppError> {
+        let path = config
+            .path
+            .clone()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| ":memory:".to_string());
+        let conn = if path == ":memory:" {
+            rusqlite::Connection::open_in_memory().map_err(de)?
+        } else if config.read_only {
+            rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(de)?
+        } else {
+            rusqlite::Connection::open(&path).map_err(de)?
+        };
+        let version: String = conn
+            .query_row("SELECT sqlite_version()", [], |r| r.get(0))
+            .unwrap_or_else(|_| "unknown".to_string());
+        Ok((
+            Backend::Sqlite(SqliteConn {
+                conn: Mutex::new(conn),
+                config: config.clone(),
+                stream_sql: None,
+                offset: 0,
+            }),
+            format!("SQLite {version}"),
+        ))
+    }
+
+    fn run_single(
+        &mut self,
+        trimmed: &str,
+        page: u32,
+        cursorable: bool,
+    ) -> Result<QueryOutcome, AppError> {
+        if cursorable {
+            // SQLite ValueRef already yields text per cell, so a plain wrap suffices.
+            let wrapped = format!("SELECT * FROM ({trimmed}) LIMIT {page}");
+            let (columns, rows) = {
+                let g = self.lock();
+                sqlite_query(&g, &wrapped)?
+            };
+            let done = (rows.len() as u32) < page;
+            if done {
+                self.stream_sql = None;
+                self.offset = 0;
+            } else {
+                self.stream_sql = Some(trimmed.to_string());
+                self.offset = page as usize;
+            }
+            Ok(QueryOutcome::Rows {
+                columns,
+                rows,
+                done,
+            })
+        } else {
+            let g = self.lock();
+            let (columns, rows) = sqlite_query(&g, trimmed)?;
+            if !columns.is_empty() {
+                Ok(QueryOutcome::Rows {
+                    columns,
+                    rows,
+                    done: true,
+                })
+            } else {
+                Ok(QueryOutcome::Exec {
+                    message: format!("OK ({} rows affected)", g.changes()),
+                })
+            }
+        }
+    }
+
+    fn fetch_page(&mut self, page: u32) -> Result<FetchResult, AppError> {
+        let base = match &self.stream_sql {
+            Some(s) => s.clone(),
+            None => {
+                return Ok(FetchResult {
+                    rows: vec![],
+                    done: true,
+                })
+            }
+        };
+        let wrapped = format!("SELECT * FROM ({base}) LIMIT {page} OFFSET {}", self.offset);
+        let (_cols, rows) = {
+            let g = self.lock();
+            sqlite_query(&g, &wrapped)?
+        };
+        let done = (rows.len() as u32) < page;
+        self.offset += rows.len();
+        if done {
+            self.stream_sql = None;
+        }
+        Ok(FetchResult { rows, done })
+    }
+}
+
+fn sqlite_value(v: rusqlite::types::ValueRef) -> Option<String> {
+    use rusqlite::types::ValueRef as V;
+    match v {
+        V::Null => None,
+        V::Integer(n) => Some(n.to_string()),
+        V::Real(f) => Some(f.to_string()),
+        V::Text(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        V::Blob(b) => Some(String::from_utf8_lossy(b).into_owned()),
+    }
+}
+
+fn sqlite_query(
+    conn: &rusqlite::Connection,
+    sql: &str,
+) -> Result<(Vec<String>, Vec<Vec<Option<String>>>), AppError> {
+    let mut stmt = conn.prepare(sql).map_err(de)?;
+    let columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let ncols = columns.len();
+    let mut rows = stmt.query([]).map_err(de)?;
+    let mut data: Vec<Vec<Option<String>>> = Vec::new();
+    while let Some(row) = rows.next().map_err(de)? {
+        let mut r = Vec::with_capacity(ncols);
+        for i in 0..ncols {
+            r.push(sqlite_value(row.get_ref(i).map_err(de)?));
+        }
+        data.push(r);
+    }
+    Ok((columns, data))
+}
+
+fn sqlite_list_tables(conn: &rusqlite::Connection) -> Result<Vec<tree::TableInfo>, AppError> {
+    let (_c, trows) = sqlite_query(
+        conn,
+        "SELECT name FROM sqlite_master WHERE type IN ('table','view') \
+         AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    let mut out: Vec<tree::TableInfo> = Vec::new();
+    for tr in &trows {
+        let name = dcell(tr, 0);
+        let (_c2, crows) = sqlite_query(conn, &format!("PRAGMA table_info({})", db::ident(&name)))?;
+        let columns = crows
+            .iter()
+            .map(|r| tree::ColumnInfo {
+                name: dcell(r, 1),
+                data_type: dcell(r, 2),
+            })
+            .collect();
+        out.push(tree::TableInfo {
+            schema: "main".to_string(),
+            name,
+            columns,
+        });
+    }
+    Ok(out)
+}
+
+fn sqlite_build_tree(conn: &rusqlite::Connection) -> Result<tree::DbTree, AppError> {
+    let (_c, rows) = sqlite_query(
+        conn,
+        "SELECT name, type FROM sqlite_master WHERE type IN ('table','view') \
+         AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    let mut tables: Vec<tree::RelStub> = Vec::new();
+    let mut views: Vec<tree::RelStub> = Vec::new();
+    for r in &rows {
+        let name = dcell(r, 0);
+        let is_view = dcell(r, 1).eq_ignore_ascii_case("view");
+        let stub = tree::RelStub {
+            name,
+            kind: if is_view { "view" } else { "table" }.to_string(),
+            comment: None,
+        };
+        if is_view {
+            views.push(stub);
+        } else {
+            tables.push(stub);
+        }
+    }
+    Ok(tree::DbTree {
+        database: "main".to_string(),
+        databases: vec!["main".to_string()],
+        schemas: vec![tree::Schema {
+            name: "main".to_string(),
+            tables,
+            views,
+            sequences: vec![],
+            functions: vec![],
+        }],
+    })
+}
+
+fn sqlite_table_detail(
+    conn: &rusqlite::Connection,
+    name: &str,
+) -> Result<tree::RelationDetail, AppError> {
+    // PRAGMA table_info → (cid, name, type, notnull, dflt_value, pk).
+    let (_c, rows) = sqlite_query(conn, &format!("PRAGMA table_info({})", db::ident(name)))?;
+    let columns = rows
+        .iter()
+        .map(|r| tree::Column {
+            name: dcell(r, 1),
+            data_type: dcell(r, 2),
+            nullable: dcell(r, 3) != "1",
+            is_pk: dcell(r, 5) != "0" && !dcell(r, 5).is_empty(),
+            is_fk: false,
+            default: r.get(4).and_then(|v| v.clone()),
+            comment: None,
+        })
+        .collect();
+    Ok(tree::RelationDetail {
+        name: name.to_string(),
+        kind: "table".to_string(),
+        comment: None,
+        columns,
+        indexes: vec![],
+        constraints: vec![],
+    })
+}
+
 /// One connected database in the app registry.
 pub struct ConnState {
     pub backend: Backend,
@@ -626,9 +911,9 @@ mod tests {
     use super::*;
     use crate::db::QueryOutcome;
 
-    fn duck_mem() -> ConnectionConfig {
+    fn mem(driver: &str) -> ConnectionConfig {
         ConnectionConfig {
-            driver: Some("duckdb".to_string()),
+            driver: Some(driver.to_string()),
             host: String::new(),
             port: 0,
             user: String::new(),
@@ -638,6 +923,48 @@ mod tests {
             read_only: false,
             path: Some(":memory:".to_string()),
         }
+    }
+    fn duck_mem() -> ConnectionConfig {
+        mem("duckdb")
+    }
+
+    #[test]
+    fn sqlite_query_page_introspect() {
+        let (backend, ver) = SqliteConn::open(&mem("sqlite")).unwrap();
+        assert!(ver.starts_with("SQLite"));
+        let mut s = match backend {
+            Backend::Sqlite(s) => s,
+            _ => panic!("expected SQLite backend"),
+        };
+        s.lock()
+            .execute_batch(
+                "CREATE TABLE t(a INTEGER, b TEXT); \
+                 INSERT INTO t VALUES (1,'x'),(2,'y'),(3,NULL)",
+            )
+            .unwrap();
+
+        let p1 = s.run_single("SELECT * FROM t ORDER BY a", 2, true).unwrap();
+        let (cols, mut all, done1) = match p1 {
+            QueryOutcome::Rows { columns, rows, done } => (columns, rows, done),
+            _ => panic!("expected rows"),
+        };
+        assert_eq!(cols, vec!["a", "b"]);
+        assert_eq!(all.len(), 2);
+        assert!(!done1);
+        let p2 = s.fetch_page(2).unwrap();
+        assert_eq!(p2.rows.len(), 1);
+        assert!(p2.done);
+        all.extend(p2.rows);
+        assert!(all.iter().any(|r| r[0] == Some("1".to_string()) && r[1] == Some("x".to_string())));
+        assert!(all.iter().any(|r| r[0] == Some("3".to_string()) && r[1].is_none()));
+
+        let tree = sqlite_build_tree(&s.lock()).unwrap();
+        assert!(tree.schemas[0].tables.iter().any(|t| t.name == "t"));
+        let det = sqlite_table_detail(&s.lock(), "t").unwrap();
+        assert_eq!(det.columns.len(), 2);
+        assert_eq!(det.columns[0].name, "a");
+        let list = sqlite_list_tables(&s.lock()).unwrap();
+        assert!(list.iter().any(|t| t.name == "t" && t.columns.len() == 2));
     }
 
     #[test]

@@ -33,6 +33,9 @@ rust_xlsxwriter = "0.95.0"
 # Embedded DuckDB. `bundled` statically compiles libduckdb from source (no system
 # dep) — larger binary + slow first build, but a self-contained installer.
 duckdb = { version = "1", features = ["bundled"] }
+# Embedded SQLite. `bundled` statically compiles SQLite (small, fast) + `column_decltype`
+# for declared column types in introspection.
+rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }

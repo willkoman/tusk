@@ -49,7 +49,7 @@ const DDL_RE = /^\s*(create|alter|drop|truncate|comment|grant|revoke)\b/i;
 const DRIVERS = [
   { id: "postgres", label: "PostgreSQL", mascot: "🐘", ready: true },
   { id: "duckdb", label: "DuckDB", mascot: "🦆", ready: true },
-  { id: "sqlite", label: "SQLite", mascot: "🪶", ready: false },
+  { id: "sqlite", label: "SQLite", mascot: "🪶", ready: true },
   { id: "mysql", label: "MySQL", mascot: "🐬", ready: false },
 ] as const;
 const driverMascot = (id?: string | null) => DRIVERS.find((d) => d.id === id)?.mascot ?? "🐘";
