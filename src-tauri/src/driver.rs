@@ -25,6 +25,7 @@ pub struct Capabilities {
     pub kind: &'static str,
     pub server_cursor: bool,
     pub bulk_copy: bool,
+    pub export: bool,
     pub schemas: bool,
     pub search_path: bool,
     pub transactional_ddl: bool,
@@ -39,6 +40,7 @@ impl Capabilities {
             kind: "postgres",
             server_cursor: true,
             bulk_copy: true,
+            export: true,
             schemas: true,
             search_path: true,
             transactional_ddl: true,
@@ -52,6 +54,7 @@ impl Capabilities {
             kind: "duckdb",
             server_cursor: false, // paged via LIMIT/OFFSET, not a server cursor
             bulk_copy: false,     // import not yet abstracted for DuckDB
+            export: false,        // export streams via a PG cursor — not yet abstracted
             schemas: true,
             search_path: false,
             transactional_ddl: true,
