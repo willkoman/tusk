@@ -82,7 +82,7 @@ export function ExportDialog(props: {
       props.onClose();
     } catch (e) {
       const m = e instanceof Object && "message" in e ? String((e as any).message) : String(e);
-      setErr(/cancel/i.test(m) ? "Export cancelled — rolled back." : m);
+      setErr(/cancel/i.test(m) ? "Export cancelled." : m);
     } finally {
       setBusy(false);
     }
@@ -246,7 +246,7 @@ export function ExportDialog(props: {
         >
           <span class="busy-label"><span class="spinner-sm" />{dest() === "clipboard" ? "Copying…" : "Exporting…"}</span>
           <span class="spacer" />
-          <button class="ghost" onClick={() => void props.onCancel?.()}>Cancel &amp; roll back</button>
+          <button class="ghost" onClick={() => void props.onCancel?.()}>Cancel export</button>
         </Show>
       </div>
     </Dialog>
