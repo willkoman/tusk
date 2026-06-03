@@ -1,15 +1,21 @@
-import { createSignal, createMemo, onMount, For, Show } from "solid-js";
+import { createSignal, createMemo, createEffect, onMount, onCleanup, For, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 import { SqlEditor, type EditorApi } from "./SqlEditor";
-import { type Dataset, parseCSV, parseJSON, EXPORT_EXT } from "./formats";
-import { save } from "@tauri-apps/plugin-dialog";
+import { type DialectId } from "./sql/dialects";
+import { type CursorInfo, type EditorPrefs, type ServerDiag } from "./editor/types";
+import { prefsStore, tabsStore, type PersistedTabs } from "./store";
+import { makeTab, basename, type Tab, type ResultSnapshot } from "./tabs";
+import { type Dataset, parseCSV, parseJSON, formatWithOptions } from "./formats";
+import { ExportDialog } from "./forms/ExportDialog";
+import { FORMAT_EXT, type ExportOptions, type ExportScope } from "./export";
+import { save, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Tree, type DbTree, type RelationDetail, type NodeDescriptor, nodeKey } from "./Tree";
 import { ContextMenu, type MenuItem, type MenuState } from "./ContextMenu";
 import { WorkbenchDialogs, type DialogState } from "./WorkbenchDialogs";
 import { Dialog } from "./Dialog";
 import { Icon } from "./Icons";
-import { ident, qualify } from "./sql/ident";
+import { ident, qualify, qualifyIn } from "./sql/ident";
 import * as ddl from "./sql/ddl";
 import { clipWrite, clipRead } from "./clipboard";
 
@@ -89,18 +95,168 @@ function App() {
   const [selected, setSelected] = createSignal<NodeDescriptor | null>(null);
   // "View value" modal for a result-grid cell.
   const [cellView, setCellView] = createSignal<{ col: string; val: string | null } | null>(null);
-  const [sql, setSql] = createSignal("SELECT * FROM information_schema.tables;");
-  const [columns, setColumns] = createSignal<string[]>([]);
-  const [rows, setRows] = createSignal<(string | null)[][]>([]);
-  const [done, setDone] = createSignal(true);
+  // Editor tabs — each owns a SQL buffer + a snapshot of its last result grid.
+  const [tabs, setTabs] = createSignal<Tab[]>([makeTab({ sql: "SELECT * FROM information_schema.tables;" })]);
+  const [activeTabId, setActiveTabId] = createSignal(tabs()[0].id);
+  const activeTab = createMemo(() => tabs().find((t) => t.id === activeTabId()) ?? tabs()[0]);
+  let cursorOwnerTabId: string | null = null; // tab that owns the single backend cursor
+
+  const patchTab = (id: string, patch: Partial<Tab>) =>
+    setTabs((ts) => ts.map((t) => (t.id === id ? { ...t, ...patch } : t)));
+  const patchResult = (id: string, patch: Partial<ResultSnapshot>) =>
+    setTabs((ts) => ts.map((t) => (t.id === id ? { ...t, result: { ...t.result, ...patch } } : t)));
+
+  // Active-tab accessors so the existing editor + result-grid JSX stays unchanged.
+  const sql = () => activeTab().sql;
+  const setSql = (v: string) => patchTab(activeTabId(), { sql: v });
+  const columns = () => activeTab().result.columns;
+  const rows = () => activeTab().result.rows;
+  const done = () => activeTab().result.done;
+  const status = () => activeTab().result.status;
+  const runErr = () => activeTab().result.runErr;
+  const elapsed = () => activeTab().result.elapsed;
+  const lastQuery = () => activeTab().result.lastQuery;
+  const setStatus = (s: string) => patchResult(activeTabId(), { status: s });
+  const setRunErr = (s: string) => patchResult(activeTabId(), { runErr: s });
+  // Distinct schema names for the active-schema (search_path) selector.
+  const schemaNames = createMemo(() => [...new Set(schema().map((t) => t.schema))].sort());
+
   const [running, setRunning] = createSignal(false);
-  const [status, setStatus] = createSignal("");
-  const [runErr, setRunErr] = createSignal("");
-  const [elapsed, setElapsed] = createSignal(0);
   const [runMs, setRunMs] = createSignal(0); // live elapsed while a query runs
   const [editorApi, setEditorApi] = createSignal<EditorApi | null>(null);
   const [editorH, setEditorH] = createSignal(Math.max(300, Math.round((window.innerHeight - 120) * 0.6)));
-  const [lastQuery, setLastQuery] = createSignal("");
+
+  // editor prefs (persisted) + cursor readout + per-connection buffer key
+  const [prefs, setPrefs] = createSignal<EditorPrefs>(prefsStore.load());
+  const [cursorInfo, setCursorInfo] = createSignal<CursorInfo | null>(null);
+  let connKey: string | null = null;
+  let saveTimer: ReturnType<typeof setTimeout> | undefined;
+  let restoring = false;
+
+  const updatePrefs = (patch: Partial<EditorPrefs>) => {
+    const next = { ...prefs(), ...patch };
+    setPrefs(next);
+    prefsStore.save(next);
+  };
+
+  // Validate the buffer against Postgres for parser-grade diagnostics (PREPARE-only,
+  // never executes). Skipped while a query is running (shares the connection lock)
+  // or when the server-lint pref is off.
+  const validate = async (sqlText: string): Promise<ServerDiag[]> => {
+    const c = conn();
+    if (!c || running() || !prefs().serverLint) return [];
+    try {
+      return await invoke<ServerDiag[]>("validate_sql", { connectionId: c.id, sql: sqlText, searchPath: activeTab().searchSchema });
+    } catch {
+      return [];
+    }
+  };
+
+  // --- tab management + file flow ---
+  const [confirmClose, setConfirmClose] = createSignal<string | null>(null);
+  // Snapshot of the result being exported, frozen when the dialog opens so a tab
+  // switch while it's open can't redirect the export to a different tab.
+  const [exportSrc, setExportSrc] = createSignal<
+    { columns: string[]; rows: (string | null)[][]; query: string; table: string; searchSchema: string | null } | null
+  >(null);
+  const openExport = () =>
+    setExportSrc({
+      columns: columns(),
+      rows: rows(),
+      query: lastQuery(),
+      table: tableNameFromSql(lastQuery()),
+      searchSchema: activeTab().searchSchema,
+    });
+
+  function switchTab(id: string) {
+    if (id === activeTabId()) return;
+    patchResult(activeTabId(), { scrollTop: scroller?.scrollTop ?? 0 });
+    setActiveTabId(id);
+    requestAnimationFrame(() => {
+      const top = activeTab().result.scrollTop;
+      if (scroller) scroller.scrollTop = top;
+      setScrollTop(top);
+    });
+  }
+
+  function openNewTab() {
+    const t = makeTab();
+    setTabs((ts) => [...ts, t]);
+    switchTab(t.id);
+  }
+
+  function removeTab(id: string) {
+    if (cursorOwnerTabId === id) cursorOwnerTabId = null;
+    editorApi()?.dropTab(id);
+    const idx = tabs().findIndex((t) => t.id === id);
+    const next = tabs().filter((t) => t.id !== id);
+    if (next.length === 0) {
+      const fresh = makeTab();
+      setTabs([fresh]);
+      setActiveTabId(fresh.id);
+      return;
+    }
+    setTabs(next);
+    if (activeTabId() === id) {
+      const neighbor = next[Math.min(idx, next.length - 1)];
+      switchTab(neighbor.id);
+    }
+  }
+
+  function closeTab(id: string) {
+    const t = tabs().find((x) => x.id === id);
+    if (!t) return;
+    if (t.dirty) {
+      setConfirmClose(id);
+      return;
+    }
+    removeTab(id);
+  }
+
+  async function openFileDialog() {
+    const path = await openDialog({ multiple: false, filters: [{ name: "SQL", extensions: ["sql", "txt"] }] });
+    if (typeof path !== "string") return;
+    const existing = tabs().find((t) => t.filePath === path);
+    if (existing) {
+      switchTab(existing.id);
+      return;
+    }
+    try {
+      const contents = await invoke<string>("read_text_file", { path });
+      const t = makeTab({ sql: contents, filePath: path, title: basename(path), dirty: false });
+      setTabs((ts) => [...ts, t]);
+      switchTab(t.id);
+    } catch (e) {
+      setRunErr(errMsg(e));
+    }
+  }
+
+  async function saveActiveTab() {
+    const t = activeTab();
+    const text = editorApi()?.getDoc() ?? t.sql;
+    if (!t.filePath) return saveAsActiveTab();
+    try {
+      await invoke("write_text_file", { path: t.filePath, contents: text });
+      patchTab(t.id, { dirty: false, sql: text });
+      setStatus(`saved → ${t.filePath}`);
+    } catch (e) {
+      setRunErr(errMsg(e));
+    }
+  }
+
+  async function saveAsActiveTab() {
+    const t = activeTab();
+    const text = editorApi()?.getDoc() ?? t.sql;
+    const path = await save({ defaultPath: t.filePath ?? `${t.title}.sql`, filters: [{ name: "SQL", extensions: ["sql"] }] });
+    if (!path) return;
+    try {
+      await invoke("write_text_file", { path, contents: text });
+      patchTab(t.id, { filePath: path, title: basename(path), dirty: false, sql: text });
+      setStatus(`saved → ${path}`);
+    } catch (e) {
+      setRunErr(errMsg(e));
+    }
+  }
 
   // import dialog
   const [importOpen, setImportOpen] = createSignal(false);
@@ -117,7 +273,6 @@ function App() {
   const [scrollTop, setScrollTop] = createSignal(0);
   const [viewportH, setViewportH] = createSignal(500);
   let scroller: HTMLDivElement | undefined;
-  let fileInput: HTMLInputElement | undefined;
   let importFileInput: HTMLInputElement | undefined;
   let loadingMore = false;
   let runTimer: ReturnType<typeof setInterval> | undefined;
@@ -126,11 +281,25 @@ function App() {
     // Suppress the WebView's native right-click menu app-wide; the sidebar shows
     // its own context menu, and the editor uses keyboard shortcuts for copy/paste.
     document.addEventListener("contextmenu", (e) => e.preventDefault());
+    // Window-level editor/tab shortcuts (the in-editor keymap owns Mod-Enter/Shift-Alt-f/
+    // Mod-f/Tab — no overlap with T/W/S/O). preventDefault so Cmd-W closes the tab, not the window.
+    window.addEventListener("keydown", onWindowKey);
     await loadProfiles();
     // Auto-connect to the default profile, if one is set.
     const def = profiles().find((p) => p.default_connect);
     if (def) connectProfile(def.id);
   });
+  onCleanup(() => window.removeEventListener("keydown", onWindowKey));
+
+  function onWindowKey(e: KeyboardEvent) {
+    if (!(e.metaKey || e.ctrlKey) || !conn()) return;
+    const k = e.key.toLowerCase();
+    if (k === "t") { e.preventDefault(); openNewTab(); }
+    else if (k === "w") { e.preventDefault(); closeTab(activeTabId()); }
+    else if (k === "s" && e.shiftKey) { e.preventDefault(); void saveAsActiveTab(); }
+    else if (k === "s") { e.preventDefault(); void saveActiveTab(); }
+    else if (k === "o") { e.preventDefault(); void openFileDialog(); }
+  }
 
   async function loadProfiles() {
     try {
@@ -177,6 +346,23 @@ function App() {
 
   async function afterConnect(r: { connection_id: string; server_version: string; read_only: boolean }) {
     setConn({ id: r.connection_id, version: r.server_version, readOnly: r.read_only });
+    // Restore this connection's tab set (buffers/paths only — results are ephemeral).
+    if (connKey) {
+      const saved = tabsStore.load(connKey);
+      restoring = true;
+      if (saved && saved.tabs.length) {
+        const restored = saved.tabs.map((pt) =>
+          makeTab({ sql: pt.sql, filePath: pt.filePath, title: pt.title, searchSchema: pt.searchSchema ?? null, dirty: false }),
+        );
+        setTabs(restored);
+        setActiveTabId(restored[Math.min(saved.activeIndex, restored.length - 1)].id);
+      } else {
+        const fresh = makeTab();
+        setTabs([fresh]);
+        setActiveTabId(fresh.id);
+      }
+      restoring = false;
+    }
     await loadSchema();
   }
 
@@ -196,6 +382,7 @@ function App() {
           read_only: readOnly(),
         },
       });
+      connKey = `adhoc:${host()}:${port()}:${dbname()}:${user()}`;
       await afterConnect(r);
     } catch (e) {
       setConnErr(errMsg(e));
@@ -208,9 +395,12 @@ function App() {
     setConnecting(true);
     setConnErr("");
     try {
-      await afterConnect(
-        await invoke<{ connection_id: string; server_version: string; read_only: boolean }>("connect_profile", { id }),
+      const r = await invoke<{ connection_id: string; server_version: string; read_only: boolean }>(
+        "connect_profile",
+        { id },
       );
+      connKey = `profile:${id}`;
+      await afterConnect(r);
     } catch (e) {
       setConnErr(errMsg(e));
     } finally {
@@ -253,18 +443,49 @@ function App() {
     }
   }
 
+  // Snapshot the tab set for persistence — capture the active tab's live editor doc
+  // (the editor, not tab.sql, is the source of truth while a tab is active).
+  function snapshotTabs(): PersistedTabs {
+    const liveDoc = editorApi()?.getDoc();
+    const list = tabs();
+    return {
+      tabs: list.map((t) => ({
+        sql: t.id === activeTabId() && liveDoc != null ? liveDoc : t.sql,
+        filePath: t.filePath,
+        title: t.title,
+        searchSchema: t.searchSchema,
+      })),
+      activeIndex: Math.max(0, list.findIndex((t) => t.id === activeTabId())),
+    };
+  }
+
   async function disconnect() {
     const c = conn();
+    if (connKey) tabsStore.save(connKey, snapshotTabs());
     if (c) invoke("disconnect", { connectionId: c.id }).catch(() => {});
+    connKey = null;
     setConn(null);
     setTree(null);
     setSchema([]);
     setDetails({});
     loadedRels.clear();
-    setColumns([]);
-    setRows([]);
-    setStatus("");
+    cursorOwnerTabId = null;
+    const fresh = makeTab();
+    setTabs([fresh]);
+    setActiveTabId(fresh.id);
   }
+
+  // Debounced per-connection tab-set save as buffers/structure change.
+  createEffect(() => {
+    const data: PersistedTabs = {
+      tabs: tabs().map((t) => ({ sql: t.sql, filePath: t.filePath, title: t.title, searchSchema: t.searchSchema })),
+      activeIndex: Math.max(0, tabs().findIndex((t) => t.id === activeTabId())),
+    };
+    if (restoring || !connKey) return;
+    const key = connKey;
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => tabsStore.save(key, data), 800);
+  });
 
   async function loadSchema() {
     const c = conn();
@@ -332,10 +553,14 @@ function App() {
     if (!c || running()) return;
     const runText = override ?? editorApi()?.getRunText() ?? sql();
     if (!runText.trim()) return;
-    setLastQuery(runText);
+    const runTabId = activeTabId();
+    const runSchema = activeTab().searchSchema; // capture now — bound to this run's tab
+    // Running here rolls back any other tab's open cursor server-side — freeze that
+    // tab's snapshot at the rows it already fetched.
+    if (cursorOwnerTabId && cursorOwnerTabId !== runTabId) patchResult(cursorOwnerTabId, { done: true });
+    cursorOwnerTabId = null;
+    patchResult(runTabId, { lastQuery: runText, runErr: "", status: "" });
     setRunning(true);
-    setRunErr("");
-    setStatus("");
     const t0 = performance.now();
     setRunMs(0);
     runTimer = setInterval(() => setRunMs(performance.now() - t0), 200);
@@ -344,45 +569,51 @@ function App() {
         connectionId: c.id,
         sql: runText,
         pageSize: PAGE,
+        searchPath: runSchema,
       });
       if (out.kind === "rows") {
-        setColumns(out.columns);
-        setRows(out.rows);
-        setDone(out.done);
-        if (scroller) scroller.scrollTop = 0;
-        setScrollTop(0);
-        setStatus(`${out.rows.length}${out.done ? "" : "+"} rows`);
+        patchResult(runTabId, {
+          columns: out.columns,
+          rows: out.rows,
+          done: out.done,
+          scrollTop: 0,
+          status: `${out.rows.length}${out.done ? "" : "+"} rows`,
+        });
+        if (!out.done) cursorOwnerTabId = runTabId;
+        if (runTabId === activeTabId()) {
+          if (scroller) scroller.scrollTop = 0;
+          setScrollTop(0);
+        }
       } else {
-        setColumns([]);
-        setRows([]);
-        setDone(true);
-        setStatus(out.message);
+        patchResult(runTabId, { columns: [], rows: [], done: true, status: out.message });
       }
       if (out.kind === "exec" || DDL_RE.test(runText)) void loadSchema(); // refresh after scripts/DDL
     } catch (e) {
-      setRunErr(errMsg(e));
-      setColumns([]);
-      setRows([]);
-      setDone(true);
+      patchResult(runTabId, { runErr: errMsg(e), columns: [], rows: [], done: true });
     } finally {
       if (runTimer) clearInterval(runTimer);
       setRunning(false);
-      setElapsed(Math.round(performance.now() - t0));
+      patchResult(runTabId, { elapsed: Math.round(performance.now() - t0) });
     }
   }
 
   async function loadMore() {
     const c = conn();
+    const id = activeTabId();
     if (!c || done() || loadingMore) return;
+    if (cursorOwnerTabId !== id) return; // this tab doesn't own the live cursor
     loadingMore = true;
     try {
       const r = await invoke<FetchResult>("fetch_more", { connectionId: c.id, pageSize: PAGE });
-      if (r.rows.length) setRows((prev) => [...prev, ...r.rows]);
-      setDone(r.done);
-      setStatus(`${rows().length}${r.done ? "" : "+"} rows`);
+      // Read the captured tab's rows (the user may have switched tabs during the fetch).
+      const prev = tabs().find((t) => t.id === id)?.result.rows ?? [];
+      const merged = r.rows.length ? [...prev, ...r.rows] : prev;
+      patchResult(id, { rows: merged, done: r.done, status: `${merged.length}${r.done ? "" : "+"} rows` });
+      if (r.done) cursorOwnerTabId = null;
     } catch (e) {
       console.error(e);
-      setDone(true);
+      patchResult(id, { done: true });
+      cursorOwnerTabId = null;
     } finally {
       loadingMore = false;
     }
@@ -392,6 +623,7 @@ function App() {
     const el = e.currentTarget as HTMLDivElement;
     setScrollTop(el.scrollTop);
     setViewportH(el.clientHeight);
+    patchResult(activeTabId(), { scrollTop: el.scrollTop });
     if (el.scrollTop + el.clientHeight > el.scrollHeight - ROW_H * 50) loadMore();
   }
 
@@ -401,55 +633,36 @@ function App() {
     new ResizeObserver(() => setViewportH(el.clientHeight)).observe(el);
   }
 
-  // --- open / save .sql (webview-native, no plugins) ---
-  function openFile() {
-    fileInput?.click();
-  }
-  async function onFileChange(e: Event) {
-    const input = e.currentTarget as HTMLInputElement;
-    const f = input.files?.[0];
-    if (f) setSql(await f.text());
-    input.value = "";
-  }
-  function saveFile() {
-    const blob = new Blob([sql()], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "query.sql";
-    a.click();
-    URL.revokeObjectURL(url);
-  }
-
   function tableNameFromSql(s: string): string {
     const m = /from\s+(?:"?[\w]+"?\.)?"?([\w]+)"?/i.exec(s);
     return m ? m[1] : "export";
   }
 
-  async function exportAs(fmt: string) {
+  async function exportToFile(opts: ExportOptions, scope: ExportScope) {
+    const src = exportSrc();
+    if (!src) return;
     const c = conn();
-    const q = lastQuery();
-    if (!c || !q || !fmt) return;
-    const ext = EXPORT_EXT[fmt] ?? "txt";
-    const table = tableNameFromSql(q);
-    try {
-      const path = await save({
-        defaultPath: `${table}.${ext}`,
-        filters: [{ name: fmt.toUpperCase(), extensions: [ext] }],
-      });
-      if (!path) return;
-      setStatus("exporting…");
-      const n = await invoke<number>("export_to_file", {
-        connectionId: c.id,
-        sql: q,
-        format: fmt,
-        table,
-        path,
-      });
-      setStatus(`exported ${n} rows → ${path}`);
-    } catch (e) {
-      setRunErr(errMsg(e));
-    }
+    const table = opts.sql.table || src.table;
+    const path = await save({
+      defaultPath: `${table}.${FORMAT_EXT[opts.format]}`,
+      filters: [{ name: opts.format.toUpperCase(), extensions: [FORMAT_EXT[opts.format]] }],
+    });
+    if (!path) return;
+    setStatus("exporting…");
+    const args =
+      scope === "all"
+        ? { connectionId: c?.id, sql: src.query, options: opts, path, searchPath: src.searchSchema }
+        : { columns: src.columns, rows: src.rows, options: opts, path };
+    const n = await invoke<number>("export_to_file", args);
+    setStatus(`exported ${n} rows → ${path}`);
+  }
+
+  async function exportToClipboard(opts: ExportOptions) {
+    const src = exportSrc();
+    if (!src) return;
+    const text = formatWithOptions({ columns: src.columns, rows: src.rows }, opts);
+    const ok = await clipWrite(text);
+    setStatus(ok ? `copied ${src.rows.length} rows` : "clipboard unavailable");
   }
 
   function openImport() {
@@ -552,13 +765,13 @@ function App() {
   });
 
   function runTable(schemaName: string, name: string) {
-    const q = `SELECT * FROM ${qualify(schemaName, name)}`;
+    const q = `SELECT * FROM ${qualifyIn(schemaName, name, activeTab().searchSchema)}`;
     setSql(q);
     doRun(q);
   }
 
   function runTableLimit(schemaName: string, name: string, limit: number) {
-    const q = `SELECT * FROM ${qualify(schemaName, name)} LIMIT ${limit}`;
+    const q = `SELECT * FROM ${qualifyIn(schemaName, name, activeTab().searchSchema)} LIMIT ${limit}`;
     setSql(q);
     doRun(q);
   }
@@ -591,7 +804,7 @@ function App() {
     const body = text.endsWith("\n") ? text : text + "\n";
     const api = editorApi();
     if (api) api.insertAtCursor(body);
-    else setSql((p) => (p ? p.replace(/\s*$/, "\n\n") : "") + body);
+    else setSql((sql() ? sql().replace(/\s*$/, "\n\n") : "") + body);
   }
 
   // "Edit as SQL" from a dialog: scaffold the single statement, close the dialog.
@@ -629,12 +842,13 @@ function App() {
     const d = details()[`${n.schema}.${n.name}`];
     const cols = d?.columns.map((c) => c.name) ?? [];
     const pks = d?.columns.filter((c) => c.is_pk).map((c) => c.name) ?? [];
+    const as = activeTab().searchSchema;
     const text =
       kind === "select"
-        ? ddl.genSelect(n.schema!, n.name, cols)
+        ? ddl.genSelect(n.schema!, n.name, cols, as)
         : kind === "insert"
-          ? ddl.genInsert(n.schema!, n.name, cols)
-          : ddl.genUpdate(n.schema!, n.name, cols, pks);
+          ? ddl.genInsert(n.schema!, n.name, cols, as)
+          : ddl.genUpdate(n.schema!, n.name, cols, pks, as);
     scaffoldEditor(text.trim() + ";");
   }
 
@@ -1087,20 +1301,71 @@ function App() {
 
           <main class="main">
             <div class="editor-pane" style={{ height: `${editorH()}px` }}>
+              <div class="tab-strip">
+                <For each={tabs()}>
+                  {(t) => (
+                    <div
+                      class="tab"
+                      classList={{ active: t.id === activeTabId() }}
+                      title={t.filePath ?? t.title}
+                      onClick={() => switchTab(t.id)}
+                      onAuxClick={(e) => { if (e.button === 1) closeTab(t.id); }}
+                    >
+                      <span class="tab-title">{t.title}</span>
+                      <Show when={t.dirty}><span class="tab-dot" title="Unsaved changes">●</span></Show>
+                      <button class="tab-close" title="Close (⌘/Ctrl+W)" onClick={(e) => { e.stopPropagation(); closeTab(t.id); }}>×</button>
+                    </div>
+                  )}
+                </For>
+                <button class="tab-new" title="New tab (⌘/Ctrl+T)" onClick={openNewTab}>＋</button>
+              </div>
               <SqlEditor
                 value={sql()}
-                onChange={setSql}
+                onChange={(t, id) => patchTab(id, { sql: t, dirty: true })}
                 onRun={() => doRun()}
+                onRunStatement={(t) => doRun(t)}
+                tabId={activeTabId()}
                 tables={schema()}
+                activeSchema={activeTab().searchSchema}
+                dialect={prefs().dialect}
+                prefs={prefs()}
+                validate={conn() ? validate : null}
+                onCursorInfo={setCursorInfo}
                 onReady={setEditorApi}
                 onContextMenu={openEditorMenu}
               />
               <div class="toolbar">
                 <button class="run" onClick={() => doRun()} disabled={running()}>{running() ? `Running… ${fmtDur(runMs())}` : "Run ▶"}</button>
-                <button class="ghost" onClick={openFile}>Open</button>
-                <button class="ghost" onClick={saveFile}>Save</button>
+                <button class="ghost" onClick={openFileDialog}>Open</button>
+                <button class="ghost" onClick={() => void saveActiveTab()}>Save</button>
+                <button class="ghost" onClick={() => void saveAsActiveTab()}>Save As</button>
+                <button class="ghost" onClick={() => editorApi()?.format()}>Format</button>
+                <button class="ghost" onClick={() => editorApi()?.openSearch()}>Find</button>
                 <span class="hint">⌘/Ctrl+Enter · runs selection or all</span>
-                <input ref={fileInput} type="file" accept=".sql,.txt" style={{ display: "none" }} onChange={onFileChange} />
+                <span class="spacer" />
+                <select
+                  class="export-select"
+                  title="Active schema (search_path)"
+                  value={activeTab().searchSchema ?? ""}
+                  onChange={(e) => patchTab(activeTabId(), { searchSchema: e.currentTarget.value || null })}
+                >
+                  <option value="">(default schema)</option>
+                  <For each={schemaNames()}>{(s) => <option value={s}>{s}</option>}</For>
+                </select>
+                <select
+                  class="export-select"
+                  title="SQL dialect"
+                  value={prefs().dialect}
+                  onChange={(e) => updatePrefs({ dialect: e.currentTarget.value as DialectId })}
+                >
+                  <option value="postgres">PostgreSQL</option>
+                  <option value="mysql">MySQL</option>
+                  <option value="sqlite">SQLite</option>
+                  <option value="mssql">SQL Server</option>
+                </select>
+                <button class="icon" title="Decrease font size" onClick={() => updatePrefs({ fontSize: Math.max(9, prefs().fontSize - 1) })}>A−</button>
+                <button class="icon" title="Increase font size" onClick={() => updatePrefs({ fontSize: Math.min(24, prefs().fontSize + 1) })}>A+</button>
+                <button class="icon" title="Toggle word wrap" classList={{ active: prefs().wordWrap }} onClick={() => updatePrefs({ wordWrap: !prefs().wordWrap })}>⤶</button>
               </div>
             </div>
 
@@ -1143,16 +1408,18 @@ function App() {
             <footer class="statusbar">
               <span>{status()}</span>
               <span class="spacer" />
+              <Show when={cursorInfo()}>
+                {(ci) => (
+                  <span class="cursor-info">
+                    Ln {ci().line}, Col {ci().col}
+                    <Show when={ci().stmtCount > 1}> · Stmt {ci().stmtIndex}/{ci().stmtCount}</Show>
+                    <Show when={ci().selChars > 0}> · {ci().selChars} sel</Show>
+                  </span>
+                )}
+              </Show>
               <Show when={!done()}><span class="streaming">streaming…</span></Show>
-              <Show when={lastQuery()}>
-                <select class="export-select" onChange={(e) => { exportAs(e.currentTarget.value); e.currentTarget.value = ""; }}>
-                  <option value="">Export…</option>
-                  <option value="csv">CSV</option>
-                  <option value="tsv">TSV</option>
-                  <option value="json">JSON</option>
-                  <option value="sql">SQL inserts</option>
-                  <option value="markdown">Markdown</option>
-                </select>
+              <Show when={lastQuery() || columns().length > 0}>
+                <button class="ghost export-btn" onClick={openExport}>Export…</button>
               </Show>
               <span>{elapsed()} ms</span>
             </footer>
@@ -1201,6 +1468,45 @@ function App() {
           onRun={runDDL}
           onEditAsSql={editAsSql}
         />
+        <Show when={exportSrc()}>
+          {(src) => (
+            <ExportDialog
+              columns={src().columns}
+              loadedRows={src().rows}
+              defaultTable={src().table}
+              onClose={() => setExportSrc(null)}
+              onExportFile={exportToFile}
+              onExportClipboard={exportToClipboard}
+            />
+          )}
+        </Show>
+        <Show when={confirmClose()}>
+          {(id) => (
+            <Dialog title="Unsaved changes" onClose={() => setConfirmClose(null)} width={420}>
+              <p class="confirm-text">
+                “{tabs().find((t) => t.id === id())?.title}” has unsaved changes. Save before closing?
+              </p>
+              <div class="form-actions">
+                <button class="ghost" onClick={() => setConfirmClose(null)}>Cancel</button>
+                <button class="btn-danger" onClick={() => { removeTab(id()); setConfirmClose(null); }}>Don't save</button>
+                <button
+                  class="run"
+                  onClick={async () => {
+                    const tid = id();
+                    setActiveTabId(tid);
+                    await saveActiveTab();
+                    if (!tabs().find((t) => t.id === tid)?.dirty) {
+                      removeTab(tid);
+                      setConfirmClose(null);
+                    }
+                  }}
+                >
+                  Save
+                </button>
+              </div>
+            </Dialog>
+          )}
+        </Show>
         <datalist id="pg-types">
           <For
             each={[

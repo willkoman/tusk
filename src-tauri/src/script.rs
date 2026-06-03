@@ -207,7 +207,7 @@ pub fn split(script: &str) -> Vec<Item> {
 }
 
 /// Skip leading whitespace and comment lines, returning the SQL that follows.
-fn effective_start(s: &str) -> &str {
+pub fn effective_start(s: &str) -> &str {
     let mut rest = s.trim_start();
     loop {
         if let Some(r) = rest.strip_prefix("--") {

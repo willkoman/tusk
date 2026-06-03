@@ -4,63 +4,16 @@ import {
   type CompletionResult,
 } from "@codemirror/autocomplete";
 import { type DialectSpec } from "./dialects";
+import {
+  aliasMap,
+  currentStatement,
+  makeIndexer,
+  tableByRef,
+  type Col,
+  type Table,
+} from "./aliases";
 
-export type Col = { name: string; data_type: string };
-export type Table = { schema: string; name: string; columns: Col[] };
-
-type Index = {
-  schemas: string[];
-  tables: Table[];
-  byQualified: Map<string, Table>;
-  byBare: Map<string, Table[]>;
-};
-
-function strip(id: string): string {
-  return id.replace(/"/g, "").trim();
-}
-
-function buildIndex(tables: Table[]): Index {
-  const byQualified = new Map<string, Table>();
-  const byBare = new Map<string, Table[]>();
-  const schemas = new Set<string>();
-  for (const t of tables) {
-    schemas.add(t.schema);
-    byQualified.set(`${t.schema}.${t.name}`.toLowerCase(), t);
-    const arr = byBare.get(t.name.toLowerCase()) ?? [];
-    arr.push(t);
-    byBare.set(t.name.toLowerCase(), arr);
-  }
-  return { schemas: [...schemas], tables, byQualified, byBare };
-}
-
-function tableByRef(idx: Index, ref: string): Table | undefined {
-  const r = strip(ref).toLowerCase();
-  if (r.includes(".")) return idx.byQualified.get(r);
-  return idx.byBare.get(r)?.[0];
-}
-
-/** Map alias (and bare table name) -> table reference, from FROM/JOIN/UPDATE/INTO in the statement. */
-function aliasMap(stmt: string): Map<string, string> {
-  const m = new Map<string, string>();
-  const re = /\b(?:FROM|JOIN|UPDATE|INTO)\s+("?[\w.]+"?)(?:\s+(?:AS\s+)?("?[a-zA-Z_]\w*"?))?/gi;
-  let g: RegExpExecArray | null;
-  while ((g = re.exec(stmt))) {
-    const table = strip(g[1]);
-    const bare = table.split(".").pop()!;
-    const alias = g[2] ? strip(g[2]) : bare;
-    m.set(alias.toLowerCase(), table);
-    m.set(bare.toLowerCase(), table);
-  }
-  return m;
-}
-
-/** The statement (between semicolons) containing `pos`, and its start offset. */
-function currentStatement(doc: string, pos: number): { text: string; start: number } {
-  const start = doc.lastIndexOf(";", pos - 1) + 1;
-  let end = doc.indexOf(";", pos);
-  if (end < 0) end = doc.length;
-  return { text: doc.slice(start, end), start };
-}
+export type { Col, Table };
 
 const TABLE_CTX = new Set(["FROM", "JOIN", "INTO", "UPDATE", "TABLE", "USING"]);
 const COLUMN_CTX = new Set([
@@ -72,22 +25,18 @@ const COLUMN_CTX = new Set([
  * Build a context-aware, dialect-specific completion source.
  * Reads the live table list via `getTables` (memoized on array identity).
  */
-export function makeSqlCompletion(getTables: () => Table[], spec: DialectSpec) {
+export function makeSqlCompletion(
+  getTables: () => Table[],
+  spec: DialectSpec,
+  getActiveSchema: () => string | null = () => null,
+) {
   const kwOptions: Completion[] = spec.keywords.map((label) => ({ label, type: "keyword", boost: -50 }));
   const stmtKwOptions: Completion[] = spec.statementKeywords.map((label) => ({ label, type: "keyword", boost: 50 }));
   const fnOptions: Completion[] = spec.functions.map((label) => ({ label, type: "function", boost: -30 }));
   const typeOptions: Completion[] = spec.types.map((label) => ({ label, type: "type", boost: -60 }));
 
   // Memoize the schema index on the tables array identity.
-  let cachedRef: Table[] | null = null;
-  let cachedIdx: Index = { schemas: [], tables: [], byQualified: new Map(), byBare: new Map() };
-  const indexOf = (tables: Table[]) => {
-    if (tables !== cachedRef) {
-      cachedIdx = buildIndex(tables);
-      cachedRef = tables;
-    }
-    return cachedIdx;
-  };
+  const indexOf = makeIndexer();
 
   const VALID = /^\w*$/;
 
@@ -140,12 +89,18 @@ export function makeSqlCompletion(getTables: () => Table[], spec: DialectSpec) {
         }
       }
 
-      const tableOptions: Completion[] = idx.tables.map((t) => ({
-        label: t.schema === "public" ? t.name : `${t.schema}.${t.name}`,
-        type: "class",
-        detail: t.schema,
-        boost: 40,
-      }));
+      // Tables in the active schema (and public) are offered bare and ranked higher,
+      // matching the session search_path so unqualified names resolve at run time.
+      const active = getActiveSchema();
+      const tableOptions: Completion[] = idx.tables.map((t) => {
+        const bare = t.schema === "public" || t.schema === active;
+        return {
+          label: bare ? t.name : `${t.schema}.${t.name}`,
+          type: "class",
+          detail: t.schema,
+          boost: t.schema === active ? 55 : 40,
+        } as Completion;
+      });
       const schemaOptions: Completion[] = idx.schemas.map((s) => ({ label: s, type: "namespace", boost: 20 }));
 
       // 2) Clause context: last significant keyword before the cursor.

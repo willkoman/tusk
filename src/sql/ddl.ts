@@ -2,7 +2,7 @@
 // multi-statement script) that is `;`-free per statement — the run path splits on
 // `;` and the editor-scaffold adds the trailing one. Quoting via ident.ts.
 
-import { ident, qualify, lit } from "./ident";
+import { ident, qualify, qualifyIn, lit } from "./ident";
 
 export type ColumnSpec = {
   name: string;
@@ -325,19 +325,27 @@ export function alterSequenceRestart(schema: string, name: string, value: string
 
 // --- GENERATE statement scaffolds -------------------------------------------
 
-export function genSelect(schema: string, table: string, cols: string[]): string {
+// Query scaffolds drop the schema prefix when it matches the console's active
+// schema (search_path) — see qualifyIn.
+export function genSelect(schema: string, table: string, cols: string[], activeSchema?: string | null): string {
   const c = cols.length ? cols.map(ident).join(", ") : "*";
-  return `SELECT ${c}\nFROM ${qualify(schema, table)}\nLIMIT 100`;
+  return `SELECT ${c}\nFROM ${qualifyIn(schema, table, activeSchema)}\nLIMIT 100`;
 }
-export function genInsert(schema: string, table: string, cols: string[]): string {
+export function genInsert(schema: string, table: string, cols: string[], activeSchema?: string | null): string {
   const names = cols.length ? cols : ["column"];
-  return `INSERT INTO ${qualify(schema, table)} (${names.map(ident).join(", ")})\nVALUES (${names
+  return `INSERT INTO ${qualifyIn(schema, table, activeSchema)} (${names.map(ident).join(", ")})\nVALUES (${names
     .map(() => "NULL")
     .join(", ")})`;
 }
-export function genUpdate(schema: string, table: string, cols: string[], pkCols: string[]): string {
+export function genUpdate(
+  schema: string,
+  table: string,
+  cols: string[],
+  pkCols: string[],
+  activeSchema?: string | null,
+): string {
   const sets = (cols.length ? cols : ["column"]).map((c) => `${ident(c)} = NULL`).join(",\n  ");
   const keys = pkCols.length ? pkCols : cols.slice(0, 1);
   const where = (keys.length ? keys : ["id"]).map((c) => `${ident(c)} = NULL`).join(" AND ");
-  return `UPDATE ${qualify(schema, table)} SET\n  ${sets}\nWHERE ${where}`;
+  return `UPDATE ${qualifyIn(schema, table, activeSchema)} SET\n  ${sets}\nWHERE ${where}`;
 }

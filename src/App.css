@@ -140,9 +140,53 @@ button.ghost { background: transparent; }
 .cm-host .cm-editor { height: 100%; }
 .cm-host .cm-editor.cm-focused { outline: none; }
 .cm-host .cm-gutters { background: transparent; border-right: 1px solid var(--border); }
+
+/* Auto-folded large literal placeholder */
+.cm-autofold {
+  display: inline-block; margin: 0 1px; padding: 0 6px; border-radius: 10px;
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--accent-2);
+  font-size: 0.85em; font-style: italic; cursor: pointer; vertical-align: baseline;
+}
+.cm-autofold:hover { background: var(--border); color: var(--text); }
+
+/* Per-statement run gutter + active-statement highlight */
+.cm-statement-gutter { width: 16px; }
+.cm-run-marker { color: var(--muted); cursor: pointer; opacity: 0; transition: opacity 0.1s, color 0.1s; font-size: 10px; }
+.cm-host .cm-editor:hover .cm-run-marker { opacity: 0.55; }
+.cm-run-marker:hover { opacity: 1 !important; color: var(--accent-2); }
+.cm-line.cm-activeStatement { background: rgba(59, 130, 246, 0.07); }
+
+/* Lint squiggle + search panel theming to match the palette */
+/* Wavy underline via a repeating SVG background (same mechanism as CodeMirror's
+   default — renders reliably in WKWebView, unlike text-decoration-style: wavy),
+   recolored to the theme. */
+.cm-host .cm-lintRange { background-position: left bottom; background-repeat: repeat-x; padding-bottom: 0.7px; }
+.cm-host .cm-lintRange-error { text-decoration: none; background-image: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="6" height="3"><path d="m0 2.5 l2 -1.5 l1 0 l2 1.5 l1 0" stroke="%23f87171" fill="none" stroke-width=".9"/></svg>'); }
+.cm-host .cm-lintRange-warning { text-decoration: none; background-image: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="6" height="3"><path d="m0 2.5 l2 -1.5 l1 0 l2 1.5 l1 0" stroke="%233b82f6" fill="none" stroke-width=".9"/></svg>'); }
+.cm-host .cm-lintRange-info { text-decoration: none; background-image: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="6" height="3"><path d="m0 2.5 l2 -1.5 l1 0 l2 1.5 l1 0" stroke="%238b97a6" fill="none" stroke-width=".9"/></svg>'); }
+.cm-host .cm-panel.cm-search { background: var(--panel-2); color: var(--text); border-top: 1px solid var(--border); }
+.cm-host .cm-panel.cm-search input, .cm-host .cm-panel.cm-search button { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 4px; }
+.cm-host .cm-tooltip { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+
+/* Editor tab strip */
+.tab-strip { display: flex; align-items: stretch; gap: 2px; padding: 4px 6px 0; background: var(--panel); overflow-x: auto; scrollbar-width: thin; }
+.tab { display: flex; align-items: center; gap: 6px; padding: 4px 8px 4px 11px; max-width: 200px; border: 1px solid transparent; border-bottom: none; border-radius: 7px 7px 0 0; color: var(--muted); cursor: pointer; font-size: 12px; white-space: nowrap; }
+.tab:hover { background: var(--panel-2); color: var(--text); }
+.tab.active { background: var(--bg); color: var(--text); border-color: var(--border); }
+.tab-title { overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
+.tab-dot { color: var(--accent-2); font-size: 9px; line-height: 1; }
+.tab-close { background: transparent; border: none; color: var(--muted); border-radius: 4px; width: 16px; height: 16px; padding: 0; line-height: 1; cursor: pointer; opacity: 0; }
+.tab:hover .tab-close, .tab.active .tab-close { opacity: 0.7; }
+.tab-close:hover { background: var(--border); color: var(--text); opacity: 1; }
+.tab-new { background: transparent; border: none; color: var(--muted); font-size: 15px; padding: 0 8px; cursor: pointer; border-radius: 6px; }
+.tab-new:hover { background: var(--panel-2); color: var(--text); }
+.confirm-text { padding: 14px 16px 4px; color: var(--text); font-size: 13px; line-height: 1.5; }
+
 .toolbar { display: flex; align-items: center; gap: 10px; padding: 6px 12px; background: var(--panel); }
 .toolbar .run { min-width: 116px; font-variant-numeric: tabular-nums; }
 .toolbar .hint { color: var(--muted); font-size: 11px; }
+.toolbar .icon.active { background: var(--accent); color: #fff; opacity: 1; }
+.cursor-info { font-variant-numeric: tabular-nums; font-size: 11px; }
 
 .result { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
 .result-error { margin: 10px 12px; }
@@ -165,6 +209,22 @@ button.ghost { background: transparent; }
 .streaming { color: var(--accent-2); }
 
 .export-select { font: inherit; font-size: 11px; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 2px 6px; }
+.export-btn { font-size: 11px; padding: 3px 10px; }
+
+/* Export configurator */
+.export-grid { display: flex; flex-direction: column; gap: 12px; padding: 14px 16px 4px; max-height: 62vh; overflow-y: auto; }
+.export-sec { display: flex; flex-direction: column; gap: 6px; }
+.export-label { font-size: 10.5px; letter-spacing: 0.4px; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+.export-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+.export-row label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--muted); }
+.export-row select, .export-row input { font: inherit; font-size: 12px; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 4px 7px; }
+.export-narrow { width: 52px; }
+.export-check { flex-direction: row !important; align-items: center; gap: 6px; color: var(--text) !important; }
+.export-cols { display: flex; flex-direction: column; gap: 2px; max-height: 150px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; }
+.export-col { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.export-col .icon { padding: 1px 5px; font-size: 11px; }
+.export-preview { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; font-size: 11px; max-height: 160px; overflow: auto; white-space: pre; color: var(--text); }
+.export-note { font-size: 11px; color: var(--muted); font-style: italic; }
 
 .modal-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55); display: grid; place-items: center; z-index: 50; }
 .modal { width: 380px; max-width: 92vw; max-height: 90vh; overflow-y: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; display: flex; flex-direction: column; gap: 10px; }
