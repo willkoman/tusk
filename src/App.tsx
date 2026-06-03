@@ -186,9 +186,10 @@ function App() {
   }
 
   // Open generated SQL in a fresh tab (never clobber the current one), with the
-  // console's active schema set so the generated unqualified names resolve.
+  // console's active schema set so the generated unqualified names resolve. Not
+  // marked dirty — it's regenerable and becomes dirty once the user edits it.
   function openGeneratedTab(sqlText: string, schema: string | null, title?: string) {
-    const t = makeTab({ sql: sqlText, searchSchema: schema, title, dirty: true });
+    const t = makeTab({ sql: sqlText, searchSchema: schema, title });
     setTabs((ts) => [...ts, t]);
     switchTab(t.id);
   }
@@ -773,14 +774,14 @@ function App() {
   });
 
   function runTable(schemaName: string, name: string) {
-    const q = `SELECT * FROM ${qualifyIn(schemaName, name, activeTab().searchSchema)}`;
-    setSql(q);
+    const q = `SELECT * FROM ${qualifyIn(schemaName, name, schemaName)}`;
+    openGeneratedTab(q, schemaName, name);
     doRun(q);
   }
 
   function runTableLimit(schemaName: string, name: string, limit: number) {
-    const q = `SELECT * FROM ${qualifyIn(schemaName, name, activeTab().searchSchema)} LIMIT ${limit}`;
-    setSql(q);
+    const q = `SELECT * FROM ${qualifyIn(schemaName, name, schemaName)} LIMIT ${limit}`;
+    openGeneratedTab(q, schemaName, name);
     doRun(q);
   }
 
