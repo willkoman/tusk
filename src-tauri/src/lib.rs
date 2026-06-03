@@ -304,7 +304,18 @@ async fn fetch_more(
 ) -> Result<FetchResult, AppError> {
     let conn = state.get(&connection_id)?;
     let mut c = conn.lock().await;
+    let was_streaming = c.cursor_open;
     ensure_alive(&mut c).await?;
+    // A live stream whose connection had to be re-opened (idle timeout, server restart,
+    // or a network drop surfaced by TCP keepalives) has lost its server-side cursor — it
+    // lived in a transaction on the old connection. Don't silently report `done`: that
+    // truncates the result with no indication. Surface the break so the UI can show it;
+    // the user re-runs to load the rest.
+    if was_streaming && !c.cursor_open {
+        return Err(AppError::new(
+            "connection dropped mid-stream — the result is incomplete. Re-run the query to load the rest.",
+        ));
+    }
     let page = page_size.unwrap_or(1000);
     if !c.cursor_open {
         return Ok(FetchResult {
