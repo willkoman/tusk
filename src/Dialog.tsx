@@ -5,10 +5,13 @@ export function Dialog(props: {
   title: string;
   onClose: () => void;
   width?: number;
+  /** When false, the ✕ and overlay-click dismissal are disabled (e.g. while busy). */
+  dismissable?: boolean;
   children: JSX.Element;
 }) {
+  const canClose = () => props.dismissable !== false;
   return (
-    <div class="modal-overlay" onClick={props.onClose}>
+    <div class="modal-overlay" onClick={() => canClose() && props.onClose()}>
       <div
         class="modal"
         style={props.width ? { width: `${props.width}px` } : undefined}
@@ -17,7 +20,7 @@ export function Dialog(props: {
         <div class="modal-head">
           {props.title}
           <span class="spacer" />
-          <button class="icon" onClick={props.onClose}>✕</button>
+          <button class="icon" disabled={!canClose()} onClick={props.onClose}>✕</button>
         </div>
         {props.children}
       </div>

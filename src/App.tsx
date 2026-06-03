@@ -684,6 +684,17 @@ function App() {
     setStatus(`exported ${n} rows → ${path}`);
   }
 
+  // Immediately cancel + roll back the in-flight export/import on this connection.
+  async function cancelOperation() {
+    const c = conn();
+    if (!c) return;
+    try {
+      await invoke("cancel_operation", { connectionId: c.id });
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
   async function exportToClipboard(opts: ExportOptions) {
     const src = exportSrc();
     if (!src) return;
@@ -758,7 +769,8 @@ function App() {
       await loadSchema();
       setTimeout(() => setImportOpen(false), 900);
     } catch (e) {
-      setImportMsg(errMsg(e));
+      const m = errMsg(e);
+      setImportMsg(/cancel/i.test(m) ? "Import cancelled — rolled back." : m);
     } finally {
       setImportBusy(false);
     }
@@ -1396,35 +1408,46 @@ function App() {
         </div>
 
         <Show when={importOpen()}>
-          <div class="modal-overlay" onClick={() => setImportOpen(false)}>
+          <div class="modal-overlay" onClick={() => !importBusy() && setImportOpen(false)}>
             <div class="modal" onClick={(e) => e.stopPropagation()}>
-              <div class="modal-head">Import data<span class="spacer" /><button class="icon" onClick={() => setImportOpen(false)}>✕</button></div>
-              <input ref={importFileInput} type="file" accept=".csv,.tsv,.json,.txt" style={{ display: "none" }} onChange={onImportFile} />
-              <button class="ghost full" onClick={() => importFileInput?.click()}>Choose file…</button>
-              <Show when={importRaw()}>
-                <label class="checkbox"><input type="checkbox" checked={importHasHeader()} onChange={(e) => { setImportHasHeader(e.currentTarget.checked); reparseImport(); }} />First row is header (CSV)</label>
-              </Show>
+              <div class="modal-head">Import data<span class="spacer" /><button class="icon" disabled={importBusy()} onClick={() => setImportOpen(false)}>✕</button></div>
+              {/* All configuration controls disable while an import is running. */}
+              <fieldset class="import-fieldset" disabled={importBusy()}>
+                <input ref={importFileInput} type="file" accept=".csv,.tsv,.json,.txt" style={{ display: "none" }} onChange={onImportFile} />
+                <button class="ghost full" onClick={() => importFileInput?.click()}>Choose file…</button>
+                <Show when={importRaw()}>
+                  <label class="checkbox"><input type="checkbox" checked={importHasHeader()} onChange={(e) => { setImportHasHeader(e.currentTarget.checked); reparseImport(); }} />First row is header (CSV)</label>
+                </Show>
+                <Show when={importData()}>
+                  {(d) => (
+                    <>
+                      <div class="import-info">{d().columns.length} cols · {d().rows.length} rows · {d().columns.slice(0, 6).join(", ")}{d().columns.length > 6 ? "…" : ""}</div>
+                      <div class="seg">
+                        <button classList={{ active: importMode() === "existing" }} onClick={() => setImportMode("existing")}>Existing table</button>
+                        <button classList={{ active: importMode() === "new" }} onClick={() => setImportMode("new")}>New table</button>
+                      </div>
+                      <Show
+                        when={importMode() === "existing"}
+                        fallback={<label>New table name<input value={importNewName()} onInput={(e) => setImportNewName(e.currentTarget.value)} placeholder="table_name" /></label>}
+                      >
+                        <label>Target table
+                          <select value={importTarget()} onChange={(e) => setImportTarget(e.currentTarget.value)}>
+                            <For each={schema()}>{(t) => <option value={`${t.schema}.${t.name}`}>{t.schema}.{t.name}</option>}</For>
+                          </select>
+                        </label>
+                      </Show>
+                    </>
+                  )}
+                </Show>
+              </fieldset>
               <Show when={importData()}>
-                {(d) => (
-                  <>
-                    <div class="import-info">{d().columns.length} cols · {d().rows.length} rows · {d().columns.slice(0, 6).join(", ")}{d().columns.length > 6 ? "…" : ""}</div>
-                    <div class="seg">
-                      <button classList={{ active: importMode() === "existing" }} onClick={() => setImportMode("existing")}>Existing table</button>
-                      <button classList={{ active: importMode() === "new" }} onClick={() => setImportMode("new")}>New table</button>
-                    </div>
-                    <Show
-                      when={importMode() === "existing"}
-                      fallback={<label>New table name<input value={importNewName()} onInput={(e) => setImportNewName(e.currentTarget.value)} placeholder="table_name" /></label>}
-                    >
-                      <label>Target table
-                        <select value={importTarget()} onChange={(e) => setImportTarget(e.currentTarget.value)}>
-                          <For each={schema()}>{(t) => <option value={`${t.schema}.${t.name}`}>{t.schema}.{t.name}</option>}</For>
-                        </select>
-                      </label>
-                    </Show>
-                    <button class="run full" onClick={doImport} disabled={importBusy()}>{importBusy() ? "Importing…" : "Import"}</button>
-                  </>
-                )}
+                <Show
+                  when={importBusy()}
+                  fallback={<button class="run full" onClick={doImport}>Import</button>}
+                >
+                  <div class="import-busy"><span class="spinner-sm" />Importing…</div>
+                  <button class="ghost full" onClick={() => void cancelOperation()}>Cancel &amp; roll back</button>
+                </Show>
               </Show>
               <Show when={importMsg()}><div class="import-msg">{importMsg()}</div></Show>
             </div>
@@ -1446,6 +1469,7 @@ function App() {
               onClose={() => setExportSrc(null)}
               onExportFile={exportToFile}
               onExportClipboard={exportToClipboard}
+              onCancel={cancelOperation}
             />
           )}
         </Show>

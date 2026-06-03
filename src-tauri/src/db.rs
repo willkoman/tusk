@@ -95,23 +95,32 @@ pub struct ConnState {
 pub const CURSOR_NAME: &str = "tusk_cur";
 
 /// Open a Postgres connection (TLS per sslmode) and return the client + server version.
-pub async fn open(cfg: &ConnectionConfig) -> Result<(Client, String), AppError> {
-    let mode = cfg.sslmode.as_deref().unwrap_or("prefer");
-    let (ssl_mode, strict) = match mode {
-        "disable" => (SslMode::Disable, false),
-        "require" => (SslMode::Require, false),
-        "verify-ca" | "verify-full" => (SslMode::Require, true),
-        _ => (SslMode::Prefer, false), // prefer: TLS if available, else plaintext
-    };
+/// Map an sslmode string to a `SslMode` (encrypt) flag.
+fn ssl_mode_of(cfg: &ConnectionConfig) -> SslMode {
+    match cfg.sslmode.as_deref().unwrap_or("prefer") {
+        "disable" => SslMode::Disable,
+        "require" | "verify-ca" | "verify-full" => SslMode::Require,
+        _ => SslMode::Prefer, // prefer: TLS if available, else plaintext
+    }
+}
 
+/// Build a TLS connector matching the connection's sslmode: always encrypt, but verify
+/// the certificate only for `verify-ca`/`verify-full` (libpq semantics). Reused by
+/// `open` and by the query-cancel path (which opens its own short-lived connection).
+pub fn make_tls(cfg: &ConnectionConfig) -> Result<postgres_native_tls::MakeTlsConnector, AppError> {
+    let strict = matches!(cfg.sslmode.as_deref(), Some("verify-ca") | Some("verify-full"));
     let mut builder = native_tls::TlsConnector::builder();
     if !strict {
-        // "require"/"prefer" encrypt but do not verify the certificate (libpq semantics).
         builder.danger_accept_invalid_certs(true);
         builder.danger_accept_invalid_hostnames(true);
     }
     let connector = builder.build().map_err(|e| AppError::new(e.to_string()))?;
-    let tls = postgres_native_tls::MakeTlsConnector::new(connector);
+    Ok(postgres_native_tls::MakeTlsConnector::new(connector))
+}
+
+pub async fn open(cfg: &ConnectionConfig) -> Result<(Client, String), AppError> {
+    let ssl_mode = ssl_mode_of(cfg);
+    let tls = make_tls(cfg)?;
 
     let mut pgcfg = tokio_postgres::Config::new();
     pgcfg
