@@ -185,6 +185,14 @@ function App() {
     switchTab(t.id);
   }
 
+  // Open generated SQL in a fresh tab (never clobber the current one), with the
+  // console's active schema set so the generated unqualified names resolve.
+  function openGeneratedTab(sqlText: string, schema: string | null, title?: string) {
+    const t = makeTab({ sql: sqlText, searchSchema: schema, title, dirty: true });
+    setTabs((ts) => [...ts, t]);
+    switchTab(t.id);
+  }
+
   function removeTab(id: string) {
     if (cursorOwnerTabId === id) cursorOwnerTabId = null;
     editorApi()?.dropTab(id);
@@ -836,20 +844,22 @@ function App() {
     }
   }
 
-  // Generate a SELECT/INSERT/UPDATE scaffold from a relation's columns.
+  // Generate a SELECT/INSERT/UPDATE scaffold from a relation's columns into a NEW
+  // tab whose schema is the relation's, so the generated query stays unqualified
+  // and resolves (rather than clobbering the current tab).
   async function generate(n: NodeDescriptor, kind: "select" | "insert" | "update") {
     await loadDetail(n.schema!, n.name, false);
     const d = details()[`${n.schema}.${n.name}`];
     const cols = d?.columns.map((c) => c.name) ?? [];
     const pks = d?.columns.filter((c) => c.is_pk).map((c) => c.name) ?? [];
-    const as = activeTab().searchSchema;
+    const schema = n.schema!;
     const text =
       kind === "select"
-        ? ddl.genSelect(n.schema!, n.name, cols, as)
+        ? ddl.genSelect(schema, n.name, cols, schema)
         : kind === "insert"
-          ? ddl.genInsert(n.schema!, n.name, cols, as)
-          : ddl.genUpdate(n.schema!, n.name, cols, pks, as);
-    scaffoldEditor(text.trim() + ";");
+          ? ddl.genInsert(schema, n.name, cols, schema)
+          : ddl.genUpdate(schema, n.name, cols, pks, schema);
+    openGeneratedTab(text.trim() + ";", schema, n.name);
   }
 
   // Index/constraint dialogs need the relation's column list (and FK targets).
