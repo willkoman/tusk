@@ -192,17 +192,33 @@ button.ghost { background: transparent; }
 .result-error { margin: 10px 12px; }
 .result-empty { padding: 16px; color: var(--muted); }
 
-.grid-scroll { flex: 1; overflow: auto; position: relative; }
-.grid-header { position: sticky; top: 0; z-index: 2; display: flex; height: 30px; background: var(--panel-2); border-bottom: 1px solid var(--border); }
-.grid-body { position: relative; }
-.grid-row { position: absolute; left: 0; height: 28px; display: flex; }
-.grid-row:hover .cell { background: var(--panel); }
-.cell {
-  height: 100%; padding: 0 10px; display: flex; align-items: center;
-  border-right: 1px solid var(--border); border-bottom: 1px solid var(--border);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px;
-}
-.cell.head { font-weight: 600; color: var(--muted); border-bottom: none; }
+/* Result grid (ResultGrid.tsx): synchronized panes (header/gutter transform-translated,
+   not sticky) + two-axis virtualization. Inline styles set sizes/offsets/transforms. */
+.rg { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+.rg-corner { position: absolute; top: 0; left: 0; z-index: 4; background: var(--panel-2); border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); cursor: pointer; }
+.rg-headwrap { position: absolute; top: 0; right: 0; overflow: hidden; z-index: 3; background: var(--panel-2); border-bottom: 1px solid var(--border); }
+.rg-head { position: relative; height: 100%; }
+.rg-headcell { position: absolute; top: 0; display: flex; align-items: center; gap: 4px; padding: 0 6px 0 10px; border-right: 1px solid var(--border); font-weight: 600; color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; box-sizing: border-box; overflow: hidden; }
+.rg-headcell:hover { background: var(--panel); }
+.rg-headcell.sel { background: rgba(59, 130, 246, 0.18); color: var(--text); }
+.rg-headname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.rg-sort { color: var(--accent-2); font-size: 10px; flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.rg-resize { position: absolute; right: 0; top: 0; width: 6px; height: 100%; cursor: col-resize; z-index: 5; }
+.rg-resize:hover { background: var(--accent); }
+.rg-reorder { position: absolute; top: 0; width: 2px; background: var(--accent); z-index: 6; pointer-events: none; }
+.rg-filter { position: absolute; left: 0; }
+.rg-filter-input { position: absolute; top: 4px; height: 22px; font: inherit; font-size: 11px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 0 6px; box-sizing: border-box; }
+.rg-gutwrap { position: absolute; left: 0; bottom: 0; overflow: hidden; z-index: 2; background: var(--panel-2); border-right: 1px solid var(--border); }
+.rg-gut { position: relative; }
+.rg-gutnum { position: absolute; left: 0; width: 100%; display: flex; align-items: center; justify-content: flex-end; padding-right: 8px; color: var(--muted); font-size: 11px; font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; cursor: pointer; box-sizing: border-box; border-bottom: 1px solid var(--border); user-select: none; }
+.rg-gutnum:hover { background: var(--panel); }
+.rg-gutnum.sel { background: rgba(59, 130, 246, 0.18); color: var(--text); }
+.rg-scroll { position: absolute; bottom: 0; right: 0; overflow: auto; }
+.rg-sizer { position: relative; }
+.rg-row { position: absolute; left: 0; }
+.rg-cell { position: absolute; top: 0; height: 100%; padding: 0 10px; display: flex; align-items: center; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; box-sizing: border-box; }
+.rg-cell.sel { background: rgba(59, 130, 246, 0.18); }
+.rg-cell.active { outline: 1.5px solid var(--accent); outline-offset: -1.5px; z-index: 1; }
 .null { color: var(--muted); font-style: italic; }
 
 .statusbar { display: flex; align-items: center; gap: 12px; padding: 5px 12px; border-top: 1px solid var(--border); background: var(--panel); color: var(--muted); font-size: 12px; }
