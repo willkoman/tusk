@@ -30,6 +30,9 @@ postgres-native-tls = "0.5"
 bytes = "1"
 futures-util = "0.3"
 rust_xlsxwriter = "0.95.0"
+# Embedded DuckDB. `bundled` statically compiles libduckdb from source (no system
+# dep) — larger binary + slow first build, but a self-contained installer.
+duckdb = { version = "1", features = ["bundled"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }

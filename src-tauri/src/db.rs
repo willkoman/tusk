@@ -40,11 +40,19 @@ impl From<tokio_postgres::Error> for AppError {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConnectionConfig {
+    /// "postgres" (default) | "duckdb" | … — selects the driver. Network fields below
+    /// are ignored by embedded drivers (DuckDB uses `path`).
+    #[serde(default)]
+    pub driver: Option<String>,
+    #[serde(default)]
     pub host: String,
+    #[serde(default)]
     pub port: u16,
+    #[serde(default)]
     pub user: String,
     #[serde(default)]
     pub password: String,
+    #[serde(default)]
     pub dbname: String,
     /// "disable" | "prefer" (default) | "require" | "verify-full".
     #[serde(default)]
@@ -52,6 +60,9 @@ pub struct ConnectionConfig {
     /// When true, the session is set read-only (writes/DDL rejected by the server).
     #[serde(default)]
     pub read_only: bool,
+    /// Embedded-driver database file (DuckDB/SQLite): an absolute path or ":memory:".
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
