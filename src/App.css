@@ -150,10 +150,10 @@ button.ghost { background: transparent; }
 .cm-autofold:hover { background: var(--border); color: var(--text); }
 
 /* Per-statement run gutter + active-statement highlight */
-.cm-statement-gutter { width: 16px; }
-.cm-run-marker { color: var(--muted); cursor: pointer; opacity: 0; transition: opacity 0.1s, color 0.1s; font-size: 10px; }
+.cm-statement-gutter { width: 20px; }
+.cm-run-marker { color: var(--muted); cursor: pointer; opacity: 0; transition: opacity 0.1s, color 0.1s, transform 0.1s; font-size: 13px; line-height: 1; }
 .cm-host .cm-editor:hover .cm-run-marker { opacity: 0.55; }
-.cm-run-marker:hover { opacity: 1 !important; color: var(--accent-2); }
+.cm-run-marker:hover { opacity: 1 !important; color: var(--accent-2); transform: scale(1.2); }
 .cm-line.cm-activeStatement { background: rgba(59, 130, 246, 0.07); }
 
 /* Lint squiggle + search panel theming to match the palette */
