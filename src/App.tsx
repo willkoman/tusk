@@ -122,6 +122,7 @@ function App() {
   const schemaNames = createMemo(() => [...new Set(schema().map((t) => t.schema))].sort());
 
   const [running, setRunning] = createSignal(false);
+  const [runningTabId, setRunningTabId] = createSignal<string | null>(null); // tab whose query is in flight
   const [runMs, setRunMs] = createSignal(0); // live elapsed while a query runs
   const [editorApi, setEditorApi] = createSignal<EditorApi | null>(null);
   const [editorH, setEditorH] = createSignal(Math.max(300, Math.round((window.innerHeight - 120) * 0.6)));
@@ -277,6 +278,7 @@ function App() {
   const setGridView = (patch: Partial<GridView>) => patchTab(activeTabId(), { gridView: { ...activeTab().gridView, ...patch } });
   const canSortFilter = () => wrappableQuery(activeTab().result.baseQuery);
   const [loadingAll, setLoadingAll] = createSignal(false);
+  const [schemaLoading, setSchemaLoading] = createSignal(false);
   let cancelAll = false;
   let importFileInput: HTMLInputElement | undefined;
   let loadingMore = false;
@@ -495,6 +497,7 @@ function App() {
   async function loadSchema() {
     const c = conn();
     if (!c) return;
+    setSchemaLoading(true);
     try {
       const t = await invoke<DbTree>("db_tree", { connectionId: c.id });
       setTree(t);
@@ -512,6 +515,8 @@ function App() {
       void refreshLoadedDetails();
     } catch (e) {
       console.error(e);
+    } finally {
+      setSchemaLoading(false);
     }
   }
 
@@ -567,6 +572,7 @@ function App() {
     cursorOwnerTabId = null;
     patchResult(runTabId, { runErr: "", status: "" });
     setRunning(true);
+    setRunningTabId(runTabId);
     const t0 = performance.now();
     setRunMs(0);
     runTimer = setInterval(() => setRunMs(performance.now() - t0), 200);
@@ -598,6 +604,7 @@ function App() {
     } finally {
       if (runTimer) clearInterval(runTimer);
       setRunning(false);
+      setRunningTabId(null);
       patchResult(runTabId, { elapsed: Math.round(performance.now() - t0) });
     }
   }
@@ -1208,7 +1215,7 @@ function App() {
               <label class="checkbox"><input type="checkbox" checked={defaultConnect()} onChange={(e) => setDefaultConnect(e.currentTarget.checked)} />Connect on startup</label>
               <div class="form-actions">
                 <button type="button" class="ghost" onClick={saveProfile}>Save</button>
-                <button type="submit" disabled={connecting()}>{connecting() ? "Connecting…" : "Connect"}</button>
+                <button type="submit" disabled={connecting()}>{connecting() ? <><span class="spinner-sm" />Connecting…</> : "Connect"}</button>
               </div>
               <Show when={connErr()}><div class="error">{connErr()}</div></Show>
             </form>
@@ -1231,7 +1238,7 @@ function App() {
               <div class="head-actions">
                 <button class="icon" title="New… (based on selection)" onClick={(e) => openPlusMenu(e)}><Icon name="plus" /></button>
                 <button class="icon" title="Import data" onClick={openImport}><Icon name="download" /></button>
-                <button class="icon" title="Refresh" onClick={() => loadSchema()}><Icon name="refresh" /></button>
+                <button class="icon" title="Refresh" disabled={schemaLoading()} onClick={() => loadSchema()}>{schemaLoading() ? <span class="spinner-sm" /> : <Icon name="refresh" />}</button>
               </div>
             </div>
             <div class="sidebar-filter">
@@ -1292,6 +1299,7 @@ function App() {
                 onChange={(t, id) => patchTab(id, { sql: t, dirty: true })}
                 onRun={() => doRun()}
                 onRunStatement={(t) => doRun(t)}
+                running={running() && runningTabId() === activeTabId()}
                 tabId={activeTabId()}
                 tables={schema()}
                 activeSchema={activeTab().searchSchema}
@@ -1303,7 +1311,7 @@ function App() {
                 onContextMenu={openEditorMenu}
               />
               <div class="toolbar">
-                <button class="run" onClick={() => doRun()} disabled={running()}>{running() ? `Running… ${fmtDur(runMs())}` : "Run ▶"}</button>
+                <button class="run" onClick={() => doRun()} disabled={running()}>{running() ? <><span class="spinner-sm" />Running… {fmtDur(runMs())}</> : "Run ▶"}</button>
                 <button class="ghost" onClick={openFileDialog}>Open</button>
                 <button class="ghost" onClick={() => void saveActiveTab()}>Save</button>
                 <button class="ghost" onClick={() => void saveAsActiveTab()}>Save As</button>
@@ -1376,8 +1384,8 @@ function App() {
                 )}
               </Show>
               <Show when={!done()}>
-                <button class="ghost export-btn" onClick={loadAll}>{loadingAll() ? "Cancel" : "Load all"}</button>
-                <span class="streaming">streaming…</span>
+                <button class="ghost export-btn" onClick={loadAll}>{loadingAll() ? <><span class="spinner-sm" />Cancel</> : "Load all"}</button>
+                <span class="streaming"><span class="spinner-sm" />streaming…</span>
               </Show>
               <Show when={lastQuery() || columns().length > 0}>
                 <button class="ghost export-btn" onClick={openExport}>Export…</button>
