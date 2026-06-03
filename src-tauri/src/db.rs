@@ -81,16 +81,6 @@ pub struct FetchResult {
     pub done: bool,
 }
 
-/// A live connection plus whether a streaming cursor is open and whether it is read-only.
-/// `config` is retained (server-side only, never sent to the frontend) so a dropped
-/// connection — e.g. an idle timeout — can be transparently re-opened.
-pub struct ConnState {
-    pub client: Client,
-    pub cursor_open: bool,
-    pub read_only: bool,
-    pub config: ConnectionConfig,
-}
-
 /// Name of the server-side cursor used for streaming reads. One per connection.
 pub const CURSOR_NAME: &str = "tusk_cur";
 
