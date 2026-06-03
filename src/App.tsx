@@ -1,5 +1,6 @@
 import { createSignal, createMemo, createEffect, onMount, onCleanup, For, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./App.css";
 import { SqlEditor, type EditorApi } from "./SqlEditor";
 import { type DialectId } from "./sql/dialects";
@@ -532,6 +533,18 @@ function App() {
     setTabs([fresh]);
     setActiveTabId(fresh.id);
   }
+
+  // Reflect the connected database in the OS window title (mascot + driver).
+  createEffect(() => {
+    const c = conn();
+    const kind = caps()?.kind;
+    const title = c ? `${driverMascot(kind)} Tusk — ${driverLabel(kind)}` : "Tusk";
+    try {
+      void getCurrentWindow().setTitle(title);
+    } catch {
+      /* not in a Tauri window (e.g. preview) */
+    }
+  });
 
   // Debounced per-connection tab-set save as buffers/structure change.
   createEffect(() => {
