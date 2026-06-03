@@ -89,11 +89,11 @@ export function makeSqlCompletion(getTables: () => Table[], spec: DialectSpec) {
     return cachedIdx;
   };
 
-  const VALID = /^[\w$]*$/;
+  const VALID = /^\w*$/;
 
   return (ctx: CompletionContext): CompletionResult | null => {
     try {
-      const word = ctx.matchBefore(/[\w$]*/);
+      const word = ctx.matchBefore(/\w*/);
       const from = word ? word.from : ctx.pos;
       const doc = ctx.state.doc.toString();
       const before = doc.slice(Math.max(0, from - 240), from);
@@ -102,7 +102,7 @@ export function makeSqlCompletion(getTables: () => Table[], spec: DialectSpec) {
       const aliases = aliasMap(stmt);
 
       // 1) Qualified: `alias.` / `table.` / `schema.` / `schema.table.`
-      const dot = /([\w$]+(?:\.[\w$]+)*)\.\s*$/.exec(before);
+      const dot = /(\w+(?:\.\w+)*)\.\s*$/.exec(before);
       if (dot) {
         const qual = dot[1];
         const last = qual.split(".").pop()!.toLowerCase();

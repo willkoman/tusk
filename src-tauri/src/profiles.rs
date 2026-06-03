@@ -19,6 +19,10 @@ pub struct Profile {
     pub dbname: String,
     #[serde(default)]
     pub save_password: bool,
+    #[serde(default)]
+    pub sslmode: Option<String>,
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 fn store_path(app: &tauri::AppHandle) -> Result<PathBuf, AppError> {

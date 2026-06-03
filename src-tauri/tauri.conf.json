@@ -12,9 +12,12 @@
   "app": {
     "windows": [
       {
-        "title": "tusk",
-        "width": 800,
-        "height": 600
+        "title": "Tusk",
+        "width": 1200,
+        "height": 820,
+        "minWidth": 900,
+        "minHeight": 600,
+        "center": true
       }
     ],
     "security": {

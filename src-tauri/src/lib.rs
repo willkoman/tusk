@@ -1,5 +1,8 @@
 mod db;
+mod export;
 mod profiles;
+mod script;
+mod tree;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,11 +35,12 @@ impl AppState {
             .ok_or_else(|| AppError::new("no such connection"))
     }
 
-    fn register(&self, client: tokio_postgres::Client) -> String {
+    fn register(&self, client: tokio_postgres::Client, read_only: bool) -> String {
         let id = format!("conn-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let conn = Arc::new(AsyncMutex::new(ConnState {
             client,
             cursor_open: false,
+            read_only,
         }));
         self.conns.lock().unwrap().insert(id.clone(), conn);
         id
@@ -52,6 +56,17 @@ fn is_cursorable(sql: &str) -> bool {
         || t.starts_with("values")
 }
 
+/// Statements allowed on a read-only connection.
+fn is_read_only_stmt(sql: &str) -> bool {
+    let t = sql.trim_start().to_ascii_lowercase();
+    t.starts_with("select")
+        || t.starts_with("with")
+        || t.starts_with("show")
+        || t.starts_with("explain")
+        || t.starts_with("table")
+        || t.starts_with("values")
+}
+
 #[tauri::command]
 async fn connect(
     state: tauri::State<'_, AppState>,
@@ -59,7 +74,7 @@ async fn connect(
 ) -> Result<ConnectResult, AppError> {
     let (client, server_version) = db::open(&config).await?;
     Ok(ConnectResult {
-        connection_id: state.register(client),
+        connection_id: state.register(client, config.read_only),
         server_version,
     })
 }
@@ -86,10 +101,12 @@ async fn connect_profile(
         user: p.user,
         password: password.unwrap_or_default(),
         dbname: p.dbname,
+        sslmode: p.sslmode,
+        read_only: p.read_only,
     };
     let (client, server_version) = db::open(&config).await?;
     Ok(ConnectResult {
-        connection_id: state.register(client),
+        connection_id: state.register(client, config.read_only),
         server_version,
     })
 }
@@ -146,8 +163,36 @@ async fn run_query(
         c.cursor_open = false;
     }
 
-    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let items = script::split(sql.trim());
+    if items.is_empty() {
+        return Ok(QueryOutcome::Exec {
+            message: "OK (nothing to run)".to_string(),
+        });
+    }
 
+    // A single plain statement runs interactively (streaming result grid).
+    if items.len() == 1 {
+        if let script::Item::Sql(stmt) = &items[0] {
+            let trimmed = stmt.trim();
+            if c.read_only && !is_read_only_stmt(trimmed) {
+                return Err(AppError::new(
+                    "connection is read-only — writes and DDL are blocked",
+                ));
+            }
+            return run_single_stmt(&mut c, trimmed, page).await;
+        }
+    }
+
+    // Multiple statements (or a COPY block) run as a script.
+    let msg = script::run(&c.client, &items, c.read_only).await?;
+    Ok(QueryOutcome::Exec { message: msg })
+}
+
+async fn run_single_stmt(
+    c: &mut db::ConnState,
+    trimmed: &str,
+    page: u32,
+) -> Result<QueryOutcome, AppError> {
     if is_cursorable(trimmed) {
         c.client.batch_execute("BEGIN").await?;
         let declare = format!("DECLARE {CURSOR_NAME} CURSOR FOR {trimmed}");
@@ -175,7 +220,6 @@ async fn run_query(
             done,
         })
     } else {
-        // DDL/DML or non-cursorable read (SHOW, EXPLAIN, INSERT ... RETURNING, ...).
         let messages = c.client.simple_query(trimmed).await?;
         let (columns, rows) = db::collect_rows(&messages);
         if !columns.is_empty() {
@@ -281,10 +325,69 @@ async fn list_schema(
     Ok(tables)
 }
 
+#[tauri::command]
+async fn db_tree(
+    state: tauri::State<'_, AppState>,
+    connection_id: String,
+) -> Result<tree::DbTree, AppError> {
+    let conn = state.get(&connection_id)?;
+    let mut c = conn.lock().await;
+    if c.cursor_open {
+        let _ = c.client.batch_execute("ROLLBACK").await;
+        c.cursor_open = false;
+    }
+    tree::build(&c.client).await
+}
+
+#[tauri::command]
+async fn export_to_file(
+    state: tauri::State<'_, AppState>,
+    connection_id: String,
+    sql: String,
+    format: String,
+    table: String,
+    path: String,
+) -> Result<u64, AppError> {
+    let conn = state.get(&connection_id)?;
+    let mut c = conn.lock().await;
+    if c.cursor_open {
+        let _ = c.client.batch_execute("ROLLBACK").await;
+        c.cursor_open = false;
+    }
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    export::run_export(&c.client, trimmed, &format, &table, &path).await
+}
+
+#[tauri::command]
+async fn import_rows(
+    state: tauri::State<'_, AppState>,
+    connection_id: String,
+    schema: String,
+    table: String,
+    columns: Vec<String>,
+    rows: Vec<Vec<Option<String>>>,
+    create: bool,
+) -> Result<u64, AppError> {
+    let conn = state.get(&connection_id)?;
+    let mut c = conn.lock().await;
+    if c.read_only {
+        return Err(AppError::new("connection is read-only — import blocked"));
+    }
+    if c.cursor_open {
+        let _ = c.client.batch_execute("ROLLBACK").await;
+        c.cursor_open = false;
+    }
+    if create {
+        db::create_table_text(&c.client, &schema, &table, &columns).await?;
+    }
+    db::copy_rows(&c.client, &schema, &table, &columns, &rows).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             connect,
@@ -295,7 +398,10 @@ pub fn run() {
             delete_profile,
             run_query,
             fetch_more,
-            list_schema
+            list_schema,
+            db_tree,
+            export_to_file,
+            import_rows
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

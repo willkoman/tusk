@@ -1,5 +1,8 @@
+use bytes::Bytes;
+use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
-use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
+use tokio_postgres::config::SslMode;
+use tokio_postgres::{Client, SimpleQueryMessage};
 
 /// Error type returned to the frontend. Serializes to `{ message: string }`.
 #[derive(Debug, Serialize)]
@@ -43,6 +46,12 @@ pub struct ConnectionConfig {
     #[serde(default)]
     pub password: String,
     pub dbname: String,
+    /// "disable" | "prefer" (default) | "require" | "verify-full".
+    #[serde(default)]
+    pub sslmode: Option<String>,
+    /// When true, the session is set read-only (writes/DDL rejected by the server).
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,7 +67,6 @@ pub enum QueryOutcome {
     Rows {
         columns: Vec<String>,
         rows: Vec<Vec<Option<String>>>,
-        /// true if the full result set has been delivered (no open cursor remains).
         done: bool,
     },
     Exec {
@@ -72,25 +80,45 @@ pub struct FetchResult {
     pub done: bool,
 }
 
-/// A live connection plus whether a streaming cursor is currently open on it.
+/// A live connection plus whether a streaming cursor is open and whether it is read-only.
 pub struct ConnState {
     pub client: Client,
     pub cursor_open: bool,
+    pub read_only: bool,
 }
 
 /// Name of the server-side cursor used for streaming reads. One per connection.
 pub const CURSOR_NAME: &str = "tusk_cur";
 
-/// Open a Postgres connection and return the client + server version string.
+/// Open a Postgres connection (TLS per sslmode) and return the client + server version.
 pub async fn open(cfg: &ConnectionConfig) -> Result<(Client, String), AppError> {
-    let (client, connection) = tokio_postgres::Config::new()
+    let mode = cfg.sslmode.as_deref().unwrap_or("prefer");
+    let (ssl_mode, strict) = match mode {
+        "disable" => (SslMode::Disable, false),
+        "require" => (SslMode::Require, false),
+        "verify-ca" | "verify-full" => (SslMode::Require, true),
+        _ => (SslMode::Prefer, false), // prefer: TLS if available, else plaintext
+    };
+
+    let mut builder = native_tls::TlsConnector::builder();
+    if !strict {
+        // "require"/"prefer" encrypt but do not verify the certificate (libpq semantics).
+        builder.danger_accept_invalid_certs(true);
+        builder.danger_accept_invalid_hostnames(true);
+    }
+    let connector = builder.build().map_err(|e| AppError::new(e.to_string()))?;
+    let tls = postgres_native_tls::MakeTlsConnector::new(connector);
+
+    let mut pgcfg = tokio_postgres::Config::new();
+    pgcfg
         .host(&cfg.host)
         .port(cfg.port)
         .user(&cfg.user)
         .password(&cfg.password)
         .dbname(&cfg.dbname)
-        .connect(NoTls)
-        .await?;
+        .ssl_mode(ssl_mode);
+
+    let (client, connection) = pgcfg.connect(tls).await?;
 
     // Drive the connection's I/O in the background on Tauri's async runtime.
     tauri::async_runtime::spawn(async move {
@@ -98,6 +126,12 @@ pub async fn open(cfg: &ConnectionConfig) -> Result<(Client, String), AppError> 
             eprintln!("[tusk] postgres connection error: {e}");
         }
     });
+
+    if cfg.read_only {
+        client
+            .batch_execute("SET default_transaction_read_only = on")
+            .await?;
+    }
 
     let server_version = client
         .simple_query("SHOW server_version")
@@ -130,4 +164,80 @@ pub fn collect_rows(messages: &[SimpleQueryMessage]) -> (Vec<String>, Vec<Vec<Op
         }
     }
     (columns, rows)
+}
+
+/// Quote a Postgres identifier.
+pub fn ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn csv_field(v: &Option<String>) -> String {
+    match v {
+        None => String::new(),
+        Some(s) => {
+            if s.is_empty()
+                || s.contains(',')
+                || s.contains('"')
+                || s.contains('\n')
+                || s.contains('\r')
+            {
+                format!("\"{}\"", s.replace('"', "\"\""))
+            } else {
+                s.clone()
+            }
+        }
+    }
+}
+
+/// Create a table whose columns are all `text` (for "create table on import").
+pub async fn create_table_text(
+    client: &Client,
+    schema: &str,
+    table: &str,
+    columns: &[String],
+) -> Result<(), AppError> {
+    let cols = columns
+        .iter()
+        .map(|c| format!("{} text", ident(c)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {}.{} ({cols})",
+            ident(schema),
+            ident(table)
+        ))
+        .await?;
+    Ok(())
+}
+
+/// Bulk-insert rows via COPY ... FROM STDIN (CSV). Returns rows written.
+pub async fn copy_rows(
+    client: &Client,
+    schema: &str,
+    table: &str,
+    columns: &[String],
+    rows: &[Vec<Option<String>>],
+) -> Result<u64, AppError> {
+    let cols = columns.iter().map(|c| ident(c)).collect::<Vec<_>>().join(", ");
+    let copy = format!(
+        "COPY {}.{} ({cols}) FROM STDIN WITH (FORMAT csv)",
+        ident(schema),
+        ident(table)
+    );
+    let sink = client.copy_in(&copy).await?;
+    futures_util::pin_mut!(sink);
+    let mut buf = String::new();
+    for row in rows {
+        let line = row.iter().map(csv_field).collect::<Vec<_>>().join(",");
+        buf.push_str(&line);
+        buf.push('\n');
+        if buf.len() >= 64 * 1024 {
+            sink.send(Bytes::from(std::mem::take(&mut buf))).await?;
+        }
+    }
+    if !buf.is_empty() {
+        sink.send(Bytes::from(buf)).await?;
+    }
+    Ok(sink.finish().await?)
 }
