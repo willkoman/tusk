@@ -1400,7 +1400,7 @@ function App() {
               <Show when={!done()}>
                 <button class="ghost export-btn" onClick={loadAll}>{loadingAll() ? <><span class="spinner-sm" />Cancel</> : "Load all"}</button>
                 <span class="streaming">
-                  <Show when={fetchingMore() || loadingAll()} fallback={"more rows"}>
+                  <Show when={fetchingMore() || loadingAll()} fallback={"idle"}>
                     <span class="spinner-sm" />streaming…
                   </Show>
                 </span>
