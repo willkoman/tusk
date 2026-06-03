@@ -45,8 +45,6 @@ export type GridView = {
   /** per-column filters (server WHERE ILIKE). */
   filters: Filter[];
   filterRowOpen: boolean;
-  scrollTop: number;
-  scrollLeft: number;
 };
 
 export const EMPTY_GRID_VIEW: GridView = {
@@ -56,8 +54,6 @@ export const EMPTY_GRID_VIEW: GridView = {
   sorts: [],
   filters: [],
   filterRowOpen: false,
-  scrollTop: 0,
-  scrollLeft: 0,
 };
 
 /** Fresh grid view sized to a column count (display order 0..n-1). */

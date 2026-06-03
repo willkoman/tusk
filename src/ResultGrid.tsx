@@ -96,7 +96,12 @@ export function ResultGrid(props: ResultGridProps) {
   });
   const range = (a: number, b: number) => Array.from({ length: Math.max(0, b - a) }, (_, i) => a + i);
 
-  // --- scroll handling (rAF-coalesced) + persist into the tab's view ---
+  // --- scroll handling (rAF-coalesced) ---
+  // Scroll updates ONLY the local signals (which only the grid's row/col window memos
+  // depend on) + a non-reactive per-tab memory. It must NOT write to the tab's gridView:
+  // that would rebuild the tabs array and invalidate `activeTab` across the whole App on
+  // every scroll frame (the cause of the large-table jank/crash).
+  const scrollMem = new Map<string, { top: number; left: number }>();
   let rafPending = false;
   function onScroll() {
     if (!scroller || rafPending) return;
@@ -108,7 +113,7 @@ export function ResultGrid(props: ResultGridProps) {
         sl = scroller.scrollLeft;
       setScrollTop(st);
       setScrollLeft(sl);
-      props.setView({ scrollTop: st, scrollLeft: sl });
+      scrollMem.set(props.activeTabId(), { top: st, left: sl });
       const gap = totalH() - (st + scroller.clientHeight);
       if (!props.done() && gap < viewportH() * 1.5) props.onLoadMore();
     });
@@ -133,8 +138,10 @@ export function ResultGrid(props: ResultGridProps) {
       setSel(EMPTY_SEL);
       const tab = key.split(":")[0];
       const switched = !prev || prev.split(":")[0] !== tab;
-      const top = switched ? props.view().scrollTop : 0;
-      const left = switched ? props.view().scrollLeft : 0;
+      if (!switched) scrollMem.set(tab, { top: 0, left: 0 }); // new query → reset
+      const mem = scrollMem.get(tab) ?? { top: 0, left: 0 };
+      const top = switched ? mem.top : 0;
+      const left = switched ? mem.left : 0;
       queueMicrotask(() => {
         if (!scroller) return;
         scroller.scrollTop = top;
@@ -142,7 +149,6 @@ export function ResultGrid(props: ResultGridProps) {
         setScrollTop(top);
         setScrollLeft(left);
       });
-      if (!switched) props.setView({ scrollTop: 0, scrollLeft: 0 });
     }),
   );
 
