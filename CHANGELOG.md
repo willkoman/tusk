@@ -5,6 +5,7 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 ## [Unreleased]
 
 ### Added
+- **Loading spinner over the output while a query runs.** A centered, animated ring overlays the result pane whenever `running()` is true (faint backdrop dims the prior/stale grid). Pointer-events pass through; solid colors only (no `color-mix`) for WKWebView reliability.
 - **Result-grid overhaul** (extracted from `App.tsx` into `src/ResultGrid.tsx`). A premium, read-only, highly-flexible grid:
   - **Two-axis virtualization** — windows rows *and* columns (variable per-column widths via prefix-sum offsets + binary search), so wide (50+ col) × deep (1M+ row) results stay smooth; a frozen header + row-number gutter implemented as synchronized transform panes (not `position:sticky`, for reliable WKWebView rendering).
   - **Click / drag / right-click** — click selects a cell; shift-click / drag selects a rectangular range (with edge auto-scroll); the row-number gutter selects rows; a header click selects the column; the corner selects all. **Keyboard nav**: arrows + Shift-extend, Home/End, ⌘/Ctrl+Home/End, PageUp/Down, ⌘/Ctrl+A, ⌘/Ctrl+C. **Copy**: ⌘/Ctrl+C copies the selection as TSV (spreadsheet-pasteable); right-click → Copy as CSV / JSON / Markdown, copy cell/column, View value.

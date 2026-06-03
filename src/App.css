@@ -191,6 +191,12 @@ button.ghost { background: transparent; }
 .result { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
 .result-error { margin: 10px 12px; }
 .result-empty { padding: 16px; color: var(--muted); }
+/* Centered loading overlay shown while a query is pending, on top of the (possibly
+   stale) output. pointer-events:none so it never traps clicks; faint backdrop dims
+   the prior result. Solid colors only (no color-mix) for WKWebView reliability. */
+.result-spinner { position: absolute; inset: 0; z-index: 10; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.18); pointer-events: none; }
+.result-spinner .spinner { width: 40px; height: 40px; border-radius: 50%; border: 3px solid var(--border); border-top-color: var(--accent); animation: tusk-spin 0.7s linear infinite; }
+@keyframes tusk-spin { to { transform: rotate(360deg); } }
 
 /* Result grid (ResultGrid.tsx): synchronized panes (header/gutter transform-translated,
    not sticky) + two-axis virtualization. Inline styles set sizes/offsets/transforms. */
