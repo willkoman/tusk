@@ -69,6 +69,9 @@ button.ghost { background: transparent; }
 .connect-card input:focus { outline: none; border-color: var(--accent); }
 .connect-card select { font: inherit; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
 .connect-card select:focus { outline: none; border-color: var(--accent); }
+.connect-card .file-row { display: flex; gap: 6px; align-items: stretch; }
+.connect-card .file-row input { flex: 1; min-width: 0; }
+.connect-card .file-row button { margin-top: 0; background: transparent; border: 1px solid var(--border); color: var(--text); font-weight: 500; white-space: nowrap; }
 .connect-card button { margin-top: 8px; padding: 9px; background: var(--accent); border-color: var(--accent); color: white; font-weight: 600; }
 .error { color: var(--danger); font-size: 12px; }
 

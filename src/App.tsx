@@ -43,6 +43,32 @@ type FetchResult = { rows: (string | null)[][]; done: boolean };
 const PAGE = 1000;
 const DDL_RE = /^\s*(create|alter|drop|truncate|comment|grant|revoke)\b/i;
 
+// Supported drivers + their mascot (the brand icon adapts to the connected DB).
+// `ready` drivers are connectable now; others are staged in the picker.
+const DRIVERS = [
+  { id: "postgres", label: "PostgreSQL", mascot: "🐘", ready: true },
+  { id: "duckdb", label: "DuckDB", mascot: "🦆", ready: true },
+  { id: "sqlite", label: "SQLite", mascot: "🪶", ready: false },
+  { id: "mysql", label: "MySQL", mascot: "🐬", ready: false },
+] as const;
+const driverMascot = (id?: string | null) => DRIVERS.find((d) => d.id === id)?.mascot ?? "🐘";
+const driverLabel = (id?: string | null) => DRIVERS.find((d) => d.id === id)?.label ?? "PostgreSQL";
+
+// Per-driver feature flags from the backend `capabilities` command. The UI gates
+// features (search-path, import, export) on these.
+type Capabilities = {
+  kind: string;
+  serverCursor: boolean;
+  bulkCopy: boolean;
+  export: boolean;
+  schemas: boolean;
+  searchPath: boolean;
+  transactionalDdl: boolean;
+  tls: boolean;
+  keychain: boolean;
+  permissions: boolean;
+};
+
 function errMsg(e: unknown): string {
   if (e && typeof e === "object" && "message" in e) return String((e as any).message);
   return String(e);
@@ -65,6 +91,9 @@ function App() {
   const [profiles, setProfiles] = createSignal<Profile[]>([]);
   const [editingId, setEditingId] = createSignal("");
   const [name, setName] = createSignal("");
+  const [driver, setDriver] = createSignal("postgres");
+  const [path, setPath] = createSignal(""); // DuckDB/SQLite file (empty = :memory:)
+  const [caps, setCaps] = createSignal<Capabilities | null>(null);
   const [host, setHost] = createSignal("localhost");
   const [port, setPort] = createSignal(5432);
   const [user, setUser] = createSignal("");
@@ -320,6 +349,7 @@ function App() {
 
   function newProfile() {
     setEditingId("");
+    setDriver("postgres");
     setName("");
     setHost("localhost");
     setPort(5432);
@@ -335,6 +365,7 @@ function App() {
 
   function editProfile(p: Profile) {
     setEditingId(p.id);
+    setDriver("postgres");
     setName(p.name);
     setHost(p.host);
     setPort(p.port);
@@ -355,6 +386,11 @@ function App() {
 
   async function afterConnect(r: { connection_id: string; server_version: string; read_only: boolean }) {
     setConn({ id: r.connection_id, version: r.server_version, readOnly: r.read_only });
+    try {
+      setCaps(await invoke<Capabilities>("capabilities", { connectionId: r.connection_id }));
+    } catch {
+      setCaps(null);
+    }
     // Restore this connection's tab set (buffers/paths only — results are ephemeral).
     if (connKey) {
       const saved = tabsStore.load(connKey);
@@ -380,24 +416,36 @@ function App() {
     setConnecting(true);
     setConnErr("");
     try {
-      const r = await invoke<{ connection_id: string; server_version: string; read_only: boolean }>("connect", {
-        config: {
-          host: host(),
-          port: Number(port()),
-          user: user(),
-          password: password(),
-          dbname: dbname(),
-          sslmode: sslmode(),
-          read_only: readOnly(),
-        },
-      });
-      connKey = `adhoc:${host()}:${port()}:${dbname()}:${user()}`;
+      const isFile = driver() === "duckdb" || driver() === "sqlite";
+      const config = isFile
+        ? { driver: driver(), path: path(), read_only: readOnly() }
+        : {
+            driver: driver(),
+            host: host(),
+            port: Number(port()),
+            user: user(),
+            password: password(),
+            dbname: dbname(),
+            sslmode: sslmode(),
+            read_only: readOnly(),
+          };
+      const r = await invoke<{ connection_id: string; server_version: string; read_only: boolean }>("connect", { config });
+      connKey = isFile ? `adhoc:${driver()}:${path() || ":memory:"}` : `adhoc:${host()}:${port()}:${dbname()}:${user()}`;
       await afterConnect(r);
     } catch (e) {
       setConnErr(errMsg(e));
     } finally {
       setConnecting(false);
     }
+  }
+
+  // Pick an existing DuckDB/SQLite database file (a new file can also be typed).
+  async function browseDbFile() {
+    const p = await openDialog({
+      multiple: false,
+      filters: [{ name: "Database", extensions: ["duckdb", "ddb", "db", "sqlite", "sqlite3"] }],
+    });
+    if (typeof p === "string") setPath(p);
   }
 
   async function connectProfile(id: string) {
@@ -474,6 +522,7 @@ function App() {
     if (c) invoke("disconnect", { connectionId: c.id }).catch(() => {});
     connKey = null;
     setConn(null);
+    setCaps(null);
     setTree(null);
     setSchema([]);
     setDetails({});
@@ -1193,7 +1242,7 @@ function App() {
                 {(p) => (
                   <div class="profile-row" classList={{ active: editingId() === p.id }} onContextMenu={(e) => openProfileMenu(e, p)}>
                     <div class="profile-main" onClick={() => useProfile(p)}>
-                      <div class="profile-name">{p.name || p.host}</div>
+                      <div class="profile-name">🐘 {p.name || p.host}</div>
                       <div class="profile-sub">
                         {p.user}@{p.host}:{p.port}/{p.dbname}{p.save_password ? " · 🔒" : ""}
                       </div>
@@ -1208,27 +1257,53 @@ function App() {
             </div>
 
             <form class="connect-card" onSubmit={doConnect}>
-              <div class="brand">🐘 Tusk</div>
+              <div class="brand">{driverMascot(driver())} Tusk</div>
               <div class="subtitle">{editingId() ? "edit connection" : "new connection"}</div>
               <label>Name<input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="My database" /></label>
-              <label>Host<input value={host()} onInput={(e) => setHost(e.currentTarget.value)} /></label>
-              <label>Port<input type="number" value={port()} onInput={(e) => setPort(Number(e.currentTarget.value))} /></label>
-              <label>User<input value={user()} onInput={(e) => setUser(e.currentTarget.value)} placeholder="postgres" /></label>
-              <label>Password<input type="password" value={password()} onInput={(e) => setPassword(e.currentTarget.value)} placeholder={editingId() && savePassword() ? "•••••• (stored)" : ""} /></label>
-              <label>Database<input value={dbname()} onInput={(e) => setDbname(e.currentTarget.value)} /></label>
-              <label>SSL Mode
-                <select value={sslmode()} onChange={(e) => setSslmode(e.currentTarget.value)}>
-                  <option value="disable">disable</option>
-                  <option value="prefer">prefer</option>
-                  <option value="require">require</option>
-                  <option value="verify-full">verify-full</option>
+              <label>Driver
+                <select value={driver()} onChange={(e) => setDriver(e.currentTarget.value)}>
+                  <For each={DRIVERS}>
+                    {(d) => <option value={d.id} disabled={!d.ready}>{d.mascot} {d.label}{d.ready ? "" : " (soon)"}</option>}
+                  </For>
                 </select>
               </label>
+              <Show
+                when={driver() === "duckdb" || driver() === "sqlite"}
+                fallback={
+                  <>
+                    <label>Host<input value={host()} onInput={(e) => setHost(e.currentTarget.value)} /></label>
+                    <label>Port<input type="number" value={port()} onInput={(e) => setPort(Number(e.currentTarget.value))} /></label>
+                    <label>User<input value={user()} onInput={(e) => setUser(e.currentTarget.value)} placeholder="postgres" /></label>
+                    <label>Password<input type="password" value={password()} onInput={(e) => setPassword(e.currentTarget.value)} placeholder={editingId() && savePassword() ? "•••••• (stored)" : ""} /></label>
+                    <label>Database<input value={dbname()} onInput={(e) => setDbname(e.currentTarget.value)} /></label>
+                    <label>SSL Mode
+                      <select value={sslmode()} onChange={(e) => setSslmode(e.currentTarget.value)}>
+                        <option value="disable">disable</option>
+                        <option value="prefer">prefer</option>
+                        <option value="require">require</option>
+                        <option value="verify-full">verify-full</option>
+                      </select>
+                    </label>
+                  </>
+                }
+              >
+                <label>Database file
+                  <div class="file-row">
+                    <input value={path()} onInput={(e) => setPath(e.currentTarget.value)} placeholder="/path/to/db.duckdb — blank = in-memory" />
+                    <button type="button" class="ghost" onClick={browseDbFile}>Browse…</button>
+                  </div>
+                </label>
+                <div class="empty-hint">Leave blank for a scratch in-memory database.</div>
+              </Show>
               <label class="checkbox"><input type="checkbox" checked={readOnly()} onChange={(e) => setReadOnly(e.currentTarget.checked)} />Read-only (block writes &amp; DDL)</label>
-              <label class="checkbox"><input type="checkbox" checked={savePassword()} onChange={(e) => setSavePassword(e.currentTarget.checked)} />Save password</label>
-              <label class="checkbox"><input type="checkbox" checked={defaultConnect()} onChange={(e) => setDefaultConnect(e.currentTarget.checked)} />Connect on startup</label>
+              <Show when={driver() === "postgres"}>
+                <label class="checkbox"><input type="checkbox" checked={savePassword()} onChange={(e) => setSavePassword(e.currentTarget.checked)} />Save password</label>
+                <label class="checkbox"><input type="checkbox" checked={defaultConnect()} onChange={(e) => setDefaultConnect(e.currentTarget.checked)} />Connect on startup</label>
+              </Show>
               <div class="form-actions">
-                <button type="button" class="ghost" onClick={saveProfile}>Save</button>
+                <Show when={driver() === "postgres"}>
+                  <button type="button" class="ghost" onClick={saveProfile}>Save</button>
+                </Show>
                 <button type="submit" disabled={connecting()}>{connecting() ? <><span class="spinner-sm" />Connecting…</> : "Connect"}</button>
               </div>
               <Show when={connErr()}><div class="error">{connErr()}</div></Show>
@@ -1239,8 +1314,8 @@ function App() {
     >
       <div class="workspace">
         <header class="topbar">
-          <span class="brand-sm">🐘 Tusk</span>
-          <span class="meta">PostgreSQL {conn()!.version}</span>
+          <span class="brand-sm">{driverMascot(caps()?.kind)} Tusk</span>
+          <span class="meta">{driverLabel(caps()?.kind)} {conn()!.version}</span>
           <span class="spacer" />
           <button class="ghost" onClick={disconnect}>Disconnect</button>
         </header>
@@ -1251,7 +1326,9 @@ function App() {
               <span class="panel-title2">Explorer</span>
               <div class="head-actions">
                 <button class="icon" title="New… (based on selection)" onClick={(e) => openPlusMenu(e)}><Icon name="plus" /></button>
-                <button class="icon" title="Import data" onClick={openImport}><Icon name="download" /></button>
+                <Show when={caps()?.bulkCopy !== false}>
+                  <button class="icon" title="Import data" onClick={openImport}><Icon name="download" /></button>
+                </Show>
                 <button class="icon" title="Refresh" disabled={schemaLoading()} onClick={() => loadSchema()}>{schemaLoading() ? <span class="spinner-sm" /> : <Icon name="refresh" />}</button>
               </div>
             </div>
@@ -1333,15 +1410,17 @@ function App() {
                 <button class="ghost" onClick={() => editorApi()?.openSearch()}>Find</button>
                 <span class="hint">⌘/Ctrl+Enter · runs selection or all</span>
                 <span class="spacer" />
-                <select
-                  class="export-select"
-                  title="Active schema (search_path)"
-                  value={activeTab().searchSchema ?? ""}
-                  onChange={(e) => patchTab(activeTabId(), { searchSchema: e.currentTarget.value || null })}
-                >
-                  <option value="">(default schema)</option>
-                  <For each={schemaNames()}>{(s) => <option value={s}>{s}</option>}</For>
-                </select>
+                <Show when={caps()?.searchPath !== false}>
+                  <select
+                    class="export-select"
+                    title="Active schema (search_path)"
+                    value={activeTab().searchSchema ?? ""}
+                    onChange={(e) => patchTab(activeTabId(), { searchSchema: e.currentTarget.value || null })}
+                  >
+                    <option value="">(default schema)</option>
+                    <For each={schemaNames()}>{(s) => <option value={s}>{s}</option>}</For>
+                  </select>
+                </Show>
                 <select
                   class="export-select"
                   title="SQL dialect"
@@ -1405,7 +1484,7 @@ function App() {
                   </Show>
                 </span>
               </Show>
-              <Show when={lastQuery() || columns().length > 0}>
+              <Show when={(lastQuery() || columns().length > 0) && caps()?.export !== false}>
                 <button class="ghost export-btn" onClick={openExport}>Export…</button>
               </Show>
               <span>{elapsed()} ms</span>
