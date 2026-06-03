@@ -35,7 +35,7 @@ import { autoFold } from "./editor/autofold";
 import { clientLint, serverLint, lintUi } from "./editor/lint";
 import { multiSelect } from "./editor/multiselect";
 import { searchExtensions, searchKeymap, openSearchPanel } from "./editor/search";
-import { statementGutter, activeStatement, cursorReadout } from "./editor/statements";
+import { statementGutter, activeStatement, cursorReadout, setRunningEffect } from "./editor/statements";
 import { formatDoc } from "./editor/format";
 
 export type { Table };
@@ -70,6 +70,8 @@ export function SqlEditor(props: {
   onChange: (v: string, tabId: string) => void;
   onRun: () => void;
   onRunStatement?: (text: string) => void;
+  /** True while a query launched from THIS tab is in flight (drives the gutter spinner). */
+  running?: boolean;
   /** Active editor tab — each tab keeps its own undo/cursor/fold state. */
   tabId: string;
   tables: Table[];
@@ -234,6 +236,15 @@ export function SqlEditor(props: {
     applyingExternal = false;
     curTabId = id;
     view.focus();
+  });
+
+  // Reflect the App's running state into the gutter (spinner on the running statement).
+  // Tracks props.tabId too: view.setState() on a tab switch resets the field, so the
+  // flag must be re-applied for the now-active tab.
+  createEffect(() => {
+    const r = !!props.running;
+    void props.tabId;
+    if (view) view.dispatch({ effects: setRunningEffect.of(r) });
   });
 
   // Live dialect switch — reconfigure highlighter + completion + keyword-case.

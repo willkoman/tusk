@@ -1,4 +1,4 @@
-import { StateField, RangeSetBuilder, type EditorState, type Extension } from "@codemirror/state";
+import { StateField, StateEffect, RangeSetBuilder, type EditorState, type Extension } from "@codemirror/state";
 import { Decoration, type DecorationSet, EditorView, GutterMarker, gutter } from "@codemirror/view";
 import { lexState, statementAt } from "./lexer";
 import { type CursorInfo } from "./types";
@@ -37,20 +37,64 @@ class RunMarker extends GutterMarker {
 }
 const runMarker = new RunMarker();
 
+// A spinner shown in place of the ▶ on the statement that is currently executing.
+class SpinMarker extends GutterMarker {
+  toDOM() {
+    const e = document.createElement("span");
+    e.className = "cm-run-spinner";
+    e.title = "Running…";
+    return e;
+  }
+}
+const spinMarker = new SpinMarker();
+
+// Whether a query launched from this editor is in flight. App toggles it via
+// `setRunningEffect` (through EditorApi); the gutter shows a spinner on the running
+// statement instead of ▶.
+export const setRunningEffect = StateEffect.define<boolean>();
+const runningField = StateField.define<boolean>({
+  create: () => false,
+  update(value, tr) {
+    for (const e of tr.effects) if (e.is(setRunningEffect)) return e.value;
+    return value;
+  },
+});
+
 export function statementGutter(onRun: (text: string) => void): Extension {
-  return gutter({
-    class: "cm-statement-gutter",
-    lineMarker: (view, line) => (startLineMap(view.state).has(line.from) ? runMarker : null),
-    domEventHandlers: {
-      mousedown(view, line) {
+  return [
+    runningField,
+    gutter({
+      class: "cm-statement-gutter",
+      lineMarker: (view, line) => {
         const idx = startLineMap(view.state).get(line.from);
-        if (idx == null) return false;
-        const stmt = lexState(view.state).stmts[idx];
-        if (stmt) onRun(stmt.text);
-        return true;
+        if (idx == null) return null;
+        if (view.state.field(runningField)) {
+          const at = statementAt(lexState(view.state).stmts, view.state.selection.main.head);
+          if (at && at.index === idx) return spinMarker;
+        }
+        return runMarker;
       },
-    },
-  });
+      // Recompute markers when the running flag flips or the cursor moves to a
+      // different statement (so the spinner tracks the active/running block).
+      lineMarkerChange: (u) =>
+        u.startState.field(runningField) !== u.state.field(runningField) ||
+        !u.startState.selection.eq(u.state.selection),
+      domEventHandlers: {
+        mousedown(view, line) {
+          const idx = startLineMap(view.state).get(line.from);
+          if (idx == null) return false;
+          const stmt = lexState(view.state).stmts[idx];
+          if (stmt) {
+            // Move the cursor into the clicked statement so the running spinner
+            // lands on it (the spinner follows the active statement).
+            view.dispatch({ selection: { anchor: line.from } });
+            onRun(stmt.text);
+          }
+          return true;
+        },
+      },
+    }),
+  ];
 }
 
 function buildActive(state: EditorState): DecorationSet {

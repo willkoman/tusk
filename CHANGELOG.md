@@ -5,6 +5,7 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 ## [Unreleased]
 
 ### Added
+- **Loading spinners across every async affordance.** Beyond the centered result-pane overlay, a small inline spinner now shows on: the **Run** button (while a query runs), the **statement run-gutter** — the `▶` on the *running* statement (the one under the cursor; clicking another `▶` moves the cursor there) becomes a spinner, the **Load all** / **streaming…** status, the **Connect** button, and the sidebar **Refresh** button (while the object tree reloads). Shared `.spinner-sm` (inherits `currentColor`, works on any button) + `.cm-run-spinner`; solid colors only for WKWebView.
 - **Loading spinner over the output while a query runs.** A centered, animated ring overlays the result pane whenever `running()` is true (faint backdrop dims the prior/stale grid). Pointer-events pass through; solid colors only (no `color-mix`) for WKWebView reliability.
 - **Result-grid overhaul** (extracted from `App.tsx` into `src/ResultGrid.tsx`). A premium, read-only, highly-flexible grid:
   - **Two-axis virtualization** — windows rows *and* columns (variable per-column widths via prefix-sum offsets + binary search), so wide (50+ col) × deep (1M+ row) results stay smooth; a frozen header + row-number gutter implemented as synchronized transform panes (not `position:sticky`, for reliable WKWebView rendering).
