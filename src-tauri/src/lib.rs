@@ -61,6 +61,20 @@ async fn ensure_alive(c: &mut ConnState) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Set the session `search_path` to the console's active schema (+ public), or reset
+/// to the connection default when no schema is chosen. Session-level, so it's
+/// re-applied on every run to keep tabs isolated over the shared connection.
+async fn apply_search_path(
+    client: &tokio_postgres::Client,
+    schema: &Option<String>,
+) -> Result<(), AppError> {
+    let sql = match schema.as_deref() {
+        Some(s) if !s.is_empty() => format!("SET search_path TO {}, public", db::ident(s)),
+        _ => "RESET search_path".to_string(),
+    };
+    client.batch_execute(&sql).await.map_err(Into::into)
+}
+
 /// Only plain read queries can be wrapped in a server-side cursor for streaming.
 fn is_cursorable(sql: &str) -> bool {
     let t = sql.trim_start().to_ascii_lowercase();
@@ -170,6 +184,7 @@ async fn run_query(
     connection_id: String,
     sql: String,
     page_size: Option<u32>,
+    search_path: Option<String>,
 ) -> Result<QueryOutcome, AppError> {
     let conn = state.get(&connection_id)?;
     let mut c = conn.lock().await;
@@ -183,12 +198,12 @@ async fn run_query(
         });
     }
 
-    match exec_items(&mut c, &items, page).await {
+    match exec_items(&mut c, &items, page, &search_path).await {
         Ok(out) => Ok(out),
         // If the connection dropped mid-query, reconnect and retry once.
         Err(_) if c.client.is_closed() => {
             ensure_alive(&mut c).await?;
-            exec_items(&mut c, &items, page).await
+            exec_items(&mut c, &items, page, &search_path).await
         }
         Err(e) => Err(e),
     }
@@ -198,12 +213,14 @@ async fn exec_items(
     c: &mut db::ConnState,
     items: &[script::Item],
     page: u32,
+    search_path: &Option<String>,
 ) -> Result<QueryOutcome, AppError> {
     // Abandon any previously open cursor/transaction before starting a new query.
     if c.cursor_open {
         let _ = c.client.batch_execute("ROLLBACK").await;
         c.cursor_open = false;
     }
+    apply_search_path(&c.client, search_path).await?;
 
     // A single plain statement runs interactively (streaming result grid).
     if items.len() == 1 {
@@ -310,6 +327,110 @@ async fn fetch_more(
     Ok(FetchResult { rows, done })
 }
 
+/// One diagnostic from `validate_sql`: a statement that failed to PREPARE.
+#[derive(serde::Serialize)]
+struct StmtDiag {
+    stmt_index: usize,
+    message: String,
+    /// 1-based char offset within the statement, mapped back from Postgres.
+    position: Option<i32>,
+}
+
+/// Statements Postgres can PREPARE (parse + plan, no execution). DDL/utility
+/// statements can't be prepared, so we skip them rather than risk anything.
+fn is_prepareable(sql: &str) -> bool {
+    let t = script::effective_start(sql).to_ascii_lowercase();
+    t.starts_with("select")
+        || t.starts_with("with")
+        || t.starts_with("insert")
+        || t.starts_with("update")
+        || t.starts_with("delete")
+        || t.starts_with("values")
+        || t.starts_with("table")
+}
+
+/// PREPARE rejects statements with bind parameters ("could not determine data type
+/// of parameter $1"), which would be a false-positive lint — skip those statements.
+fn has_bind_params(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    (0..b.len()).any(|i| b[i] == b'$' && i + 1 < b.len() && b[i + 1].is_ascii_digit())
+}
+
+/// Turn a PREPARE error into a diagnostic, remapping Postgres' 1-based position
+/// (relative to the `PREPARE … AS ` wrapper) back into the user's statement.
+fn db_error_diag(e: &tokio_postgres::Error, prefix_chars: i32, stmt_index: usize) -> StmtDiag {
+    let (message, raw_pos) = match e.as_db_error() {
+        Some(db) => {
+            let msg = match db.hint() {
+                Some(h) => format!("{} (hint: {h})", db.message()),
+                None => db.message().to_string(),
+            };
+            let pos = match db.position() {
+                Some(tokio_postgres::error::ErrorPosition::Original(p)) => Some(*p as i32),
+                _ => None,
+            };
+            (msg, pos)
+        }
+        None => (e.to_string(), None),
+    };
+    let position = raw_pos.and_then(|p| {
+        let adj = p - prefix_chars;
+        if adj >= 1 {
+            Some(adj)
+        } else {
+            None
+        }
+    });
+    StmtDiag {
+        stmt_index,
+        message,
+        position,
+    }
+}
+
+/// Validate each statement by PREPARE-ing it (parse + plan, never execute) and
+/// reporting the parser-grade error. Read-only safe; isolated from the streaming
+/// cursor; runs in autocommit so a failing statement doesn't poison the next one.
+#[tauri::command]
+async fn validate_sql(
+    state: tauri::State<'_, AppState>,
+    connection_id: String,
+    sql: String,
+    search_path: Option<String>,
+) -> Result<Vec<StmtDiag>, AppError> {
+    let conn = state.get(&connection_id)?;
+    let mut c = conn.lock().await;
+    ensure_alive(&mut c).await?;
+    if c.cursor_open {
+        let _ = c.client.batch_execute("ROLLBACK").await;
+        c.cursor_open = false;
+    }
+    apply_search_path(&c.client, &search_path).await?;
+    let _ = c.client.batch_execute("DEALLOCATE ALL").await;
+
+    let items = script::split(sql.trim());
+    let mut diags: Vec<StmtDiag> = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let stmt = match item {
+            script::Item::Sql(s) => s,
+            script::Item::Copy { .. } => continue,
+        };
+        if !is_prepareable(stmt) || has_bind_params(stmt) {
+            continue;
+        }
+        let name = format!("tusk_validate_{i}");
+        let prefix = format!("PREPARE {name} AS ");
+        let prefix_chars = prefix.chars().count() as i32;
+        match c.client.batch_execute(&format!("{prefix}{stmt}")).await {
+            Ok(()) => {
+                let _ = c.client.batch_execute(&format!("DEALLOCATE {name}")).await;
+            }
+            Err(e) => diags.push(db_error_diag(&e, prefix_chars, i)),
+        }
+    }
+    Ok(diags)
+}
+
 #[derive(serde::Serialize)]
 struct ColumnInfo {
     name: String,
@@ -412,24 +533,51 @@ async fn object_ddl(
     ddl::object_ddl(&c.client, &kind, &schema, &name).await
 }
 
+/// Export to a file with a full options payload. Either streams a query
+/// (scope=all, needs a connection) or formats inline rows (scope=loaded).
 #[tauri::command]
 async fn export_to_file(
     state: tauri::State<'_, AppState>,
-    connection_id: String,
-    sql: String,
-    format: String,
-    table: String,
+    connection_id: Option<String>,
+    sql: Option<String>,
+    columns: Option<Vec<String>>,
+    rows: Option<Vec<Vec<Option<String>>>>,
+    options: export::ExportOptions,
     path: String,
+    search_path: Option<String>,
 ) -> Result<u64, AppError> {
-    let conn = state.get(&connection_id)?;
-    let mut c = conn.lock().await;
-    ensure_alive(&mut c).await?;
-    if c.cursor_open {
-        let _ = c.client.batch_execute("ROLLBACK").await;
-        c.cursor_open = false;
+    if let Some(q) = sql {
+        let id = connection_id.ok_or_else(|| AppError::new("no connection"))?;
+        let conn = state.get(&id)?;
+        let mut c = conn.lock().await;
+        ensure_alive(&mut c).await?;
+        if c.cursor_open {
+            let _ = c.client.batch_execute("ROLLBACK").await;
+            c.cursor_open = false;
+        }
+        apply_search_path(&c.client, &search_path).await?;
+        // Export streams exactly one query through a cursor. Split (dollar-quote aware)
+        // so a multi-statement input can't smuggle extra statements (e.g. a trailing
+        // DROP) into the DECLARE … CURSOR FOR.
+        let sqls: Vec<String> = script::split(q.trim())
+            .into_iter()
+            .filter_map(|it| match it {
+                script::Item::Sql(s) => {
+                    let t = s.trim_end_matches(';').trim().to_string();
+                    (!t.is_empty()).then_some(t)
+                }
+                _ => None,
+            })
+            .collect();
+        if sqls.len() != 1 {
+            return Err(AppError::new("export streams a single query — select one statement"));
+        }
+        export::run_export_query(&c.client, &sqls[0], &options, &path).await
+    } else if let (Some(cols), Some(rs)) = (columns, rows) {
+        export::run_export_rows(&cols, &rs, &options, &path).await
+    } else {
+        Err(AppError::new("export: provide either a query or inline rows"))
     }
-    let trimmed = sql.trim().trim_end_matches(';').trim();
-    export::run_export(&c.client, trimmed, &format, &table, &path).await
 }
 
 #[tauri::command]
@@ -458,6 +606,23 @@ async fn import_rows(
     db::copy_rows(&c.client, &schema, &table, &columns, &rows).await
 }
 
+/// Read a UTF-8 text file by absolute path (the path comes from a native open dialog,
+/// i.e. an explicit user gesture). Used by the editor's Open flow.
+#[tauri::command]
+async fn read_text_file(path: String) -> Result<String, AppError> {
+    tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| AppError::new(e.to_string()))
+}
+
+/// Write a UTF-8 text file by absolute path (from a native save dialog). Editor Save flow.
+#[tauri::command]
+async fn write_text_file(path: String, contents: String) -> Result<(), AppError> {
+    tokio::fs::write(&path, contents)
+        .await
+        .map_err(|e| AppError::new(e.to_string()))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -472,13 +637,16 @@ pub fn run() {
             save_profile,
             delete_profile,
             run_query,
+            validate_sql,
             fetch_more,
             list_schema,
             db_tree,
             table_detail,
             object_ddl,
             export_to_file,
-            import_rows
+            import_rows,
+            read_text_file,
+            write_text_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
