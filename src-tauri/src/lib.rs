@@ -54,13 +54,9 @@ impl AppState {
         self.cancels.lock().unwrap().get(id).cloned()
     }
 
-    fn register(&self, client: tokio_postgres::Client, config: ConnectionConfig) -> String {
+    fn register(&self, backend: Backend, read_only: bool) -> String {
         let id = format!("conn-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
-        let read_only = config.read_only;
-        let conn = Arc::new(AsyncMutex::new(ConnState {
-            backend: Backend::postgres(client, config),
-            read_only,
-        }));
+        let conn = Arc::new(AsyncMutex::new(ConnState { backend, read_only }));
         self.conns.lock().unwrap().insert(id.clone(), conn);
         id
     }
@@ -101,10 +97,10 @@ async fn connect(
     state: tauri::State<'_, AppState>,
     config: ConnectionConfig,
 ) -> Result<ConnectResult, AppError> {
-    let (client, server_version) = db::open(&config).await?;
     let read_only = config.read_only;
+    let (backend, server_version) = driver::connect(&config).await?;
     Ok(ConnectResult {
-        connection_id: state.register(client, config),
+        connection_id: state.register(backend, read_only),
         server_version,
         read_only,
     })
@@ -127,6 +123,7 @@ async fn connect_profile(
         ));
     }
     let config = ConnectionConfig {
+        driver: None,
         host: p.host,
         port: p.port,
         user: p.user,
@@ -134,11 +131,12 @@ async fn connect_profile(
         dbname: p.dbname,
         sslmode: p.sslmode,
         read_only: p.read_only,
+        path: None,
     };
     let read_only = config.read_only;
-    let (client, server_version) = db::open(&config).await?;
+    let (backend, server_version) = driver::connect(&config).await?;
     Ok(ConnectResult {
-        connection_id: state.register(client, config),
+        connection_id: state.register(backend, read_only),
         server_version,
         read_only,
     })
@@ -368,53 +366,16 @@ async fn validate_sql(
     Ok(diags)
 }
 
-#[derive(serde::Serialize)]
-struct ColumnInfo {
-    name: String,
-    data_type: String,
-}
-
-#[derive(serde::Serialize)]
-struct TableInfo {
-    schema: String,
-    name: String,
-    columns: Vec<ColumnInfo>,
-}
-
 #[tauri::command]
 async fn list_schema(
     state: tauri::State<'_, AppState>,
     connection_id: String,
-) -> Result<Vec<TableInfo>, AppError> {
+) -> Result<Vec<tree::TableInfo>, AppError> {
     let conn = state.get(&connection_id)?;
     let mut c = conn.lock().await;
     ensure_alive(&mut c).await?;
     c.backend.rollback_cursor().await;
-    let q = "SELECT table_schema, table_name, column_name, data_type \
-             FROM information_schema.columns \
-             WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
-             ORDER BY table_schema, table_name, ordinal_position";
-    let messages = c.backend.pg()?.simple_query(q).await?;
-    let mut tables: Vec<TableInfo> = Vec::new();
-    for m in &messages {
-        if let tokio_postgres::SimpleQueryMessage::Row(r) = m {
-            let schema = r.get(0).unwrap_or("").to_string();
-            let name = r.get(1).unwrap_or("").to_string();
-            let col = ColumnInfo {
-                name: r.get(2).unwrap_or("").to_string(),
-                data_type: r.get(3).unwrap_or("").to_string(),
-            };
-            match tables.last_mut() {
-                Some(t) if t.schema == schema && t.name == name => t.columns.push(col),
-                _ => tables.push(TableInfo {
-                    schema,
-                    name,
-                    columns: vec![col],
-                }),
-            }
-        }
-    }
-    Ok(tables)
+    c.backend.list_tables().await
 }
 
 #[tauri::command]
@@ -426,7 +387,7 @@ async fn db_tree(
     let mut c = conn.lock().await;
     ensure_alive(&mut c).await?;
     c.backend.rollback_cursor().await;
-    tree::build_shallow(c.backend.pg()?).await
+    c.backend.build_tree().await
 }
 
 #[tauri::command]
@@ -440,7 +401,7 @@ async fn table_detail(
     let mut c = conn.lock().await;
     ensure_alive(&mut c).await?;
     c.backend.rollback_cursor().await;
-    tree::table_detail(c.backend.pg()?, &schema, &name).await
+    c.backend.table_detail(&schema, &name).await
 }
 
 #[tauri::command]

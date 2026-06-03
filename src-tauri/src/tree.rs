@@ -72,6 +72,44 @@ pub struct DbTree {
     pub schemas: Vec<Schema>,
 }
 
+/// Flat schema/table/column list that feeds frontend autocomplete (decoupled from the
+/// lazy tree). Driver-agnostic — built from `(schema, table, column, data_type)` rows.
+#[derive(Serialize)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub data_type: String,
+}
+
+#[derive(Serialize)]
+pub struct TableInfo {
+    pub schema: String,
+    pub name: String,
+    pub columns: Vec<ColumnInfo>,
+}
+
+/// Group consecutive `(schema, table, column, data_type)` rows into `TableInfo`s
+/// (rows must be ordered by schema, table, ordinal).
+pub fn tables_from_rows(rows: Vec<Vec<Option<String>>>) -> Vec<TableInfo> {
+    let mut tables: Vec<TableInfo> = Vec::new();
+    for r in rows {
+        let schema = cell(&r, 0);
+        let name = cell(&r, 1);
+        let col = ColumnInfo {
+            name: cell(&r, 2),
+            data_type: cell(&r, 3),
+        };
+        match tables.last_mut() {
+            Some(t) if t.schema == schema && t.name == name => t.columns.push(col),
+            _ => tables.push(TableInfo {
+                schema,
+                name,
+                columns: vec![col],
+            }),
+        }
+    }
+    tables
+}
+
 fn cell(r: &[Option<String>], i: usize) -> String {
     r.get(i).and_then(|v| v.clone()).unwrap_or_default()
 }
