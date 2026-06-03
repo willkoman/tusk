@@ -132,7 +132,13 @@ export function ResultGrid(props: ResultGridProps) {
   // Keyed on `${tabId}:${epoch}` so we can tell the two apart. NOTE: a sort/filter re-run
   // bumps epoch on purpose — it re-streams from the top, so the old scroll/selection point
   // at now-irrelevant rows; resetting them is the intended behavior (don't "fix" this).
-  const resultKey = () => `${props.activeTabId()}:${props.epoch()}`;
+  // MUST be a memo: `on()` re-runs its callback whenever a tracked dep *notifies*, not
+  // only when the value changes. `props.epoch()` reads through App's `activeTab()` memo,
+  // whose identity changes on every patchTab/patchResult (row append, resize, hide, …) —
+  // so a plain function here fired the reset on every grid mutation, yanking scroll to 0
+  // and clearing the selection. The memo dedupes by string value, so the callback runs
+  // only on a real tab switch or new-query epoch bump.
+  const resultKey = createMemo(() => `${props.activeTabId()}:${props.epoch()}`);
   createEffect(
     on(resultKey, (key, prev) => {
       setSel(EMPTY_SEL);
