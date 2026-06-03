@@ -1358,6 +1358,9 @@ function App() {
                   canSortFilter={canSortFilter}
                 />
               </Show>
+              <Show when={running()}>
+                <div class="result-spinner"><div class="spinner" /></div>
+              </Show>
             </div>
 
             <footer class="statusbar">
