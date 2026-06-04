@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./App.css";
 import { SqlEditor, type EditorApi } from "./SqlEditor";
-import { type DialectId } from "./sql/dialects";
+import { driverDialect, type DialectId } from "./sql/dialects";
 import { type CursorInfo, type EditorPrefs, type ServerDiag } from "./editor/types";
 import { prefsStore, tabsStore, type PersistedTabs } from "./store";
 import { makeTab, basename, gridViewFor, type Tab, type ResultSnapshot, type GridView, type SortKey, type Filter } from "./tabs";
@@ -18,7 +18,7 @@ import { ContextMenu, type MenuItem, type MenuState } from "./ContextMenu";
 import { WorkbenchDialogs, type DialogState } from "./WorkbenchDialogs";
 import { Dialog } from "./Dialog";
 import { Icon } from "./Icons";
-import { ident, qualify, qualifyIn } from "./sql/ident";
+import { ident, qualify, qualifyIn, setSqlDialect } from "./sql/ident";
 import * as ddl from "./sql/ddl";
 import { clipWrite, clipRead } from "./clipboard";
 
@@ -159,6 +159,11 @@ function App() {
 
   // editor prefs (persisted) + cursor readout + per-connection buffer key
   const [prefs, setPrefs] = createSignal<EditorPrefs>(prefsStore.load());
+  // Editor dialect follows the connected driver (DuckDB → Postgres dialect); falls back
+  // to the saved pref when disconnected. Drives highlighting, keyword/function/type
+  // autocomplete, and identifier quoting (`setSqlDialect` → backticks on MySQL).
+  const activeDialect = createMemo<DialectId>(() => (conn() ? driverDialect(caps()?.kind) : prefs().dialect));
+  createEffect(() => setSqlDialect(activeDialect()));
   const [cursorInfo, setCursorInfo] = createSignal<CursorInfo | null>(null);
   let connKey: string | null = null;
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1415,7 +1420,7 @@ function App() {
                 tabId={activeTabId()}
                 tables={schema()}
                 activeSchema={activeTab().searchSchema}
-                dialect={prefs().dialect}
+                dialect={activeDialect()}
                 prefs={prefs()}
                 validate={conn() ? validate : null}
                 onCursorInfo={setCursorInfo}
@@ -1442,17 +1447,6 @@ function App() {
                     <For each={schemaNames()}>{(s) => <option value={s}>{s}</option>}</For>
                   </select>
                 </Show>
-                <select
-                  class="export-select"
-                  title="SQL dialect"
-                  value={prefs().dialect}
-                  onChange={(e) => updatePrefs({ dialect: e.currentTarget.value as DialectId })}
-                >
-                  <option value="postgres">PostgreSQL</option>
-                  <option value="mysql">MySQL</option>
-                  <option value="sqlite">SQLite</option>
-                  <option value="mssql">SQL Server</option>
-                </select>
                 <button class="icon" title="Decrease font size" onClick={() => updatePrefs({ fontSize: Math.max(9, prefs().fontSize - 1) })}>A−</button>
                 <button class="icon" title="Increase font size" onClick={() => updatePrefs({ fontSize: Math.min(24, prefs().fontSize + 1) })}>A+</button>
                 <button class="icon" title="Toggle word wrap" classList={{ active: prefs().wordWrap }} onClick={() => updatePrefs({ wordWrap: !prefs().wordWrap })}>⤶</button>

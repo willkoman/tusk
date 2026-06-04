@@ -1,9 +1,20 @@
-// Identifier + literal quoting — mirrors Rust `db::ident` (src-tauri/src/db.rs).
-// One source of truth for building SQL strings on the frontend.
+// Identifier + literal quoting. One source of truth for building SQL strings on the
+// frontend. Identifier quoting is dialect-aware: MySQL uses backticks (`x`), everyone
+// else standard double-quotes ("x"). The active dialect is set once per connection
+// (`setSqlDialect`) — the app is single-connection, so this avoids threading a dialect
+// arg through every call site (scaffolds, grid filters, DDL builders). For Postgres it
+// matches Rust `db::ident`, which is only used on PG-only backend paths (import/DDL).
 
-/** Quote an identifier: `users` → `"users"`, `we"ird` → `"we""ird"`. */
+let backtick = false; // true = MySQL identifier quoting
+
+/** Set identifier quoting for the connected driver. Call on connect / dialect change. */
+export function setSqlDialect(dialect: string): void {
+  backtick = dialect === "mysql";
+}
+
+/** Quote an identifier: `users` → `"users"` (or `` `users` `` on MySQL). */
 export function ident(name: string): string {
-  return `"${name.replace(/"/g, '""')}"`;
+  return backtick ? `\`${name.replace(/`/g, "``")}\`` : `"${name.replace(/"/g, '""')}"`;
 }
 
 /** Schema-qualified identifier: `("public","users")` → `"public"."users"`. */
