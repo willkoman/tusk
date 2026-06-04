@@ -4,6 +4,7 @@ mod driver;
 #[cfg(test)]
 mod driver_conformance;
 mod export;
+mod perms;
 mod profiles;
 mod script;
 mod tree;
@@ -448,6 +449,20 @@ async fn capabilities(
     Ok(c.backend.capabilities())
 }
 
+/// The connected role's effective privileges (Postgres). The frontend gates sidebar DDL
+/// actions on these; refreshed on every introspection reload.
+#[tauri::command]
+async fn permissions(
+    state: tauri::State<'_, AppState>,
+    connection_id: String,
+) -> Result<perms::Permissions, AppError> {
+    let conn = state.get(&connection_id)?;
+    let mut c = conn.lock().await;
+    ensure_alive(&mut c).await?;
+    c.backend.rollback_cursor().await;
+    c.backend.permissions().await
+}
+
 #[tauri::command]
 async fn cancel_operation(
     state: tauri::State<'_, AppState>,
@@ -588,6 +603,7 @@ pub fn run() {
             object_ddl,
             export_to_file,
             capabilities,
+            permissions,
             cancel_operation,
             import_rows,
             read_text_file,

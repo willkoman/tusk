@@ -333,6 +333,52 @@ async fn readonly_postgres_blocks_writes() {
     assert!(res.is_err(), "read-only postgres must reject writes/DDL");
 }
 
+// --- Postgres permission model (Epic 2): effective privileges of a limited role ---
+
+#[tokio::test]
+async fn permissions_postgres() {
+    let Some(su) = pg_cfg() else {
+        eprintln!("SKIP permissions_postgres (set TUSK_TEST_PG_PORT)");
+        return;
+    };
+    let (mut a, _) = connect(&su).await.expect("connect superuser");
+    // setup: a SELECT-only role on one table
+    exec(&mut a, "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='tusk_limited') THEN EXECUTE 'DROP OWNED BY tusk_limited'; DROP ROLE tusk_limited; END IF; END $$").await;
+    exec(&mut a, "CREATE ROLE tusk_limited LOGIN PASSWORD 'lim'").await;
+    exec(&mut a, "DROP TABLE IF EXISTS perm_t").await;
+    exec(&mut a, "CREATE TABLE perm_t (a int)").await;
+    exec(&mut a, "GRANT SELECT ON perm_t TO tusk_limited").await;
+    exec(&mut a, "GRANT USAGE ON SCHEMA public TO tusk_limited").await;
+
+    // superuser: enforced, owns its table with full privileges
+    let psu = a.permissions().await.unwrap();
+    assert!(psu.enforced && psu.is_superuser, "postgres role is an enforced superuser");
+    assert!(
+        psu.tables.iter().any(|t| t.name == "perm_t" && t.select && t.is_owner),
+        "owner sees its table with SELECT + ownership"
+    );
+
+    // limited role: SELECT but no writes/ownership, USAGE-not-CREATE on public, no DB/role
+    let mut lim = su.clone();
+    lim.user = "tusk_limited".into();
+    lim.password = "lim".into();
+    let (b, _) = connect(&lim).await.expect("connect limited role");
+    let pl = b.permissions().await.unwrap();
+    assert!(pl.enforced && !pl.is_superuser, "limited role is enforced, not superuser");
+    assert!(!pl.can_create_db && !pl.can_create_role, "limited can't create db/role");
+    let pt = pl.tables.iter().find(|t| t.name == "perm_t").expect("perm_t visible to limited");
+    assert!(pt.select, "limited has SELECT");
+    assert!(!pt.insert && !pt.update && !pt.delete, "limited lacks write privileges");
+    assert!(!pt.is_owner, "limited is not the owner");
+    let pub_s = pl.schemas.iter().find(|s| s.name == "public").expect("public schema");
+    assert!(pub_s.usage && !pub_s.create, "limited: USAGE not CREATE on public");
+
+    // cleanup
+    exec(&mut a, "DROP OWNED BY tusk_limited").await;
+    exec(&mut a, "DROP ROLE IF EXISTS tusk_limited").await;
+    exec(&mut a, "DROP TABLE IF EXISTS perm_t").await;
+}
+
 // --- command layer (lib.rs exec_items: routing + the app-layer read-only guard that
 //     protects engines with no server-side read-only, e.g. MySQL) ---
 

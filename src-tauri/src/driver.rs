@@ -424,6 +424,15 @@ impl Backend {
         }
     }
 
+    /// Effective privileges of the connected role. Postgres only for now; other drivers
+    /// report `unrestricted` (the UI imposes no extra gating).
+    pub async fn permissions(&self) -> Result<crate::perms::Permissions, AppError> {
+        match self {
+            Backend::Pg(p) => crate::perms::collect(&p.client).await,
+            _ => Ok(crate::perms::Permissions::unrestricted()),
+        }
+    }
+
     /// Flat schema/table/column list that feeds frontend autocomplete.
     pub async fn list_tables(&self) -> Result<Vec<tree::TableInfo>, AppError> {
         // SQLite has no information_schema — build from sqlite_master + PRAGMA.
