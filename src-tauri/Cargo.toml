@@ -40,6 +40,11 @@ rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
 # !Sync-connection problem) and its `Value` enum makes all-text extraction easy.
 mysql_async = { version = "0.34", default-features = false, features = ["default-rustls"] }
 
+[dev-dependencies]
+# Test-only: async test runtime (the app uses Tauri's runtime, so the main tokio dep
+# stays lean). Enables `#[tokio::test]` for the driver conformance suite.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
 
