@@ -601,6 +601,17 @@ function App() {
     }
   });
 
+  // Label for the connected target shown in the topbar chip: the database name for
+  // server drivers, or the file basename (":memory:" when blank) for embedded ones.
+  const connTarget = () => {
+    const k = caps()?.kind;
+    if (k === "duckdb" || k === "sqlite") {
+      const p = path().trim();
+      return p ? p.split(/[\\/]/).pop() || p : ":memory:";
+    }
+    return dbname() || host();
+  };
+
   // Debounced per-connection tab-set save as buffers/structure change.
   createEffect(() => {
     const data: PersistedTabs = {
@@ -1042,17 +1053,17 @@ function App() {
 
     if (tableCtx) {
       items.push(
-        { label: `New column in ${tableCtx.name}…`, icon: "＋", ...gate(ownsTable(tableCtx.schema!, tableCtx.name), `Requires ownership of ${tableCtx.name}`), onClick: () => setActiveDialog({ kind: "addColumn", ctx: tableCtx }) },
-        { label: `New index on ${tableCtx.name}…`, icon: "📑", ...gate(ownsTable(tableCtx.schema!, tableCtx.name), `Requires ownership of ${tableCtx.name}`), onClick: () => openIndexDialog(tableCtx) },
-        { label: `New constraint on ${tableCtx.name}…`, icon: "🔗", ...gate(ownsTable(tableCtx.schema!, tableCtx.name), `Requires ownership of ${tableCtx.name}`), onClick: () => openConstraintDialog(tableCtx) },
+        { label: `New column in ${tableCtx.name}…`, icon: "plus", ...gate(ownsTable(tableCtx.schema!, tableCtx.name), `Requires ownership of ${tableCtx.name}`), onClick: () => setActiveDialog({ kind: "addColumn", ctx: tableCtx }) },
+        { label: `New index on ${tableCtx.name}…`, icon: "index", ...gate(ownsTable(tableCtx.schema!, tableCtx.name), `Requires ownership of ${tableCtx.name}`), onClick: () => openIndexDialog(tableCtx) },
+        { label: `New constraint on ${tableCtx.name}…`, icon: "link", ...gate(ownsTable(tableCtx.schema!, tableCtx.name), `Requires ownership of ${tableCtx.name}`), onClick: () => openConstraintDialog(tableCtx) },
         { sep: true },
       );
     }
     if (schemaName)
-      items.push({ label: `New table in ${schemaName}…`, icon: "📋", ...gate(canCreateInSchema(schemaName), `Requires CREATE on schema ${schemaName}`), onClick: () => setActiveDialog({ kind: "createTable", schema: schemaName }) });
+      items.push({ label: `New table in ${schemaName}…`, icon: "copy", ...gate(canCreateInSchema(schemaName), `Requires CREATE on schema ${schemaName}`), onClick: () => setActiveDialog({ kind: "createTable", schema: schemaName }) });
     items.push(
-      { label: "New schema…", icon: "📂", ...gate(canCreateSchema(), "Requires CREATE on the database"), onClick: () => setActiveDialog({ kind: "createSchema" }) },
-      { label: "New database…", icon: "🗄️", ...gate(canCreateDatabase(), "Requires the CREATEDB role attribute"), onClick: () => setActiveDialog({ kind: "createDatabase" }) },
+      { label: "New schema…", icon: "folder", ...gate(canCreateSchema(), "Requires CREATE on the database"), onClick: () => setActiveDialog({ kind: "createSchema" }) },
+      { label: "New database…", icon: "database", ...gate(canCreateDatabase(), "Requires the CREATEDB role attribute"), onClick: () => setActiveDialog({ kind: "createDatabase" }) },
     );
     setMenu({ x: e.clientX, y: e.clientY, items });
   }
@@ -1070,35 +1081,35 @@ function App() {
     const ro = conn()?.readOnly ?? false;
     const s = n.schema;
     const qual = s ? qualify(s, n.name) : ident(n.name);
-    const copyName: MenuItem = { label: "Copy name", icon: "📋", onClick: () => copyText(n.name, `copied ${n.name}`) };
-    const copyQual: MenuItem = { label: "Copy qualified name", icon: "📋", onClick: () => copyText(qual, "copied name") };
+    const copyName: MenuItem = { label: "Copy name", icon: "copy", onClick: () => copyText(n.name, `copied ${n.name}`) };
+    const copyQual: MenuItem = { label: "Copy qualified name", icon: "copy", onClick: () => copyText(qual, "copied name") };
     const copyDdl: MenuItem[] = [
-      { label: "Copy DDL", icon: "📄", onClick: () => copyDDL(n, false) },
-      { label: "Copy DDL → editor", icon: "📝", onClick: () => copyDDL(n, true) },
+      { label: "Copy DDL", icon: "fileCode", onClick: () => copyDDL(n, false) },
+      { label: "Copy DDL → editor", icon: "fileCode", onClick: () => copyDDL(n, true) },
     ];
     const items: MenuItem[] = [];
 
     switch (n.kind) {
       case "table":
         items.push(
-          { label: "Select 100 rows", icon: "▶", onClick: () => runTableLimit(s!, n.name, 100) },
-          { label: "Select all rows", icon: "▶", onClick: () => runTable(s!, n.name) },
+          { label: "Select 100 rows", icon: "play", onClick: () => runTableLimit(s!, n.name, 100) },
+          { label: "Select all rows", icon: "play", onClick: () => runTable(s!, n.name) },
           { sep: true },
-          { label: "Modify table…", icon: "✏️", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openModify(n) },
-          { label: "Add column…", icon: "＋", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "addColumn", ctx: n }) },
-          { label: "Add index…", icon: "📑", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openIndexDialog(n) },
-          { label: "Add constraint…", icon: "🔗", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openConstraintDialog(n) },
+          { label: "Modify table…", icon: "edit", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openModify(n) },
+          { label: "Add column…", icon: "plus", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "addColumn", ctx: n }) },
+          { label: "Add index…", icon: "index", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openIndexDialog(n) },
+          { label: "Add constraint…", icon: "link", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openConstraintDialog(n) },
           { sep: true },
-          { label: "Rename…", icon: "✎", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename table ${n.name}`, current: n.name, build: (nn) => ddl.renameRelation("table", s!, n.name, nn) }) },
-          { label: "Duplicate…", icon: "⧉", ...gate(canCreateInSchema(s!), `Requires CREATE on schema ${s}`), onClick: () => setActiveDialog({ kind: "duplicate", title: `Duplicate ${n.name}`, defaultName: `${n.name}_copy`, build: (nn, wd) => ddl.duplicateTable(s!, n.name, nn, wd) }) },
-          { label: "Edit comment…", icon: "💬", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.comment(`TABLE ${qual}`, t) }) },
+          { label: "Rename…", icon: "edit", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename table ${n.name}`, current: n.name, build: (nn) => ddl.renameRelation("table", s!, n.name, nn) }) },
+          { label: "Duplicate…", icon: "duplicate", ...gate(canCreateInSchema(s!), `Requires CREATE on schema ${s}`), onClick: () => setActiveDialog({ kind: "duplicate", title: `Duplicate ${n.name}`, defaultName: `${n.name}_copy`, build: (nn, wd) => ddl.duplicateTable(s!, n.name, nn, wd) }) },
+          { label: "Edit comment…", icon: "comment", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.comment(`TABLE ${qual}`, t) }) },
           { sep: true },
-          { label: "Truncate…", icon: "🧹", danger: true, ...gate(canTruncate(s!, n.name), `Requires TRUNCATE or ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Truncate ${n.name}`, primaryLabel: "Truncate", showCascade: true, showRestartIdentity: true, build: (o) => ddl.truncate(s!, n.name, o) }) },
-          { label: "Drop…", icon: "🗑", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop table ${n.name}`, primaryLabel: "Drop table", showCascade: true, build: (o) => ddl.dropRelation("table", s!, n.name, o.cascade) }) },
+          { label: "Truncate…", icon: "eraser", danger: true, ...gate(canTruncate(s!, n.name), `Requires TRUNCATE or ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Truncate ${n.name}`, primaryLabel: "Truncate", showCascade: true, showRestartIdentity: true, build: (o) => ddl.truncate(s!, n.name, o) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop table ${n.name}`, primaryLabel: "Drop table", showCascade: true, build: (o) => ddl.dropRelation("table", s!, n.name, o.cascade) }) },
           { sep: true },
-          { label: "Generate SELECT", icon: "≣", onClick: () => generate(n, "select") },
-          { label: "Generate INSERT", icon: "≣", onClick: () => generate(n, "insert") },
-          { label: "Generate UPDATE", icon: "≣", onClick: () => generate(n, "update") },
+          { label: "Generate SELECT", icon: "code", onClick: () => generate(n, "select") },
+          { label: "Generate INSERT", icon: "code", onClick: () => generate(n, "insert") },
+          { label: "Generate UPDATE", icon: "code", onClick: () => generate(n, "update") },
           { sep: true },
           ...copyDdl,
           copyName,
@@ -1108,17 +1119,17 @@ function App() {
       case "view":
       case "matview": {
         const kw = n.kind;
-        items.push({ label: "Select all rows", icon: "▶", onClick: () => runTable(s!, n.name) });
+        items.push({ label: "Select all rows", icon: "play", onClick: () => runTable(s!, n.name) });
         if (kw === "matview")
           items.push(
-            { label: "Refresh", icon: "↻", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => runDDLToast(ddl.refreshMatview(s!, n.name, false)) },
-            { label: "Refresh concurrently", icon: "↻", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => runDDLToast(ddl.refreshMatview(s!, n.name, true)) },
+            { label: "Refresh", icon: "refresh", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => runDDLToast(ddl.refreshMatview(s!, n.name, false)) },
+            { label: "Refresh concurrently", icon: "refresh", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => runDDLToast(ddl.refreshMatview(s!, n.name, true)) },
           );
         items.push(
           { sep: true },
-          { label: "Rename…", icon: "✎", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename ${n.name}`, current: n.name, build: (nn) => ddl.renameRelation(kw, s!, n.name, nn) }) },
-          { label: "Edit comment…", icon: "💬", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.comment(`${kw === "matview" ? "MATERIALIZED VIEW" : "VIEW"} ${qual}`, t) }) },
-          { label: "Drop…", icon: "🗑", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop ${n.name}`, primaryLabel: "Drop", showCascade: true, build: (o) => ddl.dropRelation(kw, s!, n.name, o.cascade) }) },
+          { label: "Rename…", icon: "edit", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename ${n.name}`, current: n.name, build: (nn) => ddl.renameRelation(kw, s!, n.name, nn) }) },
+          { label: "Edit comment…", icon: "comment", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.comment(`${kw === "matview" ? "MATERIALIZED VIEW" : "VIEW"} ${qual}`, t) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop ${n.name}`, primaryLabel: "Drop", showCascade: true, build: (o) => ddl.dropRelation(kw, s!, n.name, o.cascade) }) },
           { sep: true },
           ...copyDdl,
           copyName,
@@ -1129,11 +1140,11 @@ function App() {
       case "column": {
         const c = n.column!;
         items.push(
-          { label: "Edit column…", icon: "✎", ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "editColumn", ctx: n }) },
-          { label: "Rename…", icon: "✎", ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename column ${n.name}`, current: n.name, build: (nn) => ddl.renameColumn(s!, n.table!, n.name, nn) }) },
-          { label: "Edit comment…", icon: "💬", ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: c.comment ?? "", build: (t) => ddl.comment(`COLUMN ${qualify(s!, n.table!)}.${ident(n.name)}`, t) }) },
+          { label: "Edit column…", icon: "edit", ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "editColumn", ctx: n }) },
+          { label: "Rename…", icon: "edit", ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename column ${n.name}`, current: n.name, build: (nn) => ddl.renameColumn(s!, n.table!, n.name, nn) }) },
+          { label: "Edit comment…", icon: "comment", ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: c.comment ?? "", build: (t) => ddl.comment(`COLUMN ${qualify(s!, n.table!)}.${ident(n.name)}`, t) }) },
           { sep: true },
-          { label: "Drop column…", icon: "🗑", danger: true, ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop column ${n.name}`, primaryLabel: "Drop column", showCascade: true, build: (o) => ddl.dropColumn(s!, n.table!, n.name, o.cascade) }) },
+          { label: "Drop column…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop column ${n.name}`, primaryLabel: "Drop column", showCascade: true, build: (o) => ddl.dropColumn(s!, n.table!, n.name, o.cascade) }) },
           { sep: true },
           copyName,
         );
@@ -1141,10 +1152,10 @@ function App() {
       }
       case "schema":
         items.push(
-          { label: "Create table…", icon: "＋", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => setActiveDialog({ kind: "createTable", schema: n.name }) },
-          { label: "Rename…", icon: "✎", ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename schema ${n.name}`, current: n.name, build: (nn) => ddl.renameSchema(n.name, nn) }) },
+          { label: "Create table…", icon: "plus", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => setActiveDialog({ kind: "createTable", schema: n.name }) },
+          { label: "Rename…", icon: "edit", ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename schema ${n.name}`, current: n.name, build: (nn) => ddl.renameSchema(n.name, nn) }) },
           { sep: true },
-          { label: "Drop…", icon: "🗑", danger: true, ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop schema ${n.name}`, primaryLabel: "Drop schema", showCascade: true, build: (o) => ddl.dropSchema(n.name, o.cascade) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop schema ${n.name}`, primaryLabel: "Drop schema", showCascade: true, build: (o) => ddl.dropSchema(n.name, o.cascade) }) },
           { sep: true },
           copyName,
         );
@@ -1152,8 +1163,8 @@ function App() {
       case "database": {
         const cur = tree()?.database === n.name;
         items.push(
-          { label: "Create schema…", icon: "＋", ...gate(canCreateSchema(), "Requires CREATE on the database"), onClick: () => setActiveDialog({ kind: "createSchema" }) },
-          { label: cur ? "Drop… (connected)" : "Drop…", icon: "🗑", danger: true, disabled: cur || conn()?.readOnly || (pEnforced() && !isSuper()), title: cur ? "Can't drop the connected database" : (pEnforced() && !isSuper()) ? "Requires database ownership (or superuser)" : undefined, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop database ${n.name}`, primaryLabel: "Drop database", build: () => ddl.dropDatabase(n.name) }) },
+          { label: "Create schema…", icon: "plus", ...gate(canCreateSchema(), "Requires CREATE on the database"), onClick: () => setActiveDialog({ kind: "createSchema" }) },
+          { label: cur ? "Drop… (connected)" : "Drop…", icon: "trash", danger: true, disabled: cur || conn()?.readOnly || (pEnforced() && !isSuper()), title: cur ? "Can't drop the connected database" : (pEnforced() && !isSuper()) ? "Requires database ownership (or superuser)" : undefined, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop database ${n.name}`, primaryLabel: "Drop database", build: () => ddl.dropDatabase(n.name) }) },
           { sep: true },
           copyName,
         );
@@ -1161,25 +1172,25 @@ function App() {
       }
       case "index":
         items.push(
-          { label: "Rename…", icon: "✎", disabled: ro, onClick: () => setActiveDialog({ kind: "rename", title: `Rename index ${n.name}`, current: n.name, build: (nn) => ddl.renameIndex(s!, n.name, nn) }) },
-          { label: "Drop…", icon: "🗑", danger: true, disabled: ro, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop index ${n.name}`, primaryLabel: "Drop index", showCascade: true, build: (o) => ddl.dropIndex(s!, n.name, o.cascade) }) },
+          { label: "Rename…", icon: "edit", disabled: ro, onClick: () => setActiveDialog({ kind: "rename", title: `Rename index ${n.name}`, current: n.name, build: (nn) => ddl.renameIndex(s!, n.name, nn) }) },
+          { label: "Drop…", icon: "trash", danger: true, disabled: ro, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop index ${n.name}`, primaryLabel: "Drop index", showCascade: true, build: (o) => ddl.dropIndex(s!, n.name, o.cascade) }) },
           { sep: true },
           copyName,
         );
         break;
       case "constraint":
         items.push(
-          { label: "Rename…", icon: "✎", disabled: ro, onClick: () => setActiveDialog({ kind: "rename", title: `Rename constraint ${n.name}`, current: n.name, build: (nn) => ddl.renameConstraint(s!, n.table!, n.name, nn) }) },
-          { label: "Drop…", icon: "🗑", danger: true, disabled: ro, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop constraint ${n.name}`, primaryLabel: "Drop constraint", showCascade: true, build: (o) => ddl.dropConstraint(s!, n.table!, n.name, o.cascade) }) },
+          { label: "Rename…", icon: "edit", disabled: ro, onClick: () => setActiveDialog({ kind: "rename", title: `Rename constraint ${n.name}`, current: n.name, build: (nn) => ddl.renameConstraint(s!, n.table!, n.name, nn) }) },
+          { label: "Drop…", icon: "trash", danger: true, disabled: ro, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop constraint ${n.name}`, primaryLabel: "Drop constraint", showCascade: true, build: (o) => ddl.dropConstraint(s!, n.table!, n.name, o.cascade) }) },
           { sep: true },
           copyName,
         );
         break;
       case "sequence":
         items.push(
-          { label: "Restart… (edit value)", icon: "↺", disabled: ro, onClick: () => editAsSql(ddl.alterSequenceRestart(s!, n.name, "1")) },
-          { label: "Rename…", icon: "✎", disabled: ro, onClick: () => setActiveDialog({ kind: "rename", title: `Rename sequence ${n.name}`, current: n.name, build: (nn) => ddl.renameSequence(s!, n.name, nn) }) },
-          { label: "Drop…", icon: "🗑", danger: true, disabled: ro, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop sequence ${n.name}`, primaryLabel: "Drop sequence", showCascade: true, build: (o) => ddl.dropSequence(s!, n.name, o.cascade) }) },
+          { label: "Restart… (edit value)", icon: "refresh", disabled: ro, onClick: () => editAsSql(ddl.alterSequenceRestart(s!, n.name, "1")) },
+          { label: "Rename…", icon: "edit", disabled: ro, onClick: () => setActiveDialog({ kind: "rename", title: `Rename sequence ${n.name}`, current: n.name, build: (nn) => ddl.renameSequence(s!, n.name, nn) }) },
+          { label: "Drop…", icon: "trash", danger: true, disabled: ro, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop sequence ${n.name}`, primaryLabel: "Drop sequence", showCascade: true, build: (o) => ddl.dropSequence(s!, n.name, o.cascade) }) },
           { sep: true },
           ...copyDdl,
           copyName,
@@ -1187,7 +1198,7 @@ function App() {
         break;
       case "function":
         items.push(
-          { label: "Drop…", icon: "🗑", danger: true, disabled: ro, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop function ${n.name}`, primaryLabel: "Drop function", showCascade: true, build: (o) => ddl.dropFunction(s!, n.name, o.cascade) }) },
+          { label: "Drop…", icon: "trash", danger: true, disabled: ro, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop function ${n.name}`, primaryLabel: "Drop function", showCascade: true, build: (o) => ddl.dropFunction(s!, n.name, o.cascade) }) },
           { sep: true },
           ...copyDdl,
           copyName,
@@ -1212,14 +1223,14 @@ function App() {
       x: e.clientX,
       y: e.clientY,
       items: [
-        { label: "Cut", icon: "✂", disabled: !hasSel, onClick: async () => { const s = api.getSelection(); if (await clipWrite(s)) api.replaceSelection(""); } },
-        { label: "Copy", icon: "📋", disabled: !hasSel, onClick: () => copyText(api.getSelection(), "copied selection") },
-        { label: "Paste", icon: "📥", onClick: async () => { const t = await clipRead(); if (t != null) api.replaceSelection(t); else setRunErr("clipboard read blocked — use ⌘/Ctrl+V"); } },
+        { label: "Cut", icon: "scissors", disabled: !hasSel, onClick: async () => { const s = api.getSelection(); if (await clipWrite(s)) api.replaceSelection(""); } },
+        { label: "Copy", icon: "copy", disabled: !hasSel, onClick: () => copyText(api.getSelection(), "copied selection") },
+        { label: "Paste", icon: "download", onClick: async () => { const t = await clipRead(); if (t != null) api.replaceSelection(t); else setRunErr("clipboard read blocked — use ⌘/Ctrl+V"); } },
         { sep: true },
-        { label: "Select all", icon: "▤", onClick: () => api.selectAll() },
-        { label: "Toggle comment", icon: "//", onClick: () => api.toggleComment() },
+        { label: "Select all", icon: "table", onClick: () => api.selectAll() },
+        { label: "Toggle comment", icon: "slash", onClick: () => api.toggleComment() },
         { sep: true },
-        { label: hasSel ? "Run selection" : "Run all", icon: "▶", onClick: () => doRun() },
+        { label: hasSel ? "Run selection" : "Run all", icon: "play", onClick: () => doRun() },
       ],
     });
   }
@@ -1256,10 +1267,10 @@ function App() {
       x: e.clientX,
       y: e.clientY,
       items: [
-        { label: "New…", icon: "＋", disabled: ro, onClick: () => openPlusMenu(e) },
+        { label: "New…", icon: "plus", disabled: ro, onClick: () => openPlusMenu(e) },
         { sep: true },
-        { label: "Refresh", icon: "↻", onClick: () => loadSchema() },
-        { label: "Clear filter", icon: "⌫", disabled: !treeFilter(), onClick: () => setTreeFilter("") },
+        { label: "Refresh", icon: "refresh", onClick: () => loadSchema() },
+        { label: "Clear filter", icon: "eraser", disabled: !treeFilter(), onClick: () => setTreeFilter("") },
       ],
     });
   }
@@ -1270,14 +1281,14 @@ function App() {
       x: e.clientX,
       y: e.clientY,
       items: [
-        { label: "Connect", icon: "▶", onClick: () => connectProfile(p.id) },
-        { label: "Edit", icon: "✎", onClick: () => editProfile(p) },
-        { label: "Duplicate", icon: "⧉", onClick: () => duplicateProfile(p) },
-        { label: p.default_connect ? "Unset default" : "Set as default", icon: "★", onClick: () => setProfileDefault(p, !p.default_connect) },
+        { label: "Connect", icon: "play", onClick: () => connectProfile(p.id) },
+        { label: "Edit", icon: "edit", onClick: () => editProfile(p) },
+        { label: "Duplicate", icon: "duplicate", onClick: () => duplicateProfile(p) },
+        { label: p.default_connect ? "Unset default" : "Set as default", icon: "star", onClick: () => setProfileDefault(p, !p.default_connect) },
         { sep: true },
-        { label: "Copy connection string", icon: "📋", onClick: () => copyText(connString(p), "copied connection string") },
+        { label: "Copy connection string", icon: "copy", onClick: () => copyText(connString(p), "copied connection string") },
         { sep: true },
-        { label: "Delete", icon: "🗑", danger: true, onClick: () => deleteProfile(p.id) },
+        { label: "Delete", icon: "trash", danger: true, onClick: () => deleteProfile(p.id) },
       ],
     });
   }
@@ -1313,11 +1324,12 @@ function App() {
                     <div class="profile-main" onClick={() => useProfile(p)}>
                       <div class="profile-name">🐘 {p.name || p.host}</div>
                       <div class="profile-sub">
-                        {p.user}@{p.host}:{p.port}/{p.dbname}{p.save_password ? " · 🔒" : ""}
+                        <span>{p.user}@{p.host}:{p.port}/{p.dbname}</span>
+                        <Show when={p.save_password}><Icon name="lock" /></Show>
                       </div>
                     </div>
-                    <button class="icon" title="Edit" onClick={() => editProfile(p)}>✎</button>
-                    <button class="icon" title="Delete" onClick={() => deleteProfile(p.id)}>🗑</button>
+                    <button class="icon" title="Edit" onClick={() => editProfile(p)}><Icon name="edit" /></button>
+                    <button class="icon" title="Delete" onClick={() => deleteProfile(p.id)}><Icon name="trash" /></button>
                   </div>
                 )}
               </For>
@@ -1326,8 +1338,13 @@ function App() {
             </div>
 
             <form class="connect-card" onSubmit={doConnect}>
-              <div class="brand">{driverMascot(driver())} Tusk</div>
-              <div class="subtitle">{editingId() ? "edit connection" : "new connection"}</div>
+              <div class="brand-row">
+                <span class="brand-mark">{driverMascot(driver())}</span>
+                <div>
+                  <div class="brand">Tusk</div>
+                  <div class="subtitle">{editingId() ? "Edit connection" : "New connection"}</div>
+                </div>
+              </div>
               <label>Name<input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="My database" /></label>
               <label>Driver
                 <select
@@ -1394,9 +1411,16 @@ function App() {
       <div class="workspace">
         <header class="topbar">
           <span class="brand-sm">{driverMascot(caps()?.kind)} Tusk</span>
+          <span class="conn-chip" title={connTarget()}>
+            <span class="conn-dot" />
+            <span class="conn-name">{connTarget()}</span>
+          </span>
           <span class="meta">{driverLabel(caps()?.kind)} {conn()!.version}</span>
+          <Show when={conn()!.readOnly}>
+            <span class="badge badge-ro" title="Writes & DDL are blocked"><Icon name="lock" /> Read-only</span>
+          </Show>
           <span class="spacer" />
-          <button class="ghost" classList={{ active: aiOpen() }} onClick={() => setAiOpen((v) => !v)} title="AI assistant">✨ AI</button>
+          <button class="ghost" classList={{ active: aiOpen() }} onClick={() => setAiOpen((v) => !v)} title="AI assistant"><Icon name="sparkle" /> AI</button>
           <button class="ghost" onClick={disconnect}>Disconnect</button>
         </header>
 
@@ -1501,9 +1525,9 @@ function App() {
                     <For each={schemaNames()}>{(s) => <option value={s}>{s}</option>}</For>
                   </select>
                 </Show>
-                <button class="icon" title="Decrease font size" onClick={() => updatePrefs({ fontSize: Math.max(9, prefs().fontSize - 1) })}>A−</button>
-                <button class="icon" title="Increase font size" onClick={() => updatePrefs({ fontSize: Math.min(24, prefs().fontSize + 1) })}>A+</button>
-                <button class="icon" title="Toggle word wrap" classList={{ active: prefs().wordWrap }} onClick={() => updatePrefs({ wordWrap: !prefs().wordWrap })}>⤶</button>
+                <button class="icon font-btn" title="Decrease font size" onClick={() => updatePrefs({ fontSize: Math.max(9, prefs().fontSize - 1) })}><span class="az-sm">A</span></button>
+                <button class="icon font-btn" title="Increase font size" onClick={() => updatePrefs({ fontSize: Math.min(24, prefs().fontSize + 1) })}><span class="az-lg">A</span></button>
+                <button class="icon" title="Toggle word wrap" classList={{ active: prefs().wordWrap }} onClick={() => updatePrefs({ wordWrap: !prefs().wordWrap })}><Icon name="wrap" /></button>
               </div>
             </div>
 
@@ -1546,17 +1570,20 @@ function App() {
                 )}
               </Show>
               <Show when={!done()}>
+                <span class="sb-sep" />
                 <button class="ghost export-btn" onClick={loadAll}>{loadingAll() ? <><span class="spinner-sm" />Cancel</> : "Load all"}</button>
-                <span class="streaming">
-                  <Show when={fetchingMore() || loadingAll()} fallback={"idle"}>
+                <span class="streaming" classList={{ idle: !(fetchingMore() || loadingAll()) }}>
+                  <Show when={fetchingMore() || loadingAll()} fallback={<><span class="stream-dot" />idle</>}>
                     <span class="spinner-sm" />streaming…
                   </Show>
                 </span>
               </Show>
               <Show when={(lastQuery() || columns().length > 0) && caps()?.export !== false}>
+                <span class="sb-sep" />
                 <button class="ghost export-btn" onClick={openExport}>Export…</button>
               </Show>
-              <span>{elapsed()} ms</span>
+              <span class="sb-sep" />
+              <span class="status-elapsed"><Icon name="clock" /> {elapsed()} ms</span>
             </footer>
           </main>
           <Show when={aiOpen()}>
@@ -1571,7 +1598,7 @@ function App() {
         <Show when={importOpen()}>
           <div class="modal-overlay" onClick={() => !importBusy() && setImportOpen(false)}>
             <div class="modal" onClick={(e) => e.stopPropagation()}>
-              <div class="modal-head">Import data<span class="spacer" /><button class="icon" disabled={importBusy()} onClick={() => setImportOpen(false)}>✕</button></div>
+              <div class="modal-head">Import data<span class="spacer" /><button class="icon modal-x" disabled={importBusy()} onClick={() => setImportOpen(false)}><Icon name="close" /></button></div>
               {/* All configuration controls disable while an import is running. */}
               <fieldset class="import-fieldset" disabled={importBusy()}>
                 <input ref={importFileInput} type="file" accept=".csv,.tsv,.json,.txt" style={{ display: "none" }} onChange={onImportFile} />

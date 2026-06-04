@@ -356,14 +356,14 @@ export function ResultGrid(props: ResultGridProps) {
     if (!isSel(r, dc)) setSel({ mode: "cell", ar: r, ac: dc, fr: r, fc: dc });
     const name = props.columns()[oi];
     props.onMenu(e.clientX, e.clientY, [
-      { label: "Copy", icon: "📋", onClick: () => void copySelection("tsv") },
-      { label: "Copy as CSV", icon: "📋", onClick: () => void copySelection("csv") },
-      { label: "Copy as JSON", icon: "📋", onClick: () => void copySelection("json") },
-      { label: "Copy as Markdown", icon: "📋", onClick: () => void copySelection("md") },
+      { label: "Copy", icon: "copy", onClick: () => void copySelection("tsv") },
+      { label: "Copy as CSV", icon: "copy", onClick: () => void copySelection("csv") },
+      { label: "Copy as JSON", icon: "copy", onClick: () => void copySelection("json") },
+      { label: "Copy as Markdown", icon: "copy", onClick: () => void copySelection("md") },
       { sep: true },
-      { label: val === null ? "Copy value (NULL→empty)" : "Copy cell value", icon: "📋", onClick: () => void copyText(val ?? "", "copied value") },
-      { label: "Copy column", icon: "📋", onClick: () => void copyText(toTSV(columnDataset(oi)), "copied column") },
-      { label: "View value…", icon: "🔍", onClick: () => props.onViewValue(name, val) },
+      { label: val === null ? "Copy value (NULL→empty)" : "Copy cell value", icon: "copy", onClick: () => void copyText(val ?? "", "copied value") },
+      { label: "Copy column", icon: "copy", onClick: () => void copyText(toTSV(columnDataset(oi)), "copied column") },
+      { label: "View value…", icon: "search", onClick: () => props.onViewValue(name, val) },
     ]);
   }
   function onHeaderContext(e: MouseEvent, oi: number, dc: number) {
@@ -372,24 +372,24 @@ export function ResultGrid(props: ResultGridProps) {
     const items: MenuItem[] = [];
     if (props.canSortFilter()) {
       items.push(
-        { label: "Sort ascending", icon: "▲", onClick: () => setSort(oi, "asc") },
-        { label: "Sort descending", icon: "▼", onClick: () => setSort(oi, "desc") },
-        { label: "Clear sort", icon: "✕", onClick: () => clearSort(oi) },
-        { label: props.view().filterRowOpen ? "Hide filter row" : "Filter…", icon: "⌕", onClick: () => props.setView({ filterRowOpen: !props.view().filterRowOpen }) },
+        { label: "Sort ascending", icon: "sortAsc", onClick: () => setSort(oi, "asc") },
+        { label: "Sort descending", icon: "sortDesc", onClick: () => setSort(oi, "desc") },
+        { label: "Clear sort", icon: "close", onClick: () => clearSort(oi) },
+        { label: props.view().filterRowOpen ? "Hide filter row" : "Filter…", icon: "search", onClick: () => props.setView({ filterRowOpen: !props.view().filterRowOpen }) },
         { sep: true },
       );
     }
     items.push(
-      { label: "Autofit column", icon: "↔", onClick: () => autofit(oi) },
-      { label: "Hide column", icon: "🙈", onClick: () => hideCol(oi) },
+      { label: "Autofit column", icon: "resize", onClick: () => autofit(oi) },
+      { label: "Hide column", icon: "eyeOff", onClick: () => hideCol(oi) },
     );
     const hidden = props.view().hidden;
     if (hidden.length) {
       items.push({ sep: true });
-      for (const h of hidden) items.push({ label: `Show "${props.columns()[h]}"`, icon: "👁", onClick: () => showCol(h) });
-      items.push({ label: "Show all columns", icon: "👁", onClick: () => props.setView({ hidden: [] }) });
+      for (const h of hidden) items.push({ label: `Show "${props.columns()[h]}"`, icon: "eye", onClick: () => showCol(h) });
+      items.push({ label: "Show all columns", icon: "eye", onClick: () => props.setView({ hidden: [] }) });
     }
-    items.push({ sep: true }, { label: "Copy column", icon: "📋", onClick: () => void copyText(toTSV(columnDataset(oi)), "copied column") });
+    items.push({ sep: true }, { label: "Copy column", icon: "copy", onClick: () => void copyText(toTSV(columnDataset(oi)), "copied column") });
     void dc;
     props.onMenu(e.clientX, e.clientY, items);
   }
