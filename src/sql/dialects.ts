@@ -118,3 +118,18 @@ const DIALECTS: Record<DialectId, DialectSpec> = {
 export function getDialect(id: DialectId): DialectSpec {
   return DIALECTS[id] ?? DIALECTS.postgres;
 }
+
+/** Map a connected-driver kind to the editor dialect. DuckDB is PostgreSQL-compatible
+ *  SQL, so it reuses the Postgres dialect (highlighting / keywords / functions). */
+export function driverDialect(kind?: string | null): DialectId {
+  switch (kind) {
+    case "mysql":
+      return "mysql";
+    case "sqlite":
+      return "sqlite";
+    case "mssql":
+      return "mssql";
+    default: // postgres, duckdb, unknown
+      return "postgres";
+  }
+}
