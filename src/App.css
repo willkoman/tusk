@@ -37,6 +37,8 @@ button:hover { border-color: #36506e; }
 button:active:not(:disabled) { transform: translateY(0.5px); }
 button:disabled { opacity: 0.5; cursor: default; }
 button.run { background: var(--accent); border-color: var(--accent); color: white; font-weight: 600; }
+button.run.cancel { background: var(--danger); border-color: var(--danger); }
+button.run.cancel:hover:not(:disabled) { filter: brightness(1.08); }
 button.ghost { background: transparent; }
 
 .editor, .cell { font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; }

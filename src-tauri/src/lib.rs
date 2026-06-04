@@ -199,15 +199,22 @@ async fn run_query(
         });
     }
 
-    match exec_items(&mut c, &items, page, &search_path).await {
+    // Arm cancellation so the Run button can interrupt this query (Postgres CancelRequest)
+    // by re-clicking. Armed after ensure_alive so the handle matches the live backend; the
+    // handle lives outside the per-connection lock we hold here so `cancel_operation` reaches it.
+    state.arm_cancel(&connection_id, c.backend.cancel_handle(), c.backend.config().clone());
+    let out = match exec_items(&mut c, &items, page, &search_path).await {
         Ok(out) => Ok(out),
         // If the connection dropped mid-query, reconnect and retry once.
         Err(_) if c.backend.is_closed() => {
             ensure_alive(&mut c).await?;
+            state.arm_cancel(&connection_id, c.backend.cancel_handle(), c.backend.config().clone());
             exec_items(&mut c, &items, page, &search_path).await
         }
         Err(e) => Err(e),
-    }
+    };
+    state.disarm_cancel(&connection_id);
+    out
 }
 
 async fn exec_items(

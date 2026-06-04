@@ -4,6 +4,11 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-04
+
+### Added
+- **Cancel a running query from the Run button.** While a query is in flight the **Run ▶** button turns into a red **✕ Cancel** button (with the live elapsed timer) — clicking it interrupts the query immediately. On Postgres this issues an out-of-band `CancelRequest` (the same mechanism export/import already used): `run_query` now **arms the cancel handle** after `ensure_alive` (so it matches the live backend, and is re-armed on the reconnect-retry path) and disarms when the query ends. The button shows **Cancelling…** until the query unwinds, and the cancelled query reports a calm **"Query cancelled"** status rather than a red error banner. Backend hardening: a failed/cancelled cursor `FETCH` now **rolls back** its `BEGIN` transaction so the still-alive session isn't left poisoned (an aborted transaction would have failed the next query). Cancel is a no-op on engines without out-of-band cancel (SQLite/MySQL); DuckDB uses its `InterruptHandle`.
+
 ## [0.2.0] - 2026-06-04
 
 ### Changed

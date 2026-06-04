@@ -471,7 +471,16 @@ impl PgConn {
                 return Err(e.into());
             }
             let fetch = format!("FETCH FORWARD {page} FROM {CURSOR_NAME}");
-            let messages = self.client.simple_query(&fetch).await?;
+            // On a failed/cancelled FETCH the BEGIN transaction is left aborted — roll it
+            // back so the next query on this (still-alive) session isn't poisoned.
+            let messages = match self.client.simple_query(&fetch).await {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = self.client.batch_execute("ROLLBACK").await;
+                    self.cursor_open = false;
+                    return Err(e.into());
+                }
+            };
             let (columns, rows) = db::collect_rows(&messages);
             let done = (rows.len() as u32) < page;
             if done {

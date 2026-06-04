@@ -203,6 +203,7 @@ function App() {
   const [running, setRunning] = createSignal(false);
   const [runningTabId, setRunningTabId] = createSignal<string | null>(null); // tab whose query is in flight
   const [runMs, setRunMs] = createSignal(0); // live elapsed while a query runs
+  const [cancelling, setCancelling] = createSignal(false); // cancel request sent, awaiting unwind
   const [editorApi, setEditorApi] = createSignal<EditorApi | null>(null);
   const [editorH, setEditorH] = createSignal(Math.max(300, Math.round((window.innerHeight - 120) * 0.6)));
 
@@ -732,13 +733,26 @@ function App() {
       }
       if (out.kind === "exec" || DDL_RE.test(sqlToRun)) void loadSchema();
     } catch (e) {
-      patchResult(runTabId, { runErr: errMsg(e), columns: [], rows: [], done: true });
+      const msg = errMsg(e);
+      // A user cancel surfaces as Postgres' "canceling statement due to user request" —
+      // present it as a calm status, not a red error banner.
+      if (/cancel/i.test(msg)) patchResult(runTabId, { runErr: "", status: "Query cancelled", columns: [], rows: [], done: true });
+      else patchResult(runTabId, { runErr: msg, columns: [], rows: [], done: true });
     } finally {
       if (runTimer) clearInterval(runTimer);
       setRunning(false);
       setRunningTabId(null);
+      setCancelling(false);
       patchResult(runTabId, { elapsed: Math.round(performance.now() - t0) });
     }
+  }
+
+  // Cancel the in-flight query (re-clicking Run): fire a Postgres CancelRequest; the
+  // run_query call then errors out and unwinds through executeQuery's finally.
+  function cancelQuery() {
+    if (!running() || cancelling()) return;
+    setCancelling(true);
+    void cancelOperation();
   }
 
   function doRun(override?: string) {
@@ -1506,7 +1520,17 @@ function App() {
                 onContextMenu={openEditorMenu}
               />
               <div class="toolbar">
-                <button class="run" onClick={() => doRun()} disabled={running()}>{running() ? <><span class="spinner-sm" />Running… {fmtDur(runMs())}</> : "Run ▶"}</button>
+                <button
+                  class="run"
+                  classList={{ cancel: running() }}
+                  onClick={() => (running() ? cancelQuery() : doRun())}
+                  disabled={cancelling()}
+                  title={running() ? "Cancel running query" : "Run selection or all"}
+                >
+                  {running()
+                    ? (cancelling() ? <><span class="spinner-sm" />Cancelling…</> : <>✕ Cancel {fmtDur(runMs())}</>)
+                    : "Run ▶"}
+                </button>
                 <button class="ghost" onClick={openFileDialog}>Open</button>
                 <button class="ghost" onClick={() => void saveActiveTab()}>Save</button>
                 <button class="ghost" onClick={() => void saveAsActiveTab()}>Save As</button>
