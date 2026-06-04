@@ -1,0 +1,315 @@
+//! Cross-engine conformance suite. One battery of behaviours run against every driver,
+//! so per-engine divergence and production-data edge cases (NULL, paging boundaries,
+//! unicode/quotes/newlines, large values, writes-apply, introspection, weird
+//! identifiers, read-only) are caught uniformly.
+//!
+//! DuckDB + SQLite run in-process (embedded). Postgres + MySQL run against a live server
+//! when `TUSK_TEST_PG_PORT` / `TUSK_TEST_MYSQL_PORT` are set (e.g. `scripts/conformance.sh`
+//! spins up throwaway Docker containers); otherwise those tests skip.
+
+use crate::db::{ConnectionConfig, QueryOutcome};
+use crate::driver::{connect, Backend};
+
+// --- engine descriptors ---
+
+fn dq(n: &str) -> String {
+    format!("\"{}\"", n.replace('"', "\"\""))
+}
+fn bt(n: &str) -> String {
+    format!("`{}`", n.replace('`', "``"))
+}
+
+struct Eng {
+    name: &'static str,
+    schema: &'static str,        // schema arg for table_detail
+    quote: fn(&str) -> String,   // identifier quoting
+}
+
+fn base() -> ConnectionConfig {
+    ConnectionConfig {
+        driver: None,
+        host: String::new(),
+        port: 0,
+        user: String::new(),
+        password: String::new(),
+        dbname: String::new(),
+        sslmode: None,
+        read_only: false,
+        path: None,
+    }
+}
+fn duck_cfg() -> ConnectionConfig {
+    ConnectionConfig { driver: Some("duckdb".into()), path: Some(":memory:".into()), ..base() }
+}
+fn sqlite_cfg() -> ConnectionConfig {
+    ConnectionConfig { driver: Some("sqlite".into()), path: Some(":memory:".into()), ..base() }
+}
+fn pg_cfg() -> Option<ConnectionConfig> {
+    let port: u16 = std::env::var("TUSK_TEST_PG_PORT").ok()?.parse().ok()?;
+    Some(ConnectionConfig {
+        driver: Some("postgres".into()),
+        host: "127.0.0.1".into(),
+        port,
+        user: "postgres".into(),
+        password: "test".into(),
+        dbname: "postgres".into(),
+        sslmode: Some("disable".into()),
+        ..base()
+    })
+}
+fn mysql_cfg() -> Option<ConnectionConfig> {
+    let port: u16 = std::env::var("TUSK_TEST_MYSQL_PORT").ok()?.parse().ok()?;
+    Some(ConnectionConfig {
+        driver: Some("mysql".into()),
+        host: "127.0.0.1".into(),
+        port,
+        user: "root".into(),
+        password: "test".into(),
+        dbname: "test".into(),
+        sslmode: Some("disable".into()),
+        ..base()
+    })
+}
+
+// --- helpers ---
+
+fn cursorable(sql: &str) -> bool {
+    let t = sql.trim_start().to_ascii_lowercase();
+    t.starts_with("select") || t.starts_with("with") || t.starts_with("table") || t.starts_with("values")
+}
+
+async fn exec(b: &mut Backend, sql: &str) {
+    b.rollback_cursor().await;
+    b.run_single(sql, 1000, cursorable(sql))
+        .await
+        .unwrap_or_else(|e| panic!("exec failed [{sql}]: {}", e.message));
+}
+
+/// Run a query and return all rows (single big page).
+async fn all(b: &mut Backend, sql: &str) -> Vec<Vec<Option<String>>> {
+    b.rollback_cursor().await;
+    match b
+        .run_single(sql, 1_000_000, true)
+        .await
+        .unwrap_or_else(|e| panic!("query failed [{sql}]: {}", e.message))
+    {
+        QueryOutcome::Rows { rows, .. } => rows,
+        QueryOutcome::Exec { message } => panic!("expected rows, got exec [{sql}]: {message}"),
+    }
+}
+
+/// Page a query and return (all rows in order, fetch count).
+async fn page_all(b: &mut Backend, sql: &str, page: u32) -> (Vec<Vec<Option<String>>>, usize) {
+    b.rollback_cursor().await;
+    let mut out = Vec::new();
+    let (mut rows, mut done) = match b.run_single(sql, page, true).await.unwrap() {
+        QueryOutcome::Rows { rows, done, .. } => (rows, done),
+        _ => panic!("expected rows"),
+    };
+    out.append(&mut rows);
+    let mut fetches = 1;
+    while !done {
+        let fr = b.fetch_page(page).await.unwrap();
+        done = fr.done;
+        out.extend(fr.rows);
+        fetches += 1;
+        assert!(fetches < 100_000, "paging never terminated");
+    }
+    (out, fetches)
+}
+
+fn cell(r: &[Option<String>], i: usize) -> Option<String> {
+    r.get(i).cloned().flatten()
+}
+
+// --- the battery ---
+
+async fn run_battery(b: &mut Backend, eng: &Eng) {
+    let q = eng.quote;
+
+    // clean slate (idempotent across re-runs on a persistent server)
+    for t in ["conf", "seq"] {
+        exec(b, &format!("DROP TABLE IF EXISTS {}", q(t))).await;
+    }
+
+    // 1. CREATE + insert edge values: unicode/emoji, embedded quote, NULL (explicit +
+    //    default), newline.
+    exec(b, &format!("CREATE TABLE {} (id INTEGER, name TEXT)", q("conf"))).await;
+    exec(b, &format!("INSERT INTO {} VALUES (1, 'café 🦆')", q("conf"))).await;
+    exec(b, &format!("INSERT INTO {} VALUES (2, 'a''b')", q("conf"))).await;
+    exec(b, &format!("INSERT INTO {} VALUES (3, NULL)", q("conf"))).await;
+    exec(b, &format!("INSERT INTO {} (id) VALUES (4)", q("conf"))).await;
+    exec(b, &format!("INSERT INTO {} VALUES (5, 'l1\nl2')", q("conf"))).await;
+
+    let r = all(b, &format!("SELECT {},{} FROM {} ORDER BY id", q("id"), q("name"), q("conf"))).await;
+    assert_eq!(r.len(), 5, "[{}] row count", eng.name);
+    assert_eq!(cell(&r[0], 0).as_deref(), Some("1"), "[{}] int→text", eng.name);
+    assert_eq!(cell(&r[0], 1).as_deref(), Some("café 🦆"), "[{}] unicode/emoji roundtrip", eng.name);
+    assert_eq!(cell(&r[1], 1).as_deref(), Some("a'b"), "[{}] quote unescaped", eng.name);
+    assert_eq!(cell(&r[2], 1), None, "[{}] explicit NULL → None", eng.name);
+    assert_eq!(cell(&r[3], 1), None, "[{}] default NULL → None", eng.name);
+    assert!(cell(&r[4], 1).unwrap().contains('\n'), "[{}] newline preserved", eng.name);
+
+    // 2. empty result set: no rows, no error. (Note: Postgres' simple-protocol can't
+    //    report column names for a zero-row result — that divergence is documented, not
+    //    asserted here.)
+    let empty = b
+        .run_single(&format!("SELECT {} FROM {} WHERE 1=0", q("id"), q("conf")), 100, true)
+        .await
+        .unwrap();
+    match empty {
+        QueryOutcome::Rows { rows, done, .. } => {
+            assert!(rows.is_empty(), "[{}] empty result has no rows", eng.name);
+            assert!(done, "[{}] empty result is done", eng.name);
+        }
+        _ => panic!("[{}] empty SELECT should be Rows", eng.name),
+    }
+
+    // 3. duplicate result column names — the realistic case (a column selected twice, or
+    //    a join sharing a name). The pager wraps the query as a derived table; MySQL
+    //    forbids duplicate names there (1060) and falls back to appending LIMIT/OFFSET.
+    let dup = all(b, &format!("SELECT {0}, {0} FROM {1} ORDER BY id", q("id"), q("conf"))).await;
+    assert_eq!(dup[0].len(), 2, "[{}] duplicate result columns kept", eng.name);
+    assert_eq!(cell(&dup[0], 0), cell(&dup[0], 1), "[{}] both dup columns same value", eng.name);
+
+    // 4. paging boundaries — the critical edges. 20 rows, page 10:
+    //    page1=10 (NOT done, == page), page2=10 (NOT done), page3=0 (done).
+    //    Must collect all 20 in order with no dup/skip and exactly 3 fetches.
+    exec(b, &format!("CREATE TABLE {} (n INTEGER)", q("seq"))).await;
+    for i in 1..=20 {
+        exec(b, &format!("INSERT INTO {} VALUES ({i})", q("seq"))).await;
+    }
+    let sel_seq = format!("SELECT {} FROM {} ORDER BY n", q("n"), q("seq"));
+    let (rows20, fetches20) = page_all(b, &sel_seq, 10).await;
+    assert_eq!(rows20.len(), 20, "[{}] paged 20 rows", eng.name);
+    assert_eq!(fetches20, 3, "[{}] exactly-full page must do a final empty fetch", eng.name);
+    let ids: Vec<i64> = rows20.iter().map(|r| cell(r, 0).unwrap().parse().unwrap()).collect();
+    assert_eq!(ids, (1..=20).collect::<Vec<_>>(), "[{}] paged order, no dup/skip", eng.name);
+    // exact single-page boundary: 10 rows, page 10 → page1=10 (not done), page2=0 (done).
+    let (rows10, fetches10) = page_all(b, &format!("{sel_seq} LIMIT 10"), 10).await;
+    assert_eq!(rows10.len(), 10, "[{}] single full page count", eng.name);
+    assert_eq!(fetches10, 2, "[{}] full single page needs a trailing empty fetch", eng.name);
+
+    // 5. large value (50 KB) survives the text pipeline intact (no truncation).
+    let big = "x".repeat(50_000);
+    exec(b, &format!("INSERT INTO {} VALUES (100, '{big}')", q("conf"))).await;
+    let lr = all(b, &format!("SELECT {} FROM {} WHERE id=100", q("name"), q("conf"))).await;
+    assert_eq!(cell(&lr[0], 0).unwrap().len(), 50_000, "[{}] 50KB value intact", eng.name);
+
+    // 6. writes actually apply (robust across affected-count reporting differences).
+    exec(b, &format!("UPDATE {} SET {}='z' WHERE id=1", q("conf"), q("name"))).await;
+    let u = all(b, &format!("SELECT {} FROM {} WHERE id=1", q("name"), q("conf"))).await;
+    assert_eq!(cell(&u[0], 0).as_deref(), Some("z"), "[{}] UPDATE applied", eng.name);
+    exec(b, &format!("DELETE FROM {} WHERE id=100", q("conf"))).await;
+    let c = all(b, &format!("SELECT COUNT(*) FROM {} WHERE id=100", q("conf"))).await;
+    assert_eq!(cell(&c[0], 0).as_deref(), Some("0"), "[{}] DELETE applied", eng.name);
+
+    // 7. introspection: tree / table_detail / autocomplete list all see the table + cols.
+    let tree = b.build_tree().await.unwrap();
+    assert!(
+        tree.schemas.iter().any(|s| s.tables.iter().any(|t| t.name == "conf")),
+        "[{}] build_tree includes conf", eng.name
+    );
+    let det = b.table_detail(eng.schema, "conf").await.unwrap();
+    let cols: Vec<&str> = det.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(cols.contains(&"id") && cols.contains(&"name"), "[{}] table_detail cols {cols:?}", eng.name);
+    let list = b.list_tables().await.unwrap();
+    assert!(
+        list.iter().any(|t| t.name == "conf" && t.columns.len() >= 2),
+        "[{}] list_tables includes conf w/ columns", eng.name
+    );
+
+    // 8. weird identifier (space + embedded quote) — quoting + introspection robustness
+    //    (the injection-adjacent path: names get inlined into catalog queries).
+    let weird = "we ird\"x";
+    let qw = q(weird);
+    exec(b, &format!("DROP TABLE IF EXISTS {qw}")).await;
+    exec(b, &format!("CREATE TABLE {qw} ({} INTEGER)", q("a"))).await;
+    exec(b, &format!("INSERT INTO {qw} VALUES (7)")).await;
+    let wr = all(b, &format!("SELECT {} FROM {qw}", q("a"))).await;
+    assert_eq!(cell(&wr[0], 0).as_deref(), Some("7"), "[{}] query weird-named table", eng.name);
+    let list2 = b.list_tables().await.unwrap();
+    assert!(
+        list2.iter().any(|t| t.name == weird),
+        "[{}] list_tables returns the exact weird name", eng.name
+    );
+    let wdet = b.table_detail(eng.schema, weird).await.unwrap();
+    assert!(wdet.columns.iter().any(|c| c.name == "a"), "[{}] table_detail of weird name", eng.name);
+    exec(b, &format!("DROP TABLE IF EXISTS {qw}")).await;
+}
+
+// --- entry points ---
+
+#[tokio::test]
+async fn conformance_duckdb() {
+    let (mut b, _v) = connect(&duck_cfg()).await.unwrap();
+    run_battery(&mut b, &Eng { name: "duckdb", schema: "main", quote: dq }).await;
+}
+
+#[tokio::test]
+async fn conformance_sqlite() {
+    let (mut b, _v) = connect(&sqlite_cfg()).await.unwrap();
+    run_battery(&mut b, &Eng { name: "sqlite", schema: "main", quote: dq }).await;
+}
+
+#[tokio::test]
+async fn conformance_postgres() {
+    let Some(cfg) = pg_cfg() else {
+        eprintln!("SKIP conformance_postgres (set TUSK_TEST_PG_PORT)");
+        return;
+    };
+    let (mut b, _v) = connect(&cfg).await.expect("connect pg");
+    run_battery(&mut b, &Eng { name: "postgres", schema: "public", quote: dq }).await;
+}
+
+#[tokio::test]
+async fn conformance_mysql() {
+    let Some(cfg) = mysql_cfg() else {
+        eprintln!("SKIP conformance_mysql (set TUSK_TEST_MYSQL_PORT)");
+        return;
+    };
+    let (mut b, _v) = connect(&cfg).await.expect("connect mysql");
+    run_battery(&mut b, &Eng { name: "mysql", schema: "test", quote: bt }).await;
+}
+
+// --- read-only enforcement (production safety) ---
+
+async fn readonly_embedded(driver: &str, ext: &str) {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("tusk_ro_{}_{}.{ext}", driver, std::process::id()));
+    let p = path.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&path);
+    let mut cfg = ConnectionConfig { driver: Some(driver.into()), path: Some(p.clone()), ..base() };
+    {
+        let (mut b, _) = connect(&cfg).await.unwrap();
+        exec(&mut b, "CREATE TABLE t (a INTEGER)").await;
+        exec(&mut b, "INSERT INTO t VALUES (1)").await;
+    }
+    cfg.read_only = true;
+    let (mut b, _) = connect(&cfg).await.unwrap();
+    let res = b.run_single("INSERT INTO t VALUES (2)", 100, false).await;
+    assert!(res.is_err(), "{driver}: read-only must reject INSERT");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn readonly_sqlite_blocks_writes() {
+    readonly_embedded("sqlite", "sqlite").await;
+}
+
+#[tokio::test]
+async fn readonly_duckdb_blocks_writes() {
+    readonly_embedded("duckdb", "duckdb").await;
+}
+
+#[tokio::test]
+async fn readonly_postgres_blocks_writes() {
+    let Some(mut cfg) = pg_cfg() else {
+        eprintln!("SKIP readonly_postgres (set TUSK_TEST_PG_PORT)");
+        return;
+    };
+    cfg.read_only = true;
+    let (mut b, _) = connect(&cfg).await.expect("connect pg ro");
+    let res = b.run_single("CREATE TABLE tusk_ro_probe (a int)", 100, false).await;
+    assert!(res.is_err(), "read-only postgres must reject writes/DDL");
+}

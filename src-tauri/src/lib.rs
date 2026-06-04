@@ -1,6 +1,8 @@
 mod db;
 mod ddl;
 mod driver;
+#[cfg(test)]
+mod driver_conformance;
 mod export;
 mod profiles;
 mod script;

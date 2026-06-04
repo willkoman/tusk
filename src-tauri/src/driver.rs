@@ -899,8 +899,7 @@ impl MySqlConn {
         cursorable: bool,
     ) -> Result<QueryOutcome, AppError> {
         if cursorable {
-            let wrapped = format!("SELECT * FROM ({trimmed}) AS _tusk LIMIT {page}");
-            let (columns, rows, _a) = mysql_run(&self.pool, &wrapped).await?;
+            let (columns, rows) = mysql_page(&self.pool, trimmed, page, 0).await?;
             let done = (rows.len() as u32) < page;
             if done {
                 self.stream_sql = None;
@@ -940,11 +939,7 @@ impl MySqlConn {
                 })
             }
         };
-        let wrapped = format!(
-            "SELECT * FROM ({base}) AS _tusk LIMIT {page} OFFSET {}",
-            self.offset
-        );
-        let (_c, rows, _a) = mysql_run(&self.pool, &wrapped).await?;
+        let (_c, rows) = mysql_page(&self.pool, &base, page, self.offset).await?;
         let done = (rows.len() as u32) < page;
         self.offset += rows.len();
         if done {
@@ -983,6 +978,28 @@ fn mysql_value_to_string(v: &mysql_async::Value) -> Option<String> {
             let base = format!("{}{hours:02}:{mi:02}:{s:02}", if *neg { "-" } else { "" });
             Some(if *us > 0 { format!("{base}.{us:06}") } else { base })
         }
+    }
+}
+
+/// Page a MySQL query by LIMIT/OFFSET. Wraps as a derived table (robust to a query's own
+/// trailing `LIMIT`/`ORDER BY`/`UNION`); but MySQL forbids duplicate column names in a
+/// derived table (error 1060), so on that error it falls back to appending LIMIT/OFFSET
+/// directly — which streams duplicate output columns (e.g. `a JOIN b` sharing a column).
+async fn mysql_page(
+    pool: &mysql_async::Pool,
+    base: &str,
+    limit: u32,
+    offset: usize,
+) -> Result<(Vec<String>, Vec<Vec<Option<String>>>), AppError> {
+    let wrapped = format!("SELECT * FROM ({base}) AS _tusk LIMIT {limit} OFFSET {offset}");
+    match mysql_run(pool, &wrapped).await {
+        Ok((c, r, _)) => Ok((c, r)),
+        Err(e) if e.message.contains("Duplicate column name") => {
+            let appended = format!("{base} LIMIT {limit} OFFSET {offset}");
+            let (c, r, _) = mysql_run(pool, &appended).await?;
+            Ok((c, r))
+        }
+        Err(e) => Err(e),
     }
 }
 
