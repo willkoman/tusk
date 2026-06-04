@@ -970,8 +970,15 @@ fn mysql_value_to_string(v: &mysql_async::Value) -> Option<String> {
         V::Float(f) => Some(f.to_string()),
         V::Double(f) => Some(f.to_string()),
         V::Date(y, mo, d, h, mi, s, us) => {
-            let base = format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}");
-            Some(if *us > 0 { format!("{base}.{us:06}") } else { base })
+            // A pure DATE (and DATETIME/TIMESTAMP at exact midnight) renders date-only;
+            // a non-zero time renders the full timestamp. (Value::Date can't distinguish
+            // DATE from DATETIME, so the zero-time heuristic keeps DATE columns clean.)
+            if *h == 0 && *mi == 0 && *s == 0 && *us == 0 {
+                Some(format!("{y:04}-{mo:02}-{d:02}"))
+            } else {
+                let base = format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}");
+                Some(if *us > 0 { format!("{base}.{us:06}") } else { base })
+            }
         }
         V::Time(neg, d, h, mi, s, us) => {
             let hours = d * 24 + *h as u32;

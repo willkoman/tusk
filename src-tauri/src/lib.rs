@@ -218,15 +218,26 @@ async fn exec_items(
     c.backend.rollback_cursor().await;
     c.backend.apply_search_path(search_path).await?;
 
+    // Read-only enforcement, uniform across drivers AND single/multi-statement input.
+    // PG also sets `default_transaction_read_only` and embedded files open read-only, but
+    // MySQL has no engine-level read-only — so this app-layer guard is what protects it.
+    // Any write/DDL statement (or a COPY block) on a read-only connection is rejected.
+    if c.read_only {
+        let has_write = items.iter().any(|it| match it {
+            script::Item::Sql(s) => !is_read_only_stmt(s.trim()),
+            script::Item::Copy { .. } => true,
+        });
+        if has_write {
+            return Err(AppError::new(
+                "connection is read-only — writes and DDL are blocked",
+            ));
+        }
+    }
+
     // A single plain statement runs interactively (streaming result grid).
     if items.len() == 1 {
         if let script::Item::Sql(stmt) = &items[0] {
             let trimmed = stmt.trim();
-            if c.read_only && !is_read_only_stmt(trimmed) {
-                return Err(AppError::new(
-                    "connection is read-only — writes and DDL are blocked",
-                ));
-            }
             return c.backend.run_single(trimmed, page, is_cursorable(trimmed)).await;
         }
     }
