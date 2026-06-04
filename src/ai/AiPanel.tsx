@@ -1,6 +1,7 @@
 import { createSignal, createEffect, For, Show, onMount, type Accessor } from "solid-js";
 import { invoke, Channel } from "@tauri-apps/api/core";
-import { aiStore, defaultModel, AI_PROVIDERS, type AiConfig, type AiProvider, type AiEvent } from "./store";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { aiStore, defaultModel, providerModels, providerInfo, AI_PROVIDERS, type AiConfig, type AiProvider, type AiEvent } from "./store";
 import { buildSystemPrompt, extractSqlBlocks, type AiContext } from "./context";
 
 type ChatMsg = { role: "user" | "assistant"; content: string };
@@ -117,10 +118,22 @@ export function AiPanel(props: {
               <For each={AI_PROVIDERS}>{(p) => <option value={p.id}>{p.label}</option>}</For>
             </select>
           </label>
-          <label>Model<input value={cfg().model} onInput={(e) => setConfig({ model: e.currentTarget.value })} placeholder={defaultModel(cfg().provider)} /></label>
-          <label>API base (optional)<input value={cfg().baseUrl} onInput={(e) => setConfig({ baseUrl: e.currentTarget.value })} placeholder={AI_PROVIDERS.find((p) => p.id === cfg().provider)?.baseHint} /></label>
+          <label>Model
+            <select
+              value={providerModels(cfg().provider).includes(cfg().model) ? cfg().model : "__custom__"}
+              onChange={(e) => { const v = e.currentTarget.value; setConfig({ model: v === "__custom__" ? "" : v }); }}
+            >
+              <For each={providerModels(cfg().provider)}>{(m) => <option value={m}>{m}</option>}</For>
+              <option value="__custom__">Custom…</option>
+            </select>
+            <Show when={!providerModels(cfg().provider).includes(cfg().model)}>
+              <input value={cfg().model} onInput={(e) => setConfig({ model: e.currentTarget.value })} placeholder="custom model id (e.g. for a local / OpenAI-compatible server)" />
+            </Show>
+          </label>
+          <label>API base (optional)<input value={cfg().baseUrl} onInput={(e) => setConfig({ baseUrl: e.currentTarget.value })} placeholder={providerInfo(cfg().provider).baseHint} /></label>
           <label>API key {hasKey() ? <span class="ai-key-ok">saved ✓</span> : <span class="ai-key-missing">not set</span>}
             <input type="password" value={keyInput()} onInput={(e) => setKeyInput(e.currentTarget.value)} placeholder={hasKey() ? "•••••• (stored in keychain)" : "paste key"} />
+            <button type="button" class="ai-key-link" onClick={() => void openUrl(providerInfo(cfg().provider).keyUrl)}>Get an API key ↗</button>
           </label>
           <div class="ai-settings-actions">
             <Show when={hasKey()}><button class="ghost" onClick={async () => { await invoke("ai_clear_key", { provider: cfg().provider }); await refreshKey(); }}>Clear key</button></Show>

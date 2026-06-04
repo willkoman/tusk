@@ -374,3 +374,5 @@ button.btn-danger { background: var(--danger); border-color: var(--danger); colo
 .ai-actions { display: flex; gap: 6px; padding: 6px 8px; border-top: 1px solid var(--border); }
 .ai-input { display: flex; gap: 6px; padding: 8px; border-top: 1px solid var(--border); }
 .ai-input input { flex: 1; min-width: 0; font: inherit; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+.ai-key-link { align-self: flex-start; margin-top: 2px; padding: 2px 0; background: transparent; border: none; color: var(--accent); font-size: 11px; text-transform: none; letter-spacing: normal; cursor: pointer; }
+.ai-key-link:hover { text-decoration: underline; }
