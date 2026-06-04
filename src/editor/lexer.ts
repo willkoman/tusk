@@ -216,10 +216,19 @@ export function isCode(spans: Span[], pos: number): boolean {
  * regex match index maps straight back to a document position. Used by the linters
  * to scan only real SQL.
  */
-export function maskNonCode(doc: string, spans: Span[], from: number, to: number): string {
+export function maskNonCode(
+  doc: string,
+  spans: Span[],
+  from: number,
+  to: number,
+  // Keep double-quoted identifiers (`"col"`) intact — they're names, not string
+  // literals. The schema linter needs them; the paren/heuristic linter does not (a `)`
+  // inside a quoted identifier would otherwise count as a real paren), so it stays false.
+  keepDquote = false,
+): string {
   const arr = doc.slice(from, to).split("");
   for (const s of spans) {
-    if (s.kind === "code" || s.to <= from || s.from >= to) continue;
+    if (s.kind === "code" || (keepDquote && s.kind === "dquote") || s.to <= from || s.from >= to) continue;
     const a = Math.max(s.from, from);
     const b = Math.min(s.to, to);
     for (let p = a; p < b; p++) {

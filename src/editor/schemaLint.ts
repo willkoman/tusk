@@ -14,9 +14,15 @@ import { closest } from "./distance";
 // FROM/JOIN/UPDATE/INTO). Bare columns are intentionally left to the server linter,
 // which has a real parser and won't false-positive on CTE columns, lateral refs, etc.
 
+// An identifier part: double-quoted (any chars) or a bare word; a table ref is one or two
+// (schema-qualified), each part independently quotable — so `public."customer"` parses.
+const IDENT = `(?:"[^"]+"|[A-Za-z_]\\w*)`;
+// Unquoted `alias.col` only — quoted columns are left to the server linter (avoids
+// false-positives on CTE-derived / computed columns).
 const QUALIFIED = /\b([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\b/g;
-const TABLE_POS = /\b(?:FROM|JOIN|UPDATE|INTO)\s+("?[a-zA-Z_][\w.]*"?)/gi;
-const CTE_DEF = /\b([a-zA-Z_]\w*)\s+AS\s*\(/gi;
+const TABLE_POS = new RegExp(`\\b(?:FROM|JOIN|UPDATE|INTO)\\s+(${IDENT}(?:\\.${IDENT})?)`, "gi");
+// CTE name (quoted or bare) before `AS (` — must register so its references aren't flagged.
+const CTE_DEF = new RegExp(`(${IDENT})\\s+AS\\s*\\(`, "gi");
 
 function replaceAction(from: number, to: number, text: string) {
   return [
@@ -39,12 +45,12 @@ export function schemaLintSource(getSchema: () => Table[]) {
     const diags: Diagnostic[] = [];
 
     for (const stmt of stmts) {
-      const masked = maskNonCode(doc, spans, stmt.from, stmt.to);
+      const masked = maskNonCode(doc, spans, stmt.from, stmt.to, true); // keep "quoted" identifiers
       const base = stmt.from;
       const aliases = aliasMap(masked);
 
       const cte = new Set<string>();
-      for (const m of masked.matchAll(CTE_DEF)) cte.add(m[1].toLowerCase());
+      for (const m of masked.matchAll(CTE_DEF)) cte.add(strip(m[1]).toLowerCase());
 
       // (1) Qualified column references: alias.col / table.col.
       for (const m of masked.matchAll(QUALIFIED)) {

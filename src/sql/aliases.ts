@@ -46,17 +46,30 @@ export function tableByRef(idx: Index, ref: string): Table | undefined {
   return idx.byBare.get(r)?.[0];
 }
 
+// An identifier part: a double-quoted name (any chars) or a bare word. A table ref is
+// `ident` or `ident.ident` (schema-qualified) — both parts independently quotable, so
+// `public."customer"`, `"public"."customer"`, `public.customer`, and `"customer"` all work.
+const IDENT = `(?:"[^"]+"|[A-Za-z_]\\w*)`;
+// Keywords that can follow a table ref where an alias would otherwise be — must not be
+// captured as the alias (e.g. `JOIN a ON …`, `FROM a WHERE …`).
+const ALIAS_STOP = `(?:ON|USING|WHERE|GROUP|ORDER|HAVING|LIMIT|OFFSET|JOIN|LEFT|RIGHT|INNER|OUTER|CROSS|FULL|NATURAL|UNION|EXCEPT|INTERSECT|AND|OR|SET|RETURNING|VALUES)`;
+const TABLE_REF = new RegExp(
+  `\\b(?:FROM|JOIN|UPDATE|INTO)\\s+(${IDENT})(?:\\.(${IDENT}))?(?:\\s+(?:AS\\s+)?(?!${ALIAS_STOP}\\b)(${IDENT}))?`,
+  "gi",
+);
+
 /** Map alias (and bare table name) -> table reference, from FROM/JOIN/UPDATE/INTO in the statement. */
 export function aliasMap(stmt: string): Map<string, string> {
   const m = new Map<string, string>();
-  const re = /\b(?:FROM|JOIN|UPDATE|INTO)\s+("?[\w.]+"?)(?:\s+(?:AS\s+)?("?[a-zA-Z_]\w*"?))?/gi;
   let g: RegExpExecArray | null;
-  while ((g = re.exec(stmt))) {
-    const table = strip(g[1]);
-    const bare = table.split(".").pop()!;
-    const alias = g[2] ? strip(g[2]) : bare;
-    m.set(alias.toLowerCase(), table);
-    m.set(bare.toLowerCase(), table);
+  TABLE_REF.lastIndex = 0;
+  while ((g = TABLE_REF.exec(stmt))) {
+    const schemaOrTable = strip(g[1]);
+    const table = g[2] ? strip(g[2]) : schemaOrTable;
+    const ref = g[2] ? `${schemaOrTable}.${table}` : table; // qualified ref drives byQualified
+    const alias = g[3] ? strip(g[3]) : table;
+    m.set(alias.toLowerCase(), ref);
+    m.set(table.toLowerCase(), ref);
   }
   return m;
 }
