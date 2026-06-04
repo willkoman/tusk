@@ -298,6 +298,9 @@ button.ghost { background: transparent; }
 
 .export-select { font: inherit; font-size: 11px; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 2px 6px; }
 .export-btn { font-size: 11px; padding: 3px 10px; }
+.sb-copyhdr { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); white-space: nowrap; cursor: pointer; user-select: none; }
+.sb-copyhdr input { width: auto; margin: 0; cursor: pointer; }
+.sb-copyhdr:hover { color: var(--text); }
 
 /* Export configurator */
 .export-grid { display: flex; flex-direction: column; gap: 12px; padding: 14px 16px 4px; max-height: 62vh; overflow-y: auto; }

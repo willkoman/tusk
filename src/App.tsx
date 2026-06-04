@@ -1578,6 +1578,7 @@ function App() {
                   onViewValue={(col, val) => setCellView({ col, val })}
                   onStatus={setStatus}
                   canSortFilter={canSortFilter}
+                  copyHeaders={() => prefs().copyHeaders}
                 />
               </Show>
               <Show when={running()}>
@@ -1605,6 +1606,13 @@ function App() {
                     <span class="spinner-sm" />streaming…
                   </Show>
                 </span>
+              </Show>
+              <Show when={columns().length > 0}>
+                <span class="sb-sep" />
+                <label class="checkbox sb-copyhdr" title="Include column names as a header row when copying from the results grid (default: off)">
+                  <input type="checkbox" checked={prefs().copyHeaders} onChange={(e) => updatePrefs({ copyHeaders: e.currentTarget.checked })} />
+                  Copy w/ column names
+                </label>
               </Show>
               <Show when={(lastQuery() || columns().length > 0) && caps()?.export !== false}>
                 <span class="sb-sep" />

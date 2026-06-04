@@ -101,25 +101,28 @@ function quoteCell(v: string | null, sep: string): string {
   return v;
 }
 
-export function toCSV(d: Dataset): string {
-  const lines = [d.columns.map((c) => quoteCell(c, ",")).join(",")];
+export function toCSV(d: Dataset, header = true): string {
+  const lines: string[] = [];
+  if (header) lines.push(d.columns.map((c) => quoteCell(c, ",")).join(","));
   for (const r of d.rows) lines.push(r.map((v) => quoteCell(v, ",")).join(","));
   return lines.join("\n");
 }
 
-export function toTSV(d: Dataset): string {
+export function toTSV(d: Dataset, header = true): string {
   const esc = (v: string | null) => (v === null ? "" : v.replace(/[\t\n\r]/g, " "));
-  const lines = [d.columns.join("\t")];
+  const lines: string[] = [];
+  if (header) lines.push(d.columns.join("\t"));
   for (const r of d.rows) lines.push(r.map(esc).join("\t"));
   return lines.join("\n");
 }
 
-export function toJSON(d: Dataset): string {
-  return JSON.stringify(
-    d.rows.map((r) => Object.fromEntries(d.columns.map((c, k) => [c, r[k]]))),
-    null,
-    2,
-  );
+export function toJSON(d: Dataset, header = true): string {
+  // With headers → array of objects keyed by column name; without → array of value
+  // arrays (the column names are exactly what the user is opting out of).
+  const value = header
+    ? d.rows.map((r) => Object.fromEntries(d.columns.map((c, k) => [c, r[k]])))
+    : d.rows.map((r) => [...r]);
+  return JSON.stringify(value, null, 2);
 }
 
 function sqlVal(v: string | null): string {
@@ -133,11 +136,12 @@ export function toSQL(d: Dataset, table: string): string {
     .join("\n");
 }
 
-export function toMarkdown(d: Dataset): string {
+export function toMarkdown(d: Dataset, header = true): string {
   const esc = (v: string | null) => (v === null ? "" : v.replace(/\|/g, "\\|").replace(/\n/g, " "));
+  const body = d.rows.map((r) => `| ${r.map(esc).join(" | ")} |`).join("\n");
+  if (!header) return body;
   const head = `| ${d.columns.join(" | ")} |`;
   const sep = `| ${d.columns.map(() => "---").join(" | ")} |`;
-  const body = d.rows.map((r) => `| ${r.map(esc).join(" | ")} |`).join("\n");
   return [head, sep, body].join("\n");
 }
 

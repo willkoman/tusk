@@ -4,6 +4,12 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-06-04
+
+### Changed
+- **Autocomplete now accepts on Enter as well as Tab.** Pressing Enter with the completion popup open accepts the highlighted suggestion (same `acceptCompletion` as Tab); when no popup is open Enter still inserts a newline normally. This is safe because `$` remains excluded from completion tokens, so the old Enter-accept dollar-quote corruption (which came from `$tag$` delimiters being offered as completions) can't recur.
+- **Copying from the results grid no longer includes column names by default.** Cmd/Ctrl+C and the right-click Copy / Copy as CSV / JSON / Markdown items now copy just the selected values. A new **"Copy w/ column names"** checkbox in the status bar (shown whenever a result is present) re-enables a header row — the choice persists (an `copyHeaders` editor preference, default off). The formatters are header-aware: TSV/CSV/Markdown omit the header line, and JSON copies an array of value-arrays instead of keyed objects when the toggle is off. "Copy column" honors the toggle too.
+
 ## [0.2.2] - 2026-06-04
 
 ### Changed

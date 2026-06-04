@@ -190,9 +190,13 @@ export function SqlEditor(props: {
         ...closeBracketsKeymap,
         ...searchKeymap,
         ...foldKeymap,
-        // Enter must insert a newline, never silently accept a completion
-        // (that corrupts e.g. dollar-quoted bodies). Accept is Tab-only.
-        ...completionKeymap.filter((b) => b.key !== "Enter"),
+        // Enter accepts a completion just like Tab. `acceptCompletion` is a no-op
+        // when no popup is open, so Enter still inserts a newline normally (the
+        // completionKeymap binding sits before defaultKeymap's Enter and falls
+        // through on false). The old dollar-quote corruption is gone now that `$`
+        // is excluded from completion tokens, so `$tag$` delimiters are never
+        // offered or replaced on accept.
+        ...completionKeymap,
         ...historyKeymap,
         ...defaultKeymap,
       ]),

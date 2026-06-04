@@ -39,6 +39,8 @@ export type ResultGridProps = {
   onViewValue: (col: string, val: string | null) => void;
   onStatus: (text: string) => void;
   canSortFilter: Accessor<boolean>;
+  /** Include column names as a header row in copied text (default off). */
+  copyHeaders: Accessor<boolean>;
 };
 
 export function ResultGrid(props: ResultGridProps) {
@@ -334,9 +336,10 @@ export function ResultGrid(props: ResultGridProps) {
   }
   async function copySelection(fmt: "tsv" | "csv" | "json" | "md") {
     const d = selectionDataset();
+    const h = props.copyHeaders();
     const cells = d.rows.length * d.columns.length;
     if (cells > 5_000_000) props.onStatus(`copying ${cells.toLocaleString()} cells…`);
-    const text = fmt === "csv" ? toCSV(d) : fmt === "json" ? toJSON(d) : fmt === "md" ? toMarkdown(d) : toTSV(d);
+    const text = fmt === "csv" ? toCSV(d, h) : fmt === "json" ? toJSON(d, h) : fmt === "md" ? toMarkdown(d, h) : toTSV(d, h);
     const ok = await clipWrite(text);
     props.onStatus(ok ? `copied ${d.rows.length}×${d.columns.length}` : "clipboard unavailable");
   }
@@ -362,7 +365,7 @@ export function ResultGrid(props: ResultGridProps) {
       { label: "Copy as Markdown", icon: "copy", onClick: () => void copySelection("md") },
       { sep: true },
       { label: val === null ? "Copy value (NULL→empty)" : "Copy cell value", icon: "copy", onClick: () => void copyText(val ?? "", "copied value") },
-      { label: "Copy column", icon: "copy", onClick: () => void copyText(toTSV(columnDataset(oi)), "copied column") },
+      { label: "Copy column", icon: "copy", onClick: () => void copyText(toTSV(columnDataset(oi), props.copyHeaders()), "copied column") },
       { label: "View value…", icon: "search", onClick: () => props.onViewValue(name, val) },
     ]);
   }
@@ -389,7 +392,7 @@ export function ResultGrid(props: ResultGridProps) {
       for (const h of hidden) items.push({ label: `Show "${props.columns()[h]}"`, icon: "eye", onClick: () => showCol(h) });
       items.push({ label: "Show all columns", icon: "eye", onClick: () => props.setView({ hidden: [] }) });
     }
-    items.push({ sep: true }, { label: "Copy column", icon: "copy", onClick: () => void copyText(toTSV(columnDataset(oi)), "copied column") });
+    items.push({ sep: true }, { label: "Copy column", icon: "copy", onClick: () => void copyText(toTSV(columnDataset(oi), props.copyHeaders()), "copied column") });
     void dc;
     props.onMenu(e.clientX, e.clientY, items);
   }

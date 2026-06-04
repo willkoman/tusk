@@ -14,6 +14,8 @@ export type EditorPrefs = {
   autoFold: boolean;
   /** Round-trip statements to Postgres for parser-grade diagnostics on idle. */
   serverLint: boolean;
+  /** Include column names as a header row when copying from the result grid. */
+  copyHeaders: boolean;
 };
 
 export const DEFAULT_PREFS: EditorPrefs = {
@@ -23,6 +25,7 @@ export const DEFAULT_PREFS: EditorPrefs = {
   theme: "oneDark",
   autoFold: true,
   serverLint: true,
+  copyHeaders: false,
 };
 
 /** One diagnostic from the backend `validate_sql` command. */

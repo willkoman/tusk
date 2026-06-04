@@ -6,9 +6,10 @@ import { type DialectSpec } from "../sql/dialects";
  * after a recognized keyword, rewrite it uppercase — skipping strings and
  * qualified names (`t.select`, `"select"`).
  *
- * Moved verbatim from SqlEditor.tsx. Accept stays Tab-only and `$` is excluded
- * from completion tokens elsewhere; this filter must not regress dollar-quote
- * handling, so it bails inside an open single-quoted string.
+ * Moved verbatim from SqlEditor.tsx. `$` is excluded from completion tokens
+ * elsewhere (which is what keeps completion accept — Tab or Enter — safe around
+ * dollar-quotes); this filter must not regress dollar-quote handling, so it bails
+ * inside an open single-quoted string.
  */
 export function keywordCase(words: Set<string>): Extension {
   return EditorState.transactionFilter.of((tr) => {
