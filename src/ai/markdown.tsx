@@ -1,5 +1,6 @@
 import { For, Show, type JSX } from "solid-js";
 import { clipWrite } from "../clipboard";
+import { highlightSql } from "./sqlHighlight";
 
 // Minimal, dependency-free markdown rendering for the AI chat — fenced code blocks
 // (with Copy + "Open in editor"), inline `code` / **bold** / *italic*, headings, and
@@ -77,7 +78,7 @@ function CodeBlock(props: { lang: string; code: string; onInsert: (sql: string) 
           <button class="ai-code-btn primary" onClick={() => props.onInsert(props.code)}>▶ Open in editor</button>
         </Show>
       </div>
-      <pre class="ai-code-body"><code>{props.code}</code></pre>
+      <pre class="ai-code-body"><code><Show when={runnable()} fallback={props.code}><For each={highlightSql(props.code)}>{(t) => <span class={t.cls}>{t.text}</span>}</For></Show></code></pre>
     </div>
   );
 }
