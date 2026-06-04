@@ -1,4 +1,5 @@
 import { type JSX, Show } from "solid-js";
+import { Icon } from "./Icons";
 
 /** Generic modal shell — reuses the `.modal` / `.modal-overlay` CSS. */
 export function Dialog(props: {
@@ -20,7 +21,7 @@ export function Dialog(props: {
         <div class="modal-head">
           {props.title}
           <span class="spacer" />
-          <button class="icon" disabled={!canClose()} onClick={props.onClose}>✕</button>
+          <button class="icon modal-x" disabled={!canClose()} onClick={props.onClose}><Icon name="close" /></button>
         </div>
         {props.children}
       </div>

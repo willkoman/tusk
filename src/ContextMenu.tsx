@@ -1,8 +1,9 @@
-import { For, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
+import { Icon, type IconName } from "./Icons";
 
 export type MenuItem =
   | { sep: true }
-  | { label: string; icon?: string; danger?: boolean; disabled?: boolean; title?: string; onClick: () => void };
+  | { label: string; icon?: IconName; danger?: boolean; disabled?: boolean; title?: string; onClick: () => void };
 
 export type MenuState = { x: number; y: number; items: MenuItem[] } | null;
 
@@ -57,7 +58,7 @@ export function ContextMenu(props: {
                 props.onClose();
               }}
             >
-              <span class="ctx-icon">{it.icon ?? ""}</span>
+              <span class="ctx-icon"><Show when={it.icon}>{(n) => <Icon name={n()} />}</Show></span>
               <span class="ctx-text">{it.label}</span>
             </div>
           )
