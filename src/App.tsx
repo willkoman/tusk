@@ -4,6 +4,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./App.css";
 import { SqlEditor, type EditorApi } from "./SqlEditor";
 import { driverDialect, type DialectId } from "./sql/dialects";
+import { AiPanel } from "./ai/AiPanel";
+import { type AiContext } from "./ai/context";
 import { type CursorInfo, type EditorPrefs, type ServerDiag } from "./editor/types";
 import { prefsStore, tabsStore, type PersistedTabs } from "./store";
 import { makeTab, basename, gridViewFor, type Tab, type ResultSnapshot, type GridView, type SortKey, type Filter } from "./tabs";
@@ -112,6 +114,22 @@ function App() {
   const [path, setPath] = createSignal(""); // DuckDB/SQLite file (empty = :memory:)
   const [caps, setCaps] = createSignal<Capabilities | null>(null);
   const [perms, setPerms] = createSignal<Permissions | null>(null);
+  const [aiOpen, setAiOpen] = createSignal(false);
+  // Context handed to the AI: connected DB dialect/version, schema summary, the role's
+  // privileges, the active schema, and the current editor SQL/selection/last error.
+  const aiContext = (): AiContext => ({
+    dialect: caps()?.kind ?? "postgres",
+    driverLabel: driverLabel(caps()?.kind),
+    version: conn()?.version ?? "",
+    user: perms()?.currentUser ?? "",
+    isSuperuser: !!perms()?.isSuperuser,
+    permissionsEnforced: !!perms()?.enforced,
+    activeSchema: activeTab().searchSchema,
+    tables: schema(),
+    currentSql: editorApi()?.getDoc() ?? activeTab().sql,
+    selection: editorApi()?.getSelection() ?? "",
+    lastError: activeTab().result.runErr,
+  });
   // --- permission gating (Postgres; `enforced:false` elsewhere → no extra gating) ---
   const pEnforced = () => perms()?.enforced ?? false;
   const isSuper = () => !pEnforced() || !!perms()?.isSuperuser;
@@ -1378,6 +1396,7 @@ function App() {
           <span class="brand-sm">{driverMascot(caps()?.kind)} Tusk</span>
           <span class="meta">{driverLabel(caps()?.kind)} {conn()!.version}</span>
           <span class="spacer" />
+          <button class="ghost" classList={{ active: aiOpen() }} onClick={() => setAiOpen((v) => !v)} title="AI assistant">✨ AI</button>
           <button class="ghost" onClick={disconnect}>Disconnect</button>
         </header>
 
@@ -1540,6 +1559,13 @@ function App() {
               <span>{elapsed()} ms</span>
             </footer>
           </main>
+          <Show when={aiOpen()}>
+            <AiPanel
+              ctx={aiContext}
+              onInsertSql={(sql) => openGeneratedTab(sql, activeTab().searchSchema, "AI query")}
+              onClose={() => setAiOpen(false)}
+            />
+          </Show>
         </div>
 
         <Show when={importOpen()}>
