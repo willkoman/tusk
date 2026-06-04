@@ -50,7 +50,7 @@ const DRIVERS = [
   { id: "postgres", label: "PostgreSQL", mascot: "🐘", ready: true },
   { id: "duckdb", label: "DuckDB", mascot: "🦆", ready: true },
   { id: "sqlite", label: "SQLite", mascot: "🪶", ready: true },
-  { id: "mysql", label: "MySQL", mascot: "🐬", ready: false },
+  { id: "mysql", label: "MySQL", mascot: "🐬", ready: true },
 ] as const;
 const driverMascot = (id?: string | null) => DRIVERS.find((d) => d.id === id)?.mascot ?? "🐘";
 const driverLabel = (id?: string | null) => DRIVERS.find((d) => d.id === id)?.label ?? "PostgreSQL";
@@ -1274,7 +1274,15 @@ function App() {
               <div class="subtitle">{editingId() ? "edit connection" : "new connection"}</div>
               <label>Name<input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="My database" /></label>
               <label>Driver
-                <select value={driver()} onChange={(e) => setDriver(e.currentTarget.value)}>
+                <select
+                  value={driver()}
+                  onChange={(e) => {
+                    const d = e.currentTarget.value;
+                    setDriver(d);
+                    if (d === "mysql" && port() === 5432) setPort(3306);
+                    if (d === "postgres" && port() === 3306) setPort(5432);
+                  }}
+                >
                   <For each={DRIVERS}>
                     {(d) => <option value={d.id} disabled={!d.ready}>{d.mascot} {d.label}{d.ready ? "" : " (soon)"}</option>}
                   </For>

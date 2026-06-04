@@ -77,6 +77,20 @@ impl Capabilities {
             permissions: false,
         }
     }
+    pub fn mysql() -> Self {
+        Self {
+            kind: "mysql",
+            server_cursor: false,
+            bulk_copy: false,
+            export: false,
+            schemas: true,            // databases-as-schemas
+            search_path: false,       // MySQL uses `USE db`, not search_path
+            transactional_ddl: false, // MySQL DDL auto-commits
+            tls: true,
+            keychain: false,
+            permissions: false,
+        }
+    }
 }
 
 /// A query-cancel handle usable without holding the connection lock. PG = libpq cancel
@@ -153,6 +167,7 @@ pub enum Backend {
     Pg(PgConn),
     Duck(DuckConn),
     Sqlite(SqliteConn),
+    MySql(MySqlConn),
 }
 
 /// Open a connection for the configured driver. PG = network (TLS); DuckDB = a local
@@ -172,6 +187,7 @@ pub async fn connect(config: &ConnectionConfig) -> Result<(Backend, String), App
         }
         "duckdb" => DuckConn::open(config),
         "sqlite" => SqliteConn::open(config),
+        "mysql" => MySqlConn::open(config).await,
         other => Err(AppError::new(format!("unknown driver: {other}"))),
     }
 }
@@ -182,6 +198,7 @@ impl Backend {
             Backend::Pg(_) => Capabilities::postgres(),
             Backend::Duck(_) => Capabilities::duckdb(),
             Backend::Sqlite(_) => Capabilities::sqlite(),
+            Backend::MySql(_) => Capabilities::mysql(),
         }
     }
 
@@ -190,6 +207,7 @@ impl Backend {
             Backend::Pg(p) => &p.config,
             Backend::Duck(d) => &d.config,
             Backend::Sqlite(s) => &s.config,
+            Backend::MySql(m) => &m.config,
         }
     }
 
@@ -205,6 +223,7 @@ impl Backend {
             Backend::Pg(p) => p.cursor_open,
             Backend::Duck(d) => d.stream_sql.is_some(),
             Backend::Sqlite(s) => s.stream_sql.is_some(),
+            Backend::MySql(m) => m.stream_sql.is_some(),
         }
     }
 
@@ -212,7 +231,7 @@ impl Backend {
         match self {
             Backend::Pg(p) => CancelHandle::Pg(p.client.cancel_token()),
             Backend::Duck(d) => CancelHandle::Duck(d.lock().interrupt_handle()),
-            Backend::Sqlite(_) => CancelHandle::None,
+            _ => CancelHandle::None,
         }
     }
 
@@ -247,6 +266,13 @@ impl Backend {
                 let (backend, _v) = SqliteConn::open(&s.config)?;
                 if let Backend::Sqlite(ns) = backend {
                     *s = ns;
+                }
+                Ok(())
+            }
+            Backend::MySql(m) => {
+                let (backend, _v) = MySqlConn::open(&m.config).await?;
+                if let Backend::MySql(nm) = backend {
+                    *m = nm;
                 }
                 Ok(())
             }
@@ -286,6 +312,10 @@ impl Backend {
                 s.stream_sql = None;
                 s.offset = 0;
             }
+            Backend::MySql(m) => {
+                m.stream_sql = None;
+                m.offset = 0;
+            }
         }
     }
 
@@ -322,6 +352,7 @@ impl Backend {
                 s.lock().execute_batch(&sql).map_err(de)?;
                 Ok("OK".to_string())
             }
+            Backend::MySql(m) => m.run_script(items).await,
         }
     }
 
@@ -336,6 +367,7 @@ impl Backend {
             Backend::Pg(p) => p.run_single(trimmed, page, cursorable).await,
             Backend::Duck(d) => d.run_single(trimmed, page, cursorable),
             Backend::Sqlite(s) => s.run_single(trimmed, page, cursorable),
+            Backend::MySql(m) => m.run_single(trimmed, page, cursorable).await,
         }
     }
 
@@ -345,6 +377,7 @@ impl Backend {
             Backend::Pg(p) => p.fetch_page(page).await,
             Backend::Duck(d) => d.fetch_page(page),
             Backend::Sqlite(s) => s.fetch_page(page),
+            Backend::MySql(m) => m.fetch_page(page).await,
         }
     }
 
@@ -360,6 +393,10 @@ impl Backend {
             }
             Backend::Duck(d) => duck_query(&d.lock(), sql),
             Backend::Sqlite(s) => sqlite_query(&s.lock(), sql),
+            Backend::MySql(m) => {
+                let (c, r, _a) = mysql_run(&m.pool, sql).await?;
+                Ok((c, r))
+            }
         }
     }
 
@@ -369,6 +406,7 @@ impl Backend {
             Backend::Pg(p) => tree::build_shallow(&p.client).await,
             Backend::Duck(d) => duck_build_tree(&d.lock()),
             Backend::Sqlite(s) => sqlite_build_tree(&s.lock()),
+            Backend::MySql(m) => mysql_build_tree(&m.pool).await,
         }
     }
 
@@ -382,6 +420,7 @@ impl Backend {
             Backend::Pg(p) => tree::table_detail(&p.client, schema, name).await,
             Backend::Duck(d) => duck_table_detail(&d.lock(), schema, name),
             Backend::Sqlite(s) => sqlite_table_detail(&s.lock(), name),
+            Backend::MySql(m) => mysql_table_detail(&m.pool, schema, name).await,
         }
     }
 
@@ -391,11 +430,19 @@ impl Backend {
         if let Backend::Sqlite(s) = self {
             return sqlite_list_tables(&s.lock());
         }
-        let sql = "SELECT table_schema, table_name, column_name, data_type \
-                   FROM information_schema.columns \
-                   WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
-                   ORDER BY table_schema, table_name, ordinal_position";
-        let (_cols, rows) = self.query_text(sql).await?;
+        // Same information_schema shape across PG / DuckDB / MySQL, only the system-schema
+        // exclusion differs.
+        let exclude = match self {
+            Backend::MySql(_) => "('mysql','information_schema','performance_schema','sys')",
+            _ => "('pg_catalog','information_schema')",
+        };
+        let sql = format!(
+            "SELECT table_schema, table_name, column_name, data_type \
+             FROM information_schema.columns \
+             WHERE table_schema NOT IN {exclude} \
+             ORDER BY table_schema, table_name, ordinal_position"
+        );
+        let (_cols, rows) = self.query_text(&sql).await?;
         Ok(tree::tables_from_rows(rows))
     }
 }
@@ -782,6 +829,269 @@ fn sqlite_table_detail(
             is_pk: dcell(r, 5) != "0" && !dcell(r, 5).is_empty(),
             is_fk: false,
             default: r.get(4).and_then(|v| v.clone()),
+            comment: None,
+        })
+        .collect();
+    Ok(tree::RelationDetail {
+        name: name.to_string(),
+        kind: "table".to_string(),
+        comment: None,
+        columns,
+        indexes: vec![],
+        constraints: vec![],
+    })
+}
+
+/// A live MySQL connection pool. A `Pool` is Send+Sync+Clone (no `!Sync`-connection
+/// problem); paging is LIMIT/OFFSET over the base query (each page is an independent
+/// query — fine over a pool).
+pub struct MySqlConn {
+    pub pool: mysql_async::Pool,
+    pub config: ConnectionConfig,
+    pub stream_sql: Option<String>,
+    pub offset: usize,
+}
+
+impl MySqlConn {
+    async fn open(config: &ConnectionConfig) -> Result<(Backend, String), AppError> {
+        let mut builder = mysql_async::OptsBuilder::default()
+            .ip_or_hostname(config.host.clone())
+            .tcp_port(config.port)
+            .user(Some(config.user.clone()))
+            .pass(Some(config.password.clone()));
+        if !config.dbname.is_empty() {
+            builder = builder.db_name(Some(config.dbname.clone()));
+        }
+        match config.sslmode.as_deref().unwrap_or("prefer") {
+            "disable" => {}
+            mode => {
+                let mut ssl = mysql_async::SslOpts::default();
+                if mode != "verify-ca" && mode != "verify-full" {
+                    ssl = ssl
+                        .with_danger_accept_invalid_certs(true)
+                        .with_danger_skip_domain_validation(true);
+                }
+                builder = builder.ssl_opts(Some(ssl));
+            }
+        }
+        let pool = mysql_async::Pool::new(builder);
+        // Fail fast + capture the server version.
+        let (_c, rows, _a) = mysql_run(&pool, "SELECT version()").await?;
+        let version = rows
+            .first()
+            .and_then(|r| r.first().cloned().flatten())
+            .unwrap_or_else(|| "unknown".to_string());
+        Ok((
+            Backend::MySql(MySqlConn {
+                pool,
+                config: config.clone(),
+                stream_sql: None,
+                offset: 0,
+            }),
+            format!("MySQL {version}"),
+        ))
+    }
+
+    async fn run_single(
+        &mut self,
+        trimmed: &str,
+        page: u32,
+        cursorable: bool,
+    ) -> Result<QueryOutcome, AppError> {
+        if cursorable {
+            let wrapped = format!("SELECT * FROM ({trimmed}) AS _tusk LIMIT {page}");
+            let (columns, rows, _a) = mysql_run(&self.pool, &wrapped).await?;
+            let done = (rows.len() as u32) < page;
+            if done {
+                self.stream_sql = None;
+                self.offset = 0;
+            } else {
+                self.stream_sql = Some(trimmed.to_string());
+                self.offset = page as usize;
+            }
+            Ok(QueryOutcome::Rows {
+                columns,
+                rows,
+                done,
+            })
+        } else {
+            let (columns, rows, affected) = mysql_run(&self.pool, trimmed).await?;
+            if !columns.is_empty() {
+                Ok(QueryOutcome::Rows {
+                    columns,
+                    rows,
+                    done: true,
+                })
+            } else {
+                Ok(QueryOutcome::Exec {
+                    message: format!("OK ({affected} rows affected)"),
+                })
+            }
+        }
+    }
+
+    async fn fetch_page(&mut self, page: u32) -> Result<FetchResult, AppError> {
+        let base = match &self.stream_sql {
+            Some(s) => s.clone(),
+            None => {
+                return Ok(FetchResult {
+                    rows: vec![],
+                    done: true,
+                })
+            }
+        };
+        let wrapped = format!(
+            "SELECT * FROM ({base}) AS _tusk LIMIT {page} OFFSET {}",
+            self.offset
+        );
+        let (_c, rows, _a) = mysql_run(&self.pool, &wrapped).await?;
+        let done = (rows.len() as u32) < page;
+        self.offset += rows.len();
+        if done {
+            self.stream_sql = None;
+        }
+        Ok(FetchResult { rows, done })
+    }
+
+    async fn run_script(&self, items: &[script::Item]) -> Result<String, AppError> {
+        use mysql_async::prelude::Queryable;
+        let mut conn = self.pool.get_conn().await.map_err(de)?;
+        for it in items {
+            if let script::Item::Sql(s) = it {
+                conn.query_drop(s.trim()).await.map_err(de)?;
+            }
+        }
+        Ok("OK".to_string())
+    }
+}
+
+fn mysql_value_to_string(v: &mysql_async::Value) -> Option<String> {
+    use mysql_async::Value as V;
+    match v {
+        V::NULL => None,
+        V::Bytes(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        V::Int(n) => Some(n.to_string()),
+        V::UInt(n) => Some(n.to_string()),
+        V::Float(f) => Some(f.to_string()),
+        V::Double(f) => Some(f.to_string()),
+        V::Date(y, mo, d, h, mi, s, us) => {
+            let base = format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}");
+            Some(if *us > 0 { format!("{base}.{us:06}") } else { base })
+        }
+        V::Time(neg, d, h, mi, s, us) => {
+            let hours = d * 24 + *h as u32;
+            let base = format!("{}{hours:02}:{mi:02}:{s:02}", if *neg { "-" } else { "" });
+            Some(if *us > 0 { format!("{base}.{us:06}") } else { base })
+        }
+    }
+}
+
+/// Run a MySQL query: returns (column names, text rows, affected-rows).
+async fn mysql_run(
+    pool: &mysql_async::Pool,
+    sql: &str,
+) -> Result<(Vec<String>, Vec<Vec<Option<String>>>, u64), AppError> {
+    use mysql_async::prelude::Queryable;
+    let mut conn = pool.get_conn().await.map_err(de)?;
+    let mut result = conn.query_iter(sql).await.map_err(de)?;
+    let columns: Vec<String> = result
+        .columns()
+        .map(|arc| arc.iter().map(|c| c.name_str().to_string()).collect())
+        .unwrap_or_default();
+    let affected = result.affected_rows();
+    let raw: Vec<mysql_async::Row> = result.collect().await.map_err(de)?;
+    let ncols = columns.len();
+    let data: Vec<Vec<Option<String>>> = raw
+        .iter()
+        .map(|row| {
+            (0..ncols)
+                .map(|i| row.as_ref(i).and_then(mysql_value_to_string))
+                .collect()
+        })
+        .collect();
+    Ok((columns, data, affected))
+}
+
+async fn mysql_build_tree(pool: &mysql_async::Pool) -> Result<tree::DbTree, AppError> {
+    const SYS: &str = "('mysql','information_schema','performance_schema','sys')";
+    let (_c, schema_rows, _a) = mysql_run(
+        pool,
+        &format!(
+            "SELECT schema_name FROM information_schema.schemata \
+             WHERE schema_name NOT IN {SYS} ORDER BY schema_name"
+        ),
+    )
+    .await?;
+    let (_c2, table_rows, _a2) = mysql_run(
+        pool,
+        &format!(
+            "SELECT table_schema, table_name, table_type FROM information_schema.tables \
+             WHERE table_schema NOT IN {SYS} ORDER BY table_schema, table_name"
+        ),
+    )
+    .await?;
+    let (_c3, dbrow, _a3) = mysql_run(pool, "SELECT database()").await?;
+    let database = dbrow
+        .first()
+        .and_then(|r| r.first().cloned().flatten())
+        .unwrap_or_default();
+    let mut schemas: Vec<tree::Schema> = schema_rows
+        .iter()
+        .map(|r| tree::Schema {
+            name: dcell(r, 0),
+            tables: vec![],
+            views: vec![],
+            sequences: vec![],
+            functions: vec![],
+        })
+        .collect();
+    for r in &table_rows {
+        let schema = dcell(r, 0);
+        let name = dcell(r, 1);
+        let is_view = dcell(r, 2).eq_ignore_ascii_case("VIEW");
+        if let Some(s) = schemas.iter_mut().find(|s| s.name == schema) {
+            let stub = tree::RelStub {
+                name,
+                kind: if is_view { "view" } else { "table" }.to_string(),
+                comment: None,
+            };
+            if is_view {
+                s.views.push(stub);
+            } else {
+                s.tables.push(stub);
+            }
+        }
+    }
+    let databases = schemas.iter().map(|s| s.name.clone()).collect();
+    Ok(tree::DbTree {
+        database,
+        databases,
+        schemas,
+    })
+}
+
+async fn mysql_table_detail(
+    pool: &mysql_async::Pool,
+    schema: &str,
+    name: &str,
+) -> Result<tree::RelationDetail, AppError> {
+    let q = format!(
+        "SELECT column_name, data_type, is_nullable, column_default, column_key \
+         FROM information_schema.columns \
+         WHERE table_schema = {} AND table_name = {} ORDER BY ordinal_position",
+        dlit(schema),
+        dlit(name)
+    );
+    let (_c, rows, _a) = mysql_run(pool, &q).await?;
+    let columns = rows
+        .iter()
+        .map(|r| tree::Column {
+            name: dcell(r, 0),
+            data_type: dcell(r, 1),
+            nullable: dcell(r, 2).eq_ignore_ascii_case("YES"),
+            is_pk: dcell(r, 4) == "PRI",
+            is_fk: false,
+            default: r.get(3).and_then(|v| v.clone()),
             comment: None,
         })
         .collect();
