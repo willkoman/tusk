@@ -172,6 +172,25 @@ async fn run_battery(b: &mut Backend, eng: &Eng) {
     assert_eq!(dup[0].len(), 2, "[{}] duplicate result columns kept", eng.name);
     assert_eq!(cell(&dup[0], 0), cell(&dup[0], 1), "[{}] both dup columns same value", eng.name);
 
+    // 3b. typed values render as readable text (the all-text model must not mangle
+    //     dates/decimals — DuckDB casts via VARCHAR, MySQL formats its Value::Date).
+    exec(b, &format!("DROP TABLE IF EXISTS {}", q("typ"))).await;
+    // Column names quoted (`dec` is a reserved word in MySQL — exercises reserved-word
+    // column handling too).
+    exec(b, &format!("CREATE TABLE {} ({} DATE, {} TIMESTAMP, {} DECIMAL(10,2))", q("typ"), q("d"), q("ts"), q("dec"))).await;
+    exec(b, &format!("INSERT INTO {} VALUES ('2024-01-15', '2024-01-15 10:30:00', 3.14)", q("typ"))).await;
+    let t = all(b, &format!("SELECT {},{},{} FROM {}", q("d"), q("ts"), q("dec"), q("typ"))).await;
+    assert_eq!(cell(&t[0], 0).as_deref(), Some("2024-01-15"), "[{}] DATE → text", eng.name);
+    assert!(
+        cell(&t[0], 1).unwrap().starts_with("2024-01-15 10:30"),
+        "[{}] TIMESTAMP → text: {:?}", eng.name, cell(&t[0], 1)
+    );
+    assert!(
+        cell(&t[0], 2).unwrap().starts_with("3.14"),
+        "[{}] DECIMAL → text: {:?}", eng.name, cell(&t[0], 2)
+    );
+    exec(b, &format!("DROP TABLE IF EXISTS {}", q("typ"))).await;
+
     // 4. paging boundaries — the critical edges. 20 rows, page 10:
     //    page1=10 (NOT done, == page), page2=10 (NOT done), page3=0 (done).
     //    Must collect all 20 in order with no dup/skip and exactly 3 fetches.
@@ -312,4 +331,54 @@ async fn readonly_postgres_blocks_writes() {
     let (mut b, _) = connect(&cfg).await.expect("connect pg ro");
     let res = b.run_single("CREATE TABLE tusk_ro_probe (a int)", 100, false).await;
     assert!(res.is_err(), "read-only postgres must reject writes/DDL");
+}
+
+// --- command layer (lib.rs exec_items: routing + the app-layer read-only guard that
+//     protects engines with no server-side read-only, e.g. MySQL) ---
+
+use crate::driver::ConnState;
+
+async fn state(cfg: &ConnectionConfig, read_only: bool) -> ConnState {
+    let (backend, _v) = connect(cfg).await.unwrap();
+    ConnState { backend, read_only }
+}
+
+#[test]
+fn is_read_only_stmt_classification() {
+    for s in ["SELECT 1", "  with x as (select 1) select * from x", "SHOW search_path", "EXPLAIN select 1", "TABLE t", "VALUES (1)"] {
+        assert!(crate::is_read_only_stmt(s), "{s:?} should be read-only");
+    }
+    for s in ["INSERT INTO t VALUES (1)", "UPDATE t SET a=1", "DELETE FROM t", "CREATE TABLE t(a int)", "DROP TABLE t", "TRUNCATE t", "ALTER TABLE t ADD c int"] {
+        assert!(!crate::is_read_only_stmt(s), "{s:?} should NOT be read-only");
+    }
+}
+
+#[tokio::test]
+async fn app_readonly_guard_blocks_writes_single_and_multi() {
+    // The app-layer guard (exec_items) blocks writes on a read-only connection — single
+    // AND multi-statement — for every driver. This is the only protection for MySQL
+    // (no engine-level read-only). Use SQLite in-memory as a stand-in for the guard logic.
+    let mut c = state(&sqlite_cfg(), true).await;
+    let block = |sql: &str| crate::script::split(sql);
+    // single-statement write blocked
+    assert!(crate::exec_items(&mut c, &block("INSERT INTO x VALUES (1)"), 100, &None).await.is_err());
+    // multi-statement write blocked (the path that used to slip through on MySQL)
+    assert!(crate::exec_items(&mut c, &block("CREATE TABLE y(a int); INSERT INTO y VALUES (1)"), 100, &None).await.is_err());
+    // reads allowed
+    assert!(crate::exec_items(&mut c, &block("SELECT 1"), 100, &None).await.is_ok());
+}
+
+#[tokio::test]
+async fn exec_items_routes_single_vs_script() {
+    let mut c = state(&sqlite_cfg(), false).await;
+    let run = |sql: &str| crate::script::split(sql);
+    crate::exec_items(&mut c, &run("CREATE TABLE t(a INTEGER)"), 100, &None).await.unwrap();
+    // single SELECT → streaming Rows
+    let single = crate::exec_items(&mut c, &run("SELECT 1 AS a"), 100, &None).await.unwrap();
+    assert!(matches!(single, QueryOutcome::Rows { .. }), "single SELECT → Rows");
+    // multi-statement → transactional script → Exec, and both writes apply
+    let multi = crate::exec_items(&mut c, &run("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)"), 100, &None).await.unwrap();
+    assert!(matches!(multi, QueryOutcome::Exec { .. }), "multi-statement → Exec");
+    let cnt = all(&mut c.backend, "SELECT COUNT(*) FROM t").await;
+    assert_eq!(cell(&cnt[0], 0).as_deref(), Some("2"), "script applied both inserts");
 }
