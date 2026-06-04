@@ -1286,6 +1286,8 @@ function App() {
                     setDriver(d);
                     if (d === "mysql" && port() === 5432) setPort(3306);
                     if (d === "postgres" && port() === 3306) setPort(5432);
+                    if (d === "mysql" && dbname() === "postgres") setDbname("");
+                    if (d === "postgres" && dbname() === "") setDbname("postgres");
                   }}
                 >
                   <For each={DRIVERS}>
@@ -1299,9 +1301,9 @@ function App() {
                   <>
                     <label>Host<input value={host()} onInput={(e) => setHost(e.currentTarget.value)} /></label>
                     <label>Port<input type="number" value={port()} onInput={(e) => setPort(Number(e.currentTarget.value))} /></label>
-                    <label>User<input value={user()} onInput={(e) => setUser(e.currentTarget.value)} placeholder="postgres" /></label>
+                    <label>User<input value={user()} onInput={(e) => setUser(e.currentTarget.value)} placeholder={driver() === "mysql" ? "root" : "postgres"} /></label>
                     <label>Password<input type="password" value={password()} onInput={(e) => setPassword(e.currentTarget.value)} placeholder={editingId() && savePassword() ? "•••••• (stored)" : ""} /></label>
-                    <label>Database<input value={dbname()} onInput={(e) => setDbname(e.currentTarget.value)} /></label>
+                    <label>Database<input value={dbname()} onInput={(e) => setDbname(e.currentTarget.value)} placeholder={driver() === "mysql" ? "(optional)" : "postgres"} /></label>
                     <label>SSL Mode
                       <select value={sslmode()} onChange={(e) => setSslmode(e.currentTarget.value)}>
                         <option value="disable">disable</option>
@@ -1315,7 +1317,7 @@ function App() {
               >
                 <label>Database file
                   <div class="file-row">
-                    <input value={path()} onInput={(e) => setPath(e.currentTarget.value)} placeholder="/path/to/db.duckdb — blank = in-memory" />
+                    <input value={path()} onInput={(e) => setPath(e.currentTarget.value)} placeholder={`/path/to/db.${driver() === "sqlite" ? "sqlite" : "duckdb"} — blank = in-memory`} />
                     <button type="button" class="ghost" onClick={browseDbFile}>Browse…</button>
                   </div>
                 </label>
