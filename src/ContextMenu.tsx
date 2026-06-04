@@ -2,7 +2,7 @@ import { For, createSignal, onCleanup, onMount } from "solid-js";
 
 export type MenuItem =
   | { sep: true }
-  | { label: string; icon?: string; danger?: boolean; disabled?: boolean; onClick: () => void };
+  | { label: string; icon?: string; danger?: boolean; disabled?: boolean; title?: string; onClick: () => void };
 
 export type MenuState = { x: number; y: number; items: MenuItem[] } | null;
 
@@ -50,6 +50,7 @@ export function ContextMenu(props: {
             <div
               class="ctx-item"
               classList={{ danger: it.danger, "ctx-disabled": it.disabled }}
+              title={it.title}
               onClick={() => {
                 if (it.disabled) return;
                 it.onClick();

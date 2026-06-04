@@ -70,6 +70,22 @@ type Capabilities = {
   permissions: boolean;
 };
 
+// The connected role's effective privileges (from the `permissions` command). `enforced`
+// is false for drivers without a permission model (embedded / MySQL) — the UI then gates
+// nothing extra. Mirrors src-tauri/src/perms.rs.
+type TablePriv = { schema: string; name: string; select: boolean; insert: boolean; update: boolean; delete: boolean; truncate: boolean; references: boolean; trigger: boolean; isOwner: boolean };
+type SchemaPriv = { name: string; create: boolean; usage: boolean; isOwner: boolean };
+type Permissions = {
+  enforced: boolean;
+  currentUser: string;
+  isSuperuser: boolean;
+  canCreateDb: boolean;
+  canCreateRole: boolean;
+  createInCurrentDb: boolean;
+  schemas: SchemaPriv[];
+  tables: TablePriv[];
+};
+
 function errMsg(e: unknown): string {
   if (e && typeof e === "object" && "message" in e) return String((e as any).message);
   return String(e);
@@ -95,6 +111,21 @@ function App() {
   const [driver, setDriver] = createSignal("postgres");
   const [path, setPath] = createSignal(""); // DuckDB/SQLite file (empty = :memory:)
   const [caps, setCaps] = createSignal<Capabilities | null>(null);
+  const [perms, setPerms] = createSignal<Permissions | null>(null);
+  // --- permission gating (Postgres; `enforced:false` elsewhere → no extra gating) ---
+  const pEnforced = () => perms()?.enforced ?? false;
+  const isSuper = () => !pEnforced() || !!perms()?.isSuperuser;
+  const tablePriv = (s: string, t: string) => perms()?.tables.find((x) => x.schema === s && x.name === t);
+  const schemaPriv = (s: string) => perms()?.schemas.find((x) => x.name === s);
+  const ownsTable = (s: string, t: string) => isSuper() || !!tablePriv(s, t)?.isOwner;
+  const ownsSchema = (s: string) => isSuper() || !!schemaPriv(s)?.isOwner;
+  const canCreateInSchema = (s: string) => isSuper() || !!schemaPriv(s)?.create;
+  const canCreateSchema = () => !pEnforced() || !!perms()?.createInCurrentDb;
+  const canCreateDatabase = () => !pEnforced() || !!perms()?.canCreateDb;
+  const canTruncate = (s: string, t: string) => ownsTable(s, t) || !!tablePriv(s, t)?.truncate;
+  // Merge into a MenuItem: read-only wins, then the privilege; supplies a tooltip reason.
+  const gate = (allowed: boolean, reason: string): { disabled?: boolean; title?: string } =>
+    conn()?.readOnly ? { disabled: true, title: "Connection is read-only" } : allowed ? {} : { disabled: true, title: reason };
   const [host, setHost] = createSignal("localhost");
   const [port, setPort] = createSignal(5432);
   const [user, setUser] = createSignal("");
@@ -529,6 +560,7 @@ function App() {
     connKey = null;
     setConn(null);
     setCaps(null);
+    setPerms(null);
     setTree(null);
     setSchema([]);
     setDetails({});
@@ -582,6 +614,8 @@ function App() {
       });
       void loadTables();
       void refreshLoadedDetails();
+      // Refresh effective privileges alongside the tree (grants/ownership can change).
+      invoke<Permissions>("permissions", { connectionId: c.id }).then(setPerms).catch(() => setPerms(null));
     } catch (e) {
       console.error(e);
     } finally {
@@ -976,7 +1010,6 @@ function App() {
   // Context-aware "+" menu — offers creates relevant to the sidebar selection.
   function openPlusMenu(e: MouseEvent) {
     e.preventDefault();
-    const ro = conn()?.readOnly ?? false;
     const sel = selected();
     const items: MenuItem[] = [];
     // Resolve the owning table for column/index/constraint selections.
@@ -991,17 +1024,17 @@ function App() {
 
     if (tableCtx) {
       items.push(
-        { label: `New column in ${tableCtx.name}…`, icon: "＋", disabled: ro, onClick: () => setActiveDialog({ kind: "addColumn", ctx: tableCtx }) },
-        { label: `New index on ${tableCtx.name}…`, icon: "📑", disabled: ro, onClick: () => openIndexDialog(tableCtx) },
-        { label: `New constraint on ${tableCtx.name}…`, icon: "🔗", disabled: ro, onClick: () => openConstraintDialog(tableCtx) },
+        { label: `New column in ${tableCtx.name}…`, icon: "＋", ...gate(ownsTable(tableCtx.schema!, tableCtx.name), `Requires ownership of ${tableCtx.name}`), onClick: () => setActiveDialog({ kind: "addColumn", ctx: tableCtx }) },
+        { label: `New index on ${tableCtx.name}…`, icon: "📑", ...gate(ownsTable(tableCtx.schema!, tableCtx.name), `Requires ownership of ${tableCtx.name}`), onClick: () => openIndexDialog(tableCtx) },
+        { label: `New constraint on ${tableCtx.name}…`, icon: "🔗", ...gate(ownsTable(tableCtx.schema!, tableCtx.name), `Requires ownership of ${tableCtx.name}`), onClick: () => openConstraintDialog(tableCtx) },
         { sep: true },
       );
     }
     if (schemaName)
-      items.push({ label: `New table in ${schemaName}…`, icon: "📋", disabled: ro, onClick: () => setActiveDialog({ kind: "createTable", schema: schemaName }) });
+      items.push({ label: `New table in ${schemaName}…`, icon: "📋", ...gate(canCreateInSchema(schemaName), `Requires CREATE on schema ${schemaName}`), onClick: () => setActiveDialog({ kind: "createTable", schema: schemaName }) });
     items.push(
-      { label: "New schema…", icon: "📂", disabled: ro, onClick: () => setActiveDialog({ kind: "createSchema" }) },
-      { label: "New database…", icon: "🗄️", disabled: ro, onClick: () => setActiveDialog({ kind: "createDatabase" }) },
+      { label: "New schema…", icon: "📂", ...gate(canCreateSchema(), "Requires CREATE on the database"), onClick: () => setActiveDialog({ kind: "createSchema" }) },
+      { label: "New database…", icon: "🗄️", ...gate(canCreateDatabase(), "Requires the CREATEDB role attribute"), onClick: () => setActiveDialog({ kind: "createDatabase" }) },
     );
     setMenu({ x: e.clientX, y: e.clientY, items });
   }
@@ -1033,17 +1066,17 @@ function App() {
           { label: "Select 100 rows", icon: "▶", onClick: () => runTableLimit(s!, n.name, 100) },
           { label: "Select all rows", icon: "▶", onClick: () => runTable(s!, n.name) },
           { sep: true },
-          { label: "Modify table…", icon: "✏️", disabled: ro, onClick: () => openModify(n) },
-          { label: "Add column…", icon: "＋", disabled: ro, onClick: () => setActiveDialog({ kind: "addColumn", ctx: n }) },
-          { label: "Add index…", icon: "📑", disabled: ro, onClick: () => openIndexDialog(n) },
-          { label: "Add constraint…", icon: "🔗", disabled: ro, onClick: () => openConstraintDialog(n) },
+          { label: "Modify table…", icon: "✏️", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openModify(n) },
+          { label: "Add column…", icon: "＋", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "addColumn", ctx: n }) },
+          { label: "Add index…", icon: "📑", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openIndexDialog(n) },
+          { label: "Add constraint…", icon: "🔗", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openConstraintDialog(n) },
           { sep: true },
-          { label: "Rename…", icon: "✎", disabled: ro, onClick: () => setActiveDialog({ kind: "rename", title: `Rename table ${n.name}`, current: n.name, build: (nn) => ddl.renameRelation("table", s!, n.name, nn) }) },
-          { label: "Duplicate…", icon: "⧉", disabled: ro, onClick: () => setActiveDialog({ kind: "duplicate", title: `Duplicate ${n.name}`, defaultName: `${n.name}_copy`, build: (nn, wd) => ddl.duplicateTable(s!, n.name, nn, wd) }) },
-          { label: "Edit comment…", icon: "💬", disabled: ro, onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.comment(`TABLE ${qual}`, t) }) },
+          { label: "Rename…", icon: "✎", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename table ${n.name}`, current: n.name, build: (nn) => ddl.renameRelation("table", s!, n.name, nn) }) },
+          { label: "Duplicate…", icon: "⧉", ...gate(canCreateInSchema(s!), `Requires CREATE on schema ${s}`), onClick: () => setActiveDialog({ kind: "duplicate", title: `Duplicate ${n.name}`, defaultName: `${n.name}_copy`, build: (nn, wd) => ddl.duplicateTable(s!, n.name, nn, wd) }) },
+          { label: "Edit comment…", icon: "💬", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.comment(`TABLE ${qual}`, t) }) },
           { sep: true },
-          { label: "Truncate…", icon: "🧹", danger: true, disabled: ro, onClick: () => setActiveDialog({ kind: "confirm", title: `Truncate ${n.name}`, primaryLabel: "Truncate", showCascade: true, showRestartIdentity: true, build: (o) => ddl.truncate(s!, n.name, o) }) },
-          { label: "Drop…", icon: "🗑", danger: true, disabled: ro, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop table ${n.name}`, primaryLabel: "Drop table", showCascade: true, build: (o) => ddl.dropRelation("table", s!, n.name, o.cascade) }) },
+          { label: "Truncate…", icon: "🧹", danger: true, ...gate(canTruncate(s!, n.name), `Requires TRUNCATE or ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Truncate ${n.name}`, primaryLabel: "Truncate", showCascade: true, showRestartIdentity: true, build: (o) => ddl.truncate(s!, n.name, o) }) },
+          { label: "Drop…", icon: "🗑", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop table ${n.name}`, primaryLabel: "Drop table", showCascade: true, build: (o) => ddl.dropRelation("table", s!, n.name, o.cascade) }) },
           { sep: true },
           { label: "Generate SELECT", icon: "≣", onClick: () => generate(n, "select") },
           { label: "Generate INSERT", icon: "≣", onClick: () => generate(n, "insert") },
@@ -1060,14 +1093,14 @@ function App() {
         items.push({ label: "Select all rows", icon: "▶", onClick: () => runTable(s!, n.name) });
         if (kw === "matview")
           items.push(
-            { label: "Refresh", icon: "↻", disabled: ro, onClick: () => runDDLToast(ddl.refreshMatview(s!, n.name, false)) },
-            { label: "Refresh concurrently", icon: "↻", disabled: ro, onClick: () => runDDLToast(ddl.refreshMatview(s!, n.name, true)) },
+            { label: "Refresh", icon: "↻", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => runDDLToast(ddl.refreshMatview(s!, n.name, false)) },
+            { label: "Refresh concurrently", icon: "↻", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => runDDLToast(ddl.refreshMatview(s!, n.name, true)) },
           );
         items.push(
           { sep: true },
-          { label: "Rename…", icon: "✎", disabled: ro, onClick: () => setActiveDialog({ kind: "rename", title: `Rename ${n.name}`, current: n.name, build: (nn) => ddl.renameRelation(kw, s!, n.name, nn) }) },
-          { label: "Edit comment…", icon: "💬", disabled: ro, onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.comment(`${kw === "matview" ? "MATERIALIZED VIEW" : "VIEW"} ${qual}`, t) }) },
-          { label: "Drop…", icon: "🗑", danger: true, disabled: ro, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop ${n.name}`, primaryLabel: "Drop", showCascade: true, build: (o) => ddl.dropRelation(kw, s!, n.name, o.cascade) }) },
+          { label: "Rename…", icon: "✎", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename ${n.name}`, current: n.name, build: (nn) => ddl.renameRelation(kw, s!, n.name, nn) }) },
+          { label: "Edit comment…", icon: "💬", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.comment(`${kw === "matview" ? "MATERIALIZED VIEW" : "VIEW"} ${qual}`, t) }) },
+          { label: "Drop…", icon: "🗑", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop ${n.name}`, primaryLabel: "Drop", showCascade: true, build: (o) => ddl.dropRelation(kw, s!, n.name, o.cascade) }) },
           { sep: true },
           ...copyDdl,
           copyName,
@@ -1078,11 +1111,11 @@ function App() {
       case "column": {
         const c = n.column!;
         items.push(
-          { label: "Edit column…", icon: "✎", disabled: ro, onClick: () => setActiveDialog({ kind: "editColumn", ctx: n }) },
-          { label: "Rename…", icon: "✎", disabled: ro, onClick: () => setActiveDialog({ kind: "rename", title: `Rename column ${n.name}`, current: n.name, build: (nn) => ddl.renameColumn(s!, n.table!, n.name, nn) }) },
-          { label: "Edit comment…", icon: "💬", disabled: ro, onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: c.comment ?? "", build: (t) => ddl.comment(`COLUMN ${qualify(s!, n.table!)}.${ident(n.name)}`, t) }) },
+          { label: "Edit column…", icon: "✎", ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "editColumn", ctx: n }) },
+          { label: "Rename…", icon: "✎", ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename column ${n.name}`, current: n.name, build: (nn) => ddl.renameColumn(s!, n.table!, n.name, nn) }) },
+          { label: "Edit comment…", icon: "💬", ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: c.comment ?? "", build: (t) => ddl.comment(`COLUMN ${qualify(s!, n.table!)}.${ident(n.name)}`, t) }) },
           { sep: true },
-          { label: "Drop column…", icon: "🗑", danger: true, disabled: ro, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop column ${n.name}`, primaryLabel: "Drop column", showCascade: true, build: (o) => ddl.dropColumn(s!, n.table!, n.name, o.cascade) }) },
+          { label: "Drop column…", icon: "🗑", danger: true, ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop column ${n.name}`, primaryLabel: "Drop column", showCascade: true, build: (o) => ddl.dropColumn(s!, n.table!, n.name, o.cascade) }) },
           { sep: true },
           copyName,
         );
@@ -1090,10 +1123,10 @@ function App() {
       }
       case "schema":
         items.push(
-          { label: "Create table…", icon: "＋", disabled: ro, onClick: () => setActiveDialog({ kind: "createTable", schema: n.name }) },
-          { label: "Rename…", icon: "✎", disabled: ro, onClick: () => setActiveDialog({ kind: "rename", title: `Rename schema ${n.name}`, current: n.name, build: (nn) => ddl.renameSchema(n.name, nn) }) },
+          { label: "Create table…", icon: "＋", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => setActiveDialog({ kind: "createTable", schema: n.name }) },
+          { label: "Rename…", icon: "✎", ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename schema ${n.name}`, current: n.name, build: (nn) => ddl.renameSchema(n.name, nn) }) },
           { sep: true },
-          { label: "Drop…", icon: "🗑", danger: true, disabled: ro, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop schema ${n.name}`, primaryLabel: "Drop schema", showCascade: true, build: (o) => ddl.dropSchema(n.name, o.cascade) }) },
+          { label: "Drop…", icon: "🗑", danger: true, ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop schema ${n.name}`, primaryLabel: "Drop schema", showCascade: true, build: (o) => ddl.dropSchema(n.name, o.cascade) }) },
           { sep: true },
           copyName,
         );
@@ -1101,8 +1134,8 @@ function App() {
       case "database": {
         const cur = tree()?.database === n.name;
         items.push(
-          { label: "Create schema…", icon: "＋", disabled: ro, onClick: () => setActiveDialog({ kind: "createSchema" }) },
-          { label: cur ? "Drop… (connected)" : "Drop…", icon: "🗑", danger: true, disabled: ro || cur, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop database ${n.name}`, primaryLabel: "Drop database", build: () => ddl.dropDatabase(n.name) }) },
+          { label: "Create schema…", icon: "＋", ...gate(canCreateSchema(), "Requires CREATE on the database"), onClick: () => setActiveDialog({ kind: "createSchema" }) },
+          { label: cur ? "Drop… (connected)" : "Drop…", icon: "🗑", danger: true, disabled: cur || conn()?.readOnly || (pEnforced() && !isSuper()), title: cur ? "Can't drop the connected database" : (pEnforced() && !isSuper()) ? "Requires database ownership (or superuser)" : undefined, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop database ${n.name}`, primaryLabel: "Drop database", build: () => ddl.dropDatabase(n.name) }) },
           { sep: true },
           copyName,
         );
