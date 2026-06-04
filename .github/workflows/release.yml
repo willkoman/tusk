@@ -1,24 +1,43 @@
 name: release
 
+# Runs on master pushes + PRs (compile-only, to validate the build AND warm the
+# per-target Rust cache on the default branch) and on v* tags (full bundle + draft
+# GitHub release). GitHub Actions caches are ref-scoped: a tag run can only restore
+# caches from its own ref or the DEFAULT branch — so warming on master is what lets a
+# release skip the cold recompile of the bundled DuckDB/SQLite C++ + the whole dep tree.
 on:
   push:
-    tags:
-      - "v*"
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
   workflow_dispatch: {}
 
 permissions:
   contents: write
+
+# Cancel superseded master/PR runs, but never cancel a release tag mid-build.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   build:
     strategy:
       fail-fast: false
       matrix:
+        # macOS universal was one job building BOTH arches serially (~2x the heavy
+        # C++ compile). Split into two parallel single-arch jobs → wall-clock ≈ one arch.
         include:
-          - platform: macos-latest # universal (Apple Silicon + Intel)
-            args: "--target universal-apple-darwin"
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            cache-key: macos-arm64
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+            cache-key: macos-x64
           - platform: windows-latest
-            args: ""
+            target: ""
+            cache-key: windows
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -26,12 +45,15 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.target }}
 
       - name: Cache Rust build
         uses: swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
+          # Stable per-target key (NOT the default per-job-id key) so master-warmed
+          # caches are reused by tag releases despite the version-bump lockfile churn.
+          shared-key: ${{ matrix.cache-key }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -42,7 +64,18 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # Non-tag (master / PR / dispatch): compile + type-check only. Warms the
+      # per-target Rust cache and validates the build — no bundling/signing.
+      - name: Build (validate + warm cache)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        shell: bash
+        run: |
+          npm run build
+          cargo build --release ${{ matrix.target && format('--target {0}', matrix.target) || '' }} --manifest-path src-tauri/Cargo.toml
+
+      # Tag (v*): full bundle + draft release, restoring the master-warmed cache.
       - name: Build and publish release
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -52,9 +85,10 @@ jobs:
           releaseBody: "Download the installer for your platform below."
           releaseDraft: true
           prerelease: false
-          args: ${{ matrix.args }}
+          args: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 # To add Linux later, append to matrix:
 #   - platform: ubuntu-22.04
-#     args: ""
+#     target: ""
+#     cache-key: linux
 # and add a step before the build to install:
 #   sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsecret-1-dev libayatana-appindicator3-dev librsvg2-dev

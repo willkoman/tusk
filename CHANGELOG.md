@@ -4,6 +4,11 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-06-04
+
+### Changed
+- **CI release builds are much faster (cache reuse + parallel macOS arches).** Releases were doing a full **cold** Rust compile every time — the `swatinem/rust-cache` restore was a 1-second miss on every run because the workflow only triggered on `v*` tags, and GitHub Actions caches are ref-scoped (a tag run can only restore caches from its own ref or the **default branch**, which never had one). The workflow now also builds on **master pushes / PRs** (compile + type-check only — no bundling), which warms a **per-target** Rust cache (stable `shared-key`) on the default branch that tag releases restore, so a release no longer recompiles the bundled DuckDB/SQLite C++ and the whole dependency tree from scratch. The macOS **universal** job (which compiled aarch64 **and** x86_64 serially) is split into **two parallel single-arch jobs**, so the mac build's wall-clock is ~one arch instead of two — now shipping separate `aarch64` and `x64` DMGs instead of one universal DMG. A `concurrency` group also cancels superseded master/PR runs (never a release tag). No app-behavior changes.
+
 ## [0.2.3] - 2026-06-04
 
 ### Changed
