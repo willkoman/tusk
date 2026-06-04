@@ -1,3 +1,4 @@
+mod ai;
 mod db;
 mod ddl;
 mod driver;
@@ -607,7 +608,11 @@ pub fn run() {
             cancel_operation,
             import_rows,
             read_text_file,
-            write_text_file
+            write_text_file,
+            ai::ai_save_key,
+            ai::ai_has_key,
+            ai::ai_clear_key,
+            ai::ai_chat
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
