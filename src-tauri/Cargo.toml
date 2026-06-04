@@ -1,6 +1,6 @@
 [package]
 name = "tusk"
-version = "0.2.1"
+version = "0.2.2"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -29,7 +29,7 @@ native-tls = "0.2"
 postgres-native-tls = "0.5"
 bytes = "1"
 futures-util = "0.3"
-rust_xlsxwriter = "0.95.0"
+rust_xlsxwriter = { version = "0.95.0", features = ["constant_memory"] }
 # AI provider proxy (streaming HTTP). rustls to avoid an OpenSSL build dep.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 # Embedded DuckDB. `bundled` statically compiles libduckdb from source (no system

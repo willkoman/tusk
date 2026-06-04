@@ -352,7 +352,8 @@ impl<'a> TextEmit<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// XlsxSink — buffers a workbook in memory (rust_xlsxwriter is not streaming),
+// XlsxSink — streams rows to the workbook in constant-memory mode (each worksheet
+// flushes its rows to a tempfile, so RAM stays flat regardless of row count),
 // rolling into a new sheet every XLSX_MAX_ROWS so all data is exported.
 // ---------------------------------------------------------------------------
 
@@ -408,7 +409,12 @@ impl<'a> XlsxSink<'a> {
         } else {
             None
         };
-        let ws = self.wb.add_worksheet();
+        // Constant-memory mode: each worksheet streams its rows to a tempfile instead of
+        // buffering them in RAM, so a multi-hundred-thousand-row export stays flat (~MBs)
+        // instead of growing to hundreds of MB. Requires writing rows strictly
+        // top-to-bottom (which the streaming export does) and per-row formatting only on
+        // the current row (the bold header is row 0, written before any data row).
+        let ws = self.wb.add_worksheet_with_constant_memory();
         ws.set_name(&name).map_err(xerr)?;
         if self.opts.header {
             for (c, col) in self.pcols.iter().enumerate() {
@@ -429,9 +435,27 @@ impl<'a> XlsxSink<'a> {
         Ok(())
     }
 
+    /// Apply the autofilter to the CURRENT (active) worksheet. Done while the sheet is
+    /// still current so constant-memory mode never has to reach back into a sheet whose
+    /// rows have already been streamed out to its tempfile.
+    fn seal_current_sheet(&mut self) -> Result<(), AppError> {
+        if !self.opts.xlsx.auto_filter || self.pcols.is_empty() || self.sheets == 0 {
+            return Ok(());
+        }
+        let idx = (self.sheets - 1) as usize;
+        let last_row = self.last_rows[idx];
+        let last_col = (self.pcols.len() - 1) as u16;
+        let ws = self.wb.worksheet_from_index(idx).map_err(xerr)?;
+        ws.autofilter(0, 0, last_row, last_col).map_err(xerr)?;
+        Ok(())
+    }
+
     fn write_row(&mut self, prow: &[Option<String>]) -> Result<(), AppError> {
         self.started = true;
-        if self.sheets == 0 || self.row_in_sheet >= XLSX_MAX_ROWS {
+        if self.sheets == 0 {
+            self.new_sheet()?;
+        } else if self.row_in_sheet >= XLSX_MAX_ROWS {
+            self.seal_current_sheet()?; // finalize the full sheet before rolling to the next
             self.new_sheet()?;
         }
         let r = self.row_in_sheet;
@@ -451,14 +475,7 @@ impl<'a> XlsxSink<'a> {
         if !self.started {
             return Ok(()); // no rows => no file
         }
-        if self.opts.xlsx.auto_filter && !self.pcols.is_empty() {
-            let last_col = (self.pcols.len() - 1) as u16;
-            for i in 0..self.sheets as usize {
-                let last_row = self.last_rows[i];
-                let ws = self.wb.worksheet_from_index(i).map_err(xerr)?;
-                ws.autofilter(0, 0, last_row, last_col).map_err(xerr)?;
-            }
-        }
+        self.seal_current_sheet()?; // autofilter for the final sheet
         self.wb.save(path).map_err(xerr)?;
         Ok(())
     }
@@ -469,7 +486,8 @@ impl<'a> XlsxSink<'a> {
 // ---------------------------------------------------------------------------
 
 /// Stream a query's full result to `path`, honoring `opts`. Text formats stream in
-/// constant memory; xlsx buffers the workbook (rust_xlsxwriter limitation).
+/// constant memory; xlsx uses rust_xlsxwriter's constant-memory mode (per-sheet tempfile),
+/// so RAM stays flat for both.
 pub async fn run_export_query(
     client: &Client,
     sql: &str,

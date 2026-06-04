@@ -230,7 +230,11 @@ function App() {
   // or when the server-lint pref is off.
   const validate = async (sqlText: string): Promise<ServerDiag[]> => {
     const c = conn();
-    if (!c || running() || !prefs().serverLint) return [];
+    // Skip while a query is running (shared connection lock) AND while any streaming
+    // cursor is open: validate_sql rolls back the open cursor to PREPARE in autocommit,
+    // which would truncate a live stream. (Double-clicking a table sets the editor doc,
+    // which fires this lint ~600ms later — it must not kill the stream it just opened.)
+    if (!c || running() || cursorOwnerTabId !== null || !prefs().serverLint) return [];
     try {
       return await invoke<ServerDiag[]>("validate_sql", { connectionId: c.id, sql: sqlText, searchPath: activeTab().searchSchema });
     } catch {

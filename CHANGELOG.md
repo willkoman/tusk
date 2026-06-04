@@ -4,6 +4,14 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-06-04
+
+### Changed
+- **xlsx export no longer buffers the whole workbook in RAM.** Previously the Excel formatter held the entire workbook in memory until save, so a large export spiked memory (e.g. ~300k rows × 9 cols briefly used ~700 MB). It now uses `rust_xlsxwriter`'s **constant-memory mode** (`add_worksheet_with_constant_memory`, behind the `constant_memory` feature), which streams each worksheet's rows to a per-sheet tempfile — RAM stays flat regardless of row count, matching the text/CSV export path. The streaming export already writes rows strictly top-to-bottom (the mode's requirement); the bold header (row 0) and freeze-panes are unaffected, and the autofilter is now **sealed per-sheet while that sheet is still current** (so constant-memory never has to reach back into a sheet whose rows were already flushed). Sheet rollover every 1,048,576 rows still works. The destination `.xlsx` is still only created at save, so cancel/error leaves no partial file.
+
+### Fixed
+- **Double-clicking a table (or any streamed result) capped at 1000 rows.** The editor's server-lint (`validate_sql`) rolls back any open cursor so it can `PREPARE` in autocommit — but double-clicking a table sets the editor document, which fires that lint ~600ms later and **silently rolled back the streaming cursor the query had just opened**. After that, scrolling / "Load all" found no cursor and reported `done`, so the result was stuck at the first page. The frontend now **skips server-lint whenever a streaming cursor is open** (in addition to skipping while a query is running) so editing or generating SQL can't truncate a live stream; lint resumes once the stream finishes or is drained. (Client-side heuristic/schema lints are unaffected.)
+
 ## [0.2.1] - 2026-06-04
 
 ### Added
