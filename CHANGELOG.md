@@ -4,6 +4,9 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+### Docs
+- **Rewrote `README.md` to match the current app.** It had drifted to the early Postgres-only state; it now covers the four drivers (Postgres/DuckDB/SQLite/MySQL), the schema workbench + DDL dialogs, layered linting, streaming multi-format export + import, the AI assistant, query cancel, permission gating, and the current CI layout (per-arch macOS DMGs + Windows NSIS/MSI, cache-warmed on master).
+
 ## [0.2.4] - 2026-06-04
 
 ### Changed
