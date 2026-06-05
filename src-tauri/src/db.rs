@@ -175,16 +175,26 @@ pub fn collect_rows(messages: &[SimpleQueryMessage]) -> (Vec<String>, Vec<Vec<Op
     let mut columns: Vec<String> = Vec::new();
     let mut rows: Vec<Vec<Option<String>>> = Vec::new();
     for m in messages {
-        if let SimpleQueryMessage::Row(r) = m {
-            let cols = r.columns();
-            if columns.is_empty() {
-                columns = cols.iter().map(|c| c.name().to_string()).collect();
+        match m {
+            // Sent before the data rows — so a zero-row result still reports its column
+            // names (an empty SELECT shows its headers instead of "no results").
+            SimpleQueryMessage::RowDescription(cols) => {
+                if columns.is_empty() {
+                    columns = cols.iter().map(|c| c.name().to_string()).collect();
+                }
             }
-            let mut row = Vec::with_capacity(cols.len());
-            for i in 0..cols.len() {
-                row.push(r.get(i).map(|s| s.to_string()));
+            SimpleQueryMessage::Row(r) => {
+                let cols = r.columns();
+                if columns.is_empty() {
+                    columns = cols.iter().map(|c| c.name().to_string()).collect();
+                }
+                let mut row = Vec::with_capacity(cols.len());
+                for i in 0..cols.len() {
+                    row.push(r.get(i).map(|s| s.to_string()));
+                }
+                rows.push(row);
             }
-            rows.push(row);
+            _ => {}
         }
     }
     (columns, rows)

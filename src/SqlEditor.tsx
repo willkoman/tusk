@@ -45,6 +45,8 @@ export type EditorApi = {
   getRunText: () => string;
   /** The statement under the cursor (whole doc if it can't be isolated). */
   getCurrentStatement: () => string;
+  /** How many statements the buffer holds (drives the run whole-file vs block chooser). */
+  getStatementCount: () => number;
   /** Insert text at the cursor (does not clobber the buffer) and focus the editor. */
   insertAtCursor: (text: string) => void;
   focus: () => void;
@@ -123,6 +125,7 @@ export function SqlEditor(props: {
     const at = statementAt(stmts, view.state.selection.main.head);
     return at ? at.stmt.text : view.state.doc.toString();
   };
+  const getStatementCount = () => (view ? lexState(view.state).stmts.length : 0);
   const insertAtCursor = (text: string) => {
     if (!view) return;
     const pos = view.state.selection.main.head;
@@ -214,6 +217,7 @@ export function SqlEditor(props: {
     props.onReady?.({
       getRunText,
       getCurrentStatement,
+      getStatementCount,
       insertAtCursor,
       focus,
       getSelection,

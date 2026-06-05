@@ -4,6 +4,15 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-06-05
+
+### Added
+- **Run chooser — whole file vs. current block.** Hitting Run (the button or ⌘/Ctrl+Enter) with the cursor inside one of several statements (and nothing selected) now opens a small popover to choose **Current block** or **Entire file** — pick with a click, or ↑/↓ + Enter (Esc cancels). A text selection or a single-statement buffer still runs immediately with no prompt; ⌘/Ctrl+Shift+Enter and the statement-gutter ▶ still run the current statement directly.
+- **Multi-statement runs show the last statement's result.** Previously running multiple statements only reported a summary. Now, when the last statement is a read (`SELECT`/`WITH`/`TABLE`/`VALUES`), the leading statements run as a transactional script and the **last statement streams to the result grid** with full pagination. (The leading writes commit before the trailing read, so a failing trailing read no longer rolls them back.) A trailing write/COPY still shows a summary.
+
+### Changed
+- **Empty result sets show their column headers.** A `SELECT` that returns zero rows now displays the result grid with its column headers (and no rows) instead of a "no results" placeholder. Backend: `db::collect_rows` reads the simple-protocol `RowDescription`, so a zero-row Postgres result still reports its column names. (`RETURNING` queries that affect no rows likewise show their headers.)
+
 ### Docs
 - **Rewrote `README.md` to match the current app.** It had drifted to the early Postgres-only state; it now covers the four drivers (Postgres/DuckDB/SQLite/MySQL), the schema workbench + DDL dialogs, layered linting, streaming multi-format export + import, the AI assistant, query cancel, permission gating, and the current CI layout (per-arch macOS DMGs + Windows NSIS/MSI, cache-warmed on master).
 

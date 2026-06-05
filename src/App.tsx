@@ -759,9 +759,46 @@ function App() {
     void cancelOperation();
   }
 
+  // Run-target chooser: when Run is hit with the cursor inside one of several statements
+  // (and nothing selected), ask whether to run the whole file or just that block.
+  const [runChoice, setRunChoice] = createSignal<{ x: number; y: number } | null>(null);
+  let runBtnRef: HTMLButtonElement | undefined;
+
+  function runText(t: string) {
+    // A multi-statement run streams only the *last* statement's result, and we don't have
+    // an isolated single SELECT to re-wrap — so store a non-wrappable base (disabling grid
+    // sort/filter). Conservative: any inner `;` counts as multi (never wrongly wrappable).
+    const inner = stripTrailingSemi(t);
+    void executeQuery(t, inner.includes(";") ? "" : inner, "base");
+  }
+
   function doRun(override?: string) {
-    const runText = override ?? editorApi()?.getRunText() ?? sql();
-    void executeQuery(runText, stripTrailingSemi(runText), "base");
+    // Explicit text (statement-gutter / run-current-statement) runs as-is, no prompt.
+    if (override !== undefined) {
+      runText(override);
+      return;
+    }
+    const api = editorApi();
+    // A selection runs exactly what's selected, no prompt.
+    if (api && api.getSelection().trim()) {
+      runText(api.getRunText());
+      return;
+    }
+    // Multiple statements + cursor inside one → ask: whole file, or just this block.
+    if (api && api.getStatementCount() > 1) {
+      const r = runBtnRef?.getBoundingClientRect();
+      setRunChoice(r ? { x: r.left, y: r.bottom + 6 } : { x: 16, y: 84 });
+      return;
+    }
+    // Single statement (or no editor) → run the whole buffer.
+    runText(api?.getRunText() ?? sql());
+  }
+
+  function chooseRun(which: "block" | "file") {
+    setRunChoice(null);
+    const api = editorApi();
+    if (!api) return;
+    runText(which === "block" ? api.getCurrentStatement() : api.getDoc());
   }
 
   // Re-stream the active tab's result sorted/filtered (server ORDER BY / WHERE).
@@ -1248,7 +1285,7 @@ function App() {
         { label: "Select all", icon: "table", onClick: () => api.selectAll() },
         { label: "Toggle comment", icon: "slash", onClick: () => api.toggleComment() },
         { sep: true },
-        { label: hasSel ? "Run selection" : "Run all", icon: "play", onClick: () => doRun() },
+        { label: hasSel ? "Run selection" : "Run all", icon: "play", onClick: () => runText(hasSel ? api.getRunText() : api.getDoc()) },
       ],
     });
   }
@@ -1525,6 +1562,7 @@ function App() {
               />
               <div class="toolbar">
                 <button
+                  ref={(el) => (runBtnRef = el)}
                   class="run"
                   classList={{ cancel: running() }}
                   onClick={() => (running() ? cancelQuery() : doRun())}
@@ -1742,6 +1780,31 @@ function App() {
       {/* Context menu + value viewer render above everything, in both screens. */}
       <Show when={menu()}>
         {(m) => <ContextMenu x={m().x} y={m().y} items={m().items} onClose={() => setMenu(null)} />}
+      </Show>
+      <Show when={runChoice()}>
+        {(rc) => (
+          <>
+            <div class="run-chooser-overlay" onMouseDown={() => setRunChoice(null)} />
+            <div
+              class="run-chooser"
+              style={{ left: `${rc().x}px`, top: `${rc().y}px` }}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") { setRunChoice(null); return; }
+                if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                  e.preventDefault();
+                  const btns = [...e.currentTarget.querySelectorAll("button")] as HTMLButtonElement[];
+                  const i = btns.indexOf(document.activeElement as HTMLButtonElement);
+                  btns[(i + (e.key === "ArrowDown" ? 1 : btns.length - 1) + btns.length) % btns.length]?.focus();
+                }
+              }}
+            >
+              <div class="run-chooser-title">Run…</div>
+              <button ref={(el) => queueMicrotask(() => el.focus())} onClick={() => chooseRun("block")}>Current block</button>
+              <button onClick={() => chooseRun("file")}>Entire file</button>
+              <div class="run-chooser-hint">↑↓ choose · Enter run · Esc cancel</div>
+            </div>
+          </>
+        )}
       </Show>
       <Show when={cellView()}>
         {(cv) => (

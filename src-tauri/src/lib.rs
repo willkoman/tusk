@@ -251,6 +251,33 @@ async fn exec_items(
         }
     }
 
+    // Multiple statements where the LAST one is a cursorable read: run the leading
+    // statements as a transactional script (atomic — rolls back on error), then STREAM
+    // the last statement to the grid so its result is shown, with full pagination just
+    // like a single-statement run. (A trailing read can't dirty state, so the only
+    // semantic shift vs. one big transaction is that a *failing* trailing SELECT no
+    // longer rolls the already-committed leading statements back.)
+    if items.len() > 1 {
+        if let Some(script::Item::Sql(last)) = items.last() {
+            let last_trimmed = last.trim();
+            if is_cursorable(last_trimmed) {
+                c.backend
+                    .run_script(&items[..items.len() - 1], c.read_only)
+                    .await?;
+                // The leading statements are now committed and must never be replayed.
+                // If streaming the trailing read trips on a dropped connection, heal it
+                // in place and retry ONLY the read — then return alive so run_query's
+                // outer retry (which re-runs the whole batch) can't fire and double-apply.
+                let out = c.backend.run_single(last_trimmed, page, true).await;
+                if out.is_err() && c.backend.is_closed() {
+                    ensure_alive(c).await?;
+                    return c.backend.run_single(last_trimmed, page, true).await;
+                }
+                return out;
+            }
+        }
+    }
+
     // Multiple statements (or a COPY block) run as a script.
     let msg = c.backend.run_script(items, c.read_only).await?;
     Ok(QueryOutcome::Exec { message: msg })

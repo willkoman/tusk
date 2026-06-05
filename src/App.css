@@ -358,6 +358,22 @@ button.ghost { background: transparent; }
 .ctx-item.ctx-disabled { opacity: 0.4; cursor: default; }
 .ctx-item.ctx-disabled:hover { background: transparent; color: var(--danger); }
 .ctx-item.ctx-disabled:not(.danger):hover { color: var(--text); }
+
+/* Run-target chooser (whole file vs current block) */
+.run-chooser-overlay { position: fixed; inset: 0; z-index: 100; }
+.run-chooser {
+  position: fixed; z-index: 101; min-width: 180px;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+  padding: 4px; box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5); user-select: none;
+  display: flex; flex-direction: column; gap: 1px;
+}
+.run-chooser-title { font-size: 11px; color: var(--muted); padding: 5px 10px 3px; }
+.run-chooser button {
+  text-align: left; background: transparent; border: none; color: var(--text);
+  padding: 6px 10px; border-radius: 5px; font-size: 12px; cursor: pointer; width: 100%;
+}
+.run-chooser button:hover, .run-chooser button:focus { background: var(--accent); color: #fff; outline: none; }
+.run-chooser-hint { font-size: 10px; color: var(--muted); padding: 4px 10px 3px; }
 .ctx-icon { width: 16px; height: 16px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; }
 .ctx-icon svg { width: 15px; height: 15px; display: block; stroke: currentColor; }
 .ctx-text { flex: 1; }

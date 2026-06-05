@@ -150,9 +150,9 @@ async fn run_battery(b: &mut Backend, eng: &Eng) {
     assert_eq!(cell(&r[3], 1), None, "[{}] default NULL → None", eng.name);
     assert!(cell(&r[4], 1).unwrap().contains('\n'), "[{}] newline preserved", eng.name);
 
-    // 2. empty result set: no rows, no error. (Note: Postgres' simple-protocol can't
-    //    report column names for a zero-row result — that divergence is documented, not
-    //    asserted here.)
+    // 2. empty result set: no rows, no error. (Postgres now reports column names even for
+    //    a zero-row result via the simple-protocol RowDescription — see db::collect_rows —
+    //    so an empty SELECT still shows its headers; column presence isn't asserted here.)
     let empty = b
         .run_single(&format!("SELECT {} FROM {} WHERE 1=0", q("id"), q("conf")), 100, true)
         .await
