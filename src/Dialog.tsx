@@ -6,6 +6,8 @@ export function Dialog(props: {
   title: string;
   onClose: () => void;
   width?: number;
+  /** Extra class on the modal box (e.g. "modal-tall" for full-height viewers). */
+  class?: string;
   /** When false, the ✕ and overlay-click dismissal are disabled (e.g. while busy). */
   dismissable?: boolean;
   children: JSX.Element;
@@ -15,6 +17,7 @@ export function Dialog(props: {
     <div class="modal-overlay" onClick={() => canClose() && props.onClose()}>
       <div
         class="modal"
+        classList={{ [props.class ?? ""]: !!props.class }}
         style={props.width ? { width: `${props.width}px` } : undefined}
         onClick={(e) => e.stopPropagation()}
       >

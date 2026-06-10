@@ -45,6 +45,10 @@ export function damerau(a: string, b: string): number {
  * Closest candidate to `word`, or null when nothing is near enough. The threshold
  * scales with word length so short words demand near-exact matches (avoids noisy
  * suggestions) and longer words tolerate a typo or two.
+ *
+ * A candidate that STARTS WITH the word counts as one edit regardless of how
+ * much longer it is ("master" → "master_id"): under-typing a real name is the
+ * most common miss, and raw edit distance prices every missing character.
  */
 export function closest(word: string, candidates: Iterable<string>): string | null {
   const w = word.toLowerCase();
@@ -52,11 +56,14 @@ export function closest(word: string, candidates: Iterable<string>): string | nu
   let best: string | null = null;
   let bestD = limit + 1;
   for (const c of candidates) {
-    const d = damerau(w, c);
+    let d = damerau(w, c);
+    if (w.length >= 3 && c.toLowerCase().startsWith(w) && c.length - w.length <= 12) {
+      d = Math.min(d, 1);
+    }
     if (d < bestD) {
       bestD = d;
       best = c;
-      if (d === 1) break; // good enough — a single edit away
+      if (d < 1) break;
     }
   }
   return best;

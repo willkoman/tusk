@@ -257,18 +257,114 @@ async fn run_battery(b: &mut Backend, eng: &Eng) {
     exec(b, &format!("DROP TABLE IF EXISTS {qw}")).await;
 }
 
+// --- relationships + DDL reconstruction (relgraph.rs / Backend::relation_ddl) ---
+
+async fn relationship_battery(b: &mut Backend, eng: &Eng) {
+    let q = eng.quote;
+    // child first (FK dependency blocks dropping the parent on PG/MySQL)
+    exec(b, &format!("DROP TABLE IF EXISTS {}", q("rel_child"))).await;
+    exec(b, &format!("DROP TABLE IF EXISTS {}", q("rel_parent"))).await;
+    exec(b, &format!("CREATE TABLE {} (id INTEGER PRIMARY KEY, label TEXT)", q("rel_parent"))).await;
+    exec(b, &format!(
+        "CREATE TABLE {} (id INTEGER PRIMARY KEY, parent_id INTEGER, \
+         FOREIGN KEY (parent_id) REFERENCES {}(id))",
+        q("rel_child"), q("rel_parent")
+    )).await;
+
+    // DuckDB's duckdb_constraints() column set varies by version: the contract
+    // there is edges-or-empty, never an error. Everything else must report.
+    let strict = eng.name != "duckdb";
+
+    let rel = b.table_relationships(eng.schema, "rel_child").await
+        .unwrap_or_else(|e| panic!("[{}] table_relationships(child): {}", eng.name, e.message));
+    if strict || !rel.outbound.is_empty() {
+        assert_eq!(rel.outbound.len(), 1, "[{}] one outbound FK", eng.name);
+        let e = &rel.outbound[0];
+        assert_eq!(e.src_table, "rel_child", "[{}] src table", eng.name);
+        assert_eq!(e.src_cols, vec!["parent_id"], "[{}] src cols", eng.name);
+        assert_eq!(e.dst_table, "rel_parent", "[{}] dst table", eng.name);
+        assert_eq!(e.dst_cols, vec!["id"], "[{}] dst cols", eng.name);
+    }
+    let relp = b.table_relationships(eng.schema, "rel_parent").await.unwrap();
+    if strict || !relp.inbound.is_empty() {
+        assert_eq!(relp.inbound.len(), 1, "[{}] one inbound FK on the parent", eng.name);
+        assert_eq!(relp.inbound[0].src_table, "rel_child", "[{}] inbound src", eng.name);
+        assert!(relp.outbound.is_empty(), "[{}] parent has no outbound FK", eng.name);
+    }
+
+    let g = b.schema_relationships(eng.schema).await
+        .unwrap_or_else(|e| panic!("[{}] schema_relationships: {}", eng.name, e.message));
+    assert!(
+        g.tables.iter().any(|t| t.name == "rel_parent") && g.tables.iter().any(|t| t.name == "rel_child"),
+        "[{}] ERD tables present", eng.name
+    );
+    if strict {
+        assert!(
+            g.edges.iter().any(|e| e.src_table == "rel_child" && e.dst_table == "rel_parent"),
+            "[{}] ERD edge present", eng.name
+        );
+        let parent = g.tables.iter().find(|t| t.name == "rel_parent").unwrap();
+        assert!(
+            parent.columns.iter().any(|c| c.name == "id" && c.is_pk),
+            "[{}] ERD pk flag on rel_parent.id", eng.name
+        );
+        let child = g.tables.iter().find(|t| t.name == "rel_child").unwrap();
+        assert!(
+            child.columns.iter().any(|c| c.name == "parent_id" && c.is_fk),
+            "[{}] ERD fk flag on rel_child.parent_id", eng.name
+        );
+    }
+
+    // Composite-key FK ordering (declared order, not alphabetical) — PG + MySQL.
+    if eng.name == "postgres" || eng.name == "mysql" {
+        exec(b, &format!("DROP TABLE IF EXISTS {}", q("rel_c2"))).await;
+        exec(b, &format!("DROP TABLE IF EXISTS {}", q("rel_p2"))).await;
+        exec(b, &format!("CREATE TABLE {} (a INTEGER, b INTEGER, PRIMARY KEY (b, a))", q("rel_p2"))).await;
+        exec(b, &format!(
+            "CREATE TABLE {} (x INTEGER, y INTEGER, FOREIGN KEY (y, x) REFERENCES {} (b, a))",
+            q("rel_c2"), q("rel_p2")
+        )).await;
+        let r2 = b.table_relationships(eng.schema, "rel_c2").await.unwrap();
+        assert_eq!(r2.outbound.len(), 1, "[{}] composite FK found", eng.name);
+        assert_eq!(r2.outbound[0].src_cols, vec!["y", "x"], "[{}] composite src order", eng.name);
+        assert_eq!(r2.outbound[0].dst_cols, vec!["b", "a"], "[{}] composite dst order", eng.name);
+        exec(b, &format!("DROP TABLE IF EXISTS {}", q("rel_c2"))).await;
+        exec(b, &format!("DROP TABLE IF EXISTS {}", q("rel_p2"))).await;
+    }
+
+    // DDL reconstruction: must contain CREATE TABLE (DuckDB may report a friendly
+    // unsupported error instead — never a panic).
+    match b.relation_ddl("table", eng.schema, "rel_child").await {
+        Ok(ddl) => {
+            assert!(
+                ddl.to_lowercase().contains("create table"),
+                "[{}] relation_ddl contains CREATE TABLE: {ddl}", eng.name
+            );
+            assert!(ddl.to_lowercase().contains("rel_child"), "[{}] relation_ddl names the table", eng.name);
+        }
+        Err(e) => assert!(eng.name == "duckdb", "[{}] relation_ddl errored: {}", eng.name, e.message),
+    }
+
+    exec(b, &format!("DROP TABLE IF EXISTS {}", q("rel_child"))).await;
+    exec(b, &format!("DROP TABLE IF EXISTS {}", q("rel_parent"))).await;
+}
+
 // --- entry points ---
 
 #[tokio::test]
 async fn conformance_duckdb() {
     let (mut b, _v) = connect(&duck_cfg()).await.unwrap();
-    run_battery(&mut b, &Eng { name: "duckdb", schema: "main", quote: dq }).await;
+    let eng = Eng { name: "duckdb", schema: "main", quote: dq };
+    run_battery(&mut b, &eng).await;
+    relationship_battery(&mut b, &eng).await;
 }
 
 #[tokio::test]
 async fn conformance_sqlite() {
     let (mut b, _v) = connect(&sqlite_cfg()).await.unwrap();
-    run_battery(&mut b, &Eng { name: "sqlite", schema: "main", quote: dq }).await;
+    let eng = Eng { name: "sqlite", schema: "main", quote: dq };
+    run_battery(&mut b, &eng).await;
+    relationship_battery(&mut b, &eng).await;
 }
 
 #[tokio::test]
@@ -278,7 +374,9 @@ async fn conformance_postgres() {
         return;
     };
     let (mut b, _v) = connect(&cfg).await.expect("connect pg");
-    run_battery(&mut b, &Eng { name: "postgres", schema: "public", quote: dq }).await;
+    let eng = Eng { name: "postgres", schema: "public", quote: dq };
+    run_battery(&mut b, &eng).await;
+    relationship_battery(&mut b, &eng).await;
 }
 
 #[tokio::test]
@@ -288,7 +386,9 @@ async fn conformance_mysql() {
         return;
     };
     let (mut b, _v) = connect(&cfg).await.expect("connect mysql");
-    run_battery(&mut b, &Eng { name: "mysql", schema: "test", quote: bt }).await;
+    let eng = Eng { name: "mysql", schema: "test", quote: bt };
+    run_battery(&mut b, &eng).await;
+    relationship_battery(&mut b, &eng).await;
 }
 
 // --- read-only enforcement (production safety) ---

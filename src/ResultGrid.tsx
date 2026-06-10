@@ -9,16 +9,22 @@ import { type GridView, type SortKey, type Filter } from "./tabs";
 // position:sticky) for reliable frozen header/gutter in WKWebView. Selection, keyboard
 // nav, multi-format copy, resize/autofit/reorder/hide, and server sort/filter affordances.
 
-const ROW_H = 28;
 const HEAD_H = 30;
 const FILTER_H = 30;
 const GUTTER_W = 56;
-const DEFAULT_COL_W = 180;
 const MIN_COL_W = 48;
 const MAX_COL_W = 900;
 const ROW_OVERSCAN = 8;
 const COL_OVERSCAN = 2;
-const GRID_FONT = '12px "JetBrains Mono","SF Mono",Menlo,Consolas,monospace';
+
+/** Pref-driven appearance (row height, measure font, zebra, NULL render, default width). */
+export type GridStyle = {
+  rowH: number;
+  font: string; // canvas font string for autofit measurement — must match .rg-cell
+  zebra: boolean;
+  nullStyle: "null" | "empty" | "dash";
+  defaultColW: number;
+};
 
 type SelMode = "none" | "cell" | "range" | "rows" | "cols";
 type Sel = { mode: SelMode; ar: number; ac: number; fr: number; fc: number }; // col = display index
@@ -41,6 +47,8 @@ export type ResultGridProps = {
   canSortFilter: Accessor<boolean>;
   /** Include column names as a header row in copied text (default off). */
   copyHeaders: Accessor<boolean>;
+  /** Appearance prefs (read via accessor inside memos/JSX — never captured). */
+  gridStyle: Accessor<GridStyle>;
 };
 
 export function ResultGrid(props: ResultGridProps) {
@@ -54,6 +62,7 @@ export function ResultGrid(props: ResultGridProps) {
   const [reorderTo, setReorderTo] = createSignal<number | null>(null);
 
   const headTop = () => HEAD_H + (props.view().filterRowOpen ? FILTER_H : 0);
+  const rowH = () => props.gridStyle().rowH;
 
   // --- display-column mapping (recomputes only on order/hidden change) ---
   const displayCols = createMemo(() => {
@@ -61,7 +70,7 @@ export function ResultGrid(props: ResultGridProps) {
     const order = props.view().order;
     return order.filter((oi) => !hidden.has(oi));
   });
-  const colWidth = (oi: number) => props.view().widths[oi] ?? DEFAULT_COL_W;
+  const colWidth = (oi: number) => props.view().widths[oi] ?? props.gridStyle().defaultColW;
   const offsets = createMemo(() => {
     const dc = displayCols();
     const out = new Array(dc.length + 1);
@@ -70,7 +79,7 @@ export function ResultGrid(props: ResultGridProps) {
     return out;
   });
   const contentW = () => offsets()[offsets().length - 1] || 0;
-  const totalH = createMemo(() => props.rows().length * ROW_H);
+  const totalH = createMemo(() => props.rows().length * rowH());
 
   function colAt(x: number): number {
     const o = offsets();
@@ -85,8 +94,8 @@ export function ResultGrid(props: ResultGridProps) {
   }
 
   const visRows = createMemo(() => {
-    const start = Math.max(0, Math.floor(scrollTop() / ROW_H) - ROW_OVERSCAN);
-    const end = Math.min(props.rows().length, start + Math.ceil(viewportH() / ROW_H) + ROW_OVERSCAN * 2);
+    const start = Math.max(0, Math.floor(scrollTop() / rowH()) - ROW_OVERSCAN);
+    const end = Math.min(props.rows().length, start + Math.ceil(viewportH() / rowH()) + ROW_OVERSCAN * 2);
     return { start, end };
   });
   const visCols = createMemo(() => {
@@ -184,9 +193,9 @@ export function ResultGrid(props: ResultGridProps) {
   function scrollCellIntoView(r: number, dc: number) {
     const sc = scroller;
     if (!sc) return;
-    const top = r * ROW_H;
+    const top = r * rowH();
     if (top < sc.scrollTop) sc.scrollTop = top;
-    else if (top + ROW_H > sc.scrollTop + sc.clientHeight) sc.scrollTop = top + ROW_H - sc.clientHeight;
+    else if (top + rowH() > sc.scrollTop + sc.clientHeight) sc.scrollTop = top + rowH() - sc.clientHeight;
     const o = offsets();
     if (dc < o.length - 1) {
       if (o[dc] < sc.scrollLeft) sc.scrollLeft = o[dc];
@@ -201,7 +210,7 @@ export function ResultGrid(props: ResultGridProps) {
   function cellFromPtr(cx: number, cy: number) {
     const sc = scroller!;
     const b = sc.getBoundingClientRect();
-    const r = Math.max(0, Math.min(props.rows().length - 1, Math.floor((cy - b.top + sc.scrollTop) / ROW_H)));
+    const r = Math.max(0, Math.min(props.rows().length - 1, Math.floor((cy - b.top + sc.scrollTop) / rowH())));
     const c = Math.max(0, Math.min(displayCols().length - 1, colAt(cx - b.left + sc.scrollLeft)));
     return { r, c };
   }
@@ -303,8 +312,8 @@ export function ResultGrid(props: ResultGridProps) {
       case "ArrowRight": move(fr, fc + 1); break;
       case "Home": mod ? move(0, 0) : move(fr, 0); break;
       case "End": mod ? move(nr - 1, nc - 1) : move(fr, nc - 1); break;
-      case "PageDown": move(fr + Math.floor(viewportH() / ROW_H), fc); break;
-      case "PageUp": move(fr - Math.floor(viewportH() / ROW_H), fc); break;
+      case "PageDown": move(fr + Math.floor(viewportH() / rowH()), fc); break;
+      case "PageUp": move(fr - Math.floor(viewportH() / rowH()), fc); break;
       case "Escape": setSel({ mode: "cell", ar: fr, ac: fc, fr, fc }); break;
       case "a": if (mod) { selectAll(); e.preventDefault(); } break;
       case "c": if (mod) { void copySelection("tsv"); e.preventDefault(); } break;
@@ -459,7 +468,7 @@ export function ResultGrid(props: ResultGridProps) {
   function autofit(oi: number) {
     if (!measureCtx) measureCtx = document.createElement("canvas").getContext("2d");
     if (!measureCtx) return;
-    measureCtx.font = GRID_FONT;
+    measureCtx.font = props.gridStyle().font;
     let max = measureCtx.measureText(props.columns()[oi]).width + 34;
     const R = props.rows();
     const { start, end } = visRows();
@@ -589,7 +598,7 @@ export function ResultGrid(props: ResultGridProps) {
               <div
                 class="rg-gutnum"
                 classList={{ sel: sel().mode === "rows" && isSel(r, 0) }}
-                style={{ top: `${r * ROW_H}px`, height: `${ROW_H}px` }}
+                style={{ top: `${r * rowH()}px`, height: `${rowH()}px` }}
                 onMouseDown={(e) => onGutterDown(e, r)}
               >
                 {r + 1}
@@ -604,7 +613,7 @@ export function ResultGrid(props: ResultGridProps) {
         <div class="rg-sizer" style={{ width: `${contentW()}px`, height: `${totalH()}px` }}>
           <For each={range(visRows().start, visRows().end)}>
             {(r) => (
-              <div class="rg-row" style={{ top: `${r * ROW_H}px`, height: `${ROW_H}px`, width: `${contentW()}px` }}>
+              <div class="rg-row" classList={{ odd: props.gridStyle().zebra && r % 2 === 1 }} style={{ top: `${r * rowH()}px`, height: `${rowH()}px`, width: `${contentW()}px` }}>
                 <For each={range(visCols().start, visCols().end)}>
                   {(k) => {
                     const oi = () => displayCols()[k];
@@ -618,7 +627,9 @@ export function ResultGrid(props: ResultGridProps) {
                         onDblClick={() => props.onViewValue(props.columns()[oi()], val())}
                         onContextMenu={(e) => onCellContext(e, r, k, oi(), val())}
                       >
-                        {val() === null ? <span class="null">NULL</span> : val()}
+                        {val() === null
+                          ? <span class="null">{props.gridStyle().nullStyle === "null" ? "NULL" : props.gridStyle().nullStyle === "dash" ? "—" : ""}</span>
+                          : val()}
                       </div>
                     );
                   }}

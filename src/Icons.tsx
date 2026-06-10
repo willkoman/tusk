@@ -67,7 +67,8 @@ export type IconName =
   | "eraser"
   | "resize"
   | "fileCode"
-  | "star";
+  | "star"
+  | "gear";
 
 export function Icon(props: { name: IconName }): JSX.Element {
   switch (props.name) {
@@ -109,6 +110,8 @@ export function Icon(props: { name: IconName }): JSX.Element {
       return svg("currentColor", <><path d="M3 6h18" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /><path d="M10 11v6M14 11v6" /></>);
     case "close":
       return svg("currentColor", <path d="M18 6 6 18M6 6l12 12" />);
+    case "gear":
+      return svg("currentColor", <><circle cx="12" cy="12" r="3" /><path d="M12 2v2.2M12 19.8V22M4.93 4.93l1.56 1.56M17.51 17.51l1.56 1.56M2 12h2.2M19.8 12H22M4.93 19.07l1.56-1.56M17.51 6.49l1.56-1.56" /></>);
     case "sparkle":
       return svg("currentColor", <><path d="m12 3 1.9 5.1a2 2 0 0 0 1.2 1.2L20 11l-4.9 1.7a2 2 0 0 0-1.2 1.2L12 19l-1.9-5.1a2 2 0 0 0-1.2-1.2L4 11l4.9-1.7a2 2 0 0 0 1.2-1.2Z" /><path d="M19 4v3M21 5.5h-3" /></>);
     case "wrap":

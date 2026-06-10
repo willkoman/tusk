@@ -72,6 +72,12 @@ export type Tab = {
   result: ResultSnapshot;
   /** Display overlay over the result (widths/order/hidden/sorts/filters). */
   gridView: GridView;
+  /**
+   * Result-area view when the result is a detected EXPLAIN plan: undefined =
+   * default ("plan" when detectable), explicit "grid" = the raw output. The
+   * parsed plan itself is never stored — it's derived lazily from the snapshot.
+   */
+  resultView?: "grid" | "plan";
 };
 
 let counter = 0;

@@ -7,6 +7,7 @@ mod driver_conformance;
 mod export;
 mod perms;
 mod profiles;
+mod relgraph;
 mod script;
 mod tree;
 
@@ -322,17 +323,26 @@ struct StmtDiag {
     position: Option<i32>,
 }
 
-/// Statements Postgres can PREPARE (parse + plan, no execution). DDL/utility
-/// statements can't be prepared, so we skip them rather than risk anything.
+/// Statements PREPARE legitimately rejects (DDL / utility / transaction control) —
+/// skip those. Everything else is PREPAREd, so an unrecognized leading word
+/// (`SELCT …`) gets a real parser diagnostic instead of being silently skipped
+/// (the old allow-list meant a misspelled first keyword produced no lint at all).
 fn is_prepareable(sql: &str) -> bool {
+    const SKIP: &[&str] = &[
+        "create", "alter", "drop", "truncate", "grant", "revoke", "comment", "set", "reset",
+        "show", "copy", "vacuum", "analyze", "analyse", "begin", "start", "commit", "end",
+        "rollback", "abort", "savepoint", "release", "do", "call", "declare", "fetch", "move",
+        "close", "prepare", "execute", "deallocate", "listen", "notify", "unlisten", "lock",
+        "reindex", "cluster", "refresh", "checkpoint", "discard", "import", "security",
+        "explain",
+    ];
     let t = script::effective_start(sql).to_ascii_lowercase();
-    t.starts_with("select")
-        || t.starts_with("with")
-        || t.starts_with("insert")
-        || t.starts_with("update")
-        || t.starts_with("delete")
-        || t.starts_with("values")
-        || t.starts_with("table")
+    if t.is_empty() || t.starts_with('\\') {
+        return false; // comment-only or psql meta-command
+    }
+    // First word = leading alphabetic run ("explain(analyze)" → "explain").
+    let first: String = t.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+    !SKIP.contains(&first.as_str())
 }
 
 /// PREPARE rejects statements with bind parameters ("could not determine data type
@@ -465,7 +475,53 @@ async fn object_ddl(
     let mut c = conn.lock().await;
     ensure_alive(&mut c).await?;
     c.backend.rollback_cursor().await;
-    ddl::object_ddl(c.backend.pg()?, &kind, &schema, &name).await
+    // Multi-engine: PG full reconstruction, SQLite sqlite_master, MySQL SHOW
+    // CREATE, DuckDB duckdb_tables()/views() best-effort.
+    c.backend.relation_ddl(&kind, &schema, &name).await
+}
+
+/// All callable function/procedure names (builtins + user-defined), feeding the
+/// editor's unknown-function lint. Empty = engine can't enumerate reliably.
+#[tauri::command]
+async fn list_functions(
+    state: tauri::State<'_, AppState>,
+    connection_id: String,
+) -> Result<Vec<String>, AppError> {
+    let conn = state.get(&connection_id)?;
+    let mut c = conn.lock().await;
+    ensure_alive(&mut c).await?;
+    c.backend.rollback_cursor().await;
+    c.backend.list_functions().await
+}
+
+/// FK relationships of one relation (outbound + inbound), for the relationship
+/// graph. Best-effort per driver — engines without the catalog answer empty.
+#[tauri::command]
+async fn table_relationships(
+    state: tauri::State<'_, AppState>,
+    connection_id: String,
+    schema: String,
+    name: String,
+) -> Result<relgraph::Relationships, AppError> {
+    let conn = state.get(&connection_id)?;
+    let mut c = conn.lock().await;
+    ensure_alive(&mut c).await?;
+    c.backend.rollback_cursor().await;
+    c.backend.table_relationships(&schema, &name).await
+}
+
+/// All FK edges + table summaries of one schema, for the whole-schema ERD.
+#[tauri::command]
+async fn schema_relationships(
+    state: tauri::State<'_, AppState>,
+    connection_id: String,
+    schema: String,
+) -> Result<relgraph::SchemaGraph, AppError> {
+    let conn = state.get(&connection_id)?;
+    let mut c = conn.lock().await;
+    ensure_alive(&mut c).await?;
+    c.backend.rollback_cursor().await;
+    c.backend.schema_relationships(&schema).await
 }
 
 /// Immediately cancel the cancellable operation in flight on a connection (a streaming
@@ -616,6 +672,47 @@ async fn write_text_file(path: String, contents: String) -> Result<(), AppError>
         .map_err(|e| AppError::new(e.to_string()))
 }
 
+/// Query-history storage: one JSON file per connection under
+/// `<app-config>/history/`. File-backed (not localStorage) so history survives
+/// WebView profile resets; the frontend treats failures as "no history" and
+/// never blocks query execution on these.
+fn history_path(app: &tauri::AppHandle, conn_key: &str) -> Result<std::path::PathBuf, AppError> {
+    use tauri::Manager;
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| AppError::new(e.to_string()))?
+        .join("history");
+    let safe: String = conn_key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    Ok(dir.join(format!("{safe}.json")))
+}
+
+#[tauri::command]
+async fn load_history(app: tauri::AppHandle, conn_key: String) -> Result<String, AppError> {
+    let path = history_path(&app, &conn_key)?;
+    match tokio::fs::read_to_string(&path).await {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("[]".into()),
+        Err(e) => Err(AppError::new(e.to_string())),
+    }
+}
+
+#[tauri::command]
+async fn save_history(app: tauri::AppHandle, conn_key: String, json: String) -> Result<(), AppError> {
+    let path = history_path(&app, &conn_key)?;
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| AppError::new(e.to_string()))?;
+    }
+    tokio::fs::write(&path, json)
+        .await
+        .map_err(|e| AppError::new(e.to_string()))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -636,6 +733,9 @@ pub fn run() {
             db_tree,
             table_detail,
             object_ddl,
+            table_relationships,
+            schema_relationships,
+            list_functions,
             export_to_file,
             capabilities,
             permissions,
@@ -643,6 +743,8 @@ pub fn run() {
             import_rows,
             read_text_file,
             write_text_file,
+            load_history,
+            save_history,
             ai::ai_save_key,
             ai::ai_has_key,
             ai::ai_clear_key,

@@ -30,7 +30,11 @@ echo -n "Waiting for Postgres"
 until docker exec tusk-it-pg pg_isready -U postgres >/dev/null 2>&1; do echo -n .; sleep 1; done
 echo " up"
 echo -n "Waiting for MySQL"
-until docker exec tusk-it-mysql mysqladmin ping -uroot -ptest --silent >/dev/null 2>&1; do echo -n .; sleep 2; done
+# Must be a TCP check: during MySQL 8's init phase `mysqladmin ping` succeeds
+# over the unix socket while port 3306 is still closed (the temp init server
+# runs with networking off) — a socket-based wait lets the suite connect too
+# early and die with "connection closed".
+until docker exec tusk-it-mysql mysql -h127.0.0.1 -uroot -ptest -e "SELECT 1" >/dev/null 2>&1; do echo -n .; sleep 2; done
 echo " up"
 
 echo "Running conformance suite (all 4 engines)…"

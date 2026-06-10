@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use tokio_postgres::{CancelToken, Client, SimpleQueryMessage};
 
 use crate::db::{self, AppError, ConnectionConfig, FetchResult, QueryOutcome, CURSOR_NAME};
+use crate::relgraph;
 use crate::script;
 use crate::tree;
 
@@ -32,6 +33,13 @@ pub struct Capabilities {
     pub tls: bool,
     pub keychain: bool,
     pub permissions: bool,
+    /// DDL reconstruction available (PG pg_catalog / SQLite sqlite_master /
+    /// MySQL SHOW CREATE / DuckDB duckdb_tables — DuckDB is best-effort).
+    pub ddl: bool,
+    /// FK relationship introspection (table_relationships / schema_relationships).
+    pub relationships: bool,
+    /// EXPLAIN ANALYZE exists on this engine (SQLite has no ANALYZE variant).
+    pub explain_analyze: bool,
 }
 
 impl Capabilities {
@@ -47,6 +55,9 @@ impl Capabilities {
             tls: true,
             keychain: true,
             permissions: true,
+            ddl: true,
+            relationships: true,
+            explain_analyze: true,
         }
     }
     pub fn duckdb() -> Self {
@@ -61,6 +72,9 @@ impl Capabilities {
             tls: false,
             keychain: false,
             permissions: false,
+            ddl: true, // best-effort via duckdb_tables()/duckdb_views()
+            relationships: true, // best-effort via duckdb_constraints()
+            explain_analyze: true,
         }
     }
     pub fn sqlite() -> Self {
@@ -75,6 +89,9 @@ impl Capabilities {
             tls: false,
             keychain: false,
             permissions: false,
+            ddl: true, // sqlite_master.sql
+            relationships: true, // pragma_foreign_key_list
+            explain_analyze: false, // no EXPLAIN ANALYZE in SQLite
         }
     }
     pub fn mysql() -> Self {
@@ -89,6 +106,9 @@ impl Capabilities {
             tls: true,
             keychain: false,
             permissions: false,
+            ddl: true, // SHOW CREATE TABLE/VIEW
+            relationships: true, // information_schema.KEY_COLUMN_USAGE
+            explain_analyze: true,
         }
     }
 }
@@ -421,6 +441,202 @@ impl Backend {
             Backend::Duck(d) => duck_table_detail(&d.lock(), schema, name),
             Backend::Sqlite(s) => sqlite_table_detail(&s.lock(), name),
             Backend::MySql(m) => mysql_table_detail(&m.pool, schema, name).await,
+        }
+    }
+
+    /// FK relationships of one relation (outbound + inbound). Best-effort:
+    /// engines that can't answer return empty lists, never errors.
+    pub async fn table_relationships(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> Result<relgraph::Relationships, AppError> {
+        match self {
+            Backend::Pg(p) => relgraph::pg_table_relationships(&p.client, schema, name).await,
+            Backend::Duck(d) => {
+                let conn = d.lock();
+                let edges = duck_fk_edges(&conn);
+                let mut outbound = Vec::new();
+                let mut inbound = Vec::new();
+                for e in edges {
+                    if e.src_schema == schema && e.src_table == name {
+                        outbound.push(e.clone());
+                    }
+                    if e.dst_schema == schema && e.dst_table == name {
+                        inbound.push(e);
+                    }
+                }
+                Ok(relgraph::Relationships { outbound, inbound })
+            }
+            Backend::Sqlite(s) => {
+                let conn = s.lock();
+                let q = move |sql: &str| sqlite_query(&conn, sql);
+                Ok(relgraph::sqlite_table_relationships(&q, name))
+            }
+            Backend::MySql(m) => {
+                let (_c, rows, _a) = mysql_run(&m.pool, &relgraph::mysql_relationship_queries(schema, name)).await?;
+                Ok(relgraph::mysql_split(&rows, schema, name))
+            }
+        }
+    }
+
+    /// All FK edges + table/column summaries of a schema, for the ERD view.
+    pub async fn schema_relationships(&self, schema: &str) -> Result<relgraph::SchemaGraph, AppError> {
+        match self {
+            Backend::Pg(p) => relgraph::pg_schema_relationships(&p.client, schema).await,
+            Backend::Duck(d) => {
+                let conn = d.lock();
+                let edges: Vec<relgraph::FkEdge> = duck_fk_edges(&conn)
+                    .into_iter()
+                    .filter(|e| e.src_schema == schema || e.dst_schema == schema)
+                    .collect();
+                // PK membership best-effort from duckdb_constraints().
+                let mut pk: std::collections::HashSet<(String, String)> = Default::default();
+                if let Ok((_c, rows)) = duck_query(&conn, relgraph::DUCK_PK) {
+                    for r in &rows {
+                        if dcell(r, 0) == schema {
+                            let t = dcell(r, 1);
+                            for c in dcell(r, 2).trim_matches(['[', ']']).split(", ") {
+                                if !c.is_empty() {
+                                    pk.insert((t.clone(), c.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+                let fk: std::collections::HashSet<(String, String)> = edges
+                    .iter()
+                    .filter(|e| e.src_schema == schema)
+                    .flat_map(|e| e.src_cols.iter().map(|c| (e.src_table.clone(), c.clone())))
+                    .collect();
+                let (_c, col_rows) = duck_query(
+                    &conn,
+                    &format!(
+                        "SELECT table_name, column_name, data_type FROM information_schema.columns \
+                         WHERE table_schema = {} ORDER BY table_name, ordinal_position",
+                        dlit(schema)
+                    ),
+                )?;
+                let mut tables: Vec<relgraph::ErdTable> = Vec::new();
+                for r in &col_rows {
+                    let t = dcell(r, 0);
+                    if tables.last().map(|x| x.name != t).unwrap_or(true) {
+                        tables.push(relgraph::ErdTable { schema: schema.to_string(), name: t.clone(), columns: Vec::new() });
+                    }
+                    let cname = dcell(r, 1);
+                    tables.last_mut().unwrap().columns.push(relgraph::ErdColumn {
+                        is_pk: pk.contains(&(t.clone(), cname.clone())),
+                        is_fk: fk.contains(&(t, cname.clone())),
+                        name: cname,
+                        data_type: dcell(r, 2),
+                    });
+                }
+                Ok(relgraph::SchemaGraph { tables, edges })
+            }
+            Backend::Sqlite(s) => {
+                let conn = s.lock();
+                let q = move |sql: &str| sqlite_query(&conn, sql);
+                Ok(relgraph::sqlite_schema_relationships(&q))
+            }
+            Backend::MySql(m) => {
+                let (_c, edge_rows, _a) = mysql_run(&m.pool, &relgraph::mysql_schema_edges_query(schema)).await?;
+                let (_c2, col_rows, _a2) = mysql_run(&m.pool, &relgraph::mysql_columns_query(schema)).await?;
+                Ok(relgraph::mysql_schema_graph(&col_rows, &edge_rows, schema))
+            }
+        }
+    }
+
+    /// Reconstructed CREATE DDL for one relation, per engine: PG pg_catalog
+    /// (full reconstruction in ddl.rs), SQLite sqlite_master (+ index DDL),
+    /// MySQL SHOW CREATE, DuckDB duckdb_tables()/duckdb_views() best-effort.
+    pub async fn relation_ddl(&self, kind: &str, schema: &str, name: &str) -> Result<String, AppError> {
+        match self {
+            Backend::Pg(p) => crate::ddl::object_ddl(&p.client, kind, schema, name).await,
+            Backend::Sqlite(s) => {
+                let conn = s.lock();
+                let lit = |x: &str| format!("'{}'", x.replace('\'', "''"));
+                let (_c, rows) = sqlite_query(
+                    &conn,
+                    &format!("SELECT sql FROM sqlite_master WHERE name = {} AND sql IS NOT NULL", lit(name)),
+                )?;
+                let mut parts: Vec<String> = rows.iter().filter_map(|r| r.first().cloned().flatten()).collect();
+                if parts.is_empty() {
+                    return Err(AppError::new("no stored DDL for this object"));
+                }
+                let (_c2, idx) = sqlite_query(
+                    &conn,
+                    &format!(
+                        "SELECT sql FROM sqlite_master WHERE tbl_name = {} AND type = 'index' AND sql IS NOT NULL ORDER BY name",
+                        lit(name)
+                    ),
+                )?;
+                parts.extend(idx.iter().filter_map(|r| r.first().cloned().flatten()));
+                Ok(parts.join(";\n\n") + ";\n")
+            }
+            Backend::MySql(m) => {
+                let is_view = kind == "view" || kind == "matview";
+                let q = format!(
+                    "SHOW CREATE {} `{}`.`{}`",
+                    if is_view { "VIEW" } else { "TABLE" },
+                    schema.replace('`', "``"),
+                    name.replace('`', "``")
+                );
+                let (_c, rows, _a) = mysql_run(&m.pool, &q).await?;
+                rows.first()
+                    .and_then(|r| r.get(1).cloned().flatten())
+                    .map(|s| s + ";\n")
+                    .ok_or_else(|| AppError::new("no DDL returned"))
+            }
+            Backend::Duck(d) => {
+                let conn = d.lock();
+                let src = if kind == "view" { "duckdb_views()" } else { "duckdb_tables()" };
+                let q = format!(
+                    "SELECT sql FROM {src} WHERE schema_name = {} AND {} = {}",
+                    dlit(schema),
+                    if kind == "view" { "view_name" } else { "table_name" },
+                    dlit(name)
+                );
+                let (_c, rows) = duck_query(&conn, &q).map_err(|_| {
+                    AppError::new("DDL reconstruction isn't supported on this DuckDB build")
+                })?;
+                rows.first()
+                    .and_then(|r| r.first().cloned().flatten())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| if s.trim_end().ends_with(';') { s + "\n" } else { s + ";\n" })
+                    .ok_or_else(|| AppError::new("no stored DDL for this object"))
+            }
+        }
+    }
+
+    /// Every callable function/procedure name visible on this connection
+    /// (builtins + user-defined), for the editor's unknown-function lint and
+    /// autocomplete. Best-effort: an engine without a complete catalog returns
+    /// EMPTY, which tells the frontend to skip function linting entirely
+    /// (never lint against a partial list — false positives kill trust).
+    pub async fn list_functions(&self) -> Result<Vec<String>, AppError> {
+        match self {
+            Backend::Pg(p) => {
+                let msgs = p
+                    .client
+                    .simple_query("SELECT DISTINCT proname FROM pg_proc")
+                    .await?;
+                let (_c, rows) = db::collect_rows(&msgs);
+                Ok(rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect())
+            }
+            Backend::Duck(d) => {
+                let conn = d.lock();
+                let (_c, rows) = duck_query(&conn, "SELECT DISTINCT function_name FROM duckdb_functions()")?;
+                Ok(rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect())
+            }
+            Backend::Sqlite(s) => {
+                let conn = s.lock();
+                let (_c, rows) = sqlite_query(&conn, "SELECT DISTINCT name FROM pragma_function_list")?;
+                Ok(rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect())
+            }
+            // MySQL has no catalog of BUILTIN functions (information_schema.routines
+            // is user routines only) — a partial list would false-positive on every
+            // uncommon builtin, so report none and the lint stays off.
+            Backend::MySql(_) => Ok(Vec::new()),
         }
     }
 
@@ -1203,6 +1419,19 @@ fn duck_query(
 
 fn dcell(r: &[Option<String>], i: usize) -> String {
     r.get(i).and_then(|v| v.clone()).unwrap_or_default()
+}
+
+/// FK edges from duckdb_constraints(), trying the structured columns first
+/// (newer libduckdb) and falling back to parsing constraint_text; any failure
+/// yields an empty list (best-effort contract — never an error).
+fn duck_fk_edges(conn: &duckdb::Connection) -> Vec<relgraph::FkEdge> {
+    if let Ok((_c, rows)) = duck_query(conn, relgraph::DUCK_FK_STRUCTURED) {
+        return relgraph::duck_edges(&rows, true);
+    }
+    if let Ok((_c, rows)) = duck_query(conn, relgraph::DUCK_FK_TEXT) {
+        return relgraph::duck_edges(&rows, false);
+    }
+    Vec::new()
 }
 
 fn dlit(s: &str) -> String {

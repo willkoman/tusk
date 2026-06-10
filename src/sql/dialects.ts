@@ -31,6 +31,32 @@ const STATEMENT_KEYWORDS = [
   "TRUNCATE", "EXPLAIN", "BEGIN", "COMMIT", "ROLLBACK",
 ];
 
+/**
+ * Every word that can legally open a statement in any supported engine
+ * (Postgres, MySQL, SQLite, MSSQL, DuckDB). Used by the heuristic linter to
+ * flag a misspelled leading keyword (`SELCT …`). A union — not per-dialect —
+ * because DuckDB shares the `postgres` DialectId and a strict list would
+ * false-positive on its extensions; typos appear in no engine's list, so the
+ * check still fires.
+ */
+export const STATEMENT_STARTERS: Set<string> = new Set([
+  // queries / DML
+  "SELECT", "INSERT", "UPDATE", "DELETE", "WITH", "VALUES", "TABLE", "MERGE", "REPLACE",
+  // DDL / object management
+  "CREATE", "ALTER", "DROP", "TRUNCATE", "GRANT", "REVOKE", "COMMENT", "RENAME",
+  // session / transaction
+  "SET", "RESET", "SHOW", "BEGIN", "START", "COMMIT", "END", "ROLLBACK", "ABORT",
+  "SAVEPOINT", "RELEASE", "USE",
+  // utility
+  "EXPLAIN", "COPY", "VACUUM", "ANALYZE", "ANALYSE", "DO", "CALL", "DECLARE", "FETCH",
+  "MOVE", "CLOSE", "PREPARE", "EXECUTE", "DEALLOCATE", "LISTEN", "NOTIFY", "UNLISTEN",
+  "LOCK", "UNLOCK", "REINDEX", "CLUSTER", "REFRESH", "CHECKPOINT", "DISCARD", "IMPORT",
+  "SECURITY", "DESCRIBE", "DESC",
+  // SQLite / DuckDB
+  "PRAGMA", "ATTACH", "DETACH", "INSTALL", "LOAD", "EXPORT", "SUMMARIZE", "PIVOT",
+  "UNPIVOT", "FROM", "FORCE",
+]);
+
 const POSTGRES_FUNCTIONS = [
   "abs", "age", "array_agg", "array_length", "array_to_string", "ascii", "avg", "bit_length",
   "btrim", "cardinality", "ceil", "char_length", "chr", "coalesce", "concat", "concat_ws",
@@ -118,6 +144,58 @@ const DIALECTS: Record<DialectId, DialectSpec> = {
 export function getDialect(id: DialectId): DialectSpec {
   return DIALECTS[id] ?? DIALECTS.postgres;
 }
+
+// Grammar words that legally appear as bare identifier-like tokens in SQL but are
+// never columns — clause/frame/field/cast vocabulary across every engine. Used
+// by the bare-identifier lint as a NOT-a-column allowlist; bias generous (a
+// missing word here is a false positive, an extra word only a missed squiggle).
+const GRAMMAR_WORDS = [
+  "AS", "ON", "BY", "IF", "DO", "AT", "TO", "IS", "IN", "OF", "FOR", "FROM", "ONLY", "BOTH",
+  "TRUE", "FALSE", "UNKNOWN", "NULLS", "FIRST", "LAST", "ASC", "DESC", "USING", "NATURAL",
+  "LATERAL", "ORDINALITY", "TABLESAMPLE", "REPEATABLE", "RECURSIVE", "MATERIALIZED",
+  "FILTER", "WITHIN", "OVER", "WINDOW", "PARTITION", "RANGE", "ROWS", "GROUPS", "PRECEDING",
+  "FOLLOWING", "UNBOUNDED", "CURRENT", "ROW", "TIES", "EXCLUDE", "OTHERS", "FETCH", "NEXT",
+  "ANY", "SOME", "ALL", "EXISTS", "COLLATE", "ZONE", "TIME", "LOCAL", "SESSION", "INTERVAL",
+  "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "EPOCH", "QUARTER", "WEEK", "DOW",
+  "DOY", "ISODOW", "ISOYEAR", "CENTURY", "DECADE", "MILLENNIUM", "MICROSECONDS",
+  "MILLISECONDS", "TIMEZONE", "TIMEZONE_HOUR", "TIMEZONE_MINUTE", "CAST", "EXTRACT",
+  "SUBSTRING", "POSITION", "OVERLAY", "TRIM", "LEADING", "TRAILING", "SYMMETRIC",
+  "ASYMMETRIC", "ESCAPE", "SIMILAR", "ILIKE", "ISNULL", "NOTNULL", "OVERLAPS", "BETWEEN",
+  "DISTINCT", "CASE", "WHEN", "THEN", "ELSE", "END", "DEFAULT", "CONFLICT", "NOTHING",
+  "RETURNING", "ARRAY", "GROUPING", "SETS", "CUBE", "ROLLUP", "VARIADIC", "ORDER", "GROUP",
+  "HAVING", "WHERE", "LIMIT", "OFFSET", "UNION", "EXCEPT", "INTERSECT", "JOIN", "INNER",
+  "LEFT", "RIGHT", "FULL", "OUTER", "CROSS", "AND", "OR", "NOT", "NULL", "LIKE", "SET",
+  "VALUES", "INTO", "CONSTRAINT", "PRIMARY", "FOREIGN", "KEY", "REFERENCES", "UNIQUE",
+  "CHECK", "INDEX", "CASCADE", "RESTRICT", "TEMP", "TEMPORARY", "UNLOGGED", "CONCURRENTLY",
+  "DEFERRABLE", "INITIALLY", "DEFERRED", "IMMEDIATE", "ADD", "COLUMN", "TYPE", "OWNER",
+  "RENAME", "GENERATED", "ALWAYS", "IDENTITY", "STORED", "BINARY", "SEPARATOR", "DIV", "MOD",
+  "REGEXP", "RLIKE", "GLOB", "INDEXED", "STRICT", "WITHOUT", "ROWID", "AUTOINCREMENT",
+  "AUTO_INCREMENT", "ENGINE", "CHARSET",
+];
+
+/**
+ * Every word that can legitimately appear as a bare token in SQL without being
+ * a column: keywords, types, statement starters, and grammar vocabulary —
+ * union across ALL dialects (multi-word entries split). The bare-identifier
+ * lint treats membership here as "not a column, not an error".
+ */
+export const ALL_SQL_WORDS: Set<string> = (() => {
+  const out = new Set<string>(GRAMMAR_WORDS);
+  for (const w of STATEMENT_STARTERS) out.add(w);
+  for (const d of Object.values(DIALECTS)) {
+    for (const list of [d.keywords, d.statementKeywords, d.types]) {
+      for (const entry of list) for (const w of entry.toUpperCase().split(/\s+/)) out.add(w);
+    }
+  }
+  return out;
+})();
+
+/** Union of every dialect's curated built-in function names (lowercase). */
+export const ALL_SQL_FUNCTIONS: Set<string> = (() => {
+  const out = new Set<string>();
+  for (const d of Object.values(DIALECTS)) for (const f of d.functions) out.add(f.toLowerCase());
+  return out;
+})();
 
 /** Map a connected-driver kind to the editor dialect. DuckDB is PostgreSQL-compatible
  *  SQL, so it reuses the Postgres dialect (highlighting / keywords / functions). */

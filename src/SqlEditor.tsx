@@ -28,17 +28,20 @@ import { makeSqlCompletion } from "./sql/completion";
 import { type Table } from "./sql/aliases";
 import { DEFAULT_PREFS, type CursorInfo, type EditorPrefs, type ValidateFn } from "./editor/types";
 import { lexState, statementAt } from "./editor/lexer";
+import { effectiveKey, type ActionId, type KeyOverrides } from "./actions";
 import { keywordCase, keywordSet } from "./editor/keywordCase";
 import { themeFor } from "./editor/theme";
 import { foldBasics, foldKeymap } from "./editor/foldBasics";
 import { autoFold } from "./editor/autofold";
-import { clientLint, serverLint, lintUi } from "./editor/lint";
+import { applyLintFix, clientLint, serverLint, lintUi } from "./editor/lint";
 import { multiSelect } from "./editor/multiselect";
 import { searchExtensions, searchKeymap, openSearchPanel } from "./editor/search";
 import { statementGutter, activeStatement, cursorReadout, setRunningEffect } from "./editor/statements";
 import { formatDoc } from "./editor/format";
 
 export type { Table };
+
+const EMPTY_FUNCS: ReadonlySet<string> = new Set();
 
 /** Imperative handle exposed to the parent. */
 export type EditorApi = {
@@ -77,12 +80,16 @@ export function SqlEditor(props: {
   /** Active editor tab — each tab keeps its own undo/cursor/fold state. */
   tabId: string;
   tables: Table[];
+  /** Lowercase live function catalog (empty set = unknown-function lint off). */
+  functions?: ReadonlySet<string>;
   /** Active schema (search_path) — tables in it are offered unqualified. */
   activeSchema?: string | null;
   dialect?: DialectId;
   prefs?: EditorPrefs;
   /** Server-side validation transport; null when disconnected / disabled. */
   validate?: ValidateFn | null;
+  /** Shortcut overrides — editor-scope actions rebind live via a Compartment. */
+  keys?: KeyOverrides;
   onCursorInfo?: (info: CursorInfo) => void;
   onReady?: (api: EditorApi) => void;
   onContextMenu?: (e: MouseEvent) => void;
@@ -100,6 +107,7 @@ export function SqlEditor(props: {
   const dialectComp = new Compartment();
   const themeComp = new Compartment();
   const foldComp = new Compartment();
+  const keymapComp = new Compartment();
 
   const dialectExtensions = (): Extension => {
     const spec = getDialect(curDialect());
@@ -156,6 +164,23 @@ export function SqlEditor(props: {
     if (s.trim()) props.onRunStatement?.(s);
   };
 
+  // Editor-scope rebindable bindings, built from the shortcut overrides. Key
+  // strings are CodeMirror syntax already ("Mod-Shift-Enter", "F5").
+  const userKeymap = (): Extension => {
+    const o = props.keys ?? {};
+    const bindings: { key: string; preventDefault: boolean; run: () => boolean }[] = [];
+    const add = (id: ActionId, fn: () => void) => {
+      const k = effectiveKey(id, o);
+      if (k) bindings.push({ key: k, preventDefault: true, run: () => (fn(), true) });
+    };
+    add("run", () => props.onRun());
+    add("runStatement", () => runCurrentStatement());
+    add("format", () => view && formatDoc(view, true, curDialect()));
+    add("find", () => view && openSearchPanel(view));
+    add("toggleComment", () => view && toggleComment(view));
+    return keymap.of(bindings);
+  };
+
   // Per-tab EditorState, so undo history / cursor / fold survive tab switches.
   const stateMap = new Map<string, EditorState>();
   let curTabId: string | undefined;
@@ -177,18 +202,24 @@ export function SqlEditor(props: {
       closeBrackets(),
       foldComp.of(p.autoFold ? autoFold() : []),
       activeStatement(),
-      clientLint(() => props.tables),
+      clientLint(() => props.tables, () => props.functions ?? EMPTY_FUNCS),
       serverLint(() => props.validate ?? null),
       dialectComp.of(dialectExtensions()),
       searchExtensions(),
       themeComp.of(themeFor(p)),
       placeholder("Write SQL — ⌘/Ctrl+Enter to run (selection or all)"),
       ...(props.onCursorInfo ? [cursorReadout((i) => props.onCursorInfo!(i))] : []),
+      // Rebindable editor-scope actions live in their own compartment so a
+      // shortcut change reconfigures live; they sit above the static keymap so
+      // they win on overlap.
+      keymapComp.of(userKeymap()),
       keymap.of([
-        { key: "Mod-Enter", preventDefault: true, run: () => (props.onRun(), true) },
-        { key: "Mod-Shift-Enter", preventDefault: true, run: () => (runCurrentStatement(), true) },
-        { key: "Shift-Alt-f", preventDefault: true, run: () => (view && formatDoc(view, true, curDialect()), true) },
+        // Tab priority: accept completion (popup open) → apply the lint
+        // quick-fix under the cursor → indent. Alt+Enter / Mod-. always fix.
         { key: "Tab", run: acceptCompletion },
+        { key: "Tab", run: applyLintFix },
+        { key: "Alt-Enter", run: applyLintFix },
+        { key: "Mod-.", run: applyLintFix },
         indentWithTab,
         ...closeBracketsKeymap,
         ...searchKeymap,
@@ -243,6 +274,18 @@ export function SqlEditor(props: {
     view.setState(next);
     applyingExternal = false;
     curTabId = id;
+    // A cached state carries the compartment values it was built with — re-apply
+    // the current ones so a theme/font/dialect change made while another tab was
+    // active doesn't come back stale.
+    const p = curPrefs();
+    view.dispatch({
+      effects: [
+        themeComp.reconfigure(themeFor(p)),
+        foldComp.reconfigure(p.autoFold ? autoFold() : []),
+        dialectComp.reconfigure(dialectExtensions()),
+        keymapComp.reconfigure(userKeymap()),
+      ],
+    });
     view.focus();
   });
 
@@ -253,6 +296,13 @@ export function SqlEditor(props: {
     const r = !!props.running;
     void props.tabId;
     if (view) view.dispatch({ effects: setRunningEffect.of(r) });
+  });
+
+  // Live shortcut rebinds — reconfigure the user keymap compartment.
+  createEffect(() => {
+    const _k = props.keys;
+    void _k;
+    if (view) view.dispatch({ effects: keymapComp.reconfigure(userKeymap()) });
   });
 
   // Live dialect switch — reconfigure highlighter + completion + keyword-case.

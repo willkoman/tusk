@@ -1,4 +1,5 @@
 import { DEFAULT_PREFS, type EditorPrefs } from "./editor/types";
+import { type KeyOverrides } from "./actions";
 
 // Lightweight, WebView-local persistence (localStorage). Editor prefs are global;
 // the editor buffer is keyed per connection so each database keeps its own scratch
@@ -21,6 +22,30 @@ export const prefsStore = {
   save(prefs: EditorPrefs): void {
     try {
       localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+    } catch {
+      /* ignore */
+    }
+  },
+};
+
+// Keyboard-shortcut overrides, keyed by ActionId. Only differences from the
+// defaults are stored (null = explicitly unbound), so a future default change
+// flows through to users who never touched that binding.
+const KEYS_KEY = "tusk.keys";
+
+export const keymapStore = {
+  load(): KeyOverrides {
+    try {
+      const raw = localStorage.getItem(KEYS_KEY);
+      if (raw) return JSON.parse(raw) as KeyOverrides;
+    } catch {
+      /* ignore */
+    }
+    return {};
+  },
+  save(overrides: KeyOverrides): void {
+    try {
+      localStorage.setItem(KEYS_KEY, JSON.stringify(overrides));
     } catch {
       /* ignore */
     }

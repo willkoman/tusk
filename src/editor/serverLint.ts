@@ -33,7 +33,10 @@ export function serverLintSource(getValidate: () => ValidateFn | null) {
       // The backend prepared the whitespace-trimmed statement; account for leading
       // whitespace/comments so the 1-based position lands on the right character.
       const lead = stmt.text.length - stmt.text.replace(/^\s+/, "").length;
-      let from = d.position && d.position > 0 ? stmt.from + lead + (d.position - 1) : stmt.from;
+      // No position from the server → squiggle the first real token, not the
+      // leading whitespace (a range starting on whitespace never widens and
+      // renders as an invisible 1-char underline).
+      let from = d.position && d.position > 0 ? stmt.from + lead + (d.position - 1) : stmt.from + lead;
       from = Math.max(stmt.from, Math.min(from, Math.max(stmt.from, stmt.to - 1))); // keep within [from, to)
       // Widen to the token under the position for a readable squiggle.
       let to = from;

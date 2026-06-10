@@ -18,6 +18,18 @@ import { save, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Tree, type DbTree, type RelationDetail, type NodeDescriptor, nodeKey } from "./Tree";
 import { ContextMenu, type MenuItem, type MenuState } from "./ContextMenu";
 import { WorkbenchDialogs, type DialogState } from "./WorkbenchDialogs";
+import { SettingsDialog, type SettingsTab } from "./settings/SettingsDialog";
+import { ShortcutsPane } from "./settings/ShortcutsPane";
+import { fontStack } from "./editor/theme";
+import { ACTIONS, type ActionCtx, type ActionId, type KeyOverrides, canonicalKey, displayKey, effectiveKey, normalizeKeyEvent } from "./actions";
+import { keymapStore } from "./store";
+import { historyStore, makeEntryId, type HistoryEntry } from "./history/store";
+import { HistoryPanel } from "./history/HistoryPanel";
+import { CommandPalette } from "./CommandPalette";
+import { detectPlan } from "./plan/detect";
+import { explainSql, analyzeExecutesWrite } from "./plan/explainSql";
+import { PlanView } from "./plan/PlanView";
+import { DdlGraphDialog } from "./relviz/DdlGraphDialog";
 import { Dialog } from "./Dialog";
 import { Icon } from "./Icons";
 import { ident, qualify, qualifyIn, setSqlDialect } from "./sql/ident";
@@ -70,6 +82,9 @@ type Capabilities = {
   tls: boolean;
   keychain: boolean;
   permissions: boolean;
+  ddl: boolean;
+  relationships: boolean;
+  explainAnalyze: boolean;
 };
 
 // The connected role's effective privileges (from the `permissions` command). `enforced`
@@ -115,6 +130,13 @@ function App() {
   const [caps, setCaps] = createSignal<Capabilities | null>(null);
   const [perms, setPerms] = createSignal<Permissions | null>(null);
   const [aiOpen, setAiOpen] = createSignal(false);
+  const [settingsOpen, setSettingsOpen] = createSignal<SettingsTab | null>(null); // non-null = open on that tab
+  const [historyOpen, setHistoryOpen] = createSignal(false);
+  const [history, setHistory] = createSignal<HistoryEntry[]>([]);
+  const [paletteOpen, setPaletteOpen] = createSignal(false);
+  // "DDL & relationships" viewer (read-only — standalone signal, not DialogState).
+  // name=null = opened from a schema node, straight into the whole-schema ERD.
+  const [ddlGraph, setDdlGraph] = createSignal<{ schema: string; name: string | null; kind: string } | null>(null);
   // Context handed to the AI: connected DB dialect/version, schema summary, the role's
   // privileges, the active schema, and the current editor SQL/selection/last error.
   const aiContext = (): AiContext => ({
@@ -162,6 +184,8 @@ function App() {
   // Autocomplete table/column list — sourced from `list_schema` (one query, all
   // tables+columns), decoupled from the lazy object tree which no longer carries columns.
   const [schema, setSchema] = createSignal<TableInfo[]>([]);
+  // Lowercase function/procedure catalog for the unknown-function lint.
+  const [funcs, setFuncs] = createSignal<ReadonlySet<string>>(new Set<string>());
   // Per-table detail (columns/indexes/constraints), fetched lazily on expand and cached.
   const [details, setDetails] = createSignal<Record<string, RelationDetail>>({});
   const loadedRels = new Map<string, { schema: string; name: string }>();
@@ -224,6 +248,69 @@ function App() {
     setPrefs(next);
     prefsStore.save(next);
   };
+
+  // Resolve the theme pref ("system" follows the OS) and flip the CSS-variable
+  // palette via <html data-theme>; the editor gets the resolved value through
+  // its prefs prop (themeFor never sees "system").
+  const prefersLight = window.matchMedia("(prefers-color-scheme: light)");
+  const [osLight, setOsLight] = createSignal(prefersLight.matches);
+  const onSchemeChange = (e: MediaQueryListEvent) => setOsLight(e.matches);
+  prefersLight.addEventListener("change", onSchemeChange);
+  onCleanup(() => prefersLight.removeEventListener("change", onSchemeChange));
+  const resolvedTheme = createMemo<"oneDark" | "light">(() => {
+    const t = prefs().theme;
+    return t === "system" ? (osLight() ? "light" : "oneDark") : t;
+  });
+  createEffect(() => {
+    document.documentElement.dataset.theme = resolvedTheme() === "light" ? "light" : "dark";
+  });
+
+  // Font pref → --mono (editor gets it via themeFor; grid/code via CSS).
+  createEffect(() => {
+    document.documentElement.style.setProperty("--mono", fontStack(prefs().fontFamily));
+  });
+
+  // Accent pref → --accent + --accent-rgb (inline on <html>, wins over both
+  // theme blocks; every accent tint derives from the rgb triplet).
+  createEffect(() => {
+    const hex = prefs().accent;
+    const el = document.documentElement;
+    const m = /^#?([0-9a-f]{6})$/i.exec(hex);
+    if (!m) return;
+    const n = parseInt(m[1], 16);
+    el.style.setProperty("--accent", `#${m[1]}`);
+    el.style.setProperty("--accent-rgb", `${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}`);
+  });
+
+  // --- keyboard shortcuts: persisted overrides + a canonical-key → action map ---
+  const [keys, setKeys] = createSignal<KeyOverrides>(keymapStore.load());
+  const updateKeys = (patch: KeyOverrides) => {
+    const next = { ...keys(), ...patch };
+    // `undefined` in a patch means "back to default" — drop the override entirely
+    // (vs null, which is persisted as "explicitly unbound").
+    for (const k of Object.keys(next) as ActionId[]) if (next[k] === undefined) delete next[k];
+    setKeys(next);
+    keymapStore.save(next);
+  };
+  const resetKeys = () => {
+    setKeys({});
+    keymapStore.save({});
+  };
+  const globalBindings = createMemo(() => {
+    const m = new Map<string, ActionId>();
+    for (const a of ACTIONS) {
+      const k = effectiveKey(a.id, keys());
+      if (k) m.set(canonicalKey(k), a.id);
+    }
+    return m;
+  });
+  const actionCtx = (): ActionCtx => ({
+    connected: !!conn(),
+    running: running(),
+    hasResult: columns().length > 0,
+    canExport: caps()?.export !== false,
+    canExplainAnalyze: caps()?.explainAnalyze !== false,
+  });
 
   // Validate the buffer against Postgres for parser-grade diagnostics (PREPARE-only,
   // never executes). Skipped while a query is running (shares the connection lock)
@@ -362,6 +449,37 @@ function App() {
   const [importBusy, setImportBusy] = createSignal(false);
   const [importMsg, setImportMsg] = createSignal("");
 
+  // Lazy EXPLAIN detection: null for normal results (the leading-keyword gate
+  // makes this free), a ParsedPlan when the active tab's result is a plan.
+  const planMemo = createMemo(() => {
+    const t = activeTab();
+    if (!conn() || !t.result.columns.length) return null;
+    return detectPlan(caps()?.kind, {
+      lastQuery: t.result.lastQuery,
+      columns: t.result.columns,
+      rows: t.result.rows,
+    });
+  });
+  const resultView = () => (planMemo() ? activeTab().resultView ?? "plan" : "grid");
+  // EXPLAIN ANALYZE on a mutating statement → explicit confirm (it executes).
+  const [confirmAnalyze, setConfirmAnalyze] = createSignal<string | null>(null);
+  // Whether this DuckDB build accepts PG-style `EXPLAIN (FORMAT json)` —
+  // probed once at connect time (a probe mid-session could disturb the pager).
+  let duckJsonExplain = false;
+
+  function runExplain(analyze: boolean) {
+    const api = editorApi();
+    if (!api) return;
+    const stmt = api.getSelection().trim() || api.getCurrentStatement();
+    if (!stmt.trim()) return;
+    const wrapped = explainSql(caps()?.kind, analyze, stmt, duckJsonExplain);
+    if (analyze && analyzeExecutesWrite(stmt)) {
+      setConfirmAnalyze(wrapped);
+      return;
+    }
+    void executeQuery(wrapped, "", "base");
+  }
+
   // result grid: per-tab view + sort/filter re-run, Load-all
   const gridView = () => activeTab().gridView;
   const setGridView = (patch: Partial<GridView>) => patchTab(activeTabId(), { gridView: { ...activeTab().gridView, ...patch } });
@@ -389,14 +507,56 @@ function App() {
   });
   onCleanup(() => window.removeEventListener("keydown", onWindowKey));
 
+  // Central dispatcher — every action callable from a shortcut, the palette, or
+  // the Shortcuts pane goes through here.
+  function runAction(id: ActionId) {
+    switch (id) {
+      case "run": void doRun(); break;
+      case "runStatement": {
+        const s = editorApi()?.getCurrentStatement();
+        if (s?.trim()) void doRun(s);
+        break;
+      }
+      case "explain": runExplain(false); break;
+      case "explainAnalyze": runExplain(true); break;
+      case "cancelQuery": if (running()) void cancelQuery(); break;
+      case "format": editorApi()?.format(); break;
+      case "find": editorApi()?.openSearch(); break;
+      case "toggleComment": editorApi()?.toggleComment(); break;
+      case "toggleWrap": updatePrefs({ wordWrap: !prefs().wordWrap }); break;
+      case "newTab": openNewTab(); break;
+      case "closeTab": closeTab(activeTabId()); break;
+      case "openFile": void openFileDialog(); break;
+      case "saveFile": void saveActiveTab(); break;
+      case "saveFileAs": void saveAsActiveTab(); break;
+      case "openSettings": setSettingsOpen("editor"); break;
+      case "openShortcuts": setSettingsOpen("shortcuts"); break;
+      case "openHistory": setHistoryOpen((v) => !v); break;
+      case "openPalette": setPaletteOpen(true); break;
+      case "toggleAi": setAiOpen((v) => !v); break;
+      case "loadAllRows": if (!done()) void loadAll(); break;
+      case "exportResult": openExport(); break;
+    }
+  }
+
   function onWindowKey(e: KeyboardEvent) {
-    if (!(e.metaKey || e.ctrlKey) || !conn()) return;
-    const k = e.key.toLowerCase();
-    if (k === "t") { e.preventDefault(); openNewTab(); }
-    else if (k === "w") { e.preventDefault(); closeTab(activeTabId()); }
-    else if (k === "s" && e.shiftKey) { e.preventDefault(); void saveAsActiveTab(); }
-    else if (k === "s") { e.preventDefault(); void saveActiveTab(); }
-    else if (k === "o") { e.preventDefault(); void openFileDialog(); }
+    // The editor keymap (and any other in-place handler) marks what it consumed.
+    if (e.defaultPrevented || !conn()) return;
+    if (paletteOpen()) return; // the palette owns the keyboard while open
+    const k = normalizeKeyEvent(e);
+    if (!k) return;
+    const id = globalBindings().get(k);
+    if (!id) return;
+    // Chords without Mod/Alt (F5, plain Enter, Shift-X…) must not fire while
+    // typing in an input/textarea or the editor.
+    if (!/^Mod-|^Alt-/.test(k)) {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable || t.closest?.(".cm-editor"))) return;
+    }
+    const def = ACTIONS.find((a) => a.id === id)!;
+    if (def.enabled && !def.enabled(actionCtx())) return;
+    e.preventDefault();
+    runAction(id);
   }
 
   async function loadProfiles() {
@@ -451,6 +611,17 @@ function App() {
     } catch {
       setCaps(null);
     }
+    // DuckDB: probe PG-style EXPLAIN options once, at connect (safe — nothing
+    // is streaming yet). Drives the Explain action's wrapping.
+    duckJsonExplain = false;
+    if (caps()?.kind === "duckdb") {
+      try {
+        await invoke<QueryOutcome>("run_query", { connectionId: r.connection_id, sql: "EXPLAIN (FORMAT json) SELECT 1", pageSize: 1, searchPath: null });
+        duckJsonExplain = true;
+      } catch {
+        duckJsonExplain = false;
+      }
+    }
     // Restore this connection's tab set (buffers/paths only — results are ephemeral).
     if (connKey) {
       const saved = tabsStore.load(connKey);
@@ -468,6 +639,7 @@ function App() {
       }
       restoring = false;
     }
+    setHistory(connKey ? await historyStore.load(connKey) : []);
     await loadSchema();
   }
 
@@ -583,9 +755,12 @@ function App() {
     connKey = null;
     setConn(null);
     setCaps(null);
+    setHistory([]);
+    setHistoryOpen(false);
     setPerms(null);
     setTree(null);
     setSchema([]);
+    setFuncs(new Set<string>());
     setDetails({});
     loadedRels.clear();
     cursorOwnerTabId = null;
@@ -657,7 +832,9 @@ function App() {
     }
   }
 
-  // Full table+column list for autocomplete (decoupled from the lazy tree).
+  // Full table+column list for autocomplete (decoupled from the lazy tree),
+  // plus the live function catalog feeding the unknown-function lint (empty
+  // set = engine can't enumerate → that lint stays off).
   async function loadTables() {
     const c = conn();
     if (!c) return;
@@ -665,6 +842,12 @@ function App() {
       setSchema(await invoke<TableInfo[]>("list_schema", { connectionId: c.id }));
     } catch (e) {
       console.error(e);
+    }
+    try {
+      const names = await invoke<string[]>("list_functions", { connectionId: c.id });
+      setFuncs(new Set(names.map((n) => n.toLowerCase())));
+    } catch {
+      setFuncs(new Set<string>());
     }
   }
 
@@ -697,6 +880,14 @@ function App() {
 
   const sameColumns = (a: string[], b: string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
 
+  // Record a finished user-issued run into the per-connection history (never a
+  // grid sort/filter re-run, never blocks the query path on storage failures).
+  const recordHistory = (e: Omit<HistoryEntry, "id" | "ts">) => {
+    if (!connKey) return;
+    const ts = Date.now();
+    setHistory(historyStore.append(connKey, { id: makeEntryId(ts), ts, ...e }));
+  };
+
   // Shared query executor. `mode:"base"` = a user-issued query (resets sorts/filters,
   // fresh grid view if the column set changed); `mode:"wrapped"` = a sort/filter re-run
   // (keep the grid view — its sorts/filters drive the wrap).
@@ -708,6 +899,7 @@ function App() {
     if (cursorOwnerTabId && cursorOwnerTabId !== runTabId) patchResult(cursorOwnerTabId, { done: true });
     cursorOwnerTabId = null;
     patchResult(runTabId, { runErr: "", status: "" });
+    patchTab(runTabId, { resultView: undefined }); // a new run resets the Plan/Grid choice
     setRunning(true);
     setRunningTabId(runTabId);
     const t0 = performance.now();
@@ -736,12 +928,32 @@ function App() {
         if (mode === "base") patchTab(runTabId, { gridView: gridViewFor(0) });
       }
       if (out.kind === "exec" || DDL_RE.test(sqlToRun)) void loadSchema();
+      if (mode === "base") {
+        recordHistory({
+          sql: sqlToRun,
+          durationMs: Math.round(performance.now() - t0),
+          status: "ok",
+          rows: out.kind === "rows" ? out.rows.length : null,
+          error: null,
+          schema: runSchema,
+        });
+      }
     } catch (e) {
       const msg = errMsg(e);
       // A user cancel surfaces as Postgres' "canceling statement due to user request" —
       // present it as a calm status, not a red error banner.
       if (/cancel/i.test(msg)) patchResult(runTabId, { runErr: "", status: "Query cancelled", columns: [], rows: [], done: true });
       else patchResult(runTabId, { runErr: msg, columns: [], rows: [], done: true });
+      if (mode === "base") {
+        recordHistory({
+          sql: sqlToRun,
+          durationMs: Math.round(performance.now() - t0),
+          status: /cancel/i.test(msg) ? "cancelled" : "error",
+          rows: null,
+          error: msg.split("\n")[0],
+          schema: runSchema,
+        });
+      }
     } finally {
       if (runTimer) clearInterval(runTimer);
       setRunning(false);
@@ -1166,6 +1378,9 @@ function App() {
           { label: "Generate INSERT", icon: "code", onClick: () => generate(n, "insert") },
           { label: "Generate UPDATE", icon: "code", onClick: () => generate(n, "update") },
           { sep: true },
+          ...(caps()?.ddl !== false || caps()?.relationships !== false
+            ? [{ label: "DDL & relationships…", icon: "fileCode" as const, onClick: () => setDdlGraph({ schema: s!, name: n.name, kind: "table" }) }]
+            : []),
           ...copyDdl,
           copyName,
           copyQual,
@@ -1186,6 +1401,9 @@ function App() {
           { label: "Edit comment…", icon: "comment", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.comment(`${kw === "matview" ? "MATERIALIZED VIEW" : "VIEW"} ${qual}`, t) }) },
           { label: "Drop…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop ${n.name}`, primaryLabel: "Drop", showCascade: true, build: (o) => ddl.dropRelation(kw, s!, n.name, o.cascade) }) },
           { sep: true },
+          ...(caps()?.ddl !== false || caps()?.relationships !== false
+            ? [{ label: "DDL & relationships…", icon: "fileCode" as const, onClick: () => setDdlGraph({ schema: s!, name: n.name, kind: kw }) }]
+            : []),
           ...copyDdl,
           copyName,
           copyQual,
@@ -1207,6 +1425,9 @@ function App() {
       }
       case "schema":
         items.push(
+          ...(caps()?.relationships !== false
+            ? [{ label: "Schema diagram…", icon: "link" as const, onClick: () => setDdlGraph({ schema: n.name, name: null, kind: "table" }) }, { sep: true as const }]
+            : []),
           { label: "Create table…", icon: "plus", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => setActiveDialog({ kind: "createTable", schema: n.name }) },
           { label: "Rename…", icon: "edit", ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename schema ${n.name}`, current: n.name, build: (nn) => ddl.renameSchema(n.name, nn) }) },
           { sep: true },
@@ -1476,6 +1697,8 @@ function App() {
           </Show>
           <span class="spacer" />
           <button class="ghost" classList={{ active: aiOpen() }} onClick={() => setAiOpen((v) => !v)} title="AI assistant"><Icon name="sparkle" /> AI</button>
+          <button class="icon" classList={{ active: historyOpen() }} title="Query history" onClick={() => setHistoryOpen((v) => !v)}><Icon name="clock" /></button>
+          <button class="icon" title="Settings" onClick={() => setSettingsOpen("editor")}><Icon name="gear" /></button>
           <button class="ghost" onClick={disconnect}>Disconnect</button>
         </header>
 
@@ -1552,9 +1775,11 @@ function App() {
                 running={running() && runningTabId() === activeTabId()}
                 tabId={activeTabId()}
                 tables={schema()}
+                functions={funcs()}
                 activeSchema={activeTab().searchSchema}
                 dialect={activeDialect()}
-                prefs={prefs()}
+                prefs={{ ...prefs(), theme: resolvedTheme() }}
+                keys={keys()}
                 validate={conn() ? validate : null}
                 onCursorInfo={setCursorInfo}
                 onReady={setEditorApi}
@@ -1578,7 +1803,30 @@ function App() {
                 <button class="ghost" onClick={() => void saveAsActiveTab()}>Save As</button>
                 <button class="ghost" onClick={() => editorApi()?.format()}>Format</button>
                 <button class="ghost" onClick={() => editorApi()?.openSearch()}>Find</button>
-                <span class="hint">⌘/Ctrl+Enter · runs selection or all</span>
+                <button
+                  class="ghost"
+                  title="Visualize the query plan for the current statement"
+                  onClick={(e) => {
+                    const r = e.currentTarget.getBoundingClientRect();
+                    setMenu({
+                      x: r.left,
+                      y: r.bottom + 4,
+                      items: [
+                        { label: "Explain", icon: "eye", onClick: () => runAction("explain") },
+                        {
+                          label: "Explain Analyze (runs the query)",
+                          icon: "play",
+                          disabled: caps()?.explainAnalyze === false,
+                          title: caps()?.explainAnalyze === false ? "Not supported by this engine" : undefined,
+                          onClick: () => runAction("explainAnalyze"),
+                        },
+                      ],
+                    });
+                  }}
+                >
+                  Explain ▾
+                </button>
+                <span class="hint">{displayKey(effectiveKey("run", keys())) || "unbound"} · runs selection or all</span>
                 <span class="spacer" />
                 <Show when={caps()?.searchPath !== false}>
                   <select
@@ -1601,7 +1849,22 @@ function App() {
 
             <div class="result">
               <Show when={runErr()}><div class="error result-error">{runErr()}</div></Show>
-              <Show when={columns().length > 0} fallback={<div class="result-empty">{status() || "no results"}</div>}>
+              <Show when={planMemo()}>
+                <div class="result-viewtoggle">
+                  <button classList={{ active: resultView() === "plan" }} onClick={() => patchTab(activeTabId(), { resultView: "plan" })}>Plan</button>
+                  <button classList={{ active: resultView() === "grid" }} onClick={() => patchTab(activeTabId(), { resultView: "grid" })}>Grid</button>
+                </div>
+              </Show>
+              <Show when={planMemo() && resultView() === "plan"}>
+                <PlanView
+                  plan={() => planMemo()!}
+                  prefs={prefs}
+                  fitKey={() => `${activeTabId()}:${activeTab().result.epoch}`}
+                />
+              </Show>
+              <Show when={!(planMemo() && resultView() === "plan") && columns().length > 0} fallback={
+                <Show when={!planMemo() && columns().length === 0}><div class="result-empty">{status() || "no results"}</div></Show>
+              }>
                 <ResultGrid
                   columns={columns}
                   rows={rows}
@@ -1617,6 +1880,13 @@ function App() {
                   onStatus={setStatus}
                   canSortFilter={canSortFilter}
                   copyHeaders={() => prefs().copyHeaders}
+                  gridStyle={() => ({
+                    rowH: prefs().gridDensity === "compact" ? 22 : 28,
+                    font: `12px ${fontStack(prefs().fontFamily)}`,
+                    zebra: prefs().gridZebra,
+                    nullStyle: prefs().gridNullStyle,
+                    defaultColW: prefs().gridColWidth,
+                  })}
                 />
               </Show>
               <Show when={running()}>
@@ -1667,7 +1937,60 @@ function App() {
               onClose={() => setAiOpen(false)}
             />
           </Show>
+          <Show when={historyOpen()}>
+            <HistoryPanel
+              entries={history}
+              onInsert={(sql) => editorApi()?.insertAtCursor(sql)}
+              onOpenTab={(sql, schema) => openGeneratedTab(sql, schema, "History")}
+              onRerun={(sql) => runText(sql)}
+              onClear={() => { if (connKey) { historyStore.clear(connKey); setHistory([]); } }}
+              onClose={() => setHistoryOpen(false)}
+            />
+          </Show>
         </div>
+
+        <Show when={paletteOpen()}>
+          <CommandPalette keys={keys()} ctx={actionCtx()} onRun={runAction} onClose={() => setPaletteOpen(false)} />
+        </Show>
+
+        <Show when={ddlGraph()}>
+          {(g) => (
+            <DdlGraphDialog
+              connectionId={conn()!.id}
+              schema={g().schema}
+              name={g().name}
+              kind={g().kind}
+              onOpenSql={(sql) => { setDdlGraph(null); openGeneratedTab(sql, g().schema, g().name ?? undefined); }}
+              onCopy={copyText}
+              onClose={() => setDdlGraph(null)}
+            />
+          )}
+        </Show>
+
+        <Show when={confirmAnalyze()}>
+          <Dialog title="Explain Analyze" width={440} onClose={() => setConfirmAnalyze(null)}>
+            <div class="confirm-note">
+              EXPLAIN ANALYZE <b>executes</b> the statement to measure it — and this statement modifies data. Run it?
+            </div>
+            <div class="form-actions">
+              <button class="ghost" onClick={() => setConfirmAnalyze(null)}>Cancel</button>
+              <button class="btn-danger" onClick={() => { const w = confirmAnalyze()!; setConfirmAnalyze(null); void executeQuery(w, "", "base"); }}>
+                Run it
+              </button>
+            </div>
+          </Dialog>
+        </Show>
+
+        <Show when={settingsOpen()}>
+          <SettingsDialog
+            prefs={prefs}
+            update={updatePrefs}
+            onClose={() => setSettingsOpen(null)}
+            initialTab={settingsOpen()!}
+            connected={!!conn()}
+            shortcutsPane={() => <ShortcutsPane keys={keys} update={updateKeys} resetAll={resetKeys} />}
+          />
+        </Show>
 
         <Show when={importOpen()}>
           <div class="modal-overlay" onClick={() => !importBusy() && setImportOpen(false)}>

@@ -1,5 +1,11 @@
 import { type Diagnostic } from "@codemirror/lint";
 import { type EditorView } from "@codemirror/view";
+import { STATEMENT_STARTERS } from "../sql/dialects";
+
+// Hoisted once — the lint source runs per statement per 300ms keystroke window;
+// no per-run spread of the keyword set.
+const STARTER_LIST = [...STATEMENT_STARTERS];
+import { closest } from "./distance";
 import { lexState, maskNonCode, spanAt } from "./lexer";
 
 // Fast, offline heuristics that run as-you-type. Deliberately limited to checks
@@ -9,10 +15,14 @@ import { lexState, maskNonCode, spanAt } from "./lexer";
 //   • unclosed '('             → warning (you may still be typing)
 //   • trailing comma           → warning
 //   • DELETE/UPDATE w/o WHERE  → warning (affects every row)
+//   • unknown leading keyword  → error (`SELCT …` — a closed set, unlike functions)
 //
 // Parser-grade errors (unknown columns, type errors, syntax) come from the server
-// linter (serverLint.ts); unknown-function/unknown-dialect-keyword checks are left
-// out on purpose — user-defined functions would make them pure noise.
+// linter (serverLint.ts); unknown-function/mid-statement-keyword checks are left
+// out on purpose — user-defined functions would make them pure noise. The leading
+// keyword IS checked: statement starters are a closed set across every engine
+// (STATEMENT_STARTERS), and the server linter skips statements it can't classify,
+// so without this a misspelled first word got no squiggle at all.
 
 export function heuristicLintSource() {
   return (view: EditorView): Diagnostic[] => {
@@ -61,6 +71,40 @@ export function heuristicLintSource() {
       }
       for (const openP of stack) {
         out.push({ from: base + openP, to: base + openP + 1, severity: "warning", message: "unclosed '('" });
+      }
+
+      // Unknown leading keyword: find the first code character (skipping comments),
+      // and if it opens a word that no engine accepts as a statement starter, flag it.
+      let p0 = stmt.from;
+      while (p0 < stmt.to) {
+        const span = spanAt(spans, p0);
+        if (!span) break;
+        if (span.kind === "line-comment" || span.kind === "block-comment") {
+          p0 = span.to;
+          continue;
+        }
+        if (span.kind !== "code") break; // starts with a literal/quoted ident — not ours to judge
+        if (/\s/.test(doc[p0])) {
+          p0++;
+          continue;
+        }
+        const tok = /^[a-zA-Z_]\w*/.exec(doc.slice(p0, Math.min(stmt.to, p0 + 64)))?.[0];
+        if (tok) {
+          const word = tok.toUpperCase();
+          // Don't flag a half-typed keyword under the cursor ("SEL|" while typing SELECT).
+          const typingHere = view.state.selection.main.head === p0 + tok.length;
+          const isPrefix = typingHere && STARTER_LIST.some((s) => s !== word && s.startsWith(word));
+          if (!STATEMENT_STARTERS.has(word) && !isPrefix) {
+            const hint = closest(word, STATEMENT_STARTERS);
+            out.push({
+              from: p0,
+              to: p0 + tok.length,
+              severity: "error",
+              message: `unknown statement "${tok}"${hint ? ` — did you mean ${hint}?` : ""}`,
+            });
+          }
+        }
+        break; // first real code char handled either way
       }
 
       const du = /^\s*(DELETE|UPDATE)\b/i.exec(m);

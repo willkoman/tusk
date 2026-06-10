@@ -34,17 +34,27 @@ export function AiPanel(props: {
     aiStore.save(next);
   };
   const refreshKey = async () => setHasKey(await invoke<boolean>("ai_has_key", { provider: cfg().provider }).catch(() => false));
+  // First-open routing happens HERE, once the async keychain check resolves: no
+  // saved key anywhere → show the setup form (provider/model/key prompt); a key
+  // exists → land straight in the chat. Deciding before the check (or in an
+  // effect over keyed(), which starts []) wrongly flashed settings open on every
+  // panel open even after setup.
+  let keysChecked = false;
   const refreshKeyed = async () => {
     const checks = await Promise.all(
       AI_PROVIDERS.map((p) => invoke<boolean>("ai_has_key", { provider: p.id }).then((h) => (h ? p.id : null)).catch(() => null)),
     );
-    setKeyed(checks.filter((x): x is AiProvider => !!x));
+    const list = checks.filter((x): x is AiProvider => !!x);
+    setKeyed(list);
+    if (!keysChecked) {
+      keysChecked = true;
+      setSettingsOpen(list.length === 0);
+    }
   };
 
   onMount(() => { void refreshKey(); void refreshKeyed(); });
-  // Re-check the current provider's key when it changes; open settings if none keyed yet.
+  // Re-check the current provider's key when it changes.
   createEffect(() => { cfg().provider; void refreshKey(); });
-  createEffect(() => { if (keyed().length === 0) setSettingsOpen(true); });
   // Keep the message list pinned to the latest as it streams.
   createEffect(() => { messages(); if (msgEl) msgEl.scrollTop = msgEl.scrollHeight; });
 
