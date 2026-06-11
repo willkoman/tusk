@@ -1,10 +1,9 @@
-import { createSignal, createMemo, createEffect, onMount, onCleanup, For, Show } from "solid-js";
+import { createSignal, createMemo, createEffect, onMount, onCleanup, For, Show, lazy } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./App.css";
 import { SqlEditor, type EditorApi } from "./SqlEditor";
 import { driverDialect, type DialectId } from "./sql/dialects";
-import { AiPanel } from "./ai/AiPanel";
 import { type AiContext } from "./ai/context";
 import { type CursorInfo, type EditorPrefs, type ServerDiag } from "./editor/types";
 import { prefsStore, tabsStore, type PersistedTabs } from "./store";
@@ -15,27 +14,21 @@ import { editTarget, editPlan, type EditPlan } from "./grid/editable";
 import { buildCommitScript } from "./grid/editSql";
 import { makeIndexer } from "./sql/aliases";
 import { type Dataset, parseCSV, parseJSON, formatWithOptions } from "./formats";
-import { ExportDialog } from "./forms/ExportDialog";
 import { FORMAT_EXT, type ExportOptions, type ExportScope } from "./export";
 import { save, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Tree, type DbTree, type RelationDetail, type NodeDescriptor, nodeKey } from "./Tree";
 import { ContextMenu, type MenuItem, type MenuState } from "./ContextMenu";
-import { WorkbenchDialogs, type DialogState } from "./WorkbenchDialogs";
-import { SettingsDialog, type SettingsTab } from "./settings/SettingsDialog";
-import { ShortcutsPane } from "./settings/ShortcutsPane";
+import { type DialogState } from "./WorkbenchDialogs";
+import { type SettingsTab } from "./settings/SettingsDialog";
 import { fontStack } from "./editor/theme";
 import { ACTIONS, type ActionCtx, type ActionId, type KeyOverrides, canonicalKey, displayKey, effectiveKey, normalizeKeyEvent } from "./actions";
 import { keymapStore } from "./store";
 import { historyStore, makeEntryId, type HistoryEntry } from "./history/store";
-import { HistoryPanel } from "./history/HistoryPanel";
-import { CommandPalette } from "./CommandPalette";
 import { detectParams, type Param, type ParamValue } from "./sql/params";
 import { type FkEdge } from "./sql/fk";
 import { ParamDialog } from "./forms/ParamDialog";
 import { detectPlan } from "./plan/detect";
 import { explainSql, analyzeExecutesWrite } from "./plan/explainSql";
-import { PlanView } from "./plan/PlanView";
-import { DdlGraphDialog } from "./relviz/DdlGraphDialog";
 import { Dialog, SqlPreview } from "./Dialog";
 import { Icon } from "./Icons";
 import { ident, qualify, qualifyIn, setSqlDialect } from "./sql/ident";
@@ -65,6 +58,19 @@ type FetchResult = { rows: (string | null)[][]; done: boolean };
 
 const PAGE = 1000;
 const DDL_RE = /^\s*(create|alter|drop|truncate|comment|grant|revoke)\b/i;
+
+// Heavy, conditionally-rendered panels load as separate chunks on first open —
+// keeps the startup bundle (and its parse time) lean. All are behind <Show>,
+// so the chunk fetch happens only when the user actually opens the surface.
+const AiPanel = lazy(() => import("./ai/AiPanel").then((m) => ({ default: m.AiPanel })));
+const ExportDialog = lazy(() => import("./forms/ExportDialog").then((m) => ({ default: m.ExportDialog })));
+const WorkbenchDialogs = lazy(() => import("./WorkbenchDialogs").then((m) => ({ default: m.WorkbenchDialogs })));
+const SettingsDialog = lazy(() => import("./settings/SettingsDialog").then((m) => ({ default: m.SettingsDialog })));
+const ShortcutsPane = lazy(() => import("./settings/ShortcutsPane").then((m) => ({ default: m.ShortcutsPane })));
+const HistoryPanel = lazy(() => import("./history/HistoryPanel").then((m) => ({ default: m.HistoryPanel })));
+const CommandPalette = lazy(() => import("./CommandPalette").then((m) => ({ default: m.CommandPalette })));
+const PlanView = lazy(() => import("./plan/PlanView").then((m) => ({ default: m.PlanView })));
+const DdlGraphDialog = lazy(() => import("./relviz/DdlGraphDialog").then((m) => ({ default: m.DdlGraphDialog })));
 
 // Supported drivers + their mascot (the brand icon adapts to the connected DB).
 // `ready` drivers are connectable now; others are staged in the picker.
@@ -2413,12 +2419,14 @@ function App() {
           </div>
         </Show>
 
-        <WorkbenchDialogs
-          state={activeDialog()}
-          onClose={() => setActiveDialog(null)}
-          onRun={runDDL}
-          onEditAsSql={editAsSql}
-        />
+        <Show when={activeDialog()}>
+          <WorkbenchDialogs
+            state={activeDialog()}
+            onClose={() => setActiveDialog(null)}
+            onRun={runDDL}
+            onEditAsSql={editAsSql}
+          />
+        </Show>
         <Show when={exportSrc()}>
           {(src) => (
             <ExportDialog

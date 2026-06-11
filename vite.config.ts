@@ -8,6 +8,14 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [solid()],
 
+  build: {
+    // The main chunk is CodeMirror + the workbench shell — all on screen at
+    // launch, so further splitting buys nothing (local file load, no network).
+    // Everything deferrable (sql-formatter, plan viz, ERD, AI, settings,
+    // export/DDL dialogs) is already a lazy chunk via dynamic import.
+    chunkSizeWarningLimit: 700,
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

@@ -2,6 +2,11 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
+## [Unreleased]
+
+### Changed
+- **Startup bundle code-split.** `sql-formatter` (the largest frontend dependency) loads on first Format use, and conditionally-rendered surfaces (AI panel, Settings, History, command palette, plan view, ERD dialog, Export and DDL dialogs) are lazy chunks loaded on first open. Startup JS drops ~38% (1,038 → 643 kB minified); the remaining main chunk is CodeMirror + the workbench shell, which are on screen at launch. Format now bails safely if the document changed during the first-use formatter load.
+
 ## [0.4.0] - 2026-06-10
 
 ### Fixed (correctness sweep)
