@@ -110,6 +110,11 @@ export function ResultGrid(props: ResultGridProps) {
     const e = props.pending()?.cells[r]?.[oi];
     return e !== undefined ? e : props.rows()[r]?.[oi] ?? null;
   };
+  /** Copy-facing value: boolean columns yield the displayed word (TRUE/FALSE), not the driver token (t/f/0/1). */
+  const copyVal = (r: number, oi: number): string | null => {
+    const v = cellVal(r, oi);
+    return v !== null && props.isBoolCol(oi) ? boolWord(v) ?? v : v;
+  };
   const isDirty = (r: number, oi: number) => r < nLoaded() && props.pending()?.cells[r]?.[oi] !== undefined;
   const isInsUntouched = (r: number, oi: number) => r >= nLoaded() && insRec(r)?.[oi] === undefined;
 
@@ -460,10 +465,10 @@ export function ResultGrid(props: ResultGridProps) {
       const re = rect();
       cols = dc.slice(Math.max(0, re.c0), Math.min(dc.length, re.c1 + 1));
     }
-    // Read through the pending overlay so copy matches what's displayed
-    // (edited cells, insert rows).
+    // Read through the pending overlay + bool mapping so copy matches what's
+    // displayed (edited cells, insert rows, TRUE/FALSE pills).
     const rows: (string | null)[][] = [];
-    for (let r = r0; r <= r1; r++) rows.push(cols.map((oi) => cellVal(r, oi)));
+    for (let r = r0; r <= r1; r++) rows.push(cols.map((oi) => copyVal(r, oi)));
     return { columns: cols.map((oi) => names[oi]), rows };
   }
   async function copySelection(fmt: "tsv" | "csv" | "json" | "md") {
@@ -481,7 +486,7 @@ export function ResultGrid(props: ResultGridProps) {
   }
   const columnDataset = (oi: number): Dataset => ({
     columns: [props.columns()[oi]],
-    rows: Array.from({ length: nRows() }, (_, r) => [cellVal(r, oi)]),
+    rows: Array.from({ length: nRows() }, (_, r) => [copyVal(r, oi)]),
   });
 
   // --- context menus ---
@@ -515,7 +520,7 @@ export function ResultGrid(props: ResultGridProps) {
       { label: "Copy as JSON", icon: "copy", onClick: () => void copySelection("json") },
       { label: "Copy as Markdown", icon: "copy", onClick: () => void copySelection("md") },
       { sep: true },
-      { label: val === null ? "Copy value (NULL→empty)" : "Copy cell value", icon: "copy", onClick: () => void copyText(val ?? "", "copied value") },
+      { label: val === null ? "Copy value (NULL→empty)" : "Copy cell value", icon: "copy", onClick: () => void copyText(copyVal(r, oi) ?? "", "copied value") },
       { label: "Copy column", icon: "copy", onClick: () => void copyText(toTSV(columnDataset(oi), props.copyHeaders()), "copied column") },
       { label: "View value…", icon: "search", onClick: () => props.onViewValue(name, val) },
     ]);

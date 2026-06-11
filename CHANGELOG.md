@@ -4,6 +4,9 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+### Changed
+- **Copying boolean cells yields the displayed word.** Grid copy (selection TSV/CSV/JSON/Markdown, Copy column, Copy cell value) now maps boolean-detected columns to the same TRUE/FALSE words the pills display, instead of the driver's raw token (`t`/`f` on Postgres, `0`/`1` on SQLite). "View value…" still shows the raw underlying token, and file export streams raw values as before.
+
 ## [0.4.6] - 2026-06-11
 
 ### Changed
