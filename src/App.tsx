@@ -9,8 +9,10 @@ import { type CursorInfo, type EditorPrefs, type ServerDiag } from "./editor/typ
 import { prefsStore, tabsStore, type PersistedTabs } from "./store";
 import { makeTab, basename, gridViewFor, pendingCount, type Tab, type ResultSnapshot, type GridView, type SortKey, type Filter, type PendingEdits } from "./tabs";
 import { ResultGrid } from "./ResultGrid";
+import { UpdateBadge } from "./UpdateBadge";
 import { wrapQuery, wrappableQuery, stripTrailingSemi, hasDuplicateColumns } from "./grid/query";
 import { editTarget, editPlan, type EditPlan } from "./grid/editable";
+import { detectBoolCols, typeBoolCols } from "./grid/bool";
 import { buildCommitScript } from "./grid/editSql";
 import { makeIndexer } from "./sql/aliases";
 import { type Dataset, parseCSV, parseJSON, formatWithOptions } from "./formats";
@@ -588,6 +590,32 @@ function App() {
     const w = editCtx().want;
     if (w) void loadDetail(w.schema, w.name);
   });
+
+  // --- boolean columns (TRUE/FALSE badges + dropdown editor) ---
+  // Type-based when the edit target's detail is loaded (exact — covers SQLite's
+  // numeric 0/1 booleans); value heuristic over the loaded rows otherwise
+  // (t/f/true/false only — never 0/1, which would catch integer columns).
+  const editRows = createMemo(() => activeTab().result.rows);
+  const editDetail = () => {
+    const p = editCtx().plan;
+    return p ? details()[`${p.schema}.${p.table}`] : undefined;
+  };
+  const boolCols = createMemo<Set<number>>(() => {
+    const det = editDetail();
+    if (det) return typeBoolCols(editCols(), det.columns);
+    return detectBoolCols(editCols(), editRows());
+  });
+  /** Dropdown editor info for a bool column; tokens match the driver's textual booleans. */
+  const boolEditInfo = (oi: number): { trueVal: string; falseVal: string; nullable: boolean } | null => {
+    const det = editDetail();
+    if (!det || !editCtx().editable || !boolCols().has(oi)) return null;
+    const name = editCols()[oi]?.toLowerCase();
+    const col = det.columns.find((c) => c.name.toLowerCase() === name);
+    if (!col) return null;
+    // SQLite stores booleans as 0/1 (no native bool); PG/DuckDB accept true/false.
+    const numeric = caps()?.kind === "sqlite" || caps()?.kind === "mysql";
+    return { trueVal: numeric ? "1" : "true", falseVal: numeric ? "0" : "false", nullable: col.nullable };
+  };
 
   // Memo (not a plain accessor): activeTab()'s identity changes on every patchTab
   // (each editor keystroke) — the memo dedupes by the pending object's reference,
@@ -2200,6 +2228,8 @@ function App() {
                   editable={() => editCtx().editable}
                   editReason={() => editCtx().reason}
                   canEditCol={(oi) => editCtx().plan?.isTableCol[oi] ?? false}
+                  isBoolCol={(oi) => boolCols().has(oi)}
+                  boolEdit={boolEditInfo}
                   pending={tabPending}
                   onEditCell={onEditCell}
                   onMarkDelete={onMarkDelete}
@@ -2513,6 +2543,9 @@ function App() {
         </datalist>
       </div>
     </Show>
+
+      {/* Update pill renders in both screens (connect + workspace). */}
+      <UpdateBadge />
 
       {/* Context menu + value viewer render above everything, in both screens. */}
       <Show when={menu()}>

@@ -79,6 +79,12 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater artifact signing (minisign). The private key lives ONLY in the
+          # repo secret; tauri-action signs the update bundles and writes/merges
+          # the `latest.json` manifest the in-app updater polls. Key generated
+          # with an empty password (the password env stays empty).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Tusk ${{ github.ref_name }}"

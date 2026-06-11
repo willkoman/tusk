@@ -813,6 +813,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             connect,
@@ -843,7 +845,8 @@ pub fn run() {
             ai::ai_save_key,
             ai::ai_has_key,
             ai::ai_clear_key,
-            ai::ai_chat
+            ai::ai_chat,
+            ai::ai_list_models
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

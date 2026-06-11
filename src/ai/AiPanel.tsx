@@ -21,6 +21,20 @@ export function AiPanel(props: {
   const [cfg, setCfg] = createSignal<AiConfig>(aiStore.load());
   const [hasKey, setHasKey] = createSignal(false);
   const [keyed, setKeyed] = createSignal<AiProvider[]>([]); // providers with a saved key
+  // Live model catalog per provider (fetched via the backend with the keychain key);
+  // the curated list in store.ts is only the fallback when the fetch fails.
+  const [liveModels, setLiveModels] = createSignal<Partial<Record<AiProvider, string[]>>>({});
+  const modelsFor = (pid: AiProvider) => liveModels()[pid] ?? providerModels(pid);
+  async function fetchModels(pid: AiProvider) {
+    // The base override only applies to the provider it was configured for.
+    const baseUrl = cfg().provider === pid ? cfg().baseUrl.trim() || null : null;
+    try {
+      const list = await invoke<string[]>("ai_list_models", { provider: pid, baseUrl });
+      if (list.length) setLiveModels((m) => ({ ...m, [pid]: list }));
+    } catch {
+      /* keep the curated fallback */
+    }
+  }
   const [keyInput, setKeyInput] = createSignal("");
   const [settingsOpen, setSettingsOpen] = createSignal(false);
   const [messages, setMessages] = createSignal<ChatMsg[]>([]);
@@ -46,6 +60,7 @@ export function AiPanel(props: {
     );
     const list = checks.filter((x): x is AiProvider => !!x);
     setKeyed(list);
+    for (const p of list) if (!liveModels()[p]) void fetchModels(p);
     if (!keysChecked) {
       keysChecked = true;
       setSettingsOpen(list.length === 0);
@@ -55,6 +70,16 @@ export function AiPanel(props: {
   onMount(() => { void refreshKey(); void refreshKeyed(); });
   // Re-check the current provider's key when it changes.
   createEffect(() => { cfg().provider; void refreshKey(); });
+  // Refetch the current provider's models when its base URL changes (debounced —
+  // OpenAI-compatible/local servers expose different catalogs per base).
+  let modelsTimer: ReturnType<typeof setTimeout> | undefined;
+  createEffect(() => {
+    const p = cfg().provider;
+    cfg().baseUrl; // track
+    if (!keyed().includes(p)) return;
+    clearTimeout(modelsTimer);
+    modelsTimer = setTimeout(() => void fetchModels(p), 600);
+  });
   // Keep the message list pinned to the latest as it streams.
   createEffect(() => { messages(); if (msgEl) msgEl.scrollTop = msgEl.scrollHeight; });
 
@@ -64,6 +89,7 @@ export function AiPanel(props: {
     await invoke("ai_save_key", { provider: cfg().provider, key: k });
     setKeyInput("");
     await Promise.all([refreshKey(), refreshKeyed()]);
+    void fetchModels(cfg().provider); // new key may unlock a different catalog
     setSettingsOpen(false);
   }
   async function clearKey() {
@@ -117,13 +143,13 @@ export function AiPanel(props: {
   const fixError = () => send("My last query errored (see the error in context). Diagnose it and give a corrected query.");
 
   // Header model picker: every model of every provider that has a key saved, so the model
-  // can be switched freely without reopening settings. Current custom model included.
+  // can be switched freely without reopening settings. Live catalog when fetched
+  // (curated fallback otherwise); the current custom model is always included.
   const headerModels = () =>
     keyed().map((pid) => {
-      const info = providerInfo(pid);
-      const models = [...info.models];
+      const models = [...modelsFor(pid)];
       if (cfg().provider === pid && cfg().model && !models.includes(cfg().model)) models.unshift(cfg().model);
-      return { label: info.label, pid, models };
+      return { label: providerInfo(pid).label, pid, models };
     });
 
   return (
@@ -159,13 +185,13 @@ export function AiPanel(props: {
           </label>
           <label>Model
             <select
-              value={providerModels(cfg().provider).includes(cfg().model) ? cfg().model : "__custom__"}
+              value={modelsFor(cfg().provider).includes(cfg().model) ? cfg().model : "__custom__"}
               onChange={(e) => { const v = e.currentTarget.value; setConfig({ model: v === "__custom__" ? "" : v }); }}
             >
-              <For each={providerModels(cfg().provider)}>{(m) => <option value={m}>{m}</option>}</For>
+              <For each={modelsFor(cfg().provider)}>{(m) => <option value={m}>{m}</option>}</For>
               <option value="__custom__">Custom…</option>
             </select>
-            <Show when={!providerModels(cfg().provider).includes(cfg().model)}>
+            <Show when={!modelsFor(cfg().provider).includes(cfg().model)}>
               <input value={cfg().model} onInput={(e) => setConfig({ model: e.currentTarget.value })} placeholder="custom model id (e.g. for a local / OpenAI-compatible server)" />
             </Show>
           </label>

@@ -346,6 +346,9 @@ button.ghost { background: transparent; }
 .rg-cell.sel { background: rgba(var(--accent-rgb), 0.18); }
 .rg-cell.active { outline: 1.5px solid var(--accent); outline-offset: -1.5px; z-index: 1; }
 .null { color: var(--muted); font-style: italic; }
+.rg-bool { font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; line-height: 16px; padding: 0 5px; border-radius: 3px; }
+.rg-bool.rg-true { color: #4cc878; background: rgba(80, 200, 120, 0.10); }
+.rg-bool.rg-false { color: var(--muted); background: rgba(128, 128, 128, 0.12); }
 
 /* --- in-grid editing overlays --- */
 .rg-cell.rg-dirty { background: rgba(230, 170, 60, 0.16); box-shadow: inset 2px 0 0 #e6aa3c; }
@@ -361,8 +364,34 @@ button.ghost { background: transparent; }
   background: var(--bg); color: var(--text);
   border: 1.5px solid var(--accent); border-radius: 0; outline: none;
 }
+.rg-edit-bool { padding: 0 6px; }
 .sb-pending { color: #e6aa3c; font-weight: 600; white-space: nowrap; }
 .sb-commit:not(:disabled) { color: var(--accent); }
+
+/* --- built-in updater pill + panel (bottom-right, both screens) --- */
+.upd-root { position: fixed; right: 16px; bottom: 34px; z-index: 90; display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+.upd-pill {
+  display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px;
+  font-size: 12px; font-weight: 600; cursor: pointer;
+  color: var(--accent); background: var(--panel);
+  border: 1px solid rgba(var(--accent-rgb), 0.5); border-radius: 999px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+}
+.upd-pill:hover { background: rgba(var(--accent-rgb), 0.12); }
+.upd-panel {
+  width: 320px; padding: 12px 14px; font-size: 12px;
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+}
+.upd-title { font-weight: 600; margin-bottom: 6px; }
+.upd-ver { color: var(--accent); font-family: var(--mono); font-weight: 600; margin-left: 4px; }
+.upd-notes { max-height: 160px; overflow: auto; white-space: pre-wrap; color: var(--muted); margin-bottom: 8px; }
+.upd-err { color: #e05050; margin-bottom: 8px; word-break: break-word; }
+.upd-actions { display: flex; justify-content: flex-end; gap: 8px; align-items: center; }
+.upd-progress { display: flex; align-items: center; gap: 8px; width: 100%; color: var(--muted); }
+.upd-bar { flex: 1; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+.upd-fill { height: 100%; background: var(--accent); transition: width 0.15s; }
 
 .statusbar { display: flex; align-items: center; gap: 10px; padding: 5px 12px; border-top: 1px solid var(--border); background: var(--panel); color: var(--muted); font-size: 12px; }
 .sb-sep { width: 1px; height: 12px; background: var(--border); flex-shrink: 0; }

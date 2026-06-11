@@ -10,9 +10,10 @@ export type AiConfig = {
   baseUrl: string;
 };
 
-// Curated current models per provider (first = default). `Custom…` in the picker still
-// lets you type any id — needed for OpenAI-compatible / OpenCode / local servers, and so
-// the list never goes stale-locked. Refreshed from provider docs (2026).
+// Curated models per provider (first = default) — the FALLBACK only. The pickers fetch
+// the live catalog via the backend `ai_list_models` command (keychain key, per-provider
+// models endpoint) and fall back here when that fails. `Custom…` still lets you type any
+// id — needed for OpenAI-compatible / OpenCode / local servers.
 export const AI_PROVIDERS: { id: AiProvider; label: string; models: string[]; baseHint: string; keyUrl: string }[] = [
   {
     id: "anthropic",

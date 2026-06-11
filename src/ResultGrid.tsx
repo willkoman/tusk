@@ -3,6 +3,7 @@ import { type Dataset, toTSV, toCSV, toJSON, toMarkdown } from "./formats";
 import { clipWrite } from "./clipboard";
 import { type MenuItem } from "./ContextMenu";
 import { type GridView, type SortKey, type Filter, type PendingEdits } from "./tabs";
+import { boolWord } from "./grid/bool";
 
 // Hand-rolled, two-axis-virtualized, read-only result grid. Uses a synchronized-pane
 // layout (header + gutter are transform-translated siblings of the body scroller, NOT
@@ -59,6 +60,10 @@ export type ResultGridProps = {
   canEditCol: (origCol: number) => boolean;
   /** Record a cell edit: null = SQL NULL, undefined = revert (clear pending entry). */
   onEditCell: (row: number, origCol: number, val: string | null | undefined) => void;
+  /** Per ORIGINAL column: render textual booleans as TRUE/FALSE badges. */
+  isBoolCol: (origCol: number) => boolean;
+  /** Boolean editor info for an ORIGINAL column (null = free-text editor). */
+  boolEdit: (origCol: number) => { trueVal: string; falseVal: string; nullable: boolean } | null;
   /** Toggle delete-marks on the given virtual row indices (insert rows are removed). */
   onMarkDelete: (rows: number[]) => void;
   onAddRow: () => void;
@@ -319,8 +324,10 @@ export function ResultGrid(props: ResultGridProps) {
   // --- inline cell editing ---
   const [editing, setEditing] = createSignal<{ r: number; dc: number } | null>(null);
   let editInput: HTMLInputElement | undefined;
+  let editSelect: HTMLSelectElement | undefined;
   let editOrig: string | null = null; // displayed value when the editor opened
   let editCancelled = false;
+  const NULL_OPT = "~null~"; // select-option sentinel for SQL NULL
   function beginEdit(r: number, dc: number) {
     if (!props.editable() || delSet().has(r)) return;
     const oi = displayCols()[dc];
@@ -333,11 +340,29 @@ export function ResultGrid(props: ResultGridProps) {
   }
   function commitEdit(move?: "down" | "right") {
     const ed = editing();
-    if (!ed || !editInput) return;
-    const v = editInput.value;
-    setEditing(null);
-    // Typing nothing over a NULL is not an edit (don't turn NULL into '').
-    if (!(editOrig === null && v === "")) props.onEditCell(ed.r, displayCols()[ed.dc], v);
+    if (!ed) return;
+    const oi = displayCols()[ed.dc];
+    const be = props.boolEdit(oi);
+    if (be) {
+      if (!editSelect) return;
+      const v = editSelect.value;
+      setEditing(null);
+      if (v === NULL_OPT) props.onEditCell(ed.r, oi, null);
+      else {
+        // Re-picking the original value reverts the pending edit instead of
+        // recording a no-op write (PG snapshot "t" vs dropdown "true" would
+        // otherwise compare unequal and stay dirty forever).
+        const snap = ed.r < nLoaded() ? props.rows()[ed.r]?.[oi] ?? null : undefined;
+        if (snap !== undefined && snap !== null && boolWord(snap) === v) props.onEditCell(ed.r, oi, undefined);
+        else props.onEditCell(ed.r, oi, v === "TRUE" ? be.trueVal : be.falseVal);
+      }
+    } else {
+      if (!editInput) return;
+      const v = editInput.value;
+      setEditing(null);
+      // Typing nothing over a NULL is not an edit (don't turn NULL into '').
+      if (!(editOrig === null && v === "")) props.onEditCell(ed.r, oi, v);
+    }
     focusGrid();
     if (move === "down") moveSelTo(ed.r + 1, ed.dc);
     if (move === "right") moveSelTo(ed.r, ed.dc + 1);
@@ -753,11 +778,14 @@ export function ResultGrid(props: ResultGridProps) {
                         }}
                         onContextMenu={(e) => onCellContext(e, r, k, oi(), val())}
                       >
-                        {isInsUntouched(r, oi())
-                          ? <span class="rg-defaultval" title="column default" />
-                          : val() === null
-                            ? <span class="null">{props.gridStyle().nullStyle === "null" ? "NULL" : props.gridStyle().nullStyle === "dash" ? "—" : ""}</span>
-                            : val()}
+                        {(() => {
+                          if (isInsUntouched(r, oi())) return <span class="rg-defaultval" title="column default" />;
+                          const v = val();
+                          if (v === null)
+                            return <span class="null">{props.gridStyle().nullStyle === "null" ? "NULL" : props.gridStyle().nullStyle === "dash" ? "—" : ""}</span>;
+                          const w = props.isBoolCol(oi()) ? boolWord(v) : null;
+                          return w ? <span class={w === "TRUE" ? "rg-bool rg-true" : "rg-bool rg-false"}>{w}</span> : v;
+                        })()}
                       </div>
                     );
                   }}
@@ -766,31 +794,72 @@ export function ResultGrid(props: ResultGridProps) {
             )}
           </For>
           <Show when={editing()}>
-            {(ed) => (
-              <input
-                class="rg-edit"
-                ref={(el) => {
-                  editInput = el;
-                  queueMicrotask(() => { el.focus(); el.select(); });
-                }}
-                style={{
-                  top: `${ed().r * rowH()}px`,
-                  left: `${offsets()[ed().dc]}px`,
-                  width: `${colWidth(displayCols()[ed().dc])}px`,
-                  height: `${rowH()}px`,
-                }}
-                value={cellVal(ed().r, displayCols()[ed().dc]) ?? ""}
-                onKeyDown={(e) => {
-                  e.stopPropagation();
-                  if (e.key === "Enter") { e.preventDefault(); commitEdit("down"); }
-                  else if (e.key === "Tab") { e.preventDefault(); commitEdit("right"); }
-                  else if (e.key === "Escape") { e.preventDefault(); cancelEdit(); }
-                  else if (e.altKey && e.key.toLowerCase() === "n") { e.preventDefault(); editToNull(); }
-                }}
-                onBlur={() => { if (!editCancelled && editing()) commitEdit(); }}
-                onMouseDown={(e) => e.stopPropagation()}
-              />
-            )}
+            {(ed) => {
+              const oi = () => displayCols()[ed().dc];
+              const editStyle = () => ({
+                top: `${ed().r * rowH()}px`,
+                left: `${offsets()[ed().dc]}px`,
+                width: `${colWidth(oi())}px`,
+                height: `${rowH()}px`,
+              });
+              const onEditKey = (e: KeyboardEvent) => {
+                e.stopPropagation();
+                if (e.key === "Enter") { e.preventDefault(); commitEdit("down"); }
+                else if (e.key === "Tab") { e.preventDefault(); commitEdit("right"); }
+                else if (e.key === "Escape") { e.preventDefault(); cancelEdit(); }
+                else if (e.altKey && e.key.toLowerCase() === "n") { e.preventDefault(); editToNull(); }
+              };
+              return (
+                <Show
+                  when={props.boolEdit(oi())}
+                  fallback={
+                    <input
+                      class="rg-edit"
+                      ref={(el) => {
+                        editInput = el;
+                        queueMicrotask(() => { el.focus(); el.select(); });
+                      }}
+                      style={editStyle()}
+                      value={cellVal(ed().r, oi()) ?? ""}
+                      onKeyDown={onEditKey}
+                      onBlur={() => { if (!editCancelled && editing()) commitEdit(); }}
+                      onMouseDown={(e) => e.stopPropagation()}
+                    />
+                  }
+                >
+                  {(be) => {
+                    const cur = () => {
+                      const v = cellVal(ed().r, oi());
+                      return v === null ? NULL_OPT : boolWord(v) ?? "TRUE";
+                    };
+                    return (
+                      <select
+                        class="rg-edit rg-edit-bool"
+                        ref={(el) => {
+                          editSelect = el;
+                          queueMicrotask(() => {
+                            el.focus();
+                            try { el.showPicker?.(); } catch { /* needs user activation; focus is enough */ }
+                          });
+                        }}
+                        style={editStyle()}
+                        value={cur()}
+                        onChange={() => commitEdit()}
+                        onKeyDown={onEditKey}
+                        onBlur={() => { if (!editCancelled && editing()) commitEdit(); }}
+                        onMouseDown={(e) => e.stopPropagation()}
+                      >
+                        <option value="TRUE">TRUE</option>
+                        <option value="FALSE">FALSE</option>
+                        <Show when={be().nullable}>
+                          <option value={NULL_OPT}>{"<null>"}</option>
+                        </Show>
+                      </select>
+                    );
+                  }}
+                </Show>
+              );
+            }}
           </Show>
         </div>
       </div>

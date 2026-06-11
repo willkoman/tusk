@@ -29,6 +29,7 @@ scripts/conformance.sh                                # + Postgres & MySQL via t
 
 - **After Rust changes → tell the user to restart `npm run tauri dev`.** Frontend-only changes hot-reload.
 - Installers are built in CI: push a `v*` tag → `.github/workflows/release.yml` builds mac (universal) + Windows (NSIS, per-user) and drafts a GitHub release. Don't cross-compile locally.
+- **Built-in updater:** `tauri-plugin-updater` polls `releases/latest/download/latest.json` (published releases only — a draft is invisible to it). CI signs updater artifacts with the `TAURI_SIGNING_PRIVATE_KEY` repo secret (minisign key, empty password; pubkey lives in `tauri.conf.json` `plugins.updater`; keypair at `~/.tauri/tusk.key` on the dev machine — NEVER commit it). Frontend = `src/UpdateBadge.tsx` (bottom-right pill, both screens; silent on check failure). `createUpdaterArtifacts: true` in the bundle config; capabilities add `updater:default` + `process:allow-restart`.
 
 ## Conventions
 

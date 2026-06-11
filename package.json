@@ -1,6 +1,6 @@
 {
   "name": "tusk",
-  "version": "0.4.0",
+  "version": "0.4.5",
   "description": "",
   "type": "module",
   "scripts": {
@@ -25,6 +25,8 @@
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.10.1",
     "solid-js": "^1.9.3",
     "sql-formatter": "^15.8.0"
   },

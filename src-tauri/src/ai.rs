@@ -170,6 +170,102 @@ fn build_request(
     }
 }
 
+/// Live model catalog for a provider (ids only), using the saved keychain key.
+/// Per provider: Anthropic `GET /v1/models`, Gemini `GET /v1beta/models` (filtered
+/// to generateContent-capable, `models/` prefix stripped), OpenAI + compatible
+/// `GET /v1/models` (obvious non-chat families dropped, newest-first sort).
+/// Errors surface to the frontend, which falls back to its curated list.
+#[tauri::command]
+pub async fn ai_list_models(
+    provider: String,
+    base_url: Option<String>,
+) -> Result<Vec<String>, AppError> {
+    let key = get_key(&provider)?;
+    let (url, headers): (String, Vec<(String, String)>) = match provider.as_str() {
+        "anthropic" => {
+            let base = base_url.as_deref().unwrap_or("https://api.anthropic.com");
+            (
+                format!("{base}/v1/models?limit=1000"),
+                vec![
+                    ("x-api-key".into(), key.clone()),
+                    ("anthropic-version".into(), "2023-06-01".into()),
+                ],
+            )
+        }
+        "gemini" => {
+            let base = base_url
+                .as_deref()
+                .unwrap_or("https://generativelanguage.googleapis.com");
+            (format!("{base}/v1beta/models?pageSize=1000&key={key}"), vec![])
+        }
+        // openai + OpenAI-compatible (OpenCode / local / proxy via base_url)
+        _ => {
+            let base = base_url.as_deref().unwrap_or("https://api.openai.com");
+            (
+                format!("{base}/v1/models"),
+                vec![("authorization".into(), format!("Bearer {key}"))],
+            )
+        }
+    };
+    let client = reqwest::Client::new();
+    let mut builder = client.get(&url);
+    for (k, v) in headers {
+        builder = builder.header(k, v);
+    }
+    let resp = builder
+        .send()
+        .await
+        .map_err(|e| AppError::new(e.to_string()))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(AppError::new(format!(
+            "provider error {status}: {}",
+            detail.chars().take(300).collect::<String>()
+        )));
+    }
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| AppError::new(e.to_string()))?;
+    let mut out: Vec<String> = match provider.as_str() {
+        "gemini" => json["models"]
+            .as_array()
+            .map(|a| a.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter(|m| {
+                m["supportedGenerationMethods"]
+                    .as_array()
+                    .map(|a| a.iter().any(|x| x.as_str() == Some("generateContent")))
+                    .unwrap_or(true)
+            })
+            .filter_map(|m| m["name"].as_str())
+            .map(|n| n.trim_start_matches("models/").to_string())
+            .collect(),
+        // anthropic + openai both wrap in `data: [{id}]`
+        _ => json["data"]
+            .as_array()
+            .map(|a| a.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .map(str::to_string)
+            .collect(),
+    };
+    if provider == "openai" {
+        // /v1/models mixes in embeddings/audio/image/moderation models — drop the
+        // obvious non-chat families (also harmless on compatible/local servers).
+        const SKIP: [&str; 11] = [
+            "embedding", "whisper", "tts", "dall-e", "moderation", "audio",
+            "realtime", "transcribe", "image", "davinci", "babbage",
+        ];
+        out.retain(|id| !SKIP.iter().any(|s| id.contains(s)));
+        out.sort_by(|a, b| b.cmp(a));
+    }
+    Ok(out)
+}
+
 /// Stream a completion from the configured provider, emitting `AiEvent`s over the channel.
 /// The API key is read from the keychain (never crosses the IPC boundary as plaintext from
 /// the frontend). Always resolves Ok — failures are delivered as an `Error` event so the
