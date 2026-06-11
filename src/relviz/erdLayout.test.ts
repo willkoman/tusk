@@ -1,8 +1,30 @@
 import { describe, expect, it } from "vitest";
-import { assignFamilies, countCrossings, layoutErd, meanEdgeSpan, type ErdEdge, type ErdNode } from "./erdLayout";
+import { assignFamilies, layoutErd, meanEdgeLength, type ErdEdge, type ErdNode } from "./erdLayout";
 
 const node = (id: string, h = 80): ErdNode => ({ id, w: 200, h });
 const E = (from: string, to: string): ErdEdge => ({ from, to });
+
+/** Every pair of placed cards keeps clear air between them. */
+function expectNoOverlaps(nodes: ErdNode[], l: ReturnType<typeof layoutErd>) {
+  const rects = nodes
+    .filter((n) => l.pos.has(n.id))
+    .map((n) => ({ id: n.id, ...l.pos.get(n.id)!, w: n.w, h: n.h }));
+  for (let i = 0; i < rects.length; i++) {
+    for (let j = i + 1; j < rects.length; j++) {
+      const a = rects[i];
+      const b = rects[j];
+      const apart = a.x + a.w <= b.x + 0.01 || b.x + b.w <= a.x + 0.01 || a.y + a.h <= b.y + 0.01 || b.y + b.h <= a.y + 0.01;
+      expect(apart, `${a.id} overlaps ${b.id}`).toBe(true);
+    }
+  }
+}
+
+const center = (l: ReturnType<typeof layoutErd>, nodes: ErdNode[], id: string) => {
+  const n = nodes.find((x) => x.id === id)!;
+  const p = l.pos.get(id)!;
+  return { x: p.x + n.w / 2, y: p.y + n.h / 2 };
+};
+const dist = (a: { x: number; y: number }, b: { x: number; y: number }) => Math.hypot(a.x - b.x, a.y - b.y);
 
 describe("layoutErd", () => {
   it("is deterministic — identical output across runs and input orderings", () => {
@@ -14,71 +36,51 @@ describe("layoutErd", () => {
     expect(l1.layers).toEqual(l2.layers);
   });
 
-  it("layers follow FK direction (parents right of children)", () => {
-    const l = layoutErd([node("c"), node("o"), node("i")], [E("o", "c"), E("i", "o")]);
-    expect(l.pos.get("i")!.x).toBeLessThan(l.pos.get("o")!.x);
-    expect(l.pos.get("o")!.x).toBeLessThan(l.pos.get("c")!.x);
-  });
-
   it("survives cycles without hanging and still places every node", () => {
     const l = layoutErd([node("a"), node("b"), node("x")], [E("a", "b"), E("b", "a"), E("x", "a")]);
     expect(l.pos.size).toBe(3);
     expect(l.pos.get("a")).not.toEqual(l.pos.get("b"));
   });
 
-  it("no overlaps within a layer (real card heights respected)", () => {
-    const nodes = [node("p"), node("a", 60), node("b", 120), node("c", 90)];
-    const l = layoutErd(nodes, [E("a", "p"), E("b", "p"), E("c", "p")]);
-    const lefts = ["a", "b", "c"].map((id) => ({ id, y: l.pos.get(id)!.y }));
-    lefts.sort((x, y) => x.y - y.y);
-    const h: Record<string, number> = { a: 60, b: 120, c: 90 };
-    for (let i = 1; i < lefts.length; i++) {
-      expect(lefts[i].y).toBeGreaterThanOrEqual(lefts[i - 1].y + h[lefts[i - 1].id]);
-    }
+  it("never overlaps cards (uneven heights, dense star)", () => {
+    const leaves = Array.from({ length: 14 }, (_, i) => node(`t${String(i).padStart(2, "0")}`, 50 + (i % 5) * 40));
+    const nodes = [node("hub", 120), ...leaves];
+    const l = layoutErd(nodes, leaves.map((n) => E(n.id, "hub")));
+    expectNoOverlaps(nodes, l);
   });
 
-  it("barycenter reduces crossings (single component)", () => {
-    // a1 → z1+z2, a2 → z1: orderable to zero crossings.
-    const nodes = [node("a1"), node("a2"), node("z1"), node("z2")];
-    const edges = [E("a1", "z2"), E("a2", "z1"), E("a1", "z1")];
-    const l = layoutErd(nodes, edges);
-    expect(countCrossings(l, edges)).toBe(0);
-  });
+  // --- proximity: the core objective ---
 
-  // --- hub-schema readability (the "everything wired from the left" fix) ---
-
-  it("tighten: star-schema leaves sit ADJACENT to their hub (span 1)", () => {
+  it("star-schema leaves hug their hub (every leaf within ~2 card-units)", () => {
     const leaves = Array.from({ length: 12 }, (_, i) => `t${String(i).padStart(2, "0")}`);
     const nodes = [node("hub"), ...leaves.map((l) => node(l))];
     const edges = leaves.map((l) => E(l, "hub"));
     const l = layoutErd(nodes, edges);
-    expect(meanEdgeSpan(l, edges)).toBe(1);
+    const hub = center(l, nodes, "hub");
+    for (const leaf of leaves) {
+      expect(dist(center(l, nodes, leaf), hub), `${leaf} drifted from hub`).toBeLessThan(620);
+    }
+    expect(meanEdgeLength(l, nodes, edges)).toBeLessThan(420);
   });
 
-  it("tighten: two-hub chain — each spoke group hugs its own hub", () => {
-    // u* → hubA → hubB ← v*. Longest-path alone leaves v* at layer 0 while
-    // hubB sits at layer 2 (span 2 for every v-edge). Tighten pulls v* right.
+  it("two-hub chain — every spoke sits closer to its own hub than to the other", () => {
     const nodes = [node("hubA"), node("hubB"), node("u1"), node("u2"), node("u3"), node("v1"), node("v2"), node("v3")];
     const edges = [E("u1", "hubA"), E("u2", "hubA"), E("u3", "hubA"), E("hubA", "hubB"), E("v1", "hubB"), E("v2", "hubB"), E("v3", "hubB")];
     const l = layoutErd(nodes, edges);
-    expect(meanEdgeSpan(l, edges)).toBe(1);
+    const a = center(l, nodes, "hubA");
+    const b = center(l, nodes, "hubB");
+    for (const u of ["u1", "u2", "u3"]) expect(dist(center(l, nodes, u), a)).toBeLessThan(dist(center(l, nodes, u), b));
+    for (const v of ["v1", "v2", "v3"]) expect(dist(center(l, nodes, v), b)).toBeLessThan(dist(center(l, nodes, v), a));
   });
 
-  it("y-refinement: a child sits vertically near its parent, not at the layer top", () => {
-    // Two parents far apart in the right layer; each child should drift toward
-    // its own parent's vertical band.
-    const nodes = [node("p1", 60), node("p2", 60), node("f1", 600), node("c1", 60), node("c2", 60)];
-    // f1 is a tall spacer card between the parents (forces vertical distance);
-    // connect it so everything is one component.
-    const edges = [E("c1", "p1"), E("c2", "p2"), E("f1", "p1"), E("f1", "p2")];
-    const l = layoutErd(nodes, edges);
-    const center = (id: string, h: number) => l.pos.get(id)!.y + h / 2;
-    const d11 = Math.abs(center("c1", 60) - center("p1", 60));
-    const d12 = Math.abs(center("c1", 60) - center("p2", 60));
-    const d22 = Math.abs(center("c2", 60) - center("p2", 60));
-    const d21 = Math.abs(center("c2", 60) - center("p1", 60));
-    expect(d11).toBeLessThan(d12);
-    expect(d22).toBeLessThan(d21);
+  it("a chain coils into a compact blob instead of a ribbon", () => {
+    const chain = Array.from({ length: 8 }, (_, i) => `c${i}`);
+    const nodes = chain.map((c) => node(c, 90));
+    const l = layoutErd(nodes, chain.slice(1).map((c, i) => E(c, `c${i}`)));
+    const ratio = l.bbox.w / l.bbox.h;
+    expect(ratio).toBeLessThan(6);
+    expect(ratio).toBeGreaterThan(1 / 6);
+    expectNoOverlaps(nodes, l);
   });
 
   // --- component separation ---
@@ -109,6 +111,8 @@ describe("layoutErd", () => {
     expect(Math.max(...["i5", "i6"].map((i) => l.pos.get(i)!.y))).toBeGreaterThan(l.pos.get("i1")!.y);
   });
 
+  // --- naming families ---
+
   it("family detection: two-token prefixes split from one-token families", () => {
     const fams = assignFamilies(["product", "product_a", "product_content_x", "product_content_y", "purchase_order_a", "purchase_order_b", "lonely_table"]);
     expect(fams.get("product")).toBe("product");
@@ -138,9 +142,7 @@ describe("layoutErd", () => {
     expect(l.pos.get("amazon_c")!.y).toBeGreaterThanOrEqual(webBottom + 140);
   });
 
-  it("naming families stay contiguous within a layer", () => {
-    // Two parents pull the families apart by barycenter; the family block must
-    // hold together anyway (grouped barycenter), interleaving forbidden.
+  it("naming families stay contiguous within a ring", () => {
     const nodes = [node("p1"), node("p2"), node("amazon_a"), node("zebra_x"), node("amazon_b"), node("zebra_y"), node("amazon_c")];
     const edges = [E("amazon_a", "p1"), E("zebra_x", "p1"), E("amazon_b", "p2"), E("zebra_y", "p2"), E("amazon_c", "p1")];
     const l = layoutErd(nodes, edges);
@@ -153,34 +155,19 @@ describe("layoutErd", () => {
     expect(span("zebra")).toBe(true);
   });
 
-  it("over-tall layers wrap into height-balanced sub-columns", () => {
-    const leaves = Array.from({ length: 18 }, (_, i) => `t${String(i).padStart(2, "0")}`);
-    const l = layoutErd([node("hub"), ...leaves.map((x) => node(x))], leaves.map((x) => E(x, "hub")));
-    const xs = new Set(leaves.map((x) => l.pos.get(x)!.x));
-    expect(xs.size).toBeGreaterThan(1); // wrapped into multiple sub-columns
-    // columns are height-balanced: no column more than ~one card taller than another
-    const byX = new Map<number, number>();
-    for (const x of leaves) {
-      const p = l.pos.get(x)!;
-      byX.set(p.x, Math.max(byX.get(p.x) ?? 0, p.y + 80));
-    }
-    const colHeights = [...byX.values()];
-    expect(Math.max(...colHeights) - Math.min(...colHeights)).toBeLessThanOrEqual(80 + 14 + 1);
-  });
-
-  it("mixed-size ranks: a small node's column is not inflated to a big block's width", () => {
-    // bigblock (600 wide) and two small nodes share a rank below the hub; the
-    // smalls must sit in a narrow column adjacent to the block, not 600px away.
+  it("mixed sizes: a big family block and small singletons pack without overlap, smalls still adjacent", () => {
     const nodes = [node("hub"), { id: "bigblock", w: 600, h: 900 }, node("sa", 60), node("sb", 60)];
     const edges = [E("bigblock", "hub"), E("sa", "hub"), E("sb", "hub")];
     const l = layoutErd(nodes, edges);
-    const xs = [l.pos.get("bigblock")!.x, l.pos.get("sa")!.x, l.pos.get("sb")!.x].sort((a, b) => a - b);
-    // the second column starts right after the first column's OWN width
-    const gap = xs[xs.length - 1] - xs[0];
-    expect(gap).toBeLessThanOrEqual(600 + 20 + 1); // big col + SUBCOL_GAP, no layer-wide slot
+    expectNoOverlaps(nodes, l);
+    const hub = center(l, nodes, "hub");
+    expect(dist(center(l, nodes, "sa"), hub)).toBeLessThan(900);
+    expect(dist(center(l, nodes, "sb"), hub)).toBeLessThan(900);
   });
 
-  it("realistic 40-table hub schema: short edges, no mega-column of unrelated tables", () => {
+  // --- the headline fix: compactness on a realistic schema ---
+
+  it("realistic 40-table hub schema: short edges, balanced aspect, deterministic", () => {
     // Django-ish: auth_user + content_type hubs, 30 leaf tables referencing
     // one or both, a session/log cluster, and 5 FK-less islands.
     const leaves = Array.from({ length: 30 }, (_, i) => `app_t${String(i).padStart(2, "0")}`);
@@ -197,7 +184,7 @@ describe("layoutErd", () => {
       E("log_a", "log_b"),
     ];
     const l = layoutErd(nodes, edges);
-    expect(meanEdgeSpan(l, edges)).toBeLessThanOrEqual(1.5);
+    expectNoOverlaps(nodes, l);
     // islands below everything, behind the gutter
     const webIds = ["auth_user", ...leaves, "log_a", "log_b"];
     const webBottom = Math.max(...webIds.map((id) => l.pos.get(id)!.y + 80));
@@ -210,5 +197,22 @@ describe("layoutErd", () => {
     // determinism on the big case too
     const l2 = layoutErd([...nodes].reverse(), [...edges].reverse());
     expect(l2.pos).toEqual(l.pos);
+  });
+
+  it("12-table shop schema (no families): proximity beats the old ribbon layout", () => {
+    const names = ["users", "orders", "order_items", "products", "categories", "reviews", "addresses", "payments", "shipments", "coupons", "carts", "cart_items"];
+    const nodes = names.map((x) => node(x, 100));
+    const edges = [
+      E("orders", "users"), E("order_items", "orders"), E("order_items", "products"),
+      E("products", "categories"), E("reviews", "users"), E("reviews", "products"),
+      E("addresses", "users"), E("payments", "orders"), E("shipments", "orders"),
+      E("orders", "coupons"), E("carts", "users"), E("cart_items", "carts"), E("cart_items", "products"),
+    ];
+    const l = layoutErd(nodes, edges);
+    expectNoOverlaps(nodes, l);
+    expect(meanEdgeLength(l, nodes, edges)).toBeLessThan(350); // old engine: ~354, layered ribbon
+    const ratio = l.bbox.w / l.bbox.h;
+    expect(ratio).toBeLessThan(3.5);
+    expect(ratio).toBeGreaterThan(0.3);
   });
 });

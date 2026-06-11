@@ -4,6 +4,12 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-06-11
+
+### Changed
+- **Schema ERD layout overhauled: proximity packing instead of left-to-right layers.** The whole-schema diagram no longer ranks tables into FK-depth columns (which made even modest schemas grow into wide ribbons needing constant panning). Family clusters are now placed by a greedy adjacency packer: the most-connected cluster seeds the canvas and every subsequent cluster lands on the nearest free spot to the weighted centroid of its already-placed referrers — spiral candidate search with distances normalized by average card dimensions (so the X and Y axes are spent in proportion to what a card costs on each), a gentle centroid pull that curls chains into the blob instead of letting them ribbon off, and refinement sweeps that relocate any table with a strictly shorter free spot near its full neighborhood. Tables sit as close to their referrers as the no-overlap rule allows; zero overlap and bit-exact determinism hold by construction (no RNG, no convergence loops). Naming-family containers, the bottom island grid, and component shelf-packing are unchanged; family *internals* keep the small layered mini-flow. On the test fixtures: an 8-table chain drops from 26.8:1 to ~3:1 aspect, a 12-table shop schema's mean FK edge shortens ~35%, and a 19-table multi-family schema goes from a 3.8:1 strip to ~1.2:1 at 35% shorter edges.
+- **ERD edges between vertically stacked cards route as a right-side loop** instead of degenerating into a near-vertical squiggle through the cards (stacking is common now that the layout uses both axes).
+
 ## [0.4.5] - 2026-06-11
 
 ### Added

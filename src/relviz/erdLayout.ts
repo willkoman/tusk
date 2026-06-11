@@ -1,19 +1,24 @@
-// Cluster-first layered layout for the whole-schema ERD.
+// Proximity-packed cluster layout for the whole-schema ERD.
 //
 // Tables are first grouped into NAMING FAMILIES (token-prefix clusters:
 // "product_*", "product_content_*", "purchase_order_*" …). Each multi-member
-// family is laid out internally, then the CLUSTER GRAPH (families as
-// variable-size super-nodes, FK edges aggregated) is laid out with the same
-// layered engine — so families form visible blocks and placement between
-// blocks still follows the FK structure. Multi-member families also get a
-// labeled background container (`groups` in the result).
+// family is laid out internally (small layered grid), then the CLUSTER GRAPH
+// (families as variable-size super-nodes, FK edges aggregated) is placed by a
+// GREEDY ADJACENCY PACKER: the most-connected cluster seeds the canvas, every
+// subsequent cluster lands on the nearest free spot to the weighted centroid
+// of its already-placed referrers (spiral candidate search, distances
+// normalized by average card dimensions so X and Y are spent proportionally),
+// followed by refinement sweeps that relocate a cluster when a strictly
+// shorter spot near its full neighborhood exists. Tables therefore sit as
+// close to their referrers as the no-overlap constraint allows, and the
+// diagram grows as a compact blob instead of a left-to-right ribbon.
 //
-// Geometry is horizontal-focused: connected components pack side-by-side,
-// over-tall layers wrap into sub-columns, FK-less islands form a block on the
-// FAR LEFT behind a wide gutter.
+// Connected components still shelf-pack side-by-side toward a ~3:2 aspect and
+// FK-less islands still form a dense grid block at the bottom behind a gutter.
 //
-// Deterministic by construction — every list is canonically sorted before any
-// float accumulation (summation order changes bits), tests assert bit-equality.
+// Deterministic by construction — no RNG, no convergence loops; every list is
+// canonically sorted before any float accumulation (summation order changes
+// bits), tests assert bit-equality.
 
 export type ErdNode = { id: string; w: number; h: number };
 export type ErdEdge = { from: string; to: string };
@@ -23,7 +28,7 @@ export type ErdGroup = { label: string; x: number; y: number; w: number; h: numb
 export type ErdLayout = {
   pos: Map<string, { x: number; y: number }>;
   bbox: { x: number; y: number; w: number; h: number };
-  /** Flattened per-rank id lists (cluster ranks, members contiguous) — test/metric introspection. */
+  /** Flattened per-ring id lists (cluster BFS rings, members contiguous) — test/metric introspection. */
   layers: string[][];
   /** Labeled containers behind multi-member naming families. */
   groups: ErdGroup[];
@@ -40,9 +45,9 @@ const GROUP_LABEL_H = 20;
 const SWEEPS = 4;
 const Y_PASSES = 3;
 /**
- * Adaptive sub-column height budget: scale with the content's total card area
- * so every layout (a 6-table family or a 90-cluster component) shapes itself
- * roughly square-ish instead of one long strip — grid/matrix use of both axes.
+ * Adaptive sub-column height budget for FAMILY INTERNALS: scale with the
+ * members' total card area so a family block shapes itself roughly square-ish
+ * instead of one long strip.
  */
 const colBudget = (nodes: { w: number; h: number }[]) => {
   const area = nodes.reduce((a, n) => a + n.w * n.h, 0);
@@ -81,14 +86,14 @@ export function assignFamilies(names: string[]): Map<string, string> {
   return out;
 }
 
-// ---------------- shared layered engine ----------------
+// ---------------- family-internal layered engine ----------------
 
 type CoreNode = { id: string; w: number; h: number };
 type CoreResult = {
   pos: Map<string, { x: number; y: number }>;
   w: number;
   h: number;
-  /** ids per rank, in final order. */
+  /** ids per rank/ring, in final order. */
   layers: string[][];
 };
 
@@ -125,16 +130,17 @@ function breakCycles(ids: string[], edges: ErdEdge[]): ErdEdge[] {
 }
 
 /**
- * The layered engine: cycle-break → longest-path layering → tighten (a node
- * nothing references pulls right, adjacent to its nearest target) → barycenter
- * ordering → sub-column wrap → stacked y + neighbor-median refinement.
- * Used twice: members inside a family, and family super-nodes in a component.
+ * Small layered engine for FAMILY INTERNALS only: cycle-break → longest-path
+ * layering → tighten (a node nothing references pulls right, adjacent to its
+ * nearest target) → barycenter ordering → sub-column wrap → stacked y +
+ * neighbor-median refinement. Families are small (2–20 tables), so the
+ * left-to-right mini-flow stays compact inside its container.
  */
 function layeredCore(nodes: CoreNode[], edgesIn: ErdEdge[], budget = 1000): CoreResult {
   const ids = nodes.map((n) => n.id).sort();
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const idSet = new Set(ids);
-  const pairKey = (e: ErdEdge) => `${e.from}${e.to}`;
+  const pairKey = (e: ErdEdge) => `${e.from}${e.to}`;
   const edges = [...new Map(
     edgesIn.filter((e) => idSet.has(e.from) && idSet.has(e.to) && e.from !== e.to).map((e) => [pairKey(e), e]),
   ).values()].sort((a, b) => (pairKey(a) < pairKey(b) ? -1 : 1));
@@ -200,8 +206,7 @@ function layeredCore(nodes: CoreNode[], edgesIn: ErdEdge[], budget = 1000): Core
 
   // Sub-column wrap: HEIGHT-balanced (barycenter order preserved → neighbors
   // stay adjacent). Each layer's total stack height is split into roughly
-  // equal columns under a budget — a rank with one tall family block and many
-  // small singletons becomes a compact rectangle, not a ragged strip.
+  // equal columns under a budget.
   const subCols: string[][][] = layers.map((l) => {
     const totalH = l.reduce((a, id) => a + byId.get(id)!.h, 0) + Math.max(0, l.length - 1) * NODE_GAP;
     const tallest = Math.max(0, ...l.map((id) => byId.get(id)!.h));
@@ -221,8 +226,7 @@ function layeredCore(nodes: CoreNode[], edgesIn: ErdEdge[], budget = 1000): Core
     return out2;
   });
 
-  // X: each sub-column is exactly as wide as ITS widest member — a giant
-  // family block never inflates the slots of neighboring singleton columns.
+  // X: each sub-column is exactly as wide as ITS widest member.
   const subX = new Map<string, number>();
   let x = 0;
   for (let i = 0; i < layers.length; i++) {
@@ -279,6 +283,249 @@ function layeredCore(nodes: CoreNode[], edgesIn: ErdEdge[], budget = 1000): Core
   return { pos, w, h, layers };
 }
 
+// ---------------- proximity packer (top-level cluster placement) ----------------
+
+const PACK_RING_STEP = 0.25; // candidate ring spacing, in normalized card units
+const PACK_RING_OVERSHOOT = 1.5; // keep scanning this far past the first free ring
+const PACK_CENTROID_PULL = 0.18; // gentle pull toward the blob center (curls chains, rounds the blob)
+const PACK_REFINE_PASSES = 2;
+const PACK_RMAX = 240; // normalized-unit search ceiling (absurdly large fallback)
+
+type Rect = { x: number; y: number; w: number; h: number };
+
+/** Two rects must keep `gap` clear air between them (0.5px slack for float noise). */
+const rectsClash = (a: Rect, b: Rect, gap: number) =>
+  a.x < b.x + b.w + gap - 0.5 && b.x < a.x + a.w + gap - 0.5 && a.y < b.y + b.h + gap - 0.5 && b.y < a.y + a.h + gap - 0.5;
+
+/** Coarse spatial hash so candidate-overlap checks stay flat on big schemas. */
+class Occupancy {
+  private cell = 384;
+  private map = new Map<string, Rect[]>();
+  private keysOf(r: Rect, pad: number): string[] {
+    const x0 = Math.floor((r.x - pad) / this.cell);
+    const x1 = Math.floor((r.x + r.w + pad) / this.cell);
+    const y0 = Math.floor((r.y - pad) / this.cell);
+    const y1 = Math.floor((r.y + r.h + pad) / this.cell);
+    const keys: string[] = [];
+    for (let cx = x0; cx <= x1; cx++) for (let cy = y0; cy <= y1; cy++) keys.push(`${cx},${cy}`);
+    return keys;
+  }
+  insert(r: Rect) {
+    for (const k of this.keysOf(r, 0)) (this.map.get(k) ?? this.map.set(k, []).get(k)!).push(r);
+  }
+  remove(r: Rect) {
+    for (const k of this.keysOf(r, 0)) {
+      const list = this.map.get(k);
+      if (list) this.map.set(k, list.filter((x) => x !== r));
+    }
+  }
+  collides(r: Rect, gap: number): boolean {
+    for (const k of this.keysOf(r, gap)) {
+      const list = this.map.get(k);
+      if (!list) continue;
+      for (const other of list) if (rectsClash(r, other, gap)) return true;
+    }
+    return false;
+  }
+}
+
+/**
+ * Greedy adjacency packer: seed = most-connected node; each next node (picked
+ * by strongest connection to the already-placed set) lands on the nearest
+ * free spot to the weighted centroid of its placed neighbors. Distances are
+ * normalized by average card dimensions, so the blob spends X and Y in
+ * proportion to what a card costs on each axis. A small centroid pull keeps
+ * chains curling into the blob instead of ribboning off. Refinement sweeps
+ * then relocate any node that has a strictly cheaper free spot near its FULL
+ * neighborhood. Zero overlap and determinism hold by construction.
+ */
+function proximityPack(nodes: CoreNode[], edgesIn: ErdEdge[]): CoreResult {
+  const ids = nodes.map((n) => n.id).sort();
+  if (!ids.length) return { pos: new Map(), w: 0, h: 0, layers: [] };
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const idSet = new Set(ids);
+
+  // Undirected pair weights (A→B and B→A collapse into weight 2).
+  const wKey = (a: string, b: string) => (a < b ? `${a}\x1f${b}` : `${b}\x1f${a}`);
+  const weight = new Map<string, number>();
+  for (const e of edgesIn) {
+    if (!idSet.has(e.from) || !idSet.has(e.to) || e.from === e.to) continue;
+    const k = wKey(e.from, e.to);
+    weight.set(k, (weight.get(k) ?? 0) + 1);
+  }
+  const neighbors = new Map<string, { id: string; w: number }[]>(ids.map((id) => [id, []]));
+  for (const [k, w] of [...weight.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    const [a, b] = k.split("\x1f");
+    neighbors.get(a)!.push({ id: b, w });
+    neighbors.get(b)!.push({ id: a, w });
+  }
+  const degree = new Map(ids.map((id) => [id, neighbors.get(id)!.reduce((a, n) => a + n.w, 0)]));
+
+  // Normalization: one "unit" ≈ one card + gap on that axis.
+  const ax = ids.reduce((a, id) => a + byId.get(id)!.w, 0) / ids.length + NODE_GAP;
+  const ay = ids.reduce((a, id) => a + byId.get(id)!.h, 0) / ids.length + NODE_GAP;
+  const ndist = (x1: number, y1: number, x2: number, y2: number) => Math.hypot((x1 - x2) / ax, (y1 - y2) / ay);
+
+  const rects = new Map<string, Rect>(); // top-left space
+  const centerOf = (id: string) => {
+    const r = rects.get(id)!;
+    return { x: r.x + r.w / 2, y: r.y + r.h / 2 };
+  };
+  const occ = new Occupancy();
+
+  type Spot = { rect: Rect; cost: number };
+  const findSpot = (
+    w: number,
+    h: number,
+    target: { x: number; y: number },
+    nbs: { id: string; w: number }[],
+    centroid: { x: number; y: number },
+  ): Spot | null => {
+    let best: Spot | null = null;
+    let foundR = Number.POSITIVE_INFINITY;
+    for (let r = 0; r <= PACK_RMAX; r += PACK_RING_STEP) {
+      if (r > foundR + PACK_RING_OVERSHOOT) break;
+      // m is forced to a multiple of 4 so the cardinal directions are always
+      // sampled — adjacent-card spots sit exactly on them; a diagonal-only
+      // ring clashes on both axes and would force horizontal ribboning.
+      const m = r === 0 ? 1 : Math.ceil(Math.max(8, Math.ceil((2 * Math.PI * r) / PACK_RING_STEP)) / 4) * 4;
+      for (let k = 0; k < m; k++) {
+        const th = (2 * Math.PI * k) / m;
+        const cx = target.x + Math.cos(th) * r * ax;
+        const cy = target.y + Math.sin(th) * r * ay;
+        const rect = { x: cx - w / 2, y: cy - h / 2, w, h };
+        if (occ.collides(rect, NODE_GAP)) continue;
+        if (foundR === Number.POSITIVE_INFINITY) foundR = r;
+        let cost = PACK_CENTROID_PULL * ndist(cx, cy, centroid.x, centroid.y);
+        for (const nb of nbs) {
+          const c = centerOf(nb.id);
+          cost += nb.w * ndist(cx, cy, c.x, c.y);
+        }
+        if (!best || cost < best.cost - 1e-9) best = { rect, cost };
+      }
+    }
+    return best;
+  };
+
+  // Placement order: strongest link to the placed set, then degree, then id.
+  const placed = new Set<string>();
+  const placedW = new Map(ids.map((id) => [id, 0]));
+  const order: string[] = [];
+  let sumX = 0;
+  let sumY = 0;
+  for (let step = 0; step < ids.length; step++) {
+    let pick: string | null = null;
+    for (const id of ids) {
+      if (placed.has(id)) continue;
+      if (
+        pick === null ||
+        placedW.get(id)! > placedW.get(pick)! ||
+        (placedW.get(id) === placedW.get(pick) &&
+          (degree.get(id)! > degree.get(pick)! || (degree.get(id) === degree.get(pick) && id < pick)))
+      )
+        pick = id;
+    }
+    const id = pick!;
+    const n = byId.get(id)!;
+    const nbs = neighbors.get(id)!.filter((nb) => placed.has(nb.id));
+    const centroid = placed.size ? { x: sumX / placed.size, y: sumY / placed.size } : { x: 0, y: 0 };
+    let target = centroid;
+    if (nbs.length) {
+      let tw = 0;
+      let tx = 0;
+      let ty = 0;
+      for (const nb of nbs) {
+        const c = centerOf(nb.id);
+        tx += c.x * nb.w;
+        ty += c.y * nb.w;
+        tw += nb.w;
+      }
+      target = { x: tx / tw, y: ty / tw };
+    }
+    const spot = placed.size ? findSpot(n.w, n.h, target, nbs, centroid)! : { rect: { x: -n.w / 2, y: -n.h / 2, w: n.w, h: n.h }, cost: 0 };
+    rects.set(id, spot.rect);
+    occ.insert(spot.rect);
+    placed.add(id);
+    order.push(id);
+    sumX += spot.rect.x + n.w / 2;
+    sumY += spot.rect.y + n.h / 2;
+    for (const nb of neighbors.get(id)!) placedW.set(nb.id, placedW.get(nb.id)! + nb.w);
+  }
+
+  // Refinement: relocate when a strictly cheaper free spot exists near the
+  // FULL neighborhood (placement only saw earlier nodes). Centroid snapshots
+  // per pass keep float order canonical.
+  for (let pass = 0; pass < PACK_REFINE_PASSES; pass++) {
+    let cSumX = 0;
+    let cSumY = 0;
+    for (const id of ids) {
+      const c = centerOf(id);
+      cSumX += c.x;
+      cSumY += c.y;
+    }
+    const centroid = { x: cSumX / ids.length, y: cSumY / ids.length };
+    for (const id of order) {
+      const nbs = neighbors.get(id)!;
+      if (!nbs.length) continue;
+      const cur = rects.get(id)!;
+      let tw = 0;
+      let tx = 0;
+      let ty = 0;
+      for (const nb of nbs) {
+        const c = centerOf(nb.id);
+        tx += c.x * nb.w;
+        ty += c.y * nb.w;
+        tw += nb.w;
+      }
+      const target = { x: tx / tw, y: ty / tw };
+      const cc = { x: cur.x + cur.w / 2, y: cur.y + cur.h / 2 };
+      let curCost = PACK_CENTROID_PULL * ndist(cc.x, cc.y, centroid.x, centroid.y);
+      for (const nb of nbs) {
+        const c = centerOf(nb.id);
+        curCost += nb.w * ndist(cc.x, cc.y, c.x, c.y);
+      }
+      occ.remove(cur);
+      const spot = findSpot(cur.w, cur.h, target, nbs, centroid);
+      if (spot && spot.cost < curCost - 1e-6) {
+        rects.set(id, spot.rect);
+        occ.insert(spot.rect);
+      } else {
+        occ.insert(cur);
+      }
+    }
+  }
+
+  // BFS rings from the seed (sorted neighbor order) — the `layers` introspection.
+  const ring = new Map<string, number>([[order[0], 0]]);
+  const queue = [order[0]];
+  while (queue.length) {
+    const cur = queue.shift()!;
+    for (const nb of neighbors.get(cur)!) {
+      if (!ring.has(nb.id)) {
+        ring.set(nb.id, ring.get(cur)! + 1);
+        queue.push(nb.id);
+      }
+    }
+  }
+  const nRings = Math.max(0, ...ring.values()) + 1;
+  const layers: string[][] = Array.from({ length: nRings }, () => []);
+  for (const id of ids) layers[ring.get(id) ?? 0].push(id);
+
+  const minX = Math.min(...ids.map((id) => rects.get(id)!.x));
+  const minY = Math.min(...ids.map((id) => rects.get(id)!.y));
+  const pos = new Map<string, { x: number; y: number }>();
+  let w = 0;
+  let h = 0;
+  for (const id of ids) {
+    const r = rects.get(id)!;
+    const p = { x: r.x - minX, y: r.y - minY };
+    pos.set(id, p);
+    w = Math.max(w, p.x + r.w);
+    h = Math.max(h, p.y + r.h);
+  }
+  return { pos, w, h, layers };
+}
+
 // ---------------- components ----------------
 
 type Comp = { ids: string[]; edges: ErdEdge[] };
@@ -320,7 +567,7 @@ export function layoutErd(nodes: ErdNode[], edges: ErdEdge[]): ErdLayout {
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const idSet = new Set(ids);
   const clean = edges.filter((e) => idSet.has(e.from) && idSet.has(e.to) && e.from !== e.to);
-  const pairKey = (e: ErdEdge) => `${e.from}${e.to}`;
+  const pairKey = (e: ErdEdge) => `${e.from}${e.to}`;
   const uniq = [...new Map(clean.map((e) => [pairKey(e), e])).values()].sort((a, b) =>
     pairKey(a) < pairKey(b) ? -1 : 1,
   );
@@ -338,7 +585,7 @@ export function layoutErd(nodes: ErdNode[], edges: ErdEdge[]): ErdLayout {
   const allLayers: string[][] = [];
   const groups: ErdGroup[] = [];
 
-  // Each web component is laid out first (cluster-first, below), producing a
+  // Each web component is packed first (cluster-first, below), producing a
   // sized block; blocks are then SHELF-PACKED in two dimensions toward a
   // ~3:2 overall aspect — a matrix of clusters, not one endless ribbon.
   type Block = {
@@ -374,13 +621,14 @@ export function layoutErd(nodes: ErdNode[], edges: ErdEdge[]): ErdLayout {
       clusterNodes.push({ id: f, w: r.w + GROUP_PAD * 2, h: r.h + GROUP_PAD * 2 + GROUP_LABEL_H });
     }
 
-    // 3) Cluster graph: aggregated FK edges between families.
+    // 3) Cluster graph: aggregated FK edges between families, placed by the
+    //    proximity packer (each family block lands next to its referrers).
     const clusterEdges: ErdEdge[] = comp.edges
       .map((e) => ({ from: family.get(e.from)!, to: family.get(e.to)! }))
       .filter((e) => e.from !== e.to);
-    const top = layeredCore(clusterNodes, clusterEdges, colBudget(clusterNodes));
+    const top = proximityPack(clusterNodes, clusterEdges);
 
-    // Flattened rank lists: each cluster rank, members contiguous per cluster.
+    // Flattened ring lists: each cluster ring, members contiguous per cluster.
     for (const rank of top.layers) {
       allLayers.push(rank.flatMap((f) => {
         const members = clusters.get(f)!;
@@ -464,43 +712,18 @@ export function layoutErd(nodes: ErdNode[], edges: ErdEdge[]): ErdLayout {
 
 // ---------------- test metrics ----------------
 
-export function countCrossings(layout: ErdLayout, edges: ErdEdge[]): number {
-  const layerIdx = new Map<string, { layer: number; idx: number }>();
-  layout.layers.forEach((l, li) => l.forEach((id, i) => layerIdx.set(id, { layer: li, idx: i })));
-  let crossings = 0;
-  const between: { a: number; b: number }[][] = [];
-  for (const e of edges) {
-    const f = layerIdx.get(e.from);
-    const t = layerIdx.get(e.to);
-    if (!f || !t || Math.abs(f.layer - t.layer) !== 1) continue;
-    const li = Math.min(f.layer, t.layer);
-    const a = f.layer === li ? f.idx : t.idx;
-    const b = f.layer === li ? t.idx : f.idx;
-    (between[li] ??= []).push({ a, b });
-  }
-  for (const list of between) {
-    if (!list) continue;
-    for (let i = 0; i < list.length; i++) {
-      for (let j = i + 1; j < list.length; j++) {
-        const e1 = list[i];
-        const e2 = list[j];
-        if ((e1.a - e2.a) * (e1.b - e2.b) < 0) crossings++;
-      }
-    }
-  }
-  return crossings;
-}
-
-export function meanEdgeSpan(layout: ErdLayout, edges: ErdEdge[]): number {
-  const layerOf = new Map<string, number>();
-  layout.layers.forEach((l, li) => l.forEach((id) => layerOf.set(id, li)));
+/** Mean FK edge length in px (table centers) — the proximity objective. */
+export function meanEdgeLength(layout: ErdLayout, nodes: ErdNode[], edges: ErdEdge[]): number {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
   let total = 0;
   let n = 0;
   for (const e of edges) {
-    const f = layerOf.get(e.from);
-    const t = layerOf.get(e.to);
-    if (f === undefined || t === undefined) continue;
-    total += Math.abs(t - f);
+    const a = layout.pos.get(e.from);
+    const b = layout.pos.get(e.to);
+    const an = byId.get(e.from);
+    const bn = byId.get(e.to);
+    if (!a || !b || !an || !bn) continue;
+    total += Math.hypot(a.x + an.w / 2 - (b.x + bn.w / 2), a.y + an.h / 2 - (b.y + bn.h / 2));
     n++;
   }
   return n ? total / n : 0;

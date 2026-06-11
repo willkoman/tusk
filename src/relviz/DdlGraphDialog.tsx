@@ -496,14 +496,24 @@ export function DdlGraphDialog(props: {
                               const sp = epos(l(), e.srcTable);
                               const dp = epos(l(), e.dstTable);
                               if (!sp || !dp) return null;
-                              const leftToRight = sp.x <= dp.x;
-                              const x1 = sp.x + (leftToRight ? ERD_W : 0);
-                              const x2 = dp.x + (leftToRight ? 0 : ERD_W);
                               const clamp = (y: number, top: number, h: number) => Math.max(top + 8, Math.min(top + h - 8, y));
                               const y1 = clamp(erdRowY(st, e.srcCols[0] ?? "", sp.y) + fanOffset(fan.si, fan.sn), sp.y, erdCardH(st));
                               const y2 = clamp(erdRowY(dt, e.dstCols[0] ?? "", dp.y) + fanOffset(fan.di, fan.dn), dp.y, erdCardH(dt));
+                              // Vertically stacked cards (heavy x-overlap) get a
+                              // right-side loop — the left/right S-curve degenerates
+                              // into a near-vertical squiggle through the cards.
+                              const xOverlap = Math.min(sp.x, dp.x) + ERD_W - Math.max(sp.x, dp.x);
+                              if (xOverlap > ERD_W * 0.55) {
+                                const x1 = sp.x + ERD_W;
+                                const x2 = dp.x + ERD_W;
+                                const cx = Math.max(x1, x2) + 46;
+                                return { d: `M ${x1} ${y1} C ${cx} ${y1}, ${cx} ${y2}, ${x2} ${y2}`, lx: cx, ly: (y1 + y2) / 2 - 5 };
+                              }
+                              const leftToRight = sp.x <= dp.x;
+                              const x1 = sp.x + (leftToRight ? ERD_W : 0);
+                              const x2 = dp.x + (leftToRight ? 0 : ERD_W);
                               const mx = (x1 + x2) / 2;
-                              return { x1, x2, y1, y2, mx };
+                              return { d: `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`, lx: mx, ly: (y1 + y2) / 2 - 5 };
                             });
                             const lit = () => hoverEdge() === key || hoverTable() === e.srcTable || hoverTable() === e.dstTable;
                             return (
@@ -513,12 +523,12 @@ export function DdlGraphDialog(props: {
                                     class="rel-edge"
                                     classList={{ ubiq: dampedHubs().has(e.dstTable) && !lit() }}
                                     style={{ stroke: edgeColor(e.dstTable) }}
-                                    d={`M ${geom()!.x1} ${geom()!.y1} C ${geom()!.mx} ${geom()!.y1}, ${geom()!.mx} ${geom()!.y2}, ${geom()!.x2} ${geom()!.y2}`}
+                                    d={geom()!.d}
                                     onMouseEnter={() => setHoverEdge(key)}
                                     onMouseLeave={() => setHoverEdge(null)}
                                   />
                                   <Show when={hoverEdge() === key || (hoverTable() !== null && lit())}>
-                                    <text class="rel-edge-label" x={geom()!.mx} y={(geom()!.y1 + geom()!.y2) / 2 - 5} text-anchor="middle">{edgeLabel(e)}</text>
+                                    <text class="rel-edge-label" x={geom()!.lx} y={geom()!.ly} text-anchor="middle">{edgeLabel(e)}</text>
                                   </Show>
                                 </g>
                               </Show>
