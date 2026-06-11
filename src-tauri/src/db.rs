@@ -80,6 +80,10 @@ pub enum QueryOutcome {
         columns: Vec<String>,
         rows: Vec<Vec<Option<String>>>,
         done: bool,
+        /// Advisory context for the status line (e.g. "earlier statements
+        /// executed — only the last result is shown").
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     Exec {
         message: String,

@@ -61,6 +61,28 @@ export function gridViewFor(ncols: number): GridView {
   return { ...EMPTY_GRID_VIEW, order: Array.from({ length: ncols }, (_, i) => i) };
 }
 
+// --- in-grid pending edits (per tab, ephemeral — cleared on epoch bump) ---
+// Snapshot rows are NEVER mutated: edits overlay rows by index, and commit WHERE
+// clauses read the ORIGINAL snapshot values.
+export type PendingEdits = {
+  /** rowIdx -> origColIdx -> new value (null = SQL NULL). */
+  cells: Record<number, Record<number, string | null>>;
+  /** Row indices marked for DELETE (delete wins over cell edits on the same row). */
+  deletes: number[];
+  /** New rows, sparse: only touched cells present (null = explicit NULL; absent = column omitted from INSERT). */
+  inserts: Record<number, string | null>[];
+};
+
+export const EMPTY_PENDING: PendingEdits = { cells: {}, deletes: [], inserts: [] };
+
+/** Total pending change count (edited rows + deletes + inserts). */
+export function pendingCount(p: PendingEdits | undefined): number {
+  if (!p) return 0;
+  const deletes = new Set(p.deletes);
+  const editedRows = Object.keys(p.cells).filter((r) => !deletes.has(+r)).length;
+  return editedRows + p.deletes.length + p.inserts.length;
+}
+
 export type Tab = {
   id: string;
   title: string;
@@ -78,6 +100,10 @@ export type Tab = {
    * parsed plan itself is never stored — it's derived lazily from the snapshot.
    */
   resultView?: "grid" | "plan";
+  /** Last-used parameter values for this tab's queries (ephemeral, not persisted). */
+  paramValues?: Record<string, { value: string; raw: boolean; isNull: boolean }>;
+  /** Uncommitted in-grid edits (ephemeral, not persisted; cleared on epoch bump). */
+  pending?: PendingEdits;
 };
 
 let counter = 0;

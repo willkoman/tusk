@@ -8,9 +8,12 @@ import { AiPanel } from "./ai/AiPanel";
 import { type AiContext } from "./ai/context";
 import { type CursorInfo, type EditorPrefs, type ServerDiag } from "./editor/types";
 import { prefsStore, tabsStore, type PersistedTabs } from "./store";
-import { makeTab, basename, gridViewFor, type Tab, type ResultSnapshot, type GridView, type SortKey, type Filter } from "./tabs";
+import { makeTab, basename, gridViewFor, pendingCount, type Tab, type ResultSnapshot, type GridView, type SortKey, type Filter, type PendingEdits } from "./tabs";
 import { ResultGrid } from "./ResultGrid";
-import { wrapQuery, wrappableQuery, stripTrailingSemi } from "./grid/query";
+import { wrapQuery, wrappableQuery, stripTrailingSemi, hasDuplicateColumns } from "./grid/query";
+import { editTarget, editPlan, type EditPlan } from "./grid/editable";
+import { buildCommitScript } from "./grid/editSql";
+import { makeIndexer } from "./sql/aliases";
 import { type Dataset, parseCSV, parseJSON, formatWithOptions } from "./formats";
 import { ExportDialog } from "./forms/ExportDialog";
 import { FORMAT_EXT, type ExportOptions, type ExportScope } from "./export";
@@ -26,11 +29,14 @@ import { keymapStore } from "./store";
 import { historyStore, makeEntryId, type HistoryEntry } from "./history/store";
 import { HistoryPanel } from "./history/HistoryPanel";
 import { CommandPalette } from "./CommandPalette";
+import { detectParams, type Param, type ParamValue } from "./sql/params";
+import { type FkEdge } from "./sql/fk";
+import { ParamDialog } from "./forms/ParamDialog";
 import { detectPlan } from "./plan/detect";
 import { explainSql, analyzeExecutesWrite } from "./plan/explainSql";
 import { PlanView } from "./plan/PlanView";
 import { DdlGraphDialog } from "./relviz/DdlGraphDialog";
-import { Dialog } from "./Dialog";
+import { Dialog, SqlPreview } from "./Dialog";
 import { Icon } from "./Icons";
 import { ident, qualify, qualifyIn, setSqlDialect } from "./sql/ident";
 import * as ddl from "./sql/ddl";
@@ -49,9 +55,11 @@ type Profile = {
   sslmode?: string | null;
   read_only: boolean;
   default_connect: boolean;
+  driver?: string | null;
+  path?: string | null;
 };
 type QueryOutcome =
-  | { kind: "rows"; columns: string[]; rows: (string | null)[][]; done: boolean }
+  | { kind: "rows"; columns: string[]; rows: (string | null)[][]; done: boolean; note?: string }
   | { kind: "exec"; message: string };
 type FetchResult = { rows: (string | null)[][]; done: boolean };
 
@@ -163,9 +171,16 @@ function App() {
   const canCreateSchema = () => !pEnforced() || !!perms()?.createInCurrentDb;
   const canCreateDatabase = () => !pEnforced() || !!perms()?.canCreateDb;
   const canTruncate = (s: string, t: string) => ownsTable(s, t) || !!tablePriv(s, t)?.truncate;
-  // Merge into a MenuItem: read-only wins, then the privilege; supplies a tooltip reason.
-  const gate = (allowed: boolean, reason: string): { disabled?: boolean; title?: string } =>
-    conn()?.readOnly ? { disabled: true, title: "Connection is read-only" } : allowed ? {} : { disabled: true, title: reason };
+  // Merge into a MenuItem: read-only wins, then driver support (the sidebar DDL
+  // builders in sql/ddl.ts emit Postgres syntax — offering them on MySQL/SQLite/
+  // DuckDB produced SQL errors at apply time), then the privilege. Every gate()
+  // call site is a mutating DDL item, so the driver check belongs here centrally.
+  const gate = (allowed: boolean, reason: string): { disabled?: boolean; title?: string } => {
+    if (conn()?.readOnly) return { disabled: true, title: "Connection is read-only" };
+    if (caps() && caps()!.kind !== "postgres")
+      return { disabled: true, title: `DDL editing isn't supported for ${driverLabel(caps()!.kind)} yet` };
+    return allowed ? {} : { disabled: true, title: reason };
+  };
   const [host, setHost] = createSignal("localhost");
   const [port, setPort] = createSignal(5432);
   const [user, setUser] = createSignal("");
@@ -186,6 +201,9 @@ function App() {
   const [schema, setSchema] = createSignal<TableInfo[]>([]);
   // Lowercase function/procedure catalog for the unknown-function lint.
   const [funcs, setFuncs] = createSignal<ReadonlySet<string>>(new Set<string>());
+  // Live FK edges for the JOIN…ON completion (active schema + public, merged).
+  const [fkEdges, setFkEdges] = createSignal<FkEdge[]>([]);
+  const fkFetched = new Set<string>(); // schemas already fetched (cleared per introspection)
   // Per-table detail (columns/indexes/constraints), fetched lazily on expand and cached.
   const [details, setDetails] = createSignal<Record<string, RelationDetail>>({});
   const loadedRels = new Map<string, { schema: string; name: string }>();
@@ -263,6 +281,12 @@ function App() {
   });
   createEffect(() => {
     document.documentElement.dataset.theme = resolvedTheme() === "light" ? "light" : "dark";
+  });
+
+  // Lazily fetch FK edges when a tab switches to a not-yet-fetched schema.
+  createEffect(() => {
+    const s = activeTab().searchSchema;
+    if (s && conn()) void fetchFkSchema(s);
   });
 
   // Font pref → --mono (editor gets it via themeFor; grid/code via CSS).
@@ -363,6 +387,34 @@ function App() {
     const t = makeTab({ sql: sqlText, searchSchema: schema, title });
     setTabs((ts) => [...ts, t]);
     switchTab(t.id);
+  }
+
+  // --- tab QoL: rename / close-many / drag-reorder ---
+  const [renameTab, setRenameTab] = createSignal<{ id: string; title: string } | null>(null);
+  let dragTabId: string | null = null;
+
+  function moveTabTo(dragId: string, targetId: string, before: boolean) {
+    setTabs((ts) => {
+      const from = ts.findIndex((t) => t.id === dragId);
+      let to = ts.findIndex((t) => t.id === targetId);
+      if (from < 0 || to < 0 || from === to) return ts;
+      const next = ts.slice();
+      const [moved] = next.splice(from, 1);
+      to = next.findIndex((t) => t.id === targetId);
+      next.splice(before ? to : to + 1, 0, moved);
+      return next;
+    });
+  }
+
+  /** Close every tab matching the predicate, skipping dirty ones (reported). */
+  function closeTabsWhere(pred: (t: Tab, i: number, arr: Tab[]) => boolean) {
+    const all = tabs();
+    const targets = all.filter((t, i) => pred(t, i, all));
+    const kept = targets.filter((t) => t.dirty);
+    for (const t of targets) {
+      if (!t.dirty) removeTab(t.id);
+    }
+    if (kept.length) setStatus(`kept ${kept.length} unsaved tab${kept.length > 1 ? "s" : ""}`);
   }
 
   function removeTab(id: string) {
@@ -483,7 +535,180 @@ function App() {
   // result grid: per-tab view + sort/filter re-run, Load-all
   const gridView = () => activeTab().gridView;
   const setGridView = (patch: Partial<GridView>) => patchTab(activeTabId(), { gridView: { ...activeTab().gridView, ...patch } });
-  const canSortFilter = () => wrappableQuery(activeTab().result.baseQuery);
+  const canSortFilter = () =>
+    wrappableQuery(activeTab().result.baseQuery) &&
+    // MySQL refuses duplicate column names inside a derived table (error 1060),
+    // so the sort/filter wrap can't work on such results there.
+    !(caps()?.kind === "mysql" && hasDuplicateColumns(activeTab().result.columns));
+  // --- in-grid data editing ---
+  // Editability of the active tab's result: single-table SELECT + loaded detail
+  // with a PK fully present in the result. `want` asks the effect below to fetch
+  // the missing table detail (the memo recomputes when `details()` updates).
+  type EditCtx = {
+    editable: boolean;
+    reason: string;
+    plan: Extract<EditPlan, { ok: true }> | null;
+    want?: { schema: string; name: string };
+  };
+  const editIndexer = makeIndexer();
+  // Narrow dedupe memos: `activeTab()` gets a new identity on EVERY patchTab
+  // (each keystroke, each pending edit) — these notify downstream only when the
+  // actual value/reference changes, so editTarget's lex doesn't rerun per keystroke.
+  const editBaseQ = createMemo(() => activeTab().result.baseQuery);
+  const editCols = createMemo(() => activeTab().result.columns);
+  const editCtx = createMemo<EditCtx>(() => {
+    const c = conn();
+    const cols = editCols();
+    if (!c || !cols.length) return { editable: false, reason: "", plan: null };
+    if (c.readOnly) return { editable: false, reason: "connection is read-only", plan: null };
+    const tgt = editTarget(editBaseQ(), editIndexer(schema()));
+    if (!tgt.ok) return { editable: false, reason: tgt.reason, plan: null };
+    // PG permission model: no write privilege at all → don't offer editing
+    // (partial privileges still commit — the server enforces per statement).
+    if (perms()?.enforced && !isSuper()) {
+      const tp = tablePriv(tgt.table.schema, tgt.table.name);
+      if (tp && !tp.isOwner && !tp.update && !tp.insert && !tp.delete)
+        return { editable: false, reason: `no write privilege on ${tgt.table.name}`, plan: null };
+    }
+    const det = details()[`${tgt.table.schema}.${tgt.table.name}`];
+    if (!det)
+      return { editable: false, reason: "loading table info…", plan: null, want: { schema: tgt.table.schema, name: tgt.table.name } };
+    const p = editPlan(det, cols, tgt.table);
+    if (!p.ok) return { editable: false, reason: p.reason, plan: null };
+    return { editable: true, reason: "", plan: p };
+  });
+  // Fetch the missing relation detail (cached + inflight-guarded in loadDetail).
+  createEffect(() => {
+    const w = editCtx().want;
+    if (w) void loadDetail(w.schema, w.name);
+  });
+
+  // Memo (not a plain accessor): activeTab()'s identity changes on every patchTab
+  // (each editor keystroke) — the memo dedupes by the pending object's reference,
+  // so the grid's overlay memos only recompute on actual edits.
+  const tabPending = createMemo(() => activeTab().pending);
+  const setPendingFor = (tabId: string, p: PendingEdits | undefined) => patchTab(tabId, { pending: p });
+  const isPendingEmpty = (p: PendingEdits) => !Object.keys(p.cells).length && !p.deletes.length && !p.inserts.length;
+  const ensurePending = (): PendingEdits => tabPending() ?? { cells: {}, deletes: [], inserts: [] };
+
+  // val: string = new value, null = SQL NULL, undefined = revert (drop the entry).
+  function onEditCell(r: number, c: number, val: string | null | undefined) {
+    // Defense-in-depth (the grid already gates): never record an edit on a column
+    // the commit script wouldn't write, and never while not editable.
+    const ec = editCtx();
+    if (!ec.editable || !(ec.plan?.isTableCol[c] ?? false)) return;
+    const t = activeTab();
+    const nLoaded = t.result.rows.length;
+    const p = ensurePending();
+    if (r >= nLoaded) {
+      const i = r - nLoaded;
+      if (!p.inserts[i]) return;
+      const inserts = p.inserts.map((x, k) => (k === i ? { ...x } : x));
+      if (val === undefined) delete inserts[i][c];
+      else inserts[i][c] = val;
+      setPendingFor(t.id, { ...p, inserts });
+      return;
+    }
+    const orig = t.result.rows[r]?.[c] ?? null;
+    const cells = { ...p.cells };
+    const rowEdits = { ...(cells[r] ?? {}) };
+    if (val === undefined || val === orig) delete rowEdits[c]; // editing back to the original is not a change
+    else rowEdits[c] = val;
+    if (Object.keys(rowEdits).length) cells[r] = rowEdits;
+    else delete cells[r];
+    const np = { ...p, cells };
+    setPendingFor(t.id, isPendingEmpty(np) ? undefined : np);
+  }
+
+  /** Toggle delete-marks on loaded rows; insert rows are removed outright. */
+  function onMarkDelete(rowIdx: number[]) {
+    if (!editCtx().editable || !rowIdx.length) return;
+    const t = activeTab();
+    const nLoaded = t.result.rows.length;
+    const p = ensurePending();
+    const rmIns = new Set(rowIdx.filter((r) => r >= nLoaded).map((r) => r - nLoaded));
+    const inserts = rmIns.size ? p.inserts.filter((_, i) => !rmIns.has(i)) : p.inserts;
+    const loaded = rowIdx.filter((r) => r < nLoaded);
+    const cur = new Set(p.deletes);
+    const allMarked = loaded.length > 0 && loaded.every((r) => cur.has(r));
+    for (const r of loaded) allMarked ? cur.delete(r) : cur.add(r);
+    const np = { ...p, deletes: [...cur].sort((a, b) => a - b), inserts };
+    setPendingFor(t.id, isPendingEmpty(np) ? undefined : np);
+  }
+
+  function onAddRow() {
+    if (!editCtx().editable) return;
+    const p = ensurePending();
+    setPendingFor(activeTabId(), { ...p, inserts: [...p.inserts, {}] });
+  }
+
+  // Commit dialog: preview the generated script, run it as one transactional
+  // script (run_query → script::run), then clear pending + refresh the grid.
+  const [commitView, setCommitView] = createSignal<{ script: string[] } | null>(null);
+  const [commitBusy, setCommitBusy] = createSignal(false);
+  const [commitErr, setCommitErr] = createSignal("");
+  const [confirmDiscard, setConfirmDiscard] = createSignal<{ count: number; run: () => void } | null>(null);
+
+  function openCommit() {
+    const ec = editCtx();
+    const t = activeTab();
+    if (!ec.editable || !ec.plan || !t.pending || running()) return;
+    const script = buildCommitScript({
+      schema: ec.plan.schema,
+      table: ec.plan.table,
+      columns: t.result.columns,
+      isTableCol: ec.plan.isTableCol,
+      pkIdx: ec.plan.pkIdx,
+      rows: t.result.rows,
+      pending: t.pending,
+      dialect: caps()?.kind,
+    });
+    if (!script.length) {
+      // Shouldn't happen (non-table cells can't be edited) — but never open a dialog
+      // that would run an empty script.
+      setStatus("no committable changes");
+      return;
+    }
+    setCommitErr("");
+    setCommitView({ script });
+  }
+
+  async function doCommit() {
+    const cv = commitView();
+    const c = conn();
+    if (!cv || !c || commitBusy() || running()) return;
+    const tabId = activeTabId();
+    setCommitBusy(true);
+    setCommitErr("");
+    try {
+      // Fully-qualified statements — no search_path dependence. Multi-statement
+      // scripts run in one transaction (rolled back wholesale on failure).
+      const sqlText = cv.script.map((s) => s + ";").join("\n");
+      await invoke<QueryOutcome>("run_query", { connectionId: c.id, sql: sqlText, pageSize: PAGE, searchPath: null });
+      setPendingFor(tabId, undefined);
+      setCommitView(null);
+      setStatus(`${cv.script.length} change${cv.script.length === 1 ? "" : "s"} applied`);
+      // Refresh the grid in place, keeping the current sort/filter view.
+      const t = tabs().find((x) => x.id === tabId);
+      if (t) {
+        const v = t.gridView;
+        const base = t.result.baseQuery;
+        const sqlToRun = v.sorts.length || v.filters.length ? wrapQuery(base, v.sorts, v.filters, t.result.columns, caps()?.kind) : base;
+        void executeQuery(sqlToRun, base, "wrapped");
+      }
+    } catch (e) {
+      setCommitErr(errMsg(e)); // pending kept — the transaction rolled back
+    } finally {
+      setCommitBusy(false);
+    }
+  }
+
+  function discardPending() {
+    const n = pendingCount(tabPending());
+    if (!n) return;
+    setConfirmDiscard({ count: n, run: () => setPendingFor(activeTabId(), undefined) });
+  }
+
   const [loadingAll, setLoadingAll] = createSignal(false);
   const [schemaLoading, setSchemaLoading] = createSignal(false);
   let cancelAll = false;
@@ -576,6 +801,7 @@ function App() {
     setUser("");
     setPassword("");
     setDbname("postgres");
+    setPath("");
     setSavePassword(false);
     setSslmode("prefer");
     setReadOnly(false);
@@ -585,13 +811,14 @@ function App() {
 
   function editProfile(p: Profile) {
     setEditingId(p.id);
-    setDriver("postgres");
+    setDriver((p.driver as (typeof DRIVERS)[number]["id"]) ?? "postgres");
     setName(p.name);
     setHost(p.host);
     setPort(p.port);
     setUser(p.user);
     setPassword("");
     setDbname(p.dbname);
+    setPath(p.path ?? "");
     setSavePassword(p.save_password);
     setSslmode(p.sslmode ?? "prefer");
     setReadOnly(p.read_only);
@@ -599,8 +826,11 @@ function App() {
     setConnErr("");
   }
 
+  const isEmbeddedDriver = (d?: string | null) => d === "duckdb" || d === "sqlite";
+
   function useProfile(p: Profile) {
-    if (p.save_password) connectProfile(p.id);
+    // Embedded profiles need no password; saved-password profiles connect directly.
+    if (isEmbeddedDriver(p.driver) || p.save_password) connectProfile(p.id);
     else editProfile(p);
   }
 
@@ -700,20 +930,23 @@ function App() {
   async function saveProfile() {
     setConnErr("");
     try {
+      const embedded = isEmbeddedDriver(driver());
       const p = await invoke<Profile>("save_profile", {
         profile: {
           id: editingId(),
-          name: name() || host(),
+          name: name() || (embedded ? basename(path() || ":memory:") : host()),
           host: host(),
           port: Number(port()),
           user: user(),
           dbname: dbname(),
-          save_password: savePassword(),
+          save_password: !embedded && savePassword(),
           sslmode: sslmode(),
           read_only: readOnly(),
           default_connect: defaultConnect(),
+          driver: driver(),
+          path: embedded ? path() || null : null,
         },
-        password: savePassword() && password() ? password() : null,
+        password: !embedded && savePassword() && password() ? password() : null,
       });
       setEditingId(p.id);
       await loadProfiles();
@@ -849,6 +1082,28 @@ function App() {
     } catch {
       setFuncs(new Set<string>());
     }
+    // FK catalog for JOIN completion: active schema + public, merged.
+    fkFetched.clear();
+    setFkEdges([]);
+    await fetchFkSchema(activeTab().searchSchema ?? "public");
+    if ((activeTab().searchSchema ?? "public") !== "public") await fetchFkSchema("public");
+  }
+
+  /** Fetch one schema's FK edges into fkEdges (deduped; best-effort). */
+  async function fetchFkSchema(schemaName: string) {
+    const c = conn();
+    if (!c || caps()?.relationships === false || fkFetched.has(schemaName)) return;
+    fkFetched.add(schemaName);
+    try {
+      const g = await invoke<{ tables: unknown[]; edges: FkEdge[] }>("schema_relationships", { connectionId: c.id, schema: schemaName });
+      setFkEdges((prev) => {
+        const key = (e: FkEdge) => `${e.constraint}|${e.srcSchema}.${e.srcTable}`;
+        const seen = new Set(prev.map(key));
+        return [...prev, ...g.edges.filter((e) => !seen.has(key(e)))];
+      });
+    } catch {
+      /* best-effort — completion just has fewer hints */
+    }
   }
 
   // Lazy-load one relation's detail on expand; cached unless `force`.
@@ -891,10 +1146,17 @@ function App() {
   // Shared query executor. `mode:"base"` = a user-issued query (resets sorts/filters,
   // fresh grid view if the column set changed); `mode:"wrapped"` = a sort/filter re-run
   // (keep the grid view — its sorts/filters drive the wrap).
-  async function executeQuery(sqlToRun: string, base: string, mode: "base" | "wrapped") {
+  async function executeQuery(sqlToRun: string, base: string, mode: "base" | "wrapped", force = false) {
     const c = conn();
     if (!c || running() || !sqlToRun.trim()) return;
     const runTabId = activeTabId();
+    // Re-running replaces the rows the pending edits index into — confirm first.
+    const pcount = pendingCount(tabs().find((t) => t.id === runTabId)?.pending);
+    if (pcount && !force) {
+      setConfirmDiscard({ count: pcount, run: () => void executeQuery(sqlToRun, base, mode, true) });
+      return;
+    }
+    if (pcount) patchTab(runTabId, { pending: undefined });
     const runSchema = activeTab().searchSchema;
     if (cursorOwnerTabId && cursorOwnerTabId !== runTabId) patchResult(cursorOwnerTabId, { done: true });
     cursorOwnerTabId = null;
@@ -913,7 +1175,7 @@ function App() {
         const prevCols = rt?.result.columns ?? [];
         patchResult(runTabId, {
           columns: out.columns, rows: out.rows, done: out.done, lastQuery: sqlToRun, baseQuery: base, epoch,
-          status: `${out.rows.length}${out.done ? "" : "+"} rows`,
+          status: `${out.rows.length}${out.done ? "" : "+"} rows${out.note ? ` · ${out.note}` : ""}`,
         });
         if (mode === "base") {
           patchTab(runTabId, {
@@ -976,7 +1238,21 @@ function App() {
   const [runChoice, setRunChoice] = createSignal<{ x: number; y: number } | null>(null);
   let runBtnRef: HTMLButtonElement | undefined;
 
+  // Pre-run parameter prompt state: every run path (Run button, gutter ▶,
+  // selection, history re-run, Explain) funnels through runText, so detection
+  // lives here once.
+  const [paramPrompt, setParamPrompt] = createSignal<{ text: string; params: Param[] } | null>(null);
+
   function runText(t: string) {
+    const params = detectParams(t);
+    if (params.length) {
+      setParamPrompt({ text: t, params });
+      return;
+    }
+    runTextNow(t);
+  }
+
+  function runTextNow(t: string) {
     // A multi-statement run streams only the *last* statement's result, and we don't have
     // an isolated single SELECT to re-wrap — so store a non-wrappable base (disabling grid
     // sort/filter). Conservative: any inner `;` counts as multi (never wrongly wrappable).
@@ -1018,7 +1294,7 @@ function App() {
     setGridView({ sorts, filters });
     const base = activeTab().result.baseQuery;
     if (!wrappableQuery(base)) return;
-    void executeQuery(wrapQuery(base, sorts, filters, activeTab().result.columns), base, "wrapped");
+    void executeQuery(wrapQuery(base, sorts, filters, activeTab().result.columns, caps()?.kind), base, "wrapped");
   }
 
   async function loadMore() {
@@ -1343,9 +1619,9 @@ function App() {
     setMenu({ x: e.clientX, y: e.clientY, items });
   }
 
-  // Per-node-kind action menu. Mutating items are disabled on read-only connections.
+  // Per-node-kind action menu. Mutating items are disabled on read-only
+  // connections and on drivers without PG-syntax DDL support (see gate()).
   function menuItems(n: NodeDescriptor): MenuItem[] {
-    const ro = conn()?.readOnly ?? false;
     const s = n.schema;
     const qual = s ? qualify(s, n.name) : ident(n.name);
     const copyName: MenuItem = { label: "Copy name", icon: "copy", onClick: () => copyText(n.name, `copied ${n.name}`) };
@@ -1448,25 +1724,25 @@ function App() {
       }
       case "index":
         items.push(
-          { label: "Rename…", icon: "edit", disabled: ro, onClick: () => setActiveDialog({ kind: "rename", title: `Rename index ${n.name}`, current: n.name, build: (nn) => ddl.renameIndex(s!, n.name, nn) }) },
-          { label: "Drop…", icon: "trash", danger: true, disabled: ro, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop index ${n.name}`, primaryLabel: "Drop index", showCascade: true, build: (o) => ddl.dropIndex(s!, n.name, o.cascade) }) },
+          { label: "Rename…", icon: "edit", ...gate(true, ""), onClick: () => setActiveDialog({ kind: "rename", title: `Rename index ${n.name}`, current: n.name, build: (nn) => ddl.renameIndex(s!, n.name, nn) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop index ${n.name}`, primaryLabel: "Drop index", showCascade: true, build: (o) => ddl.dropIndex(s!, n.name, o.cascade) }) },
           { sep: true },
           copyName,
         );
         break;
       case "constraint":
         items.push(
-          { label: "Rename…", icon: "edit", disabled: ro, onClick: () => setActiveDialog({ kind: "rename", title: `Rename constraint ${n.name}`, current: n.name, build: (nn) => ddl.renameConstraint(s!, n.table!, n.name, nn) }) },
-          { label: "Drop…", icon: "trash", danger: true, disabled: ro, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop constraint ${n.name}`, primaryLabel: "Drop constraint", showCascade: true, build: (o) => ddl.dropConstraint(s!, n.table!, n.name, o.cascade) }) },
+          { label: "Rename…", icon: "edit", ...gate(true, ""), onClick: () => setActiveDialog({ kind: "rename", title: `Rename constraint ${n.name}`, current: n.name, build: (nn) => ddl.renameConstraint(s!, n.table!, n.name, nn) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop constraint ${n.name}`, primaryLabel: "Drop constraint", showCascade: true, build: (o) => ddl.dropConstraint(s!, n.table!, n.name, o.cascade) }) },
           { sep: true },
           copyName,
         );
         break;
       case "sequence":
         items.push(
-          { label: "Restart… (edit value)", icon: "refresh", disabled: ro, onClick: () => editAsSql(ddl.alterSequenceRestart(s!, n.name, "1")) },
-          { label: "Rename…", icon: "edit", disabled: ro, onClick: () => setActiveDialog({ kind: "rename", title: `Rename sequence ${n.name}`, current: n.name, build: (nn) => ddl.renameSequence(s!, n.name, nn) }) },
-          { label: "Drop…", icon: "trash", danger: true, disabled: ro, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop sequence ${n.name}`, primaryLabel: "Drop sequence", showCascade: true, build: (o) => ddl.dropSequence(s!, n.name, o.cascade) }) },
+          { label: "Restart… (edit value)", icon: "refresh", ...gate(true, ""), onClick: () => editAsSql(ddl.alterSequenceRestart(s!, n.name, "1")) },
+          { label: "Rename…", icon: "edit", ...gate(true, ""), onClick: () => setActiveDialog({ kind: "rename", title: `Rename sequence ${n.name}`, current: n.name, build: (nn) => ddl.renameSequence(s!, n.name, nn) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop sequence ${n.name}`, primaryLabel: "Drop sequence", showCascade: true, build: (o) => ddl.dropSequence(s!, n.name, o.cascade) }) },
           { sep: true },
           ...copyDdl,
           copyName,
@@ -1474,12 +1750,24 @@ function App() {
         break;
       case "function":
         items.push(
-          { label: "Drop…", icon: "trash", danger: true, disabled: ro, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop function ${n.name}`, primaryLabel: "Drop function", showCascade: true, build: (o) => ddl.dropFunction(s!, n.name, o.cascade) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop function ${n.name}`, primaryLabel: "Drop function", showCascade: true, build: (o) => ddl.dropFunction(s!, n.name, o.cascade) }) },
           { sep: true },
           ...copyDdl,
           copyName,
         );
         break;
+      case "trigger": {
+        // The trigger def rides along on the node (pg_get_triggerdef) — no backend roundtrip.
+        const def = n.trigger?.def ?? "";
+        items.push(
+          { label: "Copy DDL", icon: "fileCode", onClick: () => copyText(def.endsWith(";") ? def : def + ";", "copied DDL") },
+          { label: "Copy DDL → editor", icon: "fileCode", onClick: () => editAsSql(def) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop trigger ${n.name}`, primaryLabel: "Drop trigger", showCascade: true, build: (o) => ddl.dropTrigger(s!, n.table!, n.name, o.cascade) }) },
+          { sep: true },
+          copyName,
+        );
+        break;
+      }
       default:
         items.push(copyName);
         if (s) items.push(copyQual);
@@ -1513,13 +1801,15 @@ function App() {
 
   // --- connect-screen profile menu ---
   function connString(p: Profile) {
-    const base = `postgresql://${p.user}@${p.host}:${p.port}/${p.dbname}`;
+    if (isEmbeddedDriver(p.driver)) return p.path || ":memory:";
+    const scheme = p.driver === "mysql" ? "mysql" : "postgresql";
+    const base = `${scheme}://${p.user}@${p.host}:${p.port}/${p.dbname}`;
     return p.sslmode && p.sslmode !== "prefer" ? `${base}?sslmode=${p.sslmode}` : base;
   }
   async function duplicateProfile(p: Profile) {
     try {
       await invoke("save_profile", {
-        profile: { id: "", name: `${p.name} copy`, host: p.host, port: p.port, user: p.user, dbname: p.dbname, save_password: false, sslmode: p.sslmode, read_only: p.read_only, default_connect: false },
+        profile: { id: "", name: `${p.name} copy`, host: p.host, port: p.port, user: p.user, dbname: p.dbname, save_password: false, sslmode: p.sslmode, read_only: p.read_only, default_connect: false, driver: p.driver ?? "postgres", path: p.path ?? null },
         password: null,
       });
       await loadProfiles();
@@ -1538,12 +1828,11 @@ function App() {
   // --- sidebar background (empty space) menu ---
   function openSidebarMenu(e: MouseEvent) {
     e.preventDefault();
-    const ro = conn()?.readOnly ?? false;
     setMenu({
       x: e.clientX,
       y: e.clientY,
       items: [
-        { label: "New…", icon: "plus", disabled: ro, onClick: () => openPlusMenu(e) },
+        { label: "New…", icon: "plus", ...gate(true, ""), onClick: () => openPlusMenu(e) },
         { sep: true },
         { label: "Refresh", icon: "refresh", onClick: () => loadSchema() },
         { label: "Clear filter", icon: "eraser", disabled: !treeFilter(), onClick: () => setTreeFilter("") },
@@ -1598,9 +1887,9 @@ function App() {
                 {(p) => (
                   <div class="profile-row" classList={{ active: editingId() === p.id }} onContextMenu={(e) => openProfileMenu(e, p)}>
                     <div class="profile-main" onClick={() => useProfile(p)}>
-                      <div class="profile-name">🐘 {p.name || p.host}</div>
+                      <div class="profile-name">{driverMascot(p.driver)} {p.name || (isEmbeddedDriver(p.driver) ? basename(p.path || ":memory:") : p.host)}</div>
                       <div class="profile-sub">
-                        <span>{p.user}@{p.host}:{p.port}/{p.dbname}</span>
+                        <span>{isEmbeddedDriver(p.driver) ? (p.path || ":memory:") : `${p.user}@${p.host}:${p.port}/${p.dbname}`}</span>
                         <Show when={p.save_password}><Icon name="lock" /></Show>
                       </div>
                     </div>
@@ -1668,14 +1957,12 @@ function App() {
                 <div class="empty-hint">Leave blank for a scratch in-memory database.</div>
               </Show>
               <label class="checkbox"><input type="checkbox" checked={readOnly()} onChange={(e) => setReadOnly(e.currentTarget.checked)} />Read-only (block writes &amp; DDL)</label>
-              <Show when={driver() === "postgres"}>
+              <Show when={!isEmbeddedDriver(driver())}>
                 <label class="checkbox"><input type="checkbox" checked={savePassword()} onChange={(e) => setSavePassword(e.currentTarget.checked)} />Save password</label>
-                <label class="checkbox"><input type="checkbox" checked={defaultConnect()} onChange={(e) => setDefaultConnect(e.currentTarget.checked)} />Connect on startup</label>
               </Show>
+              <label class="checkbox"><input type="checkbox" checked={defaultConnect()} onChange={(e) => setDefaultConnect(e.currentTarget.checked)} />Connect on startup</label>
               <div class="form-actions">
-                <Show when={driver() === "postgres"}>
-                  <button type="button" class="ghost" onClick={saveProfile}>Save</button>
-                </Show>
+                <button type="button" class="ghost" onClick={saveProfile}>Save</button>
                 <button type="submit" disabled={connecting()}>{connecting() ? <><span class="spinner-sm" />Connecting…</> : "Connect"}</button>
               </div>
               <Show when={connErr()}><div class="error">{connErr()}</div></Show>
@@ -1756,8 +2043,32 @@ function App() {
                       class="tab"
                       classList={{ active: t.id === activeTabId() }}
                       title={t.filePath ?? t.title}
+                      draggable={true}
+                      onDragStart={() => (dragTabId = t.id)}
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        if (!dragTabId || dragTabId === t.id) return;
+                        const rect = e.currentTarget.getBoundingClientRect();
+                        const before = e.clientX < rect.left + rect.width / 2;
+                        moveTabTo(dragTabId, t.id, before);
+                      }}
+                      onDragEnd={() => (dragTabId = null)}
                       onClick={() => switchTab(t.id)}
                       onAuxClick={(e) => { if (e.button === 1) closeTab(t.id); }}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        setMenu({
+                          x: e.clientX,
+                          y: e.clientY,
+                          items: [
+                            { label: "Rename…", icon: "edit", onClick: () => setRenameTab({ id: t.id, title: t.title }) },
+                            { sep: true },
+                            { label: "Close", icon: "close", onClick: () => closeTab(t.id) },
+                            { label: "Close others", icon: "close", onClick: () => closeTabsWhere((x) => x.id !== t.id) },
+                            { label: "Close tabs to the right", icon: "close", onClick: () => closeTabsWhere((_x, i, arr) => i > arr.findIndex((y) => y.id === t.id)) },
+                          ],
+                        });
+                      }}
                     >
                       <span class="tab-title">{t.title}</span>
                       <Show when={t.dirty}><span class="tab-dot" title="Unsaved changes">●</span></Show>
@@ -1776,6 +2087,7 @@ function App() {
                 tabId={activeTabId()}
                 tables={schema()}
                 functions={funcs()}
+                fkEdges={fkEdges()}
                 activeSchema={activeTab().searchSchema}
                 dialect={activeDialect()}
                 prefs={{ ...prefs(), theme: resolvedTheme() }}
@@ -1879,6 +2191,13 @@ function App() {
                   onViewValue={(col, val) => setCellView({ col, val })}
                   onStatus={setStatus}
                   canSortFilter={canSortFilter}
+                  editable={() => editCtx().editable}
+                  editReason={() => editCtx().reason}
+                  canEditCol={(oi) => editCtx().plan?.isTableCol[oi] ?? false}
+                  pending={tabPending}
+                  onEditCell={onEditCell}
+                  onMarkDelete={onMarkDelete}
+                  onAddRow={onAddRow}
                   copyHeaders={() => prefs().copyHeaders}
                   gridStyle={() => ({
                     rowH: prefs().gridDensity === "compact" ? 22 : 28,
@@ -1914,6 +2233,17 @@ function App() {
                     <span class="spinner-sm" />streaming…
                   </Show>
                 </span>
+              </Show>
+              <Show when={editCtx().editable || pendingCount(tabPending()) > 0}>
+                <span class="sb-sep" />
+                <Show when={pendingCount(tabPending()) > 0}>
+                  <span class="sb-pending" title="Uncommitted in-grid changes">✎ {pendingCount(tabPending())} change{pendingCount(tabPending()) === 1 ? "" : "s"}</span>
+                  <button class="ghost export-btn sb-commit" onClick={openCommit} disabled={!editCtx().editable || running()} title={editCtx().editable ? "Preview & run the change script" : editCtx().reason}>Commit…</button>
+                  <button class="ghost export-btn" onClick={discardPending}>Discard</button>
+                </Show>
+                <Show when={editCtx().editable}>
+                  <button class="ghost export-btn" title="Add a new row (committed as INSERT)" onClick={onAddRow}>+ Row</button>
+                </Show>
               </Show>
               <Show when={columns().length > 0}>
                 <span class="sb-sep" />
@@ -1964,6 +2294,50 @@ function App() {
               onCopy={copyText}
               onClose={() => setDdlGraph(null)}
             />
+          )}
+        </Show>
+
+        <Show when={paramPrompt()}>
+          {(pp) => (
+            <ParamDialog
+              sql={pp().text}
+              params={pp().params}
+              initial={activeTab().paramValues}
+              onRun={(values: Record<string, ParamValue>, substituted: string) => {
+                patchTab(activeTabId(), { paramValues: { ...activeTab().paramValues, ...values } });
+                setParamPrompt(null);
+                runTextNow(substituted);
+              }}
+              onClose={() => setParamPrompt(null)}
+            />
+          )}
+        </Show>
+
+        <Show when={renameTab()}>
+          {(rt) => (
+            <Dialog title="Rename tab" width={380} onClose={() => setRenameTab(null)}>
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const title = rt().title.trim();
+                  if (title) patchTab(rt().id, { title });
+                  setRenameTab(null);
+                }}
+              >
+                <label>
+                  Title
+                  <input
+                    value={rt().title}
+                    ref={(el) => setTimeout(() => { el.focus(); el.select(); })}
+                    onInput={(e) => setRenameTab({ id: rt().id, title: e.currentTarget.value })}
+                  />
+                </label>
+                <div class="form-actions">
+                  <button type="button" class="ghost" onClick={() => setRenameTab(null)}>Cancel</button>
+                  <button type="submit" class="run">Rename</button>
+                </div>
+              </form>
+            </Dialog>
           )}
         </Show>
 
@@ -2056,6 +2430,38 @@ function App() {
               onExportClipboard={exportToClipboard}
               onCancel={cancelOperation}
             />
+          )}
+        </Show>
+        <Show when={commitView()}>
+          {(cv) => (
+            <Dialog title="Commit changes" width={620} onClose={() => setCommitView(null)} dismissable={!commitBusy()}>
+              <p class="confirm-text">
+                {cv().script.length} statement{cv().script.length === 1 ? "" : "s"} will run in one transaction (rolled back wholesale on failure).
+              </p>
+              <SqlPreview sql={cv().script.map((s) => s + ";").join("\n")} />
+              <Show when={commitErr()}>
+                <div class="error">{commitErr()}</div>
+              </Show>
+              <div class="form-actions">
+                <button class="ghost" disabled={commitBusy()} onClick={() => setCommitView(null)}>Cancel</button>
+                <button class="run" disabled={commitBusy()} onClick={() => void doCommit()}>
+                  {commitBusy() ? "Committing…" : "Commit"}
+                </button>
+              </div>
+            </Dialog>
+          )}
+        </Show>
+        <Show when={confirmDiscard()}>
+          {(cd) => (
+            <Dialog title="Discard pending changes?" width={420} onClose={() => setConfirmDiscard(null)}>
+              <p class="confirm-text">
+                This discards {cd().count} uncommitted change{cd().count === 1 ? "" : "s"} in the result grid.
+              </p>
+              <div class="form-actions">
+                <button class="ghost" onClick={() => setConfirmDiscard(null)}>Keep changes</button>
+                <button class="btn-danger" onClick={() => { const r = cd().run; setConfirmDiscard(null); r(); }}>Discard</button>
+              </div>
+            </Dialog>
           )}
         </Show>
         <Show when={confirmClose()}>

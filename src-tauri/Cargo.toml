@@ -42,6 +42,15 @@ rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
 # !Sync-connection problem) and its `Value` enum makes all-text extraction easy.
 mysql_async = { version = "0.34", default-features = false, features = ["default-rustls"] }
 
+# Dev builds: full debuginfo for the bundled DuckDB/Arrow/SQLite tree costs
+# ~20 GB of target/ artifacts and regularly fills the disk. line-tables-only
+# keeps usable backtraces at a fraction of the size; deps get none at all.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [dev-dependencies]
 # Test-only: async test runtime (the app uses Tauri's runtime, so the main tokio dep
 # stays lean). Enables `#[tokio::test]` for the driver conformance suite.

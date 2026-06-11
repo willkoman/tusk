@@ -12,6 +12,8 @@ import {
   type Col,
   type Table,
 } from "./aliases";
+import { joinConditions } from "./joinHints";
+import { type FkEdge } from "./fk";
 
 export type { Col, Table };
 
@@ -29,6 +31,7 @@ export function makeSqlCompletion(
   getTables: () => Table[],
   spec: DialectSpec,
   getActiveSchema: () => string | null = () => null,
+  getFkEdges: () => FkEdge[] = () => [],
 ) {
   const kwOptions: Completion[] = spec.keywords.map((label) => ({ label, type: "keyword", boost: -50 }));
   const stmtKwOptions: Completion[] = spec.statementKeywords.map((label) => ({ label, type: "keyword", boost: 50 }));
@@ -123,7 +126,18 @@ export function makeSqlCompletion(
           : idx.tables.flatMap((t) =>
               t.columns.map((c) => ({ label: c.name, type: "property", detail: `${c.data_type} · ${t.name}`, boost: 10 } as Completion)),
             );
-        options = [...cols, ...fnOptions, ...kwOptions];
+        // FK-aware JOIN hints: right after ON, propose complete join conditions
+        // (`o.user_id = u.id`) from the live FK catalog, ranked above columns.
+        const fkHints: Completion[] =
+          lastKw === "ON"
+            ? joinConditions(doc.slice(stmtStart, ctx.pos), idx, getFkEdges()).map((cond) => ({
+                label: cond,
+                type: "text",
+                detail: "foreign key",
+                boost: 95,
+              }))
+            : [];
+        options = [...fkHints, ...cols, ...fnOptions, ...kwOptions];
       } else {
         options = [...inScopeCols, ...tableOptions, ...fnOptions, ...kwOptions, ...typeOptions];
       }

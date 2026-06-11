@@ -349,6 +349,72 @@ async fn relationship_battery(b: &mut Backend, eng: &Eng) {
     exec(b, &format!("DROP TABLE IF EXISTS {}", q("rel_parent"))).await;
 }
 
+// --- script atomicity + exec-message + paged-export batteries (v0.4.0 sweep) ---
+
+async fn sweep_battery(b: &mut Backend, eng: &Eng) {
+    let q = eng.quote;
+
+    // B0: a multi-statement DML script failing mid-way leaves NOTHING applied.
+    exec(b, &format!("DROP TABLE IF EXISTS {}", q("atomic_t"))).await;
+    exec(b, &format!("CREATE TABLE {} (a INTEGER)", q("atomic_t"))).await;
+    let items = crate::script::split(&format!(
+        "INSERT INTO {0} VALUES (1); INSERT INTO no_such_table_xyz VALUES (2); INSERT INTO {0} VALUES (3);",
+        q("atomic_t")
+    ));
+    let res = b.run_script(&items, false).await;
+    assert!(res.is_err(), "[{}] failing script must error", eng.name);
+    let n = all(b, &format!("SELECT COUNT(*) FROM {}", q("atomic_t"))).await;
+    assert_eq!(cell(&n[0], 0).as_deref(), Some("0"), "[{}] failed script rolled back fully", eng.name);
+
+    // B0: user-managed transactions are NOT double-wrapped.
+    let items2 = crate::script::split(&format!(
+        "BEGIN; INSERT INTO {0} VALUES (7); COMMIT;",
+        q("atomic_t")
+    ));
+    b.run_script(&items2, false).await
+        .unwrap_or_else(|e| panic!("[{}] user-txn script: {}", eng.name, e.message));
+    let n2 = all(b, &format!("SELECT COUNT(*) FROM {}", q("atomic_t"))).await;
+    assert_eq!(cell(&n2[0], 0).as_deref(), Some("1"), "[{}] user-txn script applied", eng.name);
+
+    // B6: DDL exec message is exactly "OK" — no bogus "(0 rows affected)".
+    b.rollback_cursor().await;
+    let out = b
+        .run_single(&format!("DROP TABLE {}", q("atomic_t")), 100, false)
+        .await
+        .unwrap();
+    match out {
+        QueryOutcome::Exec { message } => assert_eq!(message, "OK", "[{}] DDL message", eng.name),
+        _ => panic!("[{}] DDL should be Exec", eng.name),
+    }
+}
+
+/// B1: paged export crosses the 10k batch boundary with an exact row count.
+async fn export_battery(b: &mut Backend, eng: &Eng) {
+    let q = eng.quote;
+    exec(b, &format!("DROP TABLE IF EXISTS {}", q("exp_t"))).await;
+    exec(b, &format!("CREATE TABLE {} (n INTEGER)", q("exp_t"))).await;
+    // Bulk-fill 25k rows in one statement. A 125×200 cross join keeps recursion
+    // depth ≤200 (MySQL's cte_max_recursion_depth defaults to 1000).
+    exec(b, &format!(
+        "INSERT INTO {} SELECT (a.n - 1) * 200 + b.n FROM \
+         (WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM g WHERE n < 125) SELECT n FROM g) AS a, \
+         (WITH RECURSIVE h(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM h WHERE n < 200) SELECT n FROM h) AS b",
+        q("exp_t")
+    )).await;
+    let path = std::env::temp_dir().join(format!("tusk_export_{}_{}.csv", eng.name, std::process::id()));
+    let p = path.to_string_lossy().to_string();
+    let opts: crate::export::ExportOptions = serde_json::from_str(r#"{"format":"csv"}"#).unwrap();
+    let n = crate::export::run_export_paged(b, &format!("SELECT n FROM {} ORDER BY n", q("exp_t")), &opts, &p)
+        .await
+        .unwrap_or_else(|e| panic!("[{}] paged export: {}", eng.name, e.message));
+    assert_eq!(n, 25_000, "[{}] export row count", eng.name);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.lines().count(), 25_001, "[{}] csv lines incl. header", eng.name);
+    assert!(text.starts_with("n"), "[{}] header row", eng.name);
+    let _ = std::fs::remove_file(&path);
+    exec(b, &format!("DROP TABLE IF EXISTS {}", q("exp_t"))).await;
+}
+
 // --- entry points ---
 
 #[tokio::test]
@@ -357,6 +423,8 @@ async fn conformance_duckdb() {
     let eng = Eng { name: "duckdb", schema: "main", quote: dq };
     run_battery(&mut b, &eng).await;
     relationship_battery(&mut b, &eng).await;
+    sweep_battery(&mut b, &eng).await;
+    export_battery(&mut b, &eng).await;
 }
 
 #[tokio::test]
@@ -365,6 +433,8 @@ async fn conformance_sqlite() {
     let eng = Eng { name: "sqlite", schema: "main", quote: dq };
     run_battery(&mut b, &eng).await;
     relationship_battery(&mut b, &eng).await;
+    sweep_battery(&mut b, &eng).await;
+    export_battery(&mut b, &eng).await;
 }
 
 #[tokio::test]
@@ -377,6 +447,8 @@ async fn conformance_postgres() {
     let eng = Eng { name: "postgres", schema: "public", quote: dq };
     run_battery(&mut b, &eng).await;
     relationship_battery(&mut b, &eng).await;
+    sweep_battery(&mut b, &eng).await;
+    export_battery(&mut b, &eng).await;
 }
 
 #[tokio::test]
@@ -389,6 +461,8 @@ async fn conformance_mysql() {
     let eng = Eng { name: "mysql", schema: "test", quote: bt };
     run_battery(&mut b, &eng).await;
     relationship_battery(&mut b, &eng).await;
+    sweep_battery(&mut b, &eng).await;
+    export_battery(&mut b, &eng).await;
 }
 
 // --- read-only enforcement (production safety) ---

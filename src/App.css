@@ -347,6 +347,23 @@ button.ghost { background: transparent; }
 .rg-cell.active { outline: 1.5px solid var(--accent); outline-offset: -1.5px; z-index: 1; }
 .null { color: var(--muted); font-style: italic; }
 
+/* --- in-grid editing overlays --- */
+.rg-cell.rg-dirty { background: rgba(230, 170, 60, 0.16); box-shadow: inset 2px 0 0 #e6aa3c; }
+.rg-cell.rg-dirty.sel { background: rgba(230, 170, 60, 0.28); }
+.rg-row.rg-del .rg-cell { text-decoration: line-through; opacity: 0.55; background: rgba(224, 80, 80, 0.10); }
+.rg-row.rg-new .rg-cell { background: rgba(80, 200, 120, 0.10); }
+.rg-gutnum.rg-del { color: #e05050; text-decoration: line-through; }
+.rg-gutnum.rg-new { color: #4cc878; font-weight: 700; }
+.rg-defaultval::before { content: "default"; color: var(--muted); font-style: italic; opacity: 0.6; font-size: 11px; }
+.rg-edit {
+  position: absolute; z-index: 3; box-sizing: border-box;
+  font-size: 12px; font-family: var(--mono); padding: 0 9px;
+  background: var(--bg); color: var(--text);
+  border: 1.5px solid var(--accent); border-radius: 0; outline: none;
+}
+.sb-pending { color: #e6aa3c; font-weight: 600; white-space: nowrap; }
+.sb-commit:not(:disabled) { color: var(--accent); }
+
 .statusbar { display: flex; align-items: center; gap: 10px; padding: 5px 12px; border-top: 1px solid var(--border); background: var(--panel); color: var(--muted); font-size: 12px; }
 .sb-sep { width: 1px; height: 12px; background: var(--border); flex-shrink: 0; }
 .status-elapsed { display: inline-flex; align-items: center; gap: 5px; font-variant-numeric: tabular-nums; }

@@ -2,7 +2,7 @@ import { createSignal, createMemo, createEffect, on, For, Show, type Accessor } 
 import { type Dataset, toTSV, toCSV, toJSON, toMarkdown } from "./formats";
 import { clipWrite } from "./clipboard";
 import { type MenuItem } from "./ContextMenu";
-import { type GridView, type SortKey, type Filter } from "./tabs";
+import { type GridView, type SortKey, type Filter, type PendingEdits } from "./tabs";
 
 // Hand-rolled, two-axis-virtualized, read-only result grid. Uses a synchronized-pane
 // layout (header + gutter are transform-translated siblings of the body scroller, NOT
@@ -49,6 +49,19 @@ export type ResultGridProps = {
   copyHeaders: Accessor<boolean>;
   /** Appearance prefs (read via accessor inside memos/JSX — never captured). */
   gridStyle: Accessor<GridStyle>;
+  /** In-grid editing: whether the current result is editable (single-table SELECT w/ PK). */
+  editable: Accessor<boolean>;
+  /** Human reason when not editable (shown in the cell context menu). */
+  editReason: Accessor<string>;
+  /** Uncommitted edits overlay (snapshot rows are never mutated). */
+  pending: Accessor<PendingEdits | undefined>;
+  /** Whether this ORIGINAL column belongs to the target table (defense-in-depth; non-table cells never edit). */
+  canEditCol: (origCol: number) => boolean;
+  /** Record a cell edit: null = SQL NULL, undefined = revert (clear pending entry). */
+  onEditCell: (row: number, origCol: number, val: string | null | undefined) => void;
+  /** Toggle delete-marks on the given virtual row indices (insert rows are removed). */
+  onMarkDelete: (rows: number[]) => void;
+  onAddRow: () => void;
 };
 
 export function ResultGrid(props: ResultGridProps) {
@@ -79,7 +92,23 @@ export function ResultGrid(props: ResultGridProps) {
     return out;
   });
   const contentW = () => offsets()[offsets().length - 1] || 0;
-  const totalH = createMemo(() => props.rows().length * rowH());
+
+  // --- pending-edits overlay (virtual rows = loaded rows + insert rows) ---
+  const nLoaded = () => props.rows().length;
+  const nIns = () => props.pending()?.inserts.length ?? 0;
+  const nRows = createMemo(() => nLoaded() + nIns());
+  const delSet = createMemo(() => new Set(props.pending()?.deletes ?? []));
+  const insRec = (r: number) => props.pending()?.inserts[r - nLoaded()];
+  /** Displayed value: pending edit > snapshot; insert rows read their sparse record. */
+  const cellVal = (r: number, oi: number): string | null => {
+    if (r >= nLoaded()) return insRec(r)?.[oi] ?? null;
+    const e = props.pending()?.cells[r]?.[oi];
+    return e !== undefined ? e : props.rows()[r]?.[oi] ?? null;
+  };
+  const isDirty = (r: number, oi: number) => r < nLoaded() && props.pending()?.cells[r]?.[oi] !== undefined;
+  const isInsUntouched = (r: number, oi: number) => r >= nLoaded() && insRec(r)?.[oi] === undefined;
+
+  const totalH = createMemo(() => nRows() * rowH());
 
   function colAt(x: number): number {
     const o = offsets();
@@ -95,7 +124,7 @@ export function ResultGrid(props: ResultGridProps) {
 
   const visRows = createMemo(() => {
     const start = Math.max(0, Math.floor(scrollTop() / rowH()) - ROW_OVERSCAN);
-    const end = Math.min(props.rows().length, start + Math.ceil(viewportH() / rowH()) + ROW_OVERSCAN * 2);
+    const end = Math.min(nRows(), start + Math.ceil(viewportH() / rowH()) + ROW_OVERSCAN * 2);
     return { start, end };
   });
   const visCols = createMemo(() => {
@@ -153,6 +182,7 @@ export function ResultGrid(props: ResultGridProps) {
   createEffect(
     on(resultKey, (key, prev) => {
       setSel(EMPTY_SEL);
+      setEditing(null);
       const tab = key.split(":")[0];
       const switched = !prev || prev.split(":")[0] !== tab;
       if (!switched) scrollMem.set(tab, { top: 0, left: 0 }); // new query → reset
@@ -210,7 +240,7 @@ export function ResultGrid(props: ResultGridProps) {
   function cellFromPtr(cx: number, cy: number) {
     const sc = scroller!;
     const b = sc.getBoundingClientRect();
-    const r = Math.max(0, Math.min(props.rows().length - 1, Math.floor((cy - b.top + sc.scrollTop) / rowH())));
+    const r = Math.max(0, Math.min(nRows() - 1, Math.floor((cy - b.top + sc.scrollTop) / rowH())));
     const c = Math.max(0, Math.min(displayCols().length - 1, colAt(cx - b.left + sc.scrollLeft)));
     return { r, c };
   }
@@ -280,16 +310,75 @@ export function ResultGrid(props: ResultGridProps) {
     beginDrag(e);
   }
   function selectAll() {
-    const nr = props.rows().length,
+    const nr = nRows(),
       nc = displayCols().length;
     if (!nr || !nc) return;
     setSel({ mode: "range", ar: 0, ac: 0, fr: nr - 1, fc: nc - 1 });
   }
 
+  // --- inline cell editing ---
+  const [editing, setEditing] = createSignal<{ r: number; dc: number } | null>(null);
+  let editInput: HTMLInputElement | undefined;
+  let editOrig: string | null = null; // displayed value when the editor opened
+  let editCancelled = false;
+  function beginEdit(r: number, dc: number) {
+    if (!props.editable() || delSet().has(r)) return;
+    const oi = displayCols()[dc];
+    if (oi === undefined || !props.canEditCol(oi)) return;
+    editOrig = cellVal(r, oi);
+    editCancelled = false;
+    setSel({ mode: "cell", ar: r, ac: dc, fr: r, fc: dc });
+    setEditing({ r, dc });
+    scrollCellIntoView(r, dc);
+  }
+  function commitEdit(move?: "down" | "right") {
+    const ed = editing();
+    if (!ed || !editInput) return;
+    const v = editInput.value;
+    setEditing(null);
+    // Typing nothing over a NULL is not an edit (don't turn NULL into '').
+    if (!(editOrig === null && v === "")) props.onEditCell(ed.r, displayCols()[ed.dc], v);
+    focusGrid();
+    if (move === "down") moveSelTo(ed.r + 1, ed.dc);
+    if (move === "right") moveSelTo(ed.r, ed.dc + 1);
+  }
+  function cancelEdit() {
+    editCancelled = true;
+    setEditing(null);
+    focusGrid();
+  }
+  function editToNull() {
+    const ed = editing();
+    if (!ed) return;
+    editCancelled = true;
+    setEditing(null);
+    props.onEditCell(ed.r, displayCols()[ed.dc], null);
+    focusGrid();
+  }
+  function moveSelTo(r: number, c: number) {
+    r = Math.max(0, Math.min(nRows() - 1, r));
+    c = Math.max(0, Math.min(displayCols().length - 1, c));
+    setSel({ mode: "cell", ar: r, ac: c, fr: r, fc: c });
+    scrollCellIntoView(r, c);
+  }
+  /**
+   * Virtual row indices of the current selection (for delete-mark toggling).
+   * A column selection spans ALL rows — never expand that into row deletes;
+   * fall back to the clicked row instead.
+   */
+  function selectedRowIndices(clickRow?: number): number[] {
+    const s = sel();
+    if (s.mode === "none" || s.mode === "cols") return clickRow !== undefined ? [clickRow] : [];
+    const { r0, r1 } = rect();
+    const out: number[] = [];
+    for (let r = Math.max(0, r0); r <= Math.min(nRows() - 1, r1); r++) out.push(r);
+    return out;
+  }
+
   // --- keyboard ---
   function onKeyDown(e: KeyboardEvent) {
     if ((e.target as HTMLElement).tagName === "INPUT") return;
-    const nr = props.rows().length,
+    const nr = nRows(),
       nc = displayCols().length;
     if (!nr || !nc) return;
     const s = sel();
@@ -317,31 +406,40 @@ export function ResultGrid(props: ResultGridProps) {
       case "Escape": setSel({ mode: "cell", ar: fr, ac: fc, fr, fc }); break;
       case "a": if (mod) { selectAll(); e.preventDefault(); } break;
       case "c": if (mod) { void copySelection("tsv"); e.preventDefault(); } break;
+      case "Enter":
+      case "F2":
+        if (props.editable() && s.mode !== "none") { beginEdit(fr, fc); e.preventDefault(); }
+        break;
+      case "Delete":
+      case "Backspace":
+        // Row-selection only — a stray Delete on a cell selection must not mark rows.
+        if (props.editable() && s.mode === "rows") { props.onMarkDelete(selectedRowIndices()); e.preventDefault(); }
+        break;
     }
   }
 
   // --- copy ---
   function selectionDataset(): Dataset {
     const dc = displayCols();
-    const R = props.rows();
     const names = props.columns();
     const s = sel();
     let r0 = 0,
-      r1 = R.length - 1,
+      r1 = nRows() - 1,
       cols = dc;
     if (s.mode === "cell" || s.mode === "range" || s.mode === "rows") {
       const re = rect();
       r0 = Math.max(0, re.r0);
-      r1 = Math.min(R.length - 1, re.r1);
+      r1 = Math.min(nRows() - 1, re.r1);
     }
     if (s.mode === "cell" || s.mode === "range" || s.mode === "cols") {
       const re = rect();
       cols = dc.slice(Math.max(0, re.c0), Math.min(dc.length, re.c1 + 1));
     }
-    return {
-      columns: cols.map((oi) => names[oi]),
-      rows: R.slice(r0, r1 + 1).map((row) => cols.map((oi) => row[oi] ?? null)),
-    };
+    // Read through the pending overlay so copy matches what's displayed
+    // (edited cells, insert rows).
+    const rows: (string | null)[][] = [];
+    for (let r = r0; r <= r1; r++) rows.push(cols.map((oi) => cellVal(r, oi)));
+    return { columns: cols.map((oi) => names[oi]), rows };
   }
   async function copySelection(fmt: "tsv" | "csv" | "json" | "md") {
     const d = selectionDataset();
@@ -358,7 +456,7 @@ export function ResultGrid(props: ResultGridProps) {
   }
   const columnDataset = (oi: number): Dataset => ({
     columns: [props.columns()[oi]],
-    rows: props.rows().map((row) => [row[oi] ?? null]),
+    rows: Array.from({ length: nRows() }, (_, r) => [cellVal(r, oi)]),
   });
 
   // --- context menus ---
@@ -367,7 +465,26 @@ export function ResultGrid(props: ResultGridProps) {
     e.stopPropagation();
     if (!isSel(r, dc)) setSel({ mode: "cell", ar: r, ac: dc, fr: r, fc: dc });
     const name = props.columns()[oi];
+    const editItems: MenuItem[] = [];
+    if (props.editable()) {
+      const selRows = selectedRowIndices(r);
+      const allDel = selRows.length > 0 && selRows.every((x) => delSet().has(x));
+      const colOk = props.canEditCol(oi) && !delSet().has(r);
+      editItems.push(
+        { label: "Edit cell", icon: "edit", disabled: !colOk, title: colOk ? undefined : "column doesn't belong to the table", onClick: () => beginEdit(r, dc) },
+        { label: "Set NULL", icon: "slash", disabled: !colOk, onClick: () => props.onEditCell(r, oi, null) },
+      );
+      if (isDirty(r, oi)) editItems.push({ label: "Revert cell", icon: "eraser", onClick: () => props.onEditCell(r, oi, undefined) });
+      editItems.push(
+        { label: allDel ? `Undelete row${selRows.length > 1 ? "s" : ""}` : `Delete row${selRows.length > 1 ? "s" : ""}`, icon: "trash", danger: !allDel, onClick: () => props.onMarkDelete(selRows) },
+        { label: "Insert row", icon: "plus", onClick: () => props.onAddRow() },
+        { sep: true },
+      );
+    } else if (props.editReason()) {
+      editItems.push({ label: "Edit cell", icon: "edit", disabled: true, title: props.editReason(), onClick: () => {} }, { sep: true });
+    }
     props.onMenu(e.clientX, e.clientY, [
+      ...editItems,
       { label: "Copy", icon: "copy", onClick: () => void copySelection("tsv") },
       { label: "Copy as CSV", icon: "copy", onClick: () => void copySelection("csv") },
       { label: "Copy as JSON", icon: "copy", onClick: () => void copySelection("json") },
@@ -525,7 +642,7 @@ export function ResultGrid(props: ResultGridProps) {
       const to = reorderTo();
       if (to != null) moveColumn(headerDown.dc, to);
     } else {
-      const nr = props.rows().length;
+      const nr = nRows();
       setSel({ mode: "cols", ar: 0, ac: headerDown.dc, fr: nr - 1, fc: headerDown.dc });
       cycleSort(headerDown.oi, headerDown.shift);
     }
@@ -597,11 +714,11 @@ export function ResultGrid(props: ResultGridProps) {
             {(r) => (
               <div
                 class="rg-gutnum"
-                classList={{ sel: sel().mode === "rows" && isSel(r, 0) }}
+                classList={{ sel: sel().mode === "rows" && isSel(r, 0), "rg-del": delSet().has(r), "rg-new": r >= nLoaded() }}
                 style={{ top: `${r * rowH()}px`, height: `${rowH()}px` }}
                 onMouseDown={(e) => onGutterDown(e, r)}
               >
-                {r + 1}
+                {r >= nLoaded() ? "+" : r + 1}
               </div>
             )}
           </For>
@@ -613,23 +730,34 @@ export function ResultGrid(props: ResultGridProps) {
         <div class="rg-sizer" style={{ width: `${contentW()}px`, height: `${totalH()}px` }}>
           <For each={range(visRows().start, visRows().end)}>
             {(r) => (
-              <div class="rg-row" classList={{ odd: props.gridStyle().zebra && r % 2 === 1 }} style={{ top: `${r * rowH()}px`, height: `${rowH()}px`, width: `${contentW()}px` }}>
+              <div
+                class="rg-row"
+                classList={{ odd: props.gridStyle().zebra && r % 2 === 1, "rg-del": delSet().has(r), "rg-new": r >= nLoaded() }}
+                style={{ top: `${r * rowH()}px`, height: `${rowH()}px`, width: `${contentW()}px` }}
+              >
                 <For each={range(visCols().start, visCols().end)}>
                   {(k) => {
                     const oi = () => displayCols()[k];
-                    const val = () => props.rows()[r]?.[oi()] ?? null;
+                    const val = () => cellVal(r, oi());
                     return (
                       <div
                         class="rg-cell"
-                        classList={{ sel: isSel(r, k), active: isActive(r, k) }}
+                        classList={{ sel: isSel(r, k), active: isActive(r, k), "rg-dirty": isDirty(r, oi()) }}
                         style={{ left: `${offsets()[k]}px`, width: `${colWidth(oi())}px` }}
                         onMouseDown={(e) => onCellDown(e, r, k)}
-                        onDblClick={() => props.onViewValue(props.columns()[oi()], val())}
+                        onDblClick={(e) => {
+                          // Editable grids edit on dbl-click; Ctrl/Cmd+dbl-click (or a
+                          // non-editable column/row) falls back to View value.
+                          if (props.editable() && !(e.ctrlKey || e.metaKey) && props.canEditCol(oi()) && !delSet().has(r)) beginEdit(r, k);
+                          else props.onViewValue(props.columns()[oi()], val());
+                        }}
                         onContextMenu={(e) => onCellContext(e, r, k, oi(), val())}
                       >
-                        {val() === null
-                          ? <span class="null">{props.gridStyle().nullStyle === "null" ? "NULL" : props.gridStyle().nullStyle === "dash" ? "—" : ""}</span>
-                          : val()}
+                        {isInsUntouched(r, oi())
+                          ? <span class="rg-defaultval" title="column default" />
+                          : val() === null
+                            ? <span class="null">{props.gridStyle().nullStyle === "null" ? "NULL" : props.gridStyle().nullStyle === "dash" ? "—" : ""}</span>
+                            : val()}
                       </div>
                     );
                   }}
@@ -637,6 +765,33 @@ export function ResultGrid(props: ResultGridProps) {
               </div>
             )}
           </For>
+          <Show when={editing()}>
+            {(ed) => (
+              <input
+                class="rg-edit"
+                ref={(el) => {
+                  editInput = el;
+                  queueMicrotask(() => { el.focus(); el.select(); });
+                }}
+                style={{
+                  top: `${ed().r * rowH()}px`,
+                  left: `${offsets()[ed().dc]}px`,
+                  width: `${colWidth(displayCols()[ed().dc])}px`,
+                  height: `${rowH()}px`,
+                }}
+                value={cellVal(ed().r, displayCols()[ed().dc]) ?? ""}
+                onKeyDown={(e) => {
+                  e.stopPropagation();
+                  if (e.key === "Enter") { e.preventDefault(); commitEdit("down"); }
+                  else if (e.key === "Tab") { e.preventDefault(); commitEdit("right"); }
+                  else if (e.key === "Escape") { e.preventDefault(); cancelEdit(); }
+                  else if (e.altKey && e.key.toLowerCase() === "n") { e.preventDefault(); editToNull(); }
+                }}
+                onBlur={() => { if (!editCancelled && editing()) commitEdit(); }}
+                onMouseDown={(e) => e.stopPropagation()}
+              />
+            )}
+          </Show>
         </div>
       </div>
     </div>

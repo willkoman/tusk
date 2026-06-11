@@ -18,6 +18,36 @@ fn de<E: std::fmt::Display>(e: E) -> AppError {
     AppError::new(e.to_string())
 }
 
+/// Shared embedded-driver script runner: joins the SQL items and executes them
+/// inside an explicit BEGIN…COMMIT (best-effort ROLLBACK on error), unless the
+/// script manages its own transaction.
+fn embedded_script<C>(
+    conn: &C,
+    items: &[script::Item],
+    user_txn: bool,
+    exec: impl Fn(&C, &str) -> Result<(), AppError>,
+) -> Result<String, AppError> {
+    let sql = items
+        .iter()
+        .filter_map(|it| match it {
+            script::Item::Sql(s) => Some(s.trim()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(";\n");
+    if user_txn {
+        exec(conn, &sql)?;
+        return Ok("OK".to_string());
+    }
+    match exec(conn, &format!("BEGIN;\n{sql};\nCOMMIT;")) {
+        Ok(()) => Ok("OK".to_string()),
+        Err(e) => {
+            let _ = exec(conn, "ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 /// What a driver supports. The UI gates features on these (hide COPY-import / search-path
 /// selector / etc. where unsupported). Serialized to the frontend.
 #[derive(Clone, Copy, serde::Serialize)]
@@ -65,7 +95,7 @@ impl Capabilities {
             kind: "duckdb",
             server_cursor: false, // paged via LIMIT/OFFSET, not a server cursor
             bulk_copy: false,     // import not yet abstracted for DuckDB
-            export: false,        // export streams via a PG cursor — not yet abstracted
+            export: true,         // paged export (export::run_export_paged)
             schemas: true,
             search_path: false,
             transactional_ddl: true,
@@ -82,7 +112,7 @@ impl Capabilities {
             kind: "sqlite",
             server_cursor: false,
             bulk_copy: false,
-            export: false,
+            export: true,   // paged export
             schemas: false, // single schema
             search_path: false,
             transactional_ddl: true,
@@ -99,7 +129,7 @@ impl Capabilities {
             kind: "mysql",
             server_cursor: false,
             bulk_copy: false,
-            export: false,
+            export: true,             // paged export (not snapshot-consistent under writes)
             schemas: true,            // databases-as-schemas
             search_path: false,       // MySQL uses `USE db`, not search_path
             transactional_ddl: false, // MySQL DDL auto-commits
@@ -339,40 +369,23 @@ impl Backend {
         }
     }
 
-    /// Run a multi-statement script. PG = one transaction (script::run); DuckDB executes
-    /// the SQL items as a batch.
+    /// Run a multi-statement script — ONE transaction on every driver (PG via
+    /// script::run; DuckDB/SQLite via an explicit BEGIN…COMMIT batch wrap;
+    /// MySQL via START TRANSACTION around the loop, though MySQL DDL still
+    /// auto-commits). Scripts that manage their own transaction (a BEGIN/
+    /// COMMIT/SAVEPOINT statement anywhere) are run unwrapped — nesting would
+    /// error on SQLite and silently misbehave elsewhere.
     pub async fn run_script(
         &self,
         items: &[script::Item],
         read_only: bool,
     ) -> Result<String, AppError> {
+        let user_txn = script::has_txn_control(items);
         match self {
             Backend::Pg(p) => script::run(&p.client, items, read_only).await,
-            Backend::Duck(d) => {
-                let sql = items
-                    .iter()
-                    .filter_map(|it| match it {
-                        script::Item::Sql(s) => Some(s.trim()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(";\n");
-                d.lock().execute_batch(&sql).map_err(de)?;
-                Ok("OK".to_string())
-            }
-            Backend::Sqlite(s) => {
-                let sql = items
-                    .iter()
-                    .filter_map(|it| match it {
-                        script::Item::Sql(s) => Some(s.trim()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(";\n");
-                s.lock().execute_batch(&sql).map_err(de)?;
-                Ok("OK".to_string())
-            }
-            Backend::MySql(m) => m.run_script(items).await,
+            Backend::Duck(d) => embedded_script(&d.lock(), items, user_txn, |c, s| c.execute_batch(s).map_err(de)),
+            Backend::Sqlite(s) => embedded_script(&s.lock(), items, user_txn, |c, s| c.execute_batch(s).map_err(de)),
+            Backend::MySql(m) => m.run_script(items, user_txn).await,
         }
     }
 
@@ -713,6 +726,7 @@ impl PgConn {
                 columns,
                 rows,
                 done,
+                note: None,
             })
         } else {
             let messages = self.client.simple_query(trimmed).await?;
@@ -722,6 +736,7 @@ impl PgConn {
                     columns,
                     rows,
                     done: true,
+                    note: None,
                 })
             } else {
                 let affected: u64 = messages
@@ -733,7 +748,8 @@ impl PgConn {
                     .last()
                     .unwrap_or(0);
                 Ok(QueryOutcome::Exec {
-                    message: format!("OK ({affected} rows affected)"),
+                    // "(0 rows affected)" after a successful ALTER reads like failure.
+                    message: if script::is_ddl(trimmed) { "OK".to_string() } else { format!("OK ({affected} rows affected)") },
                 })
             }
         }
@@ -814,8 +830,19 @@ impl DuckConn {
                 columns,
                 rows,
                 done,
+                note: None,
             })
         } else {
+            // DuckDB surfaces a synthetic "Count" result column for DDL/DML run
+            // through query(), which would misclassify them as Rows — route DDL
+            // straight to execute_batch and report a clean "OK".
+            if script::is_ddl(trimmed) {
+                let g = self.lock();
+                g.execute_batch(trimmed).map_err(de)?;
+                return Ok(QueryOutcome::Exec {
+                    message: "OK".to_string(),
+                });
+            }
             let (columns, rows) = {
                 let g = self.lock();
                 duck_query(&g, trimmed)?
@@ -825,6 +852,7 @@ impl DuckConn {
                     columns,
                     rows,
                     done: true,
+                    note: None,
                 })
             } else {
                 Ok(QueryOutcome::Exec {
@@ -915,6 +943,7 @@ impl SqliteConn {
                 columns,
                 rows,
                 done,
+                note: None,
             })
         } else {
             let g = self.lock();
@@ -924,10 +953,13 @@ impl SqliteConn {
                     columns,
                     rows,
                     done: true,
+                    note: None,
                 })
             } else {
                 Ok(QueryOutcome::Exec {
-                    message: format!("OK ({} rows affected)", g.changes()),
+                    // sqlite `changes()` is STALE after DDL (reports the previous
+                    // statement's count) — and DDL counts are noise anyway.
+                    message: if script::is_ddl(trimmed) { "OK".to_string() } else { format!("OK ({} rows affected)", g.changes()) },
                 })
             }
         }
@@ -1028,6 +1060,8 @@ fn sqlite_build_tree(conn: &rusqlite::Connection) -> Result<tree::DbTree, AppErr
             name,
             kind: if is_view { "view" } else { "table" }.to_string(),
             comment: None,
+            rows: None,
+            size: None,
         };
         if is_view {
             views.push(stub);
@@ -1073,6 +1107,7 @@ fn sqlite_table_detail(
         columns,
         indexes: vec![],
         constraints: vec![],
+        triggers: vec![],
     })
 }
 
@@ -1146,6 +1181,7 @@ impl MySqlConn {
                 columns,
                 rows,
                 done,
+                note: None,
             })
         } else {
             let (columns, rows, affected) = mysql_run(&self.pool, trimmed).await?;
@@ -1154,10 +1190,11 @@ impl MySqlConn {
                     columns,
                     rows,
                     done: true,
+                    note: None,
                 })
             } else {
                 Ok(QueryOutcome::Exec {
-                    message: format!("OK ({affected} rows affected)"),
+                    message: if script::is_ddl(trimmed) { "OK".to_string() } else { format!("OK ({affected} rows affected)") },
                 })
             }
         }
@@ -1182,13 +1219,26 @@ impl MySqlConn {
         Ok(FetchResult { rows, done })
     }
 
-    async fn run_script(&self, items: &[script::Item]) -> Result<String, AppError> {
+    /// Transactional unless the script manages its own transaction. NOTE:
+    /// MySQL DDL statements implicitly commit — DML-only scripts are atomic.
+    async fn run_script(&self, items: &[script::Item], user_txn: bool) -> Result<String, AppError> {
         use mysql_async::prelude::Queryable;
         let mut conn = self.pool.get_conn().await.map_err(de)?;
+        if !user_txn {
+            conn.query_drop("START TRANSACTION").await.map_err(de)?;
+        }
         for it in items {
             if let script::Item::Sql(s) = it {
-                conn.query_drop(s.trim()).await.map_err(de)?;
+                if let Err(e) = conn.query_drop(s.trim()).await.map_err(de) {
+                    if !user_txn {
+                        let _ = conn.query_drop("ROLLBACK").await;
+                    }
+                    return Err(e);
+                }
             }
+        }
+        if !user_txn {
+            conn.query_drop("COMMIT").await.map_err(de)?;
         }
         Ok("OK".to_string())
     }
@@ -1312,6 +1362,8 @@ async fn mysql_build_tree(pool: &mysql_async::Pool) -> Result<tree::DbTree, AppE
                 name,
                 kind: if is_view { "view" } else { "table" }.to_string(),
                 comment: None,
+                rows: None,
+                size: None,
             };
             if is_view {
                 s.views.push(stub);
@@ -1360,6 +1412,7 @@ async fn mysql_table_detail(
         columns,
         indexes: vec![],
         constraints: vec![],
+        triggers: vec![],
     })
 }
 
@@ -1472,6 +1525,8 @@ fn duck_build_tree(conn: &duckdb::Connection) -> Result<tree::DbTree, AppError> 
                 name,
                 kind: if is_view { "view" } else { "table" }.to_string(),
                 comment: None,
+                rows: None,
+                size: None,
             };
             if is_view {
                 s.views.push(stub);
@@ -1526,7 +1581,7 @@ mod tests {
 
         let p1 = s.run_single("SELECT * FROM t ORDER BY a", 2, true).unwrap();
         let (cols, mut all, done1) = match p1 {
-            QueryOutcome::Rows { columns, rows, done } => (columns, rows, done),
+            QueryOutcome::Rows { columns, rows, done, .. } => (columns, rows, done),
             _ => panic!("expected rows"),
         };
         assert_eq!(cols, vec!["a", "b"]);
@@ -1565,7 +1620,7 @@ mod tests {
         // Page 1 of 2 over 3 rows: every value is text (COLUMNS(*) cast), not done.
         let p1 = d.run_single("SELECT * FROM t ORDER BY a", 2, true).unwrap();
         let (cols, mut all, done1) = match p1 {
-            QueryOutcome::Rows { columns, rows, done } => (columns, rows, done),
+            QueryOutcome::Rows { columns, rows, done, .. } => (columns, rows, done),
             _ => panic!("expected rows"),
         };
         assert_eq!(cols, vec!["a", "b"]);
@@ -1606,16 +1661,30 @@ fn duck_table_detail(
         dlit(name)
     );
     let (_c, rows) = duck_query(conn, &q)?;
+    // PK flags via pragma_table_info (information_schema carries no key info);
+    // best-effort — feeds the in-grid editor's PK requirement.
+    let pk: std::collections::HashSet<String> = duck_query(
+        conn,
+        &format!(
+            "SELECT name FROM pragma_table_info({}) WHERE pk",
+            dlit(&format!("{schema}.{name}"))
+        ),
+    )
+    .map(|(_c, rs)| rs.iter().map(|r| dcell(r, 0)).collect())
+    .unwrap_or_default();
     let columns = rows
         .iter()
-        .map(|r| tree::Column {
-            name: dcell(r, 0),
-            data_type: dcell(r, 1),
-            nullable: dcell(r, 2).eq_ignore_ascii_case("YES"),
-            is_pk: false,
-            is_fk: false,
-            default: r.get(3).and_then(|v| v.clone()),
-            comment: None,
+        .map(|r| {
+            let nm = dcell(r, 0);
+            tree::Column {
+                is_pk: pk.contains(&nm),
+                name: nm,
+                data_type: dcell(r, 1),
+                nullable: dcell(r, 2).eq_ignore_ascii_case("YES"),
+                is_fk: false,
+                default: r.get(3).and_then(|v| v.clone()),
+                comment: None,
+            }
         })
         .collect();
     Ok(tree::RelationDetail {
@@ -1625,5 +1694,6 @@ fn duck_table_detail(
         columns,
         indexes: vec![],
         constraints: vec![],
+        triggers: vec![],
     })
 }

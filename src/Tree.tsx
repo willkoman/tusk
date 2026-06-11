@@ -12,7 +12,14 @@ export type Column = {
 };
 export type Idx = { name: string; unique: boolean; primary: boolean; def: string };
 export type Con = { name: string; kind: string; def: string };
-export type RelStub = { name: string; kind: string; comment: string | null };
+export type RelStub = {
+  name: string;
+  kind: string;
+  comment: string | null;
+  rows: number | null; // planner estimate (PG reltuples); null = unknown / non-PG
+  size: string | null; // pretty total size (tables/matviews)
+};
+export type Trg = { name: string; def: string };
 export type RelationDetail = {
   name: string;
   kind: string;
@@ -20,6 +27,7 @@ export type RelationDetail = {
   columns: Column[];
   indexes: Idx[];
   constraints: Con[];
+  triggers: Trg[];
 };
 export type Func = { name: string; args: string; returns: string };
 export type SchemaT = {
@@ -41,7 +49,8 @@ export type NodeKind =
   | "index"
   | "constraint"
   | "sequence"
-  | "function";
+  | "function"
+  | "trigger";
 
 /** Identifies a tree node for the context menu / actions. */
 export type NodeDescriptor = {
@@ -51,6 +60,7 @@ export type NodeDescriptor = {
   name: string; // the object's own name (db name when kind === "database")
   detail?: RelationDetail; // loaded relation detail, when available
   column?: Column; // for kind === "column"
+  trigger?: Trg; // for kind === "trigger" (def carried so Copy DDL needs no roundtrip)
 };
 
 /** Stable identity key for selection/highlight (ignores transient `detail`). */
@@ -151,6 +161,23 @@ export function Tree(props: {
       .filter(Boolean)
       .join("\n") || undefined;
 
+  // ≈1.2K / ≈34M style row estimate for the tw-detail slot.
+  const fmtApprox = (n: number): string =>
+    n < 1_000
+      ? `${n}`
+      : n < 1_000_000
+        ? `${+(n / 1_000).toFixed(n < 10_000 ? 1 : 0)}K`
+        : n < 1_000_000_000
+          ? `${+(n / 1_000_000).toFixed(n < 10_000_000 ? 1 : 0)}M`
+          : `${+(n / 1_000_000_000).toFixed(1)}B`;
+
+  const relMeta = (rel: RelStub): string | undefined => {
+    const parts: string[] = [];
+    if (rel.rows != null) parts.push(`≈${fmtApprox(rel.rows)}`);
+    if (rel.size) parts.push(rel.size);
+    return parts.length ? parts.join(" · ") : undefined;
+  };
+
   const relation = (schema: string, rel: RelStub, depth: number) => {
     const isView = rel.kind === "view" || rel.kind === "matview";
     const kind = rel.kind as NodeKind;
@@ -158,6 +185,7 @@ export function Tree(props: {
     const ck = `${tk}:cols`;
     const ik = `${tk}:idx`;
     const xk = `${tk}:con`;
+    const gk = `${tk}:trg`;
     const dkey = `${schema}.${rel.name}`;
     const det = () => props.details[dkey] as RelationDetail | undefined;
     const openRel = () => {
@@ -171,7 +199,7 @@ export function Tree(props: {
           depth={depth}
           icon={<Icon name={isView ? "eye" : "table"} />}
           label={rel.name}
-          detail={det() ? `${det()!.columns.length}` : undefined}
+          detail={relMeta(rel) ?? (det() ? `${det()!.columns.length}` : undefined)}
           title={rel.comment ?? undefined}
           expandable
           open={isOpen(tk)}
@@ -235,6 +263,24 @@ export function Tree(props: {
                           selected={props.selectedKey === nodeKey({ kind: "constraint", schema, table: rel.name, name: cn.name })}
                           onSelect={() => props.onSelect({ kind: "constraint", schema, table: rel.name, name: cn.name })}
                           onContext={(e) => props.onContext(e, { kind: "constraint", schema, table: rel.name, name: cn.name })}
+                        />
+                      )}
+                    </For>
+                  </Show>
+                </Show>
+                <Show when={d().triggers.length}>
+                  <Row depth={depth + 1} header icon={<Icon name="bolt" />} label="Triggers" detail={`${d().triggers.length}`} expandable open={isOpen(gk)} onToggle={() => toggle(gk)} />
+                  <Show when={isOpen(gk)}>
+                    <For each={d().triggers}>
+                      {(tg) => (
+                        <Row
+                          depth={depth + 2}
+                          icon={<Icon name="bolt" />}
+                          label={tg.name}
+                          title={tg.def}
+                          selected={props.selectedKey === nodeKey({ kind: "trigger", schema, table: rel.name, name: tg.name })}
+                          onSelect={() => props.onSelect({ kind: "trigger", schema, table: rel.name, name: tg.name, trigger: tg })}
+                          onContext={(e) => props.onContext(e, { kind: "trigger", schema, table: rel.name, name: tg.name, trigger: tg })}
                         />
                       )}
                     </For>

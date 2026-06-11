@@ -518,51 +518,126 @@ pub async fn run_export_query(
     }
 }
 
-async fn stream_to_sink(client: &Client, opts: &ExportOptions, path: &str) -> Result<u64, AppError> {
-    let is_xlsx = opts.format == "xlsx";
-    let mut total: u64 = 0;
-    let mut indices: Vec<usize> = Vec::new();
-    let mut text: Option<TextEmit> = None;
-    let mut xlsx: Option<XlsxSink> = None;
+/// Shared sink feeder: lazily initializes the right sink on first column set,
+/// projects + writes rows, finishes. Used by the PG cursor stream AND the
+/// driver-paged path so the two can never drift.
+struct SinkFeeder<'a> {
+    opts: &'a ExportOptions,
+    path: &'a str,
+    is_xlsx: bool,
+    indices: Vec<usize>,
+    text: Option<TextEmit<'a>>,
+    xlsx: Option<XlsxSink<'a>>,
+    total: u64,
+}
 
+impl<'a> SinkFeeder<'a> {
+    fn new(opts: &'a ExportOptions, path: &'a str) -> Self {
+        Self { opts, path, is_xlsx: opts.format == "xlsx", indices: Vec::new(), text: None, xlsx: None, total: 0 }
+    }
+
+    fn init_cols(&mut self, cols: &[String]) {
+        if cols.is_empty() || !self.indices.is_empty() {
+            return;
+        }
+        self.indices = self.opts.indices(cols.len());
+        let pcols = project_cols(cols, &self.indices);
+        if self.is_xlsx {
+            self.xlsx = Some(XlsxSink::new(self.opts, pcols));
+        } else {
+            self.text = Some(TextEmit::new(self.opts, pcols, self.path));
+        }
+    }
+
+    async fn feed(&mut self, rows: &[Vec<Option<String>>]) -> Result<(), AppError> {
+        for row in rows {
+            let prow = project_row(row, &self.indices);
+            if self.is_xlsx {
+                self.xlsx.as_mut().unwrap().write_row(&prow)?;
+            } else {
+                self.text.as_mut().unwrap().row(&prow).await?;
+            }
+            self.total += 1;
+        }
+        Ok(())
+    }
+
+    async fn finish(self) -> Result<u64, AppError> {
+        if self.is_xlsx {
+            if let Some(s) = self.xlsx {
+                s.finish(self.path)?;
+            }
+        } else if let Some(mut t) = self.text {
+            t.finish().await?;
+        }
+        Ok(self.total)
+    }
+}
+
+async fn stream_to_sink(client: &Client, opts: &ExportOptions, path: &str) -> Result<u64, AppError> {
+    let mut feeder = SinkFeeder::new(opts, path);
     loop {
         let fetch = format!("FETCH FORWARD {BATCH} FROM {EXPORT_CURSOR}");
         let messages = client.simple_query(&fetch).await?;
         let (cols, rows) = collect_rows(&messages);
-        if !cols.is_empty() && indices.is_empty() {
-            indices = opts.indices(cols.len());
-            let pcols = project_cols(&cols, &indices);
-            if is_xlsx {
-                xlsx = Some(XlsxSink::new(opts, pcols));
-            } else {
-                text = Some(TextEmit::new(opts, pcols, path));
-            }
-        }
+        feeder.init_cols(&cols);
         if rows.is_empty() {
             break;
         }
-        for row in &rows {
-            let prow = project_row(row, &indices);
-            if is_xlsx {
-                xlsx.as_mut().unwrap().write_row(&prow)?;
-            } else {
-                text.as_mut().unwrap().row(&prow).await?;
-            }
-            total += 1;
-        }
-        if (rows.len() as u32) < BATCH {
+        let short = (rows.len() as u32) < BATCH;
+        feeder.feed(&rows).await?;
+        if short {
             break;
         }
     }
+    feeder.finish().await
+}
 
-    if is_xlsx {
-        if let Some(s) = xlsx {
-            s.finish(path)?;
+/// Driver-paged export for engines without a server-side cursor (DuckDB /
+/// SQLite / MySQL): page 1 via `run_single`, then `fetch_page` until done,
+/// through the same SinkFeeder as the PG cursor path. On error the pager is
+/// reset and the partial file removed. NOTE: LIMIT/OFFSET pages aren't
+/// snapshot-consistent under concurrent writes (same class as grid paging).
+pub async fn run_export_paged(
+    backend: &mut crate::driver::Backend,
+    sql: &str,
+    opts: &ExportOptions,
+    path: &str,
+) -> Result<u64, AppError> {
+    backend.rollback_cursor().await;
+    match paged_inner(backend, sql, opts, path).await {
+        Ok(n) => {
+            backend.rollback_cursor().await; // close any remaining pager state
+            Ok(n)
         }
-    } else if let Some(mut t) = text {
-        t.finish().await?;
+        Err(e) => {
+            backend.rollback_cursor().await;
+            let _ = tokio::fs::remove_file(path).await;
+            Err(e)
+        }
     }
-    Ok(total)
+}
+
+async fn paged_inner(
+    backend: &mut crate::driver::Backend,
+    sql: &str,
+    opts: &ExportOptions,
+    path: &str,
+) -> Result<u64, AppError> {
+    let mut feeder = SinkFeeder::new(opts, path);
+    let out = backend.run_single(sql, BATCH, true).await?;
+    let (cols, rows, mut done) = match out {
+        db::QueryOutcome::Rows { columns, rows, done, .. } => (columns, rows, done),
+        db::QueryOutcome::Exec { .. } => return Err(AppError::new("the export query returned no result set")),
+    };
+    feeder.init_cols(&cols);
+    feeder.feed(&rows).await?;
+    while !done {
+        let page = backend.fetch_page(BATCH).await?;
+        done = page.done;
+        feeder.feed(&page.rows).await?;
+    }
+    feeder.finish().await
 }
 
 /// Export an in-memory result (the rows already loaded in the grid) to `path`.

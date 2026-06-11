@@ -25,6 +25,7 @@ import {
 import { bracketMatching } from "@codemirror/language";
 import { getDialect, type DialectId } from "./sql/dialects";
 import { makeSqlCompletion } from "./sql/completion";
+import { type FkEdge } from "./sql/fk";
 import { type Table } from "./sql/aliases";
 import { DEFAULT_PREFS, type CursorInfo, type EditorPrefs, type ValidateFn } from "./editor/types";
 import { lexState, statementAt } from "./editor/lexer";
@@ -82,6 +83,8 @@ export function SqlEditor(props: {
   tables: Table[];
   /** Lowercase live function catalog (empty set = unknown-function lint off). */
   functions?: ReadonlySet<string>;
+  /** Live FK edges — powers the JOIN … ON condition completions. */
+  fkEdges?: FkEdge[];
   /** Active schema (search_path) — tables in it are offered unqualified. */
   activeSchema?: string | null;
   dialect?: DialectId;
@@ -114,7 +117,7 @@ export function SqlEditor(props: {
     return [
       sql({ dialect: spec.cm, upperCaseKeywords: true }),
       autocompletion({
-        override: [makeSqlCompletion(() => props.tables, spec, () => props.activeSchema ?? null)],
+        override: [makeSqlCompletion(() => props.tables, spec, () => props.activeSchema ?? null, () => props.fkEdges ?? [])],
         icons: true,
         defaultKeymap: false,
       }),

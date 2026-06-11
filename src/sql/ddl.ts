@@ -201,6 +201,10 @@ export function dropConstraint(schema: string, table: string, name: string, casc
   return `ALTER TABLE ${qualify(schema, table)} DROP CONSTRAINT ${ident(name)}${cascade ? " CASCADE" : ""}`;
 }
 
+export function dropTrigger(schema: string, table: string, name: string, cascade: boolean): string {
+  return `DROP TRIGGER ${ident(name)} ON ${qualify(schema, table)}${cascade ? " CASCADE" : ""}`;
+}
+
 export function truncate(
   schema: string,
   name: string,

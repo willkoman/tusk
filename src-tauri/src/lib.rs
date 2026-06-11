@@ -121,14 +121,16 @@ async fn connect_profile(
         .into_iter()
         .find(|x| x.id == id)
         .ok_or_else(|| AppError::new("no such profile"))?;
-    let password = profiles::get_password(&id);
-    if p.save_password && password.as_deref().unwrap_or("").is_empty() {
+    // Embedded drivers have no password — skip the keychain entirely.
+    let embedded = matches!(p.driver.as_deref(), Some("duckdb") | Some("sqlite"));
+    let password = if embedded { None } else { profiles::get_password(&id) };
+    if !embedded && p.save_password && password.as_deref().unwrap_or("").is_empty() {
         return Err(AppError::new(
             "couldn't read the saved password from the keychain (macOS may block keychain access for unsigned dev builds) — reconnect via the form, or re-save the connection",
         ));
     }
     let config = ConnectionConfig {
-        driver: None,
+        driver: p.driver.clone(),
         host: p.host,
         port: p.port,
         user: p.user,
@@ -136,7 +138,7 @@ async fn connect_profile(
         dbname: p.dbname,
         sslmode: p.sslmode,
         read_only: p.read_only,
-        path: None,
+        path: p.path.clone(),
     };
     let read_only = config.read_only;
     let (backend, server_version) = driver::connect(&config).await?;
@@ -269,10 +271,22 @@ async fn exec_items(
                 // If streaming the trailing read trips on a dropped connection, heal it
                 // in place and retry ONLY the read — then return alive so run_query's
                 // outer retry (which re-runs the whole batch) can't fire and double-apply.
-                let out = c.backend.run_single(last_trimmed, page, true).await;
+                let mut out = c.backend.run_single(last_trimmed, page, true).await;
                 if out.is_err() && c.backend.is_closed() {
                     ensure_alive(c).await?;
-                    return c.backend.run_single(last_trimmed, page, true).await;
+                    out = c.backend.run_single(last_trimmed, page, true).await;
+                }
+                // Tell the user the earlier statements ran too — when several
+                // are reads, their results were silently superseded by this one.
+                if let Ok(QueryOutcome::Rows { note, .. }) = &mut out {
+                    let leading_reads = items[..items.len() - 1].iter().any(|it| {
+                        matches!(it, script::Item::Sql(s) if is_cursorable(s.trim()))
+                    });
+                    *note = Some(if leading_reads {
+                        "earlier statements executed — only the last result is shown".into()
+                    } else {
+                        format!("{} earlier statement(s) executed", items.len() - 1)
+                    });
                 }
                 return out;
             }
@@ -347,9 +361,84 @@ fn is_prepareable(sql: &str) -> bool {
 
 /// PREPARE rejects statements with bind parameters ("could not determine data type
 /// of parameter $1"), which would be a false-positive lint — skip those statements.
+/// Also treats `:name` (the editor's named-parameter style, prompted at run time)
+/// as a parameter, scanning OUTSIDE strings/comments/quoted idents/dollar bodies so
+/// `'a:b'` or `::casts` don't trigger it.
 fn has_bind_params(sql: &str) -> bool {
     let b = sql.as_bytes();
-    (0..b.len()).any(|i| b[i] == b'$' && i + 1 < b.len() && b[i + 1].is_ascii_digit())
+    let n = b.len();
+    let mut i = 0usize;
+    while i < n {
+        let c = b[i];
+        // skip line comment
+        if c == b'-' && i + 1 < n && b[i + 1] == b'-' {
+            while i < n && b[i] != b'\n' { i += 1; }
+            continue;
+        }
+        // skip block comment
+        if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') { i += 1; }
+            i = (i + 2).min(n);
+            continue;
+        }
+        // skip quoted regions
+        if c == b'\'' || c == b'"' {
+            let q = c;
+            i += 1;
+            while i < n {
+                if b[i] == q {
+                    if i + 1 < n && b[i + 1] == q { i += 2; continue; }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'$' {
+            if i + 1 < n && b[i + 1].is_ascii_digit() {
+                return true; // $1-style
+            }
+            // dollar-quoted body — skip to the closing tag
+            if let Some(tag_end) = dollar_tag_end(b, i) {
+                let tag = &b[i..tag_end];
+                let mut j = tag_end;
+                while j + tag.len() <= n {
+                    if &b[j..j + tag.len()] == tag { i = j + tag.len(); break; }
+                    j += 1;
+                }
+                if j + tag.len() > n { return false; } // unterminated — nothing further to find
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b':' {
+            // `::cast` is two colons; word-adjacent colons aren't params either.
+            let prev = if i > 0 { b[i - 1] } else { b' ' };
+            let next = if i + 1 < n { b[i + 1] } else { b' ' };
+            if next == b':' || prev == b':' { i += 2.min(n - i); continue; }
+            if (next.is_ascii_alphabetic() || next == b'_')
+                && !(prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'"' || prev == b'\'' || prev == b']')
+            {
+                return true; // :name-style
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `$tag$` opener at `b[i]` → byte offset just past the closing `$` of the tag,
+/// or None when this `$` doesn't open a dollar-quote (mirrors script.rs lexing).
+fn dollar_tag_end(b: &[u8], i: usize) -> Option<usize> {
+    let n = b.len();
+    let mut j = i + 1;
+    while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+        j += 1;
+    }
+    (j < n && b[j] == b'$').then_some(j + 1)
 }
 
 /// Turn a PREPARE error into a diagnostic, remapping Postgres' 1-based position
@@ -602,8 +691,14 @@ async fn export_to_file(
             return Err(AppError::new("export streams a single query — select one statement"));
         }
         // Arm cancellation for the duration of the stream, then always disarm.
+        // PG streams through a server-side cursor (snapshot-consistent);
+        // other drivers page via LIMIT/OFFSET through the same sink feeder.
         state.arm_cancel(&id, c.backend.cancel_handle(), c.backend.config().clone());
-        let result = export::run_export_query(c.backend.pg()?, &sqls[0], &options, &path).await;
+        let result = if matches!(c.backend, driver::Backend::Pg(_)) {
+            export::run_export_query(c.backend.pg()?, &sqls[0], &options, &path).await
+        } else {
+            export::run_export_paged(&mut c.backend, &sqls[0], &options, &path).await
+        };
         state.disarm_cancel(&id);
         result
     } else if let (Some(cols), Some(rs)) = (columns, rows) {

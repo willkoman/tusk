@@ -238,6 +238,39 @@ fn is_read(sql: &str) -> bool {
         || t.starts_with("set")
 }
 
+/// First alphabetic word after comments/whitespace, lowercased.
+fn first_word(sql: &str) -> String {
+    effective_start(sql)
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// DDL / utility statements where "(N rows affected)" is meaningless noise.
+pub fn is_ddl(sql: &str) -> bool {
+    matches!(
+        first_word(sql).as_str(),
+        "create" | "alter" | "drop" | "truncate" | "comment" | "grant" | "revoke" | "vacuum"
+            | "analyze" | "analyse" | "reindex" | "set" | "reset"
+    )
+}
+
+/// True when the script manages its own transaction — wrapping it in another
+/// BEGIN/COMMIT would nest and error (SQLite) or silently misbehave.
+pub fn has_txn_control(items: &[Item]) -> bool {
+    items.iter().any(|it| {
+        let s = match it {
+            Item::Sql(s) => s.as_str(),
+            Item::Copy { stmt, .. } => stmt.as_str(),
+        };
+        matches!(
+            first_word(s).as_str(),
+            "begin" | "start" | "commit" | "end" | "rollback" | "abort" | "savepoint" | "release"
+        )
+    })
+}
+
 async fn copy_in_text(client: &Client, stmt: &str, data: &str) -> Result<u64, AppError> {
     let sink = client.copy_in(stmt).await?;
     futures_util::pin_mut!(sink);

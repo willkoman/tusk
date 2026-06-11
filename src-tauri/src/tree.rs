@@ -43,6 +43,16 @@ pub struct RelStub {
     pub name: String,
     pub kind: String, // table | view | matview
     pub comment: Option<String>,
+    /// Planner row estimate (`reltuples`); `None` when never analyzed (<0) or non-PG.
+    pub rows: Option<i64>,
+    /// Pretty total relation size — tables/matviews only.
+    pub size: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct Trigger {
+    pub name: String,
+    pub def: String,
 }
 
 /// Full per-relation detail, fetched on expand.
@@ -54,6 +64,7 @@ pub struct RelationDetail {
     pub columns: Vec<Column>,
     pub indexes: Vec<Index>,
     pub constraints: Vec<Constraint>,
+    pub triggers: Vec<Trigger>,
 }
 
 #[derive(Serialize)]
@@ -148,7 +159,9 @@ pub async fn build_shallow(client: &Client) -> Result<DbTree, AppError> {
     .await?;
 
     let rel_rows = query(client, &format!(
-        "SELECT n.nspname, c.relname, c.relkind::text, obj_description(c.oid,'pg_class') \
+        "SELECT n.nspname, c.relname, c.relkind::text, obj_description(c.oid,'pg_class'), \
+         c.reltuples::bigint, \
+         CASE WHEN c.relkind IN ('r','p','m') THEN pg_size_pretty(pg_total_relation_size(c.oid)) END \
          FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace \
          WHERE c.relkind IN ('r','p','v','m','S') AND {NS} ORDER BY n.nspname, c.relname")).await?;
 
@@ -169,22 +182,35 @@ pub async fn build_shallow(client: &Client) -> Result<DbTree, AppError> {
         let name = cell(r, 1);
         let kind = cell(r, 2);
         let comment = r.get(3).and_then(|v| v.clone());
+        // reltuples is -1 (never analyzed) → no estimate to show.
+        let rows = r
+            .get(4)
+            .and_then(|v| v.as_deref())
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|n| *n >= 0);
+        let size = r.get(5).and_then(|v| v.clone());
         schema_names.insert(s.clone());
         match kind.as_str() {
             "r" | "p" => tables.entry(s).or_default().push(RelStub {
                 name,
                 kind: "table".into(),
                 comment,
+                rows,
+                size,
             }),
             "v" => views.entry(s).or_default().push(RelStub {
                 name,
                 kind: "view".into(),
                 comment,
+                rows: None,
+                size: None,
             }),
             "m" => views.entry(s).or_default().push(RelStub {
                 name,
                 kind: "matview".into(),
                 comment,
+                rows,
+                size,
             }),
             "S" => seqs.entry(s).or_default().push(name),
             _ => {}
@@ -317,6 +343,18 @@ pub async fn table_detail(
         })
         .collect();
 
+    // User triggers only — FK-internal triggers are noise (tgisinternal).
+    let trg_rows = query(client, &format!(
+        "SELECT t.tgname, pg_get_triggerdef(t.oid) FROM pg_trigger t \
+         WHERE t.tgrelid={oid} AND NOT t.tgisinternal ORDER BY t.tgname")).await?;
+    let triggers = trg_rows
+        .iter()
+        .map(|r| Trigger {
+            name: cell(r, 0),
+            def: cell(r, 1),
+        })
+        .collect();
+
     let comment = query(client, &format!("SELECT obj_description({oid},'pg_class')"))
         .await?
         .into_iter()
@@ -330,5 +368,6 @@ pub async fn table_detail(
         columns,
         indexes,
         constraints,
+        triggers,
     })
 }
