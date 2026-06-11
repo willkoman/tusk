@@ -1833,6 +1833,35 @@ function App() {
     });
   }
 
+  const explainMenuItems = (): MenuItem[] => [
+    { label: "Explain", icon: "eye", onClick: () => runAction("explain") },
+    {
+      label: "Explain Analyze (runs the query)",
+      icon: "play",
+      disabled: caps()?.explainAnalyze === false,
+      title: caps()?.explainAnalyze === false ? "Not supported by this engine" : undefined,
+      onClick: () => runAction("explainAnalyze"),
+    },
+  ];
+  /** Narrow-toolbar ⋯ menu: the text actions that container queries hide. */
+  function openToolbarOverflow(e: MouseEvent) {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    setMenu({
+      x: r.left,
+      y: r.bottom + 4,
+      items: [
+        { label: "Open…", icon: "fileCode", onClick: openFileDialog },
+        { label: "Save", icon: "download", onClick: () => void saveActiveTab() },
+        { label: "Save As…", icon: "download", onClick: () => void saveAsActiveTab() },
+        { sep: true },
+        { label: "Format", icon: "edit", onClick: () => editorApi()?.format() },
+        { label: "Find", icon: "search", onClick: () => editorApi()?.openSearch() },
+        { sep: true },
+        ...explainMenuItems(),
+      ],
+    });
+  }
+
   // --- connect-screen profile menu ---
   function connString(p: Profile) {
     if (isEmbeddedDriver(p.driver)) return p.path || ":memory:";
@@ -2112,6 +2141,52 @@ function App() {
                 </For>
                 <button class="tab-new" title="New tab (⌘/Ctrl+T)" onClick={openNewTab}>＋</button>
               </div>
+              <div class="toolbar">
+                <button
+                  ref={(el) => (runBtnRef = el)}
+                  class="run"
+                  classList={{ cancel: running() }}
+                  onClick={() => (running() ? cancelQuery() : doRun())}
+                  disabled={cancelling()}
+                  title={running() ? "Cancel running query" : "Run selection or all"}
+                >
+                  {running()
+                    ? (cancelling() ? <><span class="spinner-sm" />Cancelling…</> : <>✕ Cancel {fmtDur(runMs())}</>)
+                    : "Run ▶"}
+                </button>
+                <button class="ghost tb-text" onClick={openFileDialog}>Open</button>
+                <button class="ghost tb-text" onClick={() => void saveActiveTab()}>Save</button>
+                <button class="ghost tb-text" onClick={() => void saveAsActiveTab()}>Save As</button>
+                <button class="ghost tb-text" onClick={() => editorApi()?.format()}>Format</button>
+                <button class="ghost tb-text" onClick={() => editorApi()?.openSearch()}>Find</button>
+                <button
+                  class="ghost tb-text"
+                  title="Visualize the query plan for the current statement"
+                  onClick={(e) => {
+                    const r = e.currentTarget.getBoundingClientRect();
+                    setMenu({ x: r.left, y: r.bottom + 4, items: explainMenuItems() });
+                  }}
+                >
+                  Explain ▾
+                </button>
+                <button class="ghost tb-more" title="More actions" onClick={openToolbarOverflow}>⋯</button>
+                <span class="hint">{displayKey(effectiveKey("run", keys())) || "unbound"} · runs selection or all</span>
+                <span class="spacer" />
+                <Show when={caps()?.searchPath !== false}>
+                  <select
+                    class="export-select"
+                    title="Active schema (search_path)"
+                    value={activeTab().searchSchema ?? ""}
+                    onChange={(e) => patchTab(activeTabId(), { searchSchema: e.currentTarget.value || null })}
+                  >
+                    <option value="">(default schema)</option>
+                    <For each={schemaNames()}>{(s) => <option value={s}>{s}</option>}</For>
+                  </select>
+                </Show>
+                <button class="icon font-btn" title="Decrease font size" onClick={() => updatePrefs({ fontSize: Math.max(9, prefs().fontSize - 1) })}><span class="az-sm">A</span></button>
+                <button class="icon font-btn" title="Increase font size" onClick={() => updatePrefs({ fontSize: Math.min(24, prefs().fontSize + 1) })}><span class="az-lg">A</span></button>
+                <button class="icon font-btn" title="Toggle word wrap" classList={{ active: prefs().wordWrap }} onClick={() => updatePrefs({ wordWrap: !prefs().wordWrap })}><Icon name="wrap" /></button>
+              </div>
               <SqlEditor
                 value={sql()}
                 onChange={(t, id) => patchTab(id, { sql: t, dirty: true })}
@@ -2131,76 +2206,55 @@ function App() {
                 onReady={setEditorApi}
                 onContextMenu={openEditorMenu}
               />
-              <div class="toolbar">
-                <button
-                  ref={(el) => (runBtnRef = el)}
-                  class="run"
-                  classList={{ cancel: running() }}
-                  onClick={() => (running() ? cancelQuery() : doRun())}
-                  disabled={cancelling()}
-                  title={running() ? "Cancel running query" : "Run selection or all"}
-                >
-                  {running()
-                    ? (cancelling() ? <><span class="spinner-sm" />Cancelling…</> : <>✕ Cancel {fmtDur(runMs())}</>)
-                    : "Run ▶"}
-                </button>
-                <button class="ghost" onClick={openFileDialog}>Open</button>
-                <button class="ghost" onClick={() => void saveActiveTab()}>Save</button>
-                <button class="ghost" onClick={() => void saveAsActiveTab()}>Save As</button>
-                <button class="ghost" onClick={() => editorApi()?.format()}>Format</button>
-                <button class="ghost" onClick={() => editorApi()?.openSearch()}>Find</button>
-                <button
-                  class="ghost"
-                  title="Visualize the query plan for the current statement"
-                  onClick={(e) => {
-                    const r = e.currentTarget.getBoundingClientRect();
-                    setMenu({
-                      x: r.left,
-                      y: r.bottom + 4,
-                      items: [
-                        { label: "Explain", icon: "eye", onClick: () => runAction("explain") },
-                        {
-                          label: "Explain Analyze (runs the query)",
-                          icon: "play",
-                          disabled: caps()?.explainAnalyze === false,
-                          title: caps()?.explainAnalyze === false ? "Not supported by this engine" : undefined,
-                          onClick: () => runAction("explainAnalyze"),
-                        },
-                      ],
-                    });
-                  }}
-                >
-                  Explain ▾
-                </button>
-                <span class="hint">{displayKey(effectiveKey("run", keys())) || "unbound"} · runs selection or all</span>
-                <span class="spacer" />
-                <Show when={caps()?.searchPath !== false}>
-                  <select
-                    class="export-select"
-                    title="Active schema (search_path)"
-                    value={activeTab().searchSchema ?? ""}
-                    onChange={(e) => patchTab(activeTabId(), { searchSchema: e.currentTarget.value || null })}
-                  >
-                    <option value="">(default schema)</option>
-                    <For each={schemaNames()}>{(s) => <option value={s}>{s}</option>}</For>
-                  </select>
-                </Show>
-                <button class="icon font-btn" title="Decrease font size" onClick={() => updatePrefs({ fontSize: Math.max(9, prefs().fontSize - 1) })}><span class="az-sm">A</span></button>
-                <button class="icon font-btn" title="Increase font size" onClick={() => updatePrefs({ fontSize: Math.min(24, prefs().fontSize + 1) })}><span class="az-lg">A</span></button>
-                <button class="icon" title="Toggle word wrap" classList={{ active: prefs().wordWrap }} onClick={() => updatePrefs({ wordWrap: !prefs().wordWrap })}><Icon name="wrap" /></button>
-              </div>
             </div>
 
             <div class="splitter" onMouseDown={startResize} />
 
             <div class="result">
-              <Show when={runErr()}><div class="error result-error">{runErr()}</div></Show>
-              <Show when={planMemo()}>
-                <div class="result-viewtoggle">
-                  <button classList={{ active: resultView() === "plan" }} onClick={() => patchTab(activeTabId(), { resultView: "plan" })}>Plan</button>
-                  <button classList={{ active: resultView() === "grid" }} onClick={() => patchTab(activeTabId(), { resultView: "grid" })}>Grid</button>
+              <Show when={columns().length > 0 || planMemo() || !done() || pendingCount(tabPending()) > 0}>
+                <div class="result-toolbar">
+                  <Show when={planMemo()}>
+                    <div class="result-viewtoggle">
+                      <button classList={{ active: resultView() === "plan" }} onClick={() => patchTab(activeTabId(), { resultView: "plan" })}>Plan</button>
+                      <button classList={{ active: resultView() === "grid" }} onClick={() => patchTab(activeTabId(), { resultView: "grid" })}>Grid</button>
+                    </div>
+                  </Show>
+                  <span class="spacer" />
+                  <Show when={!done()}>
+                    <button class="ghost export-btn" onClick={loadAll}>{loadingAll() ? <><span class="spinner-sm" />Cancel</> : "Load all"}</button>
+                    <span class="streaming" classList={{ idle: !(fetchingMore() || loadingAll()) }}>
+                      <Show when={fetchingMore() || loadingAll()} fallback={<><span class="stream-dot" />idle</>}>
+                        <span class="spinner-sm" />streaming…
+                      </Show>
+                    </span>
+                    <span class="sb-sep" />
+                  </Show>
+                  <Show when={editCtx().editable || pendingCount(tabPending()) > 0}>
+                    <Show when={pendingCount(tabPending()) > 0}>
+                      <span class="sb-pending" title="Uncommitted in-grid changes">✎ {pendingCount(tabPending())} change{pendingCount(tabPending()) === 1 ? "" : "s"}</span>
+                      <button class="ghost export-btn sb-commit" onClick={openCommit} disabled={!editCtx().editable || running()} title={editCtx().editable ? "Preview & run the change script" : editCtx().reason}>Commit…</button>
+                      <button class="ghost export-btn" onClick={discardPending}>Discard</button>
+                    </Show>
+                    <Show when={editCtx().editable}>
+                      <button class="ghost export-btn" title="Add a new row (committed as INSERT)" onClick={onAddRow}>+ Row</button>
+                    </Show>
+                    <span class="sb-sep" />
+                  </Show>
+                  <Show when={columns().length > 0}>
+                    <label class="checkbox sb-copyhdr" title="Include column names as a header row when copying from the results grid (default: off)">
+                      <input type="checkbox" checked={prefs().copyHeaders} onChange={(e) => updatePrefs({ copyHeaders: e.currentTarget.checked })} />
+                      Copy w/ column names
+                    </label>
+                  </Show>
+                  <Show when={(lastQuery() || columns().length > 0) && caps()?.export !== false}>
+                    <span class="sb-sep" />
+                    <button class="ghost export-btn" onClick={openExport}>Export…</button>
+                  </Show>
+                  <span class="sb-sep" />
+                  <span class="status-elapsed"><Icon name="clock" /> {elapsed()} ms</span>
                 </div>
               </Show>
+              <Show when={runErr()}><div class="error result-error">{runErr()}</div></Show>
               <Show when={planMemo() && resultView() === "plan"}>
                 <PlanView
                   plan={() => planMemo()!}
@@ -2261,39 +2315,6 @@ function App() {
                   </span>
                 )}
               </Show>
-              <Show when={!done()}>
-                <span class="sb-sep" />
-                <button class="ghost export-btn" onClick={loadAll}>{loadingAll() ? <><span class="spinner-sm" />Cancel</> : "Load all"}</button>
-                <span class="streaming" classList={{ idle: !(fetchingMore() || loadingAll()) }}>
-                  <Show when={fetchingMore() || loadingAll()} fallback={<><span class="stream-dot" />idle</>}>
-                    <span class="spinner-sm" />streaming…
-                  </Show>
-                </span>
-              </Show>
-              <Show when={editCtx().editable || pendingCount(tabPending()) > 0}>
-                <span class="sb-sep" />
-                <Show when={pendingCount(tabPending()) > 0}>
-                  <span class="sb-pending" title="Uncommitted in-grid changes">✎ {pendingCount(tabPending())} change{pendingCount(tabPending()) === 1 ? "" : "s"}</span>
-                  <button class="ghost export-btn sb-commit" onClick={openCommit} disabled={!editCtx().editable || running()} title={editCtx().editable ? "Preview & run the change script" : editCtx().reason}>Commit…</button>
-                  <button class="ghost export-btn" onClick={discardPending}>Discard</button>
-                </Show>
-                <Show when={editCtx().editable}>
-                  <button class="ghost export-btn" title="Add a new row (committed as INSERT)" onClick={onAddRow}>+ Row</button>
-                </Show>
-              </Show>
-              <Show when={columns().length > 0}>
-                <span class="sb-sep" />
-                <label class="checkbox sb-copyhdr" title="Include column names as a header row when copying from the results grid (default: off)">
-                  <input type="checkbox" checked={prefs().copyHeaders} onChange={(e) => updatePrefs({ copyHeaders: e.currentTarget.checked })} />
-                  Copy w/ column names
-                </label>
-              </Show>
-              <Show when={(lastQuery() || columns().length > 0) && caps()?.export !== false}>
-                <span class="sb-sep" />
-                <button class="ghost export-btn" onClick={openExport}>Export…</button>
-              </Show>
-              <span class="sb-sep" />
-              <span class="status-elapsed"><Icon name="clock" /> {elapsed()} ms</span>
             </footer>
           </main>
           <Show when={aiOpen()}>

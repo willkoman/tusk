@@ -4,6 +4,13 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-06-11
+
+### Changed
+- **Workspace toolbars reorganized + responsive.** The editor toolbar (Run / file ops / Format / Find / Explain / schema / font / wrap) now sits **above the editor** under the tab strip, and a new **result toolbar above the output** carries everything result-specific: the Plan/Grid toggle (no longer floating over the grid), Load all + streaming state, the pending-edit controls (✎ count / Commit… / Discard / + Row), "Copy w/ column names", Export…, and the elapsed-time readout. The footer status bar slims down to the status message + cursor position. The editor toolbar is responsive via container queries on the editor pane (so sidebar resizing counts): the shortcut hint drops first, then the text actions collapse into a ⋯ overflow menu (same actions, plus Explain), then the font/wrap icons hide — nothing clips, and every collapsed action stays reachable.
+- **AI chat streams smoothly and stops yanking the scroll.** Each streamed delta replaced the last message object, and the list was keyed on object identity — so the entire assistant bubble's DOM was torn down and rebuilt on every chunk (choppy rendering), and an unconditional scroll-to-bottom ran per delta (reading scrolled-up text was impossible while streaming). The message list now keys by position (the streaming bubble's DOM is patched, not rebuilt), and auto-scroll only engages while you're actually at the bottom — scrolling up releases the pin, scrolling back down (or sending a new message) re-engages it.
+- **Theme contrast pass.** Light theme: TRUE pills, new-row markers, dirty-cell amber, the pending-edit counter, the row-count chip on selected tree rows, and the new-column highlight in Modify table were all dark-surface tints that washed out on white — re-pinned to saturated light-palette equivalents. Both themes: deleted-row gutter numbers, the updater error line, and the AI "key saved" check now ride the semantic `--danger`/`--ok` variables instead of hardcoded dark-theme colors.
+
 ## [0.4.7] - 2026-06-11
 
 ### Changed

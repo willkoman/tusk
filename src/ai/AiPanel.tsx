@@ -1,4 +1,4 @@
-import { createSignal, createEffect, For, Show, onMount, type Accessor } from "solid-js";
+import { createSignal, createEffect, For, Index, Show, onMount, type Accessor } from "solid-js";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { aiStore, defaultModel, providerModels, providerInfo, AI_PROVIDERS, type AiConfig, type AiProvider, type AiEvent } from "./store";
@@ -80,8 +80,14 @@ export function AiPanel(props: {
     clearTimeout(modelsTimer);
     modelsTimer = setTimeout(() => void fetchModels(p), 600);
   });
-  // Keep the message list pinned to the latest as it streams.
-  createEffect(() => { messages(); if (msgEl) msgEl.scrollTop = msgEl.scrollHeight; });
+  // Keep the message list pinned to the latest as it streams — but only while
+  // the user is actually AT the bottom. Scrolling up to read releases the pin
+  // (no more yank-down per delta); scrolling back to the bottom re-engages it.
+  let pinned = true;
+  const onMsgScroll = () => {
+    if (msgEl) pinned = msgEl.scrollHeight - msgEl.scrollTop - msgEl.clientHeight < 48;
+  };
+  createEffect(() => { messages(); if (msgEl && pinned) msgEl.scrollTop = msgEl.scrollHeight; });
 
   async function saveKey() {
     const k = keyInput().trim();
@@ -110,6 +116,7 @@ export function AiPanel(props: {
     if (!text.trim() || streaming()) return;
     if (!hasKey()) { setSettingsOpen(true); return; }
     const convo: ChatMsg[] = [...messages(), { role: "user", content: text }];
+    pinned = true; // a fresh send always follows the reply
     setMessages([...convo, { role: "assistant", content: "" }]);
     setInput("");
     setStreaming(true);
@@ -209,21 +216,24 @@ export function AiPanel(props: {
         </div>
       </Show>
 
-      <div class="ai-messages" ref={msgEl}>
+      <div class="ai-messages" ref={msgEl} onScroll={onMsgScroll}>
         <Show when={messages().length === 0}>
           <div class="ai-empty">Ask about your schema, generate a query, or explain / optimize the SQL in your editor. Proposed SQL stays read-only until you open + run it.</div>
         </Show>
-        <For each={messages()}>
+        {/* Index, not For: streaming replaces the last message OBJECT per delta —
+            For keys on identity and would tear down + rebuild the whole bubble's
+            DOM on every chunk; Index keeps the row and patches the text. */}
+        <Index each={messages()}>
           {(m) => (
-            <div class="ai-msg" classList={{ user: m.role === "user", assistant: m.role === "assistant" }}>
-              <Show when={m.role === "assistant"} fallback={<div class="ai-msg-body">{m.content}</div>}>
-                <Show when={m.content} fallback={<div class="ai-typing"><span /><span /><span /></div>}>
-                  <Markdown text={m.content} onInsertSql={props.onInsertSql} />
+            <div class="ai-msg" classList={{ user: m().role === "user", assistant: m().role === "assistant" }}>
+              <Show when={m().role === "assistant"} fallback={<div class="ai-msg-body">{m().content}</div>}>
+                <Show when={m().content} fallback={<div class="ai-typing"><span /><span /><span /></div>}>
+                  <Markdown text={m().content} onInsertSql={props.onInsertSql} />
                 </Show>
               </Show>
             </div>
           )}
-        </For>
+        </Index>
       </div>
 
       <div class="ai-actions">

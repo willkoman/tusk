@@ -224,7 +224,7 @@ button.ghost { background: transparent; }
 
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 
-.editor-pane { display: flex; flex-direction: column; min-height: 0; }
+.editor-pane { display: flex; flex-direction: column; min-height: 0; container-type: inline-size; container-name: editorpane; }
 .splitter { height: 6px; flex-shrink: 0; cursor: row-resize; background: var(--border); }
 .splitter:hover { background: var(--accent); }
 .cm-host { flex: 1; min-height: 0; overflow: hidden; }
@@ -285,11 +285,27 @@ button.ghost { background: transparent; }
 .tab-new:hover { background: var(--panel-2); color: var(--text); }
 .confirm-text { padding: 14px 16px 4px; color: var(--text); font-size: 13px; line-height: 1.5; }
 
-.toolbar { display: flex; align-items: center; gap: 10px; padding: 6px 12px; background: var(--panel); }
+.toolbar { display: flex; align-items: center; gap: 10px; padding: 6px 12px; background: var(--panel); border-bottom: 1px solid var(--border); min-width: 0; }
 .toolbar .run { min-width: 116px; font-variant-numeric: tabular-nums; }
-.toolbar .hint { color: var(--muted); font-size: 11px; }
+.toolbar .hint { color: var(--muted); font-size: 11px; white-space: nowrap; }
 .toolbar .icon.active { background: var(--accent); color: #fff; opacity: 1; }
 .toolbar .icon svg { width: 15px; height: 15px; display: block; }
+.toolbar .tb-text, .toolbar .tb-more { white-space: nowrap; }
+.toolbar .tb-more { display: none; padding: 6px 10px; font-weight: 700; }
+.toolbar .export-select { max-width: 180px; min-width: 60px; flex: 0 1 auto; text-overflow: ellipsis; }
+/* Responsive tiers keyed to the editor pane's width (sidebar resize counts),
+   not the window: hint text goes first, then the text actions collapse into
+   the ⋯ menu, then the font/wrap icons hide (still in Settings). */
+@container editorpane (max-width: 1080px) {
+  .toolbar .hint { display: none; }
+}
+@container editorpane (max-width: 880px) {
+  .toolbar .tb-text { display: none; }
+  .toolbar .tb-more { display: inline-flex; }
+}
+@container editorpane (max-width: 620px) {
+  .toolbar .font-btn { display: none; }
+}
 .font-btn { min-width: 26px; display: inline-flex; align-items: center; justify-content: center; }
 .font-btn .az-sm { font-weight: 700; font-size: 10px; line-height: 1; }
 .font-btn .az-lg { font-weight: 700; font-size: 14px; line-height: 1; }
@@ -355,7 +371,7 @@ button.ghost { background: transparent; }
 .rg-cell.rg-dirty.sel { background: rgba(230, 170, 60, 0.28); }
 .rg-row.rg-del .rg-cell { text-decoration: line-through; opacity: 0.55; background: rgba(224, 80, 80, 0.10); }
 .rg-row.rg-new .rg-cell { background: rgba(80, 200, 120, 0.10); }
-.rg-gutnum.rg-del { color: #e05050; text-decoration: line-through; }
+.rg-gutnum.rg-del { color: var(--danger); text-decoration: line-through; }
 .rg-gutnum.rg-new { color: #4cc878; font-weight: 700; }
 .rg-defaultval::before { content: "default"; color: var(--muted); font-style: italic; opacity: 0.6; font-size: 11px; }
 .rg-edit {
@@ -366,6 +382,17 @@ button.ghost { background: transparent; }
 }
 .rg-edit-bool { padding: 0 6px; }
 .sb-pending { color: #e6aa3c; font-weight: 600; white-space: nowrap; }
+
+/* Light-theme contrast overrides: the grid edit/bool tints above are tuned for
+   the dark surfaces (mint/amber text washes out on white) — re-pin them to the
+   light palette's saturated equivalents. */
+:root[data-theme="light"] .rg-bool.rg-true { color: #15803d; background: rgba(22, 163, 74, 0.10); }
+:root[data-theme="light"] .rg-row.rg-new .rg-cell { background: rgba(22, 163, 74, 0.10); }
+:root[data-theme="light"] .rg-gutnum.rg-new { color: #15803d; }
+:root[data-theme="light"] .rg-cell.rg-dirty { background: rgba(180, 83, 9, 0.13); box-shadow: inset 2px 0 0 #b45309; }
+:root[data-theme="light"] .rg-cell.rg-dirty.sel { background: rgba(180, 83, 9, 0.24); }
+:root[data-theme="light"] .sb-pending { color: #a16207; }
+:root[data-theme="light"] .tw-row.selected .tw-detail.is-count { background: rgba(15, 23, 42, 0.08); }
 .sb-commit:not(:disabled) { color: var(--accent); }
 
 /* --- built-in updater pill + panel (bottom-right, both screens) --- */
@@ -387,7 +414,7 @@ button.ghost { background: transparent; }
 .upd-title { font-weight: 600; margin-bottom: 6px; }
 .upd-ver { color: var(--accent); font-family: var(--mono); font-weight: 600; margin-left: 4px; }
 .upd-notes { max-height: 160px; overflow: auto; white-space: pre-wrap; color: var(--muted); margin-bottom: 8px; }
-.upd-err { color: #e05050; margin-bottom: 8px; word-break: break-word; }
+.upd-err { color: var(--danger); margin-bottom: 8px; word-break: break-word; }
 .upd-actions { display: flex; justify-content: flex-end; gap: 8px; align-items: center; }
 .upd-progress { display: flex; align-items: center; gap: 8px; width: 100%; color: var(--muted); }
 .upd-bar { flex: 1; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
@@ -558,7 +585,8 @@ button.ghost { background: transparent; }
 .erd-card { touch-action: none; }
 
 /* ---- result Plan/Grid toggle ---- */
-.result-viewtoggle { position: absolute; top: 8px; right: 14px; z-index: 12; display: flex; background: var(--panel); border: 1px solid var(--border); border-radius: 7px; padding: 2px; box-shadow: var(--shadow-panel); }
+.result-toolbar { display: flex; align-items: center; gap: 10px; padding: 4px 12px; background: var(--panel); border-bottom: 1px solid var(--border); color: var(--muted); font-size: 12px; min-height: 32px; flex: none; }
+.result-viewtoggle { display: flex; background: var(--bg); border: 1px solid var(--border); border-radius: 7px; padding: 2px; }
 .result-viewtoggle button { border: none; background: transparent; padding: 3px 12px; font-size: 11px; border-radius: 5px; color: var(--muted); }
 .result-viewtoggle button.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
 .confirm-note { font-size: 12.5px; line-height: 1.5; color: var(--text); }
@@ -730,6 +758,7 @@ button.btn-danger { background: var(--danger); border-color: var(--danger); colo
 .col-builder-row.row-dropped { opacity: 0.45; }
 .col-builder-row.row-dropped input { text-decoration: line-through; }
 .col-builder-row.row-new { background: rgba(45, 212, 191, 0.07); border-radius: 6px; }
+:root[data-theme="light"] .col-builder-row.row-new { background: rgba(13, 148, 136, 0.10); }
 
 .drop-list { display: flex; flex-direction: column; gap: 2px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px; max-height: 130px; overflow-y: auto; }
 .drop-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
@@ -751,7 +780,7 @@ button.btn-danger { background: var(--danger); border-color: var(--danger); colo
 .ai-settings { display: flex; flex-direction: column; gap: 8px; padding: 10px; border-bottom: 1px solid var(--border); }
 .ai-settings label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; }
 .ai-settings input, .ai-settings select { font: inherit; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
-.ai-key-ok { color: #3fb950; text-transform: none; letter-spacing: normal; }
+.ai-key-ok { color: var(--ok); text-transform: none; letter-spacing: normal; }
 .ai-key-missing { color: var(--muted); text-transform: none; letter-spacing: normal; }
 .ai-settings-actions { display: flex; align-items: center; gap: 6px; }
 .ai-note { font-size: 10px; color: var(--muted); line-height: 1.4; }
