@@ -2,7 +2,7 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
-## [Unreleased]
+## [0.4.0] - 2026-06-10
 
 ### Fixed (correctness sweep)
 - **Multi-statement scripts are now atomic on every driver.** DuckDB/SQLite ran scripts as a bare batch and MySQL as a plain loop — a mid-script failure left earlier statements applied, despite the rollback promise. Scripts now run inside BEGIN…COMMIT (best-effort ROLLBACK on error) on DuckDB/SQLite and START TRANSACTION…COMMIT on MySQL (whose DDL still auto-commits — engine behavior). Scripts that manage their own transaction (BEGIN/COMMIT/SAVEPOINT anywhere) run unwrapped. Conformance: a failing 3-statement DML script leaves zero changes on all four engines.
