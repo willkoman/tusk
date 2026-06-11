@@ -107,7 +107,7 @@ export function ModifyTableForm(props: {
   };
 
   return (
-    <Dialog title={`Modify table · ${table}`} onClose={props.onClose} width={680}>
+    <Dialog title={`Modify table · ${table}`} onClose={props.onClose} width={Math.min(window.innerWidth - 80, 1100)}>
       <div class="modify-head">
         <label>Table name<input value={tableName()} onInput={(e) => setTableName(e.currentTarget.value)} /></label>
         <label>Comment<input value={tableComment()} onInput={(e) => setTableComment(e.currentTarget.value)} placeholder="(none)" /></label>

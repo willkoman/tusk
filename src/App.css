@@ -723,9 +723,9 @@ button.btn-danger { background: var(--danger); border-color: var(--danger); colo
 /* ---- modify-table dialog ---- */
 .modify-head { display: flex; gap: 10px; }
 .modify-head label { flex: 1; }
-.modify-cols { max-height: 320px; overflow-y: auto; }
+.modify-cols { max-height: min(48vh, 520px); overflow-y: auto; }
 .col-builder-head.modify-row, .col-builder-row.modify-row {
-  grid-template-columns: 1.1fr 1.3fr 32px 28px 1.3fr 1fr 24px;
+  grid-template-columns: 1.1fr 1.2fr 32px 28px 1.4fr 1.2fr 24px;
 }
 .col-builder-row.row-dropped { opacity: 0.45; }
 .col-builder-row.row-dropped input { text-decoration: line-through; }

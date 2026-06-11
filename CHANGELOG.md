@@ -4,7 +4,10 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-06-11
+
 ### Changed
+- **Modify-table dialog is wide.** The per-row column editor (name / type / null / PK / default / comment) was squeezed into a 680px modal (~110px per field); the dialog now sizes to the viewport (up to 1100px), the column list scrolls at up to ~48vh instead of a fixed 320px, and the grid gives default/type/comment the extra room.
 - **Neighborhood graph: readable edge labels + draggable cards.** The column gap is now sized to the longest `src → dst` edge label (was a fixed 330px column pitch that left only 80–130px of air, running labels underneath the cards), and every card — neighbors and the center table — can be click-dragged to reposition (5px tolerance keeps plain click = re-center), with edges following live and a Reset layout button for the neighborhood scope too. Repositioning clears on re-center.
 - **Copying boolean cells yields the displayed word.** Grid copy (selection TSV/CSV/JSON/Markdown, Copy column, Copy cell value) now maps boolean-detected columns to the same TRUE/FALSE words the pills display, instead of the driver's raw token (`t`/`f` on Postgres, `0`/`1` on SQLite). "View value…" still shows the raw underlying token, and file export streams raw values as before.
 
