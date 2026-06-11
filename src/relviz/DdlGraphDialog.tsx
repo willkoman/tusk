@@ -56,8 +56,8 @@ const CTR_W = 250; // center card
 const COL_ROW_H = 19;
 const CTR_HEAD = 34;
 const GAP_Y = 22;
-const COL_X = 330; // horizontal distance between columns
 const MAX_COLS = 14;
+const LABEL_CH = 6; // ~px per char of the 10px mono edge label
 
 // ---- ERD geometry (must match the .erd-card CSS metrics) ----
 const ERD_W = 240;
@@ -140,6 +140,8 @@ export function DdlGraphDialog(props: {
     setCenter({ schema, name, kind: "table" });
   };
 
+  const edgeLabel = (e: FkEdge) => `${e.srcCols.join(", ")} → ${e.dstCols.join(", ")}`;
+
   // ---- neighborhood layout (deterministic 3-column) ----
   const hood = createMemo(() => {
     const r = rels();
@@ -169,9 +171,15 @@ export function DdlGraphDialog(props: {
     };
     const inFan = groupIdx(inbound, (e) => e.dstCols[0] ?? "");
     const outFan = groupIdx(outbound, (e) => e.srcCols[0] ?? "");
+    // Column gap sized to the longest edge label so the column details have
+    // room between the cards instead of running underneath them.
+    const maxLabel = Math.max(0, ...[...inbound, ...outbound].map((e) => edgeLabel(e).length));
+    const gap = Math.min(420, Math.max(130, maxLabel * LABEL_CH + 28));
+    const ctrX = NB_W + gap;
+    const outX = ctrX + CTR_W + gap;
     const inPos = inbound.map((e, i) => ({ e, x: 0, y: stack(inbound.length, i), ...inFan[i] }));
-    const outPos = outbound.map((e, i) => ({ e, x: COL_X * 2, y: stack(outbound.length, i), ...outFan[i] }));
-    const ctr = { x: COL_X, y: (totalH - ctrH) / 2, h: ctrH };
+    const outPos = outbound.map((e, i) => ({ e, x: outX, y: stack(outbound.length, i), ...outFan[i] }));
+    const ctr = { x: ctrX, y: (totalH - ctrH) / 2, h: ctrH };
     const colY = (col: string) => {
       const i = cols.findIndex((c) => c.name === col);
       return i >= 0 ? ctr.y + CTR_HEAD + i * COL_ROW_H + COL_ROW_H / 2 : ctr.y + ctrH / 2;
@@ -184,7 +192,7 @@ export function DdlGraphDialog(props: {
       cols,
       moreCols: Math.max(0, (detail()?.length ?? 0) - MAX_COLS),
       colY,
-      bbox: { x: 0, y: 0, w: COL_X * 2 + NB_W, h: totalH },
+      bbox: { x: 0, y: 0, w: outX + NB_W, h: totalH },
     };
   });
 
@@ -203,15 +211,21 @@ export function DdlGraphDialog(props: {
   // live on top of the computed layout, in canvas units (screen ÷ zoom k).
   const [nudges, setNudges] = createSignal<Map<string, { x: number; y: number }>>(new Map(), { equals: false });
   const [groupNudges, setGroupNudges] = createSignal<Map<number, { x: number; y: number }>>(new Map(), { equals: false });
+  // Neighborhood cards are draggable too (keys: "ctr" / "in:i" / "out:i"),
+  // cleared on re-center — otherwise a card sitting on an edge label can't be
+  // moved out of the way.
+  const [hoodNudges, setHoodNudges] = createSignal<Map<string, { x: number; y: number }>>(new Map(), { equals: false });
   let erdPz: PanZoom | undefined;
-  let dragRef: { kind: "table" | "group"; id: string; gi: number; members: string[]; startX: number; startY: number; lastX: number; lastY: number; moved: boolean } | null = null;
+  let dragRef: { kind: "table" | "group" | "hood"; id: string; gi: number; members: string[]; startX: number; startY: number; lastX: number; lastY: number; moved: boolean } | null = null;
 
   createEffect(on(erd, () => {
     setNudges(new Map());
     setGroupNudges(new Map());
   }));
+  createEffect(on(rels, () => setHoodNudges(new Map())));
 
   const nudgeOf = (name: string) => nudges().get(name) ?? { x: 0, y: 0 };
+  const hn = (key: string) => hoodNudges().get(key) ?? { x: 0, y: 0 };
   const epos = (l: { pos: Map<string, { x: number; y: number }> }, name: string) => {
     const p = l.pos.get(name);
     if (!p) return undefined;
@@ -219,7 +233,7 @@ export function DdlGraphDialog(props: {
     return { x: p.x + n.x, y: p.y + n.y };
   };
 
-  const beginDrag = (e: PointerEvent, kind: "table" | "group", id: string, gi: number, members: string[]) => {
+  const beginDrag = (e: PointerEvent, kind: "table" | "group" | "hood", id: string, gi: number, members: string[]) => {
     if (e.button !== 0) return;
     e.stopPropagation();
     dragRef = { kind, id, gi, members, startX: e.clientX, startY: e.clientY, lastX: e.clientX, lastY: e.clientY, moved: false };
@@ -246,6 +260,8 @@ export function DdlGraphDialog(props: {
         for (const member of d.members) bump(m, member);
         return m;
       });
+    } else if (d.kind === "hood") {
+      setHoodNudges((m) => bump(m, d.id));
     } else {
       setNudges((m) => bump(m, d.id));
     }
@@ -319,8 +335,6 @@ export function DdlGraphDialog(props: {
     return i >= 0 ? topY + ERD_HEAD + i * ERD_ROW + ERD_ROW / 2 : topY + erdCardH(t) / 2;
   };
 
-  const edgeLabel = (e: FkEdge) => `${e.srcCols.join(", ")} → ${e.dstCols.join(", ")}`;
-
   return (
     <Dialog
       title={center().name ? `DDL & relationships — ${center().schema}.${center().name}` : `Schema diagram — ${center().schema}`}
@@ -376,19 +390,21 @@ export function DdlGraphDialog(props: {
             <Show when={scope() === "schema" && (erd()?.tables.length ?? 0) > 300}>
               <span class="relviz-warn">large schema — {erd()!.tables.length} tables</span>
             </Show>
-            <Show when={scope() === "schema"}>
-              <button
-                class="ghost"
-                disabled={nudges().size === 0 && groupNudges().size === 0}
-                title="Discard manual repositioning, back to the computed layout"
-                onClick={() => {
+            <button
+              class="ghost"
+              disabled={scope() === "schema" ? nudges().size === 0 && groupNudges().size === 0 : hoodNudges().size === 0}
+              title="Discard manual repositioning, back to the computed layout"
+              onClick={() => {
+                if (scope() === "schema") {
                   setNudges(new Map());
                   setGroupNudges(new Map());
-                }}
-              >
-                Reset layout
-              </button>
-            </Show>
+                } else {
+                  setHoodNudges(new Map());
+                }
+              }}
+            >
+              Reset layout
+            </button>
           </div>
 
           <Switch>
@@ -406,47 +422,83 @@ export function DdlGraphDialog(props: {
                       </div>
                     }
                   >
-                    <PanZoomCanvas bbox={h().bbox} fitKey={`${center().schema}.${center().name}:${Math.round(h().bbox.w)}x${Math.round(h().bbox.h)}:${ddlCollapsed() ? "c" : "e"}`}>
+                    <PanZoomCanvas ref={(pz) => (erdPz = pz)} bbox={h().bbox} fitKey={`${center().schema}.${center().name}:${Math.round(h().bbox.w)}x${Math.round(h().bbox.h)}:${ddlCollapsed() ? "c" : "e"}`}>
                       <svg class="viz-edges" width={h().bbox.w} height={h().bbox.h} viewBox={`0 0 ${Math.max(1, h().bbox.w)} ${Math.max(1, h().bbox.h)}`}>
                         <For each={h().inbound}>
-                          {(n) => {
-                            const y1 = n.y + NB_H / 2;
-                            const y2 = h().colY(n.e.dstCols[0] ?? "") + fanOffset(n.fi, n.fn);
-                            const x1 = NB_W;
-                            const x2 = h().ctr.x;
-                            const mx = (x1 + x2) / 2;
+                          {(n, i) => {
+                            // Geometry is a memo over the nudges so edges follow
+                            // dragged cards live.
+                            const geom = createMemo(() => {
+                              const a = hn(`in:${i()}`);
+                              const c = hn("ctr");
+                              const y1 = n.y + a.y + NB_H / 2;
+                              const y2 = h().colY(n.e.dstCols[0] ?? "") + c.y + fanOffset(n.fi, n.fn);
+                              const x1 = NB_W + a.x;
+                              const x2 = h().ctr.x + c.x;
+                              return { x1, x2, y1, y2, mx: (x1 + x2) / 2 };
+                            });
                             return (
                               <g classList={{ "edge-hover": hoverEdge() === n.e.constraint }}>
-                                <path class="rel-edge" style={{ stroke: edgeColor(n.e.srcTable) }} d={`M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`} onMouseEnter={() => setHoverEdge(n.e.constraint)} onMouseLeave={() => setHoverEdge(null)} />
-                                <text class="rel-edge-label" x={mx} y={(y1 + y2) / 2 - 5} text-anchor="middle">{edgeLabel(n.e)}</text>
+                                <path class="rel-edge" style={{ stroke: edgeColor(n.e.srcTable) }} d={`M ${geom().x1} ${geom().y1} C ${geom().mx} ${geom().y1}, ${geom().mx} ${geom().y2}, ${geom().x2} ${geom().y2}`} onMouseEnter={() => setHoverEdge(n.e.constraint)} onMouseLeave={() => setHoverEdge(null)} />
+                                <text class="rel-edge-label" x={geom().mx} y={(geom().y1 + geom().y2) / 2 - 5} text-anchor="middle">{edgeLabel(n.e)}</text>
                               </g>
                             );
                           }}
                         </For>
                         <For each={h().outbound}>
-                          {(n) => {
-                            const y1 = h().colY(n.e.srcCols[0] ?? "") + fanOffset(n.fi, n.fn);
-                            const y2 = n.y + NB_H / 2;
-                            const x1 = h().ctr.x + CTR_W;
-                            const x2 = n.x;
-                            const mx = (x1 + x2) / 2;
+                          {(n, i) => {
+                            const geom = createMemo(() => {
+                              const a = hn(`out:${i()}`);
+                              const c = hn("ctr");
+                              const y1 = h().colY(n.e.srcCols[0] ?? "") + c.y + fanOffset(n.fi, n.fn);
+                              const y2 = n.y + a.y + NB_H / 2;
+                              const x1 = h().ctr.x + c.x + CTR_W;
+                              const x2 = n.x + a.x;
+                              return { x1, x2, y1, y2, mx: (x1 + x2) / 2 };
+                            });
                             return (
                               <g classList={{ "edge-hover": hoverEdge() === n.e.constraint }}>
-                                <path class="rel-edge" style={{ stroke: edgeColor(n.e.dstTable) }} d={`M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`} onMouseEnter={() => setHoverEdge(n.e.constraint)} onMouseLeave={() => setHoverEdge(null)} />
-                                <text class="rel-edge-label" x={mx} y={(y1 + y2) / 2 - 5} text-anchor="middle">{edgeLabel(n.e)}</text>
+                                <path class="rel-edge" style={{ stroke: edgeColor(n.e.dstTable) }} d={`M ${geom().x1} ${geom().y1} C ${geom().mx} ${geom().y1}, ${geom().mx} ${geom().y2}, ${geom().x2} ${geom().y2}`} onMouseEnter={() => setHoverEdge(n.e.constraint)} onMouseLeave={() => setHoverEdge(null)} />
+                                <text class="rel-edge-label" x={geom().mx} y={(geom().y1 + geom().y2) / 2 - 5} text-anchor="middle">{edgeLabel(n.e)}</text>
                               </g>
                             );
                           }}
                         </For>
                       </svg>
                       <For each={h().inbound}>
-                        {(n) => <NeighborCard edge={n.e} side="in" x={n.x} y={n.y} onClick={() => recenter(n.e.srcSchema, n.e.srcTable)} />}
+                        {(n, i) => (
+                          <NeighborCard
+                            edge={n.e}
+                            side="in"
+                            x={n.x + hn(`in:${i()}`).x}
+                            y={n.y + hn(`in:${i()}`).y}
+                            onPointerDown={(e) => beginDrag(e, "hood", `in:${i()}`, -1, [])}
+                            onPointerMove={moveDrag}
+                            onPointerUp={(e) => endDrag(e, () => recenter(n.e.srcSchema, n.e.srcTable))}
+                          />
+                        )}
                       </For>
-                      <div style={{ position: "absolute", left: `${h().ctr.x}px`, top: `${h().ctr.y}px` }}>
+                      <div
+                        style={{ position: "absolute", left: `${h().ctr.x + hn("ctr").x}px`, top: `${h().ctr.y + hn("ctr").y}px`, cursor: "grab" }}
+                        title="Drag to reposition"
+                        onPointerDown={(e) => beginDrag(e, "hood", "ctr", -1, [])}
+                        onPointerMove={moveDrag}
+                        onPointerUp={(e) => endDrag(e)}
+                      >
                         <CenterCard name={center().name ?? ""} cols={h().cols} more={h().moreCols} selfRefs={h().selfRefs.length} />
                       </div>
                       <For each={h().outbound}>
-                        {(n) => <NeighborCard edge={n.e} side="out" x={n.x} y={n.y} onClick={() => recenter(n.e.dstSchema, n.e.dstTable)} />}
+                        {(n, i) => (
+                          <NeighborCard
+                            edge={n.e}
+                            side="out"
+                            x={n.x + hn(`out:${i()}`).x}
+                            y={n.y + hn(`out:${i()}`).y}
+                            onPointerDown={(e) => beginDrag(e, "hood", `out:${i()}`, -1, [])}
+                            onPointerMove={moveDrag}
+                            onPointerUp={(e) => endDrag(e, () => recenter(n.e.dstSchema, n.e.dstTable))}
+                          />
+                        )}
                       </For>
                     </PanZoomCanvas>
                   </Show>
@@ -584,7 +636,7 @@ export function DdlGraphDialog(props: {
 
 function CenterCard(props: { name: string; cols: DetailCol[]; more: number; selfRefs?: number }) {
   return (
-    <div class="hood-center" style={{ width: `${CTR_W}px` }} onPointerDown={(e) => e.stopPropagation()}>
+    <div class="hood-center" style={{ width: `${CTR_W}px` }}>
       <div class="hood-center-head"><Icon name="table" /> {props.name}{(props.selfRefs ?? 0) > 0 ? <span class="hood-self" title="Self-referencing foreign key">↺</span> : null}</div>
       <For each={props.cols}>
         {(c) => (
@@ -600,16 +652,25 @@ function CenterCard(props: { name: string; cols: DetailCol[]; more: number; self
   );
 }
 
-function NeighborCard(props: { edge: FkEdge; side: "in" | "out"; x: number; y: number; onClick: () => void }) {
+function NeighborCard(props: {
+  edge: FkEdge;
+  side: "in" | "out";
+  x: number;
+  y: number;
+  onPointerDown: (e: PointerEvent) => void;
+  onPointerMove: (e: PointerEvent) => void;
+  onPointerUp: (e: PointerEvent) => void;
+}) {
   const name = () => (props.side === "in" ? props.edge.srcTable : props.edge.dstTable);
   const schema = () => (props.side === "in" ? props.edge.srcSchema : props.edge.dstSchema);
   return (
     <div
       class="hood-card"
       style={{ left: `${props.x}px`, top: `${props.y}px`, width: `${NB_W}px`, height: `${NB_H}px` }}
-      onPointerDown={(e) => e.stopPropagation()}
-      onClick={props.onClick}
-      title={`${schema()}.${name()} — click to re-center`}
+      onPointerDown={(e) => props.onPointerDown(e)}
+      onPointerMove={(e) => props.onPointerMove(e)}
+      onPointerUp={(e) => props.onPointerUp(e)}
+      title={`${schema()}.${name()} — click: re-center · drag: reposition`}
     >
       <div class="hood-card-name"><span class="erd-hue" style={{ background: edgeColor(name()) }} /><Icon name="table" /> {name()}</div>
       <div class="hood-card-sub">{props.side === "in" ? "references this" : "referenced"} · {props.edge.constraint}</div>
