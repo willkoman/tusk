@@ -2,6 +2,7 @@ import { createSignal, createMemo, createEffect, onMount, onCleanup, For, Show, 
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./App.css";
+import { isDarkTheme, normalizeTheme, type ThemeId } from "./themes";
 import { SqlEditor, type EditorApi } from "./SqlEditor";
 import { driverDialect, type DialectId } from "./sql/dialects";
 import { type AiContext } from "./ai/context";
@@ -283,12 +284,15 @@ function App() {
   const onSchemeChange = (e: MediaQueryListEvent) => setOsLight(e.matches);
   prefersLight.addEventListener("change", onSchemeChange);
   onCleanup(() => prefersLight.removeEventListener("change", onSchemeChange));
-  const resolvedTheme = createMemo<"oneDark" | "light">(() => {
+  const resolvedTheme = createMemo<ThemeId>(() => {
     const t = prefs().theme;
-    return t === "system" ? (osLight() ? "light" : "oneDark") : t;
+    return t === "system" ? (osLight() ? "light" : "oneDark") : normalizeTheme(t);
   });
   createEffect(() => {
-    document.documentElement.dataset.theme = resolvedTheme() === "light" ? "light" : "dark";
+    // data-theme picks the palette block; data-mode keys the dark/light-level
+    // CSS fixes shared by every theme of that polarity.
+    document.documentElement.dataset.theme = resolvedTheme();
+    document.documentElement.dataset.mode = isDarkTheme(resolvedTheme()) ? "dark" : "light";
   });
 
   // Lazily fetch FK edges when a tab switches to a not-yet-fetched schema.

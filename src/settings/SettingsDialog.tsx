@@ -2,6 +2,7 @@ import { type Accessor, For, Match, Show, Switch, createSignal } from "solid-js"
 import { Dialog } from "../Dialog";
 import { type EditorPrefs } from "../editor/types";
 import { type DialectId } from "../sql/dialects";
+import { THEMES } from "../themes";
 
 export type SettingsTab = "editor" | "appearance" | "grid" | "plans" | "shortcuts";
 
@@ -93,8 +94,12 @@ export function SettingsDialog(props: {
               <label class="settings-row">
                 <span>Theme</span>
                 <select value={p().theme} onChange={(e) => props.update({ theme: e.currentTarget.value as EditorPrefs["theme"] })}>
-                  <option value="oneDark">Dark (One Dark)</option>
-                  <option value="light">Light</option>
+                  <optgroup label="Dark">
+                    <For each={THEMES.filter((t) => t.dark)}>{(t) => <option value={t.id}>{t.label}</option>}</For>
+                  </optgroup>
+                  <optgroup label="Light">
+                    <For each={THEMES.filter((t) => !t.dark)}>{(t) => <option value={t.id}>{t.label}</option>}</For>
+                  </optgroup>
                   <option value="system">Follow system</option>
                 </select>
               </label>

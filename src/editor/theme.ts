@@ -2,6 +2,7 @@ import { type Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { lightTheme } from "./lightTheme";
+import { cmThemes } from "./cmThemes";
 import { type EditorPrefs } from "./types";
 
 export const DEFAULT_FONT_STACK = '"JetBrains Mono","SF Mono",Menlo,Consolas,monospace';
@@ -19,12 +20,12 @@ export function fontStack(fontFamily: string): string {
  * Pure theme builder driven by prefs. Returned via a Compartment in SqlEditor so a
  * font-size / word-wrap / theme / font-family change reconfigures live — no editor
  * rebuild, no history or fold-state reset. `prefs.theme` arrives already resolved
- * ("system" is mapped to a concrete theme by App before it gets here); anything
- * that isn't "light" renders dark.
+ * ("system" is mapped to a concrete theme by App before it gets here); unknown
+ * ids fall back to One Dark.
  */
 export function themeFor(prefs: EditorPrefs): Extension {
   return [
-    prefs.theme === "light" ? lightTheme : oneDark,
+    prefs.theme === "light" ? lightTheme : prefs.theme === "oneDark" ? oneDark : cmThemes[prefs.theme] ?? oneDark,
     prefs.wordWrap ? EditorView.lineWrapping : [],
     EditorView.theme({
       "&": {

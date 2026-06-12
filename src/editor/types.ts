@@ -1,5 +1,6 @@
 import type { DialectId } from "../sql/dialects";
 import type { Table } from "../sql/aliases";
+import type { ThemeId } from "../themes";
 
 export type { Table };
 
@@ -12,8 +13,8 @@ export type EditorPrefs = {
   fontSize: number;
   wordWrap: boolean;
   dialect: DialectId;
-  /** Editor + UI theme; "system" follows the OS light/dark preference. */
-  theme: "oneDark" | "light" | "system";
+  /** Editor + UI theme (see src/themes.ts); "system" follows the OS light/dark preference. */
+  theme: ThemeId | "system";
   /** Auto-fold large inline literals (the headline editor feature). */
   autoFold: boolean;
   /** Round-trip statements to Postgres for parser-grade diagnostics on idle. */
