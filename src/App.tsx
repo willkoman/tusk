@@ -2134,6 +2134,7 @@ function App() {
                       }}
                     >
                       <span class="tab-title">{t.title}</span>
+                      <Show when={running() && runningTabId() === t.id}><span class="spinner-sm tab-spin" title="Query running" /></Show>
                       <Show when={t.dirty}><span class="tab-dot" title="Unsaved changes">●</span></Show>
                       <button class="tab-close" title="Close (⌘/Ctrl+W)" onClick={(e) => { e.stopPropagation(); closeTab(t.id); }}>×</button>
                     </div>

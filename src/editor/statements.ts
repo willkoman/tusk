@@ -50,13 +50,17 @@ const spinMarker = new SpinMarker();
 
 // Whether a query launched from this editor is in flight. App toggles it via
 // `setRunningEffect` (through EditorApi); the gutter shows a spinner on the running
-// statement instead of ▶.
+// statement instead of ▶. The field stores the ANCHOR POSITION captured when the
+// run started (mapped through edits) — not the live cursor — so clicking around
+// other statements while a query runs doesn't drag the spinner with it.
 export const setRunningEffect = StateEffect.define<boolean>();
-const runningField = StateField.define<boolean>({
-  create: () => false,
+const runningField = StateField.define<number | null>({
+  create: () => null,
   update(value, tr) {
-    for (const e of tr.effects) if (e.is(setRunningEffect)) return e.value;
-    return value;
+    let v = value;
+    if (v != null && tr.docChanged) v = tr.changes.mapPos(v);
+    for (const e of tr.effects) if (e.is(setRunningEffect)) v = e.value ? tr.state.selection.main.head : null;
+    return v;
   },
 });
 
@@ -68,25 +72,25 @@ export function statementGutter(onRun: (text: string) => void): Extension {
       lineMarker: (view, line) => {
         const idx = startLineMap(view.state).get(line.from);
         if (idx == null) return null;
-        if (view.state.field(runningField)) {
-          const at = statementAt(lexState(view.state).stmts, view.state.selection.main.head);
+        const runPos = view.state.field(runningField);
+        if (runPos != null) {
+          const at = statementAt(lexState(view.state).stmts, runPos);
           if (at && at.index === idx) return spinMarker;
         }
         return runMarker;
       },
-      // Recompute markers when the running flag flips or the cursor moves to a
-      // different statement (so the spinner tracks the active/running block).
-      lineMarkerChange: (u) =>
-        u.startState.field(runningField) !== u.state.field(runningField) ||
-        !u.startState.selection.eq(u.state.selection),
+      // Recompute markers when the pinned running anchor changes (run start/stop
+      // or a doc edit remapping it) — cursor moves alone don't repaint.
+      lineMarkerChange: (u) => u.startState.field(runningField) !== u.state.field(runningField),
       domEventHandlers: {
         mousedown(view, line) {
           const idx = startLineMap(view.state).get(line.from);
           if (idx == null) return false;
           const stmt = lexState(view.state).stmts[idx];
           if (stmt) {
-            // Move the cursor into the clicked statement so the running spinner
-            // lands on it (the spinner follows the active statement).
+            // Move the cursor into the clicked statement BEFORE launching, so
+            // the run-start anchor (captured from the selection) pins the
+            // spinner to this statement.
             view.dispatch({ selection: { anchor: line.from } });
             onRun(stmt.text);
           }
