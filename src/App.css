@@ -186,7 +186,9 @@ button.ghost { background: transparent; }
 .tree-filter { width: 100%; font: inherit; font-size: 12px; padding: 6px 9px 6px 29px; border-radius: 7px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
 .tree-filter::placeholder { color: var(--muted); }
 .tree-filter:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px rgba(var(--accent-rgb), 0.18); }
-.sidebar-body { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 4px 0; }
+/* overflow-anchor off: expanding a node at the scrolled-to-bottom edge must not
+   shift the clicked row (Chromium bottom-anchors the scroll, breaking dblclick). */
+.sidebar-body { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 4px 0; overflow-anchor: none; }
 
 .splitter-v { width: 5px; flex-shrink: 0; cursor: col-resize; background: var(--border); }
 .splitter-v:hover { background: var(--accent); }

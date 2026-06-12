@@ -135,7 +135,11 @@ export function Tree(props: {
         classList={{ muted: p.muted, selected: p.selected, "is-header": p.header }}
         title={p.title}
         style={{ "padding-left": `${p.depth * 13 + 6}px`, "--d": p.depth }}
-        onClick={() => {
+        onClick={(e) => {
+          // The 2nd click of a double-click also fires `click` — without this
+          // guard it re-collapses the node expanded by the 1st click and the
+          // dblclick (run table) becomes unreachable.
+          if (e.detail > 1) return;
           p.onSelect?.();
           p.expandable ? p.onToggle?.() : p.onActivate?.();
         }}

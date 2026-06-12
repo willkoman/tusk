@@ -22,6 +22,8 @@ const COLUMN_CTX = new Set([
   "SELECT", "WHERE", "ON", "HAVING", "SET", "GROUP BY", "ORDER BY", "RETURNING", "AND", "OR",
   "VALUES", "BY",
 ]);
+/** After these, the user is naming something callable — rank the live catalog top. */
+const CALLABLE_CTX = new Set(["CALL", "EXECUTE", "EXEC", "PERFORM"]);
 
 /**
  * Build a context-aware, dialect-specific completion source.
@@ -32,11 +34,29 @@ export function makeSqlCompletion(
   spec: DialectSpec,
   getActiveSchema: () => string | null = () => null,
   getFkEdges: () => FkEdge[] = () => [],
+  getLiveFuncs: () => ReadonlySet<string> = () => new Set(),
 ) {
   const kwOptions: Completion[] = spec.keywords.map((label) => ({ label, type: "keyword", boost: -50 }));
   const stmtKwOptions: Completion[] = spec.statementKeywords.map((label) => ({ label, type: "keyword", boost: 50 }));
   const fnOptions: Completion[] = spec.functions.map((label) => ({ label, type: "function", boost: -30 }));
   const typeOptions: Completion[] = spec.types.map((label) => ({ label, type: "type", boost: -60 }));
+
+  // Live database functions/procedures (the `list_functions` catalog), memoized
+  // on set identity; dialect builtins filtered out so they don't double up.
+  const builtinLc = new Set(spec.functions.map((f) => f.toLowerCase()));
+  let lastFuncs: ReadonlySet<string> | null = null;
+  let liveFnOptions: Completion[] = [];
+  const liveOptions = (): Completion[] => {
+    const s = getLiveFuncs();
+    if (s !== lastFuncs) {
+      lastFuncs = s;
+      liveFnOptions = [...s]
+        .filter((n) => !builtinLc.has(n.toLowerCase()))
+        .sort()
+        .map((label) => ({ label, type: "function", detail: "db function", boost: -20 }));
+    }
+    return liveFnOptions;
+  };
 
   // Memoize the schema index on the tables array identity.
   const indexOf = makeIndexer();
@@ -108,7 +128,7 @@ export function makeSqlCompletion(
 
       // 2) Clause context: last significant keyword before the cursor.
       const head = before.toUpperCase();
-      const kwRe = /\b(SELECT|FROM|JOIN|WHERE|ON|USING|GROUP\s+BY|ORDER\s+BY|HAVING|SET|INTO|UPDATE|VALUES|RETURNING|AND|OR|TABLE|BY)\b/g;
+      const kwRe = /\b(SELECT|FROM|JOIN|WHERE|ON|USING|GROUP\s+BY|ORDER\s+BY|HAVING|SET|INTO|UPDATE|VALUES|RETURNING|AND|OR|TABLE|BY|CALL|EXECUTE|EXEC|PERFORM)\b/g;
       let lastKw: string | null = null;
       let mm: RegExpExecArray | null;
       while ((mm = kwRe.exec(head))) lastKw = mm[1].replace(/\s+/g, " ");
@@ -118,6 +138,13 @@ export function makeSqlCompletion(
       let options: Completion[];
       if (!headTrim) {
         options = stmtKwOptions; // statement start
+      } else if (lastKw && CALLABLE_CTX.has(lastKw)) {
+        // CALL / EXEC: the live procedure/function catalog tops the list.
+        options = [
+          ...liveOptions().map((o) => ({ ...o, detail: "procedure/function", boost: 90 })),
+          ...fnOptions,
+          ...schemaOptions,
+        ];
       } else if (lastKw && TABLE_CTX.has(lastKw)) {
         options = [...tableOptions, ...schemaOptions];
       } else if (lastKw && COLUMN_CTX.has(lastKw)) {
@@ -137,9 +164,9 @@ export function makeSqlCompletion(
                 boost: 95,
               }))
             : [];
-        options = [...fkHints, ...cols, ...fnOptions, ...kwOptions];
+        options = [...fkHints, ...cols, ...fnOptions, ...liveOptions(), ...kwOptions];
       } else {
-        options = [...inScopeCols, ...tableOptions, ...fnOptions, ...kwOptions, ...typeOptions];
+        options = [...inScopeCols, ...tableOptions, ...fnOptions, ...liveOptions(), ...kwOptions, ...typeOptions];
       }
 
       return { from, validFor: VALID, options };

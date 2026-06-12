@@ -117,7 +117,7 @@ export function SqlEditor(props: {
     return [
       sql({ dialect: spec.cm, upperCaseKeywords: true }),
       autocompletion({
-        override: [makeSqlCompletion(() => props.tables, spec, () => props.activeSchema ?? null, () => props.fkEdges ?? [])],
+        override: [makeSqlCompletion(() => props.tables, spec, () => props.activeSchema ?? null, () => props.fkEdges ?? [], () => props.functions ?? EMPTY_FUNCS)],
         icons: true,
         defaultKeymap: false,
       }),

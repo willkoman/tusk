@@ -5,6 +5,8 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 ## [Unreleased]
 
 ### Changed
+- **Completion knows the live function/procedure catalog.** After `CALL` / `EXEC` / `EXECUTE` / `PERFORM`, the database's own callables (the `list_functions` catalog that already feeds the lint) top the suggestion list; they're also offered in general expression contexts alongside the dialect builtins (they were absent from completion entirely).
+- **Explorer: double-click runs the table reliably.** The second click of a double-click no longer re-collapses the node the first click expanded, and scroll anchoring is disabled on the tree so expanding a node at the scrolled-to-bottom edge can't shift the clicked row out from under the cursor (which made double-click physically impossible there).
 - **AI schema context: relevance-ranked, never silently truncated.** The system prompt's schema dump (was: first ~8KB of the table catalog in list order, rest dropped) now ranks tables by relevance first — any table mentioned in the conversation, the editor SQL, or sharing a name token with them gets its full column list ahead of the budget (raised to ~12KB) — and every table past the budget is still listed by name so the model knows it exists and can ask. Fixes "table X wasn't in the truncated schema list" on large schemas.
 - **AI composer is a multiline textarea**: grows with content up to ~5 lines (then scrolls), Enter sends, Shift+Enter inserts a newline.
 
