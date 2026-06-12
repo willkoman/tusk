@@ -18,7 +18,8 @@ export type AiContext = {
   lastError: string;
 };
 
-const SCHEMA_BUDGET = 8000; // chars of schema dump before truncation
+const SCHEMA_BUDGET = 12000; // chars of full table(columns) lines before falling back to names
+const NAME_LIST_BUDGET = 2500; // chars of the names-only tail for tables past the budget
 
 const QUOTE_NOTE: Record<string, string> = {
   mysql: "Quote identifiers with backticks (`col`).",
@@ -27,21 +28,46 @@ const QUOTE_NOTE: Record<string, string> = {
   sqlite: 'Quote identifiers with double quotes ("col").',
 };
 
-function schemaSummary(tables: AiCtxTable[]): string {
+function schemaSummary(tables: AiCtxTable[], focus: string): string {
+  // Relevance first: tables whose name appears in the conversation (or shares a
+  // word with it) get their full column lists ahead of the budget cutoff, so
+  // asking about `product_vendor_link` pulls it in even on a 500-table schema.
+  const f = focus.toLowerCase();
+  const fWords = new Set(f.split(/[^a-z0-9_]+/).filter((w) => w.length > 2));
+  const score = (t: AiCtxTable): number => {
+    const n = t.name.toLowerCase();
+    if (f.includes(n)) return 0;
+    if (n.split("_").some((tok) => fWords.has(tok))) return 1;
+    return 2;
+  };
+  const ranked = tables.map((t, i) => ({ t, i, s: score(t) })).sort((a, b) => a.s - b.s || a.i - b.i);
+
   let out = "";
-  let shown = 0;
-  for (const t of tables) {
+  const rest: string[] = [];
+  for (const { t } of ranked) {
     const cols = t.columns.map((c) => `${c.name} ${c.data_type}`).join(", ");
     const line = `${t.schema}.${t.name}(${cols})\n`;
-    if (out.length + line.length > SCHEMA_BUDGET) break;
-    out += line;
-    shown++;
+    if (out.length + line.length > SCHEMA_BUDGET) rest.push(`${t.schema}.${t.name}`);
+    else out += line;
   }
-  if (shown < tables.length) out += `… and ${tables.length - shown} more tables (ask to see a specific one).\n`;
+  if (rest.length) {
+    // Never silently drop a table: the remainder is listed by NAME so the
+    // model knows it exists and can ask for its columns.
+    let names = "";
+    let listed = 0;
+    for (const n of rest) {
+      if (names.length + n.length + 2 > NAME_LIST_BUDGET) break;
+      names += (names ? ", " : "") + n;
+      listed++;
+    }
+    out += `\nOther tables (columns available on request — ask the user to mention the table):\n${names}`;
+    if (listed < rest.length) out += `, … and ${rest.length - listed} more`;
+    out += "\n";
+  }
   return out || "(no user tables)";
 }
 
-export function buildSystemPrompt(c: AiContext): string {
+export function buildSystemPrompt(c: AiContext, conversationText = ""): string {
   const quote = QUOTE_NOTE[c.dialect] ?? QUOTE_NOTE.postgres;
   const lines: string[] = [
     "You are an AI assistant embedded in Tusk, a desktop SQL client. Help the user write, understand, fix, and optimize SQL.",
@@ -60,7 +86,7 @@ export function buildSystemPrompt(c: AiContext): string {
     "- Generate SQL in the dialect above and quote identifiers as noted. Be concise.",
     "",
     "Database schema (schema.table(columns)):",
-    schemaSummary(c.tables),
+    schemaSummary(c.tables, `${conversationText} ${c.currentSql} ${c.selection}`),
   );
   if (c.currentSql.trim()) {
     const sql = c.selection.trim() || c.currentSql;

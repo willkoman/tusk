@@ -4,6 +4,10 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+### Changed
+- **AI schema context: relevance-ranked, never silently truncated.** The system prompt's schema dump (was: first ~8KB of the table catalog in list order, rest dropped) now ranks tables by relevance first — any table mentioned in the conversation, the editor SQL, or sharing a name token with them gets its full column list ahead of the budget (raised to ~12KB) — and every table past the budget is still listed by name so the model knows it exists and can ask. Fixes "table X wasn't in the truncated schema list" on large schemas.
+- **AI composer is a multiline textarea**: grows with content up to ~5 lines (then scrolls), Enter sends, Shift+Enter inserts a newline.
+
 ## [0.4.8] - 2026-06-11
 
 ### Changed

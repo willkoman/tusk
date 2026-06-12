@@ -41,6 +41,14 @@ export function AiPanel(props: {
   const [input, setInput] = createSignal("");
   const [streaming, setStreaming] = createSignal(false);
   let msgEl: HTMLDivElement | undefined;
+  let inputEl: HTMLTextAreaElement | undefined;
+  // Auto-grow the composer with its content, capped at ~5 lines (CSS max-height
+  // does the clamping; scrollHeight keeps growing past it → scrollbar).
+  const autoGrow = () => {
+    if (!inputEl) return;
+    inputEl.style.height = "auto";
+    inputEl.style.height = `${inputEl.scrollHeight}px`;
+  };
 
   const setConfig = (patch: Partial<AiConfig>) => {
     const next = { ...cfg(), ...patch };
@@ -119,6 +127,7 @@ export function AiPanel(props: {
     pinned = true; // a fresh send always follows the reply
     setMessages([...convo, { role: "assistant", content: "" }]);
     setInput("");
+    queueMicrotask(autoGrow); // collapse the composer back to one line
     setStreaming(true);
     const channel = new Channel<AiEvent>();
     channel.onmessage = (ev) => {
@@ -133,7 +142,9 @@ export function AiPanel(props: {
           provider: c.provider,
           model: c.model || defaultModel(c.provider),
           baseUrl: c.baseUrl.trim() || null,
-          system: buildSystemPrompt(props.ctx()),
+          // Conversation text steers the schema summary: mentioned tables get
+          // their full columns even when the schema dump is over budget.
+          system: buildSystemPrompt(props.ctx(), convo.map((m) => m.content).join("\n")),
           messages: convo.map((m) => ({ role: m.role, content: m.content })),
           maxTokens: 2048,
         },
@@ -241,7 +252,20 @@ export function AiPanel(props: {
         <button class="ghost" disabled={streaming()} onClick={fixError}>Fix error</button>
       </div>
       <form class="ai-input" onSubmit={(e) => { e.preventDefault(); send(input()); }}>
-        <input value={input()} onInput={(e) => setInput(e.currentTarget.value)} placeholder={streaming() ? "…streaming" : "Ask the AI…"} disabled={streaming()} />
+        <textarea
+          ref={inputEl}
+          rows={1}
+          value={input()}
+          onInput={(e) => { setInput(e.currentTarget.value); autoGrow(); }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              send(input());
+            }
+          }}
+          placeholder={streaming() ? "…streaming" : "Ask the AI… (Shift+Enter = newline)"}
+          disabled={streaming()}
+        />
         <button class="run" type="submit" disabled={streaming() || !input().trim()}>Send</button>
       </form>
     </div>

@@ -792,8 +792,14 @@ button.btn-danger { background: var(--danger); border-color: var(--danger); colo
 .ai-sql-btn { align-self: flex-start; font-size: 11px; padding: 3px 8px; border: 1px solid var(--accent); color: var(--accent); background: transparent; border-radius: 6px; cursor: pointer; }
 .ai-sql-btn:hover { background: var(--accent); color: #fff; }
 .ai-actions { display: flex; gap: 6px; padding: 6px 8px; border-top: 1px solid var(--border); }
-.ai-input { display: flex; gap: 6px; padding: 8px; border-top: 1px solid var(--border); }
-.ai-input input { flex: 1; min-width: 0; font: inherit; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+.ai-input { display: flex; align-items: flex-end; gap: 6px; padding: 8px; border-top: 1px solid var(--border); }
+.ai-input textarea {
+  flex: 1; min-width: 0; font: inherit; padding: 8px 10px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+  resize: none; min-height: 36px; max-height: 108px; /* ~5 lines, then scrolls */
+  line-height: 1.45; overflow-y: auto;
+}
+.ai-input textarea:focus { outline: none; border-color: var(--accent); }
 .ai-key-link { align-self: flex-start; margin-top: 2px; padding: 2px 0; background: transparent; border: none; color: var(--accent); font-size: 11px; text-transform: none; letter-spacing: normal; cursor: pointer; }
 .ai-key-link:hover { text-decoration: underline; }
 
