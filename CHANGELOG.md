@@ -4,6 +4,8 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.4.9] - 2026-06-12
+
 ### Changed
 - **Tab strip scrolls with the mouse wheel** when it overflows (vertical wheel → horizontal scroll).
 - **Running-query spinner: pinned + visible on the tab.** The statement-gutter spinner used to follow the cursor's statement, so clicking around while a query ran dragged the spinner to blocks that weren't doing anything — it's now pinned to the statement where the run actually started (anchor mapped through edits). The tab strip also shows a small spinner on whichever tab owns the in-flight query, so a run stays visible from any tab.
