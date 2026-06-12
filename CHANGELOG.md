@@ -4,6 +4,8 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.4.10] - 2026-06-12
+
 ### Added
 - **Six new themes** alongside One Dark and One Light: **Catppuccin Mocha**, **Dracula**, **Tokyo Night** (dark) and **Solarized Light**, **GitHub Light**, **Gruvbox Light** — each with a full UI palette (surfaces, borders, semantic colors, scrollbars, heat scale), matching CodeMirror editor theme (canonical syntax palettes via a shared theme factory), and themed syntax tokens for the DDL/history/AI code panes. Settings → Appearance groups the picker by Dark/Light; "Follow system" still resolves to One Dark / One Light.
 
