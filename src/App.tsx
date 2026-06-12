@@ -2099,7 +2099,18 @@ function App() {
 
           <main class="main">
             <div class="editor-pane" style={{ height: `${editorH()}px` }}>
-              <div class="tab-strip">
+              <div
+                class="tab-strip"
+                onWheel={(e) => {
+                  // Vertical wheel scrolls the horizontal strip when it overflows.
+                  const el = e.currentTarget;
+                  if (el.scrollWidth <= el.clientWidth) return;
+                  if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+                    el.scrollLeft += e.deltaY;
+                    e.preventDefault();
+                  }
+                }}
+              >
                 <For each={tabs()}>
                   {(t) => (
                     <div

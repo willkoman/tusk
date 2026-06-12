@@ -5,6 +5,7 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 ## [Unreleased]
 
 ### Changed
+- **Tab strip scrolls with the mouse wheel** when it overflows (vertical wheel → horizontal scroll).
 - **Running-query spinner: pinned + visible on the tab.** The statement-gutter spinner used to follow the cursor's statement, so clicking around while a query ran dragged the spinner to blocks that weren't doing anything — it's now pinned to the statement where the run actually started (anchor mapped through edits). The tab strip also shows a small spinner on whichever tab owns the in-flight query, so a run stays visible from any tab.
 - **Completion knows the live function/procedure catalog.** After `CALL` / `EXEC` / `EXECUTE` / `PERFORM`, the database's own callables (the `list_functions` catalog that already feeds the lint) top the suggestion list; they're also offered in general expression contexts alongside the dialect builtins (they were absent from completion entirely).
 - **Explorer: double-click runs the table reliably.** The second click of a double-click no longer re-collapses the node the first click expanded, and scroll anchoring is disabled on the tree so expanding a node at the scrolled-to-bottom edge can't shift the clicked row out from under the cursor (which made double-click physically impossible there).
