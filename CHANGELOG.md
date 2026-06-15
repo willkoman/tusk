@@ -4,6 +4,11 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.4.11] - 2026-06-15
+
+### Changed
+- **Refreshed app icon** regenerated from an updated source logo (desktop `.ico`/`.icns`/PNG set + Windows Store tiles).
+
 ## [0.4.10] - 2026-06-12
 
 ### Added
