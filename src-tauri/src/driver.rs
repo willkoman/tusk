@@ -1497,13 +1497,18 @@ fn duck_build_tree(conn: &duckdb::Connection) -> Result<tree::DbTree, AppError> 
         .unwrap_or_default();
     let (_c, schema_rows) = duck_query(
         conn,
+        // DuckDB's information_schema spans every ATTACHED catalog (memory/system/temp),
+        // each of which has its own `main` schema — filter to the current database or the
+        // sidebar shows `main` (and any user schema) once per catalog.
         "SELECT schema_name FROM information_schema.schemata \
-         WHERE schema_name NOT IN ('information_schema','pg_catalog') ORDER BY schema_name",
+         WHERE catalog_name = current_database() \
+         AND schema_name NOT IN ('information_schema','pg_catalog') ORDER BY schema_name",
     )?;
     let (_c2, table_rows) = duck_query(
         conn,
         "SELECT table_schema, table_name, table_type FROM information_schema.tables \
-         WHERE table_schema NOT IN ('information_schema','pg_catalog') \
+         WHERE table_catalog = current_database() \
+         AND table_schema NOT IN ('information_schema','pg_catalog') \
          ORDER BY table_schema, table_name",
     )?;
     let mut schemas: Vec<tree::Schema> = schema_rows

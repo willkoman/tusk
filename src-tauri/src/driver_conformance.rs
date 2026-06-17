@@ -229,6 +229,16 @@ async fn run_battery(b: &mut Backend, eng: &Eng) {
         tree.schemas.iter().any(|s| s.tables.iter().any(|t| t.name == "conf")),
         "[{}] build_tree includes conf", eng.name
     );
+    // no duplicate schema rows — DuckDB's information_schema spans attached catalogs
+    // (memory/system/temp), each with its own `main`, so an unfiltered schemata query
+    // showed `main` three times in the sidebar. Every engine must report each schema once.
+    {
+        let mut names: Vec<&str> = tree.schemas.iter().map(|s| s.name.as_str()).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(total, names.len(), "[{}] duplicate schema rows: {names:?}", eng.name);
+    }
     let det = b.table_detail(eng.schema, "conf").await.unwrap();
     let cols: Vec<&str> = det.columns.iter().map(|c| c.name.as_str()).collect();
     assert!(cols.contains(&"id") && cols.contains(&"name"), "[{}] table_detail cols {cols:?}", eng.name);

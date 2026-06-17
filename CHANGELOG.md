@@ -4,6 +4,9 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+### Fixed
+- **DuckDB sidebar listed the `main` schema (and any user schema) once per attached catalog.** DuckDB's `information_schema` spans every attached catalog (`memory`/`system`/`temp`), each with its own `main`, so the tree showed `main` three times (only the first carried tables). `duck_build_tree` now filters `schemata`/`tables` to `current_database()`. Added a cross-engine conformance assertion that every driver reports each schema exactly once.
+
 ## [0.4.11] - 2026-06-15
 
 ### Changed
