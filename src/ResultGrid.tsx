@@ -1,9 +1,10 @@
 import { createSignal, createMemo, createEffect, on, For, Show, type Accessor } from "solid-js";
 import { type Dataset, toTSV, toCSV, toJSON, toMarkdown } from "./formats";
-import { clipWrite } from "./clipboard";
+import { clipWrite, clipRead } from "./clipboard";
 import { type MenuItem } from "./ContextMenu";
 import { type GridView, type SortKey, type Filter, type PendingEdits } from "./tabs";
 import { boolWord } from "./grid/bool";
+import { parseClipboardTable, type RowRef } from "./grid/paste";
 
 // Hand-rolled, two-axis-virtualized, read-only result grid. Uses a synchronized-pane
 // layout (header + gutter are transform-translated siblings of the body scroller, NOT
@@ -59,14 +60,19 @@ export type ResultGridProps = {
   /** Whether this ORIGINAL column belongs to the target table (defense-in-depth; non-table cells never edit). */
   canEditCol: (origCol: number) => boolean;
   /** Record a cell edit: null = SQL NULL, undefined = revert (clear pending entry). */
-  onEditCell: (row: number, origCol: number, val: string | null | undefined) => void;
+  onEditCell: (ref: RowRef, origCol: number, val: string | null | undefined) => void;
   /** Per ORIGINAL column: render textual booleans as TRUE/FALSE badges. */
   isBoolCol: (origCol: number) => boolean;
   /** Boolean editor info for an ORIGINAL column (null = free-text editor). */
   boolEdit: (origCol: number) => { trueVal: string; falseVal: string; nullable: boolean } | null;
-  /** Toggle delete-marks on the given virtual row indices (insert rows are removed). */
-  onMarkDelete: (rows: number[]) => void;
+  /** Toggle delete-marks on the given rows (insert rows are removed outright). */
+  onMarkDelete: (rows: RowRef[]) => void;
   onAddRow: () => void;
+  /**
+   * Paste a parsed clipboard grid. `anchor`/`anchorDisplayIdx`/`displayOrigCols`
+   * describe where a positional paste starts; header-mapped pastes ignore them.
+   */
+  onPaste: (anchor: RowRef, anchorDisplayIdx: number, displayOrigCols: number[], table: string[][]) => void;
 };
 
 export function ResultGrid(props: ResultGridProps) {
@@ -98,25 +104,36 @@ export function ResultGrid(props: ResultGridProps) {
   });
   const contentW = () => offsets()[offsets().length - 1] || 0;
 
-  // --- pending-edits overlay (virtual rows = loaded rows + insert rows) ---
+  // --- pending-edits overlay (virtual rows = insert rows FIRST, then loaded rows) ---
+  // Insert rows occupy virtual indices [0, nIns) so they stay pinned at the top of the
+  // grid, immediately reachable, regardless of how many loaded rows have streamed in (a
+  // bottom-anchored insert would force scrolling to the end of a huge result to edit it).
+  // The pending store still keys edits/deletes by LOADED index and inserts by array
+  // index — `rowRef` is the single translation from a virtual row to that stable
+  // identity, used both for rendering and for every callback into App.
   const nLoaded = () => props.rows().length;
   const nIns = () => props.pending()?.inserts.length ?? 0;
   const nRows = createMemo(() => nLoaded() + nIns());
+  const isInsRow = (r: number) => r < nIns();
+  const loadedAt = (r: number) => r - nIns(); // valid when !isInsRow(r)
+  const rowRef = (r: number): RowRef => (isInsRow(r) ? { kind: "insert", i: r } : { kind: "loaded", i: loadedAt(r) });
   const delSet = createMemo(() => new Set(props.pending()?.deletes ?? []));
-  const insRec = (r: number) => props.pending()?.inserts[r - nLoaded()];
+  const isDeleted = (r: number) => !isInsRow(r) && delSet().has(loadedAt(r));
+  const insRec = (r: number) => props.pending()?.inserts[r];
   /** Displayed value: pending edit > snapshot; insert rows read their sparse record. */
   const cellVal = (r: number, oi: number): string | null => {
-    if (r >= nLoaded()) return insRec(r)?.[oi] ?? null;
-    const e = props.pending()?.cells[r]?.[oi];
-    return e !== undefined ? e : props.rows()[r]?.[oi] ?? null;
+    if (isInsRow(r)) return insRec(r)?.[oi] ?? null;
+    const li = loadedAt(r);
+    const e = props.pending()?.cells[li]?.[oi];
+    return e !== undefined ? e : props.rows()[li]?.[oi] ?? null;
   };
   /** Copy-facing value: boolean columns yield the displayed word (TRUE/FALSE), not the driver token (t/f/0/1). */
   const copyVal = (r: number, oi: number): string | null => {
     const v = cellVal(r, oi);
     return v !== null && props.isBoolCol(oi) ? boolWord(v) ?? v : v;
   };
-  const isDirty = (r: number, oi: number) => r < nLoaded() && props.pending()?.cells[r]?.[oi] !== undefined;
-  const isInsUntouched = (r: number, oi: number) => r >= nLoaded() && insRec(r)?.[oi] === undefined;
+  const isDirty = (r: number, oi: number) => !isInsRow(r) && props.pending()?.cells[loadedAt(r)]?.[oi] !== undefined;
+  const isInsUntouched = (r: number, oi: number) => isInsRow(r) && insRec(r)?.[oi] === undefined;
 
   const totalH = createMemo(() => nRows() * rowH());
 
@@ -208,6 +225,28 @@ export function ResultGrid(props: ResultGridProps) {
       });
     }),
   );
+
+  // New insert rows (from +Row or paste) are appended to the pending insert array and
+  // live at the TOP of the virtual space — reveal the first one and put the cursor on
+  // its first editable cell so the user can type immediately without scrolling. Gated
+  // to same-tab increases so a tab switch (different pending) never triggers it.
+  let insTrack = { tab: "", n: 0 };
+  createEffect(() => {
+    const tab = props.activeTabId();
+    const n = nIns();
+    const prev = insTrack;
+    insTrack = { tab, n };
+    if (!props.editable() || prev.tab !== tab || n <= prev.n) return;
+    const firstNew = prev.n; // virtual index of the first appended insert row
+    const dc = displayCols();
+    let col = 0;
+    for (let k = 0; k < dc.length; k++) if (props.canEditCol(dc[k])) { col = k; break; }
+    queueMicrotask(() => {
+      setSel({ mode: "cell", ar: firstNew, ac: col, fr: firstNew, fc: col });
+      scrollCellIntoView(firstNew, col);
+      focusGrid(); // +Row leaves focus on the button; reclaim it for immediate typing
+    });
+  });
 
   // --- selection ---
   const rect = () => {
@@ -334,7 +373,7 @@ export function ResultGrid(props: ResultGridProps) {
   let editCancelled = false;
   const NULL_OPT = "~null~"; // select-option sentinel for SQL NULL
   function beginEdit(r: number, dc: number) {
-    if (!props.editable() || delSet().has(r)) return;
+    if (!props.editable() || isDeleted(r)) return;
     const oi = displayCols()[dc];
     if (oi === undefined || !props.canEditCol(oi)) return;
     editOrig = cellVal(r, oi);
@@ -352,21 +391,21 @@ export function ResultGrid(props: ResultGridProps) {
       if (!editSelect) return;
       const v = editSelect.value;
       setEditing(null);
-      if (v === NULL_OPT) props.onEditCell(ed.r, oi, null);
+      if (v === NULL_OPT) props.onEditCell(rowRef(ed.r), oi, null);
       else {
         // Re-picking the original value reverts the pending edit instead of
         // recording a no-op write (PG snapshot "t" vs dropdown "true" would
         // otherwise compare unequal and stay dirty forever).
-        const snap = ed.r < nLoaded() ? props.rows()[ed.r]?.[oi] ?? null : undefined;
-        if (snap !== undefined && snap !== null && boolWord(snap) === v) props.onEditCell(ed.r, oi, undefined);
-        else props.onEditCell(ed.r, oi, v === "TRUE" ? be.trueVal : be.falseVal);
+        const snap = !isInsRow(ed.r) ? props.rows()[loadedAt(ed.r)]?.[oi] ?? null : undefined;
+        if (snap !== undefined && snap !== null && boolWord(snap) === v) props.onEditCell(rowRef(ed.r), oi, undefined);
+        else props.onEditCell(rowRef(ed.r), oi, v === "TRUE" ? be.trueVal : be.falseVal);
       }
     } else {
       if (!editInput) return;
       const v = editInput.value;
       setEditing(null);
       // Typing nothing over a NULL is not an edit (don't turn NULL into '').
-      if (!(editOrig === null && v === "")) props.onEditCell(ed.r, oi, v);
+      if (!(editOrig === null && v === "")) props.onEditCell(rowRef(ed.r), oi, v);
     }
     focusGrid();
     if (move === "down") moveSelTo(ed.r + 1, ed.dc);
@@ -382,7 +421,7 @@ export function ResultGrid(props: ResultGridProps) {
     if (!ed) return;
     editCancelled = true;
     setEditing(null);
-    props.onEditCell(ed.r, displayCols()[ed.dc], null);
+    props.onEditCell(rowRef(ed.r), displayCols()[ed.dc], null);
     focusGrid();
   }
   function moveSelTo(r: number, c: number) {
@@ -436,6 +475,9 @@ export function ResultGrid(props: ResultGridProps) {
       case "Escape": setSel({ mode: "cell", ar: fr, ac: fc, fr, fc }); break;
       case "a": if (mod) { selectAll(); e.preventDefault(); } break;
       case "c": if (mod) { void copySelection("tsv"); e.preventDefault(); } break;
+      case "v":
+        if (mod && props.editable()) { e.preventDefault(); e.stopPropagation(); void doPaste(); }
+        break;
       case "Enter":
       case "F2":
         if (props.editable() && s.mode !== "none") { beginEdit(fr, fc); e.preventDefault(); }
@@ -443,8 +485,26 @@ export function ResultGrid(props: ResultGridProps) {
       case "Delete":
       case "Backspace":
         // Row-selection only — a stray Delete on a cell selection must not mark rows.
-        if (props.editable() && s.mode === "rows") { props.onMarkDelete(selectedRowIndices()); e.preventDefault(); }
+        if (props.editable() && s.mode === "rows") { props.onMarkDelete(selectedRowIndices().map(rowRef)); e.preventDefault(); }
         break;
+    }
+  }
+
+  // --- paste (Mod+V) — parse the clipboard and hand a grid + anchor to App ---
+  async function doPaste() {
+    const text = await clipRead();
+    if (text == null || text === "") return;
+    const table = parseClipboardTable(text);
+    if (!table.length) return;
+    const dc = displayCols();
+    const s = sel();
+    // No active cell → anchor at the append region so a stray paste never overwrites
+    // loaded rows; otherwise anchor at the focused cell.
+    if (s.mode === "none") props.onPaste({ kind: "insert", i: nIns() }, 0, dc, table);
+    else {
+      const ar = s.fr < 0 ? 0 : Math.min(s.fr, nRows() - 1 < 0 ? 0 : nRows() - 1);
+      const ac = s.fc < 0 ? 0 : s.fc;
+      props.onPaste(rowRef(Math.max(0, ar)), ac, dc, table);
     }
   }
 
@@ -498,15 +558,18 @@ export function ResultGrid(props: ResultGridProps) {
     const editItems: MenuItem[] = [];
     if (props.editable()) {
       const selRows = selectedRowIndices(r);
-      const allDel = selRows.length > 0 && selRows.every((x) => delSet().has(x));
-      const colOk = props.canEditCol(oi) && !delSet().has(r);
+      // "Undelete" only when every LOADED row in the selection is already marked
+      // (insert rows aren't delete-marked — they're removed outright).
+      const loadedSel = selRows.filter((x) => !isInsRow(x));
+      const allDel = loadedSel.length > 0 && loadedSel.every(isDeleted);
+      const colOk = props.canEditCol(oi) && !isDeleted(r);
       editItems.push(
         { label: "Edit cell", icon: "edit", disabled: !colOk, title: colOk ? undefined : "column doesn't belong to the table", onClick: () => beginEdit(r, dc) },
-        { label: "Set NULL", icon: "slash", disabled: !colOk, onClick: () => props.onEditCell(r, oi, null) },
+        { label: "Set NULL", icon: "slash", disabled: !colOk, onClick: () => props.onEditCell(rowRef(r), oi, null) },
       );
-      if (isDirty(r, oi)) editItems.push({ label: "Revert cell", icon: "eraser", onClick: () => props.onEditCell(r, oi, undefined) });
+      if (isDirty(r, oi)) editItems.push({ label: "Revert cell", icon: "eraser", onClick: () => props.onEditCell(rowRef(r), oi, undefined) });
       editItems.push(
-        { label: allDel ? `Undelete row${selRows.length > 1 ? "s" : ""}` : `Delete row${selRows.length > 1 ? "s" : ""}`, icon: "trash", danger: !allDel, onClick: () => props.onMarkDelete(selRows) },
+        { label: allDel ? `Undelete row${selRows.length > 1 ? "s" : ""}` : `Delete row${selRows.length > 1 ? "s" : ""}`, icon: "trash", danger: !allDel, onClick: () => props.onMarkDelete(selRows.map(rowRef)) },
         { label: "Insert row", icon: "plus", onClick: () => props.onAddRow() },
         { sep: true },
       );
@@ -617,10 +680,9 @@ export function ResultGrid(props: ResultGridProps) {
     if (!measureCtx) return;
     measureCtx.font = props.gridStyle().font;
     let max = measureCtx.measureText(props.columns()[oi]).width + 34;
-    const R = props.rows();
     const { start, end } = visRows();
     for (let r = start; r < end; r++) {
-      const v = R[r]?.[oi];
+      const v = cellVal(r, oi);
       if (v != null) max = Math.max(max, measureCtx.measureText(v).width + 22);
     }
     props.setView({ widths: { ...props.view().widths, [oi]: Math.max(MIN_COL_W, Math.min(MAX_COL_W, Math.ceil(max))) } });
@@ -744,11 +806,11 @@ export function ResultGrid(props: ResultGridProps) {
             {(r) => (
               <div
                 class="rg-gutnum"
-                classList={{ sel: sel().mode === "rows" && isSel(r, 0), "rg-del": delSet().has(r), "rg-new": r >= nLoaded() }}
+                classList={{ sel: sel().mode === "rows" && isSel(r, 0), "rg-del": isDeleted(r), "rg-new": isInsRow(r) }}
                 style={{ top: `${r * rowH()}px`, height: `${rowH()}px` }}
                 onMouseDown={(e) => onGutterDown(e, r)}
               >
-                {r >= nLoaded() ? "+" : r + 1}
+                {isInsRow(r) ? "+" : loadedAt(r) + 1}
               </div>
             )}
           </For>
@@ -762,7 +824,7 @@ export function ResultGrid(props: ResultGridProps) {
             {(r) => (
               <div
                 class="rg-row"
-                classList={{ odd: props.gridStyle().zebra && r % 2 === 1, "rg-del": delSet().has(r), "rg-new": r >= nLoaded() }}
+                classList={{ odd: props.gridStyle().zebra && r % 2 === 1, "rg-del": isDeleted(r), "rg-new": isInsRow(r) }}
                 style={{ top: `${r * rowH()}px`, height: `${rowH()}px`, width: `${contentW()}px` }}
               >
                 <For each={range(visCols().start, visCols().end)}>
@@ -778,7 +840,7 @@ export function ResultGrid(props: ResultGridProps) {
                         onDblClick={(e) => {
                           // Editable grids edit on dbl-click; Ctrl/Cmd+dbl-click (or a
                           // non-editable column/row) falls back to View value.
-                          if (props.editable() && !(e.ctrlKey || e.metaKey) && props.canEditCol(oi()) && !delSet().has(r)) beginEdit(r, k);
+                          if (props.editable() && !(e.ctrlKey || e.metaKey) && props.canEditCol(oi()) && !isDeleted(r)) beginEdit(r, k);
                           else props.onViewValue(props.columns()[oi()], val());
                         }}
                         onContextMenu={(e) => onCellContext(e, r, k, oi(), val())}

@@ -4,6 +4,14 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.4.12] - 2026-06-17
+
+### Added
+- **Paste tabular data into the grid (editable results).** ⌘/Ctrl+V parses the clipboard (auto-detecting TSV vs CSV, quoted fields honored) and either (a) **maps by header** — when the first pasted row matches the result's column names, every following row is appended as a new row with values mapped to columns by name (order-independent) — or (b) **fills positionally** from the focused cell, overwriting cells and overflowing into new rows. Blank cell pastes as NULL; a short row omits the trailing columns (server default on INSERT). Pure, vitest-covered (`src/grid/paste.ts`).
+
+### Changed
+- **New in-grid rows are pinned to the TOP of the result, not the bottom.** Previously an inserted row sat after every loaded row, so on a large/streaming result you had to scroll to the very end to fill it in. Insert rows now occupy the top of the grid (stable regardless of how many rows have streamed), and adding/pasting rows scrolls there and focuses the first editable cell. Internally the grid↔App edit boundary now passes a stable `RowRef` (loaded-vs-insert identity) instead of a virtual row index.
+
 ### Fixed
 - **DuckDB sidebar listed the `main` schema (and any user schema) once per attached catalog.** DuckDB's `information_schema` spans every attached catalog (`memory`/`system`/`temp`), each with its own `main`, so the tree showed `main` three times (only the first carried tables). `duck_build_tree` now filters `schemata`/`tables` to `current_database()`. Added a cross-engine conformance assertion that every driver reports each schema exactly once.
 

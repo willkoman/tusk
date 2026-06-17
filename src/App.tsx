@@ -15,6 +15,7 @@ import { wrapQuery, wrappableQuery, stripTrailingSemi, hasDuplicateColumns } fro
 import { editTarget, editPlan, type EditPlan } from "./grid/editable";
 import { detectBoolCols, typeBoolCols } from "./grid/bool";
 import { buildCommitScript } from "./grid/editSql";
+import { planPaste, mergePaste, type RowRef } from "./grid/paste";
 import { makeIndexer } from "./sql/aliases";
 import { type Dataset, parseCSV, parseJSON, formatWithOptions } from "./formats";
 import { FORMAT_EXT, type ExportOptions, type ExportScope } from "./export";
@@ -630,16 +631,17 @@ function App() {
   const ensurePending = (): PendingEdits => tabPending() ?? { cells: {}, deletes: [], inserts: [] };
 
   // val: string = new value, null = SQL NULL, undefined = revert (drop the entry).
-  function onEditCell(r: number, c: number, val: string | null | undefined) {
+  // `ref` is the stable row identity from the grid (loaded snapshot row vs pending
+  // insert row) — App never reasons about virtual grid positions.
+  function onEditCell(ref: RowRef, c: number, val: string | null | undefined) {
     // Defense-in-depth (the grid already gates): never record an edit on a column
     // the commit script wouldn't write, and never while not editable.
     const ec = editCtx();
     if (!ec.editable || !(ec.plan?.isTableCol[c] ?? false)) return;
     const t = activeTab();
-    const nLoaded = t.result.rows.length;
     const p = ensurePending();
-    if (r >= nLoaded) {
-      const i = r - nLoaded;
+    if (ref.kind === "insert") {
+      const i = ref.i;
       if (!p.inserts[i]) return;
       const inserts = p.inserts.map((x, k) => (k === i ? { ...x } : x));
       if (val === undefined) delete inserts[i][c];
@@ -647,6 +649,7 @@ function App() {
       setPendingFor(t.id, { ...p, inserts });
       return;
     }
+    const r = ref.i;
     const orig = t.result.rows[r]?.[c] ?? null;
     const cells = { ...p.cells };
     const rowEdits = { ...(cells[r] ?? {}) };
@@ -659,19 +662,48 @@ function App() {
   }
 
   /** Toggle delete-marks on loaded rows; insert rows are removed outright. */
-  function onMarkDelete(rowIdx: number[]) {
-    if (!editCtx().editable || !rowIdx.length) return;
+  function onMarkDelete(refs: RowRef[]) {
+    if (!editCtx().editable || !refs.length) return;
     const t = activeTab();
-    const nLoaded = t.result.rows.length;
     const p = ensurePending();
-    const rmIns = new Set(rowIdx.filter((r) => r >= nLoaded).map((r) => r - nLoaded));
+    const rmIns = new Set(refs.filter((r) => r.kind === "insert").map((r) => r.i));
     const inserts = rmIns.size ? p.inserts.filter((_, i) => !rmIns.has(i)) : p.inserts;
-    const loaded = rowIdx.filter((r) => r < nLoaded);
+    const loaded = refs.filter((r) => r.kind === "loaded").map((r) => r.i);
     const cur = new Set(p.deletes);
     const allMarked = loaded.length > 0 && loaded.every((r) => cur.has(r));
     for (const r of loaded) allMarked ? cur.delete(r) : cur.add(r);
     const np = { ...p, deletes: [...cur].sort((a, b) => a - b), inserts };
     setPendingFor(t.id, isPendingEmpty(np) ? undefined : np);
+  }
+
+  /** Paste a clipboard grid (header-mapped or positional) into pending edits. */
+  function onPaste(anchor: RowRef, anchorDisplayIdx: number, displayOrigCols: number[], table: string[][]) {
+    const ec = editCtx();
+    if (!ec.editable || !ec.plan || !table.length) return;
+    const t = activeTab();
+    const p = ensurePending();
+    const plan = planPaste({
+      table,
+      resultColumns: t.result.columns,
+      isTableCol: ec.plan.isTableCol,
+      displayOrigCols,
+      anchorDisplayIdx,
+      anchor,
+      nLoaded: t.result.rows.length,
+      nInsExisting: p.inserts.length,
+    });
+    if (!plan.updates.length && !plan.inserts.length) {
+      setStatus("nothing to paste (no editable columns)");
+      return;
+    }
+    const np = mergePaste(p, plan, t.result.rows);
+    setPendingFor(t.id, isPendingEmpty(np) ? undefined : np);
+    const added = plan.inserts.length;
+    setStatus(
+      plan.mode === "mapped"
+        ? `pasted ${plan.rowCount} row${plan.rowCount === 1 ? "" : "s"} (mapped by header)`
+        : `pasted ${plan.rowCount}×${plan.colCount}${added ? ` (+${added} new row${added === 1 ? "" : "s"})` : ""}`,
+    );
   }
 
   function onAddRow() {
@@ -2304,6 +2336,7 @@ function App() {
                   onEditCell={onEditCell}
                   onMarkDelete={onMarkDelete}
                   onAddRow={onAddRow}
+                  onPaste={onPaste}
                   copyHeaders={() => prefs().copyHeaders}
                   gridStyle={() => ({
                     rowH: prefs().gridDensity === "compact" ? 22 : 28,
