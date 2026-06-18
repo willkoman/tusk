@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { hasDuplicateColumns, stripTrailingSemi, wrapQuery, wrappableQuery } from "./query";
+import { hasDuplicateColumns, hasViewRules, stripTrailingSemi, wrapQuery, wrappableQuery } from "./query";
 import { setSqlDialect } from "../sql/ident";
 
 afterEach(() => setSqlDialect("postgres"));
@@ -51,5 +51,18 @@ describe("existing helpers", () => {
     expect(wrappableQuery("SELECT 1;")).toBe(true);
     expect(wrappableQuery("UPDATE t SET a=1")).toBe(false);
     expect(stripTrailingSemi("  SELECT 1 ;  ")).toBe("SELECT 1");
+  });
+});
+
+describe("hasViewRules", () => {
+  it("true for any sort", () => {
+    expect(hasViewRules([{ col: 0, dir: "asc" }], [])).toBe(true);
+  });
+  it("true only for a non-blank filter", () => {
+    expect(hasViewRules([], [{ col: 0, text: "x" }])).toBe(true);
+    expect(hasViewRules([], [{ col: 0, text: "   " }])).toBe(false);
+  });
+  it("false when empty", () => {
+    expect(hasViewRules([], [])).toBe(false);
   });
 });

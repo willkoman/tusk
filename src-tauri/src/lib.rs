@@ -552,6 +552,31 @@ async fn table_detail(
     c.backend.table_detail(&schema, &name).await
 }
 
+/// A handful of sample rows from a relation, for the AI assistant's context (so it can
+/// answer targeted questions about real data without the user pasting any). Read-only;
+/// deliberately does NOT roll back the streaming cursor, so it never interrupts an
+/// in-flight result.
+#[derive(serde::Serialize)]
+struct SampleResult {
+    columns: Vec<String>,
+    rows: Vec<Vec<Option<String>>>,
+}
+
+#[tauri::command]
+async fn sample_rows(
+    state: tauri::State<'_, AppState>,
+    connection_id: String,
+    schema: String,
+    name: String,
+    limit: Option<u32>,
+) -> Result<SampleResult, AppError> {
+    let conn = state.get(&connection_id)?;
+    let mut c = conn.lock().await;
+    ensure_alive(&mut c).await?;
+    let (columns, rows) = c.backend.sample_rows(&schema, &name, limit.unwrap_or(5)).await?;
+    Ok(SampleResult { columns, rows })
+}
+
 #[tauri::command]
 async fn object_ddl(
     state: tauri::State<'_, AppState>,
@@ -829,6 +854,7 @@ pub fn run() {
             list_schema,
             db_tree,
             table_detail,
+            sample_rows,
             object_ddl,
             table_relationships,
             schema_relationships,

@@ -5,13 +5,13 @@ import "./App.css";
 import { isDarkTheme, normalizeTheme, type ThemeId } from "./themes";
 import { SqlEditor, type EditorApi } from "./SqlEditor";
 import { driverDialect, type DialectId } from "./sql/dialects";
-import { type AiContext } from "./ai/context";
+import { type AiContext, type SampleTable } from "./ai/context";
 import { type CursorInfo, type EditorPrefs, type ServerDiag } from "./editor/types";
 import { prefsStore, tabsStore, type PersistedTabs } from "./store";
 import { makeTab, basename, gridViewFor, pendingCount, type Tab, type ResultSnapshot, type GridView, type SortKey, type Filter, type PendingEdits } from "./tabs";
 import { ResultGrid } from "./ResultGrid";
 import { UpdateBadge } from "./UpdateBadge";
-import { wrapQuery, wrappableQuery, stripTrailingSemi, hasDuplicateColumns } from "./grid/query";
+import { wrapQuery, wrappableQuery, stripTrailingSemi, hasDuplicateColumns, hasViewRules } from "./grid/query";
 import { editTarget, editPlan, type EditPlan } from "./grid/editable";
 import { detectBoolCols, typeBoolCols } from "./grid/bool";
 import { buildCommitScript } from "./grid/editSql";
@@ -170,6 +170,32 @@ function App() {
     selection: editorApi()?.getSelection() ?? "",
     lastError: activeTab().result.runErr,
   });
+  // Sample-data fetcher for the AI assistant: a few read-only rows per relevant table,
+  // cached for the session (cleared on schema reload) and run without disturbing any
+  // in-flight stream. Best-effort — a table that can't be sampled is just skipped.
+  const sampleCache = new Map<string, SampleTable>();
+  async function aiSampleRows(targets: { schema: string; name: string }[]): Promise<SampleTable[]> {
+    const c = conn();
+    if (!c) return [];
+    const results = await Promise.all(
+      targets.map(async (t): Promise<SampleTable | null> => {
+        const key = `${t.schema}/${t.name}`;
+        const hit = sampleCache.get(key);
+        if (hit) return hit;
+        try {
+          const r = await invoke<{ columns: string[]; rows: (string | null)[][] }>("sample_rows", {
+            connectionId: c.id, schema: t.schema, name: t.name, limit: 5,
+          });
+          const s: SampleTable = { schema: t.schema, name: t.name, columns: r.columns, rows: r.rows };
+          sampleCache.set(key, s);
+          return s;
+        } catch {
+          return null;
+        }
+      }),
+    );
+    return results.filter((x): x is SampleTable => x !== null);
+  }
   // --- permission gating (Postgres; `enforced:false` elsewhere → no extra gating) ---
   const pEnforced = () => perms()?.enforced ?? false;
   const isSuper = () => !pEnforced() || !!perms()?.isSuperuser;
@@ -1111,6 +1137,7 @@ function App() {
     const c = conn();
     if (!c) return;
     setSchemaLoading(true);
+    sampleCache.clear(); // schema (and likely data) may have changed — drop stale AI samples
     try {
       const t = await invoke<DbTree>("db_tree", { connectionId: c.id });
       setTree(t);
@@ -1248,10 +1275,12 @@ function App() {
           status: `${out.rows.length}${out.done ? "" : "+"} rows${out.note ? ` · ${out.note}` : ""}`,
         });
         if (mode === "base") {
+          // A fresh result resets sort/filter, but the filter-row VISIBILITY is a UI
+          // preference (e.g. "Filter rows…" from the sidebar) — keep it across the reset.
           patchTab(runTabId, {
             gridView: sameColumns(prevCols, out.columns)
               ? { ...(rt?.gridView ?? gridViewFor(out.columns.length)), sorts: [], filters: [] }
-              : gridViewFor(out.columns.length),
+              : { ...gridViewFor(out.columns.length), filterRowOpen: rt?.gridView.filterRowOpen ?? false },
           });
         }
         if (!out.done) cursorOwnerTabId = runTabId;
@@ -1327,7 +1356,22 @@ function App() {
     // an isolated single SELECT to re-wrap — so store a non-wrappable base (disabling grid
     // sort/filter). Conservative: any inner `;` counts as multi (never wrongly wrappable).
     const inner = stripTrailingSemi(t);
-    void executeQuery(t, inner.includes(";") ? "" : inner, "base");
+    const base = inner.includes(";") ? "" : inner;
+    const at = activeTab();
+    // Re-running the SAME query text (no edits) while the grid has active sort/filter
+    // rules carries them over: re-stream the wrapped query instead of resetting to the
+    // raw result. Any edit to the query text breaks the match → fresh result (rules reset).
+    if (
+      base !== "" &&
+      base === stripTrailingSemi(at.result.baseQuery) &&
+      wrappableQuery(base) &&
+      hasViewRules(at.gridView.sorts, at.gridView.filters)
+    ) {
+      const gv = at.gridView;
+      void executeQuery(wrapQuery(base, gv.sorts, gv.filters, at.result.columns, caps()?.kind), base, "wrapped");
+      return;
+    }
+    void executeQuery(t, base, "base");
   }
 
   function doRun(override?: string) {
@@ -1549,6 +1593,16 @@ function App() {
     doRun(q);
   }
 
+  /** Open a table in a new tab and run it with the per-column filter row already showing. */
+  function filterTable(schemaName: string, name: string) {
+    const q = `SELECT * FROM ${qualifyIn(schemaName, name, schemaName)}`;
+    const t = makeTab({ sql: q, searchSchema: schemaName, title: name });
+    t.gridView = { ...t.gridView, filterRowOpen: true };
+    setTabs((ts) => [...ts, t]);
+    switchTab(t.id);
+    doRun(q);
+  }
+
   // Run a DDL statement built by a form/confirm dialog, then refresh the tree.
   // Returns ok/error so the dialog can stay open and show failures inline.
   async function runDDL(sqlText: string): Promise<{ ok: boolean; error?: string }> {
@@ -1707,6 +1761,7 @@ function App() {
         items.push(
           { label: "Select 100 rows", icon: "play", onClick: () => runTableLimit(s!, n.name, 100) },
           { label: "Select all rows", icon: "play", onClick: () => runTable(s!, n.name) },
+          { label: "Filter rows…", icon: "search", onClick: () => filterTable(s!, n.name) },
           { sep: true },
           { label: "Modify table…", icon: "edit", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openModify(n) },
           { label: "Add column…", icon: "plus", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "addColumn", ctx: n }) },
@@ -1735,7 +1790,10 @@ function App() {
       case "view":
       case "matview": {
         const kw = n.kind;
-        items.push({ label: "Select all rows", icon: "play", onClick: () => runTable(s!, n.name) });
+        items.push(
+          { label: "Select all rows", icon: "play", onClick: () => runTable(s!, n.name) },
+          { label: "Filter rows…", icon: "search", onClick: () => filterTable(s!, n.name) },
+        );
         if (kw === "matview")
           items.push(
             { label: "Refresh", icon: "refresh", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => runDDLToast(ddl.refreshMatview(s!, n.name, false)) },
@@ -2369,6 +2427,7 @@ function App() {
           <Show when={aiOpen()}>
             <AiPanel
               ctx={aiContext}
+              sampleRows={aiSampleRows}
               onInsertSql={(sql) => openGeneratedTab(sql, activeTab().searchSchema, "AI query")}
               onClose={() => setAiOpen(false)}
             />

@@ -8,6 +8,8 @@ export type AiConfig = {
   model: string;
   /** Override the API base — OpenAI-compatible / OpenCode / local / proxy. Blank = default. */
   baseUrl: string;
+  /** Send a few sample rows of relevant tables to the model (real values leave your machine). Default on. */
+  shareSamples: boolean;
 };
 
 // Curated models per provider (first = default) — the FALLBACK only. The pickers fetch
@@ -48,11 +50,11 @@ export const aiStore = {
   load(): AiConfig {
     try {
       const r = JSON.parse(localStorage.getItem(KEY) || "");
-      if (r && r.provider) return { baseUrl: "", ...r };
+      if (r && r.provider) return { baseUrl: "", shareSamples: true, ...r };
     } catch {
       /* ignore */
     }
-    return { provider: "anthropic", model: defaultModel("anthropic"), baseUrl: "" };
+    return { provider: "anthropic", model: defaultModel("anthropic"), baseUrl: "", shareSamples: true };
   },
   save(c: AiConfig) {
     localStorage.setItem(KEY, JSON.stringify(c));

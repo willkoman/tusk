@@ -4,6 +4,15 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.4.13] - 2026-06-18
+
+### Added
+- **AI assistant now sees real data, not just the schema.** Before each message it auto-fetches a few sample rows from the tables most relevant to your question (read-only, bounded, schema already rode along) and folds them into the model's context — so you can ask targeted questions ("why are these amounts negative?", "what format is `status`?") and the model understands the actual value shapes without you pasting anything. New backend `sample_rows` command runs alongside an in-flight stream without interrupting it. A **"Share sample data with the model"** toggle in AI settings (default on) controls whether real values leave your machine.
+- **"Filter rows…" from the sidebar.** Right-clicking a table or view now offers *Filter rows…*, which opens it in a new tab with the per-column filter row already showing — type a value in any column to narrow the rows (server-side `WHERE`), no SQL needed.
+
+### Changed
+- **Re-running an unchanged query keeps its sort/filter.** Hitting Run again on the same query text (no edits) now re-applies the grid's active sort/filter rules instead of resetting to the raw result. Any edit to the query text still starts fresh. The filter-row visibility also survives a re-run.
+
 ## [0.4.12] - 2026-06-17
 
 ### Added
@@ -13,6 +22,7 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 - **New in-grid rows are pinned to the TOP of the result, not the bottom.** Previously an inserted row sat after every loaded row, so on a large/streaming result you had to scroll to the very end to fill it in. Insert rows now occupy the top of the grid (stable regardless of how many rows have streamed), and adding/pasting rows scrolls there and focuses the first editable cell. Internally the grid↔App edit boundary now passes a stable `RowRef` (loaded-vs-insert identity) instead of a virtual row index.
 
 ### Fixed
+- **AI model picker could get stuck on one model.** The dropdown is populated from the live model catalog (fetched asynchronously); the controlled `<select value>` wasn't re-applied once those options arrived, so it snapped to the first-loaded model and resisted changes. The header and settings model pickers now mark the selected `<option>` directly, so the choice sticks regardless of catalog timing.
 - **DuckDB sidebar listed the `main` schema (and any user schema) once per attached catalog.** DuckDB's `information_schema` spans every attached catalog (`memory`/`system`/`temp`), each with its own `main`, so the tree showed `main` three times (only the first carried tables). `duck_build_tree` now filters `schemata`/`tables` to `current_database()`. Added a cross-engine conformance assertion that every driver reports each schema exactly once.
 
 ## [0.4.11] - 2026-06-15

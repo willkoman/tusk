@@ -247,6 +247,11 @@ async fn run_battery(b: &mut Backend, eng: &Eng) {
         list.iter().any(|t| t.name == "conf" && t.columns.len() >= 2),
         "[{}] list_tables includes conf w/ columns", eng.name
     );
+    // sample_rows: read-only, dialect-quoted, bounded — feeds the AI assistant's context.
+    let (scols, srows) = b.sample_rows(eng.schema, "conf", 3).await.unwrap();
+    assert!(scols.iter().any(|c| c == "id"), "[{}] sample_rows columns {scols:?}", eng.name);
+    assert!(!srows.is_empty() && srows.len() <= 3, "[{}] sample_rows bounded non-empty", eng.name);
+    assert!(srows.iter().all(|r| r.len() == scols.len()), "[{}] sample_rows row width", eng.name);
 
     // 8. weird identifier (space + embedded quote) — quoting + introspection robustness
     //    (the injection-adjacent path: names get inlined into catalog queries).

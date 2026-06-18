@@ -19,6 +19,11 @@ export function hasDuplicateColumns(cols: string[]): boolean {
   return new Set(cols.map((c) => c.toLowerCase())).size !== cols.length;
 }
 
+/** A grid view carries active ordering or a non-empty filter (so a re-run should re-apply it). */
+export function hasViewRules(sorts: SortKey[], filters: Filter[]): boolean {
+  return sorts.length > 0 || filters.some((f) => f.text.trim() !== "");
+}
+
 /** Per-dialect "stringify column and case-insensitively LIKE-match" expression. */
 function filterExpr(col: string, text: string, dialect: string): string {
   const pat = lit("%" + text + "%");

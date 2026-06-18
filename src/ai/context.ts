@@ -4,6 +4,9 @@
 
 export type AiCtxTable = { schema: string; name: string; columns: { name: string; data_type: string }[] };
 
+/** Sample rows pulled from a relation, for grounding the model in real values. */
+export type SampleTable = { schema: string; name: string; columns: string[]; rows: (string | null)[][] };
+
 export type AiContext = {
   dialect: string; // "postgres" | "mysql" | "sqlite" | "duckdb"
   driverLabel: string;
@@ -28,18 +31,57 @@ const QUOTE_NOTE: Record<string, string> = {
   sqlite: 'Quote identifiers with double quotes ("col").',
 };
 
+/**
+ * Score a table's relevance to the focus text: 0 = its name appears verbatim,
+ * 1 = it shares a word with the focus, 2 = unrelated. Used to surface the right
+ * tables (full columns + sample rows) ahead of any budget cutoff.
+ */
+function relevanceScore(t: AiCtxTable, focus: string): number {
+  const f = focus.toLowerCase();
+  const fWords = new Set(f.split(/[^a-z0-9_]+/).filter((w) => w.length > 2));
+  const n = t.name.toLowerCase();
+  if (f.includes(n)) return 0;
+  if (n.split("_").some((tok) => fWords.has(tok))) return 1;
+  return 2;
+}
+
+/** Tables actually relevant to the focus (score ≤ 1), most-relevant first, capped. */
+export function relevantTables(tables: AiCtxTable[], focus: string, limit: number): AiCtxTable[] {
+  return tables
+    .map((t, i) => ({ t, i, s: relevanceScore(t, focus) }))
+    .filter((x) => x.s <= 1)
+    .sort((a, b) => a.s - b.s || a.i - b.i)
+    .slice(0, limit)
+    .map((x) => x.t);
+}
+
+const SAMPLE_BUDGET = 4000; // chars of sample-row text in the prompt
+const CELL_CAP = 80; // max chars per sampled cell
+
+/** Render fetched sample rows as a compact, budgeted block of pipe-separated tables. */
+export function formatSamples(samples: SampleTable[]): string {
+  const cell = (v: string | null) => {
+    if (v === null) return "NULL";
+    const s = v.replace(/\s+/g, " ");
+    return s.length > CELL_CAP ? s.slice(0, CELL_CAP - 1) + "…" : s;
+  };
+  let out = "";
+  for (const s of samples) {
+    if (!s.columns.length || !s.rows.length) continue;
+    let block = `\n${s.schema}.${s.name} (${s.rows.length} sample row${s.rows.length === 1 ? "" : "s"}):\n`;
+    block += s.columns.join(" | ") + "\n";
+    for (const r of s.rows) block += s.columns.map((_, k) => cell(r[k] ?? null)).join(" | ") + "\n";
+    if (out.length + block.length > SAMPLE_BUDGET) break;
+    out += block;
+  }
+  return out;
+}
+
 function schemaSummary(tables: AiCtxTable[], focus: string): string {
   // Relevance first: tables whose name appears in the conversation (or shares a
   // word with it) get their full column lists ahead of the budget cutoff, so
   // asking about `product_vendor_link` pulls it in even on a 500-table schema.
-  const f = focus.toLowerCase();
-  const fWords = new Set(f.split(/[^a-z0-9_]+/).filter((w) => w.length > 2));
-  const score = (t: AiCtxTable): number => {
-    const n = t.name.toLowerCase();
-    if (f.includes(n)) return 0;
-    if (n.split("_").some((tok) => fWords.has(tok))) return 1;
-    return 2;
-  };
+  const score = (t: AiCtxTable): number => relevanceScore(t, focus);
   const ranked = tables.map((t, i) => ({ t, i, s: score(t) })).sort((a, b) => a.s - b.s || a.i - b.i);
 
   let out = "";
@@ -67,7 +109,7 @@ function schemaSummary(tables: AiCtxTable[], focus: string): string {
   return out || "(no user tables)";
 }
 
-export function buildSystemPrompt(c: AiContext, conversationText = ""): string {
+export function buildSystemPrompt(c: AiContext, conversationText = "", samples: SampleTable[] = []): string {
   const quote = QUOTE_NOTE[c.dialect] ?? QUOTE_NOTE.postgres;
   const lines: string[] = [
     "You are an AI assistant embedded in Tusk, a desktop SQL client. Help the user write, understand, fix, and optimize SQL.",
@@ -88,6 +130,14 @@ export function buildSystemPrompt(c: AiContext, conversationText = ""): string {
     "Database schema (schema.table(columns)):",
     schemaSummary(c.tables, `${conversationText} ${c.currentSql} ${c.selection}`),
   );
+  const sampleText = formatSamples(samples);
+  if (sampleText.trim()) {
+    lines.push(
+      "",
+      "Sample rows from the most relevant tables (real data, so you understand value shapes/formats — never assume these are the only rows, and don't treat them as exhaustive):",
+      sampleText.trimEnd(),
+    );
+  }
   if (c.currentSql.trim()) {
     const sql = c.selection.trim() || c.currentSql;
     lines.push("", "The user's current editor SQL:", "```sql", sql.slice(0, 4000), "```");

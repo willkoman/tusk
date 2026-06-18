@@ -2,7 +2,7 @@ import { createSignal, createEffect, For, Index, Show, onMount, type Accessor } 
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { aiStore, defaultModel, providerModels, providerInfo, AI_PROVIDERS, type AiConfig, type AiProvider, type AiEvent } from "./store";
-import { buildSystemPrompt, type AiContext } from "./context";
+import { buildSystemPrompt, relevantTables, type AiContext, type SampleTable } from "./context";
 import { Markdown } from "./markdown";
 
 type ChatMsg = { role: "user" | "assistant"; content: string };
@@ -15,6 +15,8 @@ function errMsg(e: unknown): string {
  *  knows the connected DB's schema/dialect/permissions. Proposes SQL; never auto-runs. */
 export function AiPanel(props: {
   ctx: Accessor<AiContext>;
+  /** Fetch a few sample rows for the given relations (read-only; best-effort). */
+  sampleRows: (targets: { schema: string; name: string }[]) => Promise<SampleTable[]>;
   onInsertSql: (sql: string) => void;
   onClose: () => void;
 }) {
@@ -137,6 +139,18 @@ export function AiPanel(props: {
     };
     try {
       const c = cfg();
+      const ctx = props.ctx();
+      const convoText = convo.map((m) => m.content).join("\n");
+      // Ground the model in real data: fetch a few sample rows of the tables most
+      // relevant to the conversation (read-only, best-effort, off if the user opted out).
+      let samples: SampleTable[] = [];
+      if (c.shareSamples !== false) {
+        const targets = relevantTables(ctx.tables, `${convoText} ${ctx.currentSql} ${ctx.selection}`, 5)
+          .map((t) => ({ schema: t.schema, name: t.name }));
+        if (targets.length) {
+          try { samples = await props.sampleRows(targets); } catch { /* best-effort — no samples */ }
+        }
+      }
       await invoke("ai_chat", {
         req: {
           provider: c.provider,
@@ -144,7 +158,7 @@ export function AiPanel(props: {
           baseUrl: c.baseUrl.trim() || null,
           // Conversation text steers the schema summary: mentioned tables get
           // their full columns even when the schema dump is over budget.
-          system: buildSystemPrompt(props.ctx(), convo.map((m) => m.content).join("\n")),
+          system: buildSystemPrompt(ctx, convoText, samples),
           messages: convo.map((m) => ({ role: m.role, content: m.content })),
           maxTokens: 2048,
         },
@@ -169,6 +183,7 @@ export function AiPanel(props: {
       if (cfg().provider === pid && cfg().model && !models.includes(cfg().model)) models.unshift(cfg().model);
       return { label: providerInfo(pid).label, pid, models };
     });
+  const curModelValue = () => `${cfg().provider}|${cfg().model}`;
 
   return (
     <div class="ai-panel">
@@ -180,11 +195,19 @@ export function AiPanel(props: {
           <select
             class="ai-model-select"
             title="Model (providers with a saved key)"
-            value={`${cfg().provider}|${cfg().model}`}
             onChange={(e) => { const [p, ...rest] = e.currentTarget.value.split("|"); setConfig({ provider: p as AiProvider, model: rest.join("|") }); }}
           >
+            {/* `selected` per option (not `value` on the select): options load async from
+                the live catalog, and Solid won't re-apply a select `value` when they arrive —
+                so the picker would stick on whatever mounted first. */}
             <For each={headerModels()}>
-              {(g) => <optgroup label={g.label}><For each={g.models}>{(m) => <option value={`${g.pid}|${m}`}>{m}</option>}</For></optgroup>}
+              {(g) => (
+                <optgroup label={g.label}>
+                  <For each={g.models}>
+                    {(m) => <option value={`${g.pid}|${m}`} selected={curModelValue() === `${g.pid}|${m}`}>{m}</option>}
+                  </For>
+                </optgroup>
+              )}
             </For>
           </select>
         </Show>
@@ -203,17 +226,21 @@ export function AiPanel(props: {
           </label>
           <label>Model
             <select
-              value={modelsFor(cfg().provider).includes(cfg().model) ? cfg().model : "__custom__"}
               onChange={(e) => { const v = e.currentTarget.value; setConfig({ model: v === "__custom__" ? "" : v }); }}
             >
-              <For each={modelsFor(cfg().provider)}>{(m) => <option value={m}>{m}</option>}</For>
-              <option value="__custom__">Custom…</option>
+              {/* `selected` per option — the model list is fetched async (see header). */}
+              <For each={modelsFor(cfg().provider)}>{(m) => <option value={m} selected={cfg().model === m}>{m}</option>}</For>
+              <option value="__custom__" selected={!modelsFor(cfg().provider).includes(cfg().model)}>Custom…</option>
             </select>
             <Show when={!modelsFor(cfg().provider).includes(cfg().model)}>
               <input value={cfg().model} onInput={(e) => setConfig({ model: e.currentTarget.value })} placeholder="custom model id (e.g. for a local / OpenAI-compatible server)" />
             </Show>
           </label>
           <label>API base (optional)<input value={cfg().baseUrl} onInput={(e) => setConfig({ baseUrl: e.currentTarget.value })} placeholder={providerInfo(cfg().provider).baseHint} /></label>
+          <label class="ai-check" title="Send a few sample rows of relevant tables so the model understands your real data. Real values leave your machine for the provider.">
+            <input type="checkbox" checked={cfg().shareSamples !== false} onChange={(e) => setConfig({ shareSamples: e.currentTarget.checked })} />
+            Share sample data with the model
+          </label>
           <label>API key {hasKey() ? <span class="ai-key-ok">saved ✓</span> : <span class="ai-key-missing">not set</span>}
             <input type="password" value={keyInput()} onInput={(e) => setKeyInput(e.currentTarget.value)} placeholder={hasKey() ? "•••••• (stored in keychain)" : "paste key"} />
             <button type="button" class="ai-key-link" onClick={() => void openUrl(providerInfo(cfg().provider).keyUrl)}>Get an API key ↗</button>

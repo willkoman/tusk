@@ -683,6 +683,34 @@ impl Backend {
         let (_cols, rows) = self.query_text(&sql).await?;
         Ok(tree::tables_from_rows(rows))
     }
+
+    /// A few sample rows from a relation (text values), for AI context. Read-only and
+    /// **does not touch the streaming cursor** — on PG it runs via `simple_query` in
+    /// whatever transaction is current, leaving an in-flight stream intact. Best-effort:
+    /// the caller treats any error as "no sample".
+    pub async fn sample_rows(
+        &self,
+        schema: &str,
+        table: &str,
+        limit: u32,
+    ) -> Result<(Vec<String>, Vec<Vec<Option<String>>>), AppError> {
+        self.query_text(&sample_sql(self, schema, table, limit.clamp(1, 50))).await
+    }
+}
+
+/// `SELECT * FROM <rel> LIMIT n`, identifier-quoted per dialect (MySQL backticks,
+/// everyone else double quotes). Schema-qualified when a schema is given.
+fn sample_sql(b: &Backend, schema: &str, table: &str, limit: u32) -> String {
+    let mysql = matches!(b, Backend::MySql(_));
+    let q = |s: &str| {
+        if mysql {
+            format!("`{}`", s.replace('`', "``"))
+        } else {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        }
+    };
+    let rel = if schema.is_empty() { q(table) } else { format!("{}.{}", q(schema), q(table)) };
+    format!("SELECT * FROM {rel} LIMIT {limit}")
 }
 
 impl PgConn {
