@@ -4,6 +4,12 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.4.14] - 2026-06-18
+
+### Changed
+- **The AI and Query-History panels are now resizable**, like the Explorer sidebar — drag the divider on each panel's inner edge (AI clamps 280–760px, History 240–700px). Every docked side/bottom panel is now resizable (Explorer, AI, History, and the editor↔results split were the set).
+- **Panel sizes now persist across sessions.** The Explorer/AI/History widths and the editor↔results split height are saved to local storage and restored on launch (the split height is re-clamped to the current window so it can't push the results pane off a smaller screen). Previously every size reset on relaunch.
+
 ## [0.4.13] - 2026-06-18
 
 ### Added

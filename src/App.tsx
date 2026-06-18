@@ -7,7 +7,7 @@ import { SqlEditor, type EditorApi } from "./SqlEditor";
 import { driverDialect, type DialectId } from "./sql/dialects";
 import { type AiContext, type SampleTable } from "./ai/context";
 import { type CursorInfo, type EditorPrefs, type ServerDiag } from "./editor/types";
-import { prefsStore, tabsStore, type PersistedTabs } from "./store";
+import { prefsStore, tabsStore, layoutStore, type PersistedTabs } from "./store";
 import { makeTab, basename, gridViewFor, pendingCount, type Tab, type ResultSnapshot, type GridView, type SortKey, type Filter, type PendingEdits } from "./tabs";
 import { ResultGrid } from "./ResultGrid";
 import { UpdateBadge } from "./UpdateBadge";
@@ -231,7 +231,11 @@ function App() {
 
   // workspace
   const [tree, setTree] = createSignal<DbTree | null>(null);
-  const [sidebarW, setSidebarW] = createSignal(270);
+  // Docked-panel sizes — restored from localStorage, persisted on resize-end.
+  const savedLayout = layoutStore.load();
+  const [sidebarW, setSidebarW] = createSignal(savedLayout.sidebarW ?? 270);
+  const [aiW, setAiW] = createSignal(savedLayout.aiW ?? 360);
+  const [historyW, setHistoryW] = createSignal(savedLayout.historyW ?? 340);
   // Autocomplete table/column list — sourced from `list_schema` (one query, all
   // tables+columns), decoupled from the lazy object tree which no longer carries columns.
   const [schema, setSchema] = createSignal<TableInfo[]>([]);
@@ -283,7 +287,12 @@ function App() {
   const [runMs, setRunMs] = createSignal(0); // live elapsed while a query runs
   const [cancelling, setCancelling] = createSignal(false); // cancel request sent, awaiting unwind
   const [editorApi, setEditorApi] = createSignal<EditorApi | null>(null);
-  const [editorH, setEditorH] = createSignal(Math.max(300, Math.round((window.innerHeight - 120) * 0.6)));
+  // Persisted editor↔results split height, clamped to the current window (a value saved
+  // on a taller window must not push the results pane off a shorter one).
+  const editorHDefault = Math.max(300, Math.round((window.innerHeight - 120) * 0.6));
+  const [editorH, setEditorH] = createSignal(
+    Math.max(80, Math.min(savedLayout.editorH ?? editorHDefault, window.innerHeight - 160)),
+  );
 
   // editor prefs (persisted) + cursor readout + per-connection buffer key
   const [prefs, setPrefs] = createSignal<EditorPrefs>(prefsStore.load());
@@ -1575,6 +1584,7 @@ function App() {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
       document.body.style.userSelect = "";
+      persistLayout();
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
@@ -2015,21 +2025,39 @@ function App() {
     });
   }
 
-  function startResizeSidebar(e: MouseEvent) {
+  // Persist all docked-panel sizes (called on resize-end, not per frame).
+  const persistLayout = () =>
+    layoutStore.save({ sidebarW: sidebarW(), aiW: aiW(), historyW: historyW(), editorH: editorH() });
+
+  // Horizontal panel resize. `dir` = +1 for a LEFT-docked panel (the splitter sits on
+  // its right edge, so dragging right grows it), -1 for a RIGHT-docked panel (splitter
+  // on its left edge, dragging left grows it).
+  function startResizeH(
+    e: MouseEvent,
+    getW: () => number,
+    setW: (n: number) => void,
+    dir: 1 | -1,
+    min: number,
+    max: number,
+  ) {
     e.preventDefault();
     const startX = e.clientX;
-    const startW = sidebarW();
+    const startW = getW();
     const onMove = (ev: MouseEvent) =>
-      setSidebarW(Math.max(180, Math.min(startW + (ev.clientX - startX), 560)));
+      setW(Math.max(min, Math.min(startW + dir * (ev.clientX - startX), max)));
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
       document.body.style.userSelect = "";
+      persistLayout();
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
     document.body.style.userSelect = "none";
   }
+  const startResizeSidebar = (e: MouseEvent) => startResizeH(e, sidebarW, setSidebarW, 1, 180, 560);
+  const startResizeAi = (e: MouseEvent) => startResizeH(e, aiW, setAiW, -1, 280, 760);
+  const startResizeHistory = (e: MouseEvent) => startResizeH(e, historyW, setHistoryW, -1, 240, 700);
 
   return (
     <>
@@ -2425,16 +2453,20 @@ function App() {
             </footer>
           </main>
           <Show when={aiOpen()}>
+            <div class="splitter-v" onMouseDown={startResizeAi} />
             <AiPanel
               ctx={aiContext}
               sampleRows={aiSampleRows}
+              width={aiW()}
               onInsertSql={(sql) => openGeneratedTab(sql, activeTab().searchSchema, "AI query")}
               onClose={() => setAiOpen(false)}
             />
           </Show>
           <Show when={historyOpen()}>
+            <div class="splitter-v" onMouseDown={startResizeHistory} />
             <HistoryPanel
               entries={history}
+              width={historyW()}
               onInsert={(sql) => editorApi()?.insertAtCursor(sql)}
               onOpenTab={(sql, schema) => openGeneratedTab(sql, schema, "History")}
               onRerun={(sql) => runText(sql)}

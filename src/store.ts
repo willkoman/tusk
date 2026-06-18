@@ -9,6 +9,30 @@ import { type KeyOverrides } from "./actions";
 const PREFS_KEY = "tusk.prefs";
 const TABS_PREFIX = "tusk.tabs.";
 
+// Docked-panel sizes (Explorer/AI/History widths + editor↔results split height).
+// Global, in px; clamped on use by the resize handlers, so a stale value is harmless.
+const LAYOUT_KEY = "tusk.layout";
+export type LayoutSizes = { sidebarW: number; aiW: number; historyW: number; editorH: number };
+
+export const layoutStore = {
+  load(): Partial<LayoutSizes> {
+    try {
+      const raw = localStorage.getItem(LAYOUT_KEY);
+      if (raw) return JSON.parse(raw) as Partial<LayoutSizes>;
+    } catch {
+      /* ignore */
+    }
+    return {};
+  },
+  save(sizes: LayoutSizes): void {
+    try {
+      localStorage.setItem(LAYOUT_KEY, JSON.stringify(sizes));
+    } catch {
+      /* ignore */
+    }
+  },
+};
+
 export const prefsStore = {
   load(): EditorPrefs {
     try {

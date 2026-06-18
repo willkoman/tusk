@@ -834,7 +834,7 @@ button.ghost { background: transparent; }
 .palette-key { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 
 /* ---- query history panel ---- */
-.hist-panel { width: 340px; flex: 0 0 340px; display: flex; flex-direction: column; border-left: 1px solid var(--border); background: var(--panel); min-height: 0; }
+.hist-panel { flex-shrink: 0; min-width: 0; display: flex; flex-direction: column; border-left: 1px solid var(--border); background: var(--panel); min-height: 0; }
 .hist-head { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
 .hist-head svg { width: 14px; height: 14px; }
 .hist-title { font-weight: 600; font-size: 12px; }
@@ -954,7 +954,7 @@ button.btn-danger { background: var(--danger); border-color: var(--danger); colo
 }
 
 /* --- AI assistant panel (right column in the workspace body) --- */
-.ai-panel { width: 360px; flex: 0 0 360px; display: flex; flex-direction: column; border-left: 1px solid var(--border); background: var(--panel); min-height: 0; }
+.ai-panel { flex-shrink: 0; min-width: 0; display: flex; flex-direction: column; border-left: 1px solid var(--border); background: var(--panel); min-height: 0; }
 .ai-head { display: flex; align-items: center; gap: 4px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
 .ai-title { font-weight: 600; }
 .ai-settings { display: flex; flex-direction: column; gap: 8px; padding: 10px; border-bottom: 1px solid var(--border); }

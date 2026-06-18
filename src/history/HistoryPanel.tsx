@@ -22,6 +22,8 @@ const fmtMs = (ms: number) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Ma
 
 export function HistoryPanel(props: {
   entries: Accessor<HistoryEntry[]>;
+  /** Docked panel width in px (resizable by the splitter on its left edge). */
+  width: number;
   onInsert: (sql: string) => void;
   onOpenTab: (sql: string, schema: string | null) => void;
   onRerun: (sql: string) => void;
@@ -39,7 +41,7 @@ export function HistoryPanel(props: {
   });
 
   return (
-    <div class="hist-panel">
+    <div class="hist-panel" style={{ width: `${props.width}px` }}>
       <div class="hist-head">
         <Icon name="clock" />
         <span class="hist-title">Query history</span>

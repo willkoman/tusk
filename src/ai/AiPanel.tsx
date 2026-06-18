@@ -17,6 +17,8 @@ export function AiPanel(props: {
   ctx: Accessor<AiContext>;
   /** Fetch a few sample rows for the given relations (read-only; best-effort). */
   sampleRows: (targets: { schema: string; name: string }[]) => Promise<SampleTable[]>;
+  /** Docked panel width in px (resizable by the splitter on its left edge). */
+  width: number;
   onInsertSql: (sql: string) => void;
   onClose: () => void;
 }) {
@@ -186,7 +188,7 @@ export function AiPanel(props: {
   const curModelValue = () => `${cfg().provider}|${cfg().model}`;
 
   return (
-    <div class="ai-panel">
+    <div class="ai-panel" style={{ width: `${props.width}px` }}>
       <div class="ai-head">
         <Show
           when={keyed().length > 0}
