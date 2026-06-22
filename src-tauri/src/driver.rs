@@ -1381,25 +1381,7 @@ async fn mysql_build_tree(pool: &mysql_async::Pool) -> Result<tree::DbTree, AppE
             functions: vec![],
         })
         .collect();
-    for r in &table_rows {
-        let schema = dcell(r, 0);
-        let name = dcell(r, 1);
-        let is_view = dcell(r, 2).eq_ignore_ascii_case("VIEW");
-        if let Some(s) = schemas.iter_mut().find(|s| s.name == schema) {
-            let stub = tree::RelStub {
-                name,
-                kind: if is_view { "view" } else { "table" }.to_string(),
-                comment: None,
-                rows: None,
-                size: None,
-            };
-            if is_view {
-                s.views.push(stub);
-            } else {
-                s.tables.push(stub);
-            }
-        }
-    }
+    attach_rels(&mut schemas, &table_rows);
     let databases = schemas.iter().map(|s| s.name.clone()).collect();
     Ok(tree::DbTree {
         database,
@@ -1502,6 +1484,33 @@ fn dcell(r: &[Option<String>], i: usize) -> String {
     r.get(i).and_then(|v| v.clone()).unwrap_or_default()
 }
 
+/// Attach `(schema, name, type)` rows to their schema in the tree. Uses a name→index
+/// map so a wide catalog (hundreds of tables across many schemas) is O(rows + schemas),
+/// not O(rows × schemas) — the previous `schemas.iter_mut().find(..)` per row. Shared by
+/// the MySQL and DuckDB build paths (both feed `information_schema.tables`-shaped rows:
+/// col 0 = schema, 1 = name, 2 = table_type where "VIEW" ⇒ view).
+fn attach_rels(schemas: &mut [tree::Schema], table_rows: &[Vec<Option<String>>]) {
+    let idx: std::collections::HashMap<String, usize> =
+        schemas.iter().enumerate().map(|(i, s)| (s.name.clone(), i)).collect();
+    for r in table_rows {
+        let schema = dcell(r, 0);
+        let Some(&i) = idx.get(&schema) else { continue };
+        let is_view = dcell(r, 2).eq_ignore_ascii_case("VIEW");
+        let stub = tree::RelStub {
+            name: dcell(r, 1),
+            kind: if is_view { "view" } else { "table" }.to_string(),
+            comment: None,
+            rows: None,
+            size: None,
+        };
+        if is_view {
+            schemas[i].views.push(stub);
+        } else {
+            schemas[i].tables.push(stub);
+        }
+    }
+}
+
 /// FK edges from duckdb_constraints(), trying the structured columns first
 /// (newer libduckdb) and falling back to parsing constraint_text; any failure
 /// yields an empty list (best-effort contract — never an error).
@@ -1549,25 +1558,7 @@ fn duck_build_tree(conn: &duckdb::Connection) -> Result<tree::DbTree, AppError> 
             functions: vec![],
         })
         .collect();
-    for r in &table_rows {
-        let schema = dcell(r, 0);
-        let name = dcell(r, 1);
-        let is_view = dcell(r, 2).eq_ignore_ascii_case("VIEW");
-        if let Some(s) = schemas.iter_mut().find(|s| s.name == schema) {
-            let stub = tree::RelStub {
-                name,
-                kind: if is_view { "view" } else { "table" }.to_string(),
-                comment: None,
-                rows: None,
-                size: None,
-            };
-            if is_view {
-                s.views.push(stub);
-            } else {
-                s.tables.push(stub);
-            }
-        }
-    }
+    attach_rels(&mut schemas, &table_rows);
     Ok(tree::DbTree {
         database: database.clone(),
         databases: vec![database],

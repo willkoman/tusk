@@ -4,6 +4,14 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-22
+
+### Changed
+- **The updater now checks periodically, not only at startup.** A long-running session re-checks the release feed every 6 hours (and when the window regains focus after that interval has passed, since timers can be starved while the machine sleeps), so updates surface without a restart. Checks remain silent on failure.
+
+### Performance
+- **Faster object-tree build on wide schemas (MySQL & DuckDB).** Attaching tables to their schema used a linear `find` per table — O(tables × schemas) at connect time. It now uses a name→index map (O(tables + schemas)), shared by both build paths. Behavior-identical (covered by the cross-engine conformance suite).
+
 ## [0.4.14] - 2026-06-18
 
 ### Changed
