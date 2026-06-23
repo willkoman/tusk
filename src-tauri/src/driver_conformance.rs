@@ -617,3 +617,88 @@ async fn exec_items_routes_single_vs_script() {
     let cnt = all(&mut c.backend, "SELECT COUNT(*) FROM t").await;
     assert_eq!(cell(&cnt[0], 0).as_deref(), Some("2"), "script applied both inserts");
 }
+
+/// The exact DDL forms the frontend `sql/ddl.ts` builders emit FOR DUCKDB must all be
+/// accepted by a real DuckDB. (Vitest asserts the builders produce these strings; this
+/// asserts DuckDB executes them — closing the builder→engine loop for DuckDB DDL parity.)
+#[test]
+fn duckdb_ddl_builder_forms_apply() {
+    let c = duckdb::Connection::open_in_memory().unwrap();
+    let steps: &[&str] = &[
+        // createTable (inline PK / NOT NULL / DEFAULT — DuckDB supports these in CREATE)
+        r#"CREATE TABLE "main"."t" (
+  "id" INTEGER,
+  "a" TEXT NOT NULL,
+  "qty" INTEGER DEFAULT 0,
+  PRIMARY KEY ("id")
+)"#,
+        r#"INSERT INTO "main"."t" VALUES (1, 'x', 5)"#,
+        // addColumn — plain (nullable) + nullable-with-default both apply on a populated table
+        r#"ALTER TABLE "main"."t" ADD COLUMN "c1" INTEGER"#,
+        r#"ALTER TABLE "main"."t" ADD COLUMN "c2" INTEGER"#,
+        r#"ALTER TABLE "main"."t" ALTER COLUMN "c2" SET DEFAULT 0"#,
+        // editColumn — one ALTER action per statement
+        r#"ALTER TABLE "main"."t" ALTER COLUMN "qty" TYPE BIGINT"#,
+        r#"ALTER TABLE "main"."t" ALTER COLUMN "qty" SET DEFAULT 1"#,
+        r#"ALTER TABLE "main"."t" ALTER COLUMN "a" DROP NOT NULL"#,
+        r#"ALTER TABLE "main"."t" RENAME COLUMN "a" TO "label""#,
+        // dropColumn
+        r#"ALTER TABLE "main"."t" DROP COLUMN "c1""#,
+        // comment on table / column
+        r#"COMMENT ON TABLE "main"."t" IS 'hi'"#,
+        r#"COMMENT ON COLUMN "main"."t"."label" IS 'the label'"#,
+        // createIndex (no USING) + dropIndex
+        r#"CREATE INDEX "idx" ON "main"."t" ("qty")"#,
+        r#"DROP INDEX "main"."idx""#,
+        // duplicateTable via CTAS (structure-only + with-data)
+        r#"CREATE TABLE "main"."t2" AS SELECT * FROM "main"."t" LIMIT 0"#,
+        r#"CREATE TABLE "main"."t3" AS SELECT * FROM "main"."t""#,
+        // schema
+        r#"CREATE SCHEMA "s1""#,
+        r#"DROP SCHEMA "s1""#,
+        // sequence
+        r#"CREATE SEQUENCE "main"."seq1""#,
+        r#"DROP SEQUENCE "main"."seq1""#,
+        // truncate (plain — no options)
+        r#"TRUNCATE TABLE "main"."t3""#,
+        // add PK where none existed
+        r#"ALTER TABLE "main"."t3" ADD PRIMARY KEY ("id")"#,
+        // addColumn — NOT NULL split on an EMPTY table (the schema-design case; no backfill)
+        r#"CREATE TABLE "main"."e" ("id" INTEGER)"#,
+        r#"ALTER TABLE "main"."e" ADD COLUMN "c" INTEGER"#,
+        r#"ALTER TABLE "main"."e" ALTER COLUMN "c" SET DEFAULT 0"#,
+        r#"ALTER TABLE "main"."e" ALTER COLUMN "c" SET NOT NULL"#,
+        r#"DROP TABLE "main"."e""#,
+        // rename table / drop relation (+ cascade) / drop view
+        r#"CREATE VIEW "main"."v" AS SELECT * FROM "main"."t""#,
+        r#"DROP VIEW "main"."v""#,
+        r#"ALTER TABLE "main"."t" RENAME TO "renamed""#,
+        r#"DROP TABLE "main"."t2""#,
+        r#"DROP TABLE "main"."t3" CASCADE"#,
+    ];
+    for s in steps {
+        c.execute_batch(s)
+            .unwrap_or_else(|e| panic!("DuckDB rejected builder DDL:\n  {s}\n  -> {e}"));
+    }
+}
+
+/// The multi-statement DuckDB add-column split the builders emit runs through
+/// `script::run` wrapped in BEGIN…COMMIT, so it must execute in ONE transaction. DuckDB
+/// refuses `SET NOT NULL` with an outstanding UPDATE in the same transaction (which is
+/// why the builder emits NO backfill); the split below must therefore succeed on an
+/// empty table within a single transaction.
+#[test]
+fn duckdb_ddl_split_runs_transactionally() {
+    let c = duckdb::Connection::open_in_memory().unwrap();
+    c.execute_batch("CREATE TABLE t(id INTEGER)").unwrap();
+    let txn = r#"BEGIN;
+ALTER TABLE "t" ADD COLUMN "c" INTEGER;
+ALTER TABLE "t" ALTER COLUMN "c" SET DEFAULT 0;
+ALTER TABLE "t" ALTER COLUMN "c" SET NOT NULL;
+COMMIT;"#;
+    c.execute_batch(txn).expect("DuckDB must accept the add-column split (no backfill) in one transaction");
+    // The new NOT NULL column with a default exists and is usable.
+    c.execute_batch(r#"INSERT INTO "t" ("id") VALUES (7)"#).unwrap();
+    let v: i64 = c.query_row("SELECT c FROM t WHERE id = 7", [], |r| r.get(0)).unwrap();
+    assert_eq!(v, 0, "default applied to new rows");
+}

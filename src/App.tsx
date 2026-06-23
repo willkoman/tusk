@@ -211,12 +211,21 @@ function App() {
   // builders in sql/ddl.ts emit Postgres syntax — offering them on MySQL/SQLite/
   // DuckDB produced SQL errors at apply time), then the privilege. Every gate()
   // call site is a mutating DDL item, so the driver check belongs here centrally.
+  // Drivers with sidebar DDL builders. Postgres is full; DuckDB covers everything its
+  // engine supports (the `sql/ddl.ts` builders emit DuckDB-compatible syntax) — the few
+  // operations DuckDB can't do via ALTER are gated per-action with `noDuck`. MySQL/SQLite
+  // still route to PG-syntax builders, so they stay off.
+  const ddlDriver = () => caps()?.kind === "postgres" || caps()?.kind === "duckdb";
   const gate = (allowed: boolean, reason: string): { disabled?: boolean; title?: string } => {
     if (conn()?.readOnly) return { disabled: true, title: "Connection is read-only" };
-    if (caps() && caps()!.kind !== "postgres")
+    if (caps() && !ddlDriver())
       return { disabled: true, title: `DDL editing isn't supported for ${driverLabel(caps()!.kind)} yet` };
     return allowed ? {} : { disabled: true, title: reason };
   };
+  // Disable an item that DuckDB's engine can't do (constraint ALTERs, rename index/
+  // sequence/constraint, ALTER SEQUENCE RESTART, CREATE DATABASE). Spread AFTER gate().
+  const noDuck = (reason: string): { disabled?: boolean; title?: string } =>
+    caps()?.kind === "duckdb" ? { disabled: true, title: reason } : {};
   const [host, setHost] = createSignal("localhost");
   const [port, setPort] = createSignal(5432);
   const [user, setUser] = createSignal("");
@@ -300,7 +309,11 @@ function App() {
   // to the saved pref when disconnected. Drives highlighting, keyword/function/type
   // autocomplete, and identifier quoting (`setSqlDialect` → backticks on MySQL).
   const activeDialect = createMemo<DialectId>(() => (conn() ? driverDialect(caps()?.kind) : prefs().dialect));
-  createEffect(() => setSqlDialect(activeDialect()));
+  // ident/DDL quoting uses the REAL driver kind (not the editor dialect, which maps
+  // DuckDB→postgres for highlighting). Quoting is identical for pg/duckdb/sqlite (double
+  // quotes; only MySQL backticks), but the DDL builders branch on the true driver so they
+  // can emit DuckDB-compatible syntax. Falls back to the editor dialect when disconnected.
+  createEffect(() => setSqlDialect(conn() ? (caps()?.kind ?? "postgres") : activeDialect()));
   const [cursorInfo, setCursorInfo] = createSignal<CursorInfo | null>(null);
   let connKey: string | null = null;
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1732,7 +1745,7 @@ function App() {
       items.push(
         { label: `New column in ${tableCtx.name}…`, icon: "plus", ...gate(ownsTable(tableCtx.schema!, tableCtx.name), `Requires ownership of ${tableCtx.name}`), onClick: () => setActiveDialog({ kind: "addColumn", ctx: tableCtx }) },
         { label: `New index on ${tableCtx.name}…`, icon: "index", ...gate(ownsTable(tableCtx.schema!, tableCtx.name), `Requires ownership of ${tableCtx.name}`), onClick: () => openIndexDialog(tableCtx) },
-        { label: `New constraint on ${tableCtx.name}…`, icon: "link", ...gate(ownsTable(tableCtx.schema!, tableCtx.name), `Requires ownership of ${tableCtx.name}`), onClick: () => openConstraintDialog(tableCtx) },
+        { label: `New constraint on ${tableCtx.name}…`, icon: "link", ...gate(ownsTable(tableCtx.schema!, tableCtx.name), `Requires ownership of ${tableCtx.name}`), ...noDuck("DuckDB can't add constraints via ALTER — define them in CREATE TABLE"), onClick: () => openConstraintDialog(tableCtx) },
         { sep: true },
       );
     }
@@ -1740,7 +1753,7 @@ function App() {
       items.push({ label: `New table in ${schemaName}…`, icon: "copy", ...gate(canCreateInSchema(schemaName), `Requires CREATE on schema ${schemaName}`), onClick: () => setActiveDialog({ kind: "createTable", schema: schemaName }) });
     items.push(
       { label: "New schema…", icon: "folder", ...gate(canCreateSchema(), "Requires CREATE on the database"), onClick: () => setActiveDialog({ kind: "createSchema" }) },
-      { label: "New database…", icon: "database", ...gate(canCreateDatabase(), "Requires the CREATEDB role attribute"), onClick: () => setActiveDialog({ kind: "createDatabase" }) },
+      { label: "New database…", icon: "database", ...gate(canCreateDatabase(), "Requires the CREATEDB role attribute"), ...noDuck("DuckDB attaches database files rather than CREATE DATABASE"), onClick: () => setActiveDialog({ kind: "createDatabase" }) },
     );
     setMenu({ x: e.clientX, y: e.clientY, items });
   }
@@ -1776,7 +1789,7 @@ function App() {
           { label: "Modify table…", icon: "edit", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openModify(n) },
           { label: "Add column…", icon: "plus", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "addColumn", ctx: n }) },
           { label: "Add index…", icon: "index", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openIndexDialog(n) },
-          { label: "Add constraint…", icon: "link", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openConstraintDialog(n) },
+          { label: "Add constraint…", icon: "link", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), ...noDuck("DuckDB can't add constraints via ALTER — define them in CREATE TABLE"), onClick: () => openConstraintDialog(n) },
           { sep: true },
           { label: "Rename…", icon: "edit", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename table ${n.name}`, current: n.name, build: (nn) => ddl.renameRelation("table", s!, n.name, nn) }) },
           { label: "Duplicate…", icon: "duplicate", ...gate(canCreateInSchema(s!), `Requires CREATE on schema ${s}`), onClick: () => setActiveDialog({ kind: "duplicate", title: `Duplicate ${n.name}`, defaultName: `${n.name}_copy`, build: (nn, wd) => ddl.duplicateTable(s!, n.name, nn, wd) }) },
@@ -1862,7 +1875,7 @@ function App() {
       }
       case "index":
         items.push(
-          { label: "Rename…", icon: "edit", ...gate(true, ""), onClick: () => setActiveDialog({ kind: "rename", title: `Rename index ${n.name}`, current: n.name, build: (nn) => ddl.renameIndex(s!, n.name, nn) }) },
+          { label: "Rename…", icon: "edit", ...gate(true, ""), ...noDuck("DuckDB can't rename an index"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename index ${n.name}`, current: n.name, build: (nn) => ddl.renameIndex(s!, n.name, nn) }) },
           { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop index ${n.name}`, primaryLabel: "Drop index", showCascade: true, build: (o) => ddl.dropIndex(s!, n.name, o.cascade) }) },
           { sep: true },
           copyName,
@@ -1870,16 +1883,16 @@ function App() {
         break;
       case "constraint":
         items.push(
-          { label: "Rename…", icon: "edit", ...gate(true, ""), onClick: () => setActiveDialog({ kind: "rename", title: `Rename constraint ${n.name}`, current: n.name, build: (nn) => ddl.renameConstraint(s!, n.table!, n.name, nn) }) },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop constraint ${n.name}`, primaryLabel: "Drop constraint", showCascade: true, build: (o) => ddl.dropConstraint(s!, n.table!, n.name, o.cascade) }) },
+          { label: "Rename…", icon: "edit", ...gate(true, ""), ...noDuck("DuckDB can't rename a constraint"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename constraint ${n.name}`, current: n.name, build: (nn) => ddl.renameConstraint(s!, n.table!, n.name, nn) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), ...noDuck("DuckDB can't drop a constraint via ALTER"), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop constraint ${n.name}`, primaryLabel: "Drop constraint", showCascade: true, build: (o) => ddl.dropConstraint(s!, n.table!, n.name, o.cascade) }) },
           { sep: true },
           copyName,
         );
         break;
       case "sequence":
         items.push(
-          { label: "Restart… (edit value)", icon: "refresh", ...gate(true, ""), onClick: () => editAsSql(ddl.alterSequenceRestart(s!, n.name, "1")) },
-          { label: "Rename…", icon: "edit", ...gate(true, ""), onClick: () => setActiveDialog({ kind: "rename", title: `Rename sequence ${n.name}`, current: n.name, build: (nn) => ddl.renameSequence(s!, n.name, nn) }) },
+          { label: "Restart… (edit value)", icon: "refresh", ...gate(true, ""), ...noDuck("DuckDB can't restart a sequence via ALTER"), onClick: () => editAsSql(ddl.alterSequenceRestart(s!, n.name, "1")) },
+          { label: "Rename…", icon: "edit", ...gate(true, ""), ...noDuck("DuckDB can't rename a sequence"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename sequence ${n.name}`, current: n.name, build: (nn) => ddl.renameSequence(s!, n.name, nn) }) },
           { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop sequence ${n.name}`, primaryLabel: "Drop sequence", showCascade: true, build: (o) => ddl.dropSequence(s!, n.name, o.cascade) }) },
           { sep: true },
           ...copyDdl,

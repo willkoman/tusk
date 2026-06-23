@@ -4,6 +4,14 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-23
+
+### Added
+- **Sidebar DDL editing now works on DuckDB**, not just Postgres. Create/modify/rename/drop tables, add/drop/rename/retype columns, set/drop defaults & NOT NULL, add a primary key, create/drop indexes, comments, truncate, create/drop schemas, duplicate (via CTAS), and create sequences all generate DuckDB-compatible SQL. The builders are dialect-aware: DuckDB takes one `ALTER` action per statement (vs Postgres' comma-joined), splits `ADD COLUMN` constraints into follow-up `ALTER`s, uses `CREATE TABLE … AS` instead of `LIKE … INCLUDING ALL`, and omits Postgres-only clauses (index method, `AUTHORIZATION`, `TRUNCATE` options). Operations DuckDB's engine genuinely can't do — adding/dropping constraints via `ALTER`, renaming an index/sequence/constraint, `CREATE DATABASE` — are disabled per-item with an explanatory tooltip. (Adding a NOT NULL column works on an empty table; on a populated one DuckDB surfaces its own "NOT NULL constraint failed", as it can't backfill-and-constrain atomically.) Covered by new builder unit tests + a DuckDB conformance battery that executes every generated form.
+
+### Changed
+- **Update checks now run every 5 minutes** (was 6 hours) while the app is open, so a published release is picked up promptly.
+
 ## [0.5.1] - 2026-06-23
 
 ### Fixed

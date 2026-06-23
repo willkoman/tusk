@@ -12,7 +12,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 // itself). Check failures (offline, dev build, no published release) are
 // silent: the updater must never get in the way of using the app.
 
-const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // re-check every 6 hours
+const CHECK_INTERVAL_MS = 5 * 60 * 1000; // re-check every 5 minutes
 
 export function UpdateBadge() {
   const [upd, setUpd] = createSignal<Update | null>(null);

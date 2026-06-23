@@ -6,10 +6,17 @@
 // matches Rust `db::ident`, which is only used on PG-only backend paths (import/DDL).
 
 let backtick = false; // true = MySQL identifier quoting
+let dialect = "postgres"; // active driver dialect (drives DDL emission quirks)
 
-/** Set identifier quoting for the connected driver. Call on connect / dialect change. */
-export function setSqlDialect(dialect: string): void {
-  backtick = dialect === "mysql";
+/** Set identifier quoting + dialect for the connected driver. Call on connect / dialect change. */
+export function setSqlDialect(d: string): void {
+  dialect = d;
+  backtick = d === "mysql";
+}
+
+/** The active dialect ("postgres" | "duckdb" | "mysql" | "sqlite"). */
+export function sqlDialect(): string {
+  return dialect;
 }
 
 /** Quote an identifier: `users` → `"users"` (or `` `users` `` on MySQL). */

@@ -2,7 +2,13 @@
 // multi-statement script) that is `;`-free per statement — the run path splits on
 // `;` and the editor-scaffold adds the trailing one. Quoting via ident.ts.
 
-import { ident, qualify, qualifyIn, lit } from "./ident";
+import { ident, qualify, qualifyIn, lit, sqlDialect } from "./ident";
+
+/** DuckDB's DDL diverges from Postgres in a few mechanical ways (one ALTER action per
+ *  statement, no constraints on ADD COLUMN, CTAS instead of LIKE, no role/identity
+ *  clauses). Builders branch on this; unsupported actions (constraint ALTERs, rename
+ *  index/seq/constraint, …) are gated off in the UI, not here. */
+const isDuck = () => sqlDialect() === "duckdb";
 
 export type ColumnSpec = {
   name: string;
@@ -21,8 +27,25 @@ export function columnDef(c: ColumnSpec): string {
   return s;
 }
 
+/** DuckDB ADD COLUMN can't carry constraints, so split into a plain add + follow-up
+ *  ALTERs (DuckDB takes one ALTER action per statement). NOTE: no backfill — DuckDB
+ *  refuses `SET NOT NULL` with an outstanding UPDATE in the same transaction (the run
+ *  path is transactional), and on a populated table the SET NOT NULL itself fails with
+ *  a clear "NOT NULL constraint failed" — so adding a NOT NULL column works when the
+ *  table is empty (schema design) and otherwise surfaces DuckDB's real limitation. */
+function duckAddColumn(q: string, c: ColumnSpec): string[] {
+  const col = ident(c.name);
+  const out = [`ALTER TABLE ${q} ADD COLUMN ${col} ${c.type.trim()}`];
+  if (c.default.trim()) out.push(`ALTER TABLE ${q} ALTER COLUMN ${col} SET DEFAULT ${c.default.trim()}`);
+  if (c.primaryKey) out.push(`ALTER TABLE ${q} ADD PRIMARY KEY (${col})`); // implies NOT NULL
+  else if (!c.nullable) out.push(`ALTER TABLE ${q} ALTER COLUMN ${col} SET NOT NULL`);
+  return out;
+}
+
 export function addColumn(schema: string, table: string, c: ColumnSpec): string {
-  return `ALTER TABLE ${qualify(schema, table)} ADD COLUMN ${columnDef(c)}`;
+  const q = qualify(schema, table);
+  if (isDuck()) return duckAddColumn(q, c).join(";\n");
+  return `ALTER TABLE ${q} ADD COLUMN ${columnDef(c)}`;
 }
 
 export function dropColumn(schema: string, table: string, name: string, cascade: boolean): string {
@@ -61,7 +84,11 @@ export function editColumn(
     );
   }
   const stmts: string[] = [];
-  if (actions.length) stmts.push(`ALTER TABLE ${q} ${actions.join(", ")}`);
+  // DuckDB allows only one ALTER action per statement; Postgres takes them comma-joined.
+  if (actions.length) {
+    if (isDuck()) for (const a of actions) stmts.push(`ALTER TABLE ${q} ${a}`);
+    else stmts.push(`ALTER TABLE ${q} ${actions.join(", ")}`);
+  }
   if (e.newName && e.newName.trim() && e.newName !== col) {
     stmts.push(`ALTER TABLE ${q} RENAME COLUMN ${ident(col)} TO ${ident(e.newName.trim())}`);
   }
@@ -141,7 +168,9 @@ export function tableDiff(s: TableDiffSpec): string {
 
   for (const r of s.columns) {
     if (r.orig || r.dropped || !r.name.trim() || !r.type.trim()) continue;
-    stmts.push(`ALTER TABLE ${q} ADD COLUMN ${columnDef({ name: r.name.trim(), type: r.type, nullable: r.nullable, default: r.default })}`);
+    const spec = { name: r.name.trim(), type: r.type, nullable: r.nullable, default: r.default };
+    if (isDuck()) stmts.push(...duckAddColumn(q, spec));
+    else stmts.push(`ALTER TABLE ${q} ADD COLUMN ${columnDef(spec)}`);
     if (r.comment.trim()) stmts.push(`COMMENT ON COLUMN ${q}.${ident(r.name.trim())} IS ${lit(r.comment)}`);
   }
 
@@ -210,6 +239,8 @@ export function truncate(
   name: string,
   o: { cascade: boolean; restartIdentity: boolean },
 ): string {
+  // DuckDB's TRUNCATE takes no options.
+  if (isDuck()) return `TRUNCATE TABLE ${qualify(schema, name)}`;
   let s = `TRUNCATE TABLE ${qualify(schema, name)}`;
   if (o.restartIdentity) s += " RESTART IDENTITY";
   if (o.cascade) s += " CASCADE";
@@ -245,6 +276,9 @@ export function renameSequence(schema: string, name: string, newName: string): s
 export function duplicateTable(schema: string, name: string, newName: string, withData: boolean): string {
   const src = qualify(schema, name);
   const dst = qualify(schema, newName);
+  // DuckDB has no `LIKE … INCLUDING ALL` — use CTAS (structure-only via `LIMIT 0`).
+  // Note: CTAS copies columns/types but not PK/indexes/defaults (DuckDB limitation).
+  if (isDuck()) return `CREATE TABLE ${dst} AS SELECT * FROM ${src}${withData ? "" : " LIMIT 0"}`;
   const create = `CREATE TABLE ${dst} (LIKE ${src} INCLUDING ALL)`;
   return withData ? `${create};\nINSERT INTO ${dst} SELECT * FROM ${src}` : create;
 }
@@ -263,7 +297,8 @@ export type IndexSpec = {
 export function createIndex(ix: IndexSpec): string {
   const u = ix.unique ? "UNIQUE " : "";
   const nm = ix.name && ix.name.trim() ? `${ident(ix.name.trim())} ` : "";
-  const m = ix.method && ix.method !== "btree" ? ` USING ${ix.method}` : "";
+  // DuckDB has a single (ART) index type and rejects `USING <method>`; omit it there.
+  const m = !isDuck() && ix.method && ix.method !== "btree" ? ` USING ${ix.method}` : "";
   const w = ix.where && ix.where.trim() ? ` WHERE ${ix.where.trim()}` : "";
   return `CREATE ${u}INDEX ${nm}ON ${qualify(ix.schema, ix.table)}${m} (${ix.columns.map(ident).join(", ")})${w}`;
 }
@@ -301,7 +336,8 @@ export function addForeignKey(schema: string, table: string, fk: FkSpec): string
 // --- SCHEMA / DATABASE ------------------------------------------------------
 
 export function createSchema(name: string, authorization?: string): string {
-  const a = authorization && authorization.trim() ? ` AUTHORIZATION ${ident(authorization.trim())}` : "";
+  // DuckDB has no roles → no AUTHORIZATION clause.
+  const a = !isDuck() && authorization && authorization.trim() ? ` AUTHORIZATION ${ident(authorization.trim())}` : "";
   return `CREATE SCHEMA ${ident(name)}${a}`;
 }
 export function createDatabase(name: string, owner?: string, encoding?: string): string {
