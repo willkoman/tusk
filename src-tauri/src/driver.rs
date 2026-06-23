@@ -183,17 +183,61 @@ pub struct PgConn {
 /// makes `ConnState` `Sync` so the Tauri command futures stay `Send`. The lock is
 /// effectively uncontended — the per-connection `AsyncMutex` already serializes access.
 pub struct DuckConn {
-    pub conn: Mutex<duckdb::Connection>,
+    /// `None` when the connection has been released while idle (a file-backed DuckDB
+    /// holds an exclusive OS file lock for its whole lifetime — keeping it open while
+    /// nothing is running blocks every other process from touching the file). Re-opened
+    /// lazily by `ensure_alive` on the next command; closed by `release_idle` when a
+    /// command finishes with no stream in flight. A `:memory:` DB can't be reopened
+    /// (closing loses all data) so it stays open — see `keep_open`.
+    pub conn: Mutex<Option<duckdb::Connection>>,
+    /// True for `:memory:` (no file lock to free, and closing would drop the data).
+    pub keep_open: bool,
     pub config: ConnectionConfig,
     pub stream_sql: Option<String>,
     pub offset: usize,
 }
 
+/// Deref'able lock guard so every existing `d.lock()` call site is unchanged: it borrows
+/// the live `Connection` out of the `Option`. The connection is guaranteed present at any
+/// call site — `ensure_alive`/`connect` open it before backend methods run.
+struct DuckGuard<'a>(std::sync::MutexGuard<'a, Option<duckdb::Connection>>);
+impl std::ops::Deref for DuckGuard<'_> {
+    type Target = duckdb::Connection;
+    fn deref(&self) -> &duckdb::Connection {
+        self.0
+            .as_ref()
+            .expect("duckdb connection accessed while released — ensure_alive must reopen it first")
+    }
+}
+
 impl DuckConn {
     /// Lock the connection, recovering the guard even if a prior holder panicked
     /// (poisoning) — a panic mid-query shouldn't permanently brick the connection.
-    fn lock(&self) -> std::sync::MutexGuard<'_, duckdb::Connection> {
-        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> DuckGuard<'_> {
+        DuckGuard(self.conn.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Whether the connection is currently open (a file lock is held).
+    fn is_open(&self) -> bool {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    /// Open the connection if it was released while idle (no-op if already open).
+    fn ensure_open(&self) -> Result<(), AppError> {
+        let mut g = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            *g = Some(Self::open_conn(&self.config)?);
+        }
+        Ok(())
+    }
+
+    /// Release the connection (drop it → free the file lock) when it isn't needed:
+    /// only a file-backed DB, and only when no result stream is mid-flight (an open
+    /// stream keeps it for fast paging + a valid cancel handle).
+    fn release_idle(&self) {
+        if !self.keep_open && self.stream_sql.is_none() {
+            *self.conn.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
     }
 }
 
@@ -264,7 +308,20 @@ impl Backend {
     pub fn is_closed(&self) -> bool {
         match self {
             Backend::Pg(p) => p.client.is_closed(),
-            _ => false, // embedded — never "drops"
+            // DuckDB reports "closed" once it's been released while idle, so `ensure_alive`
+            // re-opens it (and its file lock) lazily on the next command.
+            Backend::Duck(d) => !d.is_open(),
+            _ => false, // SQLite/MySQL — embedded/pooled, never "drops"
+        }
+    }
+
+    /// After a command finishes, drop an embedded connection that doesn't need to stay
+    /// open so it doesn't hold a file lock while idle. Currently only file-backed DuckDB
+    /// (SQLite takes no exclusive idle lock; PG/MySQL are network). Re-opened by
+    /// `ensure_alive` on the next command.
+    pub fn release_idle(&self) {
+        if let Backend::Duck(d) = self {
+            d.release_idle();
         }
     }
 
@@ -305,13 +362,10 @@ impl Backend {
                 p.cursor_open = false;
                 Ok(())
             }
-            Backend::Duck(d) => {
-                let (backend, _v) = DuckConn::open(&d.config)?;
-                if let Backend::Duck(nd) = backend {
-                    *d = nd;
-                }
-                Ok(())
-            }
+            // Re-open only the released connection; keep the pager/stream state intact
+            // (the LIMIT/OFFSET pager re-derives each page from `stream_sql`, so a
+            // released-then-reopened connection resumes paging correctly).
+            Backend::Duck(d) => d.ensure_open(),
             Backend::Sqlite(s) => {
                 let (backend, _v) = SqliteConn::open(&s.config)?;
                 if let Backend::Sqlite(ns) = backend {
@@ -801,28 +855,39 @@ impl PgConn {
 }
 
 impl DuckConn {
-    fn open(config: &ConnectionConfig) -> Result<(Backend, String), AppError> {
-        let path = config
+    /// Resolve the effective DuckDB path (`:memory:` when blank/unset).
+    fn resolve_path(config: &ConnectionConfig) -> String {
+        config
             .path
             .clone()
             .filter(|p| !p.is_empty())
-            .unwrap_or_else(|| ":memory:".to_string());
-        let conn = if path == ":memory:" {
-            duckdb::Connection::open_in_memory().map_err(de)?
+            .unwrap_or_else(|| ":memory:".to_string())
+    }
+
+    /// Open a raw DuckDB connection per the config (memory / read-only file / read-write file).
+    fn open_conn(config: &ConnectionConfig) -> Result<duckdb::Connection, AppError> {
+        let path = Self::resolve_path(config);
+        if path == ":memory:" {
+            duckdb::Connection::open_in_memory().map_err(de)
         } else if config.read_only {
             let cfg = duckdb::Config::default()
                 .access_mode(duckdb::AccessMode::ReadOnly)
                 .map_err(de)?;
-            duckdb::Connection::open_with_flags(&path, cfg).map_err(de)?
+            duckdb::Connection::open_with_flags(&path, cfg).map_err(de)
         } else {
-            duckdb::Connection::open(&path).map_err(de)?
-        };
+            duckdb::Connection::open(&path).map_err(de)
+        }
+    }
+
+    fn open(config: &ConnectionConfig) -> Result<(Backend, String), AppError> {
+        let conn = Self::open_conn(config)?;
         let version = conn
             .query_row("SELECT version()", [], |r| r.get::<_, String>(0))
             .unwrap_or_else(|_| "DuckDB".to_string());
         Ok((
             Backend::Duck(DuckConn {
-                conn: Mutex::new(conn),
+                conn: Mutex::new(Some(conn)),
+                keep_open: Self::resolve_path(config) == ":memory:",
                 config: config.clone(),
                 stream_sql: None,
                 offset: 0,
@@ -1586,6 +1651,48 @@ mod tests {
     }
     fn duck_mem() -> ConnectionConfig {
         mem("duckdb")
+    }
+
+    /// A file-backed DuckDB connection must drop (free its exclusive file lock) when idle,
+    /// reopen lazily, and not lose written data across the release.
+    #[tokio::test]
+    async fn duckdb_releases_file_lock_when_idle() {
+        let path = std::env::temp_dir().join(format!("tusk_idle_{}.duckdb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = duck_mem();
+        cfg.path = Some(path.to_string_lossy().into_owned());
+
+        let (mut b, _) = connect(&cfg).await.unwrap();
+        b.run_single("CREATE TABLE t(a INT)", 1, false).await.unwrap();
+        b.run_single("INSERT INTO t VALUES (42)", 1, false).await.unwrap();
+        assert!(!b.is_closed(), "open while in use");
+
+        // A command finishing with nothing streaming releases the connection → lock freed.
+        b.release_idle();
+        assert!(b.is_closed(), "released when idle");
+
+        // The same file can now be opened by a fresh connection (the lock is gone).
+        let (b2, _) = connect(&cfg).await.expect("file lock freed after release_idle");
+        drop(b2); // DuckDB is single-writer — free it before reopening b.
+
+        // Reopen the original; the data written before the release must still be there.
+        b.reopen().await.unwrap();
+        match b.run_single("SELECT a FROM t", 10, true).await.unwrap() {
+            QueryOutcome::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0].as_deref(), Some("42"));
+            }
+            _ => panic!("expected rows"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A `:memory:` DuckDB must NOT be released on idle — closing it would lose all data.
+    #[tokio::test]
+    async fn duckdb_memory_stays_open_when_idle() {
+        let (b, _) = connect(&duck_mem()).await.unwrap();
+        b.release_idle();
+        assert!(!b.is_closed(), ":memory: must stay open across idle (closing loses data)");
     }
 
     #[test]

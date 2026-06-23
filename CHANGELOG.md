@@ -4,6 +4,12 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-06-23
+
+### Fixed
+- **DuckDB was pulling a broken preview build.** The registry carries `1.105xx` *preview* versions (DuckDB 1.5.x) that sort higher than the stable `1.4.x` line, so the loose `version = "1"` resolved to a broken preview (v1.5.3) in which even `CURRENT_DATE - INTERVAL …` failed to bind (`Binder Error: No function matches '-(DATE, INTERVAL)'`) — surfacing on any query/EXPLAIN using bare `CURRENT_DATE`/`CURRENT_TIMESTAMP` date math. Pinned to stable DuckDB **1.4.x**, where date arithmetic binds correctly.
+- **DuckDB no longer holds the database file locked while idle.** A file-backed DuckDB connection takes an exclusive OS lock for its whole lifetime, so keeping it open between queries blocked every other process (the DuckDB CLI, another tool, a second Tusk window) from opening the file. The connection is now released the moment a command finishes with nothing streaming, and re-opened lazily on the next command — so the lock is held only while a query is actually running. `:memory:` databases stay open (closing would discard their data); SQLite/MySQL/Postgres are unaffected (no exclusive idle lock / networked).
+
 ## [0.5.0] - 2026-06-22
 
 ### Changed

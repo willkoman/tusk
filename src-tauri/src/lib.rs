@@ -77,6 +77,34 @@ async fn ensure_alive(c: &mut ConnState) -> Result<(), AppError> {
     Ok(())
 }
 
+/// A locked connection for the duration of one command. On drop (every return path,
+/// including `?`) it releases an embedded connection that no longer needs to be held —
+/// a file-backed DuckDB otherwise keeps an exclusive OS file lock while idle, blocking
+/// other tools/processes from opening the file. Re-opened lazily by `ensure_alive` on the
+/// next command. Deref(Mut) makes it a drop-in for the raw `MutexGuard<ConnState>`.
+struct ConnGuard<'a> {
+    inner: tokio::sync::MutexGuard<'a, ConnState>,
+}
+impl Drop for ConnGuard<'_> {
+    fn drop(&mut self) {
+        self.inner.backend.release_idle();
+    }
+}
+impl std::ops::Deref for ConnGuard<'_> {
+    type Target = ConnState;
+    fn deref(&self) -> &ConnState {
+        &self.inner
+    }
+}
+impl std::ops::DerefMut for ConnGuard<'_> {
+    fn deref_mut(&mut self) -> &mut ConnState {
+        &mut self.inner
+    }
+}
+async fn lock_conn(conn: &Conn) -> ConnGuard<'_> {
+    ConnGuard { inner: conn.lock().await }
+}
+
 /// Only plain read queries can be wrapped in a server-side cursor for streaming.
 fn is_cursorable(sql: &str) -> bool {
     let t = sql.trim_start().to_ascii_lowercase();
@@ -157,7 +185,7 @@ async fn disconnect(
     state.disarm_cancel(&connection_id);
     let removed = state.conns.lock().unwrap().remove(&connection_id);
     if let Some(conn) = removed {
-        let mut c = conn.lock().await;
+        let mut c = lock_conn(&conn).await;
         c.backend.rollback_cursor().await;
     }
     Ok(())
@@ -191,7 +219,7 @@ async fn run_query(
     search_path: Option<String>,
 ) -> Result<QueryOutcome, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = conn.lock().await;
+    let mut c = lock_conn(&conn).await;
     let page = page_size.unwrap_or(1000);
     ensure_alive(&mut c).await?;
 
@@ -305,7 +333,7 @@ async fn fetch_more(
     page_size: Option<u32>,
 ) -> Result<FetchResult, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = conn.lock().await;
+    let mut c = lock_conn(&conn).await;
     let was_streaming = c.backend.cursor_open();
     ensure_alive(&mut c).await?;
     // A live stream whose connection had to be re-opened (idle timeout, server restart,
@@ -484,7 +512,7 @@ async fn validate_sql(
     search_path: Option<String>,
 ) -> Result<Vec<StmtDiag>, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = conn.lock().await;
+    let mut c = lock_conn(&conn).await;
     ensure_alive(&mut c).await?;
     c.backend.rollback_cursor().await;
     c.backend.apply_search_path(&search_path).await?;
@@ -520,7 +548,7 @@ async fn list_schema(
     connection_id: String,
 ) -> Result<Vec<tree::TableInfo>, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = conn.lock().await;
+    let mut c = lock_conn(&conn).await;
     ensure_alive(&mut c).await?;
     c.backend.rollback_cursor().await;
     c.backend.list_tables().await
@@ -532,7 +560,7 @@ async fn db_tree(
     connection_id: String,
 ) -> Result<tree::DbTree, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = conn.lock().await;
+    let mut c = lock_conn(&conn).await;
     ensure_alive(&mut c).await?;
     c.backend.rollback_cursor().await;
     c.backend.build_tree().await
@@ -546,7 +574,7 @@ async fn table_detail(
     name: String,
 ) -> Result<tree::RelationDetail, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = conn.lock().await;
+    let mut c = lock_conn(&conn).await;
     ensure_alive(&mut c).await?;
     c.backend.rollback_cursor().await;
     c.backend.table_detail(&schema, &name).await
@@ -571,7 +599,7 @@ async fn sample_rows(
     limit: Option<u32>,
 ) -> Result<SampleResult, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = conn.lock().await;
+    let mut c = lock_conn(&conn).await;
     ensure_alive(&mut c).await?;
     let (columns, rows) = c.backend.sample_rows(&schema, &name, limit.unwrap_or(5)).await?;
     Ok(SampleResult { columns, rows })
@@ -586,7 +614,7 @@ async fn object_ddl(
     name: String,
 ) -> Result<String, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = conn.lock().await;
+    let mut c = lock_conn(&conn).await;
     ensure_alive(&mut c).await?;
     c.backend.rollback_cursor().await;
     // Multi-engine: PG full reconstruction, SQLite sqlite_master, MySQL SHOW
@@ -602,7 +630,7 @@ async fn list_functions(
     connection_id: String,
 ) -> Result<Vec<String>, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = conn.lock().await;
+    let mut c = lock_conn(&conn).await;
     ensure_alive(&mut c).await?;
     c.backend.rollback_cursor().await;
     c.backend.list_functions().await
@@ -618,7 +646,7 @@ async fn table_relationships(
     name: String,
 ) -> Result<relgraph::Relationships, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = conn.lock().await;
+    let mut c = lock_conn(&conn).await;
     ensure_alive(&mut c).await?;
     c.backend.rollback_cursor().await;
     c.backend.table_relationships(&schema, &name).await
@@ -632,7 +660,7 @@ async fn schema_relationships(
     schema: String,
 ) -> Result<relgraph::SchemaGraph, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = conn.lock().await;
+    let mut c = lock_conn(&conn).await;
     ensure_alive(&mut c).await?;
     c.backend.rollback_cursor().await;
     c.backend.schema_relationships(&schema).await
@@ -650,7 +678,7 @@ async fn capabilities(
     connection_id: String,
 ) -> Result<driver::Capabilities, AppError> {
     let conn = state.get(&connection_id)?;
-    let c = conn.lock().await;
+    let c = lock_conn(&conn).await;
     Ok(c.backend.capabilities())
 }
 
@@ -662,7 +690,7 @@ async fn permissions(
     connection_id: String,
 ) -> Result<perms::Permissions, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = conn.lock().await;
+    let mut c = lock_conn(&conn).await;
     ensure_alive(&mut c).await?;
     c.backend.rollback_cursor().await;
     c.backend.permissions().await
@@ -695,7 +723,7 @@ async fn export_to_file(
     if let Some(q) = sql {
         let id = connection_id.ok_or_else(|| AppError::new("no connection"))?;
         let conn = state.get(&id)?;
-        let mut c = conn.lock().await;
+        let mut c = lock_conn(&conn).await;
         ensure_alive(&mut c).await?;
         c.backend.rollback_cursor().await;
         c.backend.apply_search_path(&search_path).await?;
@@ -744,7 +772,7 @@ async fn import_rows(
     create: bool,
 ) -> Result<u64, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = conn.lock().await;
+    let mut c = lock_conn(&conn).await;
     ensure_alive(&mut c).await?;
     if c.read_only {
         return Err(AppError::new("connection is read-only — import blocked"));

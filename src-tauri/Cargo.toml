@@ -1,6 +1,6 @@
 [package]
 name = "tusk"
-version = "0.5.0"
+version = "0.5.1"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -38,7 +38,11 @@ rust_xlsxwriter = { version = "0.95.0", features = ["constant_memory"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 # Embedded DuckDB. `bundled` statically compiles libduckdb from source (no system
 # dep) — larger binary + slow first build, but a self-contained installer.
-duckdb = { version = "1", features = ["bundled"] }
+# Pinned to the STABLE 1.4.x line: the registry also carries `1.105xx` *preview* builds
+# (DuckDB 1.5.x) that sort higher than 1.4.x, so a loose `version = "1"` resolved to a
+# broken preview (v1.5.3) where even `CURRENT_DATE - INTERVAL` failed to bind. `~1.4`
+# excludes the 1.5 preview line.
+duckdb = { version = "~1.4", features = ["bundled"] }
 # Embedded SQLite. `bundled` statically compiles SQLite (small, fast) + `column_decltype`
 # for declared column types in introspection.
 rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
