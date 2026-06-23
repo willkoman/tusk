@@ -4,6 +4,11 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-06-23
+
+### Fixed
+- **DuckDB EXPLAIN / EXPLAIN ANALYZE plans now show rows, timing, and heat** — not just bare nodes. DuckDB emits two different JSON shapes and both were mishandled: plain EXPLAIN kept its estimated cardinality as a string inside `extra_info` (never read), and ANALYZE labels its nodes with `operator_name`/`operator_type` (the parser only read `name`) under a profiling root + `EXPLAIN_ANALYZE` wrapper. The parser now lifts estimated cardinality to estimated rows, unwraps the analyze wrappers, and maps `operator_timing`/`operator_cardinality`/`latency` to per-node time / actual rows / execution time. The plan card also shows DuckDB's exclusive per-operator time (it had only read inclusive time), and heat coloring falls back cost → time → rows so DuckDB (which has no cost numbers) is still colored.
+
 ## [0.6.0] - 2026-06-23
 
 ### Added

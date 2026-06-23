@@ -270,6 +270,67 @@ describe("parseDuck", () => {
     expect(parseDuck('"just a string"')).toBeNull();
     expect(parseDuck("[1, 2, 3]")).toBeNull();
   });
+
+  // Real DuckDB shapes (captured from libduckdb 1.4.x).
+  it("plain EXPLAIN: lifts 'Estimated Cardinality' to planRows (+ object) so rows heat works", () => {
+    const json = JSON.stringify([
+      {
+        name: "SEQ_SCAN ",
+        children: [],
+        extra_info: { Table: "t", Type: "Sequential Scan", Filters: "id>10", "Estimated Cardinality": "200" },
+      },
+    ]);
+    const p = parseDuck(json) as PlanTree;
+    expect(p.root.label).toBe("SEQ_SCAN");
+    expect(p.root.object).toBe("t");
+    expect(p.root.planRows).toBe(200);
+    expect(p.maxRows).toBe(200); // heat has a metric to scale by
+  });
+
+  it("ANALYZE: unwraps profiling root + EXPLAIN_ANALYZE, reads operator_name/timing/cardinality", () => {
+    const json = JSON.stringify({
+      latency: 0.5,
+      rows_returned: 1,
+      children: [
+        {
+          operator_name: "EXPLAIN_ANALYZE",
+          operator_type: "EXPLAIN_ANALYZE",
+          operator_timing: 5e-7,
+          children: [
+            {
+              operator_name: "UNGROUPED_AGGREGATE",
+              operator_cardinality: 1,
+              operator_timing: 0.0000175,
+              extra_info: { Aggregates: "count_star()" },
+              children: [
+                {
+                  operator_name: "SEQ_SCAN ",
+                  operator_type: "TABLE_SCAN",
+                  operator_cardinality: 989,
+                  operator_timing: 0.0000472,
+                  extra_info: { Table: "t", Filters: "id>10", "Estimated Cardinality": "200" },
+                  children: [],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    const p = parseDuck(json) as PlanTree;
+    // Real root is the aggregate (profiling + EXPLAIN_ANALYZE wrappers dropped).
+    expect(p.root.label).toBe("UNGROUPED_AGGREGATE");
+    expect(p.root.actualRows).toBe(1);
+    const scan = p.root.children[0];
+    expect(scan.label).toBe("SEQ_SCAN");
+    expect(scan.actualRows).toBe(989); // operator_cardinality → drives rows heat
+    expect(scan.selfTimeMs).toBeCloseTo(0.0472, 3); // operator_timing*1000 → time heat
+    expect(scan.planRows).toBe(200); // estimated cardinality still surfaced
+    expect(p.hasActual).toBe(true);
+    expect(p.executionMs).toBeCloseTo(500, 1); // latency*1000
+    expect(p.maxSelfTimeMs).toBeGreaterThan(0);
+    expect(p.maxRows).toBe(989);
+  });
 });
 
 // ---------- detect ----------

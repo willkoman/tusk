@@ -37,8 +37,10 @@ const fmtMs = (ms: number) => (ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${ms
 
 /** 0..1 heat for a node under the chosen metric (sqrt — mid values stay visible). */
 function heatOf(n: PlanNode, plan: PlanTree, metric: EditorPrefs["planHeat"]): number {
-  // cost → time fallback when the engine has no costs (DuckDB/SQLite).
-  const m = metric === "cost" && plan.maxSelfCost === 0 && plan.maxSelfTimeMs > 0 ? "time" : metric;
+  // cost → time → rows fallback when the engine has no costs (DuckDB has no cost numbers:
+  // ANALYZE gives per-operator time, plain EXPLAIN only estimated cardinality).
+  let m = metric;
+  if (m === "cost" && plan.maxSelfCost === 0) m = plan.maxSelfTimeMs > 0 ? "time" : "rows";
   let v = 0;
   let max = 0;
   if (m === "cost") {
@@ -194,10 +196,12 @@ export function PlanView(props: {
                           <Show when={n.object}><div class="plan-card-obj" title={n.object}>{n.object}</div></Show>
                           <Show when={props.prefs().planDensity !== "compact"}>
                             <div class="plan-card-stats">
-                              <Show when={t().hasActual && n.totalTimeMs !== undefined} fallback={
+                              <Show when={t().hasActual && (n.totalTimeMs ?? n.selfTimeMs) !== undefined} fallback={
                                 <Show when={n.totalCost !== undefined}><span>cost {fmtNum(n.totalCost!)}</span></Show>
                               }>
-                                <span>{fmtMs(n.totalTimeMs! * (n.loops ?? 1))}</span>
+                                {/* DuckDB reports exclusive per-operator time (selfTimeMs); Postgres reports
+                                    inclusive per-loop time (totalTimeMs × loops). */}
+                                <span>{fmtMs(n.totalTimeMs !== undefined ? n.totalTimeMs * (n.loops ?? 1) : n.selfTimeMs!)}</span>
                               </Show>
                               <Show when={n.actualRows !== undefined} fallback={
                                 <Show when={n.planRows !== undefined}><span>~{fmtNum(n.planRows!)} rows</span></Show>
