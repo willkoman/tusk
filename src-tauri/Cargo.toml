@@ -1,6 +1,6 @@
 [package]
 name = "tusk"
-version = "0.6.1"
+version = "0.6.2"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -43,6 +43,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 # broken preview (v1.5.3) where even `CURRENT_DATE - INTERVAL` failed to bind. `~1.4`
 # excludes the 1.5 preview line.
 duckdb = { version = "~1.4", features = ["bundled"] }
+# Render DuckDB's temporal `Value` variants (Date32/Timestamp/Time64) to readable
+# text on the rare non-VARCHAR-cast paths (introspection / sample rows / non-cursorable
+# reads). Already in the tree transitively.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Embedded SQLite. `bundled` statically compiles SQLite (small, fast) + `column_decltype`
 # for declared column types in introspection.
 rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }

@@ -4,6 +4,11 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-06-24
+
+### Fixed
+- **DuckDB date/time/decimal values render correctly on every path.** Temporal and decimal columns coming back through a path that doesn't VARCHAR-cast (introspection, AI sample rows, or a read not routed through the streaming cursor) printed Rust Debug like `Date32(19797)` / `Timestamp(Microsecond, …)`. The value formatter now renders `DATE`→`YYYY-MM-DD`, `TIMESTAMP`/`TIME`→ISO with trimmed fractional seconds, `DECIMAL`/`HUGEINT` as digits, `INTERVAL` readably, and lists/structs recursively — matching `CAST(… AS VARCHAR)` for the scalar types.
+
 ## [0.6.1] - 2026-06-23
 
 ### Fixed

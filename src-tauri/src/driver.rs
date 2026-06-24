@@ -1500,27 +1500,115 @@ pub struct ConnState {
 // --- DuckDB helpers ---
 
 fn duck_value_to_string(v: duckdb::types::Value) -> Option<String> {
+    match v {
+        duckdb::types::Value::Null => None,
+        other => Some(duck_value_repr(other)),
+    }
+}
+
+/// Split a `TimeUnit`-scaled count into (whole seconds, sub-second nanos), Euclidean so
+/// negative timestamps (pre-1970) still floor correctly.
+fn duck_time_parts(unit: duckdb::types::TimeUnit, v: i64) -> (i64, u32) {
+    use duckdb::types::TimeUnit as U;
+    let per_sec: i64 = match unit {
+        U::Second => 1,
+        U::Millisecond => 1_000,
+        U::Microsecond => 1_000_000,
+        U::Nanosecond => 1_000_000_000,
+    };
+    let scale = 1_000_000_000 / per_sec; // sub-unit → nanos
+    (v.div_euclid(per_sec), (v.rem_euclid(per_sec) * scale) as u32)
+}
+
+/// `.123` style fractional-seconds suffix (micro precision, trailing zeros trimmed) —
+/// matches DuckDB's VARCHAR rendering; empty when there's no sub-second part.
+fn duck_frac(nanos: u32) -> String {
+    let micros = nanos / 1000;
+    if micros == 0 {
+        return String::new();
+    }
+    format!(".{}", format!("{micros:06}").trim_end_matches('0'))
+}
+
+/// Render a non-NULL DuckDB value to text, matching `CAST(… AS VARCHAR)` for the common
+/// scalar types so paths that don't cast (introspection / sample rows / a read that
+/// wasn't routed through the cursor) don't leak Rust Debug like `Date32(19797)`.
+fn duck_value_repr(v: duckdb::types::Value) -> String {
     use duckdb::types::Value as V;
     match v {
-        V::Null => None,
-        V::Boolean(b) => Some(b.to_string()),
-        V::TinyInt(n) => Some(n.to_string()),
-        V::SmallInt(n) => Some(n.to_string()),
-        V::Int(n) => Some(n.to_string()),
-        V::BigInt(n) => Some(n.to_string()),
-        V::HugeInt(n) => Some(n.to_string()),
-        V::UTinyInt(n) => Some(n.to_string()),
-        V::USmallInt(n) => Some(n.to_string()),
-        V::UInt(n) => Some(n.to_string()),
-        V::UBigInt(n) => Some(n.to_string()),
-        V::Float(n) => Some(n.to_string()),
-        V::Double(n) => Some(n.to_string()),
-        V::Text(s) => Some(s),
-        V::Blob(b) => Some(String::from_utf8_lossy(&b).into_owned()),
-        // Decimal/Timestamp/Date/Time/List/Struct/… — user data is VARCHAR-cast before
-        // it reaches here, so this fallback is rare; Debug is acceptable for v1.
-        other => Some(format!("{other:?}")),
+        V::Null => "NULL".to_string(),
+        V::Boolean(b) => b.to_string(),
+        V::TinyInt(n) => n.to_string(),
+        V::SmallInt(n) => n.to_string(),
+        V::Int(n) => n.to_string(),
+        V::BigInt(n) => n.to_string(),
+        V::HugeInt(n) => n.to_string(),
+        V::UTinyInt(n) => n.to_string(),
+        V::USmallInt(n) => n.to_string(),
+        V::UInt(n) => n.to_string(),
+        V::UBigInt(n) => n.to_string(),
+        V::Float(n) => n.to_string(),
+        V::Double(n) => n.to_string(),
+        V::Decimal(d) => d.to_string(),
+        V::Text(s) => s,
+        V::Enum(s) => s,
+        V::Blob(b) => String::from_utf8_lossy(&b).into_owned(),
+        // DATE: days since the Unix epoch → YYYY-MM-DD.
+        V::Date32(days) => chrono::DateTime::from_timestamp(days as i64 * 86_400, 0)
+            .map(|dt| dt.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| days.to_string()),
+        // TIMESTAMP (tz-naive): YYYY-MM-DD HH:MM:SS[.ffffff].
+        V::Timestamp(unit, t) => {
+            let (secs, nanos) = duck_time_parts(unit, t);
+            chrono::DateTime::from_timestamp(secs, nanos)
+                .map(|dt| format!("{}{}", dt.format("%Y-%m-%d %H:%M:%S"), duck_frac(nanos)))
+                .unwrap_or_else(|| t.to_string())
+        }
+        // TIME: HH:MM:SS[.ffffff] (count is within a day).
+        V::Time64(unit, t) => {
+            let (secs, nanos) = duck_time_parts(unit, t);
+            let s = secs.rem_euclid(86_400) as u32;
+            format!("{:02}:{:02}:{:02}{}", s / 3600, (s % 3600) / 60, s % 60, duck_frac(nanos))
+        }
+        // INTERVAL: a readable "N years N months N days HH:MM:SS" (best-effort).
+        V::Interval { months, days, nanos } => duck_interval(months, days, nanos),
+        // Nested types — recurse so a list/array reads like `[a, b, c]`, a struct like
+        // `{'k': v}` (close to DuckDB's VARCHAR form; readable rather than Debug).
+        V::List(xs) | V::Array(xs) => {
+            format!("[{}]", xs.into_iter().map(duck_value_repr).collect::<Vec<_>>().join(", "))
+        }
+        V::Struct(m) => {
+            let body = m
+                .iter()
+                .map(|(k, val)| format!("'{k}': {}", duck_value_repr(val.clone())))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{{body}}}")
+        }
+        other => format!("{other:?}"),
     }
+}
+
+fn duck_interval(months: i32, days: i32, nanos: i64) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let (y, mo) = (months / 12, months % 12);
+    let plural = |n: i32| if n.abs() == 1 { "" } else { "s" };
+    if y != 0 {
+        parts.push(format!("{y} year{}", plural(y)));
+    }
+    if mo != 0 {
+        parts.push(format!("{mo} month{}", plural(mo)));
+    }
+    if days != 0 {
+        parts.push(format!("{days} day{}", plural(days)));
+    }
+    let total_secs = nanos / 1_000_000_000;
+    let sub = (nanos % 1_000_000_000) as u32;
+    let s = total_secs.rem_euclid(86_400);
+    if s != 0 || sub != 0 || parts.is_empty() {
+        parts.push(format!("{:02}:{:02}:{:02}{}", s / 3600, (s % 3600) / 60, s % 60, duck_frac(sub)));
+    }
+    parts.join(" ")
 }
 
 fn duck_query(
@@ -1685,6 +1773,31 @@ mod tests {
             _ => panic!("expected rows"),
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// DuckDB temporal/decimal values must render like `CAST(… AS VARCHAR)` on the raw
+    /// (non-cast) path — not Rust Debug like `Date32(19797)`. Covers every path that uses
+    /// `duck_value_to_string` (introspection / sample rows / a non-cursorable read).
+    #[test]
+    fn duck_renders_temporal_types_like_varchar() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let sel = "SELECT DATE '2024-03-15' AS d, \
+                   TIMESTAMP '2024-03-15 10:30:45.123' AS ts, \
+                   TIME '10:30:45.5' AS tm, \
+                   CAST(3.14 AS DECIMAL(10,2)) AS dec, \
+                   CAST(123456789012345678 AS HUGEINT) AS hug, \
+                   DATE '2024-01-01' AS d2";
+        // `duck_query` runs values through `duck_value_to_string`.
+        let (_c, raw) = duck_query(&conn, sel).unwrap();
+        // VARCHAR cast is the authoritative rendering.
+        let (_c2, cast) = duck_query(&conn, &format!("SELECT CAST(COLUMNS(*) AS VARCHAR) FROM ({sel}) _t")).unwrap();
+        assert_eq!(raw[0], cast[0], "formatter must match the VARCHAR cast");
+        assert_eq!(raw[0][0].as_deref(), Some("2024-03-15"), "DATE renders ISO, not Date32(..)");
+        assert!(
+            !raw[0].iter().flatten().any(|s| s.contains("Date32") || s.contains("Timestamp(") || s.contains("Time64")),
+            "no Rust Debug leaks: {:?}",
+            raw[0]
+        );
     }
 
     /// A `:memory:` DuckDB must NOT be released on idle — closing it would lose all data.
