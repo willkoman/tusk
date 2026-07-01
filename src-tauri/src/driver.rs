@@ -867,16 +867,22 @@ impl DuckConn {
     /// Open a raw DuckDB connection per the config (memory / read-only file / read-write file).
     fn open_conn(config: &ConnectionConfig) -> Result<duckdb::Connection, AppError> {
         let path = Self::resolve_path(config);
-        if path == ":memory:" {
-            duckdb::Connection::open_in_memory().map_err(de)
+        let conn = if path == ":memory:" {
+            duckdb::Connection::open_in_memory().map_err(de)?
         } else if config.read_only {
             let cfg = duckdb::Config::default()
                 .access_mode(duckdb::AccessMode::ReadOnly)
                 .map_err(de)?;
-            duckdb::Connection::open_with_flags(&path, cfg).map_err(de)
+            duckdb::Connection::open_with_flags(&path, cfg).map_err(de)?
         } else {
-            duckdb::Connection::open(&path).map_err(de)
-        }
+            duckdb::Connection::open(&path).map_err(de)?
+        };
+        // The bundled libduckdb ships the ICU extension installed-but-not-loaded.
+        // Without it, TIMESTAMP WITH TIME ZONE casts fail ("Unimplemented type for
+        // cast (TIMESTAMP WITH TIME ZONE -> DATE)"), which the DuckDB CLI auto-loads.
+        // Best-effort: ignore if unavailable (older/custom builds without ICU).
+        let _ = conn.execute("LOAD icu", []);
+        Ok(conn)
     }
 
     fn open(config: &ConnectionConfig) -> Result<(Backend, String), AppError> {
@@ -1845,6 +1851,54 @@ mod tests {
         assert_eq!(det.columns[0].name, "a");
         let list = sqlite_list_tables(&s.lock()).unwrap();
         assert!(list.iter().any(|t| t.name == "t" && t.columns.len() == 2));
+    }
+
+    /// The bundled libduckdb ships ICU installed-but-not-loaded, so
+    /// `CAST(TIMESTAMPTZ AS DATE)` fails without explicitly loading the extension.
+    /// `open_conn` now runs `LOAD icu` — verify the cast works through the full
+    /// `run_single` path (what the app actually uses), and survives the
+    /// release/reopen cycle (file-backed DuckDB drops the connection when idle).
+    #[tokio::test]
+    async fn duckdb_timestamptz_cast_after_icu_load() {
+        let path = std::env::temp_dir().join(format!("tusk_icu_{}.duckdb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = duck_mem();
+        cfg.path = Some(path.to_string_lossy().into_owned());
+
+        let (mut b, _) = connect(&cfg).await.unwrap();
+        b.run_single(
+            "CREATE TABLE inventory_action (id INT, item_id INT, created_at TIMESTAMPTZ, \
+             qty_delta INT, cost_delta INT, location_key VARCHAR, type VARCHAR)",
+            1, false,
+        ).await.unwrap();
+        b.run_single(
+            "INSERT INTO inventory_action VALUES (1, 1, now(), 5, 10, 'MAIN', 'PURCHASE')",
+            1, false,
+        ).await.unwrap();
+
+        let q = "SELECT CAST(ia.created_at AS DATE) AS action_date FROM inventory_action ia";
+
+        // Works on first connect (open_conn loads ICU).
+        match b.run_single(q, 50, true).await.unwrap() {
+            QueryOutcome::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0].as_deref(), Some("2026-07-01"));
+            }
+            _ => panic!("expected rows"),
+        }
+
+        // Release + reopen (simulates idle lock release) — ICU must re-load.
+        b.release_idle();
+        b.reopen().await.unwrap();
+        match b.run_single(q, 50, true).await.unwrap() {
+            QueryOutcome::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0].as_deref(), Some("2026-07-01"));
+            }
+            _ => panic!("expected rows after reopen"),
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

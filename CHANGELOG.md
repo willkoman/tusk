@@ -4,6 +4,9 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+### Fixed
+- **DuckDB `TIMESTAMP WITH TIME ZONE` casts (e.g. `CAST(col AS DATE)`) no longer fail with "Unimplemented type for cast".** The bundled libduckdb ships the ICU extension installed-but-not-loaded, so casts involving `TIMESTAMPTZ` (which the DuckDB CLI auto-loads) failed in Tusk. `open_conn` now runs `LOAD icu` on every DuckDB connection (including reopens after idle lock release), best-effort (ignored if ICU is unavailable).
+
 ## [0.6.2] - 2026-06-24
 
 ### Fixed
