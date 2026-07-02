@@ -1,6 +1,7 @@
 import { createSignal, createMemo, createEffect, onMount, onCleanup, For, Show, lazy } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "./App.css";
 import { isDarkTheme, normalizeTheme, type ThemeId } from "./themes";
 import { SqlEditor, type EditorApi } from "./SqlEditor";
@@ -59,6 +60,9 @@ type QueryOutcome =
   | { kind: "rows"; columns: string[]; rows: (string | null)[][]; done: boolean; note?: string }
   | { kind: "exec"; message: string };
 type FetchResult = { rows: (string | null)[][]; done: boolean };
+// Slack bot events (mirrors slack::StatusInfo / the slack:executed payload in Rust).
+type SlackStatus = { running: boolean; state: string; error: string | null };
+type SlackExecuted = { sql: string; durationMs: number; status: string; rows?: number; error?: string; slackUser: string };
 
 const PAGE = 1000;
 const DDL_RE = /^\s*(create|alter|drop|truncate|comment|grant|revoke)\b/i;
@@ -836,6 +840,9 @@ function App() {
   const [fetchingMore, setFetchingMore] = createSignal(false);
   let runTimer: ReturnType<typeof setInterval> | undefined;
 
+  const [slackStatus, setSlackStatus] = createSignal<SlackStatus>({ running: false, state: "disconnected", error: null });
+  const slackUnlisten: UnlistenFn[] = [];
+
   onMount(async () => {
     // Suppress the WebView's native right-click menu app-wide; the sidebar shows
     // its own context menu, and the editor uses keyboard shortcuts for copy/paste.
@@ -843,12 +850,39 @@ function App() {
     // Window-level editor/tab shortcuts (the in-editor keymap owns Mod-Enter/Shift-Alt-f/
     // Mod-f/Tab — no overlap with T/W/S/O). preventDefault so Cmd-W closes the tab, not the window.
     window.addEventListener("keydown", onWindowKey);
+    // Load profiles + auto-connect FIRST — the core startup path must not depend on
+    // the Slack event bridge (a rejected listen() would otherwise abort onMount and
+    // leave the connect screen empty).
     await loadProfiles();
-    // Auto-connect to the default profile, if one is set.
     const def = profiles().find((p) => p.default_connect);
     if (def) connectProfile(def.id);
+    // Slack bot status (statusbar badge) + audit trail: every Slack-approved query
+    // lands in the normal per-connection history with a [Slack] marker comment.
+    // Best-effort — a failed listen must never break the app.
+    try {
+      invoke<SlackStatus>("slack_status").then(setSlackStatus).catch(() => {});
+      slackUnlisten.push(await listen<SlackStatus>("slack:status", (e) => setSlackStatus(e.payload)));
+      slackUnlisten.push(
+        await listen<SlackExecuted>("slack:executed", (e) => {
+          const p = e.payload;
+          recordHistory({
+            sql: `-- [Slack] asked by ${p.slackUser}\n${p.sql}`,
+            durationMs: p.durationMs,
+            status: p.status === "ok" ? "ok" : "error",
+            rows: p.rows ?? null,
+            error: p.error ? p.error.split("\n")[0] : null,
+            schema: null,
+          });
+        }),
+      );
+    } catch {
+      /* Slack event bridge unavailable — badge + audit degrade silently */
+    }
   });
-  onCleanup(() => window.removeEventListener("keydown", onWindowKey));
+  onCleanup(() => {
+    window.removeEventListener("keydown", onWindowKey);
+    for (const u of slackUnlisten) u();
+  });
 
   // Central dispatcher — every action callable from a shortcut, the palette, or
   // the Shortcuts pane goes through here.
@@ -2453,6 +2487,14 @@ function App() {
 
             <footer class="statusbar">
               <span>{status()}</span>
+              <Show when={slackStatus().state !== "disconnected"}>
+                <span
+                  class="slack-badge"
+                  title={slackStatus().error ? `Slack: ${slackStatus().state} — ${slackStatus().error}` : `Slack bot ${slackStatus().state}`}
+                >
+                  {slackStatus().state === "connected" ? "🟢" : "🟡"} Slack
+                </span>
+              </Show>
               <span class="spacer" />
               <Show when={cursorInfo()}>
                 {(ci) => (

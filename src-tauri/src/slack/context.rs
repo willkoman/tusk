@@ -1,0 +1,340 @@
+//! Rust port of `src/ai/context.ts` for the Slack bot (the bot runs in Rust and
+//! can't call the frontend). PARITY PAIR: keep the budgets, relevance scoring, and
+//! sample formatting in step with the TS version — same class of pairing as
+//! `editor/lexer.ts` ↔ `script.rs`. The system prompt itself intentionally differs:
+//! Slack asks for exactly one read-only SELECT in a ```sql block.
+
+use crate::tree::TableInfo;
+use std::collections::HashSet;
+
+// Budgets — mirror src/ai/context.ts.
+const SCHEMA_BUDGET: usize = 12_000;
+const NAME_LIST_BUDGET: usize = 2_500;
+const SAMPLE_BUDGET: usize = 4_000;
+const CELL_CAP: usize = 80;
+
+/// Sample rows pulled from a relation, for grounding the model in real values.
+pub struct SampleTable {
+    pub schema: String,
+    pub name: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+}
+
+/// Connection facts the prompt needs (Slack has no editor SQL / selection).
+pub struct SlackAiCtx {
+    pub dialect: String, // "postgres" | "mysql" | "sqlite" | "duckdb"
+    pub user: String,
+    pub is_superuser: bool,
+    pub permissions_enforced: bool,
+    /// "refuse" = refuse destructive asks outright; anything else = propose a
+    /// read-only preview SELECT instead. Execution gates enforce regardless.
+    pub destructive_policy: String,
+}
+
+fn quote_note(dialect: &str) -> &'static str {
+    match dialect {
+        "mysql" => "Quote identifiers with backticks (`col`).",
+        _ => "Quote identifiers with double quotes (\"col\").",
+    }
+}
+
+/// 0 = table name appears verbatim in the focus, 1 = shares a word, 2 = unrelated.
+fn relevance_score(t: &TableInfo, focus_lower: &str, focus_words: &HashSet<String>) -> u8 {
+    let n = t.name.to_lowercase();
+    if focus_lower.contains(&n) {
+        return 0;
+    }
+    if n.split('_').any(|tok| focus_words.contains(tok)) {
+        return 1;
+    }
+    2
+}
+
+fn focus_words(focus_lower: &str) -> HashSet<String> {
+    focus_lower
+        .split(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+        .filter(|w| w.len() > 2)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Tables actually relevant to the focus (score ≤ 1), most-relevant first, capped.
+pub fn relevant_tables<'a>(tables: &'a [TableInfo], focus: &str, limit: usize) -> Vec<&'a TableInfo> {
+    let f = focus.to_lowercase();
+    let words = focus_words(&f);
+    let mut scored: Vec<(u8, usize, &TableInfo)> = tables
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (relevance_score(t, &f, &words), i, t))
+        .filter(|(s, _, _)| *s <= 1)
+        .collect();
+    scored.sort_by_key(|(s, i, _)| (*s, *i));
+    scored.into_iter().take(limit).map(|(_, _, t)| t).collect()
+}
+
+/// Render fetched sample rows as a compact, budgeted block of pipe-separated tables.
+pub fn format_samples(samples: &[SampleTable]) -> String {
+    // Parity with src/ai/context.ts `formatSamples`: collapse whitespace RUNS to a
+    // single space WITHOUT trimming the edges (TS `s.replace(/\s+/g, " ")`), then cap.
+    let collapse_ws = |s: &str| -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut in_ws = false;
+        for ch in s.chars() {
+            if ch.is_whitespace() {
+                if !in_ws {
+                    out.push(' ');
+                }
+                in_ws = true;
+            } else {
+                out.push(ch);
+                in_ws = false;
+            }
+        }
+        out
+    };
+    let cell = |v: &Option<String>| -> String {
+        match v {
+            None => "NULL".to_string(),
+            Some(s) => {
+                let s = collapse_ws(s);
+                if s.chars().count() > CELL_CAP {
+                    let cut: String = s.chars().take(CELL_CAP - 1).collect();
+                    format!("{cut}…")
+                } else {
+                    s
+                }
+            }
+        }
+    };
+    let mut out = String::new();
+    for s in samples {
+        if s.columns.is_empty() || s.rows.is_empty() {
+            continue;
+        }
+        let plural = if s.rows.len() == 1 { "" } else { "s" };
+        let mut block = format!("\n{}.{} ({} sample row{plural}):\n", s.schema, s.name, s.rows.len());
+        block.push_str(&s.columns.join(" | "));
+        block.push('\n');
+        for r in &s.rows {
+            let line: Vec<String> = (0..s.columns.len())
+                .map(|k| cell(&r.get(k).cloned().flatten()))
+                .collect();
+            block.push_str(&line.join(" | "));
+            block.push('\n');
+        }
+        if out.len() + block.len() > SAMPLE_BUDGET {
+            break;
+        }
+        out.push_str(&block);
+    }
+    out
+}
+
+fn schema_summary(tables: &[TableInfo], focus: &str) -> String {
+    let f = focus.to_lowercase();
+    let words = focus_words(&f);
+    let mut ranked: Vec<(u8, usize, &TableInfo)> = tables
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (relevance_score(t, &f, &words), i, t))
+        .collect();
+    ranked.sort_by_key(|(s, i, _)| (*s, *i));
+
+    let mut out = String::new();
+    let mut rest: Vec<String> = Vec::new();
+    for (_, _, t) in &ranked {
+        let cols = t
+            .columns
+            .iter()
+            .map(|c| format!("{} {}", c.name, c.data_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let line = format!("{}.{}({cols})\n", t.schema, t.name);
+        if out.len() + line.len() > SCHEMA_BUDGET {
+            rest.push(format!("{}.{}", t.schema, t.name));
+        } else {
+            out.push_str(&line);
+        }
+    }
+    if !rest.is_empty() {
+        // Never silently drop a table: list the remainder by NAME.
+        let mut names = String::new();
+        let mut listed = 0usize;
+        for n in &rest {
+            if names.len() + n.len() + 2 > NAME_LIST_BUDGET {
+                break;
+            }
+            if !names.is_empty() {
+                names.push_str(", ");
+            }
+            names.push_str(n);
+            listed += 1;
+        }
+        out.push_str(&format!(
+            "\nOther tables (columns available on request — ask the user to mention the table):\n{names}"
+        ));
+        if listed < rest.len() {
+            out.push_str(&format!(", … and {} more", rest.len() - listed));
+        }
+        out.push('\n');
+    }
+    if out.is_empty() {
+        "(no user tables)".to_string()
+    } else {
+        out
+    }
+}
+
+/// The Slack-flavored system prompt: one read-only SELECT, one-sentence explanation.
+pub fn build_system_prompt(
+    ctx: &SlackAiCtx,
+    tables: &[TableInfo],
+    conversation_text: &str,
+    samples: &[SampleTable],
+) -> String {
+    let mut lines: Vec<String> = vec![
+        format!(
+            "You are a SQL assistant connected to a {} database, answering questions asked in Slack. {}",
+            ctx.dialect,
+            quote_note(&ctx.dialect)
+        ),
+        format!(
+            "Current role: {}{}.",
+            if ctx.user.is_empty() { "(unknown)" } else { &ctx.user },
+            if ctx.is_superuser { " (superuser)" } else { "" }
+        ),
+        String::new(),
+        "Generate a single read-only SELECT query answering the user's question. Format your response as:".to_string(),
+        "1. One sentence explaining what the query does (and any assumptions you made).".to_string(),
+        "2. The query in a ```sql code block.".to_string(),
+        String::new(),
+        "Rules:".to_string(),
+        "- Only SELECT queries. No INSERT/UPDATE/DELETE/DDL, no writable CTEs, no FOR UPDATE/FOR SHARE, and exactly one statement. This is enforced — mutating SQL will be rejected, never executed.".to_string(),
+        if ctx.destructive_policy == "refuse" {
+            "- If the user asks for anything destructive or mutating (insert/update/delete/drop/alter/truncate/any DDL/grants), do NOT write that SQL and do NOT emit any code block. Politely refuse and tell them to run it themselves in the Tusk desktop editor.".to_string()
+        } else {
+            "- If the user asks for anything destructive or mutating (insert/update/delete/drop/alter/truncate/any DDL/grants), do NOT write that SQL. Instead propose a read-only SELECT that previews the data their request would affect (e.g. the rows that would be deleted), state clearly that mutations can't run from Slack, and point them to the Tusk desktop editor for the actual change.".to_string()
+        },
+        "- Always quote identifiers as noted above.".to_string(),
+        "- Use LIMIT when the user asks for \"top N\" or when the result could be large.".to_string(),
+        "- If the question is ambiguous, make reasonable assumptions and note them in your explanation.".to_string(),
+        "- If (and ONLY if) the user explicitly asks for a chart/graph/plot/visualization, ALSO return a second fenced block tagged `chart` after the sql block, containing JSON:".to_string(),
+        "  {\"type\":\"line|bar|scatter|pie\",\"x\":\"<x column>\",\"series\":[\"<numeric column>\",...],\"title\":\"...\",\"xLabel\":\"...\",\"yLabel\":\"...\"}".to_string(),
+        "  Column names must exactly match the SQL output columns. Honor the user's requested chart type, axis assignment, labels, and series choices; pick sensible defaults for anything unspecified. Keep chartable results small (LIMIT ≤ 100). Never emit a chart block when no chart was asked for.".to_string(),
+    ];
+    if ctx.permissions_enforced && !ctx.is_superuser {
+        lines.push("- This role has limited privileges — stick to tables listed below.".to_string());
+    }
+    lines.push(String::new());
+    lines.push("Database schema (schema.table(columns)):".to_string());
+    lines.push(schema_summary(tables, conversation_text));
+    let sample_text = format_samples(samples);
+    if !sample_text.trim().is_empty() {
+        lines.push(String::new());
+        lines.push(
+            "Sample rows from the most relevant tables (real data, so you understand value shapes/formats — never assume these are the only rows):"
+                .to_string(),
+        );
+        lines.push(sample_text.trim_end().to_string());
+    }
+    lines.join("\n")
+}
+
+/// All fenced blocks in an assistant message as (info-string, body) pairs.
+pub fn extract_blocks(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("```") {
+        let after = &rest[open + 3..];
+        // The info string (e.g. "sql", "chart") runs to the first newline.
+        let Some(nl) = after.find('\n') else { break };
+        let lang = after[..nl].trim().to_lowercase();
+        let body_start = &after[nl + 1..];
+        let Some(close) = body_start.find("```") else { break };
+        let body = body_start[..close].trim();
+        if !body.is_empty() {
+            out.push((lang, body.to_string()));
+        }
+        rest = &body_start[close + 3..];
+    }
+    out
+}
+
+/// Extract ```sql blocks (or untagged fences) — NOT ```chart/other-tagged blocks.
+/// Mirrors context.ts `extractSqlBlocks` (which predates the chart tag) without regex.
+pub fn extract_sql_blocks(text: &str) -> Vec<String> {
+    extract_blocks(text)
+        .into_iter()
+        .filter(|(lang, _)| lang.is_empty() || lang == "sql")
+        .map(|(_, body)| body)
+        .collect()
+}
+
+/// The first ```chart block's body, if any (JSON chart spec).
+pub fn extract_chart_block(text: &str) -> Option<String> {
+    extract_blocks(text).into_iter().find(|(lang, _)| lang == "chart").map(|(_, b)| b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree::ColumnInfo;
+
+    fn t(name: &str, cols: &[(&str, &str)]) -> TableInfo {
+        TableInfo {
+            schema: "public".into(),
+            name: name.into(),
+            columns: cols
+                .iter()
+                .map(|(n, d)| ColumnInfo { name: n.to_string(), data_type: d.to_string() })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn relevance_ranks_verbatim_then_shared_word() {
+        let tables = vec![t("orders", &[("id", "int")]), t("order_items", &[("id", "int")]), t("users", &[("id", "int")])];
+        let rel = relevant_tables(&tables, "top orders by items sold", 10);
+        let names: Vec<&str> = rel.iter().map(|t| t.name.as_str()).collect();
+        // "orders" appears verbatim (score 0); "order_items" shares the word "items"
+        // (score 1); "users" is unrelated (score 2 → excluded). Mirrors context.ts.
+        assert_eq!(names, vec!["orders", "order_items"]);
+    }
+
+    #[test]
+    fn schema_summary_lists_overflow_by_name() {
+        let many: Vec<TableInfo> = (0..2000).map(|i| t(&format!("table_{i}"), &[("col_a", "text"), ("col_b", "integer")])).collect();
+        let s = schema_summary(&many, "");
+        assert!(s.len() < SCHEMA_BUDGET + NAME_LIST_BUDGET + 200);
+        assert!(s.contains("Other tables"));
+    }
+
+    #[test]
+    fn extract_sql_blocks_finds_fenced() {
+        let text = "Here you go:\n```sql\nSELECT 1;\n```\nand also\n```\nSELECT 2\n```";
+        assert_eq!(extract_sql_blocks(text), vec!["SELECT 1;".to_string(), "SELECT 2".to_string()]);
+    }
+
+    #[test]
+    fn chart_blocks_split_from_sql() {
+        let text = "Sales by month.\n```sql\nSELECT \"month\", \"total\" FROM \"s\"\n```\n```chart\n{\"type\":\"bar\",\"x\":\"month\",\"series\":[\"total\"]}\n```";
+        assert_eq!(extract_sql_blocks(text), vec!["SELECT \"month\", \"total\" FROM \"s\"".to_string()]);
+        let chart = extract_chart_block(text).unwrap();
+        assert!(chart.contains("\"type\":\"bar\""));
+        assert!(extract_chart_block("no charts here ```sql\nSELECT 1\n```").is_none());
+    }
+
+    #[test]
+    fn format_samples_caps_cells() {
+        let s = SampleTable {
+            schema: "public".into(),
+            name: "users".into(),
+            columns: vec!["name".into()],
+            rows: vec![vec![Some("x".repeat(500))], vec![None]],
+        };
+        let out = format_samples(&[s]);
+        assert!(out.contains("…"));
+        assert!(out.contains("NULL"));
+    }
+}

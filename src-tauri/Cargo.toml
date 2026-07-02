@@ -1,6 +1,6 @@
 [package]
 name = "tusk"
-version = "0.6.2"
+version = "0.7.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -27,7 +27,7 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["sync", "fs", "io-util"] }
+tokio = { version = "1", features = ["sync", "fs", "io-util", "time", "macros"] }
 tokio-postgres = "0.7"
 native-tls = "0.2"
 postgres-native-tls = "0.5"
@@ -36,6 +36,22 @@ futures-util = "0.3"
 rust_xlsxwriter = { version = "0.95.0", features = ["constant_memory"] }
 # AI provider proxy (streaming HTTP). rustls to avoid an OpenSSL build dep.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# Slack Socket Mode (desktop-hosted bot — outbound WebSocket only, no HTTP server).
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+# Pin the process-wide rustls CryptoProvider to ring: reqwest's rustls-tls is
+# ring-flavored while tokio-tungstenite's rustls defaults to aws-lc-rs — with both
+# providers in the graph rustls has NO default and panics at TLS-config build time.
+# lib.rs installs ring as the default at startup (and ring avoids the CMake+NASM
+# toolchain aws-lc-rs needs on Windows).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Local chart rendering for the Slack bot (no external chart service). ab_glyph =
+# pure-Rust font rendering off an EMBEDDED font (assets/JetBrainsMono-Regular.ttf,
+# OFL) — deterministic, no system-font dependency. IMPORTANT: keep
+# default-features = false — the default `ttf` feature (font-kit) silently WINS
+# over `ab_glyph` when both are enabled.
+plotters = { version = "0.3.7", default-features = false, features = ["bitmap_backend", "ab_glyph", "line_series", "histogram"] }
+png = "0.18"
 # Embedded DuckDB. `bundled` statically compiles libduckdb from source (no system
 # dep) — larger binary + slow first build, but a self-contained installer.
 # Pinned to the STABLE 1.4.x line: the registry also carries `1.105xx` *preview* builds

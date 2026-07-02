@@ -3,14 +3,16 @@ import { Dialog } from "../Dialog";
 import { type EditorPrefs } from "../editor/types";
 import { type DialectId } from "../sql/dialects";
 import { THEMES } from "../themes";
+import { SlackPane } from "./SlackPane";
 
-export type SettingsTab = "editor" | "appearance" | "grid" | "plans" | "shortcuts";
+export type SettingsTab = "editor" | "appearance" | "grid" | "plans" | "slack" | "shortcuts";
 
 const TABS: { id: SettingsTab; label: string }[] = [
   { id: "editor", label: "Editor" },
   { id: "appearance", label: "Appearance" },
   { id: "grid", label: "Grid" },
   { id: "plans", label: "Plans" },
+  { id: "slack", label: "Slack" },
   { id: "shortcuts", label: "Shortcuts" },
 ];
 
@@ -207,6 +209,10 @@ export function SettingsDialog(props: {
               <div class="settings-note">
                 The plan view appears automatically when a result is an EXPLAIN output, and via the Explain toolbar action. Raw engine output stays available under the Grid toggle.
               </div>
+            </Match>
+
+            <Match when={tab() === "slack"}>
+              <SlackPane />
             </Match>
 
             <Match when={tab() === "shortcuts"}>

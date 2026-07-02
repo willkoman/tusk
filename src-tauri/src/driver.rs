@@ -1877,12 +1877,18 @@ mod tests {
         ).await.unwrap();
 
         let q = "SELECT CAST(ia.created_at AS DATE) AS action_date FROM inventory_action ia";
+        // The point is that the TIMESTAMPTZ→DATE cast SUCCEEDS (ICU loaded) — assert a
+        // YYYY-MM-DD shape, never a literal date (a hardcoded date is a time bomb).
+        let is_date = |v: Option<&str>| {
+            let s = v.expect("non-null date");
+            s.len() == 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-'
+        };
 
         // Works on first connect (open_conn loads ICU).
         match b.run_single(q, 50, true).await.unwrap() {
             QueryOutcome::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0][0].as_deref(), Some("2026-07-01"));
+                assert!(is_date(rows[0][0].as_deref()));
             }
             _ => panic!("expected rows"),
         }
@@ -1893,7 +1899,7 @@ mod tests {
         match b.run_single(q, 50, true).await.unwrap() {
             QueryOutcome::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0][0].as_deref(), Some("2026-07-01"));
+                assert!(is_date(rows[0][0].as_deref()));
             }
             _ => panic!("expected rows after reopen"),
         }

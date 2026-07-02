@@ -640,6 +640,38 @@ async fn paged_inner(
     feeder.finish().await
 }
 
+/// Format inline rows into an in-memory byte buffer (Slack file attachments).
+/// Reuses the file sinks unchanged via a tempfile — the extra I/O is negligible at
+/// attachment sizes, and every format (incl. xlsx + BOM handling) stays identical
+/// to the file-export path by construction.
+pub async fn export_rows_to_bytes(
+    columns: &[String],
+    rows: &[Vec<Option<String>>],
+    opts: &ExportOptions,
+) -> Result<Vec<u8>, AppError> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("tusk-slack-{nanos}.tmp"));
+    let path_str = path.to_string_lossy().to_string();
+    let result = run_export_rows(columns, rows, opts, &path_str).await;
+    let bytes = match &result {
+        // Zero rows never create the file (lazy sink) — return an empty buffer.
+        Ok(_) => match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(AppError::new(e.to_string()));
+            }
+        },
+        Err(_) => Vec::new(),
+    };
+    let _ = tokio::fs::remove_file(&path).await;
+    result.map(|_| bytes)
+}
+
 /// Export an in-memory result (the rows already loaded in the grid) to `path`.
 pub async fn run_export_rows(
     columns: &[String],

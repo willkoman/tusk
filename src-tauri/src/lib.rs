@@ -9,6 +9,7 @@ mod perms;
 mod profiles;
 mod relgraph;
 mod script;
+mod slack;
 mod tree;
 
 use std::collections::HashMap;
@@ -25,8 +26,11 @@ use profiles::Profile;
 type Conn = Arc<AsyncMutex<ConnState>>;
 
 #[derive(Default)]
-struct AppState {
+pub(crate) struct AppState {
     conns: Mutex<HashMap<String, Conn>>,
+    /// The connection the UI most recently opened — what the Slack bot runs against.
+    /// Maintained by register()/disconnect (the app is single-connection).
+    active_conn_id: Mutex<Option<String>>,
     // Cancel handles for the *currently running* cancellable operation (export/import)
     // on a connection, keyed by connection id. Kept OUTSIDE the per-connection async
     // Mutex (which the long operation holds for its whole duration) so `cancel_operation`
@@ -49,13 +53,13 @@ impl AppState {
 
     /// Arm cancellation for an operation about to run on `id` (call after `ensure_alive`,
     /// with the *current* client's token). `disarm_cancel` must be called when it ends.
-    fn arm_cancel(&self, id: &str, handle: CancelHandle, cfg: ConnectionConfig) {
+    pub(crate) fn arm_cancel(&self, id: &str, handle: CancelHandle, cfg: ConnectionConfig) {
         self.cancels.lock().unwrap().insert(id.to_string(), (handle, cfg));
     }
-    fn disarm_cancel(&self, id: &str) {
+    pub(crate) fn disarm_cancel(&self, id: &str) {
         self.cancels.lock().unwrap().remove(id);
     }
-    fn cancel_handle(&self, id: &str) -> Option<(CancelHandle, ConnectionConfig)> {
+    pub(crate) fn cancel_handle(&self, id: &str) -> Option<(CancelHandle, ConnectionConfig)> {
         self.cancels.lock().unwrap().get(id).cloned()
     }
 
@@ -63,14 +67,34 @@ impl AppState {
         let id = format!("conn-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let conn = Arc::new(AsyncMutex::new(ConnState { backend, read_only }));
         self.conns.lock().unwrap().insert(id.clone(), conn);
+        *self.active_conn_id.lock().unwrap() = Some(id.clone());
         id
+    }
+
+    /// The connection the Slack bot should use: the UI's active one, falling back to
+    /// the sole registered connection.
+    pub(crate) fn active(&self) -> Result<(String, Conn), AppError> {
+        let active = self.active_conn_id.lock().unwrap().clone();
+        let conns = self.conns.lock().unwrap();
+        if let Some(id) = active {
+            if let Some(c) = conns.get(&id) {
+                return Ok((id, c.clone()));
+            }
+        }
+        if conns.len() == 1 {
+            let (k, v) = conns.iter().next().unwrap();
+            return Ok((k.clone(), v.clone()));
+        }
+        Err(AppError::new(
+            "no active database connection in Tusk — connect to a database first",
+        ))
     }
 }
 
 /// Re-open the connection if the client was dropped — idle timeout, server restart,
 /// or a network drop that TCP keepalives surfaced as `is_closed`. Resets cursor
 /// state since a fresh connection has none. Never caps query duration.
-async fn ensure_alive(c: &mut ConnState) -> Result<(), AppError> {
+pub(crate) async fn ensure_alive(c: &mut ConnState) -> Result<(), AppError> {
     if c.backend.is_closed() {
         c.backend.reopen().await?;
     }
@@ -82,7 +106,7 @@ async fn ensure_alive(c: &mut ConnState) -> Result<(), AppError> {
 /// a file-backed DuckDB otherwise keeps an exclusive OS file lock while idle, blocking
 /// other tools/processes from opening the file. Re-opened lazily by `ensure_alive` on the
 /// next command. Deref(Mut) makes it a drop-in for the raw `MutexGuard<ConnState>`.
-struct ConnGuard<'a> {
+pub(crate) struct ConnGuard<'a> {
     inner: tokio::sync::MutexGuard<'a, ConnState>,
 }
 impl Drop for ConnGuard<'_> {
@@ -101,7 +125,7 @@ impl std::ops::DerefMut for ConnGuard<'_> {
         &mut self.inner
     }
 }
-async fn lock_conn(conn: &Conn) -> ConnGuard<'_> {
+pub(crate) async fn lock_conn(conn: &Conn) -> ConnGuard<'_> {
     ConnGuard { inner: conn.lock().await }
 }
 
@@ -115,7 +139,7 @@ fn is_cursorable(sql: &str) -> bool {
 }
 
 /// Statements allowed on a read-only connection.
-fn is_read_only_stmt(sql: &str) -> bool {
+pub(crate) fn is_read_only_stmt(sql: &str) -> bool {
     let t = sql.trim_start().to_ascii_lowercase();
     t.starts_with("select")
         || t.starts_with("with")
@@ -183,6 +207,12 @@ async fn disconnect(
     connection_id: String,
 ) -> Result<(), AppError> {
     state.disarm_cancel(&connection_id);
+    {
+        let mut active = state.active_conn_id.lock().unwrap();
+        if active.as_deref() == Some(connection_id.as_str()) {
+            *active = None;
+        }
+    }
     let removed = state.conns.lock().unwrap().remove(&connection_id);
     if let Some(conn) = removed {
         let mut c = lock_conn(&conn).await;
@@ -861,14 +891,120 @@ async fn save_history(app: tauri::AppHandle, conn_key: String, json: String) -> 
         .map_err(|e| AppError::new(e.to_string()))
 }
 
+// ---------------------------------------------------------------------------
+// Slack integration commands (bot lifecycle + config; tokens live in the keychain).
+// ---------------------------------------------------------------------------
+
+/// Config + token presence for the settings pane (tokens themselves never returned).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SlackConfigInfo {
+    config: slack::config::SlackConfig,
+    has_bot_token: bool,
+    has_app_token: bool,
+}
+
+#[tauri::command]
+async fn slack_load_config(app: tauri::AppHandle) -> Result<SlackConfigInfo, AppError> {
+    let config = slack::config::load(&app)?;
+    let (has_bot_token, has_app_token) = slack::config::has_tokens();
+    Ok(SlackConfigInfo { config, has_bot_token, has_app_token })
+}
+
+#[tauri::command]
+async fn slack_save_config(
+    app: tauri::AppHandle,
+    config: slack::config::SlackConfig,
+    bot_token: Option<String>,
+    app_token: Option<String>,
+) -> Result<(), AppError> {
+    slack::config::save_tokens(bot_token, app_token)?;
+    slack::config::save(&app, &config)
+}
+
+#[tauri::command]
+async fn slack_clear_tokens(app: tauri::AppHandle) -> Result<(), AppError> {
+    slack::stop(&app);
+    slack::config::clear_tokens();
+    Ok(())
+}
+
+#[tauri::command]
+async fn slack_start(app: tauri::AppHandle) -> Result<(), AppError> {
+    slack::start(app).await
+}
+
+#[tauri::command]
+async fn slack_stop(app: tauri::AppHandle) -> Result<(), AppError> {
+    slack::stop(&app);
+    Ok(())
+}
+
+#[tauri::command]
+fn slack_status(runtime: tauri::State<'_, slack::SlackRuntime>) -> slack::StatusInfo {
+    runtime.status_info()
+}
+
+/// Validate both saved tokens without starting the bot: auth.test (bot token) +
+/// apps.connections.open (app-level token). Returns the workspace name.
+#[tauri::command]
+async fn slack_test() -> Result<String, AppError> {
+    let bot = slack::config::bot_token()
+        .ok_or_else(|| AppError::new("no bot token saved"))?;
+    let app_token = slack::config::app_token()
+        .ok_or_else(|| AppError::new("no app-level token saved"))?;
+    let api = slack::api::SlackApi::new(bot);
+    let (team, _bot_user) = api.auth_test().await?;
+    // Mint (and discard) a socket URL to prove the xapp token + connections:write scope.
+    let client = reqwest::Client::new();
+    let v: serde_json::Value = client
+        .post("https://slack.com/api/apps.connections.open")
+        .bearer_auth(&app_token)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .send()
+        .await
+        .map_err(|e| AppError::new(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| AppError::new(e.to_string()))?;
+    if v["ok"].as_bool() != Some(true) {
+        let err = v["error"].as_str().unwrap_or("unknown error");
+        return Err(AppError::new(format!(
+            "app-level token check failed: {err} (the xapp token needs the connections:write scope)"
+        )));
+    }
+    Ok(team)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Pin the process-wide rustls CryptoProvider: the dep graph carries BOTH ring
+    // (reqwest rustls-tls) and aws-lc-rs (tokio-tungstenite's rustls default) — with
+    // two providers present rustls has no default and panics when a TLS config is
+    // built (the Slack WebSocket). Ring also spares Windows CI the CMake+NASM
+    // toolchain aws-lc-rs needs.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AppState::default())
+        .manage(slack::SlackRuntime::default())
+        .setup(|app| {
+            // Auto-start the Slack bot when enabled + tokens saved. Failures are
+            // non-fatal: the settings pane shows the status and can retry.
+            let handle = app.handle().clone();
+            if slack::config::load(&handle).map(|c| c.enabled).unwrap_or(false) {
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = slack::start(handle).await {
+                        eprintln!("[tusk-slack] autostart failed: {}", e.message);
+                    }
+                });
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             connect,
             connect_profile,
@@ -900,7 +1036,14 @@ pub fn run() {
             ai::ai_has_key,
             ai::ai_clear_key,
             ai::ai_chat,
-            ai::ai_list_models
+            ai::ai_list_models,
+            slack_load_config,
+            slack_save_config,
+            slack_clear_tokens,
+            slack_start,
+            slack_stop,
+            slack_status,
+            slack_test
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

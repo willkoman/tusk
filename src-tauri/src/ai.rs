@@ -266,6 +266,114 @@ pub async fn ai_list_models(
     Ok(out)
 }
 
+/// One parsed SSE line's meaning.
+enum SseItem {
+    Delta(String),
+    Done,
+    Ignore,
+}
+
+/// Drain COMPLETE lines from a byte buffer, leaving any partial trailing line.
+/// Splitting on the `\n` BYTE (0x0A, which never appears inside a multibyte UTF-8
+/// sequence) guarantees each returned line is a whole UTF-8 boundary — so decoding
+/// per line can't mangle a character split across two network chunks (the bug when
+/// you `from_utf8_lossy` each raw chunk before splitting).
+fn drain_sse_lines(buf: &mut Vec<u8>) -> Vec<String> {
+    let mut lines = Vec::new();
+    loop {
+        let Some(nl) = buf.iter().position(|&b| b == b'\n') else { break };
+        let line: Vec<u8> = buf.drain(..=nl).collect();
+        lines.push(String::from_utf8_lossy(&line[..line.len() - 1]).trim_end().to_string());
+    }
+    lines
+}
+
+/// Parse one SSE line (`data: {json}` / `data: [DONE]`) into an item for `provider`.
+fn parse_sse_line(line: &str, provider: &str) -> SseItem {
+    let Some(payload) = line.strip_prefix("data:") else { return SseItem::Ignore };
+    let payload = payload.trim();
+    if payload.is_empty() {
+        return SseItem::Ignore;
+    }
+    if payload == "[DONE]" {
+        return SseItem::Done;
+    }
+    match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(json) => match extract_delta(provider, &json) {
+            Some(text) => SseItem::Delta(text),
+            None => SseItem::Ignore,
+        },
+        Err(_) => SseItem::Ignore,
+    }
+}
+
+/// Non-streaming completion for backend consumers (the Slack bot): same provider
+/// request as `ai_chat` (one request builder, two consumers), but the SSE deltas are
+/// accumulated into a single String instead of being forwarded over a Channel.
+pub async fn complete_one_shot(req: &AiRequest) -> Result<String, AppError> {
+    let key = get_key(&req.provider)?;
+    let (url, headers, body) = build_request(req, &key);
+    let client = reqwest::Client::new();
+    let mut builder = client.post(&url).json(&body);
+    for (k, v) in headers {
+        builder = builder.header(k, v);
+    }
+    let resp = builder.send().await.map_err(|e| AppError::new(e.to_string()))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(AppError::new(format!(
+            "AI provider error {status}: {}",
+            detail.chars().take(500).collect::<String>()
+        )));
+    }
+    let mut out = String::new();
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| AppError::new(e.to_string()))?;
+        buf.extend_from_slice(&bytes);
+        for line in drain_sse_lines(&mut buf) {
+            match parse_sse_line(&line, &req.provider) {
+                SseItem::Delta(text) => out.push_str(&text),
+                SseItem::Done => return Ok(out),
+                SseItem::Ignore => {}
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sse_lines_survive_multibyte_chunk_splits() {
+        // "région" — the 2-byte 'é' (0xC3 0xA9) split across two network chunks.
+        let full = b"data: {\"choices\":[{\"delta\":{\"content\":\"r\xc3\xa9gion\"}}]}\n";
+        let split = full.iter().position(|&b| b == 0xC3).unwrap() + 1; // between 0xC3 and 0xA9
+        let (a, b) = full.split_at(split);
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(a);
+        assert!(drain_sse_lines(&mut buf).is_empty()); // no newline yet
+        buf.extend_from_slice(b);
+        let lines = drain_sse_lines(&mut buf);
+        assert_eq!(lines.len(), 1);
+        match parse_sse_line(&lines[0], "openai") {
+            SseItem::Delta(t) => assert_eq!(t, "région"), // NOT "r��gion"
+            _ => panic!("expected a delta"),
+        }
+    }
+
+    #[test]
+    fn sse_done_and_ignore() {
+        assert!(matches!(parse_sse_line("data: [DONE]", "openai"), SseItem::Done));
+        assert!(matches!(parse_sse_line(": comment", "openai"), SseItem::Ignore));
+        assert!(matches!(parse_sse_line("data:  ", "openai"), SseItem::Ignore));
+    }
+}
+
 /// Stream a completion from the configured provider, emitting `AiEvent`s over the channel.
 /// The API key is read from the keychain (never crosses the IPC boundary as plaintext from
 /// the frontend). Always resolves Ok — failures are delivered as an `Error` event so the
@@ -302,9 +410,9 @@ pub async fn ai_chat(req: AiRequest, on_event: tauri::ipc::Channel<AiEvent>) -> 
         return Ok(());
     }
 
-    // Line-based SSE: collect `data:` lines, parse JSON, extract per-provider deltas.
+    // Line-based SSE: drain complete lines (multibyte-safe), parse per provider.
     let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
         let bytes = match chunk {
             Ok(b) => b,
@@ -313,25 +421,19 @@ pub async fn ai_chat(req: AiRequest, on_event: tauri::ipc::Channel<AiEvent>) -> 
                 return Ok(());
             }
         };
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(nl) = buf.find('\n') {
-            let line: String = buf.drain(..=nl).collect();
-            let line = line.trim_end();
-            let Some(payload) = line.strip_prefix("data:") else { continue };
-            let payload = payload.trim();
-            if payload.is_empty() {
-                continue;
-            }
-            if payload == "[DONE]" {
-                let _ = on_event.send(AiEvent::Done);
-                return Ok(());
-            }
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) {
-                if let Some(text) = extract_delta(&req.provider, &json) {
+        buf.extend_from_slice(&bytes);
+        for line in drain_sse_lines(&mut buf) {
+            match parse_sse_line(&line, &req.provider) {
+                SseItem::Delta(text) => {
                     if !text.is_empty() {
                         let _ = on_event.send(AiEvent::Delta { text });
                     }
                 }
+                SseItem::Done => {
+                    let _ = on_event.send(AiEvent::Done);
+                    return Ok(());
+                }
+                SseItem::Ignore => {}
             }
         }
     }
