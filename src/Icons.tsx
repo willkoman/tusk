@@ -69,7 +69,10 @@ export type IconName =
   | "fileCode"
   | "star"
   | "gear"
-  | "bolt";
+  | "bolt"
+  | "help"
+  | "panelLeft"
+  | "panelBottom";
 
 export function Icon(props: { name: IconName }): JSX.Element {
   switch (props.name) {
@@ -135,6 +138,12 @@ export function Icon(props: { name: IconName }): JSX.Element {
       return svg("currentColor", <path d="m18 16 4-4-4-4M6 8l-4 4 4 4M14.5 4l-5 16" />);
     case "bolt":
       return svg(C.unique, <path d="M13 2 3 14h7l-1 8 10-12h-7l1-8Z" />);
+    case "help":
+      return svg("currentColor", <><circle cx="12" cy="12" r="9" /><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 2.6-3 4" /><path d="M12 17.5h.01" /></>);
+    case "panelLeft":
+      return svg("currentColor", <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16" /></>);
+    case "panelBottom":
+      return svg("currentColor", <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M3 14h18" /></>);
     case "eyeOff":
       return svg("currentColor", <><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" /><path d="M10.7 5.1A10.4 10.4 0 0 1 12 5c7 0 10 7 10 7a13.2 13.2 0 0 1-1.7 2.7" /><path d="M6.6 6.6A13.5 13.5 0 0 0 2 12s3 7 10 7a9.7 9.7 0 0 0 5.4-1.6" /><path d="m2 2 20 20" /></>);
     case "sortAsc":

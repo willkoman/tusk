@@ -25,6 +25,7 @@ import { Tree, type DbTree, type RelationDetail, type NodeDescriptor, nodeKey } 
 import { ContextMenu, type MenuItem, type MenuState } from "./ContextMenu";
 import { type DialogState } from "./WorkbenchDialogs";
 import { type SettingsTab } from "./settings/SettingsDialog";
+const HelpDialog = lazy(() => import("./help/HelpDialog"));
 import { fontStack } from "./editor/theme";
 import { ACTIONS, type ActionCtx, type ActionId, type KeyOverrides, canonicalKey, displayKey, effectiveKey, normalizeKeyEvent } from "./actions";
 import { keymapStore } from "./store";
@@ -156,6 +157,7 @@ function App() {
   const [historyOpen, setHistoryOpen] = createSignal(false);
   const [history, setHistory] = createSignal<HistoryEntry[]>([]);
   const [paletteOpen, setPaletteOpen] = createSignal(false);
+  const [helpOpen, setHelpOpen] = createSignal(false);
   // "DDL & relationships" viewer (read-only — standalone signal, not DialogState).
   // name=null = opened from a schema node, straight into the whole-schema ERD.
   const [ddlGraph, setDdlGraph] = createSignal<{ schema: string; name: string | null; kind: string } | null>(null);
@@ -249,6 +251,10 @@ function App() {
   const [sidebarW, setSidebarW] = createSignal(savedLayout.sidebarW ?? 270);
   const [aiW, setAiW] = createSignal(savedLayout.aiW ?? 360);
   const [historyW, setHistoryW] = createSignal(savedLayout.historyW ?? 340);
+  // Collapsed panels (Explorer + results). Sizes are remembered separately, so a
+  // toggle restores the previous width/height instead of a default.
+  const [sidebarOpen, setSidebarOpen] = createSignal(savedLayout.sidebarOpen ?? true);
+  const [resultsOpen, setResultsOpen] = createSignal(savedLayout.resultsOpen ?? true);
   // Autocomplete table/column list — sourced from `list_schema` (one query, all
   // tables+columns), decoupled from the lazy object tree which no longer carries columns.
   const [schema, setSchema] = createSignal<TableInfo[]>([]);
@@ -850,6 +856,9 @@ function App() {
     // Window-level editor/tab shortcuts (the in-editor keymap owns Mod-Enter/Shift-Alt-f/
     // Mod-f/Tab — no overlap with T/W/S/O). preventDefault so Cmd-W closes the tab, not the window.
     window.addEventListener("keydown", onWindowKey);
+    // Shrinking the window re-clamps every docked panel (see clampPanels).
+    window.addEventListener("resize", clampPanels);
+    clampPanels();
     // Load profiles + auto-connect FIRST — the core startup path must not depend on
     // the Slack event bridge (a rejected listen() would otherwise abort onMount and
     // leave the connect screen empty).
@@ -881,6 +890,7 @@ function App() {
   });
   onCleanup(() => {
     window.removeEventListener("keydown", onWindowKey);
+    window.removeEventListener("resize", clampPanels);
     for (const u of slackUnlisten) u();
   });
 
@@ -901,6 +911,8 @@ function App() {
       case "find": editorApi()?.openSearch(); break;
       case "toggleComment": editorApi()?.toggleComment(); break;
       case "toggleWrap": updatePrefs({ wordWrap: !prefs().wordWrap }); break;
+      case "toggleSidebar": toggleSidebar(); break;
+      case "toggleResults": toggleResults(); break;
       case "newTab": openNewTab(); break;
       case "closeTab": closeTab(activeTabId()); break;
       case "openFile": void openFileDialog(); break;
@@ -908,6 +920,7 @@ function App() {
       case "saveFileAs": void saveAsActiveTab(); break;
       case "openSettings": setSettingsOpen("editor"); break;
       case "openShortcuts": setSettingsOpen("shortcuts"); break;
+      case "openHelp": setHelpOpen(true); break;
       case "openHistory": setHistoryOpen((v) => !v); break;
       case "openPalette": setPaletteOpen(true); break;
       case "toggleAi": setAiOpen((v) => !v); break;
@@ -918,12 +931,14 @@ function App() {
 
   function onWindowKey(e: KeyboardEvent) {
     // The editor keymap (and any other in-place handler) marks what it consumed.
-    if (e.defaultPrevented || !conn()) return;
+    if (e.defaultPrevented) return;
     if (paletteOpen()) return; // the palette owns the keyboard while open
     const k = normalizeKeyEvent(e);
     if (!k) return;
     const id = globalBindings().get(k);
     if (!id) return;
+    // On the connect screen only screen-independent actions fire (manual, settings).
+    if (!conn() && id !== "openHelp" && id !== "openSettings") return;
     // Chords without Mod/Alt (F5, plain Enter, Shift-X…) must not fire while
     // typing in an input/textarea or the editor.
     if (!/^Mod-|^Alt-/.test(k)) {
@@ -1310,6 +1325,8 @@ function App() {
       return;
     }
     if (pcount) patchTab(runTabId, { pending: undefined });
+    // Running with the results panel collapsed would hide the output — reopen it.
+    if (!resultsOpen()) { setResultsOpen(true); persistLayout(); }
     const runSchema = activeTab().searchSchema;
     if (cursorOwnerTabId && cursorOwnerTabId !== runTabId) patchResult(cursorOwnerTabId, { done: true });
     cursorOwnerTabId = null;
@@ -1626,7 +1643,7 @@ function App() {
     const startY = e.clientY;
     const startH = editorH();
     const onMove = (ev: MouseEvent) =>
-      setEditorH(Math.max(80, Math.min(startH + (ev.clientY - startY), window.innerHeight - 160)));
+      setEditorH(Math.max(80, Math.min(startH + (ev.clientY - startY), maxEditorH())));
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
@@ -2074,7 +2091,33 @@ function App() {
 
   // Persist all docked-panel sizes (called on resize-end, not per frame).
   const persistLayout = () =>
-    layoutStore.save({ sidebarW: sidebarW(), aiW: aiW(), historyW: historyW(), editorH: editorH() });
+    layoutStore.save({
+      sidebarW: sidebarW(), aiW: aiW(), historyW: historyW(), editorH: editorH(),
+      sidebarOpen: sidebarOpen(), resultsOpen: resultsOpen(),
+    });
+
+  // Hard safety bounds: no side panel may grow past the point where the editor/main
+  // column disappears, and the editor↔results split always leaves the results pane
+  // reachable. Re-applied on window resize, so shrinking the window can never leave
+  // a panel covering everything (a size saved on a big monitor stays harmless).
+  const maxSidebarW = () => Math.max(180, Math.min(560, window.innerWidth - 420));
+  const maxSideDockW = (cap: number) => Math.max(240, Math.min(cap, window.innerWidth - 480));
+  const maxEditorH = () => Math.max(80, window.innerHeight - 160);
+  function clampPanels() {
+    setSidebarW(Math.min(sidebarW(), maxSidebarW()));
+    setAiW(Math.min(aiW(), maxSideDockW(760)));
+    setHistoryW(Math.min(historyW(), maxSideDockW(700)));
+    setEditorH(Math.min(editorH(), maxEditorH()));
+  }
+
+  function toggleSidebar() {
+    setSidebarOpen((v) => !v);
+    persistLayout();
+  }
+  function toggleResults() {
+    setResultsOpen((v) => !v);
+    persistLayout();
+  }
 
   // Horizontal panel resize. `dir` = +1 for a LEFT-docked panel (the splitter sits on
   // its right edge, so dragging right grows it), -1 for a RIGHT-docked panel (splitter
@@ -2102,9 +2145,9 @@ function App() {
     window.addEventListener("mouseup", onUp);
     document.body.style.userSelect = "none";
   }
-  const startResizeSidebar = (e: MouseEvent) => startResizeH(e, sidebarW, setSidebarW, 1, 180, 560);
-  const startResizeAi = (e: MouseEvent) => startResizeH(e, aiW, setAiW, -1, 280, 760);
-  const startResizeHistory = (e: MouseEvent) => startResizeH(e, historyW, setHistoryW, -1, 240, 700);
+  const startResizeSidebar = (e: MouseEvent) => startResizeH(e, sidebarW, setSidebarW, 1, 180, maxSidebarW());
+  const startResizeAi = (e: MouseEvent) => startResizeH(e, aiW, setAiW, -1, 280, maxSideDockW(760));
+  const startResizeHistory = (e: MouseEvent) => startResizeH(e, historyW, setHistoryW, -1, 240, maxSideDockW(700));
 
   return (
     <>
@@ -2112,26 +2155,47 @@ function App() {
       when={conn()}
       fallback={
         <div class="connect-screen">
+          <div class="connect-utils">
+            <button class="icon" title="Manual (F1)" onClick={() => setHelpOpen(true)}><Icon name="help" /></button>
+            <button class="icon" title="Settings" onClick={() => setSettingsOpen("editor")}><Icon name="gear" /></button>
+          </div>
           <div class="connect-layout">
             <div class="profiles-panel">
               <div class="panel-title">Connections</div>
-              <For each={profiles()}>
-                {(p) => (
-                  <div class="profile-row" classList={{ active: editingId() === p.id }} onContextMenu={(e) => openProfileMenu(e, p)}>
-                    <div class="profile-main" onClick={() => useProfile(p)}>
-                      <div class="profile-name">{driverMascot(p.driver)} {p.name || (isEmbeddedDriver(p.driver) ? basename(p.path || ":memory:") : p.host)}</div>
-                      <div class="profile-sub">
-                        <span>{isEmbeddedDriver(p.driver) ? (p.path || ":memory:") : `${p.user}@${p.host}:${p.port}/${p.dbname}`}</span>
-                        <Show when={p.save_password}><Icon name="lock" /></Show>
+              <div class="profiles-list">
+                <For each={profiles()}>
+                  {(p) => (
+                    <div class="profile-row" classList={{ active: editingId() === p.id }} onContextMenu={(e) => openProfileMenu(e, p)}>
+                      <div class="profile-main" onClick={() => useProfile(p)}>
+                        <span class="profile-avatar">{driverMascot(p.driver)}</span>
+                        <div class="profile-text">
+                          <div class="profile-name">
+                            <span class="profile-name-text">{p.name || (isEmbeddedDriver(p.driver) ? basename(p.path || ":memory:") : p.host)}</span>
+                            <Show when={p.default_connect}><span class="profile-star" title="Connects on startup"><Icon name="star" /></span></Show>
+                            <Show when={p.read_only}><span class="chip-ro" title="Read-only connection">RO</span></Show>
+                          </div>
+                          <div class="profile-sub">
+                            <span>{isEmbeddedDriver(p.driver) ? (p.path || ":memory:") : `${p.user}@${p.host}:${p.port}/${p.dbname}`}</span>
+                            <Show when={p.save_password}><Icon name="lock" /></Show>
+                          </div>
+                        </div>
+                        <span class="profile-go"><Icon name="play" /></span>
                       </div>
+                      <button class="icon" title="Edit" onClick={() => editProfile(p)}><Icon name="edit" /></button>
+                      <button class="icon" title="Delete" onClick={() => deleteProfile(p.id)}><Icon name="trash" /></button>
                     </div>
-                    <button class="icon" title="Edit" onClick={() => editProfile(p)}><Icon name="edit" /></button>
-                    <button class="icon" title="Delete" onClick={() => deleteProfile(p.id)}><Icon name="trash" /></button>
+                  )}
+                </For>
+                <Show when={profiles().length === 0}>
+                  <div class="profiles-empty">
+                    <span class="profiles-empty-mark">🐘</span>
+                    <div>No saved connections yet.</div>
+                    <div class="profiles-empty-sub">Fill the form and hit <b>Save</b> — or just <b>Connect</b> without saving.</div>
                   </div>
-                )}
-              </For>
-              <Show when={profiles().length === 0}><div class="empty-hint">no saved connections</div></Show>
+                </Show>
+              </div>
               <button class="ghost full" onClick={newProfile}>＋ New connection</button>
+              <div class="connect-foot">Right-click a connection for more · <kbd class="kb-kbd">F1</kbd> manual</div>
             </div>
 
             <form class="connect-card" onSubmit={doConnect}>
@@ -2144,39 +2208,53 @@ function App() {
               </div>
               <label>Name<input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="My database" /></label>
               <label>Driver
-                <select
-                  value={driver()}
-                  onChange={(e) => {
-                    const d = e.currentTarget.value;
-                    setDriver(d);
-                    if (d === "mysql" && port() === 5432) setPort(3306);
-                    if (d === "postgres" && port() === 3306) setPort(5432);
-                    if (d === "mysql" && dbname() === "postgres") setDbname("");
-                    if (d === "postgres" && dbname() === "") setDbname("postgres");
-                  }}
-                >
+                <div class="driver-tiles" role="radiogroup" aria-label="Driver">
                   <For each={DRIVERS}>
-                    {(d) => <option value={d.id} disabled={!d.ready}>{d.mascot} {d.label}{d.ready ? "" : " (soon)"}</option>}
+                    {(d) => (
+                      <button
+                        type="button"
+                        class="driver-tile"
+                        role="radio"
+                        aria-checked={driver() === d.id}
+                        classList={{ active: driver() === d.id }}
+                        disabled={!d.ready}
+                        title={d.ready ? d.label : `${d.label} (soon)`}
+                        onClick={() => {
+                          setDriver(d.id);
+                          if (d.id === "mysql" && port() === 5432) setPort(3306);
+                          if (d.id === "postgres" && port() === 3306) setPort(5432);
+                          if (d.id === "mysql" && dbname() === "postgres") setDbname("");
+                          if (d.id === "postgres" && dbname() === "") setDbname("postgres");
+                        }}
+                      >
+                        <span class="dt-mascot">{d.mascot}</span>
+                        <span class="dt-label">{d.label}</span>
+                      </button>
+                    )}
                   </For>
-                </select>
+                </div>
               </label>
               <Show
                 when={driver() === "duckdb" || driver() === "sqlite"}
                 fallback={
                   <>
-                    <label>Host<input value={host()} onInput={(e) => setHost(e.currentTarget.value)} /></label>
-                    <label>Port<input type="number" value={port()} onInput={(e) => setPort(Number(e.currentTarget.value))} /></label>
+                    <div class="field-row host-port">
+                      <label>Host<input value={host()} onInput={(e) => setHost(e.currentTarget.value)} /></label>
+                      <label>Port<input type="number" value={port()} onInput={(e) => setPort(Number(e.currentTarget.value))} /></label>
+                    </div>
                     <label>User<input value={user()} onInput={(e) => setUser(e.currentTarget.value)} placeholder={driver() === "mysql" ? "root" : "postgres"} /></label>
                     <label>Password<input type="password" value={password()} onInput={(e) => setPassword(e.currentTarget.value)} placeholder={editingId() && savePassword() ? "•••••• (stored)" : ""} /></label>
-                    <label>Database<input value={dbname()} onInput={(e) => setDbname(e.currentTarget.value)} placeholder={driver() === "mysql" ? "(optional)" : "postgres"} /></label>
-                    <label>SSL Mode
-                      <select value={sslmode()} onChange={(e) => setSslmode(e.currentTarget.value)}>
-                        <option value="disable">disable</option>
-                        <option value="prefer">prefer</option>
-                        <option value="require">require</option>
-                        <option value="verify-full">verify-full</option>
-                      </select>
-                    </label>
+                    <div class="field-row halves">
+                      <label>Database<input value={dbname()} onInput={(e) => setDbname(e.currentTarget.value)} placeholder={driver() === "mysql" ? "(optional)" : "postgres"} /></label>
+                      <label>SSL Mode
+                        <select value={sslmode()} onChange={(e) => setSslmode(e.currentTarget.value)}>
+                          <option value="disable">disable</option>
+                          <option value="prefer">prefer</option>
+                          <option value="require">require</option>
+                          <option value="verify-full">verify-full</option>
+                        </select>
+                      </label>
+                    </div>
                   </>
                 }
               >
@@ -2215,13 +2293,18 @@ function App() {
             <span class="badge badge-ro" title="Writes & DDL are blocked"><Icon name="lock" /> Read-only</span>
           </Show>
           <span class="spacer" />
+          <button class="icon" classList={{ active: sidebarOpen() }} title={`${sidebarOpen() ? "Hide" : "Show"} explorer (${displayKey(effectiveKey("toggleSidebar", keys()))})`} onClick={toggleSidebar}><Icon name="panelLeft" /></button>
+          <button class="icon" classList={{ active: resultsOpen() }} title={`${resultsOpen() ? "Hide" : "Show"} results (${displayKey(effectiveKey("toggleResults", keys()))})`} onClick={toggleResults}><Icon name="panelBottom" /></button>
+          <span class="topbar-sep" />
           <button class="ghost" classList={{ active: aiOpen() }} onClick={() => setAiOpen((v) => !v)} title="AI assistant"><Icon name="sparkle" /> AI</button>
           <button class="icon" classList={{ active: historyOpen() }} title="Query history" onClick={() => setHistoryOpen((v) => !v)}><Icon name="clock" /></button>
+          <button class="icon" classList={{ active: helpOpen() }} title="Manual" onClick={() => setHelpOpen(true)}><Icon name="help" /></button>
           <button class="icon" title="Settings" onClick={() => setSettingsOpen("editor")}><Icon name="gear" /></button>
           <button class="ghost" onClick={disconnect}>Disconnect</button>
         </header>
 
         <div class="body">
+          <Show when={sidebarOpen()}>
           <aside class="sidebar" style={{ width: `${sidebarW()}px` }}>
             <div class="sidebar-head">
               <span class="panel-title2">Explorer</span>
@@ -2265,9 +2348,10 @@ function App() {
             </div>
           </aside>
           <div class="splitter-v" onMouseDown={startResizeSidebar} />
+          </Show>
 
           <main class="main">
-            <div class="editor-pane" style={{ height: `${editorH()}px` }}>
+            <div class="editor-pane" classList={{ full: !resultsOpen() }} style={resultsOpen() ? { height: `${editorH()}px` } : undefined}>
               <div
                 class="tab-strip"
                 onWheel={(e) => {
@@ -2389,6 +2473,7 @@ function App() {
               />
             </div>
 
+            <Show when={resultsOpen()}>
             <div class="splitter" onMouseDown={startResize} />
 
             <div class="result">
@@ -2484,6 +2569,7 @@ function App() {
                 <div class="result-spinner"><div class="spinner" /></div>
               </Show>
             </div>
+            </Show>
 
             <footer class="statusbar">
               <span>{status()}</span>
@@ -2605,17 +2691,6 @@ function App() {
               </button>
             </div>
           </Dialog>
-        </Show>
-
-        <Show when={settingsOpen()}>
-          <SettingsDialog
-            prefs={prefs}
-            update={updatePrefs}
-            onClose={() => setSettingsOpen(null)}
-            initialTab={settingsOpen()!}
-            connected={!!conn()}
-            shortcutsPane={() => <ShortcutsPane keys={keys} update={updateKeys} resetAll={resetKeys} />}
-          />
         </Show>
 
         <Show when={importOpen()}>
@@ -2762,6 +2837,21 @@ function App() {
 
       {/* Update pill renders in both screens (connect + workspace). */}
       <UpdateBadge />
+
+      {/* Manual + Settings work on both screens (connect screen has its own buttons). */}
+      <Show when={helpOpen()}>
+        <HelpDialog keys={keys()} onClose={() => setHelpOpen(false)} />
+      </Show>
+      <Show when={settingsOpen()}>
+        <SettingsDialog
+          prefs={prefs}
+          update={updatePrefs}
+          onClose={() => setSettingsOpen(null)}
+          initialTab={settingsOpen()!}
+          connected={!!conn()}
+          shortcutsPane={() => <ShortcutsPane keys={keys} update={updateKeys} resetAll={resetKeys} />}
+        />
+      </Show>
 
       {/* Context menu + value viewer render above everything, in both screens. */}
       <Show when={menu()}>

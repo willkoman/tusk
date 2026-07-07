@@ -19,10 +19,13 @@ export type ActionId =
   | "openFile"
   | "openSettings"
   | "openShortcuts"
+  | "openHelp"
   | "openHistory"
   | "openPalette"
   | "toggleAi"
   | "toggleWrap"
+  | "toggleSidebar"
+  | "toggleResults"
   | "loadAllRows"
   | "exportResult";
 
@@ -63,6 +66,8 @@ export const ACTIONS: readonly ActionDef[] = [
   { id: "find", title: "Find & replace", category: "Editor", defaultKey: null, scope: "editor" },
   { id: "toggleComment", title: "Toggle comment", category: "Editor", defaultKey: "Mod-/", scope: "editor" },
   { id: "toggleWrap", title: "Toggle word wrap", category: "Editor", defaultKey: null, scope: "global" },
+  { id: "toggleSidebar", title: "Toggle explorer sidebar", category: "View", defaultKey: "Mod-b", scope: "global", enabled: (c) => c.connected },
+  { id: "toggleResults", title: "Toggle results panel", category: "View", defaultKey: "Mod-j", scope: "global", enabled: (c) => c.connected },
   { id: "newTab", title: "New tab", category: "Tabs", defaultKey: "Mod-t", scope: "global", enabled: (c) => c.connected },
   { id: "closeTab", title: "Close tab", category: "Tabs", defaultKey: "Mod-w", scope: "global", enabled: (c) => c.connected },
   { id: "openFile", title: "Open file…", category: "File", defaultKey: "Mod-o", scope: "global", enabled: (c) => c.connected },
@@ -70,6 +75,7 @@ export const ACTIONS: readonly ActionDef[] = [
   { id: "saveFileAs", title: "Save as…", category: "File", defaultKey: "Mod-Shift-s", scope: "global", enabled: (c) => c.connected },
   { id: "openSettings", title: "Open settings", category: "View", defaultKey: "Mod-,", scope: "global" },
   { id: "openShortcuts", title: "Show keyboard shortcuts", category: "View", defaultKey: null, scope: "global" },
+  { id: "openHelp", title: "Open manual", category: "View", defaultKey: "F1", scope: "global" },
   { id: "openHistory", title: "Toggle query history", category: "View", defaultKey: "Mod-Shift-h", scope: "global", enabled: (c) => c.connected },
   { id: "openPalette", title: "Command palette", category: "View", defaultKey: "Mod-k", scope: "global" },
   { id: "toggleAi", title: "Toggle AI assistant", category: "View", defaultKey: null, scope: "global", enabled: (c) => c.connected },
