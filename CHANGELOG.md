@@ -4,6 +4,11 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-07-07
+
+### Changed
+- Settings icon is a proper toothed cog (the old circle-with-spokes read as a sun).
+
 ## [0.8.0] - 2026-07-07
 
 ### Added
