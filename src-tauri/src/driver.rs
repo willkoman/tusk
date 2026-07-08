@@ -497,6 +497,38 @@ impl Backend {
         }
     }
 
+    /// The connected database's NAME, as the sidebar shows it — i.e. what `build_tree()`
+    /// puts in `DbTree.database`, derived from the server, NOT from `ConnectionConfig.dbname`.
+    ///
+    /// These differ, and the difference is silent: `dbname` is the field the user typed, so
+    /// it's **empty for DuckDB/SQLite** (path-based) and empty on Postgres whenever libpq
+    /// defaults it. Anything that scopes behaviour by database — notably **AI skills**, in
+    /// both the panel and the Slack bot — must agree on one value, or a skill applies in one
+    /// place and silently vanishes in the other. `driver_conformance` pins this to `build_tree`.
+    pub async fn database_name(&self) -> String {
+        match self {
+            Backend::Pg(_) => self
+                .query_text("SELECT current_database()")
+                .await
+                .ok()
+                .and_then(|(_c, rows)| rows.into_iter().next())
+                .and_then(|r| r.into_iter().next().flatten())
+                .unwrap_or_default(),
+            Backend::Duck(d) => d
+                .lock()
+                .query_row("SELECT current_database()", [], |r| r.get::<_, String>(0))
+                .unwrap_or_default(),
+            // SQLite's single attached database is always `main` (see `sqlite_build_tree`).
+            Backend::Sqlite(_) => "main".to_string(),
+            Backend::MySql(m) => mysql_run(&m.pool, "SELECT database()")
+                .await
+                .ok()
+                .and_then(|(_c, rows, _a)| rows.into_iter().next())
+                .and_then(|r| r.into_iter().next().flatten())
+                .unwrap_or_default(),
+        }
+    }
+
     /// Per-relation detail (columns + indexes/constraints) on expand.
     pub async fn table_detail(
         &self,

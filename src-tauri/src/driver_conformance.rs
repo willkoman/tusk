@@ -124,7 +124,27 @@ fn cell(r: &[Option<String>], i: usize) -> Option<String> {
 
 // --- the battery ---
 
+/// `Backend::database_name()` MUST equal what the sidebar shows (`DbTree.database`).
+/// Anything that scopes by database — AI skills, in both the panel and the Slack bot —
+/// reads one of these; if they drift, a skill applies in one place and silently vanishes
+/// in the other. `ConnectionConfig.dbname` is NOT a valid source: it's the field the user
+/// typed, empty for DuckDB/SQLite and empty on PG whenever libpq defaults it.
+async fn database_name_battery(b: &mut Backend, eng: &Eng) {
+    let from_tree = b.build_tree().await.expect("build_tree").database;
+    let direct = b.database_name().await;
+    assert_eq!(direct, from_tree, "[{}] database_name() must match DbTree.database", eng.name);
+    assert!(!direct.is_empty(), "[{}] database_name() must not be empty", eng.name);
+
+    // ...and it must not silently fall back to the typed config field, which is blank for
+    // the embedded engines. This is the exact bug the Slack bot had.
+    if matches!(b, Backend::Duck(_) | Backend::Sqlite(_)) {
+        assert!(b.config().dbname.is_empty(), "[{}] embedded config.dbname is blank by construction", eng.name);
+        assert_ne!(direct, b.config().dbname, "[{}] database_name() must not come from config.dbname", eng.name);
+    }
+}
+
 async fn run_battery(b: &mut Backend, eng: &Eng) {
+    database_name_battery(b, eng).await;
     let q = eng.quote;
 
     // clean slate (idempotent across re-runs on a persistent server)

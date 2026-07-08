@@ -228,9 +228,12 @@ async fn generate_proposal(
         // actually read. Anything less and the prompt must stay silent about foreign keys.
         let fks_known = !relevant.is_empty()
             && relevant.iter().all(|t| fetched.iter().any(|s| **s == t.schema));
-        // Skills are on disk (skills.rs). Scope by the connected database's name, exactly
-        // as the desktop panel does — the bot and the panel must agree on the house rules.
-        let database = c.backend.config().dbname.clone();
+        // Skills are on disk (skills.rs), reloaded per event, so an edit applies to the next
+        // question without a bot restart. Scope by the SERVER-reported database name — the
+        // same value the sidebar and the panel use. `config().dbname` is the field the user
+        // typed: empty for DuckDB/SQLite, and empty on Postgres when libpq defaults it, so
+        // scoping on it would silently drop database-scoped skills for the bot only.
+        let database = c.backend.database_name().await;
         let all_skills = crate::skills::load_all(app);
         let skills = context::active_skills(&all_skills, &database);
 
