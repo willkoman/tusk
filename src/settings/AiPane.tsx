@@ -90,6 +90,8 @@ export function AiPane(props: { database: string }) {
     return { label: "No key", cls: "off" };
   };
   const isActive = (pid: AiProvider) => cfg().provider === pid;
+  /** How many providers are usable right now — a key saved, or keyless and local. */
+  const configured = createMemo(() => AI_PROVIDERS.filter((p) => probe()[p.id]?.hasKey).length);
 
   // ---------------------------------------------------------------- skills
 
@@ -142,12 +144,17 @@ export function AiPane(props: { database: string }) {
   }
 
   return (
-    <>
+    <div class="ai-pane">
       {/* ------------------------------------------------ providers */}
-      <div class="settings-note">
-        Each provider stores its key separately in your OS keychain — add several and switch
-        models from the chat header. Keys never reach the web view.
-      </div>
+      <section class="ai-section">
+        <header class="ai-section-head">
+          <h3 class="ai-section-title">Providers</h3>
+          <span class="ai-section-sub">{configured()} set up</span>
+        </header>
+        <div class="settings-note">
+          Each provider stores its key separately in your OS keychain — add several and switch
+          models from the chat header. Keys never reach the web view.
+        </div>
 
       <div class="ai-cards">
         <For each={AI_PROVIDERS}>
@@ -240,48 +247,56 @@ export function AiPane(props: { database: string }) {
         </For>
       </div>
 
-      <label class="settings-row" title="Send a few sample rows of relevant tables so the model understands your real data. Real values leave your machine.">
-        <span>Share sample data with the model</span>
-        <input type="checkbox" checked={cfg().shareSamples !== false} onChange={(e) => setConfig({ shareSamples: e.currentTarget.checked })} />
-      </label>
+        <label class="settings-row" title="Send a few sample rows of relevant tables so the model understands your real data. Real values leave your machine.">
+          <span>Share sample data with the model</span>
+          <input type="checkbox" checked={cfg().shareSamples !== false} onChange={(e) => setConfig({ shareSamples: e.currentTarget.checked })} />
+        </label>
+      </section>
 
       {/* ------------------------------------------------ skills */}
-      <h3 class="settings-h">Skills</h3>
-      <div class="settings-note">
-        Instructions you write once and the assistant follows every time — house definitions,
-        naming conventions, which tables to prefer. <b>Workspace</b> skills apply everywhere;
-        <b> database</b> skills only on a matching database.
-        <Show when={props.database}> Connected to <b>{props.database}</b>.</Show>
-        {" "}{activeCount()} active for this connection.
-      </div>
-
-      <div class="ai-card-actions">
-        <button class="ghost" onClick={() => setEditing({ ...emptySkill(), scope: props.database ? "database" : "workspace", database: props.database })}>+ New skill</button>
-        <button class="ghost" onClick={() => void importSkill()}>Import…</button>
-        <span class="spacer" />
-      </div>
+      <section class="ai-section">
+        <header class="ai-section-head">
+          <h3 class="ai-section-title">Skills</h3>
+          <span class="ai-section-sub">
+            {activeCount()} active{props.database ? ` on ${props.database}` : ""}
+          </span>
+          <div class="ai-section-actions">
+            <button class="ghost" onClick={() => void importSkill()}>Import…</button>
+            <button class="run" onClick={() => setEditing({ ...emptySkill(), scope: props.database ? "database" : "workspace", database: props.database })}>+ New skill</button>
+          </div>
+        </header>
+        <div class="settings-note">
+          Instructions you write once and the assistant follows every time — house definitions,
+          naming conventions, which tables to prefer. <b>Workspace</b> skills apply everywhere;
+          <b> database</b> skills only on a matching database.
+        </div>
 
       <Show when={skillNote()}><div class="ai-note">{skillNote()}</div></Show>
 
       <div class="ai-skills">
         <Show when={skills().length === 0}>
-          <div class="ai-note">No skills yet. A skill is just Markdown — write one, or import a `.md` file.</div>
+          <div class="ai-empty-box">
+            No skills yet. A skill is just Markdown — <b>New skill</b> to write one, or
+            <b> Import…</b> an existing <code>.md</code> file.
+          </div>
         </Show>
         <For each={skills()}>
           {(s) => (
             <div class="ai-skill" classList={{ dim: !s.enabled || !inScope(s) }}>
-              <input type="checkbox" checked={s.enabled} title="Enabled" onChange={() => void toggleSkill(s)} />
+              <input class="ai-skill-on" type="checkbox" checked={s.enabled} title={s.enabled ? "Enabled" : "Disabled"} onChange={() => void toggleSkill(s)} />
               <div class="ai-skill-main">
                 <div class="ai-skill-name">
-                  {s.name}
+                  <span class="ai-skill-title">{s.name}</span>
                   <span class="ai-chip">{s.scope === "database" ? `db: ${s.database}` : "workspace"}</span>
                   <Show when={s.enabled && !inScope(s)}><span class="ai-chip off">not this database</span></Show>
                 </div>
-                <Show when={s.description}><div class="ai-note">{s.description}</div></Show>
+                <Show when={s.description}><div class="ai-skill-desc">{s.description}</div></Show>
               </div>
-              <button class="ghost" onClick={() => setEditing({ ...s })}>Edit</button>
-              <button class="ghost" onClick={() => void exportSkill(s)}>Export</button>
-              <button class="ghost" onClick={() => void removeSkill(s)}>Delete</button>
+              <div class="ai-skill-actions">
+                <button class="ghost" onClick={() => setEditing({ ...s })}>Edit</button>
+                <button class="ghost" onClick={() => void exportSkill(s)}>Export</button>
+                <button class="ghost danger" onClick={() => void removeSkill(s)}>Delete</button>
+              </div>
             </div>
           )}
         </For>
@@ -290,6 +305,9 @@ export function AiPane(props: { database: string }) {
       <Show when={editing()}>
         {(sk) => (
           <div class="ai-skill-edit">
+            <header class="ai-section-head">
+              <h3 class="ai-section-title">{sk().id ? "Edit skill" : "New skill"}</h3>
+            </header>
             <label class="settings-row">
               <span>Name</span>
               <input value={sk().name} onInput={(e) => setEditing({ ...sk(), name: e.currentTarget.value })} placeholder="Revenue definitions" />
@@ -311,9 +329,10 @@ export function AiPane(props: { database: string }) {
                 <input value={sk().database} onInput={(e) => setEditing({ ...sk(), database: e.currentTarget.value })} placeholder={props.database || "database name"} />
               </label>
             </Show>
+            <div class="ai-skill-bodylabel">Instructions (Markdown) — this text is what reaches the model.</div>
             <textarea
               class="ai-skill-body"
-              rows={10}
+              rows={16}
               value={sk().body}
               onInput={(e) => setEditing({ ...sk(), body: e.currentTarget.value })}
               placeholder={"Markdown. For example:\n\n- “Revenue” always excludes refunds (status <> 'refunded').\n- Prefer the `analytics.*` views over raw tables.\n- Dates are UTC; report by calendar month."}
@@ -328,6 +347,7 @@ export function AiPane(props: { database: string }) {
           </div>
         )}
       </Show>
-    </>
+      </section>
+    </div>
   );
 }

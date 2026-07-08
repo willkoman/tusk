@@ -1133,7 +1133,20 @@ button.btn-danger { background: var(--danger); border-color: var(--danger); colo
 /* ---------- Settings → AI (src/settings/AiPane.tsx) ----------
    Reuses .settings-row / .settings-note / .run / .ghost / .error; the classes below only
    add the card + skill-row layout. Colours come from the theme vars, never literals. */
-.settings-h { margin: 16px 0 6px; font-size: 12px; font-weight: 600; color: var(--text); text-transform: uppercase; letter-spacing: 0.04em; }
+/* The pane scrolls, not the dialog: ten provider cards plus skills otherwise grow the
+   modal past the viewport. Matches .shortcuts-pane, which already does this. */
+.ai-pane { display: flex; flex-direction: column; gap: 4px; max-height: 62vh; overflow-y: auto; padding-right: 6px; }
+
+/* Providers and Skills are PEERS. Skills previously had the only heading, which read as a
+   sub-section hanging off the provider list. Same header treatment for both. */
+.ai-section { display: flex; flex-direction: column; gap: 2px; }
+.ai-section + .ai-section { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+.ai-section-head { display: flex; align-items: center; gap: 10px; min-height: 30px; }
+.ai-section-title { margin: 0; font-size: 14px; font-weight: 600; color: var(--text); }
+.ai-section-sub { font-size: 11px; color: var(--muted); }
+.ai-section-actions { margin-left: auto; display: flex; gap: 6px; }
+.ai-section-actions button { font-size: 12px; padding: 4px 10px; }
+
 .ai-cards { display: flex; flex-direction: column; gap: 6px; margin: 6px 0 10px; }
 .ai-card { border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); overflow: hidden; }
 .ai-card.active { border-color: var(--accent); }
@@ -1157,18 +1170,41 @@ button.btn-danger { background: var(--danger); border-color: var(--danger); colo
 .ai-chip.off { color: var(--muted); }
 .ai-chip.accent { color: var(--accent); border-color: var(--accent); }
 
-.ai-skills { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
-.ai-skill { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel-2); }
-.ai-skill.dim { opacity: 0.55; }
-.ai-skill-main { flex: 1; min-width: 0; }
-.ai-skill-name { display: flex; align-items: center; gap: 6px; font-size: 13px; }
-.ai-skill button { font-size: 11px; padding: 3px 8px; }
-.ai-skill-edit { display: flex; flex-direction: column; gap: 4px; border: 1px solid var(--accent); border-radius: 8px; padding: 10px; margin: 6px 0; background: var(--panel-2); }
+.ai-skills { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.ai-skill {
+  display: flex; align-items: flex-start; gap: 12px; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2);
+}
+.ai-skill:hover { border-color: var(--accent); }
+.ai-skill.dim { opacity: 0.5; }
+.ai-skill.dim:hover { opacity: 0.75; }
+.ai-skill-on { margin-top: 3px; flex-shrink: 0; }
+.ai-skill-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.ai-skill-name { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.ai-skill-title { font-size: 13px; font-weight: 600; }
+.ai-skill-desc { font-size: 12px; color: var(--muted); line-height: 1.45; }
+/* Actions never wrap under the name; they hold a fixed column on the right. */
+.ai-skill-actions { display: flex; gap: 4px; flex-shrink: 0; align-self: center; }
+.ai-skill-actions button { font-size: 11px; padding: 4px 9px; }
+.ai-skill-actions button.danger:hover { color: var(--danger); border-color: var(--danger); }
+
+.ai-skill-edit {
+  display: flex; flex-direction: column; gap: 4px; border: 1px solid var(--accent);
+  border-radius: 8px; padding: 12px 14px 14px; margin: 8px 0 4px; background: var(--panel-2);
+}
+.ai-skill-edit .settings-row input { width: 340px; max-width: 60%; }
+.ai-skill-bodylabel { font-size: 11px; color: var(--muted); padding: 8px 0 4px; }
 .ai-skill-body {
-  font-family: var(--mono); font-size: 12px; line-height: 1.5; padding: 8px 10px; resize: vertical;
-  border-radius: 7px; border: 1px solid var(--border); background: var(--bg); color: var(--text);
+  font-family: var(--mono); font-size: 12px; line-height: 1.55; padding: 10px 12px; resize: vertical;
+  min-height: 240px; border-radius: 7px; border: 1px solid var(--border); background: var(--bg); color: var(--text);
 }
 .ai-skill-body:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+
+.ai-empty-box {
+  padding: 18px 16px; border: 1px dashed var(--border); border-radius: 8px;
+  color: var(--muted); font-size: 12px; line-height: 1.6; text-align: center;
+}
+.ai-empty-box code { font-family: var(--mono); font-size: 11px; }
 
 /* ---------- Knowledge base (src/help/HelpDialog.tsx) ---------- */
 .kb-body { display: flex; gap: 12px; height: min(78vh, 860px); min-height: 0; }

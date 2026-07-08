@@ -41,8 +41,12 @@ export function SettingsDialog(props: {
   const [tab, setTab] = createSignal<SettingsTab>(props.initialTab ?? "editor");
   const p = props.prefs;
 
+  // The AI tab holds provider cards and a Markdown skill editor; 680px starves both.
+  // Every other tab is label+control rows and reads better narrow.
+  const width = () => (tab() === "ai" ? 900 : 680);
+
   return (
-    <Dialog title="Settings" width={680} onClose={props.onClose}>
+    <Dialog title="Settings" width={width()} onClose={props.onClose}>
       <div class="settings-body">
         <div class="settings-rail">
           <For each={TABS}>
