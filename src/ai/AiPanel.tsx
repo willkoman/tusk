@@ -1,12 +1,13 @@
-import { createSignal, createEffect, For, Index, Show, onMount, type Accessor } from "solid-js";
+import { createSignal, createEffect, Index, Show, onMount, type Accessor } from "solid-js";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import {
   aiStore, activeBaseUrl, defaultModel, providerModels, providerInfo, AI_PROVIDERS, isKeyless,
-  resolveWire, resolveBaseUrl, modelSupported, groupByTier, modelNote,
+  resolveWire, resolveBaseUrl, modelSupported,
   type AiConfig, type AiProvider, type AiEvent,
 } from "./store";
 import { buildSystemPrompt, relevantTables, type AiContext, type SampleTable } from "./context";
 import { Markdown } from "./markdown";
+import { ModelPicker } from "./ModelPicker";
 
 /** A turn's outcome lives on the message, NOT in its `content` — an error appended to the
  *  text would be replayed to the provider as part of the conversation on the next send. */
@@ -319,26 +320,6 @@ export function AiPanel(props: {
     return !streaming() && last?.role === "assistant" && (last.error || last.cancelled) ? last : undefined;
   };
 
-  // Header model picker: every model of every ready provider, so the model can be
-  // switched freely without reopening settings. Live catalog when fetched (curated
-  // fallback otherwise); the current custom model is always included. Providers whose
-  // catalog we know are sub-grouped by tier (Flagship / Balanced / Fast / Older);
-  // routers and local servers render as one flat "Models" group.
-  const headerGroups = () =>
-    keyed().flatMap((pid) => {
-      const models = [...modelsFor(pid)];
-      if (cfg().provider === pid && cfg().model && !models.includes(cfg().model)) models.unshift(cfg().model);
-      if (!models.length) return [];
-      const label = providerInfo(pid).label;
-      return groupByTier(pid, models).map((g) => ({
-        // "Anthropic · Flagship" — one <optgroup> per (provider, tier).
-        label: `${label} · ${g.label}`,
-        pid,
-        models: g.models,
-      }));
-    });
-  const curModelValue = () => `${cfg().provider}|${cfg().model}`;
-  const curModelNote = () => modelNote(cfg().provider, cfg().model);
 
   return (
     <div class="ai-panel" style={{ width: `${props.width}px` }}>
@@ -347,28 +328,12 @@ export function AiPanel(props: {
           when={keyed().length > 0}
           fallback={<button class="ai-setup" onClick={() => props.onOpenSettings()}>✨ Set up a model →</button>}
         >
-          <select
-            class="ai-model-select"
-            title={curModelNote() ?? "Model (providers that are set up)"}
-            onChange={(e) => { const [p, ...rest] = e.currentTarget.value.split("|"); setConfig({ provider: p as AiProvider, model: rest.join("|") }); }}
-          >
-            {/* `selected` per option (not `value` on the select): options load async from
-                the live catalog, and Solid won't re-apply a select `value` when they arrive —
-                so the picker would stick on whatever mounted first. */}
-            <For each={headerGroups()}>
-              {(g) => (
-                <optgroup label={g.label}>
-                  <For each={g.models}>
-                    {(m) => (
-                      <option value={`${g.pid}|${m}`} selected={curModelValue() === `${g.pid}|${m}`} title={modelNote(g.pid, m)}>
-                        {m}
-                      </option>
-                    )}
-                  </For>
-                </optgroup>
-              )}
-            </For>
-          </select>
+          <ModelPicker
+            providers={keyed()}
+            modelsFor={modelsFor}
+            current={{ provider: cfg().provider, model: cfg().model }}
+            onPick={(c) => setConfig({ provider: c.provider, model: c.model })}
+          />
         </Show>
         <span class="spacer" />
         <button class="icon" title="New chat" disabled={messages().length === 0} onClick={newChat}>✚</button>
