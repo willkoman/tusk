@@ -1483,45 +1483,170 @@ export const TOPICS: Topic[] = [
   {
     "id": "ai",
     "title": "AI assistant",
-    "blurb": "Schema-aware chat that proposes SQL; keys in OS keychain, nothing auto-runs.",
+    "blurb": "Schema-aware chat that proposes SQL. Keys in the OS keychain; nothing auto-runs.",
+    "icon": "sparkle",
     "blocks": [
       {
         "k": "p",
-        "md": "Toggle the docked right-side panel with the **✨ AI** topbar button (or bind `toggleAi` — it ships unbound). The assistant sees your dialect, schema, privileges, editor SQL, and sample rows, but only *proposes* SQL — nothing runs until you open it in a tab and hit Run yourself."
+        "md": "Toggle the docked right-side panel with the **✨ AI** topbar button (or bind `toggleAi` — it ships unbound). The assistant sees your dialect, schema, **foreign keys**, privileges, your [[topic:ai|skills]], editor SQL, and sample rows — but only *proposes* SQL. Nothing runs until you open it in a tab and press Run yourself."
       },
       {
         "k": "h",
-        "text": "Providers and models",
+        "text": "Providers and keys",
         "id": "providers"
       },
       {
         "k": "p",
-        "md": "Manage providers, keys and **skills** in **Settings → AI**. Built in: **Anthropic**, **OpenAI**, **Google Gemini**, **OpenCode Go**, **OpenCode Zen**, **OpenRouter**, **Groq**, and the local servers **Ollama** and **LM Studio** (no API key — nothing leaves your machine). Anything else exposing `/v1/chat/completions` works via **OpenAI-compatible (custom)**, where you enter the base URL. Each provider's key is stored separately in your OS keychain, so you can switch models across providers from the header picker without re-entering anything."
+        "md": "Everything to do with providers, keys and skills lives in **Settings → AI**. Each provider is a card: paste a key, pick a default model, override the API base, and press **Test connection** — which really does fetch that provider's model catalogue and shows you the actual error if it can't."
+      },
+      {
+        "k": "table",
+        "head": [
+          "Provider",
+          "What it is",
+          "Key"
+        ],
+        "rows": [
+          [
+            "**Anthropic**, **OpenAI**, **Google Gemini**",
+            "The frontier labs, direct",
+            "Yours"
+          ],
+          [
+            "**OpenCode Go**",
+            "Flat-rate subscription, open-source coding models",
+            "One key"
+          ],
+          [
+            "**OpenCode Zen**",
+            "Frontier *and* open models through one gateway",
+            "One key"
+          ],
+          [
+            "**OpenRouter**, **Groq**",
+            "Routers / fast open-model hosting",
+            "Yours"
+          ],
+          [
+            "**Ollama**, **LM Studio**",
+            "Local servers on this machine",
+            "None needed"
+          ],
+          [
+            "**OpenAI-compatible (custom)**",
+            "Anything serving `/v1/chat/completions`",
+            "Yours + a base URL"
+          ]
+        ]
+      },
+      {
+        "k": "p",
+        "md": "Keys are stored **per provider** in the **OS keychain** (service `tusk-ai`) and are used only by the Rust backend — never in localStorage, never echoed back to the UI. The panel only ever learns a boolean. Because each provider has its own keychain entry, you can set up several and switch between them mid-conversation without re-entering anything. Non-secret config (active provider, per-provider model and base URL, the sample-data toggle) lives in localStorage under `tusk.ai.config`."
+      },
+      {
+        "k": "tip",
+        "kind": "tip",
+        "md": "Local providers need no key and no network: with **Ollama** or **LM Studio** selected, your schema, foreign keys and sample rows never leave the machine."
+      },
+      {
+        "k": "h",
+        "text": "Choosing a model",
+        "id": "models"
+      },
+      {
+        "k": "p",
+        "md": "The picker in the panel header is a **searchable combobox**, not a dropdown — a router like OpenRouter serves several hundred models. Click it (or just start typing) to fuzzy-filter across every provider you've set up; ↑/↓ to move, Enter to pick, Esc to close. Matched characters are highlighted."
+      },
+      {
+        "k": "table",
+        "head": [
+          "Type this",
+          "To find"
+        ],
+        "rows": [
+          [
+            "`opus`",
+            "every Opus model, from any provider"
+          ],
+          [
+            "`ant opus`",
+            "**both terms must match** — `anthropic/claude-opus-4.8`"
+          ],
+          [
+            "`co48`",
+            "`claude-opus-4-8` — an abbreviation across separators"
+          ],
+          [
+            "`oss`",
+            "`openai/gpt-oss-120b`, because `oss` starts a word"
+          ]
+        ]
+      },
+      {
+        "k": "p",
+        "md": "With the search box empty you get the curated grouping instead: **Flagship / Balanced / Fast & cheap / Older, still widely used**, per provider. Model lists are fetched **live** from each provider using your saved key; the curated list is only a fallback for when that fetch fails. **Custom…** in Settings accepts any model id your endpoint takes."
+      },
+      {
+        "k": "h",
+        "text": "Skills — instructions the assistant follows",
+        "id": "skills"
+      },
+      {
+        "k": "p",
+        "md": "A **skill** is a piece of Markdown you write once and the assistant obeys on every question. It is for the things your schema *cannot* tell it: that money is stored in integer cents, that \"revenue\" excludes refunds, that `orders.buyer` is the customer link, that the `legacy_*` tables are never correct. Manage them in **Settings → AI → Skills**."
+      },
+      {
+        "k": "table",
+        "head": [
+          "Scope",
+          "Applies",
+          "Use it for"
+        ],
+        "rows": [
+          [
+            "**Workspace**",
+            "Every connection",
+            "House style, SQL conventions, how you like answers formatted"
+          ],
+          [
+            "**This database**",
+            "Only the connected database",
+            "Domain rules, table quirks, forbidden tables"
+          ]
+        ]
+      },
+      {
+        "k": "p",
+        "md": "A database skill adopts whichever database you're connected to — you never type the name. Open one written against a different database and Tusk says so, and offers **Retarget** in one click."
+      },
+      {
+        "k": "code",
+        "caption": "A skill is just Markdown with a little frontmatter. This IS the file on disk.",
+        "text": "---\nname: shop house rules\ndescription: Revenue, money units and forbidden tables\nscope: database\ndatabase: tusk_demo\nenabled: true\n---\n## Money\nEvery monetary column is an integer number of **cents**. Divide by 100.0 and round to 2dp.\n\n## Revenue\nAn order counts only if `status = 'paid'` **and** it has no row in `shop.refunds`\n(partial refunds leave the status alone) **and** the customer is not soft-deleted.\nPrefer `analytics.v_orders_clean`, which already encodes all three.\n\n## Forbidden\nNever query `shop.legacy_orders_2019`. Its conventional column names look inviting\nand it is never part of a current report."
       },
       {
         "k": "list",
         "items": [
-          "**Custom…** in the model dropdown accepts any model id your endpoint takes.",
-          "Model lists fetch live from each provider (using your saved key), falling back to a curated list; changing the base URL refetches after a short debounce."
+          "**Create / Edit / Delete** — the body is the part the model reads; name and description are for you and for the skill list.",
+          "**Enable / disable** with the checkbox. A disabled skill is never sent.",
+          "**Import…** any `.md` file. No frontmatter? The whole file becomes the body.",
+          "**Export** writes exactly the file above — the on-disk format *is* the export format, so skills are diffable and can live in a repo.",
+          "Skills are stored one file per skill under the app config directory (`skills/<id>.md`)."
         ],
         "ordered": false
       },
       {
         "k": "p",
-        "md": "Once any provider has a key, the **model picker in the panel header** lists every model across all keyed providers, grouped by provider — switch mid-conversation. First open with no key lands on the setup form."
+        "md": "Skills reach the model **before** the schema — house rules are read before the data — and a database-scoped skill sorts ahead of a workspace one, so the specific instruction survives a context-budget cut ahead of the general one. If a skill *is* cut for budget, the prompt says so **by name**, because a silently dropped instruction is indistinguishable from a model that ignored it."
       },
       {
-        "k": "h",
-        "text": "Where your API key lives",
-        "id": "keys"
-      },
-      {
-        "k": "p",
-        "md": "Keys save per provider in the **OS keychain** (service `tusk-ai`), used only by the Rust backend — never in localStorage, never echoed to the UI. The panel sees only a boolean (*saved ✓* / *not set*); the password field shows a placeholder."
+        "k": "tip",
+        "kind": "warn",
+        "md": "Skills shape *what* the model writes; they never widen *what can run*. The read-only guard, the [[topic:safety|permission gates]], and the Slack bot's single-read-only-SELECT rule are enforced in code and always outrank a skill."
       },
       {
         "k": "p",
-        "md": "**Clear key** removes it from the keychain. Non-secret config (provider, model, base URL, sample-data toggle) persists in localStorage under `tusk.ai.config`."
+        "md": "The [[topic:slack|Slack bot]] reads the same skills, scoped to the same database, and reloads them on every question — edit a skill and the next Slack question already follows it, no restart."
       },
       {
         "k": "h",
@@ -1535,14 +1660,21 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
+          "**Your skills** — the ones in scope, first, as above.",
           "**Dialect + version** — driver label, server version, and a quoting note (backticks on MySQL, double quotes elsewhere).",
           "**Your role** — user name, superuser flag, and (on Postgres) whether privileges are enforced; a limited role gets an explicit \"prefer reads, warn before writes/DDL\" instruction.",
           "**Active schema** — the tab's search-path schema, so bare table names resolve as your queries do.",
-          "**Schema summary** — `schema.table(col type, …)` lines up to a **12,000-character budget**, relevance-ranked: tables named in the conversation get full columns first. Tables past the budget are still listed by name (up to another 2,500 chars).",
-          "**Your editor SQL** — the buffer, or just the selection (capped at 4,000 chars), plus the tab's last query error (800 chars); the **Explain** and **Fix error** quick actions use exactly this.",
+          "**Schema summary** — `schema.table(col type, …)` lines up to a **12,000-character budget**, relevance-ranked: tables named in the conversation get full columns first. Tables past the budget are still listed by name.",
+          "**Foreign keys** — the real join graph (`orders.buyer -> customers.id`, composites as `a.(x, y) -> b.(p, q)`), told to the model as authoritative. Without it the model guesses join columns from naming convention and gets them wrong on any schema that doesn't follow `<table>_id`.",
+          "**Your editor SQL** — the buffer, or just the selection (capped at 4,000 chars), plus the tab's last query error; the **Explain** and **Fix error** quick actions use exactly this.",
           "**Sample rows** — see below."
         ],
         "ordered": false
+      },
+      {
+        "k": "tip",
+        "kind": "tip",
+        "md": "If Tusk hasn't been able to read the foreign keys, it stays **silent** about them rather than telling the model \"this schema has none\" — a wrong claim there is what produces confidently wrong joins."
       },
       {
         "k": "h",
@@ -1556,7 +1688,26 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "Sample sharing is **on by default** — real cell values go to your AI provider. Untick **Share sample data with the model** in the panel's ⚙ settings for a schema-only prompt. This governs the in-app assistant only; the [[topic:slack|Slack bot]] builds its own context, sample rows included."
+        "md": "Sample sharing is **on by default** — real cell values go to your AI provider. Untick **Share sample data with the model** in the panel's ⚙ drawer for a schema-only prompt. (It never applies to local providers, which have no third party.) The [[topic:slack|Slack bot]] builds its own context, sample rows included."
+      },
+      {
+        "k": "h",
+        "text": "Stop, Retry, and streams that die",
+        "id": "stop-retry"
+      },
+      {
+        "k": "p",
+        "md": "While a reply streams, **Send** becomes **⏹ Stop** — pressing it (or [[kbd:Escape]]) interrupts the live HTTP stream at the provider, not just on screen. The partial reply stays; nothing is lost."
+      },
+      {
+        "k": "list",
+        "items": [
+          "A **transient failure before the first word** (rate limit, overload, dropped socket) is retried up to three times automatically, with backoff. You never see it.",
+          "A reply that **dies mid-sentence** can't be replayed — that would duplicate the text you're already reading — so Tusk **restarts the turn once**, then hands you a **↻ Retry** button.",
+          "A reply cut short by the model's token ceiling is flagged **✂️ Cut off at the token limit** rather than pretending it finished.",
+          "A provider error is shown as an error. Tusk never reports a failed reply as a finished one."
+        ],
+        "ordered": false
       },
       {
         "k": "h",
@@ -1565,19 +1716,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Replies stream token-by-token (SSE parsed in Rust, relayed over a Tauri channel; capped at 2,048 output tokens) and render as markdown with syntax-highlighted fenced ```sql blocks. Each SQL (or untagged) block gets **Copy** and **▶ Open in editor** — the latter opens a **new tab** titled *AI query* with your active schema attached; it never overwrites your buffer and never executes."
-      },
-      {
-        "k": "p",
-        "md": "Running stays your explicit [[kbd:Mod-Enter]] in the [[topic:editor|editor]], where server lint, the read-only guard, and every other [[topic:safety|safety layer]] apply. The system prompt asks the model to flag destructive statements and prefer a `SELECT` preview first — advice to the model, not enforcement."
-      },
-      {
-        "k": "p",
-        "md": "In the composer, [[kbd:Enter]] sends and **Shift+Enter** inserts a newline; the box auto-grows to about five lines. While a reply streams, the list stays pinned to the bottom only if you're already there."
-      },
-      {
-        "k": "p",
-        "md": "**✚ New chat** clears the conversation and resets the relevance ranking — the whole conversation steers the schema summary and sample selection, so a fresh chat is how you fully change subject."
+        "md": "Replies stream token-by-token (SSE parsed in Rust, relayed over a Tauri channel) and render as markdown with syntax-highlighted fenced ```sql blocks. Each SQL (or untagged) block gets **Copy** and **▶ Open in editor** — the latter opens a **new tab** titled *AI query* with your active schema attached; it never overwrites your buffer and never runs. Running is always your keystroke."
       },
       {
         "k": "h",
@@ -1592,13 +1731,20 @@ export const TOPICS: Topic[] = [
             "does": "Show / hide the AI panel (unbound by default — set it in [[topic:shortcuts|Settings → Shortcuts]])"
           },
           {
+            "action": "openSettings",
+            "does": "Open Settings — the **AI** tab holds providers, keys and skills"
+          },
+          {
+            "combo": "Escape",
+            "does": "Stop the reply that's currently streaming"
+          },
+          {
             "combo": "Shift-Enter",
             "does": "Newline in the chat composer (plain Enter sends)"
           }
         ]
       }
-    ],
-    "icon": "sparkle"
+    ]
   },
   {
     "blocks": [
@@ -1618,7 +1764,7 @@ export const TOPICS: Topic[] = [
           "**Two tokens** — the Bot token (`xoxb-…`, from Install to Workspace) and an App-level token (`xapp-…`) with `connections:write`.",
           "**Paste both in Settings → Slack** — stored in the OS keychain (service `tusk-slack`), never written to disk, never echoed back (placeholder says *\"saved in keychain — type to replace\"*).",
           "**Test connection** validates both tokens and names the workspace; **Enable Slack bot** starts/stops it. Statusbar badge: `🟢 Slack` running, 🟡 connecting/reconnecting.",
-          "**AI provider/model** comes from the in-app [[topic:ai|AI panel]] — configure it there first; Save on the Slack tab mirrors it into the bot's config."
+          "**AI provider/model** is mirrored from **Settings → AI** when you press Save here — the Rust bot can't read the web view's storage, so re-save after changing provider or model."
         ],
         "ordered": false
       },
@@ -1649,6 +1795,20 @@ export const TOPICS: Topic[] = [
       {
         "k": "p",
         "md": "Every approved run lands in Tusk's [[topic:history|query history]] with a `-- [Slack] asked by <user>` marker, so you can audit what the bot executed."
+      },
+      {
+        "k": "h",
+        "text": "It follows your skills",
+        "id": "slack-skills"
+      },
+      {
+        "k": "p",
+        "md": "The bot reads the same [[topic:ai|skills]] as the desktop assistant — workspace skills always, and database skills when they match the connected database. They are reloaded **on every question**, so editing a skill changes the next answer with no bot restart (unlike the Slack settings themselves, which need a toggle off/on)."
+      },
+      {
+        "k": "tip",
+        "kind": "warn",
+        "md": "A skill can change the SQL the bot *writes*. It can never change what the bot is *allowed to run*: the single read-only `SELECT` gate is enforced in code, at proposal time and again at execution, and no instruction can widen it."
       },
       {
         "k": "h",
@@ -2489,6 +2649,25 @@ export const TOPICS: Topic[] = [
         "k": "tip",
         "kind": "tip",
         "md": "The updater shipped in v0.4.5 — earlier installs can't auto-update. Grab a fresh installer once; every version after keeps itself current."
+      },
+      {
+        "k": "h",
+        "text": "v0.8.3 — AI providers, skills, and a lot of honesty about failure",
+        "id": "v0-8-3"
+      },
+      {
+        "k": "list",
+        "ordered": false,
+        "items": [
+          "**Ten AI providers, one key each.** Anthropic, OpenAI, Gemini, OpenCode Go, OpenCode Zen, OpenRouter, Groq, Ollama, LM Studio, and a generic OpenAI-compatible entry — each with its own OS-keychain entry. Managed in the new **Settings → AI** tab, with a **Test connection** button that really calls the provider.",
+          "**Skills.** Markdown instructions the assistant follows every time, scoped to your workspace or to one database. Create, edit, import, export. The [[topic:slack|Slack bot]] follows them too. See [[topic:ai|Skills]].",
+          "**Searchable model picker.** Fuzzy, multi-term (`ant opus`), because a router catalogue is hundreds of models.",
+          "**The AI knows your foreign keys.** The join graph now reaches the model as authoritative, instead of it guessing join columns from naming convention.",
+          "**Stop and Retry.** ⏹ Stop (or [[kbd:Escape]]) interrupts the live stream; a reply that dies mid-sentence restarts itself once.",
+          "**Fixed: a failed reply used to look like a finished one.** Provider errors arriving mid-stream were ignored, so the chat went quiet and Slack blamed your question (\"try the desktop app\") for what was really a provider outage.",
+          "**Fixed: dropdown popups were unreadable in every dark theme** — white text on a white native popup. Affected every dropdown in the app, not just the AI panel.",
+          "**Fixed: DuckDB `TIMESTAMPTZ` casts failed on a fresh machine.** The ICU extension is now installed on demand, not merely loaded."
+        ]
       },
       {
         "k": "h",

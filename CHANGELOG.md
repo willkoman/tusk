@@ -4,7 +4,7 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
-## [0.9.0] - 2026-07-08
+## [0.8.3] - 2026-07-08
 
 ### Added
 - **AI Skills — reusable instructions the assistant follows.** Write a skill once ("revenue always excludes refunds", "prefer the `analytics.*` views", "dates are UTC") and it becomes part of the assistant's working context on every question. Skills are **workspace-scoped** (every connection) or **database-scoped** (only on a matching database), can be created, edited, enabled/disabled, imported, exported, and deleted from **Settings → AI**, and are used by **both** the desktop panel and the Slack bot. They land in the prompt *before* the schema — house rules are read before the data — and database-scoped skills rank ahead of workspace ones so the specific instruction survives a budget cutoff. A skill dropped for budget is **named**, never silently cut. Safety rules still outrank skills, and the Slack read-only gates are enforced in code, not by the prompt.
