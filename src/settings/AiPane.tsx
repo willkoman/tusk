@@ -262,6 +262,8 @@ export function AiPane(props: { database: string }) {
           </span>
           <div class="ai-section-actions">
             <button class="ghost" onClick={() => void importSkill()}>Import…</button>
+            {/* Default a new skill to the database you're looking at; workspace when there
+                isn't one. Either way the target is adopted, never typed. */}
             <button class="run" onClick={() => setEditing({ ...emptySkill(), scope: props.database ? "database" : "workspace", database: props.database })}>+ New skill</button>
           </div>
         </header>
@@ -318,16 +320,37 @@ export function AiPane(props: { database: string }) {
             </label>
             <label class="settings-row">
               <span>Scope</span>
-              <select value={sk().scope} onChange={(e) => setEditing({ ...sk(), scope: e.currentTarget.value as Skill["scope"] })}>
-                <option value="workspace">Workspace (every connection)</option>
-                <option value="database">This database only</option>
+              <select
+                value={sk().scope}
+                onChange={(e) => {
+                  const scope = e.currentTarget.value as Skill["scope"];
+                  // The database is a fact about the connection, not something to retype.
+                  // Keep an existing target when re-selecting the scope; otherwise adopt
+                  // whatever we're connected to.
+                  setEditing({ ...sk(), scope, database: scope === "database" ? (sk().database || props.database) : "" });
+                }}
+              >
+                <option value="workspace">Workspace — every connection</option>
+                <option value="database" disabled={!props.database && !sk().database}>
+                  {props.database ? `This database — ${props.database}` : "One database (connect first)"}
+                </option>
               </select>
             </label>
             <Show when={sk().scope === "database"}>
-              <label class="settings-row">
-                <span>Database</span>
-                <input value={sk().database} onInput={(e) => setEditing({ ...sk(), database: e.currentTarget.value })} placeholder={props.database || "database name"} />
-              </label>
+              <div class="settings-row">
+                <span>Applies to</span>
+                <span class="ai-scope-target">
+                  <code>{sk().database || "—"}</code>
+                  {/* Editing a skill written against a different database: say so plainly and
+                      offer the one-click fix rather than a text field to get wrong. */}
+                  <Show when={props.database && sk().database && sk().database !== props.database}>
+                    <span class="ai-scope-warn">not the connected database</span>
+                    <button class="ghost" onClick={() => setEditing({ ...sk(), database: props.database })}>
+                      Retarget to {props.database}
+                    </button>
+                  </Show>
+                </span>
+              </div>
             </Show>
             <div class="ai-skill-bodylabel">Instructions (Markdown) — this text is what reaches the model.</div>
             <textarea
@@ -340,7 +363,11 @@ export function AiPane(props: { database: string }) {
             <div class="ai-card-actions">
               <button class="ghost" onClick={() => { setEditing(null); setSkillNote(""); }}>Cancel</button>
               <span class="spacer" />
-              <button class="run" disabled={!sk().name.trim()} onClick={async () => { if (await persist(sk())) setEditing(null); }}>
+              <button
+                class="run"
+                disabled={!sk().name.trim() || (sk().scope === "database" && !sk().database.trim())}
+                onClick={async () => { if (await persist(sk())) setEditing(null); }}
+              >
                 {sk().id ? "Save skill" : "Create skill"}
               </button>
             </div>
