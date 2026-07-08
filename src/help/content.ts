@@ -1496,7 +1496,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Built in: **Anthropic**, **OpenAI**, **Google Gemini**, **OpenCode Zen**, **OpenRouter**, **Groq**, and the local servers **Ollama** and **LM Studio** (no API key — nothing leaves your machine). Anything else exposing `/v1/chat/completions` works via **OpenAI-compatible (custom)**, where you enter the base URL. Each provider's key is stored separately in your OS keychain, so you can switch models across providers from the header picker without re-entering anything."
+        "md": "Manage providers, keys and **skills** in **Settings → AI**. Built in: **Anthropic**, **OpenAI**, **Google Gemini**, **OpenCode Go**, **OpenCode Zen**, **OpenRouter**, **Groq**, and the local servers **Ollama** and **LM Studio** (no API key — nothing leaves your machine). Anything else exposing `/v1/chat/completions` works via **OpenAI-compatible (custom)**, where you enter the base URL. Each provider's key is stored separately in your OS keychain, so you can switch models across providers from the header picker without re-entering anything."
       },
       {
         "k": "list",

@@ -9,6 +9,7 @@ mod perms;
 mod profiles;
 mod relgraph;
 mod script;
+mod skills;
 mod slack;
 mod tree;
 
@@ -1038,6 +1039,11 @@ pub fn run() {
             ai::ai_clear_key,
             ai::ai_chat,
             ai::ai_cancel,
+            skills::skills_list,
+            skills::skills_save,
+            skills::skills_delete,
+            skills::skills_export,
+            skills::skills_import,
             ai::ai_list_models,
             slack_load_config,
             slack_save_config,

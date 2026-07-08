@@ -25,13 +25,22 @@ export {
 } from "./providers";
 
 export type AiConfig = {
+  /** The provider a chat runs against right now. */
   provider: AiProvider;
+  /** The model for the active provider. Mirrored into `models[provider]` on every change. */
   model: string;
-  /** Override the provider's default API base. Blank = the registry default. */
-  baseUrl: string;
+  /** Remembered model per provider, so switching provider doesn't lose your choice. */
+  models: Partial<Record<AiProvider, string>>;
+  /** Base-URL override per provider. Blank/absent = the registry default. Keyed per
+   *  provider because a single `baseUrl` leaked across a provider switch: point OpenAI at
+   *  a local server, switch to Gemini, and Gemini inherited the local server's URL. */
+  baseUrls: Partial<Record<AiProvider, string>>;
   /** Send a few sample rows of relevant tables to the model (real values leave your machine). Default on. */
   shareSamples: boolean;
 };
+
+/** The active provider's base-URL override ("" = use the registry default). */
+export const activeBaseUrl = (c: AiConfig): string => c.baseUrls[c.provider] ?? "";
 
 const KEY = "tusk.ai.config";
 
@@ -42,17 +51,19 @@ const KEY = "tusk.ai.config";
  *  to reach a compatible endpoint before the registry) keeps working exactly as before:
  *  `openai` is still an openai-wire provider with an editable base. Nothing to migrate —
  *  the only guard needed is against a provider id this build doesn't know. */
-function normalize(raw: Partial<AiConfig>): AiConfig {
+function normalize(raw: Partial<AiConfig> & { baseUrl?: string }): AiConfig {
   const known = AI_PROVIDERS.some((p) => p.id === raw.provider);
   const provider = (known ? raw.provider : "anthropic") as AiProvider;
-  return {
-    provider,
-    // A model saved for a provider we fell back off of is meaningless; otherwise the
-    // user's model (including a custom id the registry doesn't list) is preserved.
-    model: known ? (raw.model ?? "") : defaultModel(provider),
-    baseUrl: raw.baseUrl ?? "",
-    shareSamples: raw.shareSamples !== false,
-  };
+  // A model saved for a provider we fell back off of is meaningless; otherwise the user's
+  // model (including a custom id the registry doesn't list) is preserved.
+  const model = known ? (raw.model ?? "") : defaultModel(provider);
+  // v1 → v2: a single global `baseUrl`/`model` becomes per-provider maps, attributed to
+  // the provider that was active when they were saved. Nothing is lost and no key moves.
+  const models = { ...(raw.models ?? {}) } as Partial<Record<AiProvider, string>>;
+  const baseUrls = { ...(raw.baseUrls ?? {}) } as Partial<Record<AiProvider, string>>;
+  if (model && models[provider] === undefined) models[provider] = model;
+  if (raw.baseUrl && baseUrls[provider] === undefined) baseUrls[provider] = raw.baseUrl;
+  return { provider, model, models, baseUrls, shareSamples: raw.shareSamples !== false };
 }
 
 export const aiStore = {
@@ -63,10 +74,12 @@ export const aiStore = {
     } catch {
       /* ignore */
     }
-    return { provider: "anthropic", model: defaultModel("anthropic"), baseUrl: "", shareSamples: true };
+    return { provider: "anthropic", model: defaultModel("anthropic"), models: {}, baseUrls: {}, shareSamples: true };
   },
   save(c: AiConfig) {
-    localStorage.setItem(KEY, JSON.stringify(c));
+    // Keep the per-provider memory in step with the active selection.
+    const next: AiConfig = { ...c, models: { ...c.models, [c.provider]: c.model } };
+    localStorage.setItem(KEY, JSON.stringify(next));
   },
 };
 

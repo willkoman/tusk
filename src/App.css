@@ -1094,6 +1094,46 @@ button.btn-danger { background: var(--danger); border-color: var(--danger); colo
 /* AI code-block SQL syntax highlighting */
 /* Light-theme token colors (the dark-tuned ones wash out on a light background). */
 
+/* ---------- Settings → AI (src/settings/AiPane.tsx) ----------
+   Reuses .settings-row / .settings-note / .run / .ghost / .error; the classes below only
+   add the card + skill-row layout. Colours come from the theme vars, never literals. */
+.settings-h { margin: 16px 0 6px; font-size: 12px; font-weight: 600; color: var(--text); text-transform: uppercase; letter-spacing: 0.04em; }
+.ai-cards { display: flex; flex-direction: column; gap: 6px; margin: 6px 0 10px; }
+.ai-card { border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); overflow: hidden; }
+.ai-card.active { border-color: var(--accent); }
+.ai-card-head {
+  display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px 10px;
+  background: transparent; border: none; color: var(--text); cursor: pointer; text-align: left; font: inherit;
+}
+.ai-card-head:hover { background: var(--border); }
+.ai-card-name { display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; }
+.ai-card-model { flex: 1; text-align: right; color: var(--muted); font-size: 11px; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-card-caret { color: var(--muted); font-size: 10px; }
+.ai-card-body { padding: 4px 10px 10px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; }
+.ai-card-actions { display: flex; align-items: center; gap: 6px; padding: 6px 0 2px; }
+.ai-card-actions .spacer { flex: 1; }
+
+.ai-chip {
+  font-size: 10px; padding: 1px 6px; border-radius: 999px; white-space: nowrap;
+  border: 1px solid var(--border); color: var(--muted); background: var(--bg);
+}
+.ai-chip.ok { color: var(--ok); border-color: var(--ok); }
+.ai-chip.off { color: var(--muted); }
+.ai-chip.accent { color: var(--accent); border-color: var(--accent); }
+
+.ai-skills { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
+.ai-skill { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel-2); }
+.ai-skill.dim { opacity: 0.55; }
+.ai-skill-main { flex: 1; min-width: 0; }
+.ai-skill-name { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.ai-skill button { font-size: 11px; padding: 3px 8px; }
+.ai-skill-edit { display: flex; flex-direction: column; gap: 4px; border: 1px solid var(--accent); border-radius: 8px; padding: 10px; margin: 6px 0; background: var(--panel-2); }
+.ai-skill-body {
+  font-family: var(--mono); font-size: 12px; line-height: 1.5; padding: 8px 10px; resize: vertical;
+  border-radius: 7px; border: 1px solid var(--border); background: var(--bg); color: var(--text);
+}
+.ai-skill-body:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+
 /* ---------- Knowledge base (src/help/HelpDialog.tsx) ---------- */
 .kb-body { display: flex; gap: 12px; height: min(78vh, 860px); min-height: 0; }
 .kb-nav { width: 216px; flex: 0 0 216px; display: flex; flex-direction: column; gap: 8px; padding-right: 8px; border-right: 1px solid var(--border); min-height: 0; }

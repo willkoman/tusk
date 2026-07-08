@@ -6,7 +6,7 @@
 import { Show, createSignal, onCleanup, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { aiStore, defaultModel, isKeyless, resolveBaseUrl, resolveWire } from "../ai/store";
+import { activeBaseUrl, aiStore, defaultModel, isKeyless, resolveBaseUrl, resolveWire } from "../ai/store";
 
 type SlackConfig = {
   enabled: boolean;
@@ -98,7 +98,7 @@ export function SlackPane() {
       aiWire: wire ?? "",
       aiModel: model,
       // Wire-resolved: some gateways host a wire under a sub-path (Zen's gemini).
-      aiBaseUrl: resolveBaseUrl(ai.provider, ai.baseUrl, wire ?? undefined) || null,
+      aiBaseUrl: resolveBaseUrl(ai.provider, activeBaseUrl(ai), wire ?? undefined) || null,
       aiAllowNoKey: isKeyless(ai.provider),
     };
     try {

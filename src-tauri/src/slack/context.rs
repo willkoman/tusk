@@ -12,6 +12,7 @@ const SCHEMA_BUDGET: usize = 12_000;
 const FK_BUDGET: usize = 3_000;
 const NAME_LIST_BUDGET: usize = 2_500;
 const SAMPLE_BUDGET: usize = 4_000;
+const SKILLS_BUDGET: usize = 8_000;
 const CELL_CAP: usize = 80;
 
 /// Sample rows pulled from a relation, for grounding the model in real values.
@@ -187,6 +188,52 @@ fn schema_summary(tables: &[TableInfo], focus: &str) -> String {
     }
 }
 
+/// Skills that apply to `database`, database-scoped first (the specific instruction
+/// survives a budget cutoff). PARITY: mirrors `activeSkills` in `src/ai/skills.ts`.
+pub fn active_skills<'a>(all: &'a [crate::skills::Skill], database: &str) -> Vec<&'a crate::skills::Skill> {
+    let mut v: Vec<(u8, usize, &crate::skills::Skill)> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.applies_to(database))
+        .map(|(i, s)| (if s.scope == crate::skills::SCOPE_DATABASE { 0 } else { 1 }, i, s))
+        .collect();
+    v.sort_by_key(|(r, i, _)| (*r, *i));
+    v.into_iter().map(|(_, _, s)| s).collect()
+}
+
+/// PARITY: mirrors `formatSkills` in `src/ai/skills.ts` — a dropped skill is NAMED, never
+/// silently cut, so a user can tell their instruction didn't reach the model.
+pub fn format_skills(skills: &[&crate::skills::Skill]) -> String {
+    let mut out = String::new();
+    let mut dropped: Vec<&str> = Vec::new();
+    for s in skills {
+        let body = s.body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let head = if s.description.trim().is_empty() {
+            s.name.clone()
+        } else {
+            format!("{} — {}", s.name, s.description.trim())
+        };
+        let scope = if s.scope == crate::skills::SCOPE_DATABASE {
+            format!(" (database: {})", s.database)
+        } else {
+            String::new()
+        };
+        let block = format!("\n## {head}{scope}\n{body}\n");
+        if out.len() + block.len() > SKILLS_BUDGET {
+            dropped.push(&s.name);
+        } else {
+            out.push_str(&block);
+        }
+    }
+    if !dropped.is_empty() {
+        out.push_str(&format!("\n(Not included, over the context budget: {})\n", dropped.join(", ")));
+    }
+    out
+}
+
 /// One FK as `orders.user_id -> users.id`, composite as `a.(x, y) -> b.(p, q)`.
 /// PARITY: mirrors `fkLine` in `src/ai/context.ts`.
 fn fk_line(e: &crate::relgraph::FkEdge) -> String {
@@ -243,6 +290,7 @@ pub fn build_system_prompt(
     samples: &[SampleTable],
     fks: &[crate::relgraph::FkEdge],
     fks_known: bool,
+    skills: &[&crate::skills::Skill],
 ) -> String {
     let mut lines: Vec<String> = vec![
         format!(
@@ -276,6 +324,16 @@ pub fn build_system_prompt(
     ];
     if ctx.permissions_enforced && !ctx.is_superuser {
         lines.push("- This role has limited privileges — stick to tables listed below.".to_string());
+    }
+    // User-authored skills: instructions, so they land BEFORE the data (the model should
+    // know the house rules before it reads the schema). Safety rules still outrank them —
+    // the Slack read-only gates are enforced in code, not by the prompt.
+    let skill_text = format_skills(skills);
+    if !skill_text.trim().is_empty() {
+        lines.push(String::new());
+        lines.push("# Skills".to_string());
+        lines.push("Instructions the user has written for this workspace/database. Follow them. Where they conflict with your defaults, they win; where they conflict with the rules above, the rules above win.".to_string());
+        lines.push(skill_text.trim_end().to_string());
     }
     lines.push(String::new());
     lines.push("Database schema (schema.table(columns)):".to_string());
@@ -412,15 +470,59 @@ mod tests {
         };
         let tables = vec![t("orders", &[("id", "int")])];
 
-        let unfetched = build_system_prompt(&ctx, &tables, "", &[], &[], false);
+        let unfetched = build_system_prompt(&ctx, &tables, "", &[], &[], false, &[]);
         assert!(!unfetched.to_lowercase().contains("no foreign keys"));
 
-        let fetched = build_system_prompt(&ctx, &tables, "", &[], &[], true);
+        let fetched = build_system_prompt(&ctx, &tables, "", &[], &[], true, &[]);
         assert!(fetched.contains("declares no foreign keys"));
 
-        let with_fks = build_system_prompt(&ctx, &tables, "", &[], &[edge("orders", &["customer_id"], "customers", &["id"])], true);
+        let with_fks = build_system_prompt(&ctx, &tables, "", &[], &[edge("orders", &["customer_id"], "customers", &["id"])], true, &[]);
         assert!(with_fks.contains("orders.customer_id -> customers.id"));
         assert!(with_fks.contains("JOIN on these rather than guessing"));
+    }
+
+    fn skill(name: &str, scope: &str, db: &str, body: &str) -> crate::skills::Skill {
+        crate::skills::Skill {
+            id: name.into(), name: name.into(), description: String::new(),
+            scope: scope.into(), database: db.into(), enabled: true, body: body.into(),
+        }
+    }
+
+    /// PARITY with `activeSkills` in `src/ai/skills.ts`: database-scoped first, so the
+    /// specific instruction survives a budget cutoff ahead of the generic one.
+    #[test]
+    fn active_skills_scopes_and_orders_like_the_ts_side() {
+        let all = vec![
+            skill("ws", "workspace", "", "generic"),
+            skill("db", "database", "pagila", "specific"),
+            skill("other", "database", "elsewhere", "nope"),
+        ];
+        let got: Vec<&str> = active_skills(&all, "pagila").iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(got, vec!["db", "ws"]); // database-scoped ranks first
+        let none: Vec<&str> = active_skills(&all, "unknown-db").iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(none, vec!["ws"]); // only workspace applies
+    }
+
+    #[test]
+    fn skills_reach_the_prompt_and_a_dropped_one_is_named() {
+        let ctx = SlackAiCtx {
+            dialect: "postgres".into(), user: "me".into(), is_superuser: false,
+            permissions_enforced: false, destructive_policy: "proposeReadonly".into(),
+        };
+        let tables = vec![t("orders", &[("id", "int")])];
+        let s1 = skill("Revenue", "database", "pagila", "Revenue excludes refunds.");
+        let out = build_system_prompt(&ctx, &tables, "", &[], &[], false, &[&s1]);
+        assert!(out.contains("# Skills"));
+        assert!(out.contains("Revenue excludes refunds."));
+        // Skills are INSTRUCTIONS: they must precede the schema dump.
+        assert!(out.find("# Skills").unwrap() < out.find("Database schema").unwrap());
+
+        // Over budget → named, never silently cut.
+        let big = skill("Huge", "workspace", "", &"x".repeat(SKILLS_BUDGET + 10));
+        let small = skill("Small", "workspace", "", "keep me");
+        let text = format_skills(&[&small, &big]);
+        assert!(text.contains("keep me"));
+        assert!(text.contains("Not included, over the context budget: Huge"));
     }
 
     #[test]

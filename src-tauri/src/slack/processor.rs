@@ -228,6 +228,12 @@ async fn generate_proposal(
         // actually read. Anything less and the prompt must stay silent about foreign keys.
         let fks_known = !relevant.is_empty()
             && relevant.iter().all(|t| fetched.iter().any(|s| **s == t.schema));
+        // Skills are on disk (skills.rs). Scope by the connected database's name, exactly
+        // as the desktop panel does — the bot and the panel must agree on the house rules.
+        let database = c.backend.config().dbname.clone();
+        let all_skills = crate::skills::load_all(app);
+        let skills = context::active_skills(&all_skills, &database);
+
         let ctx = SlackAiCtx {
             dialect: caps.kind.to_string(),
             user: perms.current_user.clone(),
@@ -235,7 +241,7 @@ async fn generate_proposal(
             permissions_enforced: perms.enforced,
             destructive_policy: cfg.destructive_policy.clone(),
         };
-        context::build_system_prompt(&ctx, &tables, &focus, &samples, &fks, fks_known)
+        context::build_system_prompt(&ctx, &tables, &focus, &samples, &fks, fks_known, &skills)
     };
 
     let req = ai::AiRequest {

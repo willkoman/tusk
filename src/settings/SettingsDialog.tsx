@@ -4,14 +4,16 @@ import { type EditorPrefs } from "../editor/types";
 import { type DialectId } from "../sql/dialects";
 import { THEMES } from "../themes";
 import { SlackPane } from "./SlackPane";
+import { AiPane } from "./AiPane";
 
-export type SettingsTab = "editor" | "appearance" | "grid" | "plans" | "slack" | "shortcuts";
+export type SettingsTab = "editor" | "appearance" | "grid" | "plans" | "ai" | "slack" | "shortcuts";
 
 const TABS: { id: SettingsTab; label: string }[] = [
   { id: "editor", label: "Editor" },
   { id: "appearance", label: "Appearance" },
   { id: "grid", label: "Grid" },
   { id: "plans", label: "Plans" },
+  { id: "ai", label: "AI" },
   { id: "slack", label: "Slack" },
   { id: "shortcuts", label: "Shortcuts" },
 ];
@@ -31,6 +33,8 @@ export function SettingsDialog(props: {
   initialTab?: SettingsTab;
   /** Connected → the dialect pref is overridden by the driver; show it disabled. */
   connected: boolean;
+  /** Connected database name — scopes database-level AI skills. "" when disconnected. */
+  database: string;
   /** Rendered inside the Shortcuts tab (lands with the keymap feature). */
   shortcutsPane?: () => any;
 }) {
@@ -211,6 +215,9 @@ export function SettingsDialog(props: {
               </div>
             </Match>
 
+            <Match when={tab() === "ai"}>
+              <AiPane database={props.database} />
+            </Match>
             <Match when={tab() === "slack"}>
               <SlackPane />
             </Match>

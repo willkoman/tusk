@@ -3,6 +3,7 @@
 // app's own capabilities. Kept compact; specific tables can be expanded on request later.
 
 import type { FkEdge } from "../sql/fk";
+import { activeSkills, formatSkills, type Skill } from "./skills";
 
 export type AiCtxTable = { schema: string; name: string; columns: { name: string; data_type: string }[] };
 
@@ -26,6 +27,10 @@ export type AiContext = {
    *  declared" vs "not fetched / driver can't report them" — and telling the model
    *  "this schema has no foreign keys" when we simply didn't look is worse than silence. */
   fksKnown: boolean;
+  /** The connected database's name, used to scope database-level skills. */
+  database: string;
+  /** All user-authored skills; `buildSystemPrompt` selects the ones in scope. */
+  skills: Skill[];
   currentSql: string;
   selection: string;
   lastError: string;
@@ -169,6 +174,23 @@ export function buildSystemPrompt(c: AiContext, conversationText = "", samples: 
     "- Put runnable SQL in fenced ```sql code blocks. The user can open any block in a new editor tab and run it — you never execute anything yourself.",
     "- For destructive statements (DROP/DELETE/UPDATE/TRUNCATE/ALTER), call it out clearly and prefer a WHERE clause / a SELECT preview first.",
     "- Generate SQL in the dialect above and quote identifiers as noted. Be concise.",
+    "",
+  );
+
+  // User-authored skills. These are INSTRUCTIONS, so they land before the data: the model
+  // should know the house rules ("revenue excludes refunds") before it reads the schema.
+  // Database-scoped skills sort ahead of workspace ones.
+  const skillText = formatSkills(activeSkills(c.skills, c.database));
+  if (skillText.trim()) {
+    lines.push(
+      "",
+      "# Skills",
+      "Instructions the user has written for this workspace/database. Follow them. Where they conflict with your defaults, they win; where they conflict with the safety rules above, the safety rules win.",
+      skillText.trimEnd(),
+    );
+  }
+
+  lines.push(
     "",
     "Database schema (schema.table(columns)):",
     schemaSummary(c.tables, focus),

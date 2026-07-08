@@ -1,8 +1,7 @@
 import { createSignal, createEffect, For, Index, Show, onMount, type Accessor } from "solid-js";
 import { invoke, Channel } from "@tauri-apps/api/core";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import {
-  aiStore, defaultModel, providerModels, providerInfo, AI_PROVIDERS, isKeyless,
+  aiStore, activeBaseUrl, defaultModel, providerModels, providerInfo, AI_PROVIDERS, isKeyless,
   resolveWire, resolveBaseUrl, modelSupported, groupByTier, modelNote,
   type AiConfig, type AiProvider, type AiEvent,
 } from "./store";
@@ -42,6 +41,8 @@ export function AiPanel(props: {
   /** Prime the FK graph before the first send (best-effort; the prompt stays silent
    *  about foreign keys if it never lands, rather than claiming there are none). */
   ensureFks?: () => Promise<void>;
+  /** Open Settings → AI (provider cards, keys, skills). */
+  onOpenSettings: () => void;
   /** Docked panel width in px (resizable by the splitter on its left edge). */
   width: number;
   onInsertSql: (sql: string) => void;
@@ -61,7 +62,7 @@ export function AiPanel(props: {
   async function fetchModels(pid: AiProvider) {
     // The base override only applies to the provider it was configured for; every other
     // provider is fetched at its registry default.
-    const override = cfg().provider === pid ? cfg().baseUrl : "";
+    const override = cfg().baseUrls[pid] ?? "";
     const spec = providerInfo(pid);
     const baseUrl = resolveBaseUrl(pid, override);
     if (!baseUrl) return; // no default, no override — never let the backend guess (see runTurn)
@@ -77,7 +78,6 @@ export function AiPanel(props: {
       /* keep the curated fallback */
     }
   }
-  const [keyInput, setKeyInput] = createSignal("");
   const [settingsOpen, setSettingsOpen] = createSignal(false);
   const [messages, setMessages] = createSignal<ChatMsg[]>([]);
   const [input, setInput] = createSignal("");
@@ -106,7 +106,6 @@ export function AiPanel(props: {
   // exists → land straight in the chat. Deciding before the check (or in an
   // effect over keyed(), which starts []) wrongly flashed settings open on every
   // panel open even after setup.
-  let keysChecked = false;
   const refreshKeyed = async () => {
     const checks = await Promise.all(
       AI_PROVIDERS.map((p) => providerReady(p.id).then((ok) => (ok ? p.id : null))),
@@ -116,12 +115,8 @@ export function AiPanel(props: {
     // Keyless providers are "ready" but may have no server running — fetching their
     // catalog is what actually tells us, and a failure just leaves them empty.
     for (const p of list) if (!liveModels()[p]) void fetchModels(p);
-    if (!keysChecked) {
-      keysChecked = true;
-      // Land in the chat only if a real key exists somewhere; a keyless local provider
-      // being "ready" shouldn't skip first-run setup for someone with no server running.
-      setSettingsOpen(!list.some((p) => !isKeyless(p)));
-    }
+    // First-run routing: with no provider set up, the header shows "✨ Set up a model →"
+    // which opens Settings → AI. No drawer to flash open.
   };
 
   onMount(() => { void refreshKey(); void refreshKeyed(); });
@@ -132,7 +127,7 @@ export function AiPanel(props: {
   let modelsTimer: ReturnType<typeof setTimeout> | undefined;
   createEffect(() => {
     const p = cfg().provider;
-    cfg().baseUrl; // track
+    cfg().baseUrls[p]; // track
     if (!keyed().includes(p)) return;
     clearTimeout(modelsTimer);
     modelsTimer = setTimeout(() => void fetchModels(p), 600);
@@ -145,20 +140,6 @@ export function AiPanel(props: {
     if (msgEl) pinned = msgEl.scrollHeight - msgEl.scrollTop - msgEl.clientHeight < 48;
   };
   createEffect(() => { messages(); if (msgEl && pinned) msgEl.scrollTop = msgEl.scrollHeight; });
-
-  async function saveKey() {
-    const k = keyInput().trim();
-    if (!k) return;
-    await invoke("ai_save_key", { provider: cfg().provider, key: k });
-    setKeyInput("");
-    await Promise.all([refreshKey(), refreshKeyed()]);
-    void fetchModels(cfg().provider); // new key may unlock a different catalog
-    setSettingsOpen(false);
-  }
-  async function clearKey() {
-    await invoke("ai_clear_key", { provider: cfg().provider });
-    await Promise.all([refreshKey(), refreshKeyed()]);
-  }
 
   function appendAssistant(text: string) {
     setMessages((ms) => {
@@ -209,7 +190,7 @@ export function AiPanel(props: {
   /** Stream one assistant reply for `convo` (which must end with a user message). */
   async function runTurn(convo: ChatMsg[]) {
     if (streaming()) return;
-    if (!hasKey()) { setSettingsOpen(true); return; }
+    if (!hasKey()) { props.onOpenSettings(); return; }
     pinned = true; // a fresh send always follows the reply
     setMessages([...convo, { role: "assistant", content: "" }]);
     setStreaming(true);
@@ -261,7 +242,7 @@ export function AiPanel(props: {
       // A provider with no registry default and no override resolves to "". Sending null
       // would make the backend fall back to api.openai.com — quietly shipping the schema,
       // FK graph, sample rows and the user's key to a third party. Refuse instead.
-      const baseUrl = resolveBaseUrl(c.provider, c.baseUrl, wire);
+      const baseUrl = resolveBaseUrl(c.provider, activeBaseUrl(c), wire);
       if (!baseUrl) {
         finishTurn(id, { error: `Set an API base URL for ${providerInfo(c.provider).label} in AI settings.` });
         return;
@@ -300,7 +281,7 @@ export function AiPanel(props: {
   function send(text: string) {
     if (!text.trim() || streaming()) return;
     // Bail BEFORE clearing the composer — otherwise the no-key path eats the question.
-    if (!hasKey()) { setSettingsOpen(true); return; }
+    if (!hasKey()) { props.onOpenSettings(); return; }
     autoRetries = AUTO_RETRY_BUDGET; // a fresh question gets a fresh restart budget
     setInput("");
     queueMicrotask(autoGrow); // collapse the composer back to one line
@@ -364,7 +345,7 @@ export function AiPanel(props: {
       <div class="ai-head">
         <Show
           when={keyed().length > 0}
-          fallback={<button class="ai-setup" onClick={() => setSettingsOpen(true)}>✨ Set up a model →</button>}
+          fallback={<button class="ai-setup" onClick={() => props.onOpenSettings()}>✨ Set up a model →</button>}
         >
           <select
             class="ai-model-select"
@@ -397,61 +378,19 @@ export function AiPanel(props: {
 
       <Show when={settingsOpen()}>
         <div class="ai-settings">
-          <label>Provider
-            <select value={cfg().provider} onChange={(e) => setConfig({ provider: e.currentTarget.value as AiProvider, model: defaultModel(e.currentTarget.value as AiProvider) })}>
-              <For each={AI_PROVIDERS}>{(p) => <option value={p.id}>{p.label}</option>}</For>
-            </select>
-          </label>
-          <Show when={providerInfo(cfg().provider).note}>
-            {(note) => <div class="ai-note">{note()}</div>}
-          </Show>
-          <label>Model
-            <select
-              onChange={(e) => { const v = e.currentTarget.value; setConfig({ model: v === "__custom__" ? "" : v }); }}
-            >
-              {/* `selected` per option — the model list is fetched async (see header). */}
-              <For each={groupByTier(cfg().provider, modelsFor(cfg().provider))}>
-                {(g) => (
-                  <optgroup label={g.label}>
-                    <For each={g.models}>
-                      {(m) => <option value={m} selected={cfg().model === m} title={modelNote(cfg().provider, m)}>{m}</option>}
-                    </For>
-                  </optgroup>
-                )}
-              </For>
-              <option value="__custom__" selected={!modelsFor(cfg().provider).includes(cfg().model)}>Custom…</option>
-            </select>
-            <Show when={!modelsFor(cfg().provider).includes(cfg().model)}>
-              <input value={cfg().model} onInput={(e) => setConfig({ model: e.currentTarget.value })} placeholder="model id (e.g. for a local / OpenAI-compatible server)" />
-            </Show>
-            <Show when={curModelNote()}>{(n) => <div class="ai-note">{n()}</div>}</Show>
-          </label>
-          <label>
-            {providerInfo(cfg().provider).id === "custom" ? "API base (required)" : "API base (optional)"}
-            <input value={cfg().baseUrl} onInput={(e) => setConfig({ baseUrl: e.currentTarget.value })} placeholder={providerInfo(cfg().provider).baseHint} />
-          </label>
+          {/* Provider/model/key management lives in Settings → AI now (provider cards,
+              Test connection, skills). This drawer keeps only the one control that is a
+              per-conversation privacy decision rather than configuration. */}
           <label class="ai-check" title="Send a few sample rows of relevant tables so the model understands your real data. Real values leave your machine for the provider.">
             <input type="checkbox" checked={cfg().shareSamples !== false} onChange={(e) => setConfig({ shareSamples: e.currentTarget.checked })} />
             Share sample data with the model
           </label>
-          {/* Local servers authenticate nothing — showing a key field would imply otherwise. */}
-          <Show
-            when={providerInfo(cfg().provider).needsKey}
-            fallback={<div class="ai-note">No API key needed — {providerInfo(cfg().provider).label} runs on this machine.</div>}
-          >
-            <label>API key {hasKey() ? <span class="ai-key-ok">saved ✓</span> : <span class="ai-key-missing">not set</span>}
-              <input type="password" value={keyInput()} onInput={(e) => setKeyInput(e.currentTarget.value)} placeholder={hasKey() ? "•••••• (stored in keychain)" : "paste key"} />
-              <Show when={providerInfo(cfg().provider).keyUrl}>
-                <button type="button" class="ai-key-link" onClick={() => void openUrl(providerInfo(cfg().provider).keyUrl)}>Get an API key ↗</button>
-              </Show>
-            </label>
-            <div class="ai-settings-actions">
-              <Show when={hasKey()}><button class="ghost" onClick={clearKey}>Clear key</button></Show>
-              <span class="spacer" />
-              <button class="run" disabled={!keyInput().trim()} onClick={saveKey}>Save key</button>
-            </div>
-            <div class="ai-note">The key is stored in your OS keychain and used only by the backend — it never reaches the web view.</div>
-          </Show>
+          <div class="ai-settings-actions">
+            <button class="ghost" onClick={() => { setSettingsOpen(false); props.onOpenSettings(); }}>
+              Manage providers &amp; skills…
+            </button>
+          </div>
+          <div class="ai-note">Keys are stored in your OS keychain and used only by the backend — they never reach the web view.</div>
         </div>
       </Show>
 

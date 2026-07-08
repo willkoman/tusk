@@ -32,6 +32,7 @@ import { keymapStore } from "./store";
 import { historyStore, makeEntryId, type HistoryEntry } from "./history/store";
 import { detectParams, type Param, type ParamValue } from "./sql/params";
 import { type FkEdge } from "./sql/fk";
+import { type Skill } from "./ai/skills";
 import { ParamDialog } from "./forms/ParamDialog";
 import { detectPlan } from "./plan/detect";
 import { explainSql, analyzeExecutesWrite } from "./plan/explainSql";
@@ -172,6 +173,8 @@ function App() {
     permissionsEnforced: !!perms()?.enforced,
     activeSchema: activeTab().searchSchema,
     tables: schema(),
+    database: tree()?.database ?? "",
+    skills: skills(),
     fks: fkEdges(),
     // Only true once a fetch actually landed for some schema and the driver supports it.
     fksKnown: caps()?.relationships !== false && fkFetched.size > 0,
@@ -265,6 +268,10 @@ function App() {
   const [funcs, setFuncs] = createSignal<ReadonlySet<string>>(new Set<string>());
   // Live FK edges for the JOIN…ON completion (active schema + public, merged).
   const [fkEdges, setFkEdges] = createSignal<FkEdge[]>([]);
+  // User-authored AI skills (stored on disk by Rust). Reloaded whenever Settings closes,
+  // since that's the only place they're created/edited/imported/removed.
+  const [skills, setSkills] = createSignal<Skill[]>([]);
+  const refreshSkills = () => invoke<Skill[]>("skills_list").then(setSkills).catch(() => setSkills([]));
   const fkFetched = new Set<string>(); // schemas fetched SUCCESSFULLY (cleared per introspection)
   const fkInFlight = new Set<string>(); // dedupe concurrent fetches of the same schema
   // Per-table detail (columns/indexes/constraints), fetched lazily on expand and cached.
@@ -854,6 +861,7 @@ function App() {
   const slackUnlisten: UnlistenFn[] = [];
 
   onMount(async () => {
+    void refreshSkills();
     // Suppress the WebView's native right-click menu app-wide; the sidebar shows
     // its own context menu, and the editor uses keyboard shortcuts for copy/paste.
     document.addEventListener("contextmenu", (e) => e.preventDefault());
@@ -2618,6 +2626,7 @@ function App() {
               ctx={aiContext}
               sampleRows={aiSampleRows}
               ensureFks={ensureAiFks}
+              onOpenSettings={() => setSettingsOpen("ai")}
               width={aiW()}
               onInsertSql={(sql) => openGeneratedTab(sql, activeTab().searchSchema, "AI query")}
               onClose={() => setAiOpen(false)}
@@ -2866,9 +2875,12 @@ function App() {
         <SettingsDialog
           prefs={prefs}
           update={updatePrefs}
-          onClose={() => setSettingsOpen(null)}
+          // Skills live on disk and are only mutated from Settings → AI, so a reload on
+          // close is enough to keep `aiContext().skills` fresh without polling.
+          onClose={() => { setSettingsOpen(null); void refreshSkills(); }}
           initialTab={settingsOpen()!}
           connected={!!conn()}
+          database={tree()?.database ?? ""}
           shortcutsPane={() => <ShortcutsPane keys={keys} update={updateKeys} resetAll={resetKeys} />}
         />
       </Show>

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { relevantTables, formatSamples, buildSystemPrompt, foreignKeySummary, type AiCtxTable, type SampleTable, type AiContext } from "./context";
 import type { FkEdge } from "../sql/fk";
+import type { Skill } from "./skills";
 
 const fk = (srcTable: string, srcCols: string[], dstTable: string, dstCols: string[], schema = "public"): FkEdge => ({
   constraint: `${srcTable}_fk`, srcSchema: schema, srcTable, srcCols, dstSchema: schema, dstTable, dstCols,
@@ -65,6 +66,8 @@ describe("buildSystemPrompt with samples", () => {
     permissionsEnforced: false,
     fks: [],
     fksKnown: false,
+    database: "testdb",
+    skills: [],
     activeSchema: null,
     tables,
     currentSql: "",
@@ -92,6 +95,7 @@ describe("foreign keys in the prompt", () => {
     dialect: "postgres", driverLabel: "PostgreSQL", version: "16", user: "me",
     isSuperuser: false, permissionsEnforced: false, activeSchema: null,
     tables, currentSql: "", selection: "", lastError: "", fks: [], fksKnown: false,
+    database: "testdb", skills: [],
   };
 
   it("renders single and composite edges readably", () => {
@@ -168,5 +172,46 @@ describe("provider message list", () => {
   it("never drops a user turn, even a whitespace-only one", () => {
     const convo: M[] = [{ role: "user", content: "  " }];
     expect(toProviderMessages(convo)).toEqual([{ role: "user", content: "  " }]);
+  });
+});
+
+
+describe("skills in the system prompt", () => {
+  const base: AiContext = {
+    dialect: "postgres", driverLabel: "PostgreSQL", version: "16", user: "me",
+    isSuperuser: false, permissionsEnforced: false, activeSchema: null,
+    tables, currentSql: "", selection: "", lastError: "", fks: [], fksKnown: false,
+    database: "pagila", skills: [],
+  };
+  const skill = (p: Partial<Skill> & { name: string }): Skill => ({
+    id: p.name, description: "", scope: "workspace", database: "", enabled: true, body: "b", ...p,
+  });
+
+  it("puts skills BEFORE the schema — house rules are read before the data", () => {
+    const out = buildSystemPrompt({ ...base, skills: [skill({ name: "Revenue", body: "exclude refunds" })] });
+    expect(out).toContain("# Skills");
+    expect(out).toContain("exclude refunds");
+    expect(out.indexOf("# Skills")).toBeLessThan(out.indexOf("Database schema"));
+  });
+
+  it("scopes database skills to the connected database", () => {
+    const skills = [
+      skill({ name: "Here", scope: "database", database: "pagila", body: "applies" }),
+      skill({ name: "Elsewhere", scope: "database", database: "other", body: "must not appear" }),
+    ];
+    const out = buildSystemPrompt({ ...base, skills });
+    expect(out).toContain("applies");
+    expect(out).not.toContain("must not appear");
+  });
+
+  it("emits no Skills section at all when nothing is in scope", () => {
+    expect(buildSystemPrompt(base)).not.toContain("# Skills");
+    const off = [skill({ name: "Off", enabled: false, body: "x" })];
+    expect(buildSystemPrompt({ ...base, skills: off })).not.toContain("# Skills");
+  });
+
+  it("tells the model the safety rules outrank a skill", () => {
+    const out = buildSystemPrompt({ ...base, skills: [skill({ name: "S", body: "b" })] });
+    expect(out).toMatch(/safety rules win/i);
   });
 });
