@@ -172,6 +172,9 @@ function App() {
     permissionsEnforced: !!perms()?.enforced,
     activeSchema: activeTab().searchSchema,
     tables: schema(),
+    fks: fkEdges(),
+    // Only true once a fetch actually landed for some schema and the driver supports it.
+    fksKnown: caps()?.relationships !== false && fkFetched.size > 0,
     currentSql: editorApi()?.getDoc() ?? activeTab().sql,
     selection: editorApi()?.getSelection() ?? "",
     lastError: activeTab().result.runErr,
@@ -262,7 +265,8 @@ function App() {
   const [funcs, setFuncs] = createSignal<ReadonlySet<string>>(new Set<string>());
   // Live FK edges for the JOIN…ON completion (active schema + public, merged).
   const [fkEdges, setFkEdges] = createSignal<FkEdge[]>([]);
-  const fkFetched = new Set<string>(); // schemas already fetched (cleared per introspection)
+  const fkFetched = new Set<string>(); // schemas fetched SUCCESSFULLY (cleared per introspection)
+  const fkInFlight = new Set<string>(); // dedupe concurrent fetches of the same schema
   // Per-table detail (columns/indexes/constraints), fetched lazily on expand and cached.
   const [details, setDetails] = createSignal<Record<string, RelationDetail>>({});
   const loadedRels = new Map<string, { schema: string; name: string }>();
@@ -1257,20 +1261,35 @@ function App() {
     if ((activeTab().searchSchema ?? "public") !== "public") await fetchFkSchema("public");
   }
 
+  /** Make sure the AI's join graph is loaded before a send: the same schemas autocomplete
+   *  primes (active + public). Without this the panel would ship an empty `fks` on the
+   *  first question of a session and the model would guess joins. */
+  async function ensureAiFks() {
+    const names = new Set([activeTab().searchSchema ?? "public", "public"]);
+    await Promise.all([...names].map((n) => fetchFkSchema(n)));
+  }
+
   /** Fetch one schema's FK edges into fkEdges (deduped; best-effort). */
   async function fetchFkSchema(schemaName: string) {
     const c = conn();
-    if (!c || caps()?.relationships === false || fkFetched.has(schemaName)) return;
-    fkFetched.add(schemaName);
+    if (!c || caps()?.relationships === false || fkFetched.has(schemaName) || fkInFlight.has(schemaName)) return;
+    fkInFlight.add(schemaName);
     try {
       const g = await invoke<{ tables: unknown[]; edges: FkEdge[] }>("schema_relationships", { connectionId: c.id, schema: schemaName });
+      // Mark fetched ONLY on success. `fksKnown` (which gates the AI prompt's "this schema
+      // declares no foreign keys" claim) is derived from this set — marking before the
+      // await meant a FAILED fetch asserted the schema had no FKs, the exact lie the
+      // tri-state exists to prevent. A failure stays unmarked so the next send retries.
+      fkFetched.add(schemaName);
       setFkEdges((prev) => {
         const key = (e: FkEdge) => `${e.constraint}|${e.srcSchema}.${e.srcTable}`;
         const seen = new Set(prev.map(key));
         return [...prev, ...g.edges.filter((e) => !seen.has(key(e)))];
       });
     } catch {
-      /* best-effort — completion just has fewer hints */
+      /* best-effort — completion just has fewer hints, and the prompt stays silent on FKs */
+    } finally {
+      fkInFlight.delete(schemaName);
     }
   }
 
@@ -2598,6 +2617,7 @@ function App() {
             <AiPanel
               ctx={aiContext}
               sampleRows={aiSampleRows}
+              ensureFks={ensureAiFks}
               width={aiW()}
               onInsertSql={(sql) => openGeneratedTab(sql, activeTab().searchSchema, "AI query")}
               onClose={() => setAiOpen(false)}

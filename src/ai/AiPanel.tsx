@@ -1,15 +1,37 @@
 import { createSignal, createEffect, For, Index, Show, onMount, type Accessor } from "solid-js";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { aiStore, defaultModel, providerModels, providerInfo, AI_PROVIDERS, type AiConfig, type AiProvider, type AiEvent } from "./store";
+import {
+  aiStore, defaultModel, providerModels, providerInfo, AI_PROVIDERS, isKeyless,
+  resolveWire, resolveBaseUrl, modelSupported, groupByTier, modelNote,
+  type AiConfig, type AiProvider, type AiEvent,
+} from "./store";
 import { buildSystemPrompt, relevantTables, type AiContext, type SampleTable } from "./context";
 import { Markdown } from "./markdown";
 
-type ChatMsg = { role: "user" | "assistant"; content: string };
+/** A turn's outcome lives on the message, NOT in its `content` — an error appended to the
+ *  text would be replayed to the provider as part of the conversation on the next send. */
+type ChatMsg = {
+  role: "user" | "assistant";
+  content: string;
+  /** The turn failed (provider error, dropped stream, empty reply). Retryable. */
+  error?: string;
+  /** The turn was stopped by the user. Retryable. */
+  cancelled?: boolean;
+  /** The model hit its token ceiling — the reply is cut short. */
+  truncated?: boolean;
+};
 
 function errMsg(e: unknown): string {
   return e instanceof Object && "message" in e ? String((e as { message: unknown }).message) : String(e);
 }
+
+const newRequestId = () =>
+  globalThis.crypto?.randomUUID?.() ?? `req-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+/** Automatic restarts of a turn that died mid-stream, per user turn. After these are
+ *  spent the message keeps its error and the manual Retry button takes over. */
+const AUTO_RETRY_BUDGET = 1;
 
 /** AI assistant panel: provider settings (key → OS keychain) + a streaming chat that
  *  knows the connected DB's schema/dialect/permissions. Proposes SQL; never auto-runs. */
@@ -17,6 +39,9 @@ export function AiPanel(props: {
   ctx: Accessor<AiContext>;
   /** Fetch a few sample rows for the given relations (read-only; best-effort). */
   sampleRows: (targets: { schema: string; name: string }[]) => Promise<SampleTable[]>;
+  /** Prime the FK graph before the first send (best-effort; the prompt stays silent
+   *  about foreign keys if it never lands, rather than claiming there are none). */
+  ensureFks?: () => Promise<void>;
   /** Docked panel width in px (resizable by the splitter on its left edge). */
   width: number;
   onInsertSql: (sql: string) => void;
@@ -28,12 +53,25 @@ export function AiPanel(props: {
   // Live model catalog per provider (fetched via the backend with the keychain key);
   // the curated list in store.ts is only the fallback when the fetch fails.
   const [liveModels, setLiveModels] = createSignal<Partial<Record<AiProvider, string[]>>>({});
-  const modelsFor = (pid: AiProvider) => liveModels()[pid] ?? providerModels(pid);
+  /** Live catalog when we have one, else the registry's curated fallback — minus any
+   *  model this provider serves on a wire we don't speak (`wireFor` → null). Both
+   *  OpenCode gateways are fully covered today, so nothing is filtered in practice. */
+  const modelsFor = (pid: AiProvider) =>
+    (liveModels()[pid] ?? providerModels(pid)).filter((m) => modelSupported(pid, m));
   async function fetchModels(pid: AiProvider) {
-    // The base override only applies to the provider it was configured for.
-    const baseUrl = cfg().provider === pid ? cfg().baseUrl.trim() || null : null;
+    // The base override only applies to the provider it was configured for; every other
+    // provider is fetched at its registry default.
+    const override = cfg().provider === pid ? cfg().baseUrl : "";
+    const spec = providerInfo(pid);
+    const baseUrl = resolveBaseUrl(pid, override);
+    if (!baseUrl) return; // no default, no override — never let the backend guess (see runTurn)
     try {
-      const list = await invoke<string[]>("ai_list_models", { provider: pid, baseUrl });
+      const list = await invoke<string[]>("ai_list_models", {
+        provider: pid,
+        wire: spec.wire,
+        baseUrl,
+        allowNoKey: !spec.needsKey,
+      });
       if (list.length) setLiveModels((m) => ({ ...m, [pid]: list }));
     } catch {
       /* keep the curated fallback */
@@ -59,7 +97,10 @@ export function AiPanel(props: {
     setCfg(next);
     aiStore.save(next);
   };
-  const refreshKey = async () => setHasKey(await invoke<boolean>("ai_has_key", { provider: cfg().provider }).catch(() => false));
+  // A keyless local server is always "ready" — never gate it behind the key prompt.
+  const providerReady = async (p: AiProvider) =>
+    isKeyless(p) || (await invoke<boolean>("ai_has_key", { provider: p }).catch(() => false));
+  const refreshKey = async () => setHasKey(await providerReady(cfg().provider));
   // First-open routing happens HERE, once the async keychain check resolves: no
   // saved key anywhere → show the setup form (provider/model/key prompt); a key
   // exists → land straight in the chat. Deciding before the check (or in an
@@ -68,14 +109,18 @@ export function AiPanel(props: {
   let keysChecked = false;
   const refreshKeyed = async () => {
     const checks = await Promise.all(
-      AI_PROVIDERS.map((p) => invoke<boolean>("ai_has_key", { provider: p.id }).then((h) => (h ? p.id : null)).catch(() => null)),
+      AI_PROVIDERS.map((p) => providerReady(p.id).then((ok) => (ok ? p.id : null))),
     );
     const list = checks.filter((x): x is AiProvider => !!x);
     setKeyed(list);
+    // Keyless providers are "ready" but may have no server running — fetching their
+    // catalog is what actually tells us, and a failure just leaves them empty.
     for (const p of list) if (!liveModels()[p]) void fetchModels(p);
     if (!keysChecked) {
       keysChecked = true;
-      setSettingsOpen(list.length === 0);
+      // Land in the chat only if a real key exists somewhere; a keyless local provider
+      // being "ready" shouldn't skip first-run setup for someone with no server running.
+      setSettingsOpen(!list.some((p) => !isKeyless(p)));
     }
   };
 
@@ -124,23 +169,65 @@ export function AiPanel(props: {
     });
   }
 
-  async function send(text: string) {
-    if (!text.trim() || streaming()) return;
+  // The in-flight turn's request id. Every event is checked against it, so a cancelled
+  // or superseded stream can never write into the message list after the fact.
+  let curReq: string | null = null;
+  // Automatic restarts left for the current user turn. Reset on every fresh send, so a
+  // conversation can't accumulate retries and a dying provider can't loop forever.
+  let autoRetries = AUTO_RETRY_BUDGET;
+
+  /** End the active turn exactly once, stamping its outcome on the assistant message.
+   *  A turn that died AFTER painting text can't be replayed by the backend (that would
+   *  duplicate what's on screen), so it lands here as an error — restart it once. */
+  function finishTurn(id: string, patch: Pick<ChatMsg, "error" | "cancelled" | "truncated">) {
+    if (curReq !== id) return; // already ended (or superseded)
+    curReq = null;
+    setStreaming(false);
+    let diedMidStream = false;
+    setMessages((ms) => {
+      const next = [...ms];
+      const last = next[next.length - 1];
+      if (!last || last.role !== "assistant") return ms;
+      // A clean finish with nothing to show is a failure the user can retry — this is
+      // what a silently-dropped provider error used to look like.
+      const empty = !last.content.trim();
+      const error = patch.error ?? (empty && !patch.cancelled ? "The model returned an empty response." : undefined);
+      // Only a partial reply means the stream genuinely died in flight. An empty one
+      // already exhausted the backend's own replay budget — restarting it just burns
+      // another round trip against the same fatal condition (bad key, bad model).
+      diedMidStream = !!patch.error && !patch.cancelled && !empty;
+      next[next.length - 1] = { ...last, ...patch, error };
+      return next;
+    });
+    if (diedMidStream && autoRetries > 0) {
+      autoRetries--;
+      // Let the state settle before restarting; `retry()` re-reads messages().
+      queueMicrotask(() => retry());
+    }
+  }
+
+  /** Stream one assistant reply for `convo` (which must end with a user message). */
+  async function runTurn(convo: ChatMsg[]) {
+    if (streaming()) return;
     if (!hasKey()) { setSettingsOpen(true); return; }
-    const convo: ChatMsg[] = [...messages(), { role: "user", content: text }];
     pinned = true; // a fresh send always follows the reply
     setMessages([...convo, { role: "assistant", content: "" }]);
-    setInput("");
-    queueMicrotask(autoGrow); // collapse the composer back to one line
     setStreaming(true);
+    const id = newRequestId();
+    curReq = id;
+
     const channel = new Channel<AiEvent>();
     channel.onmessage = (ev) => {
+      if (curReq !== id) return; // stale stream — cancelled or superseded
       if (ev.type === "delta") appendAssistant(ev.text);
-      else if (ev.type === "error") { appendAssistant(`\n\n⚠️ ${ev.message}`); setStreaming(false); }
-      else setStreaming(false);
+      else if (ev.type === "error") finishTurn(id, { error: ev.message });
+      else if (ev.type === "cancelled") finishTurn(id, { cancelled: true });
+      else finishTurn(id, { truncated: ev.truncated });
     };
     try {
       const c = cfg();
+      // Prime the join graph BEFORE snapshotting ctx — `fks`/`fksKnown` are read off it.
+      await props.ensureFks?.().catch(() => { /* best-effort — prompt omits the FK section */ });
       const ctx = props.ctx();
       const convoText = convo.map((m) => m.content).join("\n");
       // Ground the model in real data: fetch a few sample rows of the tables most
@@ -153,39 +240,124 @@ export function AiPanel(props: {
           try { samples = await props.sampleRows(targets); } catch { /* best-effort — no samples */ }
         }
       }
+      // Stop pressed while sampling: the stream was never registered, so `ai_cancel`
+      // has nothing to interrupt — just don't start it.
+      if (curReq !== id) return;
+      const model = c.model || defaultModel(c.provider);
+      // Live-catalog-only providers (routers, local servers) have no curated default,
+      // so an unreachable server or an unset model must say so, not 404 at the provider.
+      if (!model) {
+        finishTurn(id, { error: `No model selected for ${providerInfo(c.provider).label}. Pick one in AI settings.` });
+        return;
+      }
+      // OpenCode serves each family on a different endpoint; the wire is per MODEL,
+      // not per provider. `null` = a shape we don't speak (should be unreachable —
+      // modelsFor already filters those out of the picker).
+      const wire = resolveWire(c.provider, model);
+      if (!wire) {
+        finishTurn(id, { error: `${providerInfo(c.provider).label} doesn't serve ${model} on an API shape Tusk supports.` });
+        return;
+      }
+      // A provider with no registry default and no override resolves to "". Sending null
+      // would make the backend fall back to api.openai.com — quietly shipping the schema,
+      // FK graph, sample rows and the user's key to a third party. Refuse instead.
+      const baseUrl = resolveBaseUrl(c.provider, c.baseUrl, wire);
+      if (!baseUrl) {
+        finishTurn(id, { error: `Set an API base URL for ${providerInfo(c.provider).label} in AI settings.` });
+        return;
+      }
       await invoke("ai_chat", {
         req: {
           provider: c.provider,
-          model: c.model || defaultModel(c.provider),
-          baseUrl: c.baseUrl.trim() || null,
+          wire,
+          model,
+          baseUrl,
           // Conversation text steers the schema summary: mentioned tables get
           // their full columns even when the schema dump is over budget.
           system: buildSystemPrompt(ctx, convoText, samples),
-          messages: convo.map((m) => ({ role: m.role, content: m.content })),
+          // Only the text is replayed — a prior turn's error/cancel never becomes context.
+          // Content-less assistant turns (Stop before the first delta, empty reply) stay
+          // in the DISPLAY list but must never be sent: Anthropic and Gemini reject an
+          // empty assistant message with a 400, which would break every later question
+          // in this chat, not just the failed one.
+          messages: convo
+            .filter((m) => m.role === "user" || m.content.trim())
+            .map((m) => ({ role: m.role, content: m.content })),
           maxTokens: 2048,
+          requestId: id,
+          allowNoKey: isKeyless(c.provider),
         },
         onEvent: channel,
       });
+      // `ai_chat` resolves after its terminal event, so finishTurn has normally already
+      // run. This only fires if the command returned without one (it shouldn't).
+      finishTurn(id, { error: "The stream ended unexpectedly." });
     } catch (e) {
-      appendAssistant(`\n\n⚠️ ${errMsg(e)}`);
-      setStreaming(false);
+      finishTurn(id, { error: errMsg(e) });
     }
+  }
+
+  function send(text: string) {
+    if (!text.trim() || streaming()) return;
+    // Bail BEFORE clearing the composer — otherwise the no-key path eats the question.
+    if (!hasKey()) { setSettingsOpen(true); return; }
+    autoRetries = AUTO_RETRY_BUDGET; // a fresh question gets a fresh restart budget
+    setInput("");
+    queueMicrotask(autoGrow); // collapse the composer back to one line
+    void runTurn([...messages(), { role: "user", content: text }]);
+  }
+
+  /** Stop the in-flight stream. The backend keeps the partial text on screen. */
+  function cancel() {
+    const id = curReq;
+    if (!id) return;
+    finishTurn(id, { cancelled: true }); // ends the turn even if the backend never answers
+    void invoke("ai_cancel", { requestId: id }).catch(() => { /* already finished */ });
+  }
+
+  /** Re-run the failed/cancelled last turn, dropping its dead assistant message. Used by
+   *  the Retry button and by the one automatic restart after a mid-stream death. */
+  function retry() {
+    const ms = messages();
+    const last = ms[ms.length - 1];
+    if (streaming() || !last || last.role !== "assistant") return;
+    void runTurn(ms.slice(0, -1));
+  }
+
+  function newChat() {
+    cancel();
+    setMessages([]);
   }
 
   // Quick actions seed the chat; the schema/SQL/error already ride in the system prompt.
   const explain = () => send("Explain what the SQL in my editor does, step by step.");
   const fixError = () => send("My last query errored (see the error in context). Diagnose it and give a corrected query.");
+  /** The last message, when it's a finished assistant turn that the user can retry. */
+  const failedLast = () => {
+    const last = messages()[messages().length - 1];
+    return !streaming() && last?.role === "assistant" && (last.error || last.cancelled) ? last : undefined;
+  };
 
-  // Header model picker: every model of every provider that has a key saved, so the model
-  // can be switched freely without reopening settings. Live catalog when fetched
-  // (curated fallback otherwise); the current custom model is always included.
-  const headerModels = () =>
-    keyed().map((pid) => {
+  // Header model picker: every model of every ready provider, so the model can be
+  // switched freely without reopening settings. Live catalog when fetched (curated
+  // fallback otherwise); the current custom model is always included. Providers whose
+  // catalog we know are sub-grouped by tier (Flagship / Balanced / Fast / Older);
+  // routers and local servers render as one flat "Models" group.
+  const headerGroups = () =>
+    keyed().flatMap((pid) => {
       const models = [...modelsFor(pid)];
       if (cfg().provider === pid && cfg().model && !models.includes(cfg().model)) models.unshift(cfg().model);
-      return { label: providerInfo(pid).label, pid, models };
+      if (!models.length) return [];
+      const label = providerInfo(pid).label;
+      return groupByTier(pid, models).map((g) => ({
+        // "Anthropic · Flagship" — one <optgroup> per (provider, tier).
+        label: `${label} · ${g.label}`,
+        pid,
+        models: g.models,
+      }));
     });
   const curModelValue = () => `${cfg().provider}|${cfg().model}`;
+  const curModelNote = () => modelNote(cfg().provider, cfg().model);
 
   return (
     <div class="ai-panel" style={{ width: `${props.width}px` }}>
@@ -196,17 +368,21 @@ export function AiPanel(props: {
         >
           <select
             class="ai-model-select"
-            title="Model (providers with a saved key)"
+            title={curModelNote() ?? "Model (providers that are set up)"}
             onChange={(e) => { const [p, ...rest] = e.currentTarget.value.split("|"); setConfig({ provider: p as AiProvider, model: rest.join("|") }); }}
           >
             {/* `selected` per option (not `value` on the select): options load async from
                 the live catalog, and Solid won't re-apply a select `value` when they arrive —
                 so the picker would stick on whatever mounted first. */}
-            <For each={headerModels()}>
+            <For each={headerGroups()}>
               {(g) => (
                 <optgroup label={g.label}>
                   <For each={g.models}>
-                    {(m) => <option value={`${g.pid}|${m}`} selected={curModelValue() === `${g.pid}|${m}`}>{m}</option>}
+                    {(m) => (
+                      <option value={`${g.pid}|${m}`} selected={curModelValue() === `${g.pid}|${m}`} title={modelNote(g.pid, m)}>
+                        {m}
+                      </option>
+                    )}
                   </For>
                 </optgroup>
               )}
@@ -214,7 +390,7 @@ export function AiPanel(props: {
           </select>
         </Show>
         <span class="spacer" />
-        <button class="icon" title="New chat" disabled={messages().length === 0} onClick={() => { setMessages([]); setStreaming(false); }}>✚</button>
+        <button class="icon" title="New chat" disabled={messages().length === 0} onClick={newChat}>✚</button>
         <button class="icon" title="Settings" classList={{ active: settingsOpen() }} onClick={() => setSettingsOpen((v) => !v)}>⚙</button>
         <button class="icon" title="Close" onClick={props.onClose}>✕</button>
       </div>
@@ -226,33 +402,56 @@ export function AiPanel(props: {
               <For each={AI_PROVIDERS}>{(p) => <option value={p.id}>{p.label}</option>}</For>
             </select>
           </label>
+          <Show when={providerInfo(cfg().provider).note}>
+            {(note) => <div class="ai-note">{note()}</div>}
+          </Show>
           <label>Model
             <select
               onChange={(e) => { const v = e.currentTarget.value; setConfig({ model: v === "__custom__" ? "" : v }); }}
             >
               {/* `selected` per option — the model list is fetched async (see header). */}
-              <For each={modelsFor(cfg().provider)}>{(m) => <option value={m} selected={cfg().model === m}>{m}</option>}</For>
+              <For each={groupByTier(cfg().provider, modelsFor(cfg().provider))}>
+                {(g) => (
+                  <optgroup label={g.label}>
+                    <For each={g.models}>
+                      {(m) => <option value={m} selected={cfg().model === m} title={modelNote(cfg().provider, m)}>{m}</option>}
+                    </For>
+                  </optgroup>
+                )}
+              </For>
               <option value="__custom__" selected={!modelsFor(cfg().provider).includes(cfg().model)}>Custom…</option>
             </select>
             <Show when={!modelsFor(cfg().provider).includes(cfg().model)}>
-              <input value={cfg().model} onInput={(e) => setConfig({ model: e.currentTarget.value })} placeholder="custom model id (e.g. for a local / OpenAI-compatible server)" />
+              <input value={cfg().model} onInput={(e) => setConfig({ model: e.currentTarget.value })} placeholder="model id (e.g. for a local / OpenAI-compatible server)" />
             </Show>
+            <Show when={curModelNote()}>{(n) => <div class="ai-note">{n()}</div>}</Show>
           </label>
-          <label>API base (optional)<input value={cfg().baseUrl} onInput={(e) => setConfig({ baseUrl: e.currentTarget.value })} placeholder={providerInfo(cfg().provider).baseHint} /></label>
+          <label>
+            {providerInfo(cfg().provider).id === "custom" ? "API base (required)" : "API base (optional)"}
+            <input value={cfg().baseUrl} onInput={(e) => setConfig({ baseUrl: e.currentTarget.value })} placeholder={providerInfo(cfg().provider).baseHint} />
+          </label>
           <label class="ai-check" title="Send a few sample rows of relevant tables so the model understands your real data. Real values leave your machine for the provider.">
             <input type="checkbox" checked={cfg().shareSamples !== false} onChange={(e) => setConfig({ shareSamples: e.currentTarget.checked })} />
             Share sample data with the model
           </label>
-          <label>API key {hasKey() ? <span class="ai-key-ok">saved ✓</span> : <span class="ai-key-missing">not set</span>}
-            <input type="password" value={keyInput()} onInput={(e) => setKeyInput(e.currentTarget.value)} placeholder={hasKey() ? "•••••• (stored in keychain)" : "paste key"} />
-            <button type="button" class="ai-key-link" onClick={() => void openUrl(providerInfo(cfg().provider).keyUrl)}>Get an API key ↗</button>
-          </label>
-          <div class="ai-settings-actions">
-            <Show when={hasKey()}><button class="ghost" onClick={clearKey}>Clear key</button></Show>
-            <span class="spacer" />
-            <button class="run" disabled={!keyInput().trim()} onClick={saveKey}>Save key</button>
-          </div>
-          <div class="ai-note">The key is stored in your OS keychain and used only by the backend — it never reaches the web view.</div>
+          {/* Local servers authenticate nothing — showing a key field would imply otherwise. */}
+          <Show
+            when={providerInfo(cfg().provider).needsKey}
+            fallback={<div class="ai-note">No API key needed — {providerInfo(cfg().provider).label} runs on this machine.</div>}
+          >
+            <label>API key {hasKey() ? <span class="ai-key-ok">saved ✓</span> : <span class="ai-key-missing">not set</span>}
+              <input type="password" value={keyInput()} onInput={(e) => setKeyInput(e.currentTarget.value)} placeholder={hasKey() ? "•••••• (stored in keychain)" : "paste key"} />
+              <Show when={providerInfo(cfg().provider).keyUrl}>
+                <button type="button" class="ai-key-link" onClick={() => void openUrl(providerInfo(cfg().provider).keyUrl)}>Get an API key ↗</button>
+              </Show>
+            </label>
+            <div class="ai-settings-actions">
+              <Show when={hasKey()}><button class="ghost" onClick={clearKey}>Clear key</button></Show>
+              <span class="spacer" />
+              <button class="run" disabled={!keyInput().trim()} onClick={saveKey}>Save key</button>
+            </div>
+            <div class="ai-note">The key is stored in your OS keychain and used only by the backend — it never reaches the web view.</div>
+          </Show>
         </div>
       </Show>
 
@@ -267,13 +466,32 @@ export function AiPanel(props: {
           {(m) => (
             <div class="ai-msg" classList={{ user: m().role === "user", assistant: m().role === "assistant" }}>
               <Show when={m().role === "assistant"} fallback={<div class="ai-msg-body">{m().content}</div>}>
-                <Show when={m().content} fallback={<div class="ai-typing"><span /><span /><span /></div>}>
-                  <Markdown text={m().content} onInsertSql={props.onInsertSql} />
+                {/* Typing dots only while a reply is genuinely still pending — an empty
+                    message that already failed must not spin forever. */}
+                <Show when={m().content || m().error || m().cancelled} fallback={<div class="ai-typing"><span /><span /><span /></div>}>
+                  <Show when={m().content}>
+                    <Markdown text={m().content} onInsertSql={props.onInsertSql} />
+                  </Show>
+                </Show>
+                <Show when={m().truncated}>
+                  <div class="ai-msg-note">✂️ Cut off at the token limit — ask for a shorter answer, or ask it to continue.</div>
+                </Show>
+                <Show when={m().cancelled}>
+                  <div class="ai-msg-note">⏹ Stopped.</div>
+                </Show>
+                <Show when={m().error}>
+                  {(err) => <div class="ai-msg-error">⚠️ {err()}</div>}
                 </Show>
               </Show>
             </div>
           )}
         </Index>
+        {/* Retry re-runs the last user message, discarding the dead reply. */}
+        <Show when={failedLast()}>
+          <div class="ai-retry-row">
+            <button class="ghost" onClick={retry}>↻ Retry</button>
+          </div>
+        </Show>
       </div>
 
       <div class="ai-actions">
@@ -281,21 +499,32 @@ export function AiPanel(props: {
         <button class="ghost" disabled={streaming()} onClick={fixError}>Fix error</button>
       </div>
       <form class="ai-input" onSubmit={(e) => { e.preventDefault(); send(input()); }}>
+        {/* Deliberately NOT `disabled` while streaming: a disabled control receives no
+            keydown, so Esc-to-stop silently never fired. Drafting the next question
+            meanwhile is fine — `send` already no-ops while a turn is in flight. */}
         <textarea
           ref={inputEl}
           rows={1}
           value={input()}
           onInput={(e) => { setInput(e.currentTarget.value); autoGrow(); }}
           onKeyDown={(e) => {
+            // `send` no-ops while streaming; Enter must still not insert a newline.
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
               send(input());
             }
+            if (e.key === "Escape" && streaming()) cancel();
           }}
-          placeholder={streaming() ? "…streaming" : "Ask the AI… (Shift+Enter = newline)"}
-          disabled={streaming()}
+          placeholder={streaming() ? "…streaming (Esc to stop)" : "Ask the AI… (Shift+Enter = newline)"}
         />
-        <button class="run" type="submit" disabled={streaming() || !input().trim()}>Send</button>
+        {/* Send doubles as Stop while streaming — one button, never both. `run cancel` is
+            the app's existing cancel-while-busy style (solid --danger); don't invent one. */}
+        <Show
+          when={streaming()}
+          fallback={<button class="run" type="submit" disabled={!input().trim()}>Send</button>}
+        >
+          <button class="run cancel" type="button" title="Stop generating (Esc)" onClick={cancel}>⏹ Stop</button>
+        </Show>
       </form>
     </div>
   );

@@ -45,12 +45,21 @@ pub struct SlackConfig {
     /// AI settings mirrored from the frontend at save time.
     #[serde(default)]
     pub ai_provider: String,
+    /// Wire protocol for `ai_provider` ("anthropic" | "gemini" | "openai"). Empty on
+    /// `slack.json` files written before the provider registry existed — `ai_request()`
+    /// then falls back to deriving it from `ai_provider`, which is correct for the
+    /// three providers that could have been saved back then.
+    #[serde(default)]
+    pub ai_wire: String,
     #[serde(default)]
     pub ai_model: String,
     #[serde(default)]
     pub ai_base_url: Option<String>,
     #[serde(default = "d_max_tokens")]
     pub ai_max_tokens: u32,
+    /// Local model servers need no API key.
+    #[serde(default)]
+    pub ai_allow_no_key: bool,
 }
 
 fn d_rows_inline() -> usize {

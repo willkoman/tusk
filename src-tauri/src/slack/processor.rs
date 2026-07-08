@@ -188,6 +188,46 @@ async fn generate_proposal(
                 samples.push(SampleTable { schema: t.schema.clone(), name: t.name.clone(), columns, rows });
             }
         }
+        // The join graph, for the schemas the question actually touches (plus `public`).
+        // Without it the model guesses join columns — the same reason the editor's
+        // autocomplete feeds these edges to its JOIN hints.
+        //
+        // Order matters: keep RELEVANCE order and dedupe in place, then truncate. Sorting
+        // alphabetically before `take(3)` would drop the focus table's own schema (`sales`)
+        // in favour of whatever sorts first (`analytics`), and `fks_known` would then be
+        // true for a schema we never looked at — the model is told "no foreign keys" and
+        // silently invents a join condition.
+        let relevant = context::relevant_tables(&tables, &focus, 3);
+        let mut fk_schemas: Vec<String> = Vec::new();
+        for t in &relevant {
+            if !fk_schemas.contains(&t.schema) {
+                fk_schemas.push(t.schema.clone());
+            }
+        }
+        if !fk_schemas.iter().any(|s| s == "public") {
+            fk_schemas.push("public".to_string());
+        }
+        fk_schemas.truncate(3);
+
+        let mut fks: Vec<crate::relgraph::FkEdge> = Vec::new();
+        let mut fetched: Vec<&String> = Vec::new();
+        for s in &fk_schemas {
+            if let Ok(g) = c.backend.schema_relationships(s).await {
+                fetched.push(s);
+                fks.extend(g.edges);
+            }
+        }
+        // A cross-schema FK is returned by BOTH endpoints of the relationship, so the
+        // concatenation above can list the same edge twice.
+        fks.sort_by(|a, b| {
+            (&a.src_schema, &a.src_table, &a.constraint).cmp(&(&b.src_schema, &b.src_table, &b.constraint))
+        });
+        fks.dedup_by(|a, b| a.constraint == b.constraint && a.src_schema == b.src_schema && a.src_table == b.src_table);
+
+        // Only claim knowledge of the graph when EVERY schema the question touches was
+        // actually read. Anything less and the prompt must stay silent about foreign keys.
+        let fks_known = !relevant.is_empty()
+            && relevant.iter().all(|t| fetched.iter().any(|s| **s == t.schema));
         let ctx = SlackAiCtx {
             dialect: caps.kind.to_string(),
             user: perms.current_user.clone(),
@@ -195,29 +235,42 @@ async fn generate_proposal(
             permissions_enforced: perms.enforced,
             destructive_policy: cfg.destructive_policy.clone(),
         };
-        context::build_system_prompt(&ctx, &tables, &focus, &samples)
+        context::build_system_prompt(&ctx, &tables, &focus, &samples, &fks, fks_known)
     };
 
     let req = ai::AiRequest {
         provider: cfg.ai_provider.clone(),
+        // Empty on pre-registry configs — `AiRequest::wire()` then derives it from the
+        // provider name, preserving the old behaviour for anthropic/openai/gemini.
+        wire: (!cfg.ai_wire.is_empty()).then(|| cfg.ai_wire.clone()),
         model: cfg.ai_model.clone(),
         base_url: cfg.ai_base_url.clone(),
         system: Some(system),
         messages,
         max_tokens: Some(cfg.ai_max_tokens),
+        request_id: None, // nothing on the Slack side can cancel a completion
+        allow_no_key: cfg.ai_allow_no_key,
     };
-    let response = ai::complete_one_shot(&req).await?;
+    // Transient provider failures are replayed inside `complete_one_shot`; a real error
+    // (or an empty response) bubbles up here and reaches the user as an error card. It
+    // must NEVER be quietly re-labelled as "I can't help with that" — that told a user
+    // the bot couldn't write their query when the provider had actually fallen over.
+    let ai::Completion { text: response, truncated } = ai::complete_one_shot(&req).await?;
 
     let sql_blocks = context::extract_sql_blocks(&response);
     let Some(first) = sql_blocks.first() else {
-        // No SQL — the model refused (destructive ask) or answered in prose.
-        // Relay its words; if it said nothing useful, give a generic pointer.
-        let reply = response.trim();
-        return Ok(Proposal::Reply(if reply.is_empty() {
-            "I can't help with that from Slack — try the Tusk desktop editor.".to_string()
-        } else {
-            reply.to_string()
-        }));
+        // A `max_tokens` stop cuts the reply mid-sentence, leaving the ```sql fence
+        // unclosed — block extraction then finds nothing. That's a truncation, not a
+        // refusal, and it needs a fix the user can act on.
+        if truncated {
+            return Err(AppError::new(format!(
+                "the AI's answer was cut off at the {} token limit before it finished the query — raise “Max tokens” in Settings → Slack, or ask something narrower",
+                cfg.ai_max_tokens
+            )));
+        }
+        // No SQL and a complete reply — the model refused (destructive ask) or
+        // answered in prose. Relay its own words.
+        return Ok(Proposal::Reply(response.trim().to_string()));
     };
     let sql = first.trim_end_matches(';').trim().to_string();
     let explanation = response

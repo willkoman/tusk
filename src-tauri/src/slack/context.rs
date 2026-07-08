@@ -9,6 +9,7 @@ use std::collections::HashSet;
 
 // Budgets — mirror src/ai/context.ts.
 const SCHEMA_BUDGET: usize = 12_000;
+const FK_BUDGET: usize = 3_000;
 const NAME_LIST_BUDGET: usize = 2_500;
 const SAMPLE_BUDGET: usize = 4_000;
 const CELL_CAP: usize = 80;
@@ -186,12 +187,62 @@ fn schema_summary(tables: &[TableInfo], focus: &str) -> String {
     }
 }
 
+/// One FK as `orders.user_id -> users.id`, composite as `a.(x, y) -> b.(p, q)`.
+/// PARITY: mirrors `fkLine` in `src/ai/context.ts`.
+fn fk_line(e: &crate::relgraph::FkEdge) -> String {
+    let rel = |schema: &str, table: &str| {
+        if !schema.is_empty() && schema != "public" { format!("{schema}.{table}") } else { table.to_string() }
+    };
+    let cols = |c: &[String]| if c.len() == 1 { c[0].clone() } else { format!("({})", c.join(", ")) };
+    format!(
+        "{}.{} -> {}.{}",
+        rel(&e.src_schema, &e.src_table),
+        cols(&e.src_cols),
+        rel(&e.dst_schema, &e.dst_table),
+        cols(&e.dst_cols)
+    )
+}
+
+/// FK edges, ones touching the focus tables first, budgeted.
+/// PARITY: mirrors `foreignKeySummary` in `src/ai/context.ts`.
+pub fn foreign_key_summary(fks: &[crate::relgraph::FkEdge], focus: &str) -> String {
+    if fks.is_empty() {
+        return String::new();
+    }
+    let f = focus.to_lowercase();
+    let touches = |t: &str| f.contains(&t.to_lowercase());
+    let mut ranked: Vec<(usize, &crate::relgraph::FkEdge)> = fks.iter().enumerate().collect();
+    ranked.sort_by_key(|(i, e)| {
+        let rel = if touches(&e.src_table) || touches(&e.dst_table) { 0 } else { 1 };
+        (rel, *i)
+    });
+
+    let mut out = String::new();
+    let mut dropped = 0usize;
+    for (_, e) in ranked {
+        let line = format!("{}\n", fk_line(e));
+        if out.len() + line.len() > FK_BUDGET {
+            dropped += 1;
+        } else {
+            out.push_str(&line);
+        }
+    }
+    if dropped > 0 {
+        out.push_str(&format!("… and {dropped} more foreign keys\n"));
+    }
+    out
+}
+
 /// The Slack-flavored system prompt: one read-only SELECT, one-sentence explanation.
+/// `fks_known` distinguishes "no FKs declared" from "we never fetched them" — asserting
+/// the former when it's the latter invites confidently wrong joins.
 pub fn build_system_prompt(
     ctx: &SlackAiCtx,
     tables: &[TableInfo],
     conversation_text: &str,
     samples: &[SampleTable],
+    fks: &[crate::relgraph::FkEdge],
+    fks_known: bool,
 ) -> String {
     let mut lines: Vec<String> = vec![
         format!(
@@ -229,6 +280,16 @@ pub fn build_system_prompt(
     lines.push(String::new());
     lines.push("Database schema (schema.table(columns)):".to_string());
     lines.push(schema_summary(tables, conversation_text));
+    // The join graph — Tusk knows it, so the model must not guess join columns.
+    let fk_text = foreign_key_summary(fks, conversation_text);
+    if !fk_text.trim().is_empty() {
+        lines.push(String::new());
+        lines.push("Foreign keys (src -> dst). JOIN on these rather than guessing column names — this list is authoritative for the tables shown above:".to_string());
+        lines.push(fk_text.trim_end().to_string());
+    } else if fks_known && !tables.is_empty() {
+        lines.push(String::new());
+        lines.push("This schema declares no foreign keys. Infer joins from column names, and say so when you do.".to_string());
+    }
     let sample_text = format_samples(samples);
     if !sample_text.trim().is_empty() {
         lines.push(String::new());
@@ -300,6 +361,66 @@ mod tests {
         // "orders" appears verbatim (score 0); "order_items" shares the word "items"
         // (score 1); "users" is unrelated (score 2 → excluded). Mirrors context.ts.
         assert_eq!(names, vec!["orders", "order_items"]);
+    }
+
+    fn edge(src: &str, sc: &[&str], dst: &str, dc: &[&str]) -> crate::relgraph::FkEdge {
+        crate::relgraph::FkEdge {
+            constraint: format!("{src}_fk"),
+            src_schema: "public".into(),
+            src_table: src.into(),
+            src_cols: sc.iter().map(|s| s.to_string()).collect(),
+            dst_schema: "public".into(),
+            dst_table: dst.into(),
+            dst_cols: dc.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// PARITY with `src/ai/context.ts` `foreignKeySummary` — same rendering, same ranking.
+    #[test]
+    fn fk_summary_matches_the_ts_rendering() {
+        assert_eq!(
+            foreign_key_summary(&[edge("orders", &["customer_id"], "customers", &["id"])], "").trim(),
+            "orders.customer_id -> customers.id"
+        );
+        assert_eq!(
+            foreign_key_summary(&[edge("a", &["x", "y"], "b", &["p", "q"])], "").trim(),
+            "a.(x, y) -> b.(p, q)"
+        );
+    }
+
+    #[test]
+    fn fk_summary_ranks_focus_tables_first_and_reports_drops() {
+        let mut many: Vec<_> = (0..400).map(|i| edge(&format!("t{i}"), &["a"], &format!("u{i}"), &["id"])).collect();
+        many.push(edge("orders", &["customer_id"], "customers", &["id"]));
+        let out = foreign_key_summary(&many, "join orders to customers");
+        assert!(out.starts_with("orders.customer_id -> customers.id
+"));
+        assert!(out.contains("more foreign keys"), "dropped edges must be acknowledged");
+        assert!(out.len() < FK_BUDGET + 100);
+    }
+
+    /// The trap: an empty edge list means EITHER "none declared" OR "never fetched".
+    /// Asserting the former when it's the latter invites confidently wrong joins.
+    #[test]
+    fn fk_absence_is_only_asserted_when_the_graph_was_fetched() {
+        let ctx = SlackAiCtx {
+            dialect: "postgres".into(),
+            user: "me".into(),
+            is_superuser: false,
+            permissions_enforced: false,
+            destructive_policy: "proposeReadonly".into(),
+        };
+        let tables = vec![t("orders", &[("id", "int")])];
+
+        let unfetched = build_system_prompt(&ctx, &tables, "", &[], &[], false);
+        assert!(!unfetched.to_lowercase().contains("no foreign keys"));
+
+        let fetched = build_system_prompt(&ctx, &tables, "", &[], &[], true);
+        assert!(fetched.contains("declares no foreign keys"));
+
+        let with_fks = build_system_prompt(&ctx, &tables, "", &[], &[edge("orders", &["customer_id"], "customers", &["id"])], true);
+        assert!(with_fks.contains("orders.customer_id -> customers.id"));
+        assert!(with_fks.contains("JOIN on these rather than guessing"));
     }
 
     #[test]

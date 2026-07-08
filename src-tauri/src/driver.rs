@@ -877,11 +877,31 @@ impl DuckConn {
         } else {
             duckdb::Connection::open(&path).map_err(de)?
         };
-        // The bundled libduckdb ships the ICU extension installed-but-not-loaded.
-        // Without it, TIMESTAMP WITH TIME ZONE casts fail ("Unimplemented type for
-        // cast (TIMESTAMP WITH TIME ZONE -> DATE)"), which the DuckDB CLI auto-loads.
-        // Best-effort: ignore if unavailable (older/custom builds without ICU).
-        let _ = conn.execute("LOAD icu", []);
+        // Without ICU, TIMESTAMP WITH TIME ZONE casts fail ("Unimplemented type for cast
+        // (TIMESTAMP WITH TIME ZONE -> DATE)"). The bundled libduckdb does NOT ship ICU
+        // compiled in — `LOAD icu` returns `Extension "icu" is an existing extension.
+        // Install it first using "INSTALL icu"` until the extension has been downloaded
+        // into the user's extension dir (~/.duckdb/extensions/<ver>/<platform>/).
+        //
+        // So: fast-path LOAD (already downloaded), else INSTALL once (one-time network
+        // fetch, cached on disk) and LOAD again. `SET autoinstall_known_extensions` /
+        // `autoload_known_extensions` do NOT help — a cast doesn't trigger autoload.
+        //
+        // Best-effort throughout: a cold + offline machine degrades exactly as before
+        // (TIMESTAMPTZ casts error), rather than failing the whole connection.
+        // Memoized: `open_conn` runs on EVERY reopen after an idle file-lock release, i.e.
+        // potentially once per command. `INSTALL` is a blocking network download, so on a
+        // cold + offline machine an un-memoized fallback would stall every single query on
+        // a connect timeout. Once it has failed, don't reach for the network again.
+        static ICU_UNAVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        use std::sync::atomic::Ordering;
+        if conn.execute("LOAD icu", []).is_err() && !ICU_UNAVAILABLE.load(Ordering::Relaxed) {
+            let _ = conn.execute("INSTALL icu", []);
+            if let Err(e) = conn.execute("LOAD icu", []) {
+                ICU_UNAVAILABLE.store(true, Ordering::Relaxed);
+                eprintln!("[tusk] DuckDB ICU extension unavailable ({e}); TIMESTAMPTZ casts will fail");
+            }
+        }
         Ok(conn)
     }
 

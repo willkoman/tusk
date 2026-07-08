@@ -18,6 +18,11 @@
   --accent-soft: rgba(var(--accent-rgb), 0.16);
   --guide: rgba(148, 163, 184, 0.15);
   --shadow-card: 0 16px 48px rgba(0, 0, 0, 0.35);
+  /* Native widgets (the <select> POPUP, scrollbars, checkboxes, focus rings) are painted
+     by the WebView, not by our CSS. Without this it assumes a light page and paints a
+     white popup, while <option> inherits our near-white --text → white on white. The
+     select BOX being styled below is not enough; only color-scheme reaches the popup. */
+  color-scheme: dark;
   --shadow-panel: 0 10px 30px rgba(0, 0, 0, 0.22);
   --scrollbar-thumb: #2c3645;
   --scrollbar-thumb-hover: #3a4759;
@@ -46,6 +51,7 @@
    bare :root above IS the "oneDark" palette. data-mode ("dark"|"light") keys
    the polarity-level fixes shared by all themes of one mode (see themes.ts). */
 :root[data-mode="light"] {
+  color-scheme: light;
   --tok-kw: #a626a4;
   --tok-type: #0d9488;
   --tok-fn: #4078f2;
@@ -282,6 +288,13 @@ button.run { background: var(--accent); border-color: var(--accent); color: whit
 button.run.cancel { background: var(--danger); border-color: var(--danger); }
 button.run.cancel:hover:not(:disabled) { filter: brightness(1.08); }
 button.ghost { background: transparent; }
+
+/* The native <select> popup. `color-scheme` on :root is what actually fixes contrast on
+   WKWebView/WebView2; webkit2gtk additionally honors explicit per-option colors. Setting
+   both renders correctly everywhere. optgroup defaults to italic in some engines. */
+select option, select optgroup { background: var(--panel-2); color: var(--text); }
+select optgroup { font-weight: 600; font-style: normal; color: var(--muted); }
+select option { font-weight: 400; }
 
 .editor, .cell { font-family: var(--mono); }
 
@@ -1067,6 +1080,16 @@ button.btn-danger { background: var(--danger); border-color: var(--danger); colo
 .ai-typing span:nth-child(2) { animation-delay: 0.2s; }
 .ai-typing span:nth-child(3) { animation-delay: 0.4s; }
 @keyframes tusk-blink { 0%, 80%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
+
+/* Turn outcome: a failed/stopped/truncated reply, and the Retry affordance.
+   Sizes follow the panel's own scale (.ai-note 10px < these 11px < .ai-msg-body 13px);
+   the error follows the app-wide `.error` / `.upd-err` idiom (plain --danger text, no
+   bespoke rail). The Stop button reuses `button.run.cancel`, the app's existing
+   cancel-while-busy style — see the composer in AiPanel.tsx. */
+.ai-msg-note { font-size: 11px; color: var(--muted); line-height: 1.45; padding: 2px 0; }
+.ai-msg-error { font-size: 11px; color: var(--danger); line-height: 1.45; padding: 2px 0; word-break: break-word; }
+.ai-retry-row { display: flex; justify-content: center; padding: 2px 0 4px; }
+.ai-retry-row button { font-size: 11px; padding: 3px 10px; }
 
 /* AI code-block SQL syntax highlighting */
 /* Light-theme token colors (the dark-tuned ones wash out on a light background). */

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { relevantTables, formatSamples, buildSystemPrompt, type AiCtxTable, type SampleTable, type AiContext } from "./context";
+import { relevantTables, formatSamples, buildSystemPrompt, foreignKeySummary, type AiCtxTable, type SampleTable, type AiContext } from "./context";
+import type { FkEdge } from "../sql/fk";
+
+const fk = (srcTable: string, srcCols: string[], dstTable: string, dstCols: string[], schema = "public"): FkEdge => ({
+  constraint: `${srcTable}_fk`, srcSchema: schema, srcTable, srcCols, dstSchema: schema, dstTable, dstCols,
+});
 
 const tables: AiCtxTable[] = [
   { schema: "public", name: "orders", columns: [{ name: "id", data_type: "int" }, { name: "customer_id", data_type: "int" }] },
@@ -58,6 +63,8 @@ describe("buildSystemPrompt with samples", () => {
     user: "me",
     isSuperuser: false,
     permissionsEnforced: false,
+    fks: [],
+    fksKnown: false,
     activeSchema: null,
     tables,
     currentSql: "",
@@ -76,5 +83,90 @@ describe("buildSystemPrompt with samples", () => {
   it("omits the sample section when there are no samples", () => {
     const p = buildSystemPrompt(ctx, "orders", []);
     expect(p).not.toContain("Sample rows from the most relevant tables");
+  });
+});
+
+
+describe("foreign keys in the prompt", () => {
+  const base: AiContext = {
+    dialect: "postgres", driverLabel: "PostgreSQL", version: "16", user: "me",
+    isSuperuser: false, permissionsEnforced: false, activeSchema: null,
+    tables, currentSql: "", selection: "", lastError: "", fks: [], fksKnown: false,
+  };
+
+  it("renders single and composite edges readably", () => {
+    const out = foreignKeySummary([fk("orders", ["customer_id"], "customers", ["id"])], "");
+    expect(out.trim()).toBe("orders.customer_id -> customers.id");
+    const comp = foreignKeySummary([fk("a", ["x", "y"], "b", ["p", "q"])], "");
+    expect(comp.trim()).toBe("a.(x, y) -> b.(p, q)");
+  });
+
+  it("qualifies non-public schemas only", () => {
+    const e = { ...fk("orders", ["cid"], "customers", ["id"]), srcSchema: "sales", dstSchema: "public" };
+    expect(foreignKeySummary([e], "").trim()).toBe("sales.orders.cid -> customers.id");
+  });
+
+  it("ranks edges touching the focus tables first, so the join path survives the budget", () => {
+    const many = Array.from({ length: 400 }, (_, i) => fk(`t${i}`, ["a"], `u${i}`, ["id"]));
+    const wanted = fk("orders", ["customer_id"], "customers", ["id"]);
+    const out = foreignKeySummary([...many, wanted], "how do I join orders to customers");
+    expect(out.split("\n")[0]).toBe("orders.customer_id -> customers.id");
+    expect(out).toContain("more foreign keys"); // the rest were dropped, and said so
+  });
+
+  it("puts the FK graph in the prompt and tells the model it is authoritative", () => {
+    const out = buildSystemPrompt({ ...base, fks: [fk("orders", ["customer_id"], "customers", ["id"])], fksKnown: true });
+    expect(out).toContain("orders.customer_id -> customers.id");
+    expect(out).toMatch(/JOIN on these rather than guessing/);
+  });
+
+  // The trap: an empty `fks` means EITHER "none declared" OR "we never fetched them".
+  // Claiming the former when it's the latter invites confidently wrong joins.
+  it("only asserts a schema has no foreign keys when the graph was actually fetched", () => {
+    const unfetched = buildSystemPrompt({ ...base, fks: [], fksKnown: false });
+    expect(unfetched).not.toMatch(/no foreign keys/i);
+
+    const fetched = buildSystemPrompt({ ...base, fks: [], fksKnown: true });
+    expect(fetched).toMatch(/declares no foreign keys/i);
+  });
+});
+
+// The provider message list is built in AiPanel's runTurn, but the invariant it must
+// uphold is testable here in isolation: NO assistant turn may be sent with empty content.
+// Anthropic and Gemini reject that with a 400, which breaks every later question in the
+// chat — not just the one that failed. A Stop-before-first-delta or an empty reply leaves
+// exactly such a message in the display list.
+describe("provider message list", () => {
+  type M = { role: "user" | "assistant"; content: string };
+  /** Mirrors the filter in AiPanel.runTurn. */
+  const toProviderMessages = (convo: M[]) =>
+    convo.filter((m) => m.role === "user" || m.content.trim()).map((m) => ({ role: m.role, content: m.content }));
+
+  it("drops a content-less assistant turn left behind by Stop or an empty reply", () => {
+    const convo: M[] = [
+      { role: "user", content: "count orders" },
+      { role: "assistant", content: "" }, // stopped before the first delta
+      { role: "user", content: "actually, count customers" },
+    ];
+    const out = toProviderMessages(convo);
+    expect(out).toEqual([
+      { role: "user", content: "count orders" },
+      { role: "user", content: "actually, count customers" },
+    ]);
+    expect(out.every((m) => m.content.trim())).toBe(true);
+  });
+
+  it("keeps a PARTIAL assistant reply — it is real context, unlike an empty one", () => {
+    const convo: M[] = [
+      { role: "user", content: "explain" },
+      { role: "assistant", content: "The query scans" }, // died mid-stream
+      { role: "user", content: "go on" },
+    ];
+    expect(toProviderMessages(convo).length).toBe(3);
+  });
+
+  it("never drops a user turn, even a whitespace-only one", () => {
+    const convo: M[] = [{ role: "user", content: "  " }];
+    expect(toProviderMessages(convo)).toEqual([{ role: "user", content: "  " }]);
   });
 });

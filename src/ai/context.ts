@@ -2,6 +2,8 @@
 // database's dialect, a token-budgeted schema summary, the user's privileges, and the
 // app's own capabilities. Kept compact; specific tables can be expanded on request later.
 
+import type { FkEdge } from "../sql/fk";
+
 export type AiCtxTable = { schema: string; name: string; columns: { name: string; data_type: string }[] };
 
 /** Sample rows pulled from a relation, for grounding the model in real values. */
@@ -16,6 +18,14 @@ export type AiContext = {
   permissionsEnforced: boolean;
   activeSchema: string | null;
   tables: AiCtxTable[];
+  /** The schema's foreign keys. Tusk knows the join graph; without this the model
+   *  guesses join columns from naming conventions and gets them wrong on any schema
+   *  that doesn't follow `<table>_id`. Same edges the autocomplete JOIN hints use. */
+  fks: FkEdge[];
+  /** Whether the FK graph was actually retrieved. An empty `fks` is ambiguous — "none
+   *  declared" vs "not fetched / driver can't report them" — and telling the model
+   *  "this schema has no foreign keys" when we simply didn't look is worse than silence. */
+  fksKnown: boolean;
   currentSql: string;
   selection: string;
   lastError: string;
@@ -77,6 +87,38 @@ export function formatSamples(samples: SampleTable[]): string {
   return out;
 }
 
+const FK_BUDGET = 3000; // chars of foreign-key lines
+
+/** One FK as `orders.user_id -> users.id`, or `a.(x, y) -> b.(p, q)` when composite.
+ *  Schema-qualified only when the two sides differ or it isn't `public`. */
+function fkLine(e: FkEdge): string {
+  const rel = (schema: string, table: string) => (schema && schema !== "public" ? `${schema}.${table}` : table);
+  const cols = (c: string[]) => (c.length === 1 ? c[0] : `(${c.join(", ")})`);
+  return `${rel(e.srcSchema, e.srcTable)}.${cols(e.srcCols)} -> ${rel(e.dstSchema, e.dstTable)}.${cols(e.dstCols)}`;
+}
+
+/** FK edges, most relevant to the focus first, budgeted. An edge is relevant when either
+ *  side is a table the conversation is about — so the join path for the asked-about
+ *  tables survives the cutoff on a large schema. */
+export function foreignKeySummary(fks: FkEdge[], focus: string): string {
+  if (!fks.length) return "";
+  const f = focus.toLowerCase();
+  const touches = (t: string) => f.includes(t.toLowerCase());
+  const ranked = fks
+    .map((e, i) => ({ e, i, s: touches(e.srcTable) || touches(e.dstTable) ? 0 : 1 }))
+    .sort((a, b) => a.s - b.s || a.i - b.i);
+
+  let out = "";
+  let dropped = 0;
+  for (const { e } of ranked) {
+    const line = fkLine(e) + "\n";
+    if (out.length + line.length > FK_BUDGET) dropped++;
+    else out += line;
+  }
+  if (dropped) out += `… and ${dropped} more foreign keys\n`;
+  return out;
+}
+
 function schemaSummary(tables: AiCtxTable[], focus: string): string {
   // Relevance first: tables whose name appears in the conversation (or shares a
   // word with it) get their full column lists ahead of the budget cutoff, so
@@ -111,6 +153,7 @@ function schemaSummary(tables: AiCtxTable[], focus: string): string {
 
 export function buildSystemPrompt(c: AiContext, conversationText = "", samples: SampleTable[] = []): string {
   const quote = QUOTE_NOTE[c.dialect] ?? QUOTE_NOTE.postgres;
+  const focus = `${conversationText} ${c.currentSql} ${c.selection}`;
   const lines: string[] = [
     "You are an AI assistant embedded in Tusk, a desktop SQL client. Help the user write, understand, fix, and optimize SQL.",
     "",
@@ -128,8 +171,22 @@ export function buildSystemPrompt(c: AiContext, conversationText = "", samples: 
     "- Generate SQL in the dialect above and quote identifiers as noted. Be concise.",
     "",
     "Database schema (schema.table(columns)):",
-    schemaSummary(c.tables, `${conversationText} ${c.currentSql} ${c.selection}`),
+    schemaSummary(c.tables, focus),
   );
+  // The join graph. Emitted right after the schema so the model reads structure and
+  // relationships together, before any sample data.
+  const fkText = foreignKeySummary(c.fks, focus);
+  if (fkText.trim()) {
+    lines.push(
+      "",
+      "Foreign keys (src -> dst). JOIN on these rather than guessing column names — this list is authoritative for the tables shown above:",
+      fkText.trimEnd(),
+    );
+  } else if (c.fksKnown && c.tables.length) {
+    // Only assert this when we actually looked. Otherwise stay silent — claiming
+    // "no foreign keys" on an unfetched graph invites confidently wrong joins.
+    lines.push("", "This schema declares no foreign keys. Infer joins from column names, and say so when you do.");
+  }
   const sampleText = formatSamples(samples);
   if (sampleText.trim()) {
     lines.push(

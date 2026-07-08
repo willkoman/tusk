@@ -1,15 +1,54 @@
 //! AI provider proxy. Keeps the API key in the OS keychain (never in the WebView) and
-//! streams completions from the configured provider over a Tauri `Channel`. Pluggable:
-//! Anthropic, OpenAI (also covers OpenAI-compatible / OpenCode / local servers via a
-//! custom `base_url`), and Gemini. The model proposes SQL/answers — it never executes
-//! anything itself; running is always an explicit user action in the app.
+//! streams completions from the configured provider over a Tauri `Channel`.
+//!
+//! **This module knows four WIRE protocols, not N providers.** `Wire::{Anthropic,
+//! Gemini, Openai, Responses}` selects the request/response shape; the provider is just
+//! a keychain account + a base URL, both supplied by the frontend registry
+//! (`src/ai/providers.ts`). Adding OpenRouter / Groq / DeepSeek / Ollama / any other
+//! OpenAI-compatible service is a registry row, NOT an arm in `build_request`.
+//! A gateway may use a DIFFERENT wire per model (OpenCode Zen does) — that's why the
+//! wire rides on the request rather than the provider.
+//!
+//! The model proposes SQL/answers — it never executes anything itself; running is
+//! always an explicit user action in the app.
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use tokio::sync::oneshot;
 
 use crate::db::AppError;
 
 const KEYCHAIN_SERVICE: &str = "tusk-ai";
+
+/// In-flight `ai_chat` streams, keyed by the frontend's `requestId`, so `ai_cancel`
+/// can interrupt one. Held outside any connection lock — a cancel must always be
+/// able to reach a stream that's blocked on the network.
+#[derive(Default)]
+pub struct AiCancels(Mutex<HashMap<String, oneshot::Sender<()>>>);
+
+/// Unregisters the in-flight stream on EVERY exit path (done / error / cancel / panic).
+struct CancelGuard<'a> {
+    cancels: &'a AiCancels,
+    id: String,
+}
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.cancels.0.lock() {
+            m.remove(&self.id);
+        }
+    }
+}
+
+/// Interrupt the `ai_chat` stream with this `requestId`. No-op if it already finished.
+#[tauri::command]
+pub fn ai_cancel(request_id: String, cancels: tauri::State<'_, AiCancels>) {
+    let tx = cancels.0.lock().ok().and_then(|mut m| m.remove(&request_id));
+    if let Some(tx) = tx {
+        let _ = tx.send(());
+    }
+}
 
 fn key_entry(provider: &str) -> Result<keyring::Entry, AppError> {
     keyring::Entry::new(KEYCHAIN_SERVICE, provider).map_err(|e| AppError::new(e.to_string()))
@@ -46,16 +85,70 @@ pub struct Msg {
     pub content: String,
 }
 
+/// The request/response shapes we speak. **Dispatch is on the wire, never on
+/// the provider name** — the provider is just a keychain account + a base URL, so a
+/// dozen OpenAI-compatible services (routers, local servers, DeepSeek, Groq, …) all
+/// ride the `Openai` arm without a code change. `src/ai/providers.ts` is the registry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Wire {
+    Anthropic,
+    Gemini,
+    Openai,
+    /// OpenAI's Responses API (`/v1/responses`). A different body (`input`/`instructions`/
+    /// `max_output_tokens`) and different SSE events from chat-completions. Needed for
+    /// GPT models on OpenCode Zen, which serves them only on this endpoint.
+    Responses,
+}
+
+impl Wire {
+    fn parse(s: &str) -> Wire {
+        match s {
+            "anthropic" => Wire::Anthropic,
+            "gemini" => Wire::Gemini,
+            "responses" => Wire::Responses,
+            _ => Wire::Openai,
+        }
+    }
+    /// Pre-registry configs (and older `slack.json`s) carry only a provider name.
+    /// The three original providers were their own wire, so the name maps cleanly.
+    fn legacy_for_provider(provider: &str) -> Wire {
+        Wire::parse(provider)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiRequest {
-    pub provider: String, // "anthropic" | "openai" | "gemini"
+    /// Registry provider id — the OS-keychain account, opaque to this module.
+    pub provider: String,
+    /// Wire protocol ("anthropic" | "gemini" | "openai"). Absent on configs written
+    /// before the registry existed; falls back to the provider name.
+    #[serde(default)]
+    pub wire: Option<String>,
     pub model: String,
-    /// Override the API base (OpenAI-compatible / OpenCode / local / proxy).
+    /// The API base. The frontend registry always sends a concrete one; the
+    /// per-wire defaults below only cover legacy callers.
     pub base_url: Option<String>,
     pub system: Option<String>,
     pub messages: Vec<Msg>,
     pub max_tokens: Option<u32>,
+    /// Frontend-generated id so `ai_cancel` can interrupt this stream. Backend
+    /// callers (the Slack bot) leave it unset — nothing can cancel those.
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// Local servers (Ollama, LM Studio) authenticate nothing. Without this a
+    /// missing keychain entry would be a hard error before the first request.
+    #[serde(default)]
+    pub allow_no_key: bool,
+}
+
+impl AiRequest {
+    fn wire(&self) -> Wire {
+        match &self.wire {
+            Some(w) => Wire::parse(w),
+            None => Wire::legacy_for_provider(&self.provider),
+        }
+    }
 }
 
 /// Streamed back to the frontend over the channel.
@@ -63,8 +156,19 @@ pub struct AiRequest {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum AiEvent {
     Delta { text: String },
-    Done,
+    /// The stream ended cleanly. `truncated` = the model hit its token ceiling, so
+    /// the reply is cut short (a fenced code block may be left unclosed).
+    Done { truncated: bool },
+    /// The user pressed Stop. Distinct from `Error` — nothing went wrong.
+    Cancelled,
     Error { message: String },
+}
+
+/// A finished (non-streaming) completion.
+pub struct Completion {
+    pub text: String,
+    /// The model hit `max_tokens` — the text is cut off mid-thought.
+    pub truncated: bool,
 }
 
 fn get_key(provider: &str) -> Result<String, AppError> {
@@ -75,43 +179,174 @@ fn get_key(provider: &str) -> Result<String, AppError> {
     })
 }
 
-/// Extract the incremental text from one SSE `data:` JSON payload, per provider.
-fn extract_delta(provider: &str, json: &serde_json::Value) -> Option<String> {
-    match provider {
-        "anthropic" => {
+/// Extract the incremental text from one SSE `data:` JSON payload, per wire.
+fn extract_delta(wire: Wire, json: &serde_json::Value) -> Option<String> {
+    match wire {
+        Wire::Anthropic => {
             if json.get("type").and_then(|t| t.as_str()) == Some("content_block_delta") {
                 json.pointer("/delta/text").and_then(|t| t.as_str()).map(str::to_string)
             } else {
                 None
             }
         }
-        "gemini" => json
+        Wire::Gemini => json
             .pointer("/candidates/0/content/parts/0/text")
             .and_then(|t| t.as_str())
             .map(str::to_string),
-        // openai + compatible
-        _ => json
+        Wire::Openai => json
             .pointer("/choices/0/delta/content")
             .and_then(|t| t.as_str())
+            .map(str::to_string),
+        // Responses streams typed events; only `response.output_text.delta` carries text.
+        Wire::Responses => (json["type"] == "response.output_text.delta")
+            .then(|| json.get("delta").and_then(|t| t.as_str()))
+            .flatten()
             .map(str::to_string),
     }
 }
 
-/// Build the (url, headers, body) for the provider request.
+/// An error delivered INSIDE the SSE stream (HTTP 200, then it falls over). Anthropic
+/// sends `{"type":"error","error":{...}}` for overloaded/rate-limit mid-stream; OpenAI
+/// and most compatible servers send a top-level `error` object; Gemini reports a blocked
+/// prompt via `promptFeedback.blockReason`. Ignoring these (as we used to) turns a
+/// provider failure into a silently truncated reply — the bug this function exists for.
+fn extract_error(wire: Wire, json: &serde_json::Value) -> Option<String> {
+    if wire == Wire::Anthropic && json.get("type").and_then(|t| t.as_str()) == Some("error") {
+        let e = &json["error"];
+        let kind = e["type"].as_str().unwrap_or("error");
+        let msg = e["message"].as_str().unwrap_or("stream error");
+        return Some(format!("{kind}: {msg}"));
+    }
+    if wire == Wire::Gemini {
+        if let Some(r) = json.pointer("/promptFeedback/blockReason").and_then(|r| r.as_str()) {
+            return Some(format!("the provider blocked the prompt ({r})"));
+        }
+    }
+    if wire == Wire::Responses {
+        // `response.failed` carries the reason on the nested response object.
+        if json["type"] == "response.failed" {
+            let msg = json
+                .pointer("/response/error/message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("the response failed");
+            return Some(msg.to_string());
+        }
+        // A bare typed error event.
+        if json["type"] == "error" {
+            let msg = json.get("message").and_then(|m| m.as_str()).unwrap_or("stream error");
+            return Some(msg.to_string());
+        }
+    }
+    match json.get("error") {
+        // Several OpenAI-compatible servers (vLLM, LiteLLM, …) put a literal
+        // `"error": null` on every normal frame — that is NOT an error.
+        None => None,
+        Some(e) if e.is_null() => None,
+        Some(e) if e.is_string() => e.as_str().map(str::to_string),
+        Some(e) => e
+            .get("message")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+            .or_else(|| Some("provider stream error".into())),
+    }
+}
+
+/// The stop/finish reason, if this frame carries one.
+fn extract_finish(wire: Wire, json: &serde_json::Value) -> Option<String> {
+    match wire {
+        Wire::Anthropic => (json["type"] == "message_delta")
+            .then(|| json.pointer("/delta/stop_reason").and_then(|r| r.as_str()))
+            .flatten()
+            .map(str::to_string),
+        Wire::Gemini => json
+            .pointer("/candidates/0/finishReason")
+            .and_then(|r| r.as_str())
+            .map(str::to_string),
+        Wire::Openai => json
+            .pointer("/choices/0/finish_reason")
+            .and_then(|r| r.as_str())
+            .map(str::to_string),
+        // Responses reports truncation as a separate `response.incomplete` event.
+        Wire::Responses => (json["type"] == "response.incomplete")
+            .then(|| json.pointer("/response/incomplete_details/reason").and_then(|r| r.as_str()))
+            .flatten()
+            .map(str::to_string),
+    }
+}
+
+enum Finish {
+    /// The model said what it wanted to say.
+    Normal,
+    /// Hit the token ceiling — text is cut off (an open ```fence stays open).
+    Truncated,
+    /// The provider killed the response (safety/content filter, or something new).
+    Aborted(String),
+}
+
+/// **Unknown stop reasons are NORMAL, never aborts.** This is a deny-list, not an
+/// allow-list. Every provider mints its own reasons (Gemini documents `OTHER` and
+/// `FINISH_REASON_UNSPECIFIED`; OpenAI-compatible servers invent their own), and an
+/// allow-list turns a perfectly good completion into a hard error the moment a provider
+/// adds a value — the reply is already in hand by the time this runs. Only abort on
+/// reasons we positively know mean "the provider withheld the answer". Same bias as the
+/// lint vocabulary in `sql/dialects.ts`: a missing word must be a false negative.
+fn classify_finish(reason: &str) -> Finish {
+    match reason.to_ascii_lowercase().as_str() {
+        // `max_output_tokens` is the Responses API's spelling of the same thing.
+        "max_tokens" | "length" | "max_output_tokens" => Finish::Truncated,
+        "safety" => Finish::Aborted("the provider blocked the response (safety filter)".into()),
+        "recitation" => Finish::Aborted("the provider blocked the response (recitation filter)".into()),
+        "content_filter" => Finish::Aborted("the provider blocked the response (content filter)".into()),
+        "blocklist" | "prohibited_content" | "spii" => {
+            Finish::Aborted("the provider blocked the response (content policy)".into())
+        }
+        // stop / end_turn / tool_use / eos / OTHER / FINISH_REASON_UNSPECIFIED / anything new.
+        _ => Finish::Normal,
+    }
+}
+
+/// The gemini wire's base must carry an API-version segment (`…/v1beta` for Google,
+/// `…/zen/v1` for OpenCode) because it appends `/models/{model}:…`. Configs written before
+/// that was true — notably a `slack.json` that mirrored the old version-less default —
+/// hold a bare host. Heal those rather than 404: a base with no path gets `/v1beta`.
+fn gemini_base(base: &str) -> String {
+    // Trim FIRST: a bare trailing slash (`https://host/`) is not a path segment.
+    let trimmed = base.trim_end_matches('/');
+    // Key on whether the LAST segment looks like an API version (`v1`, `v1beta`, …).
+    // "has any path" is wrong: a saved proxy base (`https://gw.corp/google`) carries a
+    // path but no version, and before this wire existed the old code appended `/v1beta`
+    // to it unconditionally. Dropping the segment there is a silent regression.
+    let last = trimmed.rsplit('/').next().unwrap_or("");
+    let versioned = last.starts_with('v') && last[1..].starts_with(|c: char| c.is_ascii_digit());
+    if versioned { trimmed.to_string() } else { format!("{trimmed}/v1beta") }
+}
+
+/// Build the (url, headers, body) for the request, keyed on the WIRE — so a new
+/// provider is a registry row in `src/ai/providers.ts`, not a new arm here.
 fn build_request(
     req: &AiRequest,
     key: &str,
 ) -> (String, Vec<(String, String)>, serde_json::Value) {
     let model = &req.model;
-    match req.provider.as_str() {
-        "anthropic" => {
+    match req.wire() {
+        Wire::Anthropic => {
             let base = req.base_url.as_deref().unwrap_or("https://api.anthropic.com");
             let url = format!("{base}/v1/messages");
-            let headers = vec![
-                ("x-api-key".into(), key.to_string()),
+            let mut headers = vec![
+                ("x-api-key".to_string(), key.to_string()),
                 ("anthropic-version".into(), "2023-06-01".into()),
                 ("content-type".into(), "application/json".into()),
             ];
+            // Gateways that speak this shape authenticate PER ENDPOINT, not per gateway:
+            // OpenCode's `/v1/messages` reads `x-api-key` (like Anthropic proper) and
+            // ignores Bearer, while its `/v1/chat/completions` reads Bearer and ignores
+            // x-api-key — probed on both /zen and /zen/go. So x-api-key above already
+            // covers OpenCode. Other Anthropic-shaped proxies read Bearer instead; send
+            // it too when this isn't Anthropic proper. Unknown auth headers are ignored
+            // (they yield "Missing API key", not a 400), so the extra header is safe.
+            if req.provider != "anthropic" {
+                headers.push(("authorization".into(), format!("Bearer {key}")));
+            }
             let msgs: Vec<_> = req
                 .messages
                 .iter()
@@ -128,13 +363,21 @@ fn build_request(
             }
             (url, headers, body)
         }
-        "gemini" => {
-            let base = req
-                .base_url
-                .as_deref()
-                .unwrap_or("https://generativelanguage.googleapis.com");
-            let url = format!("{base}/v1beta/models/{model}:streamGenerateContent?alt=sse&key={key}");
-            let headers = vec![("content-type".into(), "application/json".into())];
+        Wire::Gemini => {
+            // `base` includes the API-version segment (`…/v1beta` for Google, `…/zen/v1`
+            // for OpenCode), because the two differ. Auth is the `x-goog-api-key` HEADER,
+            // not the `?key=` query param: Google accepts both, OpenCode Zen only the
+            // header (probed — `?key=` yields "Missing API key").
+            let base = gemini_base(
+                req.base_url
+                    .as_deref()
+                    .unwrap_or("https://generativelanguage.googleapis.com/v1beta"),
+            );
+            let url = format!("{base}/models/{model}:streamGenerateContent?alt=sse");
+            let headers = vec![
+                ("x-goog-api-key".to_string(), key.to_string()),
+                ("content-type".into(), "application/json".into()),
+            ];
             let contents: Vec<_> = req
                 .messages
                 .iter()
@@ -149,14 +392,16 @@ fn build_request(
             }
             (url, headers, body)
         }
-        // openai + OpenAI-compatible (OpenCode / local / proxy via base_url)
-        _ => {
+        // Every OpenAI-compatible service: OpenAI, OpenCode, OpenRouter, Groq,
+        // DeepSeek, Mistral, xAI, Ollama/LM Studio, … — they differ only by base URL.
+        Wire::Openai => {
             let base = req.base_url.as_deref().unwrap_or("https://api.openai.com");
             let url = format!("{base}/v1/chat/completions");
-            let headers = vec![
-                ("authorization".into(), format!("Bearer {key}")),
-                ("content-type".into(), "application/json".into()),
-            ];
+            let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
+            // A local server has no key; sending `Bearer ` (empty) trips some of them.
+            if !key.is_empty() {
+                headers.push(("authorization".into(), format!("Bearer {key}")));
+            }
             let mut msgs: Vec<serde_json::Value> = Vec::new();
             if let Some(sys) = &req.system {
                 msgs.push(serde_json::json!({ "role": "system", "content": sys }));
@@ -167,22 +412,57 @@ fn build_request(
             let body = serde_json::json!({ "model": model, "stream": true, "messages": msgs });
             (url, headers, body)
         }
+        // OpenAI's Responses API. Same Bearer auth as chat-completions, different body:
+        // the system prompt is `instructions`, turns are `input`, and the output cap is
+        // `max_output_tokens` (minimum 16).
+        Wire::Responses => {
+            let base = req.base_url.as_deref().unwrap_or("https://api.openai.com");
+            let url = format!("{base}/v1/responses");
+            let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
+            if !key.is_empty() {
+                headers.push(("authorization".into(), format!("Bearer {key}")));
+            }
+            let input: Vec<_> = req
+                .messages
+                .iter()
+                .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+                .collect();
+            let mut body = serde_json::json!({ "model": model, "stream": true, "input": input });
+            if let Some(mt) = req.max_tokens {
+                body["max_output_tokens"] = serde_json::json!(mt.max(16));
+            }
+            if let Some(sys) = &req.system {
+                body["instructions"] = serde_json::json!(sys);
+            }
+            (url, headers, body)
+        }
     }
 }
 
 /// Live model catalog for a provider (ids only), using the saved keychain key.
-/// Per provider: Anthropic `GET /v1/models`, Gemini `GET /v1beta/models` (filtered
-/// to generateContent-capable, `models/` prefix stripped), OpenAI + compatible
-/// `GET /v1/models` (obvious non-chat families dropped, newest-first sort).
+/// Per wire: Anthropic `GET {base}/v1/models` (x-api-key), Gemini `GET {base}/models`
+/// (x-goog-api-key; `base` carries the version segment; filtered to generateContent-capable,
+/// `models/` prefix stripped), OpenAI + Responses + compatible `GET {base}/v1/models`
+/// (Bearer; obvious non-chat families dropped, sorted so router ids group by vendor).
 /// Errors surface to the frontend, which falls back to its curated list.
 #[tauri::command]
 pub async fn ai_list_models(
     provider: String,
+    wire: Option<String>,
     base_url: Option<String>,
+    allow_no_key: Option<bool>,
 ) -> Result<Vec<String>, AppError> {
-    let key = get_key(&provider)?;
-    let (url, headers): (String, Vec<(String, String)>) = match provider.as_str() {
-        "anthropic" => {
+    let wire = match &wire {
+        Some(w) => Wire::parse(w),
+        None => Wire::legacy_for_provider(&provider),
+    };
+    let key = match get_key(&provider) {
+        Ok(k) => k,
+        Err(_) if allow_no_key.unwrap_or(false) => String::new(),
+        Err(e) => return Err(e),
+    };
+    let (url, headers): (String, Vec<(String, String)>) = match wire {
+        Wire::Anthropic => {
             let base = base_url.as_deref().unwrap_or("https://api.anthropic.com");
             (
                 format!("{base}/v1/models?limit=1000"),
@@ -192,19 +472,26 @@ pub async fn ai_list_models(
                 ],
             )
         }
-        "gemini" => {
-            let base = base_url
-                .as_deref()
-                .unwrap_or("https://generativelanguage.googleapis.com");
-            (format!("{base}/v1beta/models?pageSize=1000&key={key}"), vec![])
-        }
-        // openai + OpenAI-compatible (OpenCode / local / proxy via base_url)
-        _ => {
-            let base = base_url.as_deref().unwrap_or("https://api.openai.com");
+        Wire::Gemini => {
+            // `base` carries the version segment; auth is the header (see `build_request`).
+            let base = gemini_base(
+                base_url
+                    .as_deref()
+                    .unwrap_or("https://generativelanguage.googleapis.com/v1beta"),
+            );
             (
-                format!("{base}/v1/models"),
-                vec![("authorization".into(), format!("Bearer {key}"))],
+                format!("{base}/models?pageSize=1000"),
+                vec![("x-goog-api-key".to_string(), key.clone())],
             )
+        }
+        // Responses providers publish the same `/v1/models` catalog as chat-completions.
+        Wire::Openai | Wire::Responses => {
+            let base = base_url.as_deref().unwrap_or("https://api.openai.com");
+            let mut h = Vec::new();
+            if !key.is_empty() {
+                h.push(("authorization".to_string(), format!("Bearer {key}")));
+            }
+            (format!("{base}/v1/models"), h)
         }
     };
     let client = reqwest::Client::new();
@@ -228,8 +515,8 @@ pub async fn ai_list_models(
         .json()
         .await
         .map_err(|e| AppError::new(e.to_string()))?;
-    let mut out: Vec<String> = match provider.as_str() {
-        "gemini" => json["models"]
+    let mut out: Vec<String> = match wire {
+        Wire::Gemini => json["models"]
             .as_array()
             .map(|a| a.as_slice())
             .unwrap_or_default()
@@ -243,8 +530,8 @@ pub async fn ai_list_models(
             .filter_map(|m| m["name"].as_str())
             .map(|n| n.trim_start_matches("models/").to_string())
             .collect(),
-        // anthropic + openai both wrap in `data: [{id}]`
-        _ => json["data"]
+        // anthropic + openai-compatible + responses all wrap in `data: [{id}]`
+        Wire::Anthropic | Wire::Openai | Wire::Responses => json["data"]
             .as_array()
             .map(|a| a.as_slice())
             .unwrap_or_default()
@@ -253,24 +540,28 @@ pub async fn ai_list_models(
             .map(str::to_string)
             .collect(),
     };
-    if provider == "openai" {
-        // /v1/models mixes in embeddings/audio/image/moderation models — drop the
-        // obvious non-chat families (also harmless on compatible/local servers).
+    if matches!(wire, Wire::Openai | Wire::Responses) {
+        // `/v1/models` mixes in embeddings/audio/image/moderation models. Applies to
+        // every OpenAI-wire provider, not just OpenAI — routers relay the same families.
         const SKIP: [&str; 11] = [
             "embedding", "whisper", "tts", "dall-e", "moderation", "audio",
             "realtime", "transcribe", "image", "davinci", "babbage",
         ];
         out.retain(|id| !SKIP.iter().any(|s| id.contains(s)));
-        out.sort_by(|a, b| b.cmp(a));
+        out.sort(); // ascending groups router ids by vendor prefix ("anthropic/…", "openai/…")
     }
     Ok(out)
 }
 
-/// One parsed SSE line's meaning.
-enum SseItem {
-    Delta(String),
-    Done,
-    Ignore,
+/// One parsed SSE line. A single frame can carry several signals at once (Gemini's
+/// last chunk has both text and `finishReason`), so this is a struct, not an enum —
+/// an enum would silently drop the finish reason of a truncated final chunk.
+#[derive(Default)]
+struct Frame {
+    delta: Option<String>,
+    finish: Option<String>,
+    error: Option<String>,
+    done: bool,
 }
 
 /// Drain COMPLETE lines from a byte buffer, leaving any partial trailing line.
@@ -288,58 +579,215 @@ fn drain_sse_lines(buf: &mut Vec<u8>) -> Vec<String> {
     lines
 }
 
-/// Parse one SSE line (`data: {json}` / `data: [DONE]`) into an item for `provider`.
-fn parse_sse_line(line: &str, provider: &str) -> SseItem {
-    let Some(payload) = line.strip_prefix("data:") else { return SseItem::Ignore };
+/// Parse one SSE line (`data: {json}` / `data: [DONE]`) into a frame for `wire`.
+fn parse_sse_line(line: &str, wire: Wire) -> Frame {
+    let mut f = Frame::default();
+    let Some(payload) = line.strip_prefix("data:") else { return f };
     let payload = payload.trim();
     if payload.is_empty() {
-        return SseItem::Ignore;
+        return f;
     }
     if payload == "[DONE]" {
-        return SseItem::Done;
+        f.done = true;
+        return f;
     }
-    match serde_json::from_str::<serde_json::Value>(payload) {
-        Ok(json) => match extract_delta(provider, &json) {
-            Some(text) => SseItem::Delta(text),
-            None => SseItem::Ignore,
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) else { return f };
+    f.error = extract_error(wire, &json);
+    f.delta = extract_delta(wire, &json).filter(|t| !t.is_empty());
+    f.finish = extract_finish(wire, &json).filter(|r| !r.is_empty());
+    if wire == Wire::Anthropic && json["type"] == "message_stop" {
+        f.done = true;
+    }
+    // Responses has no `[DONE]` sentinel — a typed terminal event ends the stream.
+    if wire == Wire::Responses && (json["type"] == "response.completed" || json["type"] == "response.incomplete") {
+        f.done = true;
+    }
+    f
+}
+
+/// Why an attempt failed, and whether starting over could plausibly succeed.
+enum Attempt {
+    /// Transient (overloaded / rate-limited / 5xx / dropped socket) AND nothing has
+    /// been shown to the user yet — safe to replay the request from scratch.
+    Retry(String),
+    /// Permanent (bad key, bad model, content filter), or we already emitted deltas
+    /// and replaying would duplicate them on screen.
+    Fatal(String),
+}
+
+fn retryable_status(s: u16) -> bool {
+    matches!(s, 408 | 429 | 500 | 502 | 503 | 504 | 529)
+}
+
+/// Transient-looking provider/transport messages. Deliberately generous: a needless
+/// retry costs one request, while a missed one strands the user (or, in Slack, prints
+/// a bogus "go use the desktop app").
+fn retryable_msg(m: &str) -> bool {
+    let m = m.to_ascii_lowercase();
+    [
+        "overloaded", "rate limit", "rate_limit", "timeout", "timed out", "temporarily",
+        "try again", "internal server", "connection", "connect", "reset by peer",
+        "unavailable", "502", "503", "529",
+    ]
+    .iter()
+    .any(|k| m.contains(k))
+}
+
+/// Resolves when the (optional) cancel channel fires; never, if there is none.
+/// `&mut oneshot::Receiver` is a Future (via `impl Future for &mut F where F: Future + Unpin`),
+/// so it can be re-polled across select! iterations without being consumed.
+async fn wait_cancel(rx: &mut Option<oneshot::Receiver<()>>) {
+    match rx {
+        // A dropped sender also means "stop" — nothing can cancel us any more.
+        Some(r) => {
+            let _ = r.await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// One attempt at a streamed completion. Feeds every text delta to `on_delta` and
+/// returns the accumulated text. Any provider error frame, aborting finish reason, or
+/// transport failure becomes an `Attempt` — never a silent early return.
+///
+/// `partial_is_fatal` = the deltas have already been shown to the user (the `ai_chat`
+/// path), so a mid-stream failure cannot be retried without duplicating text. The Slack
+/// path buffers instead, so it can safely replay.
+async fn stream_attempt<F: FnMut(String) + Send>(
+    client: &reqwest::Client,
+    req: &AiRequest,
+    key: &str,
+    on_delta: &mut F,
+    cancel: &mut Option<oneshot::Receiver<()>>,
+    partial_is_fatal: bool,
+) -> Result<Option<Completion>, Attempt> {
+    let (url, headers, body) = build_request(req, key);
+    let mut builder = client.post(&url).json(&body);
+    for (k, v) in headers {
+        builder = builder.header(k, v);
+    }
+
+    let resp = tokio::select! {
+        biased;
+        _ = wait_cancel(cancel) => return Ok(None),
+        r = builder.send() => match r {
+            Ok(r) => r,
+            // Nothing emitted yet by definition — the request never landed.
+            Err(e) => return Err(Attempt::Retry(e.to_string())),
         },
-        Err(_) => SseItem::Ignore,
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = resp.text().await.unwrap_or_default();
+        let msg = format!("provider error {status}: {}", detail.chars().take(500).collect::<String>());
+        return Err(if retryable_status(status.as_u16()) {
+            Attempt::Retry(msg)
+        } else {
+            Attempt::Fatal(msg)
+        });
     }
+
+    // Line-based SSE: drain complete lines (multibyte-safe), parse per provider.
+    let mut text = String::new();
+    let mut truncated = false;
+    let mut emitted = false;
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = wait_cancel(cancel) => return Ok(None),
+            c = stream.next() => c,
+        };
+        let Some(chunk) = chunk else { break }; // stream ended without an explicit Done
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => return Err(soft_fail(e.to_string(), emitted && partial_is_fatal)),
+        };
+        buf.extend_from_slice(&bytes);
+        for line in drain_sse_lines(&mut buf) {
+            let f = parse_sse_line(&line, req.wire());
+            if let Some(msg) = f.error {
+                return Err(soft_fail(msg, emitted && partial_is_fatal));
+            }
+            if let Some(t) = f.delta {
+                emitted = true;
+                text.push_str(&t);
+                on_delta(t);
+            }
+            if let Some(r) = f.finish {
+                match classify_finish(&r) {
+                    Finish::Normal => {}
+                    Finish::Truncated => truncated = true,
+                    Finish::Aborted(m) => return Err(Attempt::Fatal(m)),
+                }
+            }
+            if f.done {
+                return Ok(Some(Completion { text, truncated }));
+            }
+        }
+    }
+    Ok(Some(Completion { text, truncated }))
+}
+
+/// Retryable unless we've already painted partial output on screen.
+fn soft_fail(msg: String, locked_in: bool) -> Attempt {
+    if !locked_in && retryable_msg(&msg) {
+        Attempt::Retry(msg)
+    } else {
+        Attempt::Fatal(msg)
+    }
+}
+
+const MAX_ATTEMPTS: u32 = 3;
+
+/// Stream a completion, transparently replaying transient failures (overloaded /
+/// rate-limited / dropped socket) up to `MAX_ATTEMPTS` with backoff. `Ok(None)` = cancelled.
+async fn complete_with_retry<F: FnMut(String) + Send>(
+    req: &AiRequest,
+    mut on_delta: F,
+    mut cancel: Option<oneshot::Receiver<()>>,
+    partial_is_fatal: bool,
+) -> Result<Option<Completion>, AppError> {
+    // Local servers (Ollama / LM Studio) have no key to look up.
+    let key = match get_key(&req.provider) {
+        Ok(k) => k,
+        Err(_) if req.allow_no_key => String::new(),
+        Err(e) => return Err(e),
+    };
+    let client = reqwest::Client::new();
+    let mut last = String::new();
+    for attempt in 0..MAX_ATTEMPTS {
+        match stream_attempt(&client, req, &key, &mut on_delta, &mut cancel, partial_is_fatal).await {
+            Ok(done) => return Ok(done),
+            Err(Attempt::Fatal(m)) => return Err(AppError::new(m)),
+            Err(Attempt::Retry(m)) => {
+                last = m;
+                if attempt + 1 < MAX_ATTEMPTS {
+                    // 400ms, 800ms.
+                    tokio::time::sleep(std::time::Duration::from_millis(400 << attempt)).await;
+                }
+            }
+        }
+    }
+    Err(AppError::new(format!("{last} (gave up after {MAX_ATTEMPTS} attempts)")))
 }
 
 /// Non-streaming completion for backend consumers (the Slack bot): same provider
 /// request as `ai_chat` (one request builder, two consumers), but the SSE deltas are
 /// accumulated into a single String instead of being forwarded over a Channel.
-pub async fn complete_one_shot(req: &AiRequest) -> Result<String, AppError> {
-    let key = get_key(&req.provider)?;
-    let (url, headers, body) = build_request(req, &key);
-    let client = reqwest::Client::new();
-    let mut builder = client.post(&url).json(&body);
-    for (k, v) in headers {
-        builder = builder.header(k, v);
-    }
-    let resp = builder.send().await.map_err(|e| AppError::new(e.to_string()))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let detail = resp.text().await.unwrap_or_default();
-        return Err(AppError::new(format!(
-            "AI provider error {status}: {}",
-            detail.chars().take(500).collect::<String>()
-        )));
-    }
-    let mut out = String::new();
-    let mut stream = resp.bytes_stream();
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk.map_err(|e| AppError::new(e.to_string()))?;
-        buf.extend_from_slice(&bytes);
-        for line in drain_sse_lines(&mut buf) {
-            match parse_sse_line(&line, &req.provider) {
-                SseItem::Delta(text) => out.push_str(&text),
-                SseItem::Done => return Ok(out),
-                SseItem::Ignore => {}
-            }
-        }
+///
+/// Unlike the streaming path this buffers, so transient failures replay invisibly.
+/// An empty response is an ERROR, not an empty success — the Slack bot used to render
+/// one as "I can't help with that", masking a real provider failure.
+pub async fn complete_one_shot(req: &AiRequest) -> Result<Completion, AppError> {
+    let out = complete_with_retry(req, |_| {}, None, false)
+        .await?
+        .expect("no cancel channel — cannot be cancelled");
+    if out.text.trim().is_empty() {
+        return Err(AppError::new(
+            "the AI returned an empty response (the stream ended before any text arrived)",
+        ));
     }
     Ok(out)
 }
@@ -360,83 +808,205 @@ mod tests {
         buf.extend_from_slice(b);
         let lines = drain_sse_lines(&mut buf);
         assert_eq!(lines.len(), 1);
-        match parse_sse_line(&lines[0], "openai") {
-            SseItem::Delta(t) => assert_eq!(t, "région"), // NOT "r��gion"
-            _ => panic!("expected a delta"),
-        }
+        assert_eq!(parse_sse_line(&lines[0], Wire::Openai).delta.as_deref(), Some("région")); // NOT "r��gion"
     }
 
     #[test]
     fn sse_done_and_ignore() {
-        assert!(matches!(parse_sse_line("data: [DONE]", "openai"), SseItem::Done));
-        assert!(matches!(parse_sse_line(": comment", "openai"), SseItem::Ignore));
-        assert!(matches!(parse_sse_line("data:  ", "openai"), SseItem::Ignore));
+        assert!(parse_sse_line("data: [DONE]", Wire::Openai).done);
+        let ignored = parse_sse_line(": comment", Wire::Openai);
+        assert!(ignored.delta.is_none() && ignored.error.is_none() && !ignored.done);
+        assert!(parse_sse_line("data:  ", Wire::Openai).delta.is_none());
+    }
+
+    /// The regression that made a stream "die mid-reply with no way to retry": an
+    /// error frame arrives with HTTP 200 after some deltas. Ignoring it (the old
+    /// behaviour) ended the loop and reported a clean `Done` on a truncated message.
+    #[test]
+    fn in_stream_error_frames_are_surfaced() {
+        let anthropic = r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let e = parse_sse_line(anthropic, Wire::Anthropic).error.expect("anthropic error frame");
+        assert!(e.contains("overloaded_error") && e.contains("Overloaded"));
+        assert!(retryable_msg(&e), "overloaded must be retryable");
+
+        let openai = r#"data: {"error":{"message":"Rate limit reached","type":"rate_limit_error"}}"#;
+        assert_eq!(parse_sse_line(openai, Wire::Openai).error.as_deref(), Some("Rate limit reached"));
+
+        let gemini = r#"data: {"promptFeedback":{"blockReason":"SAFETY"}}"#;
+        assert!(parse_sse_line(gemini, Wire::Gemini).error.unwrap().contains("SAFETY"));
+
+        // A normal delta frame must not be mistaken for an error.
+        assert!(parse_sse_line(r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#, Wire::Openai).error.is_none());
+        // vLLM/LiteLLM stamp `"error": null` on every frame — must not read as a failure.
+        let ok = parse_sse_line(r#"data: {"error":null,"choices":[{"delta":{"content":"hi"}}]}"#, Wire::Openai);
+        assert!(ok.error.is_none() && ok.delta.as_deref() == Some("hi"));
+    }
+
+    /// The Slack symptom: a `max_tokens` stop leaves a ```sql fence unclosed, so block
+    /// extraction finds nothing. The reply must be reported as truncated, not as a refusal.
+    #[test]
+    fn truncation_is_detected_per_provider() {
+        let a = r#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#;
+        assert!(matches!(classify_finish(&parse_sse_line(a, Wire::Anthropic).finish.unwrap()), Finish::Truncated));
+
+        let o = r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#;
+        assert!(matches!(classify_finish(&parse_sse_line(o, Wire::Openai).finish.unwrap()), Finish::Truncated));
+
+        // Gemini's final chunk carries text AND the finish reason — both must survive.
+        let g = r#"data: {"candidates":[{"content":{"parts":[{"text":"tail"}]},"finishReason":"MAX_TOKENS"}]}"#;
+        let f = parse_sse_line(g, Wire::Gemini);
+        assert_eq!(f.delta.as_deref(), Some("tail"));
+        assert!(matches!(classify_finish(&f.finish.unwrap()), Finish::Truncated));
+    }
+
+    #[test]
+    fn finish_reasons_classify() {
+        assert!(matches!(classify_finish("end_turn"), Finish::Normal));
+        assert!(matches!(classify_finish("STOP"), Finish::Normal));
+        assert!(matches!(classify_finish("tool_use"), Finish::Normal));
+        assert!(matches!(classify_finish("content_filter"), Finish::Aborted(_)));
+        assert!(matches!(classify_finish("SAFETY"), Finish::Aborted(_)));
+        // UNKNOWN reasons are NORMAL. The reply is already in hand when this runs, so an
+        // allow-list would discard a good completion the moment a provider mints a value.
+        // These are all real: Gemini, Anthropic, vLLM/llama.cpp/OpenRouter.
+        for r in ["OTHER", "FINISH_REASON_UNSPECIFIED", "MALFORMED_FUNCTION_CALL",
+                  "pause_turn", "model_context_window_exceeded", "eos_token", "abort", ""] {
+            assert!(matches!(classify_finish(r), Finish::Normal), "unknown reason {r:?} must not abort");
+        }
+        // Anthropic's stop_reason only rides on `message_delta`, never a content delta.
+        assert!(parse_sse_line(r#"data: {"type":"content_block_delta","delta":{"text":"x"}}"#, Wire::Anthropic)
+            .finish
+            .is_none());
+    }
+
+    /// OpenAI's Responses API (`/v1/responses`) — the shape OpenCode Zen serves GPT on.
+    /// Typed events, no `[DONE]` sentinel, and a separate `response.incomplete` for
+    /// truncation. Getting any of these wrong reproduces the silent-truncation class of bug.
+    #[test]
+    fn responses_wire_frames() {
+        let d = parse_sse_line(r#"data: {"type":"response.output_text.delta","delta":"hi"}"#, Wire::Responses);
+        assert_eq!(d.delta.as_deref(), Some("hi"));
+        assert!(!d.done && d.error.is_none());
+
+        // Other typed events carry no text — notably `.done`, which repeats the FULL text
+        // and would duplicate the whole reply if it were treated as a delta.
+        assert!(parse_sse_line(r#"data: {"type":"response.output_text.done","text":"hi"}"#, Wire::Responses)
+            .delta
+            .is_none());
+
+        // A typed terminal event ends the stream (Responses sends no `[DONE]`).
+        assert!(parse_sse_line(r#"data: {"type":"response.completed"}"#, Wire::Responses).done);
+
+        // Truncation is both terminal AND truncated.
+        let inc = parse_sse_line(
+            r#"data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+            Wire::Responses,
+        );
+        assert!(inc.done);
+        assert!(matches!(classify_finish(&inc.finish.unwrap()), Finish::Truncated));
+
+        // Mid-stream failure must surface, not end the stream silently.
+        let failed = parse_sse_line(
+            r#"data: {"type":"response.failed","response":{"error":{"message":"upstream overloaded"}}}"#,
+            Wire::Responses,
+        );
+        assert_eq!(failed.error.as_deref(), Some("upstream overloaded"));
+        assert!(retryable_msg(&failed.error.unwrap()));
+
+        // The two OpenAI shapes must not cross-read each other's frames.
+        assert!(parse_sse_line(r#"data: {"choices":[{"delta":{"content":"x"}}]}"#, Wire::Responses).delta.is_none());
+        assert!(parse_sse_line(r#"data: {"type":"response.output_text.delta","delta":"x"}"#, Wire::Openai).delta.is_none());
+    }
+
+    #[test]
+    fn gemini_base_appends_a_version_segment_unless_one_is_present() {
+        // A pre-registry slack.json mirrored the old version-less default.
+        assert_eq!(gemini_base("https://generativelanguage.googleapis.com"), "https://generativelanguage.googleapis.com/v1beta");
+        assert_eq!(gemini_base("https://generativelanguage.googleapis.com/"), "https://generativelanguage.googleapis.com/v1beta");
+        // Already versioned → untouched.
+        assert_eq!(gemini_base("https://generativelanguage.googleapis.com/v1beta"), "https://generativelanguage.googleapis.com/v1beta");
+        assert_eq!(gemini_base("https://opencode.ai/zen/v1"), "https://opencode.ai/zen/v1");
+        // REGRESSION GUARD: a saved custom proxy base carries a path but NO version. The
+        // pre-registry code appended /v1beta to it; keying on "has a path" silently dropped
+        // the segment and 404'd every request for those users.
+        assert_eq!(gemini_base("https://gw.corp.example/google"), "https://gw.corp.example/google/v1beta");
+        assert_eq!(gemini_base("https://gw.corp.example/google/"), "https://gw.corp.example/google/v1beta");
+    }
+
+    #[test]
+    fn wire_parse_round_trips_the_registry_strings() {
+        // These four strings are what `src/ai/providers.ts` sends. An unknown wire falls
+        // back to Openai — the shape most third-party gateways speak.
+        assert!(Wire::parse("anthropic") == Wire::Anthropic);
+        assert!(Wire::parse("gemini") == Wire::Gemini);
+        assert!(Wire::parse("openai") == Wire::Openai);
+        assert!(Wire::parse("responses") == Wire::Responses);
+        assert!(Wire::parse("something-new") == Wire::Openai);
+        // Legacy configs (and older slack.json) carry only a provider name.
+        assert!(Wire::legacy_for_provider("gemini") == Wire::Gemini);
+        assert!(Wire::legacy_for_provider("groq") == Wire::Openai);
+    }
+
+    #[test]
+    fn retry_classification() {
+        assert!(retryable_status(529) && retryable_status(429) && retryable_status(503));
+        assert!(!retryable_status(401) && !retryable_status(400) && !retryable_status(404));
+        assert!(retryable_msg("upstream connect error"));
+        assert!(!retryable_msg("invalid x-api-key"));
+        // Once deltas are on screen, even a transient failure must not replay them.
+        assert!(matches!(soft_fail("Overloaded".into(), true), Attempt::Fatal(_)));
+        assert!(matches!(soft_fail("Overloaded".into(), false), Attempt::Retry(_)));
     }
 }
 
 /// Stream a completion from the configured provider, emitting `AiEvent`s over the channel.
 /// The API key is read from the keychain (never crosses the IPC boundary as plaintext from
 /// the frontend). Always resolves Ok — failures are delivered as an `Error` event so the
-/// frontend has a single event stream to consume.
+/// frontend has a single event stream to consume, and a failed turn is retryable there.
+///
+/// Transient failures BEFORE the first delta are replayed internally; once text has been
+/// painted, a failure surfaces as `Error` (the frontend offers Retry rather than
+/// duplicating the partial reply). `req.requestId` registers the stream for `ai_cancel`.
 #[tauri::command]
-pub async fn ai_chat(req: AiRequest, on_event: tauri::ipc::Channel<AiEvent>) -> Result<(), AppError> {
-    let key = match get_key(&req.provider) {
-        Ok(k) => k,
-        Err(e) => {
-            let _ = on_event.send(AiEvent::Error { message: e.message });
-            return Ok(());
-        }
-    };
-    let (url, headers, body) = build_request(&req, &key);
-    let client = reqwest::Client::new();
-    let mut builder = client.post(&url).json(&body);
-    for (k, v) in headers {
-        builder = builder.header(k, v);
-    }
-
-    let resp = match builder.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = on_event.send(AiEvent::Error { message: e.to_string() });
-            return Ok(());
-        }
-    };
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let detail = resp.text().await.unwrap_or_default();
-        let _ = on_event.send(AiEvent::Error {
-            message: format!("provider error {status}: {}", detail.chars().take(500).collect::<String>()),
-        });
-        return Ok(());
-    }
-
-    // Line-based SSE: drain complete lines (multibyte-safe), parse per provider.
-    let mut stream = resp.bytes_stream();
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let bytes = match chunk {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = on_event.send(AiEvent::Error { message: e.to_string() });
-                return Ok(());
+pub async fn ai_chat(
+    req: AiRequest,
+    on_event: tauri::ipc::Channel<AiEvent>,
+    cancels: tauri::State<'_, AiCancels>,
+) -> Result<(), AppError> {
+    // Register a cancel channel keyed by the frontend's request id. Without an id
+    // (shouldn't happen from the panel) the stream simply isn't cancellable — a `None`
+    // receiver, NOT a dropped sender, which would fire the cancel branch immediately.
+    let mut guard = None;
+    let rx = match &req.request_id {
+        Some(id) => {
+            let (tx, rx) = oneshot::channel();
+            if let Ok(mut m) = cancels.0.lock() {
+                m.insert(id.clone(), tx);
             }
-        };
-        buf.extend_from_slice(&bytes);
-        for line in drain_sse_lines(&mut buf) {
-            match parse_sse_line(&line, &req.provider) {
-                SseItem::Delta(text) => {
-                    if !text.is_empty() {
-                        let _ = on_event.send(AiEvent::Delta { text });
-                    }
-                }
-                SseItem::Done => {
-                    let _ = on_event.send(AiEvent::Done);
-                    return Ok(());
-                }
-                SseItem::Ignore => {}
-            }
+            guard = Some(CancelGuard { cancels: cancels.inner(), id: id.clone() });
+            Some(rx)
         }
-    }
-    let _ = on_event.send(AiEvent::Done);
+        None => None,
+    };
+
+    // Clone (not borrow) the channel into the delta closure: the closure must be Send
+    // to cross the awaits inside the retry loop.
+    let emit = on_event.clone();
+    let res = complete_with_retry(
+        &req,
+        move |text| {
+            let _ = emit.send(AiEvent::Delta { text });
+        },
+        rx,
+        true, // partial output is on screen — never replay over it
+    )
+    .await;
+    drop(guard);
+
+    let _ = match res {
+        Ok(Some(c)) => on_event.send(AiEvent::Done { truncated: c.truncated }),
+        Ok(None) => on_event.send(AiEvent::Cancelled),
+        Err(e) => on_event.send(AiEvent::Error { message: e.message }),
+    };
     Ok(())
 }

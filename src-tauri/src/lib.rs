@@ -992,6 +992,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(AppState::default())
         .manage(slack::SlackRuntime::default())
+        .manage(ai::AiCancels::default())
         .setup(|app| {
             // Auto-start the Slack bot when enabled + tokens saved. Failures are
             // non-fatal: the settings pane shows the status and can retry.
@@ -1036,6 +1037,7 @@ pub fn run() {
             ai::ai_has_key,
             ai::ai_clear_key,
             ai::ai_chat,
+            ai::ai_cancel,
             ai::ai_list_models,
             slack_load_config,
             slack_save_config,

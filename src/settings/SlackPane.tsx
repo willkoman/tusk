@@ -6,7 +6,7 @@
 import { Show, createSignal, onCleanup, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { aiStore } from "../ai/store";
+import { aiStore, defaultModel, isKeyless, resolveBaseUrl, resolveWire } from "../ai/store";
 
 type SlackConfig = {
   enabled: boolean;
@@ -18,9 +18,12 @@ type SlackConfig = {
   chartsEnabled: boolean;
   destructivePolicy: string;
   aiProvider: string;
+  /** Wire protocol, resolved from the TS provider registry at save time. */
+  aiWire: string;
   aiModel: string;
   aiBaseUrl: string | null;
   aiMaxTokens: number;
+  aiAllowNoKey: boolean;
 };
 
 type SlackConfigInfo = { config: SlackConfig; hasBotToken: boolean; hasAppToken: boolean };
@@ -36,9 +39,11 @@ const DEFAULT_CONFIG: SlackConfig = {
   chartsEnabled: true,
   destructivePolicy: "proposeReadonly",
   aiProvider: "",
+  aiWire: "",
   aiModel: "",
   aiBaseUrl: null,
   aiMaxTokens: 2048,
+  aiAllowNoKey: false,
 };
 
 const errMsg = (e: unknown): string => (e as { message?: string })?.message ?? String(e);
@@ -80,12 +85,21 @@ export function SlackPane() {
   // `override` lets callers pin fields (notably `enabled`) independent of the signal.
   const save = async (override: Partial<SlackConfig> = {}): Promise<boolean> => {
     const ai = aiStore.load();
+    const model = ai.model || defaultModel(ai.provider);
+    const wire = resolveWire(ai.provider, model);
     const config: SlackConfig = {
       ...cfg(),
       ...override,
       aiProvider: ai.provider,
-      aiModel: ai.model,
-      aiBaseUrl: ai.baseUrl || null,
+      // The registry lives in TS, so the bot gets the RESOLVED wire and base URL —
+      // it can't look them up. Wire is per-model (OpenCode); an unsupported model
+      // falls back to the provider's default wire and will surface as a bot error
+      // rather than silently hitting the wrong endpoint.
+      aiWire: wire ?? "",
+      aiModel: model,
+      // Wire-resolved: some gateways host a wire under a sub-path (Zen's gemini).
+      aiBaseUrl: resolveBaseUrl(ai.provider, ai.baseUrl, wire ?? undefined) || null,
+      aiAllowNoKey: isKeyless(ai.provider),
     };
     try {
       await invoke("slack_save_config", {
