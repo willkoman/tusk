@@ -774,6 +774,12 @@ async fn export_to_file(
         if sqls.len() != 1 {
             return Err(AppError::new("export streams a single query — select one statement"));
         }
+        // Scope=all re-runs the query, so the frontend's grid-based bool detection
+        // (typed or heuristic over the LOADED rows) can't vouch for rows it never
+        // saw. Override with the server-reported column types — exact for the full
+        // stream, including expression columns. Best-effort: empty on failure.
+        let mut options = options;
+        options.bool_cols = c.backend.bool_columns(&sqls[0]).await;
         // Arm cancellation for the duration of the stream, then always disarm.
         // PG streams through a server-side cursor (snapshot-consistent);
         // other drivers page via LIMIT/OFFSET through the same sink feeder.

@@ -170,9 +170,11 @@ export function formatDataset(d: Dataset, fmt: string, table: string): string {
 
 // ---------- options-driven formatting (clipboard export) ----------
 // Mirrors src-tauri/src/export.rs byte-for-byte (delimiter / quote mode / null /
-// header / column projection / line ending). xlsx is never produced here.
+// header / column projection / line ending / boolean mapping). xlsx is never
+// produced here.
 
 import { type ExportOptions, resolvedDelimiter, nullString } from "./export";
+import { boolWord } from "./grid/bool";
 
 function delimField(v: string | null, o: ExportOptions): string {
   if (v === null) return nullString(o);
@@ -197,23 +199,51 @@ export function formatWithOptions(d: Dataset, o: ExportOptions): string {
   const rows = d.rows.map((r) => idx.map((i) => r[i] ?? null));
   const nl = o.lineEnding === "crlf" ? "\r\n" : "\n";
   const table = o.sql.table || "exported";
+  // Per projected column: is the SOURCE column a boolean? (boolCols holds source
+  // indices, like columnIndices.) A bool cell whose token isn't recognized (or NULL)
+  // falls through to the raw value — the mapping never invents data.
+  const pbool = idx.map((i) => (o.boolCols ?? []).includes(i));
+  const word = (k: number, v: string | null): string | null =>
+    v !== null && pbool[k] ? boolWord(v) ?? v : v;
 
   switch (o.format) {
     case "json":
-      return JSON.stringify(rows.map((r) => Object.fromEntries(cols.map((c, k) => [c, r[k]]))), null, 2);
+      return JSON.stringify(
+        rows.map((r) =>
+          Object.fromEntries(
+            cols.map((c, k) => {
+              const v = r[k];
+              const w = v !== null && pbool[k] ? boolWord(v) : null;
+              return [c, w !== null ? w === "TRUE" : v];
+            }),
+          ),
+        ),
+        null,
+        2,
+      );
     case "markdown": {
       const esc = (v: string | null) => (v === null ? "" : v.replace(/\|/g, "\\|").replace(/\n/g, " "));
       const head = `| ${cols.map((c) => c.replace(/\|/g, "\\|")).join(" | ")} |`;
       const sep = `| ${cols.map(() => "---").join(" | ")} |`;
-      return [head, sep, ...rows.map((r) => `| ${r.map(esc).join(" | ")} |`)].join(nl);
+      return [head, sep, ...rows.map((r) => `| ${r.map((v, k) => esc(word(k, v))).join(" | ")} |`)].join(nl);
     }
     case "sql": {
       const colList = cols.map(qIdent).join(", ");
+      // Recognized booleans emit as unquoted TRUE/FALSE literals (valid on PG /
+      // DuckDB / MySQL / SQLite); anything else stays a quoted string.
       const tuple = (r: (string | null)[]) =>
-        `(${r.map((v) => (v === null ? "NULL" : `'${v.replace(/'/g, "''")}'`)).join(", ")})`;
+        `(${r
+          .map((v, k) => {
+            if (v === null) return "NULL";
+            const w = pbool[k] ? boolWord(v) : null;
+            return w ?? `'${v.replace(/'/g, "''")}'`;
+          })
+          .join(", ")})`;
       const lines: string[] = [];
       if (o.sql.includeCreate) {
-        lines.push(`CREATE TABLE ${qIdent(table)} (${cols.map((c) => `${qIdent(c)} text`).join(", ")});`);
+        lines.push(
+          `CREATE TABLE ${qIdent(table)} (${cols.map((c, k) => `${qIdent(c)} ${pbool[k] ? "boolean" : "text"}`).join(", ")});`,
+        );
       }
       if (o.sql.multiRow) {
         for (let i = 0; i < rows.length; i += 1000) {
@@ -229,7 +259,7 @@ export function formatWithOptions(d: Dataset, o: ExportOptions): string {
       const delim = resolvedDelimiter(o);
       const lines: string[] = [];
       if (o.header) lines.push(cols.map((c) => delimField(c, o)).join(delim));
-      for (const r of rows) lines.push(r.map((v) => delimField(v, o)).join(delim));
+      for (const r of rows) lines.push(r.map((v, k) => delimField(word(k, v), o)).join(delim));
       return lines.join(nl);
     }
   }

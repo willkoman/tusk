@@ -30,6 +30,14 @@ export type ExportOptions = {
   bom: boolean;
   /** Included source-column indices, in output order. Empty = all, natural order. */
   columnIndices: number[];
+  /**
+   * Source-column indices whose values are textual booleans (t/f, true/false, 0/1),
+   * exported as TRUE/FALSE (native booleans in xlsx/JSON) instead of the driver's
+   * raw token. Data-shape metadata, not a user-editable option: the grid's bool
+   * detection seeds it (scope=loaded/clipboard); scope=all is overridden backend-side
+   * by the server-reported column types. Empty = no mapping.
+   */
+  boolCols: number[];
   sql: SqlExportOptions;
   xlsx: XlsxExportOptions;
 };
@@ -70,6 +78,7 @@ export function defaultExportOptions(table: string): ExportOptions {
     lineEnding: "lf",
     bom: false,
     columnIndices: [],
+    boolCols: [],
     sql: { table: table || "exported", multiRow: false, includeCreate: false },
     xlsx: { sheetName: (table || "Sheet1").slice(0, 26), headerStyling: true, autoFilter: true, freezeHeader: true },
   };

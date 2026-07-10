@@ -248,6 +248,20 @@ export function SlackPane() {
           onChange={(e) => patch({ queryTimeoutSecs: Math.max(1, Math.min(600, Number(e.currentTarget.value) || 30)) })}
         />
       </label>
+      <label
+        class="settings-row"
+        title="Upper bound on the AI's reply length, in tokens. Too low cuts replies (and their SQL) off mid-sentence; the provider may cap it lower than this."
+      >
+        <span>AI reply max tokens</span>
+        <input
+          type="number"
+          min="256"
+          max="128000"
+          step="256"
+          value={cfg().aiMaxTokens}
+          onChange={(e) => patch({ aiMaxTokens: Math.max(256, Math.min(128000, Number(e.currentTarget.value) || 2048)) })}
+        />
+      </label>
 
       <label class="settings-row" title="Slack channel IDs (C…/D…), comma-separated. Empty = any channel the bot is in.">
         <span>Allowed channels</span>

@@ -468,6 +468,69 @@ impl Backend {
         }
     }
 
+    /// Column indices of `sql`'s result set whose server-reported type is boolean.
+    /// Feeds export's TRUE/FALSE mapping (scope=all — the frontend's grid-based
+    /// detection can't see rows it hasn't loaded, so the server types are the truth
+    /// here). Best-effort: any failure returns empty and the export proceeds unmapped.
+    ///
+    /// - Postgres: extended-protocol prepare (parse+plan only, nothing executes) —
+    ///   also types expressions (`a AND b`), which no declared-type tier can.
+    /// - DuckDB: `DESCRIBE <sql>` (binder output; types expressions too).
+    /// - SQLite: declared column types off the prepared statement (no execution);
+    ///   expressions have no decltype and are skipped — same tier as the grid.
+    /// - MySQL: none. `tinyint(1)` is a display width the metadata drops, and the
+    ///   grid deliberately shows 0/1 there — the export must match the grid.
+    pub async fn bool_columns(&self, sql: &str) -> Vec<usize> {
+        match self {
+            Backend::Pg(p) => match p.client.prepare(sql).await {
+                Ok(stmt) => stmt
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| *c.type_() == tokio_postgres::types::Type::BOOL)
+                    .map(|(i, _)| i)
+                    .collect(),
+                Err(_) => Vec::new(),
+            },
+            Backend::Duck(d) => {
+                // DESCRIBE returns one row per result column, in order; find the
+                // column_type field by name so a layout change can't misread it.
+                match duck_query(&d.lock(), &format!("DESCRIBE {sql}")) {
+                    Ok((cols, rows)) => {
+                        let Some(ty) = cols.iter().position(|c| c == "column_type") else {
+                            return Vec::new();
+                        };
+                        rows.iter()
+                            .enumerate()
+                            .filter(|(_, r)| r.get(ty).and_then(|v| v.as_deref()) == Some("BOOLEAN"))
+                            .map(|(i, _)| i)
+                            .collect()
+                    }
+                    Err(_) => Vec::new(),
+                }
+            }
+            Backend::Sqlite(s) => {
+                let conn = s.lock();
+                let found = match conn.prepare(sql) {
+                    Ok(stmt) => stmt
+                        .columns()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| {
+                            c.decl_type()
+                                .map(|t| t.trim().eq_ignore_ascii_case("bool") || t.trim().eq_ignore_ascii_case("boolean"))
+                                .unwrap_or(false)
+                        })
+                        .map(|(i, _)| i)
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+                found
+            }
+            Backend::MySql(_) => Vec::new(),
+        }
+    }
+
     /// Run an internal text-returning query (introspection): columns + text rows.
     async fn query_text(
         &self,

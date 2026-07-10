@@ -4,6 +4,12 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-07-10
+
+### Fixed
+- **Booleans no longer export as raw driver tokens (`t`/`f`).** The grid has always displayed TRUE/FALSE, but every export path emitted the text-protocol token — Postgres `t`/`f`, DuckDB `true`/`false`, SQLite `0`/`1` — straight into the file. Boolean columns now export as **TRUE/FALSE everywhere**: native boolean cells in Excel (real `TRUE`/`FALSE`, usable in formulas), real `true`/`false` in JSON, unquoted `TRUE`/`FALSE` literals in SQL inserts (with a `boolean` column type when "Include CREATE TABLE" is on), and the display words in CSV/TSV/Markdown/clipboard. Which columns are boolean comes from the most authoritative source each path has: **"All rows" exports ask the server** (new `Backend::bool_columns` — Postgres types the query via a parse-only prepare, so even expression columns like `a AND b` are caught; DuckDB via `DESCRIBE`; SQLite via declared column types; each pinned by a conformance battery on all four engines), while "Loaded rows"/clipboard reuse the exact bool-column set the grid is showing. Unrecognized values in a boolean column pass through raw — the mapping never invents data. **MySQL deliberately keeps `0`/`1`**: `tinyint(1)` is a display width the metadata drops, the grid shows `0`/`1` there, and export matches the grid. Slack results get the same treatment (inline tables, CSV/Excel/JSON/Markdown export buttons) via the grid's value heuristic over the fully buffered result.
+- **Slack AI replies were stuck at 2048 tokens.** The backend has had a configurable `aiMaxTokens` in `slack.json` all along, but Settings → Slack never exposed a field for it, so every install ran on the default and long replies truncated mid-SQL. Settings → Slack now has an "AI reply max tokens" field (256–128000); applies on the next question, no bot restart needed.
+
 ## [0.8.3] - 2026-07-08
 
 ### Added

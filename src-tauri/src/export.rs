@@ -76,6 +76,14 @@ pub struct ExportOptions {
     /// Included source-column indices, in output order. Empty = all, natural order.
     #[serde(default)]
     pub column_indices: Vec<usize>,
+    /// Source-column indices whose values are textual booleans, exported as
+    /// TRUE/FALSE (native booleans in xlsx/JSON) instead of the driver's raw
+    /// token (PG `t`/`f`, DuckDB `true`/`false`, SQLite `0`/`1`). The frontend
+    /// seeds it from the grid's bool detection (scope=loaded/clipboard);
+    /// `export_to_file` overrides it with the server-reported column types for
+    /// scope=all (`Backend::bool_columns`). Empty = no mapping.
+    #[serde(default)]
+    pub bool_cols: Vec<usize>,
     #[serde(default)]
     pub sql: SqlOptions,
     #[serde(default)]
@@ -147,6 +155,57 @@ fn project_cols(columns: &[String], idx: &[usize]) -> Vec<String> {
 fn project_row(row: &[Option<String>], idx: &[usize]) -> Vec<Option<String>> {
     idx.iter().map(|&i| row.get(i).cloned().flatten()).collect()
 }
+/// Per PROJECTED column: is the source column a declared boolean?
+fn project_bools(opts: &ExportOptions, idx: &[usize]) -> Vec<bool> {
+    idx.iter().map(|i| opts.bool_cols.contains(i)).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Boolean mapping — PARITY PAIR with src/grid/bool.ts `boolWord` (the grid's
+// display words) and src/formats.ts `formatWithOptions` (the clipboard path).
+// Change all three together.
+// ---------------------------------------------------------------------------
+
+/// Map a driver's textual boolean token; `None` = not a recognized token (the
+/// raw value passes through — the mapping never invents data). Exactly the
+/// token set of the grid's `boolWord`: PG `t`/`f`, DuckDB `true`/`false`,
+/// SQLite/MySQL `1`/`0`, plus the display words themselves.
+pub fn bool_token(v: &str) -> Option<bool> {
+    match v {
+        "t" | "true" | "TRUE" | "1" => Some(true),
+        "f" | "false" | "FALSE" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn bool_display(b: bool) -> &'static str {
+    if b {
+        "TRUE"
+    } else {
+        "FALSE"
+    }
+}
+
+/// Value heuristic mirroring the grid's `detectBoolCols` (src/grid/bool.ts):
+/// columns whose non-NULL values are all t/f/true/false tokens (with at least
+/// one non-NULL seen). `0`/`1` are deliberately NOT heuristic tokens — they
+/// would misclassify integer columns. Used by the Slack export path, where the
+/// full result is buffered and no column-type metadata survives execution.
+pub fn detect_bool_cols(ncols: usize, rows: &[Vec<Option<String>>]) -> Vec<usize> {
+    (0..ncols)
+        .filter(|&c| {
+            let mut seen = false;
+            for row in rows {
+                match row.get(c).and_then(|v| v.as_deref()) {
+                    None => continue,
+                    Some("t" | "f" | "true" | "false" | "TRUE" | "FALSE") => seen = true,
+                    Some(_) => return false,
+                }
+            }
+            seen
+        })
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Field / row formatting (pure). Mirrors src/formats.ts `formatWithOptions`.
@@ -186,7 +245,7 @@ fn sql_val(v: &Option<String>) -> String {
 
 /// The header / preamble for a format (delimited header row, markdown rule, `[`,
 /// or a SQL `CREATE TABLE`). Empty when the format has none.
-fn header_text(opts: &ExportOptions, pcols: &[String]) -> String {
+fn header_text(opts: &ExportOptions, pcols: &[String], pbool: &[bool]) -> String {
     let nl = opts.newline();
     match opts.format.as_str() {
         "json" => "[".to_string(),
@@ -198,7 +257,15 @@ fn header_text(opts: &ExportOptions, pcols: &[String]) -> String {
         "sql" => {
             if opts.sql.include_create {
                 let table = if opts.sql.table.is_empty() { "exported".to_string() } else { opts.sql.table.clone() };
-                let cols = pcols.iter().map(|c| format!("{} text", db::ident(c))).collect::<Vec<_>>().join(", ");
+                let cols = pcols
+                    .iter()
+                    .enumerate()
+                    .map(|(k, c)| {
+                        let ty = if pbool.get(k).copied().unwrap_or(false) { "boolean" } else { "text" };
+                        format!("{} {ty}", db::ident(c))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 format!("CREATE TABLE {} ({cols});{nl}", db::ident(&table))
             } else {
                 String::new()
@@ -225,14 +292,24 @@ struct TextEmit<'a> {
     path: &'a str,
     opts: &'a ExportOptions,
     pcols: Vec<String>,
+    pbool: Vec<bool>, // per projected column: map textual booleans to TRUE/FALSE
     writer: Option<BufWriter<File>>,
     wrote_rows: u64,
     sql_buf: Vec<String>, // pending value-tuples for a multi-row INSERT
 }
 
 impl<'a> TextEmit<'a> {
-    fn new(opts: &'a ExportOptions, pcols: Vec<String>, path: &'a str) -> Self {
-        Self { path, opts, pcols, writer: None, wrote_rows: 0, sql_buf: Vec::new() }
+    fn new(opts: &'a ExportOptions, pcols: Vec<String>, pbool: Vec<bool>, path: &'a str) -> Self {
+        Self { path, opts, pcols, pbool, writer: None, wrote_rows: 0, sql_buf: Vec::new() }
+    }
+
+    /// The recognized boolean word for projected cell `k`, if the column is a
+    /// boolean and the value a known token.
+    fn word(&self, k: usize, v: &Option<String>) -> Option<&'static str> {
+        if !self.pbool.get(k).copied().unwrap_or(false) {
+            return None;
+        }
+        v.as_deref().and_then(bool_token).map(bool_display)
     }
 
     async fn ensure_open(&mut self) -> Result<(), AppError> {
@@ -244,7 +321,7 @@ impl<'a> TextEmit<'a> {
         if self.opts.bom {
             w.write_all(&[0xEF, 0xBB, 0xBF]).await.map_err(|e| AppError::new(e.to_string()))?;
         }
-        let head = header_text(self.opts, &self.pcols);
+        let head = header_text(self.opts, &self.pcols, &self.pbool);
         if !head.is_empty() {
             w.write_all(head.as_bytes()).await.map_err(|e| AppError::new(e.to_string()))?;
         }
@@ -294,9 +371,11 @@ impl<'a> TextEmit<'a> {
                     if k > 0 {
                         out.push(',');
                     }
-                    let val = match &prow[k] {
-                        Some(s) => json_str(s),
-                        None => "null".to_string(),
+                    // Booleans emit as real JSON booleans, not quoted tokens.
+                    let val = match (self.word(k, &prow[k]), &prow[k]) {
+                        (Some(w), _) => w.to_ascii_lowercase(),
+                        (None, Some(s)) => json_str(s),
+                        (None, None) => "null".to_string(),
                     };
                     out.push_str(&format!("{}: {}", json_str(c), val));
                 }
@@ -306,15 +385,29 @@ impl<'a> TextEmit<'a> {
             "markdown" => {
                 let cells: Vec<String> = prow
                     .iter()
-                    .map(|v| match v {
-                        None => String::new(),
-                        Some(s) => s.replace('|', "\\|").replace('\n', " "),
+                    .enumerate()
+                    .map(|(k, v)| match (self.word(k, v), v) {
+                        (Some(w), _) => w.to_string(),
+                        (None, Some(s)) => s.replace('|', "\\|").replace('\n', " "),
+                        (None, None) => String::new(),
                     })
                     .collect();
                 self.write(format!("| {} |{nl}", cells.join(" | ")).as_bytes()).await?;
             }
             "sql" => {
-                let tuple = format!("({})", prow.iter().map(sql_val).collect::<Vec<_>>().join(", "));
+                // Recognized booleans emit as unquoted TRUE/FALSE literals (valid on
+                // PG / DuckDB / MySQL / SQLite); anything else stays a quoted string.
+                let tuple = format!(
+                    "({})",
+                    prow.iter()
+                        .enumerate()
+                        .map(|(k, v)| match self.word(k, v) {
+                            Some(w) => w.to_string(),
+                            None => sql_val(v),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
                 if self.opts.sql.multi_row {
                     self.sql_buf.push(tuple);
                     if self.sql_buf.len() >= SQL_TUPLES_PER_INSERT {
@@ -328,7 +421,14 @@ impl<'a> TextEmit<'a> {
             }
             // csv / tsv / custom delimited
             _ => {
-                let cells: Vec<String> = prow.iter().map(|v| delim_field(v, self.opts)).collect();
+                let cells: Vec<String> = prow
+                    .iter()
+                    .enumerate()
+                    .map(|(k, v)| match self.word(k, v) {
+                        Some(w) => delim_field(&Some(w.to_string()), self.opts),
+                        None => delim_field(v, self.opts),
+                    })
+                    .collect();
                 self.write(format!("{}{nl}", cells.join(&self.opts.delim().to_string())).as_bytes()).await?;
             }
         }
@@ -374,6 +474,7 @@ struct XlsxSink<'a> {
     wb: Workbook,
     opts: &'a ExportOptions,
     pcols: Vec<String>,
+    pbool: Vec<bool>, // per projected column: write native Excel booleans
     base_name: String,
     sheets: u32,    // number of sheets created so far
     row_in_sheet: u32, // next row index to write in the current sheet
@@ -382,12 +483,13 @@ struct XlsxSink<'a> {
 }
 
 impl<'a> XlsxSink<'a> {
-    fn new(opts: &'a ExportOptions, pcols: Vec<String>) -> Self {
+    fn new(opts: &'a ExportOptions, pcols: Vec<String>, pbool: Vec<bool>) -> Self {
         Self {
             wb: Workbook::new(),
             opts,
             base_name: sanitize_sheet(&opts.xlsx.sheet_name),
             pcols,
+            pbool,
             sheets: 0,
             row_in_sheet: 0,
             last_rows: Vec::new(),
@@ -463,7 +565,13 @@ impl<'a> XlsxSink<'a> {
         let ws = self.wb.worksheet_from_index(idx).map_err(xerr)?;
         for (c, v) in prow.iter().enumerate() {
             if let Some(s) = v {
-                ws.write_string(r, c as u16, s).map_err(xerr)?;
+                // Boolean columns land as native Excel booleans (cell type `b`,
+                // displayed TRUE/FALSE, usable in formulas); an unrecognized token
+                // in a bool column degrades to the raw string.
+                match self.pbool.get(c).copied().unwrap_or(false).then(|| bool_token(s)).flatten() {
+                    Some(b) => ws.write_boolean(r, c as u16, b).map_err(xerr)?,
+                    None => ws.write_string(r, c as u16, s).map_err(xerr)?,
+                };
             }
         }
         self.row_in_sheet += 1;
@@ -542,10 +650,11 @@ impl<'a> SinkFeeder<'a> {
         }
         self.indices = self.opts.indices(cols.len());
         let pcols = project_cols(cols, &self.indices);
+        let pbool = project_bools(self.opts, &self.indices);
         if self.is_xlsx {
-            self.xlsx = Some(XlsxSink::new(self.opts, pcols));
+            self.xlsx = Some(XlsxSink::new(self.opts, pcols, pbool));
         } else {
-            self.text = Some(TextEmit::new(self.opts, pcols, self.path));
+            self.text = Some(TextEmit::new(self.opts, pcols, pbool, self.path));
         }
     }
 
@@ -681,16 +790,17 @@ pub async fn run_export_rows(
 ) -> Result<u64, AppError> {
     let indices = opts.indices(columns.len());
     let pcols = project_cols(columns, &indices);
+    let pbool = project_bools(opts, &indices);
     let mut total: u64 = 0;
     if opts.format == "xlsx" {
-        let mut sink = XlsxSink::new(opts, pcols);
+        let mut sink = XlsxSink::new(opts, pcols, pbool);
         for row in rows {
             sink.write_row(&project_row(row, &indices))?;
             total += 1;
         }
         sink.finish(path)?;
     } else {
-        let mut emit = TextEmit::new(opts, pcols, path);
+        let mut emit = TextEmit::new(opts, pcols, pbool, path);
         for row in rows {
             emit.row(&project_row(row, &indices)).await?;
             total += 1;
@@ -698,4 +808,144 @@ pub async fn run_export_rows(
         emit.finish().await?;
     }
     Ok(total)
+}
+
+// ---------------------------------------------------------------------------
+// Tests — the boolean mapping here is a PARITY PAIR with src/formats.test.ts
+// (`formatWithOptions`): both assert the same outputs for the same inputs.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(json: &str) -> ExportOptions {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// `note` deliberately holds bool-looking tokens: NOT in bool_cols, must pass raw.
+    fn data() -> (Vec<String>, Vec<Vec<Option<String>>>) {
+        let cols = vec!["id".into(), "active".into(), "note".into()];
+        let rows = vec![
+            vec![Some("1".into()), Some("t".into()), Some("t".into())],
+            vec![Some("2".into()), Some("f".into()), Some("plain".into())],
+            vec![Some("3".into()), None, None],
+        ];
+        (cols, rows)
+    }
+
+    async fn export(o: &ExportOptions, name: &str) -> String {
+        let (cols, rows) = data();
+        let path = std::env::temp_dir().join(format!("tusk_boolexp_{}_{}", std::process::id(), name));
+        let p = path.to_string_lossy().to_string();
+        run_export_rows(&cols, &rows, o, &p).await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        text
+    }
+
+    #[test]
+    fn bool_token_matches_grid_word_set() {
+        // Exactly src/grid/bool.ts boolWord — no more, no less.
+        for (v, want) in [
+            ("t", Some(true)),
+            ("true", Some(true)),
+            ("TRUE", Some(true)),
+            ("1", Some(true)),
+            ("f", Some(false)),
+            ("false", Some(false)),
+            ("FALSE", Some(false)),
+            ("0", Some(false)),
+            ("T", None),
+            ("True", None),
+            ("yes", None),
+            ("", None),
+        ] {
+            assert_eq!(bool_token(v), want, "token {v:?}");
+        }
+    }
+
+    #[test]
+    fn detect_heuristic_mirrors_grid() {
+        let rows: Vec<Vec<Option<String>>> = vec![
+            vec![Some("t".into()), Some("1".into()), None, Some("t".into())],
+            vec![Some("false".into()), Some("0".into()), None, Some("x".into())],
+        ];
+        // col0: all tokens → detected. col1: 0/1 are NOT heuristic tokens (integer
+        // columns would misclassify). col2: all-NULL → not detected. col3: mixed → no.
+        assert_eq!(detect_bool_cols(4, &rows), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn csv_maps_only_bool_cols() {
+        let text = export(&opts(r#"{"format":"csv","boolCols":[1]}"#), "csv").await;
+        assert_eq!(text, "id,active,note\n1,TRUE,t\n2,FALSE,plain\n3,,\n");
+    }
+
+    #[tokio::test]
+    async fn csv_without_bool_cols_is_unchanged() {
+        let text = export(&opts(r#"{"format":"csv"}"#), "csv_raw").await;
+        assert_eq!(text, "id,active,note\n1,t,t\n2,f,plain\n3,,\n");
+    }
+
+    #[tokio::test]
+    async fn json_emits_real_booleans() {
+        let text = export(&opts(r#"{"format":"json","boolCols":[1]}"#), "json").await;
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v[0]["active"], serde_json::Value::Bool(true));
+        assert_eq!(v[0]["note"], serde_json::Value::String("t".into()));
+        assert_eq!(v[1]["active"], serde_json::Value::Bool(false));
+        assert_eq!(v[2]["active"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn sql_emits_unquoted_literals_and_boolean_create_type() {
+        let text = export(
+            &opts(r#"{"format":"sql","boolCols":[1],"sql":{"table":"exported","includeCreate":true}}"#),
+            "sql",
+        )
+        .await;
+        assert!(text.contains(r#"CREATE TABLE "exported" ("id" text, "active" boolean, "note" text);"#), "{text}");
+        assert!(text.contains("VALUES ('1', TRUE, 't');"), "{text}");
+        assert!(text.contains("VALUES ('3', NULL, NULL);"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn markdown_maps_to_display_words() {
+        let text = export(&opts(r#"{"format":"markdown","boolCols":[1]}"#), "md").await;
+        assert!(text.contains("| 1 | TRUE | t |"), "{text}");
+        assert!(text.contains("| 2 | FALSE | plain |"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn bool_cols_are_source_indices_surviving_projection() {
+        let text = export(&opts(r#"{"format":"csv","boolCols":[1],"columnIndices":[2,1]}"#), "proj").await;
+        assert_eq!(text, "note,active\nt,TRUE\nplain,FALSE\n,\n");
+    }
+
+    #[tokio::test]
+    async fn unrecognized_tokens_in_a_bool_col_pass_raw() {
+        let cols = vec!["b".into()];
+        let rows: Vec<Vec<Option<String>>> =
+            vec![vec![Some("maybe".into())], vec![Some("1".into())], vec![Some("0".into())]];
+        let path = std::env::temp_dir().join(format!("tusk_boolexp_{}_raw.csv", std::process::id()));
+        let p = path.to_string_lossy().to_string();
+        run_export_rows(&cols, &rows, &opts(r#"{"format":"csv","boolCols":[0]}"#), &p).await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // 1/0 are recognized tokens (SQLite/MySQL numeric booleans); junk stays raw.
+        assert_eq!(text, "b\nmaybe\nTRUE\nFALSE\n");
+    }
+
+    #[tokio::test]
+    async fn xlsx_bool_col_writes_without_error() {
+        let (cols, rows) = data();
+        let path = std::env::temp_dir().join(format!("tusk_boolexp_{}.xlsx", std::process::id()));
+        let p = path.to_string_lossy().to_string();
+        let n = run_export_rows(&cols, &rows, &opts(r#"{"format":"xlsx","boolCols":[1]}"#), &p).await.unwrap();
+        assert_eq!(n, 3);
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(meta.len() > 0);
+        let _ = std::fs::remove_file(&path);
+    }
 }

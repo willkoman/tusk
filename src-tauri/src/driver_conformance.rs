@@ -450,6 +450,56 @@ async fn export_battery(b: &mut Backend, eng: &Eng) {
     exec(b, &format!("DROP TABLE IF EXISTS {}", q("exp_t"))).await;
 }
 
+/// B1b: boolean export. `Backend::bool_columns` reports the server-typed bool columns
+/// of an arbitrary query, and the export maps their driver tokens (PG `t`/`f`, DuckDB
+/// `true`/`false`, SQLite `0`/`1`) to TRUE/FALSE — while a TEXT column holding the same
+/// tokens passes through raw. MySQL is pinned to NO detection: `tinyint(1)` is a display
+/// width the metadata drops, and the grid deliberately shows 0/1 there — export matches.
+async fn bool_export_battery(b: &mut Backend, eng: &Eng) {
+    let q = eng.quote;
+    exec(b, &format!("DROP TABLE IF EXISTS {}", q("bool_t"))).await;
+    exec(b, &format!("CREATE TABLE {} (id INTEGER, flag BOOLEAN, note VARCHAR(10))", q("bool_t"))).await;
+    exec(b, &format!("INSERT INTO {} VALUES (1, TRUE, 't'), (2, FALSE, 'f'), (3, NULL, 'x')", q("bool_t"))).await;
+
+    let sql = format!("SELECT id, flag, note FROM {} ORDER BY id", q("bool_t"));
+    let bc = b.bool_columns(&sql).await;
+    if eng.name == "mysql" {
+        assert!(bc.is_empty(), "[{}] tinyint(1) must NOT be detected (grid shows 0/1)", eng.name);
+    } else {
+        assert_eq!(bc, vec![1], "[{}] flag column detected as boolean", eng.name);
+    }
+
+    // Expression columns: typed by the binder on PG/DuckDB (prepare/DESCRIBE); SQLite
+    // decltype is declared-columns-only, so an expression is (correctly) not detected.
+    let expr = b.bool_columns(&format!("SELECT flag AND flag AS x, id FROM {}", q("bool_t"))).await;
+    match eng.name {
+        "postgres" | "duckdb" => assert_eq!(expr, vec![0], "[{}] bool expression detected", eng.name),
+        "sqlite" => assert!(expr.is_empty(), "[{}] expressions have no decltype", eng.name),
+        _ => {}
+    }
+
+    // A garbage query must degrade to "no detection", never an error.
+    assert!(b.bool_columns("SELECT * FROM no_such_table_xyz").await.is_empty());
+
+    // End-to-end: the detected set drives the CSV mapping through the paged exporter.
+    let mut opts: crate::export::ExportOptions = serde_json::from_str(r#"{"format":"csv"}"#).unwrap();
+    opts.bool_cols = bc;
+    let path = std::env::temp_dir().join(format!("tusk_boolexp_{}_{}.csv", eng.name, std::process::id()));
+    let p = path.to_string_lossy().to_string();
+    crate::export::run_export_paged(b, &sql, &opts, &p)
+        .await
+        .unwrap_or_else(|e| panic!("[{}] bool export: {}", eng.name, e.message));
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let want = if eng.name == "mysql" {
+        "id,flag,note\n1,1,t\n2,0,f\n3,,x\n"
+    } else {
+        "id,flag,note\n1,TRUE,t\n2,FALSE,f\n3,,x\n"
+    };
+    assert_eq!(text, want, "[{}] bool CSV output", eng.name);
+    exec(b, &format!("DROP TABLE IF EXISTS {}", q("bool_t"))).await;
+}
+
 // --- entry points ---
 
 #[tokio::test]
@@ -460,6 +510,7 @@ async fn conformance_duckdb() {
     relationship_battery(&mut b, &eng).await;
     sweep_battery(&mut b, &eng).await;
     export_battery(&mut b, &eng).await;
+    bool_export_battery(&mut b, &eng).await;
 }
 
 #[tokio::test]
@@ -470,6 +521,7 @@ async fn conformance_sqlite() {
     relationship_battery(&mut b, &eng).await;
     sweep_battery(&mut b, &eng).await;
     export_battery(&mut b, &eng).await;
+    bool_export_battery(&mut b, &eng).await;
 }
 
 #[tokio::test]
@@ -484,6 +536,7 @@ async fn conformance_postgres() {
     relationship_battery(&mut b, &eng).await;
     sweep_battery(&mut b, &eng).await;
     export_battery(&mut b, &eng).await;
+    bool_export_battery(&mut b, &eng).await;
 }
 
 #[tokio::test]
@@ -498,6 +551,7 @@ async fn conformance_mysql() {
     relationship_battery(&mut b, &eng).await;
     sweep_battery(&mut b, &eng).await;
     export_battery(&mut b, &eng).await;
+    bool_export_battery(&mut b, &eng).await;
 }
 
 // --- read-only enforcement (production safety) ---

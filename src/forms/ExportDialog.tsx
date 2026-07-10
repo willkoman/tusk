@@ -16,6 +16,8 @@ export function ExportDialog(props: {
   columns: string[];
   loadedRows: (string | null)[][];
   defaultTable: string;
+  /** Source indices of boolean columns (grid detection); exported as TRUE/FALSE. */
+  boolCols?: number[];
   onClose: () => void;
   onExportFile: (opts: ExportOptions, scope: ExportScope) => Promise<void>;
   onExportClipboard: (opts: ExportOptions) => Promise<void>;
@@ -46,7 +48,7 @@ export function ExportDialog(props: {
     setCols(next);
   };
 
-  const finalOpts = (): ExportOptions => ({ ...opts(), columnIndices: columnIndices() });
+  const finalOpts = (): ExportOptions => ({ ...opts(), columnIndices: columnIndices(), boolCols: props.boolCols ?? [] });
 
   // Live preview of the first rows (cheap). Not shown for xlsx.
   const preview = createMemo(() => {

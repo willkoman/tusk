@@ -641,10 +641,13 @@ async fn handle_export(
             .await;
         return;
     };
-    let opts: crate::export::ExportOptions = match serde_json::from_value(json!({ "format": fmt })) {
+    let mut opts: crate::export::ExportOptions = match serde_json::from_value(json!({ "format": fmt })) {
         Ok(o) => o,
         Err(_) => return,
     };
+    // No column-type metadata survives a buffered run; the full result is in hand,
+    // so the grid's value heuristic (t/f/true/false-only columns) is exact here.
+    opts.bool_cols = crate::export::detect_bool_cols(stored.columns.len(), &stored.rows);
     match crate::export::export_rows_to_bytes(&stored.columns, &stored.rows, &opts).await {
         Ok(bytes) => {
             let ext = if fmt == "markdown" { "md" } else { fmt };
@@ -823,10 +826,11 @@ async fn attach(
     summary: &str,
     fmt: &str,
 ) {
-    let opts: crate::export::ExportOptions = match serde_json::from_value(json!({ "format": fmt })) {
+    let mut opts: crate::export::ExportOptions = match serde_json::from_value(json!({ "format": fmt })) {
         Ok(o) => o,
         Err(_) => return,
     };
+    opts.bool_cols = crate::export::detect_bool_cols(columns.len(), rows);
     match crate::export::export_rows_to_bytes(columns, rows, &opts).await {
         Ok(bytes) => {
             let filename = format!("result.{fmt}");

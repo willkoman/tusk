@@ -48,12 +48,19 @@ pub fn decide_format(
 }
 
 /// Space-padded monospace table (rendered inside a triple-backtick code block).
+/// Boolean-looking columns render as TRUE/FALSE — the same words the desktop
+/// grid displays and the Slack export files emit (same heuristic + token map).
 pub fn render_inline_table(columns: &[String], rows: &[Vec<Option<String>>]) -> String {
     const CELL_CAP: usize = 40;
-    let cell = |v: &Option<String>| -> String {
+    let bools = crate::export::detect_bool_cols(columns.len(), rows);
+    let cell = |k: usize, v: &Option<String>| -> String {
         let s = match v {
             None => "NULL".to_string(),
-            Some(s) => s.replace(['\n', '\r'], " "),
+            Some(s) => match bools.contains(&k).then(|| crate::export::bool_token(s)).flatten() {
+                Some(true) => "TRUE".to_string(),
+                Some(false) => "FALSE".to_string(),
+                None => s.replace(['\n', '\r'], " "),
+            },
         };
         if s.chars().count() > CELL_CAP {
             let cut: String = s.chars().take(CELL_CAP - 1).collect();
@@ -68,7 +75,7 @@ pub fn render_inline_table(columns: &[String], rows: &[Vec<Option<String>>]) -> 
         .map(|r| {
             (0..columns.len())
                 .map(|k| {
-                    let s = cell(&r.get(k).cloned().flatten());
+                    let s = cell(k, &r.get(k).cloned().flatten());
                     widths[k] = widths[k].max(s.chars().count());
                     s
                 })

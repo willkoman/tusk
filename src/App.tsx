@@ -440,7 +440,15 @@ function App() {
   // Snapshot of the result being exported, frozen when the dialog opens so a tab
   // switch while it's open can't redirect the export to a different tab.
   const [exportSrc, setExportSrc] = createSignal<
-    { columns: string[]; rows: (string | null)[][]; query: string; table: string; searchSchema: string | null } | null
+    {
+      columns: string[];
+      rows: (string | null)[][];
+      query: string;
+      table: string;
+      searchSchema: string | null;
+      /** The grid's bool-column set (source indices) frozen with the snapshot — export shows what the grid shows. */
+      boolCols: number[];
+    } | null
   >(null);
   const openExport = () =>
     setExportSrc({
@@ -449,6 +457,7 @@ function App() {
       query: lastQuery(),
       table: tableNameFromSql(lastQuery()),
       searchSchema: activeTab().searchSchema,
+      boolCols: [...boolCols()],
     });
 
   function switchTab(id: string) {
@@ -2783,6 +2792,7 @@ function App() {
               columns={src().columns}
               loadedRows={src().rows}
               defaultTable={src().table}
+              boolCols={src().boolCols}
               onClose={() => setExportSrc(null)}
               onExportFile={exportToFile}
               onExportClipboard={exportToClipboard}
