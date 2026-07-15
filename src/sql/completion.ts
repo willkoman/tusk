@@ -68,6 +68,9 @@ export function makeSqlCompletion(
       const word = ctx.matchBefore(/\w*/);
       const from = word ? word.from : ctx.pos;
       const doc = ctx.state.doc.toString();
+      // Enter/Tab accept completion. Never offer one for the `s` in a DB-API
+      // `%s` placeholder or accepting it can rewrite the placeholder itself.
+      if (word?.text === "s" && from > 0 && doc[from - 1] === "%") return null;
       const before = doc.slice(Math.max(0, from - 240), from);
       const { text: stmt, start: stmtStart } = currentStatement(doc, ctx.pos);
       const idx = indexOf(getTables());

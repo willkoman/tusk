@@ -1,4 +1,5 @@
 mod ai;
+mod crash;
 mod db;
 mod ddl;
 mod driver;
@@ -420,9 +421,9 @@ fn is_prepareable(sql: &str) -> bool {
 
 /// PREPARE rejects statements with bind parameters ("could not determine data type
 /// of parameter $1"), which would be a false-positive lint — skip those statements.
-/// Also treats `:name` (the editor's named-parameter style, prompted at run time)
-/// as a parameter, scanning OUTSIDE strings/comments/quoted idents/dollar bodies so
-/// `'a:b'` or `::casts` don't trigger it.
+/// Also treats `:name` and DB-API `%s` (prompted at run time) as parameters,
+/// scanning OUTSIDE strings/comments/quoted idents/dollar bodies so lookalikes
+/// such as `'a:b'`, `::casts`, and `'%s'` don't trigger it.
 fn has_bind_params(sql: &str) -> bool {
     let b = sql.as_bytes();
     let n = b.len();
@@ -484,6 +485,23 @@ fn has_bind_params(sql: &str) -> bool {
                 return true; // :name-style
             }
         }
+        if c == b'%' && i + 1 < n && b[i + 1] == b's' {
+            let prev = if i > 0 { b[i - 1] } else { b' ' };
+            let next = if i + 2 < n { b[i + 2] } else { b' ' };
+            // Match the frontend scanner: `%%s` is escaped, `a%s` is compact
+            // modulo, and `%sfoo` is an identifier lookalike.
+            let adjacent_prev = prev.is_ascii_alphanumeric()
+                || prev == b'_'
+                || prev == b'"'
+                || prev == b'\''
+                || prev == b']'
+                || prev == b')';
+            if prev != b'%' && !adjacent_prev && !(next.is_ascii_alphanumeric() || next == b'_') {
+                return true;
+            }
+            i += 2;
+            continue;
+        }
         i += 1;
     }
     false
@@ -498,6 +516,34 @@ fn dollar_tag_end(b: &[u8], i: usize) -> Option<usize> {
         j += 1;
     }
     (j < n && b[j] == b'$').then_some(j + 1)
+}
+
+#[cfg(test)]
+mod bind_param_tests {
+    use super::has_bind_params;
+
+    #[test]
+    fn detects_supported_bind_styles() {
+        assert!(has_bind_params("SELECT $1"));
+        assert!(has_bind_params("SELECT :name"));
+        assert!(has_bind_params("SELECT 1 WHERE 1 = ANY(%s::int[])"));
+    }
+
+    #[test]
+    fn ignores_masked_and_lookalike_format_params() {
+        for sql in [
+            "SELECT '%s'",
+            "SELECT \"%s\"",
+            "SELECT 1 -- %s",
+            "SELECT /* %s */ 1",
+            "DO $fn$ SELECT %s $fn$",
+            "SELECT %%s",
+            "SELECT a%s",
+            "SELECT %sfoo",
+        ] {
+            assert!(!has_bind_params(sql), "unexpected bind param in {sql}");
+        }
+    }
 }
 
 /// Turn a PREPARE error into a diagnostic, remapping Postgres' 1-based position
@@ -1001,6 +1047,7 @@ pub fn run() {
         .manage(slack::SlackRuntime::default())
         .manage(ai::AiCancels::default())
         .setup(|app| {
+            crash::install(app.handle());
             // Auto-start the Slack bot when enabled + tokens saved. Failures are
             // non-fatal: the settings pane shows the status and can retry.
             let handle = app.handle().clone();
@@ -1057,7 +1104,10 @@ pub fn run() {
             slack_start,
             slack_stop,
             slack_status,
-            slack_test
+            slack_test,
+            crash::crash_report_get,
+            crash::crash_report_write,
+            crash::crash_report_clear
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

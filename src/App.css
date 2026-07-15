@@ -724,6 +724,20 @@ select option { font-weight: 400; }
   box-shadow: var(--shadow-card);
   animation: tusk-modal-in 0.16s cubic-bezier(0.16, 1, 0.3, 1);
 }
+
+/* Last-resort frontend/native crash report. Kept independent of Dialog so it
+   can render even when the normal application tree failed. */
+.crash-overlay { position: fixed; inset: 0; z-index: 500; display: grid; place-items: center; padding: 20px; background: color-mix(in srgb, var(--bg) 92%, transparent); }
+.crash-card { width: min(680px, 94vw); max-height: 90vh; overflow: auto; display: grid; grid-template-columns: 42px 1fr; gap: 14px; padding: 22px; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow-card); }
+.crash-mark { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 10px; color: var(--danger); background: color-mix(in srgb, var(--danger) 14%, transparent); border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent); font: 700 22px/1 var(--mono); }
+.crash-card h1 { margin: 0 0 5px; font-size: 18px; }
+.crash-card p { margin: 0; color: var(--muted); line-height: 1.5; }
+.crash-privacy, .crash-card details, .crash-status, .crash-actions { grid-column: 1 / -1; }
+.crash-privacy { padding: 10px 12px; border-radius: 8px; background: var(--bg); color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+.crash-card summary { cursor: pointer; color: var(--text); font-weight: 600; }
+.crash-card details pre { max-height: 280px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--muted); font: 11px/1.45 var(--mono); user-select: text; }
+.crash-status { color: var(--accent-2); font-size: 12px; }
+.crash-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
 @keyframes tusk-overlay-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes tusk-modal-in { from { opacity: 0; transform: translateY(8px) scale(0.985); } to { opacity: 1; transform: none; } }
 .modal-head { display: flex; align-items: center; font-weight: 600; }

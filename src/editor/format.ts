@@ -1,5 +1,5 @@
 import { type EditorView } from "@codemirror/view";
-import { lex } from "./lexer";
+import { lex, maskNonCode } from "./lexer";
 import { type DialectId } from "../sql/dialects";
 
 // SQL pretty-printer backed by `sql-formatter`. Dollar-quoted bodies are carved out
@@ -23,23 +23,52 @@ export async function formatSql(text: string, dialect: DialectId): Promise<strin
   const { format: sqlFormat } = await loadFormatter();
   const { spans } = lex(text);
   const bodies: string[] = [];
-  let carved = "";
-  let last = 0;
+  const modTokens: string[] = [];
+  let modPrefix = "__TUSK_FORMAT_MOD_S_";
+  while (text.includes(modPrefix)) modPrefix = `_${modPrefix}`;
+  const masked = maskNonCode(text, spans, 0, text.length);
+  const protectedRanges: { from: number; to: number; replacement: string }[] = [];
   for (const s of spans) {
     if (s.kind !== "dollar") continue;
-    carved += text.slice(last, s.from) + `'__TUSK_DQ_${bodies.length}__'`;
+    const i = bodies.length;
     bodies.push(text.slice(s.from, s.to));
-    last = s.to;
+    protectedRanges.push({ from: s.from, to: s.to, replacement: `'__TUSK_DQ_${i}__'` });
+  }
+  for (const m of masked.matchAll(/%s/g)) {
+    const from = m.index;
+    const prev = from > 0 ? masked[from - 1] : "";
+    // `a%s` is compact modulo, not a DB-API placeholder. Give the formatter a
+    // temporary identifier, then restore it as `% s` so formatting cannot turn
+    // it into a promptable `%s` token.
+    if (!/[\w"'\]\)]/.test(prev)) continue;
+    const token = `${modPrefix}${modTokens.length}__`;
+    modTokens.push(token);
+    protectedRanges.push({ from, to: from + 2, replacement: token });
+  }
+  protectedRanges.sort((a, b) => a.from - b.from);
+  let carved = "";
+  let last = 0;
+  for (const range of protectedRanges) {
+    carved += text.slice(last, range.from) + range.replacement;
+    last = range.to;
   }
   carved += text.slice(last);
 
   let formatted: string;
   try {
-    formatted = sqlFormat(carved, { language: LANG[dialect], keywordCase: "upper" });
+    formatted = sqlFormat(carved, {
+      language: LANG[dialect],
+      keywordCase: "upper",
+      // Without a custom param token sql-formatter rewrites `%s` to `% s`,
+      // silently disabling the pre-run DB-API parameter prompt.
+      paramTypes: { custom: [{ regex: "%%s" }, { regex: "%s" }] },
+    });
   } catch {
     return text; // unparseable — leave the buffer untouched
   }
-  return formatted.replace(/'__TUSK_DQ_(\d+)__'/g, (m, i) => bodies[Number(i)] ?? m);
+  let restored = formatted.replace(/'__TUSK_DQ_(\d+)__'/g, (m, i) => bodies[Number(i)] ?? m);
+  for (const token of modTokens) restored = restored.replace(token, " % s");
+  return restored;
 }
 
 /** Format the selection (when non-empty and `selectionOnly`) or the whole buffer. */

@@ -15,6 +15,18 @@ describe("detectParams", () => {
     ]);
   });
 
+  it("finds DB-API %s params by occurrence", () => {
+    expect(detectParams("SELECT * FROM t WHERE id = ANY(%s::int[]) OR backup_id = %s")).toEqual([
+      { name: "%s #1", kind: "positional" },
+      { name: "%s #2", kind: "positional" },
+    ]);
+  });
+
+  it("ignores escaped, adjacent, and masked %s lookalikes", () => {
+    expect(detectParams("SELECT %%s, a%s, %sfoo, '%s' -- %s\n/* %s */")).toEqual([]);
+    expect(detectParams("DO $fn$ SELECT %s; $fn$")).toEqual([]);
+  });
+
   it("ignores ::casts", () => {
     expect(detectParams("SELECT a::int, b::my_type FROM t")).toEqual([]);
   });
@@ -42,6 +54,21 @@ describe("substituteParams", () => {
 
   it("substitutes every occurrence of the same param", () => {
     expect(substituteParams("SELECT $1, $1, $2", { $1: v("a"), $2: v("b") })).toBe("SELECT 'a', 'a', 'b'");
+  });
+
+  it("substitutes each %s occurrence independently", () => {
+    expect(
+      substituteParams("WHERE a = %s AND b = ANY(%s::int[])", {
+        "%s #1": v("first"),
+        "%s #2": v("{1,2}"),
+      }),
+    ).toBe("WHERE a = 'first' AND b = ANY('{1,2}'::int[])");
+  });
+
+  it("supports raw array expressions for ANY(%s)", () => {
+    expect(substituteParams("WHERE id = ANY(%s)", { "%s #1": v("ARRAY[1,2]", { raw: true }) })).toBe(
+      "WHERE id = ANY(ARRAY[1,2])",
+    );
   });
 
   it("NULL and raw modes", () => {

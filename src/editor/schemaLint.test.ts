@@ -131,6 +131,10 @@ describe("schemaDiagnostics — false-positive guards", () => {
     expect(msgs('SELECT id FROM users WHERE email = $1 AND id = id::my_custom_domain AND "Weird Col" IS NULL')).toEqual([]);
   });
 
+  it("DB-API params are not treated as bare columns", () => {
+    expect(msgs("SELECT id FROM users WHERE id = ANY(%s::int[])")).toEqual([]);
+  });
+
   it("DDL and utility statements never run the bare-identifier check", () => {
     expect(msgs("CREATE INDEX idx_x ON users (lower(email))")).toEqual([]);
     expect(msgs("GRANT SELECT ON users TO somebody")).toEqual([]);

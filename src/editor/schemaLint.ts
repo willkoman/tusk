@@ -210,7 +210,7 @@ export function schemaDiagnostics(
       const lower = tok.toLowerCase();
       if (inQuoted) continue;
       if (ALL_SQL_WORDS.has(upper)) continue;
-      if (before === "." || before === '"' || before === ":" || before === "@" || before === "$") continue;
+      if (before === "." || before === '"' || before === ":" || before === "@" || before === "$" || (before === "%" && lower === "s")) continue;
       if (nextCh === "(" || nextCh === ".") continue; // function call / qualifier — other checks own these
       if (PREV_SKIP.has(adjacentPrev)) continue;
       if (aliases.has(lower) || cte.has(lower) || asTargets.has(lower)) continue;

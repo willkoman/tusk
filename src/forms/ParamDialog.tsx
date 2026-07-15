@@ -1,8 +1,8 @@
-import { For, createMemo, createSignal } from "solid-js";
+import { For, Show, createMemo, createSignal } from "solid-js";
 import { Dialog, SqlPreview } from "../Dialog";
 import { substituteParams, type Param, type ParamValue } from "../sql/params";
 
-// Pre-run parameter prompt: one row per detected `$n` / `:name` with a value
+// Pre-run parameter prompt: one row per detected `$n` / `%s` / `:name` with a value
 // input, NULL toggle, and raw (unquoted) toggle; live preview of the
 // substituted SQL. Values are remembered per tab by the caller.
 
@@ -21,6 +21,11 @@ export function ParamDialog(props: {
     setValues((m) => ({ ...m, [name]: { ...m[name], ...v } }));
 
   const preview = createMemo(() => substituteParams(props.sql, values()));
+  const previewText = createMemo(() => {
+    const text = preview();
+    const limit = 20_000;
+    return text.length <= limit ? text : `${text.slice(0, limit)}\n-- preview truncated; full SQL will run`;
+  });
 
   return (
     <Dialog title="Query parameters" width={560} onClose={props.onClose}>
@@ -54,7 +59,12 @@ export function ParamDialog(props: {
             )}
           </For>
         </div>
-        <SqlPreview sql={preview()} />
+        <Show when={props.params.some((p) => p.name.startsWith("%s #"))}>
+          <div class="import-info">
+            `%s` values are quoted by default. For PostgreSQL <code>ANY(%s)</code>, enter an array literal such as <code>{`{1,2}`}</code>, or enable raw and enter <code>ARRAY[1,2]</code>.
+          </div>
+        </Show>
+        <SqlPreview sql={previewText()} />
         <div class="form-actions">
           <button type="button" class="ghost" onClick={props.onClose}>Cancel</button>
           <button type="submit" class="run">Run ▶</button>

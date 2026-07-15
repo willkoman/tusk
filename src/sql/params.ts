@@ -5,8 +5,9 @@ import { lit } from "./ident";
 // Pure and lexer-masked: params inside strings, comments, and dollar-quoted
 // bodies are never matched ($tag$…$tag$ vs $1 is already the lexer's job).
 //
-// Styles: positional `$1 $2 …` and named `:name` (not preceded by `:` — kills
-// `::type` casts — nor by a word/quote character). Documented limitation:
+// Styles: positional `$1 $2 …`, DB-API `%s` (positional by occurrence), and
+// named `:name` (not preceded by `:` — kills `::type` casts — nor by a
+// word/quote character). Documented limitation:
 // PG array slices with identifier bounds (`arr[i:j]`) can false-positive on
 // `:j`; the "raw" toggle is the escape hatch.
 
@@ -19,17 +20,26 @@ function scan(sqlText: string): Span[] {
   const { spans } = lex(sqlText);
   const masked = maskNonCode(sqlText, spans, 0, sqlText.length);
   const out: Span[] = [];
-  const re = /\$(\d+)|:([A-Za-z_]\w*)/g;
+  const re = /\$(\d+)|:([A-Za-z_]\w*)|%s/g;
+  let formatIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = re.exec(masked))) {
     if (m[1] !== undefined) {
       out.push({ name: `$${m[1]}`, kind: "positional", from: m.index, to: m.index + m[0].length });
-    } else {
+    } else if (m[2] !== undefined) {
       const prev = m.index > 0 ? masked[m.index - 1] : "";
       if (prev === ":" || /[\w"'\]]/.test(prev)) continue; // ::cast, slice end, adjacency
       const next = masked[m.index + m[0].length] ?? "";
       if (next === ":") continue; // first half of `::`
       out.push({ name: `:${m[2]}`, kind: "named", from: m.index, to: m.index + m[0].length });
+    } else {
+      const prev = m.index > 0 ? masked[m.index - 1] : "";
+      const next = masked[m.index + 2] ?? "";
+      // `%%s` is an escaped percent lookalike; word adjacency is compact modulo
+      // (`a%s`), not a placeholder. Whitespace/operators/parens cover DB-API SQL.
+      if (prev === "%" || /[\w"'\]\)]/.test(prev) || /\w/.test(next)) continue;
+      formatIndex++;
+      out.push({ name: `%s #${formatIndex}`, kind: "positional", from: m.index, to: m.index + 2 });
     }
   }
   return out;

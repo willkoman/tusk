@@ -4,6 +4,14 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-07-15
+
+### Added
+- **Actionable crash recovery without automatic telemetry.** Frontend render errors, uncaught browser errors, and unhandled promise rejections are contained behind a recovery screen instead of leaving a blank workbench. Rust panics are written to a local `last-crash.txt` and offered on the next launch. The report can be reviewed, copied, or sent through an explicitly opened email draft to `willko@willko.dev`; nothing is transmitted automatically, and Tusk does not intentionally add connection settings, credentials, or query text.
+
+### Fixed
+- **Python/DB-API `%s` query parameters now open the parameter modal instead of reaching the server as invalid SQL.** Each `%s` occurrence gets an independent value; `$1` and `:name` behavior is unchanged. PostgreSQL `ANY(%s)` accepts a quoted array literal such as `{1,2}`, or a raw expression such as `ARRAY[1,2]`. `%s` now survives SQL formatting, is ignored by editor/server lint and completion, and works through Explain. Parameterized history stores the original template rather than expanded values, the preview is capped to avoid huge DOM nodes, and a second shortcut can no longer replace a live parameter dialog's state.
+
 ## [0.8.4] - 2026-07-10
 
 ### Fixed

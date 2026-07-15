@@ -1,5 +1,6 @@
 /* @refresh reload */
 import { render } from "solid-js/web";
 import App from "./App";
+import { CrashGuard } from "./CrashGuard";
 
-render(() => <App />, document.getElementById("root") as HTMLElement);
+render(() => <CrashGuard><App /></CrashGuard>, document.getElementById("root") as HTMLElement);

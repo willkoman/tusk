@@ -620,7 +620,7 @@ function App() {
       setConfirmAnalyze(wrapped);
       return;
     }
-    void executeQuery(wrapped, "", "base");
+    runParameterized(wrapped, (substituted) => void executeQuery(substituted, "", "base", false, wrapped));
   }
 
   // result grid: per-tab view + sort/filter re-run, Load-all
@@ -954,6 +954,7 @@ function App() {
     // The editor keymap (and any other in-place handler) marks what it consumed.
     if (e.defaultPrevented) return;
     if (paletteOpen()) return; // the palette owns the keyboard while open
+    if (paramPrompt()) return; // the parameter modal owns input; never replace its live state
     const k = normalizeKeyEvent(e);
     if (!k) return;
     const id = globalBindings().get(k);
@@ -1350,14 +1351,20 @@ function App() {
   // Shared query executor. `mode:"base"` = a user-issued query (resets sorts/filters,
   // fresh grid view if the column set changed); `mode:"wrapped"` = a sort/filter re-run
   // (keep the grid view — its sorts/filters drive the wrap).
-  async function executeQuery(sqlToRun: string, base: string, mode: "base" | "wrapped", force = false) {
+  async function executeQuery(
+    sqlToRun: string,
+    base: string,
+    mode: "base" | "wrapped",
+    force = false,
+    historySql = sqlToRun,
+  ) {
     const c = conn();
     if (!c || running() || !sqlToRun.trim()) return;
     const runTabId = activeTabId();
     // Re-running replaces the rows the pending edits index into — confirm first.
     const pcount = pendingCount(tabs().find((t) => t.id === runTabId)?.pending);
     if (pcount && !force) {
-      setConfirmDiscard({ count: pcount, run: () => void executeQuery(sqlToRun, base, mode, true) });
+      setConfirmDiscard({ count: pcount, run: () => void executeQuery(sqlToRun, base, mode, true, historySql) });
       return;
     }
     if (pcount) patchTab(runTabId, { pending: undefined });
@@ -1400,7 +1407,7 @@ function App() {
       if (out.kind === "exec" || DDL_RE.test(sqlToRun)) void loadSchema();
       if (mode === "base") {
         recordHistory({
-          sql: sqlToRun,
+          sql: historySql,
           durationMs: Math.round(performance.now() - t0),
           status: "ok",
           rows: out.kind === "rows" ? out.rows.length : null,
@@ -1416,7 +1423,7 @@ function App() {
       else patchResult(runTabId, { runErr: msg, columns: [], rows: [], done: true });
       if (mode === "base") {
         recordHistory({
-          sql: sqlToRun,
+          sql: historySql,
           durationMs: Math.round(performance.now() - t0),
           status: /cancel/i.test(msg) ? "cancelled" : "error",
           rows: null,
@@ -1449,18 +1456,30 @@ function App() {
   // Pre-run parameter prompt state: every run path (Run button, gutter ▶,
   // selection, history re-run, Explain) funnels through runText, so detection
   // lives here once.
-  const [paramPrompt, setParamPrompt] = createSignal<{ text: string; params: Param[] } | null>(null);
+  const [paramPrompt, setParamPrompt] = createSignal<{
+    text: string;
+    params: Param[];
+    tabId: string;
+    onRun: (substituted: string) => void;
+  } | null>(null);
 
-  function runText(t: string) {
+  function runParameterized(t: string, onRun: (substituted: string) => void) {
     const params = detectParams(t);
-    if (params.length) {
-      setParamPrompt({ text: t, params });
+    if (!params.length) {
+      onRun(t);
       return;
     }
-    runTextNow(t);
+    // Global shortcuts are blocked while this is open. Keep this guard too for
+    // programmatic paths so a second run cannot swap props under a live dialog.
+    if (paramPrompt()) return;
+    setParamPrompt({ text: t, params, tabId: activeTabId(), onRun });
   }
 
-  function runTextNow(t: string) {
+  function runText(t: string) {
+    runParameterized(t, (substituted) => runTextNow(substituted, t));
+  }
+
+  function runTextNow(t: string, historySql = t) {
     // A multi-statement run streams only the *last* statement's result, and we don't have
     // an isolated single SELECT to re-wrap — so store a non-wrappable base (disabling grid
     // sort/filter). Conservative: any inner `;` counts as multi (never wrongly wrappable).
@@ -1480,7 +1499,7 @@ function App() {
       void executeQuery(wrapQuery(base, gv.sorts, gv.filters, at.result.columns, caps()?.kind), base, "wrapped");
       return;
     }
-    void executeQuery(t, base, "base");
+    void executeQuery(t, base, "base", false, historySql);
   }
 
   function doRun(override?: string) {
@@ -2678,11 +2697,14 @@ function App() {
             <ParamDialog
               sql={pp().text}
               params={pp().params}
-              initial={activeTab().paramValues}
+              initial={tabs().find((t) => t.id === pp().tabId)?.paramValues}
               onRun={(values: Record<string, ParamValue>, substituted: string) => {
-                patchTab(activeTabId(), { paramValues: { ...activeTab().paramValues, ...values } });
+                const prompt = pp();
+                const source = tabs().find((t) => t.id === prompt.tabId);
+                patchTab(prompt.tabId, { paramValues: { ...source?.paramValues, ...values } });
+                setActiveTabId(prompt.tabId);
                 setParamPrompt(null);
-                runTextNow(substituted);
+                prompt.onRun(substituted);
               }}
               onClose={() => setParamPrompt(null)}
             />
@@ -2724,7 +2746,11 @@ function App() {
             </div>
             <div class="form-actions">
               <button class="ghost" onClick={() => setConfirmAnalyze(null)}>Cancel</button>
-              <button class="btn-danger" onClick={() => { const w = confirmAnalyze()!; setConfirmAnalyze(null); void executeQuery(w, "", "base"); }}>
+              <button class="btn-danger" onClick={() => {
+                const w = confirmAnalyze()!;
+                setConfirmAnalyze(null);
+                runParameterized(w, (substituted) => void executeQuery(substituted, "", "base", false, w));
+              }}>
                 Run it
               </button>
             </div>
