@@ -20,6 +20,14 @@ export type RelStub = {
   size: string | null; // pretty total size (tables/matviews)
 };
 export type Trg = { name: string; def: string };
+
+/**
+ * Detail-cache key for a relation. SINGLE SOURCE for both sides of the cache:
+ * App's loadDetail writes `details[relKey(...)]` and the tree reads it — a key
+ * drift shows every expanded table as "loading…" forever (the JSON-tuple form
+ * exists because a dotted `schema.name` join collides on names containing dots).
+ */
+export const relKey = (schema: string, name: string) => JSON.stringify([schema, name]);
 export type RelationDetail = {
   name: string;
   kind: string;
@@ -190,8 +198,7 @@ export function Tree(props: {
     const ik = `${tk}:idx`;
     const xk = `${tk}:con`;
     const gk = `${tk}:trg`;
-    const dkey = `${schema}.${rel.name}`;
-    const det = () => props.details[dkey] as RelationDetail | undefined;
+    const det = () => props.details[relKey(schema, rel.name)] as RelationDetail | undefined;
     const openRel = () => {
       const willOpen = !isOpen(tk);
       toggle(tk);

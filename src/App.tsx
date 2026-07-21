@@ -22,7 +22,7 @@ import { makeIndexer } from "./sql/aliases";
 import { type Dataset, IMPORT_LIMITS, parseCSV, parseJSON, formatWithOptions } from "./formats";
 import { FORMAT_EXT, type ExportOptions, type ExportScope } from "./export";
 import { save, open as openDialog } from "@tauri-apps/plugin-dialog";
-import { Tree, type DbTree, type RelationDetail, type NodeDescriptor, nodeKey } from "./Tree";
+import { Tree, type DbTree, type RelationDetail, type NodeDescriptor, nodeKey, relKey } from "./Tree";
 import { ContextMenu, type MenuItem, type MenuState } from "./ContextMenu";
 import { type DialogState } from "./WorkbenchDialogs";
 import { type SettingsTab } from "./settings/SettingsDialog";
@@ -187,7 +187,8 @@ function App() {
   // cached for the session (cleared on schema reload) and run without disturbing any
   // in-flight stream. Best-effort — a table that can't be sampled is just skipped.
   const sampleCache = new Map<string, SampleTable>();
-  const relKey = (schemaName: string, relationName: string) => JSON.stringify([schemaName, relationName]);
+  // relKey now lives in Tree.tsx — the tree reads the same cache, and a key drift
+  // between writer and reader showed every expanded table as "loading…" forever.
   async function aiSampleRows(targets: { schema: string; name: string }[]): Promise<SampleTable[]> {
     const c = conn();
     if (!c) return [];
