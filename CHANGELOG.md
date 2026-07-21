@@ -4,6 +4,8 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.8.7] - 2026-07-21
+
 ### Fixed
 - **Sidebar table expand stuck on "loading…" forever (0.8.6 regression).** The async-race hardening moved the detail cache to collision-safe JSON-tuple keys on the write side, but the tree still looked entries up under the old dotted `schema.name` key — the fetch succeeded and the tree never saw it. `relKey` is now exported from `Tree.tsx` as the single source for both sides.
 
