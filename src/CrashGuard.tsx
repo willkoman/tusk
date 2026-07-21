@@ -2,6 +2,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ErrorBoundary, Show, createSignal, onCleanup, onMount, type JSX } from "solid-js";
+import { crashConsent, setCrashConsent } from "./store";
 
 const SUPPORT_EMAIL = "willko@willko.dev";
 const MAX_REPORT_CHARS = 96_000;
@@ -33,6 +34,7 @@ export function formatFrontendCrash(source: string, reason: unknown, version = "
 
 function CrashPanel(props: { report: string; prior?: boolean; onContinue: () => void }) {
   const [status, setStatus] = createSignal("");
+  const offerEmail = () => crashConsent() === "on";
 
   async function copyReport(): Promise<boolean> {
     try {
@@ -84,7 +86,9 @@ function CrashPanel(props: { report: string; prior?: boolean; onContinue: () => 
         <Show when={status()}><div class="crash-status">{status()}</div></Show>
         <div class="crash-actions">
           <button class="ghost" onClick={() => void copyReport()}>Copy report</button>
-          <button class="ghost" onClick={() => void emailReport()}>Email {SUPPORT_EMAIL}</button>
+          <Show when={offerEmail()}>
+            <button class="ghost" onClick={() => void emailReport()}>Email {SUPPORT_EMAIL}</button>
+          </Show>
           <button class="run" onClick={props.onContinue}>{props.prior ? "Dismiss" : "Try to continue"}</button>
         </div>
       </section>
@@ -117,6 +121,8 @@ function CapturedCrash(props: { source: string; reason: unknown; prior?: boolean
 
 export function CrashGuard(props: { children: JSX.Element }) {
   const [unexpected, setUnexpected] = createSignal<{ source: string; reason: unknown; prior?: boolean } | null>(null);
+  // Prior-run report held until consent is known ("unset" defers to the prompt's answer).
+  const [priorReport, setPriorReport] = createSignal<string | null>(null);
 
   const clear = (after?: () => void) => {
     setUnexpected(null);
@@ -124,10 +130,36 @@ export function CrashGuard(props: { children: JSX.Element }) {
     after?.();
   };
 
+  const discardPrior = () => {
+    setPriorReport(null);
+    void invoke("crash_report_clear").catch(() => undefined);
+  };
+
+  // Route a recovered prior-run report by consent: show it, or clear it quietly.
+  const routePrior = (report: string) => {
+    if (crashConsent() === "off") {
+      void invoke("crash_report_clear").catch(() => undefined);
+    } else if (crashConsent() === "on") {
+      if (!unexpected()) setUnexpected({ source: "previous native run", reason: report, prior: true });
+    } else {
+      setPriorReport(report); // consent pending — the prompt's answer decides
+    }
+  };
+
+  const answerConsent = (v: "on" | "off") => {
+    setCrashConsent(v);
+    const held = priorReport();
+    if (held !== null) {
+      setPriorReport(null);
+      if (v === "on") routePrior(held);
+      else discardPrior();
+    }
+  };
+
   onMount(() => {
     void invoke<string | null>("crash_report_get")
       .then((report) => {
-        if (report && !unexpected()) setUnexpected({ source: "previous native run", reason: report, prior: true });
+        if (report) routePrior(report);
       })
       .catch(() => undefined);
 
@@ -164,6 +196,37 @@ export function CrashGuard(props: { children: JSX.Element }) {
           />
         )}
       </Show>
+      <Show when={crashConsent() === "unset" && !unexpected()}>
+        <ConsentGate onAnswer={answerConsent} />
+      </Show>
     </>
+  );
+}
+
+/** Thin wrapper so ConsentPrompt's buttons can hand the answer back to CrashGuard. */
+function ConsentGate(props: { onAnswer: (v: "on" | "off") => void }) {
+  return (
+    <div class="crash-overlay" role="alertdialog" aria-modal="true" aria-label="Crash report preference">
+      <section class="crash-card">
+        <div class="crash-mark" aria-hidden="true">?</div>
+        <div>
+          <h1>Help improve Tusk?</h1>
+          <p>
+            If Tusk ever crashes, it can show the crash details on the next launch with a one-click
+            option to email them to the developer. Nothing is ever sent automatically — you review
+            and send each report yourself.
+          </p>
+        </div>
+        <div class="crash-privacy">
+          Reports contain the app version, platform, and the error message/stack — which can include
+          fragments of whatever text triggered the error. They never intentionally include connection
+          settings, credentials, or saved queries. You can change this any time in Settings → Privacy.
+        </div>
+        <div class="crash-actions">
+          <button class="ghost" onClick={() => props.onAnswer("off")}>No, just recover quietly</button>
+          <button class="run" onClick={() => props.onAnswer("on")}>Yes, offer crash reports</button>
+        </div>
+      </section>
+    </div>
   );
 }

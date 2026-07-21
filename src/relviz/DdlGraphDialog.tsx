@@ -173,7 +173,9 @@ export function DdlGraphDialog(props: {
     const outFan = groupIdx(outbound, (e) => e.srcCols[0] ?? "");
     // Column gap sized to the longest edge label so the column details have
     // room between the cards instead of running underneath them.
-    const maxLabel = Math.max(0, ...[...inbound, ...outbound].map((e) => edgeLabel(e).length));
+    let maxLabel = 0;
+    for (const e of inbound) maxLabel = Math.max(maxLabel, edgeLabel(e).length);
+    for (const e of outbound) maxLabel = Math.max(maxLabel, edgeLabel(e).length);
     const gap = Math.min(420, Math.max(130, maxLabel * LABEL_CH + 28));
     const ctrX = NB_W + gap;
     const outX = ctrX + CTR_W + gap;
@@ -197,12 +199,24 @@ export function DdlGraphDialog(props: {
   });
 
   // ---- ERD layout ----
+  // Hard ceiling: layout cost grows superlinearly with table count and runs
+  // synchronously inside this memo — thousands of tables would freeze the UI for
+  // minutes. Above the cap we skip layout entirely and say so (the Neighborhood
+  // view still works per-table at any schema size).
+  const ERD_MAX_TABLES = 600;
+  const erdTooBig = createMemo(() => (erd()?.tables.length ?? 0) > ERD_MAX_TABLES);
   const erdLayoutMemo = createMemo(() => {
     const g = erd();
-    if (!g || !g.tables.length) return null;
+    if (!g || !g.tables.length || erdTooBig()) return null;
+    const names = new Set(g.tables.map((t) => t.name));
+    // schema_relationships includes cross-schema edges touching this schema,
+    // while this ERD only has cards for this schema. Skip unresolved endpoints
+    // rather than dereferencing a missing card (or misrouting to a same-name card).
+    const edges = g.edges.filter((e) =>
+      e.srcSchema === center().schema && e.dstSchema === center().schema && names.has(e.srcTable) && names.has(e.dstTable));
     const nodes: ErdNode[] = g.tables.map((t) => ({ id: t.name, w: ERD_W, h: erdCardH(t) }));
-    const l = layoutErd(nodes, g.edges.map((e) => ({ from: e.srcTable, to: e.dstTable })));
-    return { ...l, graph: g };
+    const l = layoutErd(nodes, edges.map((e) => ({ from: e.srcTable, to: e.dstTable })));
+    return { ...l, graph: { ...g, edges } };
   });
 
   // ---- ERD manual drag: click = drill in, click-DRAG = reposition (pinned
@@ -279,11 +293,12 @@ export function DdlGraphDialog(props: {
 
   // O(1) lookups for the render hot paths (93 tables × 100+ edges re-render on
   // every hover/drag frame — no linear scans inside <For> bodies).
-  const erdTableByName = createMemo(() => new Map((erd()?.tables ?? []).map((t) => [t.name, t])));
+  const erdGraph = createMemo(() => erdLayoutMemo()?.graph);
+  const erdTableByName = createMemo(() => new Map((erdGraph()?.tables ?? []).map((t) => [t.name, t])));
   const erdAdj = createMemo(() => {
     const m = new Map<string, Set<string>>();
     const add = (a: string, b: string) => (m.get(a) ?? m.set(a, new Set()).get(a)!).add(b);
-    for (const e of erd()?.edges ?? []) {
+    for (const e of erdGraph()?.edges ?? []) {
       add(e.srcTable, e.dstTable);
       add(e.dstTable, e.srcTable);
     }
@@ -294,7 +309,7 @@ export function DdlGraphDialog(props: {
   // created_by/updated_by FKs) would bury the diagram — its edges render
   // faint/thin by default and light up only on hover.
   const dampedHubs = createMemo(() => {
-    const g = erd();
+    const g = erdGraph();
     if (!g) return new Set<string>();
     const inDeg = new Map<string, number>();
     for (const e of g.edges) inDeg.set(e.dstTable, (inDeg.get(e.dstTable) ?? 0) + 1);
@@ -306,7 +321,7 @@ export function DdlGraphDialog(props: {
   // row, or same source column) get spread by a few px so they never coincide.
   const edgeKey = (e: FkEdge) => `${e.constraint}:${e.srcTable}`;
   const erdFan = createMemo(() => {
-    const g = erd();
+    const g = erdGraph();
     const out = new Map<string, { si: number; sn: number; di: number; dn: number }>();
     if (!g) return out;
     // Two passes with counters — O(E), no per-edge indexOf.
@@ -508,7 +523,16 @@ export function DdlGraphDialog(props: {
 
             <Match when={scope() === "schema"}>
               <Show when={!erd.loading} fallback={<div class="relviz-note">loading schema graph…</div>}>
-                <Show when={erdLayoutMemo()} fallback={<div class="relviz-empty">No tables found in schema “{center().schema}”.</div>}>
+                <Show
+                  when={erdLayoutMemo()}
+                  fallback={
+                    <div class="relviz-empty">
+                      {erdTooBig()
+                        ? `Schema too large for the ERD (${erd()!.tables.length} tables, limit ${ERD_MAX_TABLES}) — use the Neighborhood view per table.`
+                        : `No tables found in schema “${center().schema}”.`}
+                    </div>
+                  }
+                >
                   {(l) => (
                     <PanZoomCanvas ref={(pz) => (erdPz = pz)} bbox={l().bbox} fitKey={`erd:${center().schema}:${Math.round(l().bbox.w)}x${Math.round(l().bbox.h)}:${ddlCollapsed() ? "c" : "e"}`}>
                       <For each={l().groups}>
@@ -538,8 +562,9 @@ export function DdlGraphDialog(props: {
                       >
                         <For each={l().graph.edges}>
                           {(e) => {
-                            const st = erdTableByName().get(e.srcTable)!;
-                            const dt = erdTableByName().get(e.dstTable)!;
+                            const st = erdTableByName().get(e.srcTable);
+                            const dt = erdTableByName().get(e.dstTable);
+                            if (!st || !dt) return null;
                             const key = edgeKey(e);
                             const fan = erdFan().get(key) ?? { si: 0, sn: 1, di: 0, dn: 1 };
                             // Geometry is a memo over epos so edges FOLLOW manual

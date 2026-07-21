@@ -54,22 +54,22 @@ impl Default for StatusInfo {
 
 impl SlackRuntime {
     pub fn set_status(&self, state: &str, error: Option<String>) {
-        let mut s = self.status.lock().unwrap();
+        let mut s = crate::lock_sync(&self.status);
         s.state = state.to_string();
         s.error = error;
         s.running = state != "disconnected";
     }
 
     pub fn status_info(&self) -> StatusInfo {
-        self.status.lock().unwrap().clone()
+        crate::lock_sync(&self.status).clone()
     }
 
     fn take_cancel(&self) -> Option<CancellationToken> {
-        self.cancel.lock().unwrap().take()
+        crate::lock_sync(&self.cancel).take()
     }
 
     fn set_cancel(&self, t: CancellationToken) {
-        if let Some(old) = self.cancel.lock().unwrap().replace(t) {
+        if let Some(old) = crate::lock_sync(&self.cancel).replace(t) {
             old.cancel();
         }
     }
@@ -138,10 +138,33 @@ pub async fn start(app: AppHandle) -> Result<(), AppError> {
                     match ev {
                         // Reload config PER EVENT so allowlist / timeout / row-cap /
                         // destructive-policy / AI-provider changes take effect on Save
-                        // without a bot restart (config::load is cheap + infallible).
+                        // without a bot restart. Parse/validation failure is fail-closed:
+                        // never replace allowlists with permissive defaults.
                         Some(ev) => {
-                            let cfg = config::load(&consumer_app).unwrap_or_default();
-                            processor::handle_event(&consumer_app, &api, &cfg, ev).await;
+                            match config::load(&consumer_app) {
+                                Ok(cfg) => {
+                                    // Panic-contained: an unwind out of handle_event would
+                                    // kill this consumer task silently — the status badge
+                                    // would keep saying "connected" while the bot never
+                                    // answers again. Contain it, report it, keep consuming.
+                                    let fut = std::panic::AssertUnwindSafe(
+                                        processor::handle_event(&consumer_app, &api, &cfg, ev),
+                                    );
+                                    if futures_util::FutureExt::catch_unwind(fut).await.is_err() {
+                                        let runtime = consumer_app.state::<SlackRuntime>();
+                                        runtime.set_status(
+                                            "error",
+                                            Some("internal error handling a Slack event (recovered — see last-crash.txt)".to_string()),
+                                        );
+                                        let _ = consumer_app.emit("slack:status", runtime.status_info());
+                                    }
+                                }
+                                Err(e) => {
+                                    let runtime = consumer_app.state::<SlackRuntime>();
+                                    runtime.set_status("error", Some(e.message));
+                                    let _ = consumer_app.emit("slack:status", runtime.status_info());
+                                }
+                            }
                         }
                         None => break, // socket task ended
                     }

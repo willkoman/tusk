@@ -2,7 +2,7 @@ import { type Diagnostic } from "@codemirror/lint";
 import { type EditorView } from "@codemirror/view";
 import { aliasMap, makeIndexer, strip, tableByRef, type Index, type Table } from "../sql/aliases";
 import { ALL_SQL_FUNCTIONS, ALL_SQL_WORDS } from "../sql/dialects";
-import { lexState, maskNonCode, type Span, type Stmt } from "./lexer";
+import { docString, lexState, maskNonCode, type Span, type Stmt } from "./lexer";
 import { closest, damerau } from "./distance";
 
 // `EXTRACT(YEAR FROM x)` / `SUBSTRING(s FROM 2)` / `TRIM(x FROM y)` … contain a
@@ -258,7 +258,7 @@ export function schemaLintSource(getSchema: () => Table[], getFuncs: () => Reado
     if (!tables.length) return []; // schema not loaded yet — don't guess
     const idx = indexOf(tables);
     const { spans, stmts } = lexState(view.state);
-    const doc = view.state.doc.toString();
+    const doc = docString(view.state);
     return schemaDiagnostics(doc, spans, stmts, idx, getFuncs()).map((d) => ({
       from: d.from,
       to: d.to,

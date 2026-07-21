@@ -1,4 +1,4 @@
-import { type ParsedPlan, type PlanNode, finishTree, propStr } from "./types";
+import { type ParsedPlan, type PlanNode, finishTree, planInputWithinLimits, propStr } from "./types";
 
 // MySQL `EXPLAIN FORMAT=JSON` → PlanTree. Root is { query_block: {...} };
 // children hide under a zoo of wrapper keys that varies by version. Known
@@ -103,6 +103,7 @@ export function parseMysql(jsonText: string): ParsedPlan | null {
     return null;
   }
   if (!parsed || typeof parsed !== "object") return null;
+  if (!planInputWithinLimits(parsed)) return null;
   const qb = (parsed as Record<string, unknown>)["query_block"];
   if (!qb || typeof qb !== "object") return null;
   const root = myNode("query_block", qb as Record<string, unknown>);

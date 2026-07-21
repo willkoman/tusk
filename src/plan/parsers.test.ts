@@ -385,6 +385,48 @@ describe("detectPlan", () => {
   });
 });
 
+describe("plan parser adversarial totality", () => {
+  it("ignores malformed children instead of throwing", () => {
+    const pg = JSON.stringify([{ Plan: { "Node Type": "Root", Plans: [null, 1, "bad", { "Node Type": "Leaf" }] } }]);
+    expect(() => parsePg(pg)).not.toThrow();
+    expect((parsePg(pg) as PlanTree).root.children).toHaveLength(1);
+  });
+
+  it("rejects excessively deep provider trees before recursive normalization", () => {
+    let pgNode: Record<string, unknown> = { "Node Type": "Leaf" };
+    let duckNode: Record<string, unknown> = { name: "Leaf", children: [] };
+    let mysqlNode: Record<string, unknown> = { table_name: "leaf" };
+    for (let i = 0; i < 300; i++) {
+      pgNode = { "Node Type": "Node", Plans: [pgNode] };
+      duckNode = { name: "Node", children: [duckNode] };
+      mysqlNode = { ordering_operation: mysqlNode };
+    }
+    expect(parsePg(JSON.stringify([{ Plan: pgNode }]))).toBeNull();
+    expect(parseDuck(JSON.stringify([duckNode]))).toBeNull();
+    expect(parseMysql(JSON.stringify({ query_block: mysqlNode }))).toBeNull();
+  });
+
+  it("never throws for a deterministic malformed corpus", () => {
+    const corpus = ["", "null", "[]", "{}", "[null]", '{"Plan":{"Plans":[null]}}', "{", "🦆", "[1,2,3]"];
+    for (const value of corpus) {
+      expect(() => parsePg(value), `pg: ${value}`).not.toThrow();
+      expect(() => parseDuck(value), `duck: ${value}`).not.toThrow();
+      expect(() => parseMysql(value), `mysql: ${value}`).not.toThrow();
+      expect(() => detectPlan("postgres", { lastQuery: "EXPLAIN SELECT 1", columns: ["plan"], rows: [[value]] })).not.toThrow();
+    }
+  });
+
+  it("bounds oversized plan input and text fallback", () => {
+    const out = detectPlan("postgres", {
+      lastQuery: "EXPLAIN SELECT 1",
+      columns: ["plan"],
+      rows: [["x".repeat(5_000_001)]],
+    });
+    expect(out?.kind).toBe("text");
+    expect(out?.kind === "text" ? out.text.length : Infinity).toBeLessThan(1_000_100);
+  });
+});
+
 // ---------- explainSql ----------
 
 describe("explainSql", () => {

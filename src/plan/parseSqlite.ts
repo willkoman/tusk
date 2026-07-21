@@ -21,8 +21,11 @@ export function parseSqlite(columns: string[], rows: (string | null)[][]): Parse
     if (!Number.isFinite(id)) return null;
     const m = /\b(?:SCAN|SEARCH)\s+(?:TABLE\s+)?([A-Za-z_][\w]*)/.exec(detail);
     const node: PlanNode = { id: 0, label: detail, object: m?.[1], props: [], children: [] };
-    byId.set(id, node);
+    // Resolve the parent BEFORE registering this node: a hostile row with
+    // parent === id would otherwise attach the node to itself, and the self-cycle
+    // spins finishTree's tree walk forever (uncatchable main-thread hang).
     const p = Number.isFinite(parent) ? byId.get(parent) : undefined;
+    byId.set(id, node);
     (p ?? root).children.push(node);
   }
   // Single top node → drop the synthetic wrapper.

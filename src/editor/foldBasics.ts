@@ -1,6 +1,6 @@
 import { codeFolding, foldGutter, foldKeymap, foldService } from "@codemirror/language";
 import { type Extension } from "@codemirror/state";
-import { lexState, isCode, type Span } from "./lexer";
+import { docString, lexState, isCode, type Span } from "./lexer";
 
 // General (manual) code folding: a fold gutter plus a SQL-aware fold service that
 // folds a multi-line parenthesized / bracketed block from the line that opens it
@@ -20,8 +20,18 @@ function matchingClose(doc: string, spans: Span[], open: number): number {
   const closeCh = openCh === OPEN_PAREN ? CLOSE_PAREN : openCh === OPEN_BRACKET ? CLOSE_BRACKET : -1;
   if (closeCh < 0) return -1;
   let depth = 0;
-  for (const s of spans) {
-    if (s.kind !== "code" || s.to <= open) continue;
+  // Binary-search the first span past `open` — a linear walk here runs per visible
+  // line via the fold service and went quadratic on span-heavy documents.
+  let lo = 0;
+  let hi = spans.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (spans[mid].to <= open) lo = mid + 1;
+    else hi = mid;
+  }
+  for (let i = lo; i < spans.length; i++) {
+    const s = spans[i];
+    if (s.kind !== "code") continue;
     for (let p = Math.max(s.from, open); p < s.to; p++) {
       const cc = doc.charCodeAt(p);
       if (cc === openCh) depth++;
@@ -33,7 +43,9 @@ function matchingClose(doc: string, spans: Span[], open: number): number {
 
 const sqlFoldService = foldService.of((state, lineStart, lineEnd) => {
   const { spans } = lexState(state);
-  const doc = state.doc.toString();
+  // Cached per doc version — toString() here ran per visible line, materializing
+  // the whole document dozens of times per repaint on large buffers.
+  const doc = docString(state);
   for (let p = lineStart; p < lineEnd; p++) {
     if (!isCode(spans, p)) continue;
     const cc = doc.charCodeAt(p);

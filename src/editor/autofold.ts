@@ -1,6 +1,6 @@
 import { StateField, RangeSetBuilder, type EditorState, type Extension } from "@codemirror/state";
 import { Decoration, type DecorationSet, EditorView, WidgetType } from "@codemirror/view";
-import { lexState } from "./lexer";
+import { docString, lexState } from "./lexer";
 
 // Auto-fold large inline literals (the headline editor feature).
 //
@@ -31,7 +31,7 @@ function fmtSize(chars: number): string {
 
 /** Find foldable regions in the doc. Pure, runs only when the doc changes. */
 function detect(state: EditorState): Candidate[] {
-  const doc = state.doc.toString();
+  const doc = docString(state);
   if (!doc) return [];
   const { spans } = lexState(state);
   const cands: Candidate[] = [];

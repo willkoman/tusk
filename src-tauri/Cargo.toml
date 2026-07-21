@@ -1,6 +1,6 @@
 [package]
 name = "tusk"
-version = "0.8.5"
+version = "0.8.6"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -34,6 +34,8 @@ postgres-native-tls = "0.5"
 bytes = "1"
 futures-util = "0.3"
 rust_xlsxwriter = { version = "0.95.0", features = ["constant_memory"] }
+# Atomic sibling-file writes for exports, profiles, history, and editor saves.
+tempfile = "3"
 # AI provider proxy (streaming HTTP). rustls to avoid an OpenSSL build dep.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 # Slack Socket Mode (desktop-hosted bot — outbound WebSocket only, no HTTP server).

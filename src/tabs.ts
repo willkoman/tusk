@@ -13,6 +13,8 @@ export type ResultSnapshot = {
   lastQuery: string;
   /** The user's original wrappable query (';'-stripped) that sort/filter re-wrap from. */
   baseQuery: string;
+  /** Rows are in the original observed order, so completed results may sort locally. */
+  rowsAreBase: boolean;
   /** Bumped on each NEW query (not on streaming append) so the grid resets scroll/selection. */
   epoch: number;
 };
@@ -26,6 +28,7 @@ export const EMPTY_RESULT: ResultSnapshot = {
   elapsed: 0,
   lastQuery: "",
   baseQuery: "",
+  rowsAreBase: true,
   epoch: 0,
 };
 

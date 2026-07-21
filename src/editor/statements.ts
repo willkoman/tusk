@@ -1,6 +1,6 @@
 import { StateField, StateEffect, RangeSetBuilder, type EditorState, type Extension } from "@codemirror/state";
 import { Decoration, type DecorationSet, EditorView, GutterMarker, gutter } from "@codemirror/view";
-import { lexState, statementAt } from "./lexer";
+import { docString, lexState, statementAt } from "./lexer";
 import { type CursorInfo } from "./types";
 
 // Per-statement affordances: a "▶" gutter marker that runs just that statement, a
@@ -15,7 +15,7 @@ function startLineMap(state: EditorState): Map<number, number> {
   if (!map) {
     map = new Map();
     const { stmts } = lexState(state);
-    const text = state.doc.toString();
+    const text = docString(state);
     stmts.forEach((s, i) => {
       let p = s.from;
       while (p < s.to && /\s/.test(text[p])) p++;
@@ -107,7 +107,7 @@ function buildActive(state: EditorState): DecorationSet {
   const at = statementAt(stmts, state.selection.main.head);
   if (!at) return Decoration.none;
   const len = state.doc.length;
-  const doc = state.doc.toString();
+  const doc = docString(state);
   // A statement span starts right after the previous ';' (still on its closing line)
   // and may include leading blank lines. Trim whitespace to both ends so the highlight
   // covers only the statement's own lines.

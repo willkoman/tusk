@@ -18,12 +18,32 @@ export function isExplainQuery(sql: string): boolean {
 }
 
 type Snap = { lastQuery: string; columns: string[]; rows: (string | null)[][] };
+const MAX_PLAN_INPUT_CHARS = 5_000_000;
+const MAX_PLAN_TEXT_CHARS = 1_000_000;
 
 /** Join a result's cells line-wise — the universal styled-text fallback. */
 function textOf(rows: (string | null)[][], colIndex?: number): string {
-  return rows
-    .map((r) => (colIndex !== undefined ? (r[colIndex] ?? "") : r.map((c) => c ?? "").join("  ")))
-    .join("\n");
+  let out = "";
+  outer: for (const row of rows) {
+    const cells = colIndex !== undefined ? [row[colIndex] ?? ""] : row;
+    for (let i = 0; i < cells.length; i++) {
+      const prefix = i ? "  " : out ? "\n" : "";
+      if (MAX_PLAN_TEXT_CHARS - out.length <= prefix.length) break outer;
+      out += prefix;
+      out += (cells[i] ?? "").slice(0, MAX_PLAN_TEXT_CHARS - out.length);
+      if (out.length >= MAX_PLAN_TEXT_CHARS) break outer;
+    }
+  }
+  return out.length >= MAX_PLAN_TEXT_CHARS ? `${out}\n… plan text truncated` : out;
+}
+
+function inputWithinLimit(rows: (string | null)[][]): boolean {
+  let chars = 0;
+  for (const row of rows) for (const cell of row) {
+    chars += cell?.length ?? 0;
+    if (chars > MAX_PLAN_INPUT_CHARS) return false;
+  }
+  return true;
 }
 
 function firstJsonCell(columns: string[], rows: (string | null)[][]): string | null {
@@ -39,8 +59,10 @@ function firstJsonCell(columns: string[], rows: (string | null)[][]): string | n
 export function detectPlan(engine: string | null | undefined, snap: Snap): ParsedPlan | null {
   if (!snap.rows.length || !snap.columns.length) return null;
   if (!isExplainQuery(snap.lastQuery)) return null;
+  if (!inputWithinLimit(snap.rows)) return { kind: "text", text: textOf(snap.rows) };
 
-  switch (engine) {
+  try {
+    switch (engine) {
     case "sqlite": {
       const tree = parseSqlite(snap.columns, snap.rows);
       return tree; // bytecode EXPLAIN → null → grid (a listing, not a tree)
@@ -72,7 +94,11 @@ export function detectPlan(engine: string | null | undefined, snap: Snap): Parse
         if (tree) return tree;
       }
       const lines = snap.rows.map((r) => r[0] ?? "");
-      return parsePgText(lines) ?? { kind: "text", text: lines.join("\n") };
+      return parsePgText(lines) ?? { kind: "text", text: textOf(snap.rows, 0) };
     }
+    }
+  } catch {
+    // Provider/database-controlled plan payloads must never take down the workbench.
+    return { kind: "text", text: textOf(snap.rows) };
   }
 }

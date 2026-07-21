@@ -13,6 +13,7 @@ import {
   type Table,
 } from "./aliases";
 import { joinConditions } from "./joinHints";
+import { docString } from "../editor/lexer";
 import { type FkEdge } from "./fk";
 
 export type { Col, Table };
@@ -67,7 +68,7 @@ export function makeSqlCompletion(
     try {
       const word = ctx.matchBefore(/\w*/);
       const from = word ? word.from : ctx.pos;
-      const doc = ctx.state.doc.toString();
+      const doc = docString(ctx.state);
       // Enter/Tab accept completion. Never offer one for the `s` in a DB-API
       // `%s` placeholder or accepting it can rewrite the placeholder itself.
       if (word?.text === "s" && from > 0 && doc[from - 1] === "%") return null;

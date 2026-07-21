@@ -264,8 +264,10 @@ pub async fn table_detail(
         )
         .await?;
     let row = rows.first().ok_or_else(|| AppError::new("relation not found"))?;
-    let oid: u32 = row.get(0);
-    let relkind: String = row.get(1);
+    // try_get: typed `get` panics on a type mismatch, which a PG-wire-compatible
+    // server (CockroachDB, proxies) can produce where real Postgres never would.
+    let oid: u32 = row.try_get(0).map_err(|e| AppError::new(format!("unexpected catalog shape: {e}")))?;
+    let relkind: String = row.try_get(1).map_err(|e| AppError::new(format!("unexpected catalog shape: {e}")))?;
     let kind = match relkind.as_str() {
         "v" => "view",
         "m" => "matview",

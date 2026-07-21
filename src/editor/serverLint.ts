@@ -1,6 +1,6 @@
 import { type Diagnostic } from "@codemirror/lint";
 import { type EditorView } from "@codemirror/view";
-import { lexState } from "./lexer";
+import { docString, lexState } from "./lexer";
 import { type ServerDiag, type ValidateFn } from "./types";
 
 // Async linter source: round-trips the buffer to the backend `validate_sql`
@@ -15,7 +15,7 @@ export function serverLintSource(getValidate: () => ValidateFn | null) {
   return async (view: EditorView): Promise<Diagnostic[]> => {
     const validate = getValidate();
     if (!validate) return [];
-    const doc = view.state.doc.toString();
+    const doc = docString(view.state);
     if (!doc.trim()) return [];
 
     let diags: ServerDiag[];

@@ -225,7 +225,7 @@ export function SlackPane() {
           min="1"
           max="100"
           value={cfg().maxRowsInline}
-          onChange={(e) => patch({ maxRowsInline: Math.max(1, Math.min(100, Number(e.currentTarget.value) || 20)) })}
+          onChange={(e) => patch({ maxRowsInline: Math.trunc(Math.max(1, Math.min(100, Number(e.currentTarget.value) || 20))) })}
         />
       </label>
       <label class="settings-row">
@@ -235,7 +235,7 @@ export function SlackPane() {
           min="100"
           max="1000000"
           value={cfg().maxRowsFile}
-          onChange={(e) => patch({ maxRowsFile: Math.max(100, Math.min(1000000, Number(e.currentTarget.value) || 10000)) })}
+          onChange={(e) => patch({ maxRowsFile: Math.trunc(Math.max(100, Math.min(1000000, Number(e.currentTarget.value) || 10000))) })}
         />
       </label>
       <label class="settings-row">
@@ -245,7 +245,7 @@ export function SlackPane() {
           min="1"
           max="600"
           value={cfg().queryTimeoutSecs}
-          onChange={(e) => patch({ queryTimeoutSecs: Math.max(1, Math.min(600, Number(e.currentTarget.value) || 30)) })}
+          onChange={(e) => patch({ queryTimeoutSecs: Math.trunc(Math.max(1, Math.min(600, Number(e.currentTarget.value) || 30))) })}
         />
       </label>
       <label
@@ -259,7 +259,7 @@ export function SlackPane() {
           max="128000"
           step="256"
           value={cfg().aiMaxTokens}
-          onChange={(e) => patch({ aiMaxTokens: Math.max(256, Math.min(128000, Number(e.currentTarget.value) || 2048)) })}
+          onChange={(e) => patch({ aiMaxTokens: Math.round(Math.max(256, Math.min(128000, Number(e.currentTarget.value) || 2048)) / 256) * 256 })}
         />
       </label>
 

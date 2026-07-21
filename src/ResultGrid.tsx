@@ -1,4 +1,4 @@
-import { createSignal, createMemo, createEffect, on, For, Show, type Accessor } from "solid-js";
+import { createSignal, createMemo, createEffect, on, onCleanup, For, Show, type Accessor } from "solid-js";
 import { type Dataset, toTSV, toCSV, toJSON, toMarkdown } from "./formats";
 import { clipWrite, clipRead } from "./clipboard";
 import { type MenuItem } from "./ContextMenu";
@@ -42,11 +42,14 @@ export type ResultGridProps = {
   /** Bumped on each new query (not on append) — grid resets scroll/selection. */
   epoch: Accessor<number>;
   onLoadMore: () => void;
-  onSortFilter: (sorts: SortKey[], filters: Filter[]) => void;
+  onSortFilter: (sorts: SortKey[], filters: Filter[], kind: "sort" | "filter") => void;
   onMenu: (x: number, y: number, items: MenuItem[]) => void;
   onViewValue: (col: string, val: string | null) => void;
   onStatus: (text: string) => void;
-  canSortFilter: Accessor<boolean>;
+  canSort: Accessor<boolean>;
+  canFilter: Accessor<boolean>;
+  /** Canonical loaded-row indices in visible order; null = identity. */
+  rowOrder: Accessor<number[] | null>;
   /** Include column names as a header row in copied text (default off). */
   copyHeaders: Accessor<boolean>;
   /** Appearance prefs (read via accessor inside memos/JSX — never captured). */
@@ -115,7 +118,8 @@ export function ResultGrid(props: ResultGridProps) {
   const nIns = () => props.pending()?.inserts.length ?? 0;
   const nRows = createMemo(() => nLoaded() + nIns());
   const isInsRow = (r: number) => r < nIns();
-  const loadedAt = (r: number) => r - nIns(); // valid when !isInsRow(r)
+  const displayLoadedAt = (r: number) => r - nIns(); // valid when !isInsRow(r)
+  const loadedAt = (r: number) => props.rowOrder()?.[displayLoadedAt(r)] ?? displayLoadedAt(r);
   const rowRef = (r: number): RowRef => (isInsRow(r) ? { kind: "insert", i: r } : { kind: "loaded", i: loadedAt(r) });
   const delSet = createMemo(() => new Set(props.pending()?.deletes ?? []));
   const isDeleted = (r: number) => !isInsRow(r) && delSet().has(loadedAt(r));
@@ -170,10 +174,12 @@ export function ResultGrid(props: ResultGridProps) {
   // every scroll frame (the cause of the large-table jank/crash).
   const scrollMem = new Map<string, { top: number; left: number }>();
   let rafPending = false;
+  let scrollRaf: number | undefined;
+  let resizeObserver: ResizeObserver | undefined;
   function onScroll() {
     if (!scroller || rafPending) return;
     rafPending = true;
-    requestAnimationFrame(() => {
+    scrollRaf = requestAnimationFrame(() => {
       rafPending = false;
       if (!scroller) return;
       const st = scroller.scrollTop,
@@ -192,7 +198,9 @@ export function ResultGrid(props: ResultGridProps) {
       setViewportW(el.clientWidth);
     };
     requestAnimationFrame(measure);
-    new ResizeObserver(measure).observe(el);
+    resizeObserver?.disconnect();
+    resizeObserver = new ResizeObserver(measure);
+    resizeObserver.observe(el);
   }
 
   // Tab switch → restore that tab's saved scroll; new query in the same tab → reset to top.
@@ -492,26 +500,39 @@ export function ResultGrid(props: ResultGridProps) {
 
   // --- paste (Mod+V) — parse the clipboard and hand a grid + anchor to App ---
   async function doPaste() {
-    const text = await clipRead();
-    if (text == null || text === "") return;
-    const table = parseClipboardTable(text);
-    if (!table.length) return;
-    const dc = displayCols();
-    const s = sel();
-    // No active cell → anchor at the append region so a stray paste never overwrites
-    // loaded rows; otherwise anchor at the focused cell.
-    if (s.mode === "none") props.onPaste({ kind: "insert", i: nIns() }, 0, dc, table);
-    else {
-      const ar = s.fr < 0 ? 0 : Math.min(s.fr, nRows() - 1 < 0 ? 0 : nRows() - 1);
-      const ac = s.fc < 0 ? 0 : s.fc;
-      props.onPaste(rowRef(Math.max(0, ar)), ac, dc, table);
+    const tabId = props.activeTabId();
+    const key = resultKey();
+    const selected = { ...sel() };
+    const dc = [...displayCols()];
+    const pending = props.pending();
+    const anchor = selected.mode === "none"
+      ? { kind: "insert" as const, i: nIns() }
+      : rowRef(Math.max(0, selected.fr < 0 ? 0 : Math.min(selected.fr, Math.max(0, nRows() - 1))));
+    const anchorCol = selected.fc < 0 ? 0 : selected.fc;
+    try {
+      const text = await clipRead();
+      if (props.activeTabId() !== tabId || resultKey() !== key || props.pending() !== pending) {
+        props.onStatus("paste cancelled because the result changed");
+        return;
+      }
+      if (text == null || text === "") return;
+      const table = parseClipboardTable(text);
+      if (!table.length) return;
+      // No active cell → anchor at the append region so a stray paste never overwrites
+      // loaded rows; otherwise anchor at the focused cell captured before clipboard I/O.
+      props.onPaste(anchor, selected.mode === "none" ? 0 : anchorCol, dc, table);
+    } catch (e) {
+      props.onStatus(`paste rejected: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
   // --- copy ---
-  function selectionDataset(): Dataset {
+  // Hard ceiling on synchronous clipboard materialization. Beyond this the string
+  // build (JSON pretty-print ≈ 2-4× expansion) freezes the UI thread and can OOM-kill
+  // the WebView — the one crash class CrashGuard cannot catch. Export streams instead.
+  const MAX_COPY_CELLS = 5_000_000;
+  function selectionBounds(): { r0: number; r1: number; cols: number[] } {
     const dc = displayCols();
-    const names = props.columns();
     const s = sel();
     let r0 = 0,
       r1 = nRows() - 1,
@@ -525,6 +546,11 @@ export function ResultGrid(props: ResultGridProps) {
       const re = rect();
       cols = dc.slice(Math.max(0, re.c0), Math.min(dc.length, re.c1 + 1));
     }
+    return { r0, r1, cols };
+  }
+  function selectionDataset(): Dataset {
+    const names = props.columns();
+    const { r0, r1, cols } = selectionBounds();
     // Read through the pending overlay + bool mapping so copy matches what's
     // displayed (edited cells, insert rows, TRUE/FALSE pills).
     const rows: (string | null)[][] = [];
@@ -532,10 +558,14 @@ export function ResultGrid(props: ResultGridProps) {
     return { columns: cols.map((oi) => names[oi]), rows };
   }
   async function copySelection(fmt: "tsv" | "csv" | "json" | "md") {
+    const b = selectionBounds();
+    const cells = (b.r1 - b.r0 + 1) * b.cols.length;
+    if (cells > MAX_COPY_CELLS) {
+      props.onStatus(`selection too large to copy (${cells.toLocaleString()} cells) — use Export… instead`);
+      return;
+    }
     const d = selectionDataset();
     const h = props.copyHeaders();
-    const cells = d.rows.length * d.columns.length;
-    if (cells > 5_000_000) props.onStatus(`copying ${cells.toLocaleString()} cells…`);
     const text = fmt === "csv" ? toCSV(d, h) : fmt === "json" ? toJSON(d, h) : fmt === "md" ? toMarkdown(d, h) : toTSV(d, h);
     const ok = await clipWrite(text);
     props.onStatus(ok ? `copied ${d.rows.length}×${d.columns.length}` : "clipboard unavailable");
@@ -548,6 +578,13 @@ export function ResultGrid(props: ResultGridProps) {
     columns: [props.columns()[oi]],
     rows: Array.from({ length: nRows() }, (_, r) => [copyVal(r, oi)]),
   });
+  function copyColumn(oi: number) {
+    if (nRows() > MAX_COPY_CELLS) {
+      props.onStatus(`column too large to copy (${nRows().toLocaleString()} rows) — use Export… instead`);
+      return;
+    }
+    void copyText(toTSV(columnDataset(oi), props.copyHeaders()), "copied column");
+  }
 
   // --- context menus ---
   function onCellContext(e: MouseEvent, r: number, dc: number, oi: number, val: string | null) {
@@ -584,7 +621,7 @@ export function ResultGrid(props: ResultGridProps) {
       { label: "Copy as Markdown", icon: "copy", onClick: () => void copySelection("md") },
       { sep: true },
       { label: val === null ? "Copy value (NULL→empty)" : "Copy cell value", icon: "copy", onClick: () => void copyText(copyVal(r, oi) ?? "", "copied value") },
-      { label: "Copy column", icon: "copy", onClick: () => void copyText(toTSV(columnDataset(oi), props.copyHeaders()), "copied column") },
+      { label: "Copy column", icon: "copy", onClick: () => copyColumn(oi) },
       { label: "View value…", icon: "search", onClick: () => props.onViewValue(name, val) },
     ]);
   }
@@ -592,15 +629,19 @@ export function ResultGrid(props: ResultGridProps) {
     e.preventDefault();
     e.stopPropagation();
     const items: MenuItem[] = [];
-    if (props.canSortFilter()) {
+    if (props.canSort()) {
       items.push(
         { label: "Sort ascending", icon: "sortAsc", onClick: () => setSort(oi, "asc") },
         { label: "Sort descending", icon: "sortDesc", onClick: () => setSort(oi, "desc") },
         { label: "Clear sort", icon: "close", onClick: () => clearSort(oi) },
-        { label: props.view().filterRowOpen ? "Hide filter row" : "Filter…", icon: "search", onClick: () => props.setView({ filterRowOpen: !props.view().filterRowOpen }) },
-        { sep: true },
       );
     }
+    if (props.canFilter()) {
+      items.push(
+        { label: props.view().filterRowOpen ? "Hide filter row" : "Filter…", icon: "search", onClick: () => props.setView({ filterRowOpen: !props.view().filterRowOpen }) },
+      );
+    }
+    if (props.canSort() || props.canFilter()) items.push({ sep: true });
     items.push(
       { label: "Autofit column", icon: "resize", onClick: () => autofit(oi) },
       { label: "Hide column", icon: "eyeOff", onClick: () => hideCol(oi) },
@@ -611,7 +652,7 @@ export function ResultGrid(props: ResultGridProps) {
       for (const h of hidden) items.push({ label: `Show "${props.columns()[h]}"`, icon: "eye", onClick: () => showCol(h) });
       items.push({ label: "Show all columns", icon: "eye", onClick: () => props.setView({ hidden: [] }) });
     }
-    items.push({ sep: true }, { label: "Copy column", icon: "copy", onClick: () => void copyText(toTSV(columnDataset(oi), props.copyHeaders()), "copied column") });
+    items.push({ sep: true }, { label: "Copy column", icon: "copy", onClick: () => copyColumn(oi) });
     void dc;
     props.onMenu(e.clientX, e.clientY, items);
   }
@@ -619,16 +660,14 @@ export function ResultGrid(props: ResultGridProps) {
   // --- sort / filter ---
   function setSort(oi: number, dir: "asc" | "desc") {
     const next: SortKey[] = [{ col: oi, dir }];
-    props.setView({ sorts: next });
-    props.onSortFilter(next, props.view().filters);
+    props.onSortFilter(next, props.view().filters, "sort");
   }
   function clearSort(oi: number) {
     const next = props.view().sorts.filter((s) => s.col !== oi);
-    props.setView({ sorts: next });
-    props.onSortFilter(next, props.view().filters);
+    props.onSortFilter(next, props.view().filters, "sort");
   }
   function cycleSort(oi: number, additive: boolean) {
-    if (!props.canSortFilter()) return;
+    if (!props.canSort()) return;
     const cur = props.view().sorts;
     const existing = cur.find((s) => s.col === oi);
     const cycled = !existing ? "asc" : existing.dir === "asc" ? "desc" : null;
@@ -639,21 +678,42 @@ export function ResultGrid(props: ResultGridProps) {
     } else {
       next = cycled ? [{ col: oi, dir: cycled }] : [];
     }
-    props.setView({ sorts: next });
-    props.onSortFilter(next, props.view().filters);
+    props.onSortFilter(next, props.view().filters, "sort");
   }
   const sortFor = (oi: number) => props.view().sorts.find((s) => s.col === oi);
   const sortIndex = (oi: number) => props.view().sorts.findIndex((s) => s.col === oi);
 
   let filterTimer: ReturnType<typeof setTimeout> | undefined;
+  let resizeCleanup: (() => void) | null = null;
   function onFilterInput(oi: number, text: string) {
     const filters = props.view().filters.filter((f) => f.col !== oi);
     if (text.trim() !== "") filters.push({ col: oi, text });
     props.setView({ filters });
     clearTimeout(filterTimer);
-    filterTimer = setTimeout(() => props.onSortFilter(props.view().sorts, filters), 300);
+    const key = resultKey();
+    const tabId = props.activeTabId();
+    const sorts = [...props.view().sorts];
+    filterTimer = setTimeout(() => {
+      if (props.activeTabId() === tabId && resultKey() === key) props.onSortFilter(sorts, filters, "filter");
+    }, 300);
   }
   const filterFor = (oi: number) => props.view().filters.find((f) => f.col === oi)?.text ?? "";
+
+  onCleanup(() => {
+    clearTimeout(filterTimer);
+    resizeObserver?.disconnect();
+    if (scrollRaf !== undefined) cancelAnimationFrame(scrollRaf);
+    dragMode = null;
+    cancelAnimationFrame(autoRAF);
+    window.removeEventListener("mousemove", onDragMove);
+    window.removeEventListener("mouseup", endDrag);
+    headerDown = null;
+    window.removeEventListener("mousemove", onHeaderMove);
+    window.removeEventListener("mouseup", onHeaderUp);
+    resizeCleanup?.();
+    document.body.style.userSelect = "";
+    document.body.style.cursor = "";
+  });
 
   // --- resize / autofit / reorder / hide ---
   function startResize(e: MouseEvent, oi: number) {
@@ -661,6 +721,7 @@ export function ResultGrid(props: ResultGridProps) {
     e.stopPropagation();
     const startX = e.clientX,
       startW = colWidth(oi);
+    resizeCleanup?.();
     document.body.style.userSelect = "none";
     document.body.style.cursor = "col-resize";
     const mv = (ev: MouseEvent) =>
@@ -670,7 +731,9 @@ export function ResultGrid(props: ResultGridProps) {
       document.body.style.cursor = "";
       window.removeEventListener("mousemove", mv);
       window.removeEventListener("mouseup", up);
+      resizeCleanup = null;
     };
+    resizeCleanup = up;
     window.addEventListener("mousemove", mv);
     window.addEventListener("mouseup", up);
   }
@@ -786,6 +849,7 @@ export function ResultGrid(props: ResultGridProps) {
                       style={{ left: `${offsets()[k]}px`, width: `${colWidth(oi()) - 6}px` }}
                       placeholder="filter…"
                       value={filterFor(oi())}
+                      disabled={!props.canFilter()}
                       onInput={(e) => onFilterInput(oi(), e.currentTarget.value)}
                     />
                   );
@@ -810,7 +874,7 @@ export function ResultGrid(props: ResultGridProps) {
                 style={{ top: `${r * rowH()}px`, height: `${rowH()}px` }}
                 onMouseDown={(e) => onGutterDown(e, r)}
               >
-                {isInsRow(r) ? "+" : loadedAt(r) + 1}
+                {isInsRow(r) ? "+" : displayLoadedAt(r) + 1}
               </div>
             )}
           </For>

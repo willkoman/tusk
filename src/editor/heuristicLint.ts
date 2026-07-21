@@ -6,7 +6,7 @@ import { STATEMENT_STARTERS } from "../sql/dialects";
 // no per-run spread of the keyword set.
 const STARTER_LIST = [...STATEMENT_STARTERS];
 import { closest } from "./distance";
-import { lexState, maskNonCode, spanAt } from "./lexer";
+import { docString, lexState, maskNonCode, spanAt } from "./lexer";
 
 // Fast, offline heuristics that run as-you-type. Deliberately limited to checks
 // that are reliably correct on real SQL (read off the masked, code-only view of
@@ -27,7 +27,7 @@ import { lexState, maskNonCode, spanAt } from "./lexer";
 export function heuristicLintSource() {
   return (view: EditorView): Diagnostic[] => {
     const { spans, stmts } = lexState(view.state);
-    const doc = view.state.doc.toString();
+    const doc = docString(view.state);
     const out: Diagnostic[] = [];
 
     for (const stmt of stmts) {
@@ -63,7 +63,10 @@ export function heuristicLintSource() {
               continue;
             }
             if (ch === ")" || ch === "]" || ch === ";") trailing = true;
-            else if (/^[a-zA-Z_]\w*/.exec(doc.slice(q, stmt.to))?.[0]?.toUpperCase() === "FROM") trailing = true;
+            // Bounded window: only the next word matters, and this runs once per comma —
+            // slicing to stmt.to copied the whole statement tail per comma, which froze
+            // the UI on big VALUES dumps (O(commas × statement length)).
+            else if (/^[a-zA-Z_]\w*/.exec(doc.slice(q, Math.min(stmt.to, q + 64)))?.[0]?.toUpperCase() === "FROM") trailing = true;
             break;
           }
           if (trailing) out.push({ from: dp, to: dp + 1, severity: "warning", message: "trailing comma" });

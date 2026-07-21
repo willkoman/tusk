@@ -38,7 +38,9 @@ export function highlightSql(code: string): Tok[] {
     else if (m[5]) out.push({ text: m[5], cls: "tok-num" });
     else if (m[6]) {
       const lower = m[6].toLowerCase();
-      const rest = code.slice(TOKEN.lastIndex);
+      // Bounded lookahead — slicing the whole remaining string per identifier was
+      // O(n²) and froze the UI on large streamed AI code blocks.
+      const rest = code.slice(TOKEN.lastIndex, TOKEN.lastIndex + 16);
       if (KEYWORDS.has(lower)) out.push({ text: m[6], cls: "tok-kw" });
       else if (TYPES.has(lower)) out.push({ text: m[6], cls: "tok-type" });
       else if (/^\s*\(/.test(rest)) out.push({ text: m[6], cls: "tok-fn" }); // word immediately before "("

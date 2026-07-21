@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { formatWithOptions, type Dataset } from "./formats";
+import { formatWithOptions, parseCSV, parseJSON, type Dataset } from "./formats";
 import { defaultExportOptions, type ExportOptions } from "./export";
 import { boolWord } from "./grid/bool";
 
@@ -19,6 +19,37 @@ const data: Dataset = {
 function opts(patch: Partial<ExportOptions>): ExportOptions {
   return { ...defaultExportOptions("exported"), boolCols: [1], ...patch };
 }
+
+describe("import parsing boundaries", () => {
+  it("parses CSV, TSV, quoted fields, and ragged rows", () => {
+    expect(parseCSV('id,name\n1,"a,b"\n2', true)).toEqual({
+      columns: ["id", "name"],
+      rows: [["1", "a,b"], ["2", null]],
+    });
+    expect(parseCSV("id\tname\n1\tduck", true, "\t")).toEqual({
+      columns: ["id", "name"],
+      rows: [["1", "duck"]],
+    });
+  });
+
+  it("rejects malformed quotes and dense amplification", () => {
+    expect(() => parseCSV('id,name\n1,"open', true)).toThrow(/unterminated/i);
+    const header = Array.from({ length: 2001 }, (_, i) => `c${i}`).join(",");
+    const body = Array.from({ length: 1000 }, () => "x").join("\n");
+    expect(() => parseCSV(`${header}\n${body}`, true)).toThrow(/dense result/i);
+    const ragged = Array.from({ length: 251 }, () => Array(10_000).fill("x").join(",")).join("\n");
+    expect(() => parseCSV(`only_one_output_column\n${ragged}`, true)).toThrow(/too large|cells/i);
+  });
+
+  it("parses object JSON linearly and rejects non-object rows", () => {
+    expect(parseJSON('[{"a":1},{"b":{"x":2}}]')).toEqual({
+      columns: ["a", "b"],
+      rows: [["1", null], [null, '{"x":2}']],
+    });
+    expect(() => parseJSON("[1,2,3]")).toThrow(/array of objects/i);
+    expect(() => parseJSON(JSON.stringify({ huge: "x".repeat(1_000_001) }))).toThrow(/field/i);
+  });
+});
 
 describe("formatWithOptions boolean mapping", () => {
   it("csv maps only boolCols; NULL and non-bool columns untouched", () => {

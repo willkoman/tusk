@@ -51,12 +51,21 @@ pub fn ai_cancel(request_id: String, cancels: tauri::State<'_, AiCancels>) {
 }
 
 fn key_entry(provider: &str) -> Result<keyring::Entry, AppError> {
+    if provider.is_empty()
+        || provider.len() > 100
+        || !provider.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(AppError::new("invalid AI provider id"));
+    }
     keyring::Entry::new(KEYCHAIN_SERVICE, provider).map_err(|e| AppError::new(e.to_string()))
 }
 
 /// Save an API key for a provider to the OS keychain.
 #[tauri::command]
 pub fn ai_save_key(provider: String, key: String) -> Result<(), AppError> {
+    if key.is_empty() || key.len() > 64 * 1024 {
+        return Err(AppError::new("AI key must be between 1 and 65536 bytes"));
+    }
     key_entry(&provider)?
         .set_password(&key)
         .map_err(|e| AppError::new(e.to_string()))
@@ -452,6 +461,13 @@ pub async fn ai_list_models(
     base_url: Option<String>,
     allow_no_key: Option<bool>,
 ) -> Result<Vec<String>, AppError> {
+    key_entry(&provider)?;
+    if wire.as_deref().is_some_and(|w| !matches!(w, "anthropic" | "gemini" | "openai" | "responses")) {
+        return Err(AppError::new("unknown AI wire protocol"));
+    }
+    if base_url.as_ref().is_some_and(|s| s.len() > 2_000) {
+        return Err(AppError::new("AI base URL is too long"));
+    }
     let wire = match &wire {
         Some(w) => Wire::parse(w),
         None => Wire::legacy_for_provider(&provider),
@@ -494,7 +510,8 @@ pub async fn ai_list_models(
             (format!("{base}/v1/models"), h)
         }
     };
-    let client = reqwest::Client::new();
+    ensure_key_transport(&url, &key)?;
+    let client = http_client()?;
     let mut builder = client.get(&url);
     for (k, v) in headers {
         builder = builder.header(k, v);
@@ -505,16 +522,15 @@ pub async fn ai_list_models(
         .map_err(|e| AppError::new(e.to_string()))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let detail = resp.text().await.unwrap_or_default();
+        let detail = limited_body(resp, 64 * 1024).await.unwrap_or_default();
+        let detail = String::from_utf8_lossy(&detail);
         return Err(AppError::new(format!(
             "provider error {status}: {}",
             detail.chars().take(300).collect::<String>()
         )));
     }
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| AppError::new(e.to_string()))?;
+    let body = limited_body(resp, MAX_MODEL_BODY).await?;
+    let json: serde_json::Value = serde_json::from_slice(&body).map_err(|e| AppError::new(e.to_string()))?;
     let mut out: Vec<String> = match wire {
         Wire::Gemini => json["models"]
             .as_array()
@@ -550,7 +566,71 @@ pub async fn ai_list_models(
         out.retain(|id| !SKIP.iter().any(|s| id.contains(s)));
         out.sort(); // ascending groups router ids by vendor prefix ("anthropic/…", "openai/…")
     }
+    out.retain(|id| !id.is_empty() && id.len() <= 500);
+    out.truncate(5_000);
     Ok(out)
+}
+
+const MAX_MODEL_BODY: usize = 5 * 1024 * 1024;
+const MAX_SSE_LINE: usize = 1024 * 1024;
+const MAX_AI_OUTPUT: usize = 4 * 1024 * 1024;
+const MAX_AI_INPUT: usize = 4 * 1024 * 1024;
+
+fn http_client() -> Result<reqwest::Client, AppError> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(5 * 60))
+        // API-key headers must never follow a provider-controlled cross-origin or
+        // HTTPS-to-HTTP redirect. Callers can configure the final endpoint directly.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| AppError::new(e.to_string()))
+}
+
+fn ensure_key_transport(url: &str, key: &str) -> Result<(), AppError> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| AppError::new(format!("invalid AI endpoint URL: {e}")))?;
+    if !key.is_empty() && parsed.scheme() != "https" {
+        return Err(AppError::new("refusing to send an AI API key over a non-HTTPS endpoint"));
+    }
+    Ok(())
+}
+
+async fn limited_body(resp: reqwest::Response, max: usize) -> Result<Vec<u8>, AppError> {
+    let mut stream = resp.bytes_stream();
+    let mut out = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| AppError::new(e.to_string()))?;
+        if out.len().saturating_add(bytes.len()) > max {
+            return Err(AppError::new(format!("provider response exceeds {max} bytes")));
+        }
+        out.extend_from_slice(&bytes);
+    }
+    Ok(out)
+}
+
+fn validate_request(req: &AiRequest) -> Result<(), AppError> {
+    key_entry(&req.provider)?;
+    if req.provider.len() > 100 || req.model.len() > 500 || req.base_url.as_ref().is_some_and(|s| s.len() > 2_000) {
+        return Err(AppError::new("AI request contains an oversized provider, model, or base URL"));
+    }
+    if req.max_tokens.is_some_and(|n| !(1..=128_000).contains(&n)) {
+        return Err(AppError::new("AI maxTokens must be between 1 and 128000"));
+    }
+    if req.wire.as_deref().is_some_and(|w| !matches!(w, "anthropic" | "gemini" | "openai" | "responses")) {
+        return Err(AppError::new("unknown AI wire protocol"));
+    }
+    if req.messages.len() > 1_000
+        || req.messages.iter().any(|m| !matches!(m.role.as_str(), "user" | "assistant") || m.role.len() > 20)
+        || req.request_id.as_ref().is_some_and(|id| id.len() > 200)
+    {
+        return Err(AppError::new("AI request contains too many messages or an invalid role/request id"));
+    }
+    let bytes = req.system.as_ref().map_or(0, String::len)
+        + req.messages.iter().map(|m| m.role.len() + m.content.len()).sum::<usize>();
+    if bytes > MAX_AI_INPUT {
+        return Err(AppError::new(format!("AI request context exceeds {MAX_AI_INPUT} bytes")));
+    }
+    Ok(())
 }
 
 /// One parsed SSE line. A single frame can carry several signals at once (Gemini's
@@ -569,14 +649,19 @@ struct Frame {
 /// sequence) guarantees each returned line is a whole UTF-8 boundary — so decoding
 /// per line can't mangle a character split across two network chunks (the bug when
 /// you `from_utf8_lossy` each raw chunk before splitting).
-fn drain_sse_lines(buf: &mut Vec<u8>) -> Vec<String> {
+fn drain_sse_lines(buf: &mut Vec<u8>) -> Result<Vec<String>, AppError> {
     let mut lines = Vec::new();
-    loop {
-        let Some(nl) = buf.iter().position(|&b| b == b'\n') else { break };
+    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+        if nl > MAX_SSE_LINE {
+            return Err(AppError::new(format!("provider SSE line exceeds {MAX_SSE_LINE} bytes")));
+        }
         let line: Vec<u8> = buf.drain(..=nl).collect();
         lines.push(String::from_utf8_lossy(&line[..line.len() - 1]).trim_end().to_string());
     }
-    lines
+    if buf.len() > MAX_SSE_LINE {
+        return Err(AppError::new(format!("provider SSE line exceeds {MAX_SSE_LINE} bytes")));
+    }
+    Ok(lines)
 }
 
 /// Parse one SSE line (`data: {json}` / `data: [DONE]`) into a frame for `wire`.
@@ -627,7 +712,7 @@ fn retryable_msg(m: &str) -> bool {
     [
         "overloaded", "rate limit", "rate_limit", "timeout", "timed out", "temporarily",
         "try again", "internal server", "connection", "connect", "reset by peer",
-        "unavailable", "502", "503", "529",
+        "unavailable", "ended before a terminal event", "502", "503", "529",
     ]
     .iter()
     .any(|k| m.contains(k))
@@ -662,6 +747,7 @@ async fn stream_attempt<F: FnMut(String) + Send>(
     partial_is_fatal: bool,
 ) -> Result<Option<Completion>, Attempt> {
     let (url, headers, body) = build_request(req, key);
+    ensure_key_transport(&url, key).map_err(|e| Attempt::Fatal(e.message))?;
     let mut builder = client.post(&url).json(&body);
     for (k, v) in headers {
         builder = builder.header(k, v);
@@ -678,7 +764,8 @@ async fn stream_attempt<F: FnMut(String) + Send>(
     };
     if !resp.status().is_success() {
         let status = resp.status();
-        let detail = resp.text().await.unwrap_or_default();
+        let detail = limited_body(resp, 64 * 1024).await.unwrap_or_default();
+        let detail = String::from_utf8_lossy(&detail);
         let msg = format!("provider error {status}: {}", detail.chars().take(500).collect::<String>());
         return Err(if retryable_status(status.as_u16()) {
             Attempt::Retry(msg)
@@ -691,6 +778,7 @@ async fn stream_attempt<F: FnMut(String) + Send>(
     let mut text = String::new();
     let mut truncated = false;
     let mut emitted = false;
+    let mut saw_finish = false;
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     loop {
@@ -705,17 +793,22 @@ async fn stream_attempt<F: FnMut(String) + Send>(
             Err(e) => return Err(soft_fail(e.to_string(), emitted && partial_is_fatal)),
         };
         buf.extend_from_slice(&bytes);
-        for line in drain_sse_lines(&mut buf) {
+        let lines = drain_sse_lines(&mut buf).map_err(|e| Attempt::Fatal(e.message))?;
+        for line in lines {
             let f = parse_sse_line(&line, req.wire());
             if let Some(msg) = f.error {
                 return Err(soft_fail(msg, emitted && partial_is_fatal));
             }
             if let Some(t) = f.delta {
+                if text.len().saturating_add(t.len()) > MAX_AI_OUTPUT {
+                    return Err(Attempt::Fatal(format!("AI response exceeds {MAX_AI_OUTPUT} bytes")));
+                }
                 emitted = true;
                 text.push_str(&t);
                 on_delta(t);
             }
             if let Some(r) = f.finish {
+                saw_finish = true;
                 match classify_finish(&r) {
                     Finish::Normal => {}
                     Finish::Truncated => truncated = true,
@@ -727,7 +820,42 @@ async fn stream_attempt<F: FnMut(String) + Send>(
             }
         }
     }
-    Ok(Some(Completion { text, truncated }))
+    // Some compatible servers omit the final newline. Process that complete final
+    // frame rather than silently discarding a terminal event or error.
+    if !buf.is_empty() {
+        let line = String::from_utf8_lossy(&buf).trim_end().to_string();
+        let f = parse_sse_line(&line, req.wire());
+        if let Some(msg) = f.error {
+            return Err(soft_fail(msg, emitted && partial_is_fatal));
+        }
+        if let Some(t) = f.delta {
+            if text.len().saturating_add(t.len()) > MAX_AI_OUTPUT {
+                return Err(Attempt::Fatal(format!("AI response exceeds {MAX_AI_OUTPUT} bytes")));
+            }
+            emitted = true;
+            text.push_str(&t);
+            on_delta(t);
+        }
+        if let Some(r) = f.finish {
+            saw_finish = true;
+            match classify_finish(&r) {
+                Finish::Normal => {}
+                Finish::Truncated => truncated = true,
+                Finish::Aborted(m) => return Err(Attempt::Fatal(m)),
+            }
+        }
+        if f.done {
+            return Ok(Some(Completion { text, truncated }));
+        }
+    }
+    if saw_finish {
+        Ok(Some(Completion { text, truncated }))
+    } else {
+        Err(soft_fail(
+            "provider stream ended before a terminal event".to_string(),
+            emitted && partial_is_fatal,
+        ))
+    }
 }
 
 /// Retryable unless we've already painted partial output on screen.
@@ -749,13 +877,14 @@ async fn complete_with_retry<F: FnMut(String) + Send>(
     mut cancel: Option<oneshot::Receiver<()>>,
     partial_is_fatal: bool,
 ) -> Result<Option<Completion>, AppError> {
+    validate_request(req)?;
     // Local servers (Ollama / LM Studio) have no key to look up.
     let key = match get_key(&req.provider) {
         Ok(k) => k,
         Err(_) if req.allow_no_key => String::new(),
         Err(e) => return Err(e),
     };
-    let client = reqwest::Client::new();
+    let client = http_client()?;
     let mut last = String::new();
     for attempt in 0..MAX_ATTEMPTS {
         match stream_attempt(&client, req, &key, &mut on_delta, &mut cancel, partial_is_fatal).await {
@@ -783,7 +912,7 @@ async fn complete_with_retry<F: FnMut(String) + Send>(
 pub async fn complete_one_shot(req: &AiRequest) -> Result<Completion, AppError> {
     let out = complete_with_retry(req, |_| {}, None, false)
         .await?
-        .expect("no cancel channel — cannot be cancelled");
+        .ok_or_else(|| AppError::new("AI completion was unexpectedly cancelled"))?;
     if out.text.trim().is_empty() {
         return Err(AppError::new(
             "the AI returned an empty response (the stream ended before any text arrived)",
@@ -804,11 +933,50 @@ mod tests {
         let (a, b) = full.split_at(split);
         let mut buf: Vec<u8> = Vec::new();
         buf.extend_from_slice(a);
-        assert!(drain_sse_lines(&mut buf).is_empty()); // no newline yet
+        assert!(drain_sse_lines(&mut buf).unwrap().is_empty()); // no newline yet
         buf.extend_from_slice(b);
-        let lines = drain_sse_lines(&mut buf);
+        let lines = drain_sse_lines(&mut buf).unwrap();
         assert_eq!(lines.len(), 1);
         assert_eq!(parse_sse_line(&lines[0], Wire::Openai).delta.as_deref(), Some("région")); // NOT "r��gion"
+    }
+
+    #[test]
+    fn keyed_ai_endpoints_require_https() {
+        assert!(ensure_key_transport("https://example.test/v1", "secret").is_ok());
+        assert!(ensure_key_transport("http://example.test/v1", "secret").is_err());
+        assert!(ensure_key_transport("http://127.0.0.1:11434/v1", "").is_ok());
+        assert!(ensure_key_transport("not a url", "").is_err());
+    }
+
+    #[test]
+    fn sse_limit_applies_to_lines_not_transport_chunks() {
+        let mut many = b"data: {}\n".repeat((MAX_SSE_LINE / 9) + 10);
+        assert!(many.len() > MAX_SSE_LINE);
+        assert!(drain_sse_lines(&mut many).is_ok());
+        let mut one = vec![b'x'; MAX_SSE_LINE + 1];
+        one.push(b'\n');
+        assert!(drain_sse_lines(&mut one).is_err());
+    }
+
+    #[test]
+    fn ai_request_limits_reject_oversized_context_and_tokens() {
+        let mut req = AiRequest {
+            provider: "openai".into(),
+            wire: Some("openai".into()),
+            model: "model".into(),
+            base_url: Some("https://example.test".into()),
+            system: None,
+            messages: vec![Msg { role: "user".into(), content: "hello".into() }],
+            max_tokens: Some(1024),
+            request_id: None,
+            allow_no_key: false,
+        };
+        assert!(validate_request(&req).is_ok());
+        req.max_tokens = Some(u32::MAX);
+        assert!(validate_request(&req).is_err());
+        req.max_tokens = Some(1024);
+        req.messages[0].content = "x".repeat(MAX_AI_INPUT + 1);
+        assert!(validate_request(&req).is_err());
     }
 
     #[test]

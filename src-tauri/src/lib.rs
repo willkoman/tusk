@@ -20,12 +20,17 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::io::AsyncReadExt;
 
 use db::{AppError, ConnectResult, ConnectionConfig, FetchResult, QueryOutcome};
 use driver::{Backend, CancelHandle, ConnState};
 use profiles::Profile;
 
 type Conn = Arc<AsyncMutex<ConnState>>;
+
+pub(crate) fn lock_sync<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[derive(Default)]
 pub(crate) struct AppState {
@@ -47,7 +52,7 @@ impl AppState {
     fn get(&self, id: &str) -> Result<Conn, AppError> {
         self.conns
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(id)
             .cloned()
             .ok_or_else(|| AppError::new("no such connection"))
@@ -56,36 +61,37 @@ impl AppState {
     /// Arm cancellation for an operation about to run on `id` (call after `ensure_alive`,
     /// with the *current* client's token). `disarm_cancel` must be called when it ends.
     pub(crate) fn arm_cancel(&self, id: &str, handle: CancelHandle, cfg: ConnectionConfig) {
-        self.cancels.lock().unwrap().insert(id.to_string(), (handle, cfg));
+        lock_sync(&self.cancels).insert(id.to_string(), (handle, cfg));
     }
     pub(crate) fn disarm_cancel(&self, id: &str) {
-        self.cancels.lock().unwrap().remove(id);
+        lock_sync(&self.cancels).remove(id);
     }
     pub(crate) fn cancel_handle(&self, id: &str) -> Option<(CancelHandle, ConnectionConfig)> {
-        self.cancels.lock().unwrap().get(id).cloned()
+        lock_sync(&self.cancels).get(id).cloned()
     }
 
     fn register(&self, backend: Backend, read_only: bool) -> String {
         let id = format!("conn-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let conn = Arc::new(AsyncMutex::new(ConnState { backend, read_only }));
-        self.conns.lock().unwrap().insert(id.clone(), conn);
-        *self.active_conn_id.lock().unwrap() = Some(id.clone());
+        lock_sync(&self.conns).insert(id.clone(), conn);
+        *lock_sync(&self.active_conn_id) = Some(id.clone());
         id
     }
 
     /// The connection the Slack bot should use: the UI's active one, falling back to
     /// the sole registered connection.
     pub(crate) fn active(&self) -> Result<(String, Conn), AppError> {
-        let active = self.active_conn_id.lock().unwrap().clone();
-        let conns = self.conns.lock().unwrap();
+        let active = lock_sync(&self.active_conn_id).clone();
+        let conns = lock_sync(&self.conns);
         if let Some(id) = active {
             if let Some(c) = conns.get(&id) {
                 return Ok((id, c.clone()));
             }
         }
         if conns.len() == 1 {
-            let (k, v) = conns.iter().next().unwrap();
-            return Ok((k.clone(), v.clone()));
+            if let Some((k, v)) = conns.iter().next() {
+                return Ok((k.clone(), v.clone()));
+            }
         }
         Err(AppError::new(
             "no active database connection in Tusk — connect to a database first",
@@ -132,23 +138,83 @@ pub(crate) async fn lock_conn(conn: &Conn) -> ConnGuard<'_> {
 }
 
 /// Only plain read queries can be wrapped in a server-side cursor for streaming.
-fn is_cursorable(sql: &str) -> bool {
-    let t = sql.trim_start().to_ascii_lowercase();
-    t.starts_with("select")
-        || t.starts_with("with")
-        || t.starts_with("table")
-        || t.starts_with("values")
+/// `duck` additionally admits DuckDB's FROM-first and PIVOT forms — they wrap as
+/// subqueries fine (pinned by `duck_from_first_and_pivot_stream`), and classifying
+/// them non-cursorable buffered ENTIRE tables in RAM (`FROM events` on a big table
+/// was an allocation-abort waiting to happen).
+fn is_cursorable(sql: &str, duck: bool) -> bool {
+    let w = first_sql_word(sql);
+    matches!(w.as_str(), "select" | "with" | "table" | "values")
+        || (duck && matches!(w.as_str(), "from" | "pivot"))
 }
 
 /// Statements allowed on a read-only connection.
 pub(crate) fn is_read_only_stmt(sql: &str) -> bool {
-    let t = sql.trim_start().to_ascii_lowercase();
-    t.starts_with("select")
-        || t.starts_with("with")
-        || t.starts_with("show")
-        || t.starts_with("explain")
-        || t.starts_with("table")
-        || t.starts_with("values")
+    let first = first_sql_word(sql);
+    let allowed = matches!(
+        first.as_str(),
+        "select" | "with" | "show" | "explain" | "table" | "values" | "from" | "pivot"
+    );
+    allowed && (matches!(first.as_str(), "show" | "explain") || slack::processor::find_mutation_word(sql).is_none())
+}
+
+fn first_sql_word(sql: &str) -> String {
+    script::effective_start(sql)
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+const DEFAULT_PAGE_SIZE: u32 = 1000;
+const MAX_PAGE_SIZE: u32 = 50_000;
+const MAX_SQL_BYTES: usize = 20 * 1024 * 1024;
+const MAX_TEXT_FILE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_HISTORY_BYTES: usize = 10 * 1024 * 1024;
+const MAX_IPC_ROWS: usize = 200_000;
+const MAX_IPC_COLUMNS: usize = 10_000;
+const MAX_IPC_CELLS: usize = 2_000_000;
+const MAX_IPC_CELL_BYTES: usize = 1024 * 1024;
+const MAX_IPC_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+fn checked_page_size(page: Option<u32>) -> Result<u32, AppError> {
+    let page = page.unwrap_or(DEFAULT_PAGE_SIZE);
+    if !(1..=MAX_PAGE_SIZE).contains(&page) {
+        return Err(AppError::new(format!(
+            "page size must be between 1 and {MAX_PAGE_SIZE}"
+        )));
+    }
+    Ok(page)
+}
+
+fn validate_sql_size(sql: &str) -> Result<(), AppError> {
+    if sql.len() > MAX_SQL_BYTES {
+        return Err(AppError::new(format!("SQL exceeds the {MAX_SQL_BYTES}-byte limit")));
+    }
+    Ok(())
+}
+
+fn validate_tabular_payload(columns: &[String], rows: &[Vec<Option<String>>]) -> Result<(), AppError> {
+    if columns.is_empty() || columns.len() > MAX_IPC_COLUMNS {
+        return Err(AppError::new(format!("column count must be between 1 and {MAX_IPC_COLUMNS}")));
+    }
+    if rows.len() > MAX_IPC_ROWS || rows.len().saturating_mul(columns.len()) > MAX_IPC_CELLS {
+        return Err(AppError::new(format!("row payload exceeds the {MAX_IPC_CELLS}-cell limit")));
+    }
+    if rows.iter().any(|r| r.len() != columns.len()) {
+        return Err(AppError::new("every row must have exactly the same number of values as columns"));
+    }
+    let mut bytes = 0usize;
+    for value in columns.iter().chain(rows.iter().flatten().flatten()) {
+        if value.len() > MAX_IPC_CELL_BYTES {
+            return Err(AppError::new(format!("a column name or value exceeds the {MAX_IPC_CELL_BYTES}-byte limit")));
+        }
+        bytes = bytes.saturating_add(value.len());
+        if bytes > MAX_IPC_PAYLOAD_BYTES {
+            return Err(AppError::new(format!("row payload exceeds the {MAX_IPC_PAYLOAD_BYTES}-byte limit")));
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -210,12 +276,12 @@ async fn disconnect(
 ) -> Result<(), AppError> {
     state.disarm_cancel(&connection_id);
     {
-        let mut active = state.active_conn_id.lock().unwrap();
+        let mut active = lock_sync(&state.active_conn_id);
         if active.as_deref() == Some(connection_id.as_str()) {
             *active = None;
         }
     }
-    let removed = state.conns.lock().unwrap().remove(&connection_id);
+    let removed = lock_sync(&state.conns).remove(&connection_id);
     if let Some(conn) = removed {
         let mut c = lock_conn(&conn).await;
         c.backend.rollback_cursor().await;
@@ -250,9 +316,10 @@ async fn run_query(
     page_size: Option<u32>,
     search_path: Option<String>,
 ) -> Result<QueryOutcome, AppError> {
+    validate_sql_size(&sql)?;
     let conn = state.get(&connection_id)?;
     let mut c = lock_conn(&conn).await;
-    let page = page_size.unwrap_or(1000);
+    let page = checked_page_size(page_size)?;
     ensure_alive(&mut c).await?;
 
     let items = script::split(sql.trim());
@@ -266,13 +333,26 @@ async fn run_query(
     // by re-clicking. Armed after ensure_alive so the handle matches the live backend; the
     // handle lives outside the per-connection lock we hold here so `cancel_operation` reaches it.
     state.arm_cancel(&connection_id, c.backend.cancel_handle(), c.backend.config().clone());
+    let retry_safe = c.read_only
+        && c.backend.capabilities().kind != "mysql"
+        && items.len() == 1
+        && matches!(&items[0], script::Item::Sql(s) if is_read_only_stmt(s));
     let out = match exec_items(&mut c, &items, page, &search_path).await {
         Ok(out) => Ok(out),
-        // If the connection dropped mid-query, reconnect and retry once.
-        Err(_) if c.backend.is_closed() => {
-            ensure_alive(&mut c).await?;
-            state.arm_cancel(&connection_id, c.backend.cancel_handle(), c.backend.config().clone());
-            exec_items(&mut c, &items, page, &search_path).await
+        // Only an engine-enforced read-only single statement is safe to replay.
+        // A dropped write has an ambiguous commit outcome and must never run twice.
+        Err(_) if c.backend.is_closed() && retry_safe => match ensure_alive(&mut c).await {
+            Ok(()) => {
+                state.arm_cancel(&connection_id, c.backend.cancel_handle(), c.backend.config().clone());
+                exec_items(&mut c, &items, page, &search_path).await
+            }
+            Err(e) => Err(e),
+        },
+        Err(e) if c.backend.is_closed() => {
+            Err(AppError::new(format!(
+                "connection dropped while the query was running; execution outcome is unknown. Verify database state before retrying. ({})",
+                e.message
+            )))
         }
         Err(e) => Err(e),
     };
@@ -307,10 +387,11 @@ async fn exec_items(
     }
 
     // A single plain statement runs interactively (streaming result grid).
+    let duck = matches!(c.backend, crate::driver::Backend::Duck(_));
     if items.len() == 1 {
         if let script::Item::Sql(stmt) = &items[0] {
             let trimmed = stmt.trim();
-            return c.backend.run_single(trimmed, page, is_cursorable(trimmed)).await;
+            return c.backend.run_single(trimmed, page, is_cursorable(trimmed, duck)).await;
         }
     }
 
@@ -323,24 +404,19 @@ async fn exec_items(
     if items.len() > 1 {
         if let Some(script::Item::Sql(last)) = items.last() {
             let last_trimmed = last.trim();
-            if is_cursorable(last_trimmed) {
+            if is_cursorable(last_trimmed, duck) {
                 c.backend
                     .run_script(&items[..items.len() - 1], c.read_only)
                     .await?;
-                // The leading statements are now committed and must never be replayed.
-                // If streaming the trailing read trips on a dropped connection, heal it
-                // in place and retry ONLY the read — then return alive so run_query's
-                // outer retry (which re-runs the whole batch) can't fire and double-apply.
+                // The leading statements are now committed. Never replay even the
+                // trailing SELECT after a disconnect: SELECT can call side-effecting
+                // functions, and its outcome is ambiguous on a writable connection.
                 let mut out = c.backend.run_single(last_trimmed, page, true).await;
-                if out.is_err() && c.backend.is_closed() {
-                    ensure_alive(c).await?;
-                    out = c.backend.run_single(last_trimmed, page, true).await;
-                }
                 // Tell the user the earlier statements ran too — when several
                 // are reads, their results were silently superseded by this one.
                 if let Ok(QueryOutcome::Rows { note, .. }) = &mut out {
                     let leading_reads = items[..items.len() - 1].iter().any(|it| {
-                        matches!(it, script::Item::Sql(s) if is_cursorable(s.trim()))
+                        matches!(it, script::Item::Sql(s) if is_cursorable(s.trim(), duck))
                     });
                     *note = Some(if leading_reads {
                         "earlier statements executed — only the last result is shown".into()
@@ -378,7 +454,7 @@ async fn fetch_more(
             "connection dropped mid-stream — the result is incomplete. Re-run the query to load the rest.",
         ));
     }
-    let page = page_size.unwrap_or(1000);
+    let page = checked_page_size(page_size)?;
     if !c.backend.cursor_open() {
         return Ok(FetchResult {
             rows: vec![],
@@ -520,7 +596,7 @@ fn dollar_tag_end(b: &[u8], i: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod bind_param_tests {
-    use super::has_bind_params;
+    use super::{checked_page_size, has_bind_params, is_cursorable, is_read_only_stmt, validate_sql_size, validate_tabular_payload, ConnectionConfig, MAX_SQL_BYTES};
 
     #[test]
     fn detects_supported_bind_styles() {
@@ -543,6 +619,66 @@ mod bind_param_tests {
         ] {
             assert!(!has_bind_params(sql), "unexpected bind param in {sql}");
         }
+    }
+
+    #[test]
+    fn query_classification_skips_comments_and_matches_whole_keywords() {
+        assert!(is_cursorable("-- heading\nSELECT 1", false));
+        assert!(is_read_only_stmt("/* heading */ WITH x AS (SELECT 1) SELECT * FROM x"));
+        assert!(!is_cursorable("selection FROM t", false));
+        assert!(!is_read_only_stmt("showcase"));
+        // DuckDB-only forms stream (buffering FROM <big table> whole was an OOM-abort
+        // class); other engines keep rejecting them as cursorable.
+        assert!(is_cursorable("FROM events", true));
+        assert!(is_cursorable("PIVOT t ON k USING sum(v)", true));
+        assert!(!is_cursorable("FROM events", false));
+        assert!(is_read_only_stmt("FROM events"));
+        assert!(!is_read_only_stmt("frombulate"));
+    }
+
+    #[test]
+    fn readonly_guard_rejects_writable_ctes_and_row_locks() {
+        assert!(!is_read_only_stmt("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"));
+        assert!(!is_read_only_stmt("SELECT * FROM t FOR UPDATE"));
+        assert!(!is_read_only_stmt("SELECT * FROM t FOR SHARE"));
+        assert!(!is_read_only_stmt("SELECT * FROM t FOR\nSHARE"));
+        assert!(!is_read_only_stmt("SELECT * FROM t INTO OUTFILE '/tmp/x'"));
+        assert!(is_read_only_stmt("SELECT 'delete' AS word -- update"));
+    }
+
+    #[test]
+    fn page_size_rejects_zero_and_unbounded_requests() {
+        assert_eq!(checked_page_size(None).unwrap(), 1000);
+        assert_eq!(checked_page_size(Some(1)).unwrap(), 1);
+        assert_eq!(checked_page_size(Some(50_000)).unwrap(), 50_000);
+        assert!(checked_page_size(Some(0)).is_err());
+        assert!(checked_page_size(Some(50_001)).is_err());
+        assert!(checked_page_size(Some(u32::MAX)).is_err());
+    }
+
+    #[test]
+    fn ipc_resource_limits_reject_oversized_and_ragged_payloads() {
+        assert!(validate_sql_size(&"x".repeat(MAX_SQL_BYTES + 1)).is_err());
+        assert!(validate_tabular_payload(&[], &[]).is_err());
+        assert!(validate_tabular_payload(&["a".into(), "b".into()], &[vec![Some("1".into())]]).is_err());
+        assert!(validate_tabular_payload(&["a".into()], &[vec![Some("1".into())]]).is_ok());
+    }
+
+    #[test]
+    fn connection_config_rejects_unknown_security_modes_and_ports() {
+        let mut cfg = ConnectionConfig {
+            driver: Some("postgres".into()), host: "localhost".into(), port: 5432,
+            user: "u".into(), password: String::new(), dbname: "d".into(),
+            sslmode: Some("verify-full".into()), read_only: false, path: None,
+        };
+        assert!(cfg.validate().is_ok());
+        cfg.sslmode = Some("verfy-full".into());
+        assert!(cfg.validate().is_err());
+        cfg.sslmode = Some("prefer".into());
+        cfg.port = 0;
+        assert!(cfg.validate().is_err());
+        cfg.driver = Some("oracle".into());
+        assert!(cfg.validate().is_err());
     }
 }
 
@@ -588,6 +724,7 @@ async fn validate_sql(
     sql: String,
     search_path: Option<String>,
 ) -> Result<Vec<StmtDiag>, AppError> {
+    validate_sql_size(&sql)?;
     let conn = state.get(&connection_id)?;
     let mut c = lock_conn(&conn).await;
     ensure_alive(&mut c).await?;
@@ -722,11 +859,18 @@ async fn table_relationships(
     schema: String,
     name: String,
 ) -> Result<relgraph::Relationships, AppError> {
+    if schema.len() > 1_000 || name.len() > 1_000 {
+        return Err(AppError::new("schema or relation name is too long"));
+    }
     let conn = state.get(&connection_id)?;
     let mut c = lock_conn(&conn).await;
     ensure_alive(&mut c).await?;
     c.backend.rollback_cursor().await;
-    c.backend.table_relationships(&schema, &name).await
+    let graph = c.backend.table_relationships(&schema, &name).await?;
+    if graph.outbound.len().saturating_add(graph.inbound.len()) > 50_000 {
+        return Err(AppError::new("relationship graph exceeds the 50000-edge limit"));
+    }
+    Ok(graph)
 }
 
 /// All FK edges + table summaries of one schema, for the whole-schema ERD.
@@ -736,11 +880,19 @@ async fn schema_relationships(
     connection_id: String,
     schema: String,
 ) -> Result<relgraph::SchemaGraph, AppError> {
+    if schema.len() > 1_000 {
+        return Err(AppError::new("schema name is too long"));
+    }
     let conn = state.get(&connection_id)?;
     let mut c = lock_conn(&conn).await;
     ensure_alive(&mut c).await?;
     c.backend.rollback_cursor().await;
-    c.backend.schema_relationships(&schema).await
+    let graph = c.backend.schema_relationships(&schema).await?;
+    let columns = graph.tables.iter().map(|t| t.columns.len()).sum::<usize>();
+    if graph.tables.len() > 5_000 || graph.edges.len() > 50_000 || columns > 100_000 {
+        return Err(AppError::new("schema graph exceeds the 5000-table/50000-edge/100000-column limits"));
+    }
+    Ok(graph)
 }
 
 /// Immediately cancel the cancellable operation in flight on a connection (a streaming
@@ -787,6 +939,7 @@ async fn cancel_operation(
 /// Export to a file with a full options payload. Either streams a query
 /// (scope=all, needs a connection) or formats inline rows (scope=loaded).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri deserializes this stable IPC payload by field name.
 async fn export_to_file(
     state: tauri::State<'_, AppState>,
     connection_id: Option<String>,
@@ -797,7 +950,22 @@ async fn export_to_file(
     path: String,
     search_path: Option<String>,
 ) -> Result<u64, AppError> {
-    if let Some(q) = sql {
+    options.validate()?;
+    let destination = std::path::PathBuf::from(&path);
+    let parent = destination.parent().filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| AppError::new("export destination must include a parent directory"))?;
+    let temp = tempfile::Builder::new()
+        .prefix(".tusk-export-")
+        .tempfile_in(parent)
+        .map_err(|e| AppError::new(format!("cannot create export temp file: {e}")))?;
+    if let Ok(meta) = std::fs::metadata(&destination) {
+        temp.as_file().set_permissions(meta.permissions()).map_err(|e| AppError::new(e.to_string()))?;
+    }
+    let temp_path = temp.into_temp_path();
+    let temp_name = temp_path.to_string_lossy().to_string();
+
+    let result = if let Some(q) = sql {
+        validate_sql_size(&q)?;
         let id = connection_id.ok_or_else(|| AppError::new("no connection"))?;
         let conn = state.get(&id)?;
         let mut c = lock_conn(&conn).await;
@@ -807,40 +975,46 @@ async fn export_to_file(
         // Export streams exactly one query through a cursor. Split (dollar-quote aware)
         // so a multi-statement input can't smuggle extra statements (e.g. a trailing
         // DROP) into the DECLARE … CURSOR FOR.
-        let sqls: Vec<String> = script::split(q.trim())
-            .into_iter()
-            .filter_map(|it| match it {
-                script::Item::Sql(s) => {
-                    let t = s.trim_end_matches(';').trim().to_string();
-                    (!t.is_empty()).then_some(t)
-                }
-                _ => None,
-            })
-            .collect();
-        if sqls.len() != 1 {
-            return Err(AppError::new("export streams a single query — select one statement"));
-        }
+        let items = script::split(q.trim());
+        let export_sql = match items.as_slice() {
+            [script::Item::Sql(s)] if !s.trim_end_matches(';').trim().is_empty() => {
+                s.trim_end_matches(';').trim().to_string()
+            }
+            _ => return Err(AppError::new("export streams exactly one SQL query — select one statement")),
+        };
         // Scope=all re-runs the query, so the frontend's grid-based bool detection
         // (typed or heuristic over the LOADED rows) can't vouch for rows it never
         // saw. Override with the server-reported column types — exact for the full
         // stream, including expression columns. Best-effort: empty on failure.
         let mut options = options;
-        options.bool_cols = c.backend.bool_columns(&sqls[0]).await;
+        options.bool_cols = c.backend.bool_columns(&export_sql).await;
         // Arm cancellation for the duration of the stream, then always disarm.
         // PG streams through a server-side cursor (snapshot-consistent);
         // other drivers page via LIMIT/OFFSET through the same sink feeder.
         state.arm_cancel(&id, c.backend.cancel_handle(), c.backend.config().clone());
         let result = if matches!(c.backend, driver::Backend::Pg(_)) {
-            export::run_export_query(c.backend.pg()?, &sqls[0], &options, &path).await
+            export::run_export_query(c.backend.pg()?, &export_sql, &options, &temp_name).await
         } else {
-            export::run_export_paged(&mut c.backend, &sqls[0], &options, &path).await
+            export::run_export_paged(&mut c.backend, &export_sql, &options, &temp_name).await
         };
         state.disarm_cancel(&id);
         result
     } else if let (Some(cols), Some(rs)) = (columns, rows) {
-        export::run_export_rows(&cols, &rs, &options, &path).await
+        validate_tabular_payload(&cols, &rs)?;
+        export::run_export_rows(&cols, &rs, &options, &temp_name).await
     } else {
         Err(AppError::new("export: provide either a query or inline rows"))
+    };
+    match result {
+        Ok(n) => {
+            if n > 0 {
+                temp_path
+                    .persist(&destination)
+                    .map_err(|e| AppError::new(format!("cannot replace export destination: {}", e.error)))?;
+            }
+            Ok(n)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -854,6 +1028,7 @@ async fn import_rows(
     rows: Vec<Vec<Option<String>>>,
     create: bool,
 ) -> Result<u64, AppError> {
+    validate_tabular_payload(&columns, &rows)?;
     let conn = state.get(&connection_id)?;
     let mut c = lock_conn(&conn).await;
     ensure_alive(&mut c).await?;
@@ -863,8 +1038,8 @@ async fn import_rows(
     c.backend.rollback_cursor().await;
     // Run create + copy in one transaction so a cancel (or any error) rolls the whole
     // import back — no half-created table, no partial rows. Cancellable via the token.
-    state.arm_cancel(&connection_id, c.backend.cancel_handle(), c.backend.config().clone());
     let client = c.backend.pg()?;
+    state.arm_cancel(&connection_id, c.backend.cancel_handle(), c.backend.config().clone());
     let res = async {
         client.batch_execute("BEGIN").await?;
         if create {
@@ -890,17 +1065,48 @@ async fn import_rows(
 /// i.e. an explicit user gesture). Used by the editor's Open flow.
 #[tauri::command]
 async fn read_text_file(path: String) -> Result<String, AppError> {
-    tokio::fs::read_to_string(&path)
+    read_utf8_bounded(std::path::Path::new(&path), MAX_TEXT_FILE_BYTES as usize, "text file").await
+}
+
+async fn read_utf8_bounded(path: &std::path::Path, max: usize, label: &str) -> Result<String, AppError> {
+    let file = tokio::fs::File::open(path)
         .await
-        .map_err(|e| AppError::new(e.to_string()))
+        .map_err(|e| AppError::new(format!("cannot read {}: {e}", path.display())))?;
+    let mut bytes = Vec::new();
+    file.take((max as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|e| AppError::new(format!("cannot read {}: {e}", path.display())))?;
+    if bytes.len() > max {
+        return Err(AppError::new(format!("{label} exceeds the {max}-byte limit")));
+    }
+    String::from_utf8(bytes).map_err(|_| AppError::new(format!("{label} is not valid UTF-8")))
 }
 
 /// Write a UTF-8 text file by absolute path (from a native save dialog). Editor Save flow.
 #[tauri::command]
 async fn write_text_file(path: String, contents: String) -> Result<(), AppError> {
-    tokio::fs::write(&path, contents)
-        .await
-        .map_err(|e| AppError::new(e.to_string()))
+    if contents.len() as u64 > MAX_TEXT_FILE_BYTES {
+        return Err(AppError::new(format!("text file exceeds the {MAX_TEXT_FILE_BYTES}-byte limit")));
+    }
+    atomic_write(std::path::PathBuf::from(path), contents.into_bytes()).await
+}
+
+async fn atomic_write(path: std::path::PathBuf, bytes: Vec<u8>) -> Result<(), AppError> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let parent = path.parent().ok_or_else(|| AppError::new("destination has no parent directory"))?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| AppError::new(e.to_string()))?;
+        if let Ok(meta) = std::fs::metadata(&path) {
+            temp.as_file().set_permissions(meta.permissions()).map_err(|e| AppError::new(e.to_string()))?;
+        }
+        temp.write_all(&bytes).map_err(|e| AppError::new(e.to_string()))?;
+        temp.as_file_mut().sync_all().map_err(|e| AppError::new(e.to_string()))?;
+        temp.persist(&path).map_err(|e| AppError::new(e.error.to_string()))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::new(format!("file write task failed: {e}")))?
 }
 
 /// Query-history storage: one JSON file per connection under
@@ -914,6 +1120,25 @@ fn history_path(app: &tauri::AppHandle, conn_key: &str) -> Result<std::path::Pat
         .app_config_dir()
         .map_err(|e| AppError::new(e.to_string()))?
         .join("history");
+    if conn_key.is_empty() || conn_key.len() > 10_000 {
+        return Err(AppError::new("invalid history connection key"));
+    }
+    let safe: String = conn_key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(80)
+        .collect();
+    // Stable FNV-1a suffix prevents different punctuation-heavy keys from mapping
+    // to the same sanitized filename.
+    let hash = conn_key.as_bytes().iter().fold(0xcbf29ce484222325u64, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
+    });
+    Ok(dir.join(format!("{safe}-{hash:016x}.json")))
+}
+
+fn legacy_history_path(app: &tauri::AppHandle, conn_key: &str) -> Result<std::path::PathBuf, AppError> {
+    use tauri::Manager;
+    let dir = app.path().app_config_dir().map_err(|e| AppError::new(e.to_string()))?.join("history");
     let safe: String = conn_key
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
@@ -923,25 +1148,72 @@ fn history_path(app: &tauri::AppHandle, conn_key: &str) -> Result<std::path::Pat
 
 #[tauri::command]
 async fn load_history(app: tauri::AppHandle, conn_key: String) -> Result<String, AppError> {
-    let path = history_path(&app, &conn_key)?;
-    match tokio::fs::read_to_string(&path).await {
-        Ok(s) => Ok(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("[]".into()),
-        Err(e) => Err(AppError::new(e.to_string())),
+    let mut path = history_path(&app, &conn_key)?;
+    if !path.exists() {
+        if conn_key.len() > 180 {
+            return Ok("[]".into());
+        }
+        let legacy = legacy_history_path(&app, &conn_key)?;
+        if !legacy.exists() {
+            return Ok("[]".into());
+        }
+        path = legacy;
     }
+    read_utf8_bounded(&path, MAX_HISTORY_BYTES, "history file").await
+}
+
+fn validate_history_json(json: &str) -> Result<(), AppError> {
+    let parsed: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| AppError::new(format!("history is not valid JSON: {e}")))?;
+    if !parsed.is_array() {
+        return Err(AppError::new("history must be a JSON array"));
+    }
+    Ok(())
 }
 
 #[tauri::command]
 async fn save_history(app: tauri::AppHandle, conn_key: String, json: String) -> Result<(), AppError> {
+    if json.len() > MAX_HISTORY_BYTES {
+        return Err(AppError::new(format!("history exceeds the {MAX_HISTORY_BYTES}-byte limit")));
+    }
+    validate_history_json(&json)?;
     let path = history_path(&app, &conn_key)?;
     if let Some(dir) = path.parent() {
         tokio::fs::create_dir_all(dir)
             .await
             .map_err(|e| AppError::new(e.to_string()))?;
     }
-    tokio::fs::write(&path, json)
-        .await
-        .map_err(|e| AppError::new(e.to_string()))
+    atomic_write(path, json.into_bytes()).await
+}
+
+#[tauri::command]
+async fn migrate_history(app: tauri::AppHandle, from_key: String, to_key: String) -> Result<String, AppError> {
+    let target = history_path(&app, &to_key)?;
+    // New-key state is authoritative, including an intentionally cleared `[]`.
+    if target.exists() {
+        let json = read_utf8_bounded(&target, MAX_HISTORY_BYTES, "history file").await?;
+        validate_history_json(&json)?;
+        return Ok(json);
+    }
+
+    let hashed_source = history_path(&app, &from_key)?;
+    let legacy_source = (from_key.len() <= 180).then(|| legacy_history_path(&app, &from_key)).transpose()?;
+    let source = if hashed_source.exists() {
+        Some(hashed_source)
+    } else {
+        legacy_source.filter(|p| p.exists())
+    };
+    let Some(source) = source else { return Ok("[]".into()) };
+    let json = read_utf8_bounded(&source, MAX_HISTORY_BYTES, "legacy history file").await?;
+    validate_history_json(&json)?;
+    if let Some(dir) = target.parent() {
+        tokio::fs::create_dir_all(dir).await.map_err(|e| AppError::new(e.to_string()))?;
+    }
+    atomic_write(target, json.as_bytes().to_vec()).await?;
+    // Delete only after the new file is durable and validated. Failure leaves a
+    // harmless duplicate; target existence prevents future resurrection.
+    let _ = tokio::fs::remove_file(source).await;
+    Ok(json)
 }
 
 // ---------------------------------------------------------------------------
@@ -971,8 +1243,19 @@ async fn slack_save_config(
     bot_token: Option<String>,
     app_token: Option<String>,
 ) -> Result<(), AppError> {
-    slack::config::save_tokens(bot_token, app_token)?;
-    slack::config::save(&app, &config)
+    config.validate()?;
+    let previous = slack::config::load(&app)?;
+    let old_tokens = (slack::config::bot_token(), slack::config::app_token());
+    slack::config::save(&app, &config)?;
+    if let Err(e) = slack::config::save_tokens(bot_token, app_token) {
+        let rollback = slack::config::save(&app, &previous);
+        slack::config::restore_tokens(old_tokens.0, old_tokens.1);
+        if let Err(r) = rollback {
+            return Err(AppError::new(format!("{}; Slack config rollback also failed: {}", e.message, r.message)));
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1087,6 +1370,7 @@ pub fn run() {
             write_text_file,
             load_history,
             save_history,
+            migrate_history,
             ai::ai_save_key,
             ai::ai_has_key,
             ai::ai_clear_key,

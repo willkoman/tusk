@@ -12,6 +12,7 @@ const KEYCHAIN_SERVICE: &str = "tusk-slack";
 const BOT_TOKEN_ACCOUNT: &str = "bot-token";
 const APP_TOKEN_ACCOUNT: &str = "app-token";
 const FILE: &str = "slack.json";
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -87,6 +88,42 @@ impl Default for SlackConfig {
     }
 }
 
+impl SlackConfig {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if !(1..=100).contains(&self.max_rows_inline) {
+            return Err(AppError::new("Slack maxRowsInline must be between 1 and 100"));
+        }
+        if !(100..=100_000).contains(&self.max_rows_file) {
+            return Err(AppError::new("Slack maxRowsFile must be between 100 and 100000"));
+        }
+        if !(1..=600).contains(&self.query_timeout_secs) {
+            return Err(AppError::new("Slack queryTimeoutSecs must be between 1 and 600"));
+        }
+        if !(256..=128_000).contains(&self.ai_max_tokens) {
+            return Err(AppError::new("Slack aiMaxTokens must be between 256 and 128000"));
+        }
+        if !matches!(self.destructive_policy.as_str(), "proposeReadonly" | "refuse") {
+            return Err(AppError::new("invalid Slack destructivePolicy"));
+        }
+        if self.allowlist_channels.len() > 100 || self.allowlist_users.len() > 100
+            || self.allowlist_channels.iter().chain(&self.allowlist_users).any(|s| s.len() > 100)
+        {
+            return Err(AppError::new("Slack allowlists may contain at most 100 IDs of 100 characters each"));
+        }
+        if self.ai_provider.len() > 100 || self.ai_wire.len() > 32 || self.ai_model.len() > 500
+            || self.ai_base_url.as_ref().is_some_and(|s| s.len() > 2_000)
+        {
+            return Err(AppError::new("Slack AI configuration contains an oversized field"));
+        }
+        if !self.ai_wire.is_empty()
+            && !matches!(self.ai_wire.as_str(), "anthropic" | "gemini" | "openai" | "responses")
+        {
+            return Err(AppError::new("invalid Slack AI wire protocol"));
+        }
+        Ok(())
+    }
+}
+
 fn store_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, AppError> {
     use tauri::Manager;
     let dir = app
@@ -98,18 +135,42 @@ fn store_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, AppError> {
 }
 
 pub fn load(app: &tauri::AppHandle) -> Result<SlackConfig, AppError> {
+    use std::io::Read;
     let path = store_path(app)?;
     if !path.exists() {
         return Ok(SlackConfig::default());
     }
-    let data = std::fs::read_to_string(&path).map_err(|e| AppError::new(e.to_string()))?;
-    Ok(serde_json::from_str(&data).unwrap_or_default())
+    let mut data = Vec::new();
+    std::fs::File::open(&path)
+        .map_err(|e| AppError::new(e.to_string()))?
+        .take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut data)
+        .map_err(|e| AppError::new(e.to_string()))?;
+    if data.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(AppError::new("Slack config exceeds 1 MiB"));
+    }
+    let data = String::from_utf8(data).map_err(|_| AppError::new("Slack config is not valid UTF-8"))?;
+    let cfg: SlackConfig = serde_json::from_str(&data)
+        .map_err(|e| AppError::new(format!("invalid Slack config {}: {e}", path.display())))?;
+    cfg.validate()?;
+    Ok(cfg)
 }
 
 pub fn save(app: &tauri::AppHandle, cfg: &SlackConfig) -> Result<(), AppError> {
+    use std::io::Write;
+    cfg.validate()?;
     let path = store_path(app)?;
     let data = serde_json::to_string_pretty(cfg).map_err(|e| AppError::new(e.to_string()))?;
-    std::fs::write(&path, data).map_err(|e| AppError::new(e.to_string()))
+    let parent = path.parent().ok_or_else(|| AppError::new("Slack config has no parent directory"))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| AppError::new(e.to_string()))?;
+    if let Ok(meta) = std::fs::metadata(&path) {
+        temp.as_file().set_permissions(meta.permissions()).map_err(|e| AppError::new(e.to_string()))?;
+    }
+    temp.write_all(data.as_bytes()).map_err(|e| AppError::new(e.to_string()))?;
+    temp.as_file_mut().sync_all().map_err(|e| AppError::new(e.to_string()))?;
+    temp.persist(&path).map_err(|e| AppError::new(e.error.to_string()))?;
+    Ok(())
 }
 
 fn entry(account: &str) -> Result<keyring::Entry, AppError> {
@@ -118,6 +179,9 @@ fn entry(account: &str) -> Result<keyring::Entry, AppError> {
 
 /// Store whichever tokens were provided (None = leave the existing one untouched).
 pub fn save_tokens(bot: Option<String>, app_level: Option<String>) -> Result<(), AppError> {
+    if bot.iter().chain(app_level.iter()).any(|t| t.len() > 20_000) {
+        return Err(AppError::new("Slack token exceeds the 20000-byte limit"));
+    }
     if let Some(t) = bot.filter(|t| !t.is_empty()) {
         entry(BOT_TOKEN_ACCOUNT)?
             .set_password(&t)
@@ -129,6 +193,17 @@ pub fn save_tokens(bot: Option<String>, app_level: Option<String>) -> Result<(),
             .map_err(|e| AppError::new(e.to_string()))?;
     }
     Ok(())
+}
+
+pub fn restore_tokens(bot: Option<String>, app_level: Option<String>) {
+    for (account, value) in [(BOT_TOKEN_ACCOUNT, bot), (APP_TOKEN_ACCOUNT, app_level)] {
+        if let Ok(entry) = entry(account) {
+            match value {
+                Some(token) => { let _ = entry.set_password(&token); }
+                None => { let _ = entry.delete_credential(); }
+            }
+        }
+    }
 }
 
 pub fn clear_tokens() {
@@ -150,4 +225,22 @@ pub fn app_token() -> Option<String> {
 
 pub fn has_tokens() -> (bool, bool) {
     (bot_token().is_some(), app_token().is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_validate_and_hostile_limits_fail_closed() {
+        assert!(SlackConfig::default().validate().is_ok());
+        for cfg in [
+            SlackConfig { max_rows_file: usize::MAX, ..Default::default() },
+            SlackConfig { query_timeout_secs: 0, ..Default::default() },
+            SlackConfig { ai_max_tokens: u32::MAX, ..Default::default() },
+            SlackConfig { ai_wire: "typo".into(), ..Default::default() },
+        ] {
+            assert!(cfg.validate().is_err());
+        }
+    }
 }

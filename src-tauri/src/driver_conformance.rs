@@ -143,8 +143,29 @@ async fn database_name_battery(b: &mut Backend, eng: &Eng) {
     }
 }
 
+/// A syntax error must surface as a normal Err and leave the connection fully
+/// usable. On DuckDB this pins the parse gate (duckdb-rs #209: an ungated parser
+/// error poisons the connection — every later statement fails with "resource
+/// deadlock would occur" and dropping the backend aborts the whole process).
+async fn syntax_error_recovery_battery(b: &mut Backend, eng: &Eng) {
+    for bad in ["SELCT 1", "SELECT * FROM x WHERE a NOT IN (1 2)"] {
+        let e = b.run_single(bad, 100, true).await.expect_err("syntax error must be Err");
+        assert!(
+            !e.message.contains("deadlock"),
+            "[{}] connection poisoned by syntax error: {}", eng.name, e.message
+        );
+    }
+    match b.run_single("SELECT 1", 100, true).await.unwrap() {
+        QueryOutcome::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1, "[{}] connection usable after syntax errors", eng.name)
+        }
+        _ => panic!("[{}] expected rows after syntax errors", eng.name),
+    }
+}
+
 async fn run_battery(b: &mut Backend, eng: &Eng) {
     database_name_battery(b, eng).await;
+    syntax_error_recovery_battery(b, eng).await;
     let q = eng.quote;
 
     // clean slate (idempotent across re-runs on a persistent server)
@@ -594,6 +615,30 @@ async fn readonly_postgres_blocks_writes() {
     let (mut b, _) = connect(&cfg).await.expect("connect pg ro");
     let res = b.run_single("CREATE TABLE tusk_ro_probe (a int)", 100, false).await;
     assert!(res.is_err(), "read-only postgres must reject writes/DDL");
+}
+
+#[tokio::test]
+async fn readonly_mysql_blocks_writes_after_pool_reuse() {
+    let Some(mut cfg) = mysql_cfg() else {
+        eprintln!("SKIP readonly_mysql (set TUSK_TEST_MYSQL_PORT)");
+        return;
+    };
+    let (mut setup, _) = connect(&cfg).await.expect("connect mysql setup");
+    let _ = setup.run_single("DROP TABLE IF EXISTS tusk_ro_page", 100, false).await;
+    setup.run_single("CREATE TABLE tusk_ro_page (a int)", 100, false).await.unwrap();
+    setup.run_single("INSERT INTO tusk_ro_page VALUES (1),(2),(3)", 100, false).await.unwrap();
+    drop(setup);
+    cfg.read_only = true;
+    let (mut b, _) = connect(&cfg).await.expect("connect mysql ro");
+    b.run_single("SELECT 1", 100, false).await.expect("first read");
+    b.run_single("SELECT 2", 100, false).await.expect("pooled read");
+    let first = b.run_single_read_only("SELECT a FROM tusk_ro_page ORDER BY a", 2, true).await.unwrap();
+    assert!(matches!(first, QueryOutcome::Rows { ref rows, done: false, .. } if rows.len() == 2));
+    let second = b.fetch_page(2).await.unwrap();
+    assert_eq!(second.rows.len(), 1);
+    assert!(second.done);
+    let res = b.run_single("CREATE TABLE tusk_ro_probe (a int)", 100, false).await;
+    assert!(res.is_err(), "read-only mysql must reject writes after pooled connection reset");
 }
 
 // --- Postgres permission model (Epic 2): effective privileges of a limited role ---

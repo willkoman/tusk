@@ -17,8 +17,9 @@ import { editTarget, editPlan, type EditPlan } from "./grid/editable";
 import { detectBoolCols, typeBoolCols } from "./grid/bool";
 import { buildCommitScript } from "./grid/editSql";
 import { planPaste, mergePaste, type RowRef } from "./grid/paste";
+import { orderedRows, sortedRowOrder } from "./grid/sort";
 import { makeIndexer } from "./sql/aliases";
-import { type Dataset, parseCSV, parseJSON, formatWithOptions } from "./formats";
+import { type Dataset, IMPORT_LIMITS, parseCSV, parseJSON, formatWithOptions } from "./formats";
 import { FORMAT_EXT, type ExportOptions, type ExportScope } from "./export";
 import { save, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Tree, type DbTree, type RelationDetail, type NodeDescriptor, nodeKey } from "./Tree";
@@ -186,18 +187,20 @@ function App() {
   // cached for the session (cleared on schema reload) and run without disturbing any
   // in-flight stream. Best-effort — a table that can't be sampled is just skipped.
   const sampleCache = new Map<string, SampleTable>();
+  const relKey = (schemaName: string, relationName: string) => JSON.stringify([schemaName, relationName]);
   async function aiSampleRows(targets: { schema: string; name: string }[]): Promise<SampleTable[]> {
     const c = conn();
     if (!c) return [];
     const results = await Promise.all(
       targets.map(async (t): Promise<SampleTable | null> => {
-        const key = `${t.schema}/${t.name}`;
+        const key = relKey(t.schema, t.name);
         const hit = sampleCache.get(key);
         if (hit) return hit;
         try {
           const r = await invoke<{ columns: string[]; rows: (string | null)[][] }>("sample_rows", {
             connectionId: c.id, schema: t.schema, name: t.name, limit: 5,
           });
+          if (conn()?.id !== c.id) return null;
           const s: SampleTable = { schema: t.schema, name: t.name, columns: r.columns, rows: r.rows };
           sampleCache.set(key, s);
           return s;
@@ -337,6 +340,8 @@ function App() {
   createEffect(() => setSqlDialect(conn() ? (caps()?.kind ?? "postgres") : activeDialect()));
   const [cursorInfo, setCursorInfo] = createSignal<CursorInfo | null>(null);
   let connKey: string | null = null;
+  let tabsConnKey: string | null = null;
+  let legacyConnKey: string | null = null;
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   let restoring = false;
 
@@ -450,15 +455,21 @@ function App() {
       boolCols: number[];
     } | null
   >(null);
-  const openExport = () =>
+  const openExport = () => {
+    const tab = activeTab();
+    const order = localRowOrder();
+    const query = order && tab.gridView.sorts.length && canServerSortFilter()
+      ? wrapQuery(tab.result.baseQuery, tab.gridView.sorts, [], tab.result.columns, caps()?.kind)
+      : lastQuery();
     setExportSrc({
       columns: columns(),
-      rows: rows(),
-      query: lastQuery(),
-      table: tableNameFromSql(lastQuery()),
-      searchSchema: activeTab().searchSchema,
+      rows: orderedRows(rows(), order),
+      query,
+      table: tableNameFromSql(query),
+      searchSchema: tab.searchSchema,
       boolCols: [...boolCols()],
     });
+  };
 
   function switchTab(id: string) {
     if (id === activeTabId()) return;
@@ -537,14 +548,14 @@ function App() {
   }
 
   async function openFileDialog() {
-    const path = await openDialog({ multiple: false, filters: [{ name: "SQL", extensions: ["sql", "txt"] }] });
-    if (typeof path !== "string") return;
-    const existing = tabs().find((t) => t.filePath === path);
-    if (existing) {
-      switchTab(existing.id);
-      return;
-    }
     try {
+      const path = await openDialog({ multiple: false, filters: [{ name: "SQL", extensions: ["sql", "txt"] }] });
+      if (typeof path !== "string") return;
+      const existing = tabs().find((t) => t.filePath === path);
+      if (existing) {
+        switchTab(existing.id);
+        return;
+      }
       const contents = await invoke<string>("read_text_file", { path });
       const t = makeTab({ sql: contents, filePath: path, title: basename(path), dirty: false });
       setTabs((ts) => [...ts, t]);
@@ -570,9 +581,9 @@ function App() {
   async function saveAsActiveTab() {
     const t = activeTab();
     const text = editorApi()?.getDoc() ?? t.sql;
-    const path = await save({ defaultPath: t.filePath ?? `${t.title}.sql`, filters: [{ name: "SQL", extensions: ["sql"] }] });
-    if (!path) return;
     try {
+      const path = await save({ defaultPath: t.filePath ?? `${t.title}.sql`, filters: [{ name: "SQL", extensions: ["sql"] }] });
+      if (!path) return;
       await invoke("write_text_file", { path, contents: text });
       patchTab(t.id, { filePath: path, title: basename(path), dirty: false, sql: text });
       setStatus(`saved → ${path}`);
@@ -591,6 +602,8 @@ function App() {
   const [importNewName, setImportNewName] = createSignal("");
   const [importBusy, setImportBusy] = createSignal(false);
   const [importMsg, setImportMsg] = createSignal("");
+  let importReadGeneration = 0;
+  let importCloseTimer: ReturnType<typeof setTimeout> | undefined;
 
   // Lazy EXPLAIN detection: null for normal results (the leading-keyword gate
   // makes this free), a ParsedPlan when the active tab's result is a plan.
@@ -626,11 +639,28 @@ function App() {
   // result grid: per-tab view + sort/filter re-run, Load-all
   const gridView = () => activeTab().gridView;
   const setGridView = (patch: Partial<GridView>) => patchTab(activeTabId(), { gridView: { ...activeTab().gridView, ...patch } });
-  const canSortFilter = () =>
+  const canServerSortFilter = () =>
     wrappableQuery(activeTab().result.baseQuery) &&
     // MySQL refuses duplicate column names inside a derived table (error 1060),
     // so the sort/filter wrap can't work on such results there.
     !(caps()?.kind === "mysql" && hasDuplicateColumns(activeTab().result.columns));
+  const localSortEligible = () => {
+    const tab = activeTab();
+    return tab.result.done && tab.result.rowsAreBase && tab.gridView.filters.length === 0;
+  };
+  const canSort = () => !running() && (localSortEligible() || canServerSortFilter());
+  const canFilter = () => !running() && canServerSortFilter();
+  const localSortRows = createMemo(() => activeTab().result.rows);
+  const localSorts = createMemo(() => activeTab().gridView.sorts);
+  const localSortDone = createMemo(() => activeTab().result.done);
+  const localSortBase = createMemo(() => activeTab().result.rowsAreBase);
+  const localSortHasFilters = createMemo(() => activeTab().gridView.filters.length > 0);
+  const localRowOrder = createMemo(() => {
+    const sorts = localSorts();
+    return localSortDone() && localSortBase() && !localSortHasFilters() && sorts.length
+      ? sortedRowOrder(localSortRows(), sorts, caps()?.kind)
+      : null;
+  });
   // --- in-grid data editing ---
   // Editability of the active tab's result: single-table SELECT + loaded detail
   // with a PK fully present in the result. `want` asks the effect below to fetch
@@ -661,7 +691,7 @@ function App() {
       if (tp && !tp.isOwner && !tp.update && !tp.insert && !tp.delete)
         return { editable: false, reason: `no write privilege on ${tgt.table.name}`, plan: null };
     }
-    const det = details()[`${tgt.table.schema}.${tgt.table.name}`];
+    const det = details()[relKey(tgt.table.schema, tgt.table.name)];
     if (!det)
       return { editable: false, reason: "loading table info…", plan: null, want: { schema: tgt.table.schema, name: tgt.table.name } };
     const p = editPlan(det, cols, tgt.table);
@@ -681,7 +711,7 @@ function App() {
   const editRows = createMemo(() => activeTab().result.rows);
   const editDetail = () => {
     const p = editCtx().plan;
-    return p ? details()[`${p.schema}.${p.table}`] : undefined;
+    return p ? details()[relKey(p.schema, p.table)] : undefined;
   };
   const boolCols = createMemo<Set<number>>(() => {
     const det = editDetail();
@@ -768,6 +798,7 @@ function App() {
       anchorDisplayIdx,
       anchor,
       nLoaded: t.result.rows.length,
+      loadedOrder: localRowOrder() ?? undefined,
       nInsExisting: p.inserts.length,
     });
     if (!plan.updates.length && !plan.inserts.length) {
@@ -913,6 +944,7 @@ function App() {
     window.removeEventListener("keydown", onWindowKey);
     window.removeEventListener("resize", clampPanels);
     for (const u of slackUnlisten) u();
+    clearTimeout(importCloseTimer);
   });
 
   // Central dispatcher — every action callable from a shortcut, the palette, or
@@ -977,7 +1009,8 @@ function App() {
     try {
       setProfiles(await invoke<Profile[]>("list_profiles"));
     } catch (e) {
-      console.error(e);
+      setProfiles([]);
+      setConnErr(`could not load saved profiles: ${errMsg(e)}`);
     }
   }
 
@@ -1026,8 +1059,11 @@ function App() {
   async function afterConnect(r: { connection_id: string; server_version: string; read_only: boolean }) {
     setConn({ id: r.connection_id, version: r.server_version, readOnly: r.read_only });
     try {
-      setCaps(await invoke<Capabilities>("capabilities", { connectionId: r.connection_id }));
+      const next = await invoke<Capabilities>("capabilities", { connectionId: r.connection_id });
+      if (conn()?.id !== r.connection_id) return;
+      setCaps(next);
     } catch {
+      if (conn()?.id !== r.connection_id) return;
       setCaps(null);
     }
     // DuckDB: probe PG-style EXPLAIN options once, at connect (safe — nothing
@@ -1036,14 +1072,24 @@ function App() {
     if (caps()?.kind === "duckdb") {
       try {
         await invoke<QueryOutcome>("run_query", { connectionId: r.connection_id, sql: "EXPLAIN (FORMAT json) SELECT 1", pageSize: 1, searchPath: null });
+        if (conn()?.id !== r.connection_id) return;
         duckJsonExplain = true;
       } catch {
+        if (conn()?.id !== r.connection_id) return;
         duckJsonExplain = false;
       }
     }
     // Restore this connection's tab set (buffers/paths only — results are ephemeral).
     if (connKey) {
-      const saved = tabsStore.load(connKey);
+      let saved = tabsStore.load(connKey);
+      if (!saved && legacyConnKey) {
+        const legacy = tabsStore.load(legacyConnKey);
+        if (legacy) {
+          saved = legacy;
+          if (tabsStore.save(connKey, legacy)) tabsStore.remove(legacyConnKey);
+          else tabsConnKey = legacyConnKey;
+        }
+      }
       restoring = true;
       if (saved && saved.tabs.length) {
         const restored = saved.tabs.map((pt) =>
@@ -1058,30 +1104,52 @@ function App() {
       }
       restoring = false;
     }
-    setHistory(connKey ? await historyStore.load(connKey) : []);
+    const history = connKey
+      ? legacyConnKey ? await historyStore.migrate(legacyConnKey, connKey) : await historyStore.load(connKey)
+      : [];
+    if (conn()?.id !== r.connection_id) return;
+    setHistory(history);
     await loadSchema();
   }
 
   async function doConnect(e: Event) {
     e.preventDefault();
+    if (connecting()) return;
     setConnecting(true);
     setConnErr("");
     try {
-      const isFile = driver() === "duckdb" || driver() === "sqlite";
+      const submittedDriver = driver();
+      const submittedPath = path();
+      const submittedHost = host();
+      const submittedUser = user();
+      const submittedDatabase = dbname();
+      const isFile = submittedDriver === "duckdb" || submittedDriver === "sqlite";
+      const networkPort = Number(port());
+      if (!isFile && (!Number.isInteger(networkPort) || networkPort < 1 || networkPort > 65535)) {
+        throw new Error("port must be a whole number between 1 and 65535");
+      }
       const config = isFile
-        ? { driver: driver(), path: path(), read_only: readOnly() }
+        ? { driver: submittedDriver, path: submittedPath, read_only: readOnly() }
         : {
-            driver: driver(),
-            host: host(),
-            port: Number(port()),
-            user: user(),
+            driver: submittedDriver,
+            host: submittedHost,
+            port: networkPort,
+            user: submittedUser,
             password: password(),
-            dbname: dbname(),
+            dbname: submittedDatabase,
             sslmode: sslmode(),
             read_only: readOnly(),
           };
+      const submittedLegacyKey = isFile
+        ? `adhoc:${submittedDriver}:${submittedPath || ":memory:"}`
+        : `adhoc:${submittedHost}:${networkPort}:${submittedDatabase}:${submittedUser}`;
+      const submittedKey = `adhoc:${JSON.stringify(isFile
+        ? [submittedDriver, submittedPath || ":memory:"]
+        : [submittedDriver, submittedHost, networkPort, submittedDatabase, submittedUser])}`;
       const r = await invoke<{ connection_id: string; server_version: string; read_only: boolean }>("connect", { config });
-      connKey = isFile ? `adhoc:${driver()}:${path() || ":memory:"}` : `adhoc:${host()}:${port()}:${dbname()}:${user()}`;
+      legacyConnKey = submittedLegacyKey;
+      connKey = submittedKey;
+      tabsConnKey = submittedKey;
       await afterConnect(r);
     } catch (e) {
       setConnErr(errMsg(e));
@@ -1092,14 +1160,19 @@ function App() {
 
   // Pick an existing DuckDB/SQLite database file (a new file can also be typed).
   async function browseDbFile() {
-    const p = await openDialog({
-      multiple: false,
-      filters: [{ name: "Database", extensions: ["duckdb", "ddb", "db", "sqlite", "sqlite3"] }],
-    });
-    if (typeof p === "string") setPath(p);
+    try {
+      const p = await openDialog({
+        multiple: false,
+        filters: [{ name: "Database", extensions: ["duckdb", "ddb", "db", "sqlite", "sqlite3"] }],
+      });
+      if (typeof p === "string") setPath(p);
+    } catch (e) {
+      setConnErr(errMsg(e));
+    }
   }
 
   async function connectProfile(id: string) {
+    if (connecting()) return;
     setConnecting(true);
     setConnErr("");
     try {
@@ -1108,6 +1181,8 @@ function App() {
         { id },
       );
       connKey = `profile:${id}`;
+      tabsConnKey = connKey;
+      legacyConnKey = null;
       await afterConnect(r);
     } catch (e) {
       setConnErr(errMsg(e));
@@ -1120,12 +1195,16 @@ function App() {
     setConnErr("");
     try {
       const embedded = isEmbeddedDriver(driver());
+      const networkPort = Number(port());
+      if (!embedded && (!Number.isInteger(networkPort) || networkPort < 1 || networkPort > 65535)) {
+        throw new Error("port must be a whole number between 1 and 65535");
+      }
       const p = await invoke<Profile>("save_profile", {
         profile: {
           id: editingId(),
           name: name() || (embedded ? basename(path() || ":memory:") : host()),
           host: host(),
-          port: Number(port()),
+          port: networkPort,
           user: user(),
           dbname: dbname(),
           save_password: !embedded && savePassword(),
@@ -1172,19 +1251,43 @@ function App() {
 
   async function disconnect() {
     const c = conn();
-    if (connKey) tabsStore.save(connKey, snapshotTabs());
+    if (tabsConnKey) tabsStore.save(tabsConnKey, snapshotTabs());
     if (c) invoke("disconnect", { connectionId: c.id }).catch(() => {});
     connKey = null;
+    tabsConnKey = null;
+    legacyConnKey = null;
     setConn(null);
     setCaps(null);
     setHistory([]);
     setHistoryOpen(false);
+    setMenu(null);
+    setActiveDialog(null);
+    setCellView(null);
+    setConfirmClose(null);
+    setExportSrc(null);
+    importReadGeneration++;
+    clearTimeout(importCloseTimer);
+    setImportBusy(false);
+    setImportOpen(false);
+    setImportData(null);
+    setImportRaw(null);
+    setConfirmAnalyze(null);
+    setCommitView(null);
+    setConfirmDiscard(null);
+    setRunChoice(null);
+    setParamPrompt(null);
+    setDdlGraph(null);
+    setRenameTab(null);
     setPerms(null);
     setTree(null);
     setSchema([]);
     setFuncs(new Set<string>());
     setDetails({});
     loadedRels.clear();
+    detailInflight.clear();
+    fkInFlight.clear();
+    fkFetched.clear();
+    setFkEdges([]);
     cursorOwnerTabId = null;
     const fresh = makeTab();
     setTabs([fresh]);
@@ -1196,11 +1299,9 @@ function App() {
     const c = conn();
     const kind = caps()?.kind;
     const title = c ? `${driverMascot(kind)} Tusk — ${driverLabel(kind)}` : "Tusk";
-    try {
-      void getCurrentWindow().setTitle(title);
-    } catch {
+    void getCurrentWindow().setTitle(title).catch(() => {
       /* not in a Tauri window (e.g. preview) */
-    }
+    });
   });
 
   // Label for the connected target shown in the topbar chip: the database name for
@@ -1220,8 +1321,8 @@ function App() {
       tabs: tabs().map((t) => ({ sql: t.sql, filePath: t.filePath, title: t.title, searchSchema: t.searchSchema })),
       activeIndex: Math.max(0, tabs().findIndex((t) => t.id === activeTabId())),
     };
-    if (restoring || !connKey) return;
-    const key = connKey;
+    if (restoring || !tabsConnKey) return;
+    const key = tabsConnKey;
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(() => tabsStore.save(key, data), 800);
   });
@@ -1233,11 +1334,12 @@ function App() {
     sampleCache.clear(); // schema (and likely data) may have changed — drop stale AI samples
     try {
       const t = await invoke<DbTree>("db_tree", { connectionId: c.id });
+      if (conn()?.id !== c.id) return;
       setTree(t);
       // Prune cached detail for relations that no longer exist (dropped / renamed),
       // so refreshLoadedDetails doesn't keep re-fetching dead keys.
       const live = new Set<string>();
-      for (const s of t.schemas) for (const r of [...s.tables, ...s.views]) live.add(`${s.name}.${r.name}`);
+      for (const s of t.schemas) for (const r of [...s.tables, ...s.views]) live.add(relKey(s.name, r.name));
       for (const k of [...loadedRels.keys()]) if (!live.has(k)) loadedRels.delete(k);
       setDetails((prev) => {
         const next: Record<string, RelationDetail> = {};
@@ -1247,11 +1349,13 @@ function App() {
       void loadTables();
       void refreshLoadedDetails();
       // Refresh effective privileges alongside the tree (grants/ownership can change).
-      invoke<Permissions>("permissions", { connectionId: c.id }).then(setPerms).catch(() => setPerms(null));
+      invoke<Permissions>("permissions", { connectionId: c.id })
+        .then((p) => { if (conn()?.id === c.id) setPerms(p); })
+        .catch(() => { if (conn()?.id === c.id) setPerms(null); });
     } catch (e) {
       console.error(e);
     } finally {
-      setSchemaLoading(false);
+      if (conn()?.id === c.id) setSchemaLoading(false);
     }
   }
 
@@ -1262,14 +1366,19 @@ function App() {
     const c = conn();
     if (!c) return;
     try {
-      setSchema(await invoke<TableInfo[]>("list_schema", { connectionId: c.id }));
+      const tables = await invoke<TableInfo[]>("list_schema", { connectionId: c.id });
+      if (conn()?.id !== c.id) return;
+      setSchema(tables);
     } catch (e) {
+      if (conn()?.id !== c.id) return;
       console.error(e);
     }
     try {
       const names = await invoke<string[]>("list_functions", { connectionId: c.id });
+      if (conn()?.id !== c.id) return;
       setFuncs(new Set(names.map((n) => n.toLowerCase())));
     } catch {
+      if (conn()?.id !== c.id) return;
       setFuncs(new Set<string>());
     }
     // FK catalog for JOIN completion: active schema + public, merged.
@@ -1290,24 +1399,27 @@ function App() {
   /** Fetch one schema's FK edges into fkEdges (deduped; best-effort). */
   async function fetchFkSchema(schemaName: string) {
     const c = conn();
-    if (!c || caps()?.relationships === false || fkFetched.has(schemaName) || fkInFlight.has(schemaName)) return;
-    fkInFlight.add(schemaName);
+    if (!c || caps()?.relationships === false || fkFetched.has(schemaName)) return;
+    const inflightKey = `${c.id}:${schemaName}`;
+    if (fkInFlight.has(inflightKey)) return;
+    fkInFlight.add(inflightKey);
     try {
       const g = await invoke<{ tables: unknown[]; edges: FkEdge[] }>("schema_relationships", { connectionId: c.id, schema: schemaName });
+      if (conn()?.id !== c.id) return;
       // Mark fetched ONLY on success. `fksKnown` (which gates the AI prompt's "this schema
       // declares no foreign keys" claim) is derived from this set — marking before the
       // await meant a FAILED fetch asserted the schema had no FKs, the exact lie the
       // tri-state exists to prevent. A failure stays unmarked so the next send retries.
       fkFetched.add(schemaName);
       setFkEdges((prev) => {
-        const key = (e: FkEdge) => `${e.constraint}|${e.srcSchema}.${e.srcTable}`;
+        const key = (e: FkEdge) => JSON.stringify([e.constraint, e.srcSchema, e.srcTable]);
         const seen = new Set(prev.map(key));
         return [...prev, ...g.edges.filter((e) => !seen.has(key(e)))];
       });
     } catch {
       /* best-effort — completion just has fewer hints, and the prompt stays silent on FKs */
     } finally {
-      fkInFlight.delete(schemaName);
+      fkInFlight.delete(inflightKey);
     }
   }
 
@@ -1315,21 +1427,23 @@ function App() {
   async function loadDetail(schemaName: string, name: string, force = false) {
     const c = conn();
     if (!c) return;
-    const key = `${schemaName}.${name}`;
-    if (!force && (details()[key] || detailInflight.has(key))) return;
-    detailInflight.add(key);
+    const key = relKey(schemaName, name);
+    const inflightKey = `${c.id}:${key}`;
+    if (!force && (details()[key] || detailInflight.has(inflightKey))) return;
+    detailInflight.add(inflightKey);
     try {
       const d = await invoke<RelationDetail>("table_detail", {
         connectionId: c.id,
         schema: schemaName,
         name,
       });
+      if (conn()?.id !== c.id) return;
       loadedRels.set(key, { schema: schemaName, name });
       setDetails((prev) => ({ ...prev, [key]: d }));
     } catch (e) {
       console.error(e);
     } finally {
-      detailInflight.delete(key);
+      detailInflight.delete(inflightKey);
     }
   }
 
@@ -1388,6 +1502,7 @@ function App() {
         const prevCols = rt?.result.columns ?? [];
         patchResult(runTabId, {
           columns: out.columns, rows: out.rows, done: out.done, lastQuery: sqlToRun, baseQuery: base, epoch,
+          rowsAreBase: mode === "base" || sqlToRun === base,
           status: `${out.rows.length}${out.done ? "" : "+"} rows${out.note ? ` · ${out.note}` : ""}`,
         });
         if (mode === "base") {
@@ -1401,7 +1516,7 @@ function App() {
         }
         if (!out.done) cursorOwnerTabId = runTabId;
       } else {
-        patchResult(runTabId, { columns: [], rows: [], done: true, lastQuery: sqlToRun, baseQuery: base, epoch, status: out.message });
+        patchResult(runTabId, { columns: [], rows: [], done: true, lastQuery: sqlToRun, baseQuery: base, rowsAreBase: false, epoch, status: out.message });
         if (mode === "base") patchTab(runTabId, { gridView: gridViewFor(0) });
       }
       if (out.kind === "exec" || DDL_RE.test(sqlToRun)) void loadSchema();
@@ -1532,11 +1647,19 @@ function App() {
   }
 
   // Re-stream the active tab's result sorted/filtered (server ORDER BY / WHERE).
-  function onSortFilter(sorts: SortKey[], filters: Filter[]) {
+  function onSortFilter(sorts: SortKey[], filters: Filter[], kind: "sort" | "filter") {
     setGridView({ sorts, filters });
-    const base = activeTab().result.baseQuery;
-    if (!wrappableQuery(base)) return;
-    void executeQuery(wrapQuery(base, sorts, filters, activeTab().result.columns, caps()?.kind), base, "wrapped");
+    const tab = activeTab();
+    if (kind === "sort" && tab.result.done && tab.result.rowsAreBase && filters.length === 0) {
+      patchResult(tab.id, { epoch: tab.result.epoch + 1 });
+      return;
+    }
+    const base = tab.result.baseQuery;
+    if (!canServerSortFilter()) return;
+    const sqlToRun = hasViewRules(sorts, filters)
+      ? wrapQuery(base, sorts, filters, tab.result.columns, caps()?.kind)
+      : base;
+    void executeQuery(sqlToRun, base, "wrapped");
   }
 
   async function loadMore() {
@@ -1621,11 +1744,13 @@ function App() {
   }
 
   function openImport() {
+    importReadGeneration++;
+    clearTimeout(importCloseTimer);
     setImportData(null);
     setImportRaw(null);
     setImportMsg("");
     setImportMode(schema().length ? "existing" : "new");
-    setImportTarget(schema().length ? `${schema()[0].schema}.${schema()[0].name}` : "");
+    setImportTarget(schema().length ? relKey(schema()[0].schema, schema()[0].name) : "");
     setImportNewName("");
     setImportOpen(true);
   }
@@ -1633,11 +1758,18 @@ function App() {
   function reparseImport() {
     const raw = importRaw();
     if (!raw) return;
-    const d = raw.name.toLowerCase().endsWith(".json")
-      ? parseJSON(raw.text)
-      : parseCSV(raw.text, importHasHeader());
-    setImportData(d);
-    if (!importNewName()) setImportNewName(raw.name.replace(/\.[^.]+$/, "").replace(/[^\w]/g, "_"));
+    setImportData(null);
+    try {
+      const lower = raw.name.toLowerCase();
+      const d = lower.endsWith(".json")
+        ? parseJSON(raw.text)
+        : parseCSV(raw.text, importHasHeader(), lower.endsWith(".tsv") ? "\t" : ",");
+      setImportData(d);
+      setImportMsg("");
+      if (!importNewName()) setImportNewName(raw.name.replace(/\.[^.]+$/, "").replace(/[^\w]/g, "_"));
+    } catch (err) {
+      setImportMsg(errMsg(err));
+    }
   }
 
   async function onImportFile(e: Event) {
@@ -1645,11 +1777,21 @@ function App() {
     const f = input.files?.[0];
     input.value = "";
     if (!f) return;
+    const generation = ++importReadGeneration;
+    setImportData(null);
+    setImportRaw(null);
+    if (f.size > IMPORT_LIMITS.bytes) {
+      setImportMsg(`import is too large: file exceeds ${IMPORT_LIMITS.bytes.toLocaleString()} bytes`);
+      return;
+    }
     try {
-      setImportRaw({ text: await f.text(), name: f.name });
+      const text = await f.text();
+      if (generation !== importReadGeneration || !importOpen()) return;
+      setImportRaw({ text, name: f.name });
       setImportMsg("");
       reparseImport();
     } catch (err) {
+      if (generation !== importReadGeneration || !importOpen()) return;
       setImportMsg(errMsg(err));
     }
   }
@@ -1662,7 +1804,13 @@ function App() {
     let table = "";
     let create = false;
     if (importMode() === "existing") {
-      [schemaName, table] = importTarget().split(".");
+      const target = schema().find((t) => relKey(t.schema, t.name) === importTarget());
+      if (!target) {
+        setImportMsg("choose a valid target table");
+        return;
+      }
+      schemaName = target.schema;
+      table = target.name;
     } else {
       table = importNewName();
       create = true;
@@ -1671,25 +1819,33 @@ function App() {
       setImportMsg("choose a target table");
       return;
     }
+    const generation = importReadGeneration;
+    const connectionId = c.id;
+    const stillCurrent = () => generation === importReadGeneration && conn()?.id === connectionId;
     setImportBusy(true);
     setImportMsg("");
     try {
       const n = await invoke<number>("import_rows", {
-        connectionId: c.id,
+        connectionId,
         schema: schemaName,
         table,
         columns: d.columns,
         rows: d.rows,
         create,
       });
-      setImportMsg(`imported ${n} rows`);
+      if (!stillCurrent()) return;
       await loadSchema();
-      setTimeout(() => setImportOpen(false), 900);
+      if (!stillCurrent()) return;
+      setImportMsg(`imported ${n} rows`);
+      importCloseTimer = setTimeout(() => {
+        if (generation === importReadGeneration) setImportOpen(false);
+      }, 900);
     } catch (e) {
+      if (!stillCurrent()) return;
       const m = errMsg(e);
       setImportMsg(/cancel/i.test(m) ? "Import cancelled — rolled back." : m);
     } finally {
-      setImportBusy(false);
+      if (stillCurrent()) setImportBusy(false);
     }
   }
 
@@ -1797,7 +1953,7 @@ function App() {
   // and resolves (rather than clobbering the current tab).
   async function generate(n: NodeDescriptor, kind: "select" | "insert" | "update") {
     await loadDetail(n.schema!, n.name, false);
-    const d = details()[`${n.schema}.${n.name}`];
+    const d = details()[relKey(n.schema!, n.name)];
     const cols = d?.columns.map((c) => c.name) ?? [];
     const pks = d?.columns.filter((c) => c.is_pk).map((c) => c.name) ?? [];
     const schema = n.schema!;
@@ -1813,12 +1969,12 @@ function App() {
   // Index/constraint dialogs need the relation's column list (and FK targets).
   async function openIndexDialog(n: NodeDescriptor) {
     await loadDetail(n.schema!, n.name, false);
-    const d = details()[`${n.schema}.${n.name}`];
+    const d = details()[relKey(n.schema!, n.name)];
     setActiveDialog({ kind: "addIndex", ctx: n, columns: d?.columns.map((c) => c.name) ?? [] });
   }
   async function openConstraintDialog(n: NodeDescriptor) {
     await loadDetail(n.schema!, n.name, false);
-    const d = details()[`${n.schema}.${n.name}`];
+    const d = details()[relKey(n.schema!, n.name)];
     setActiveDialog({
       kind: "addConstraint",
       ctx: n,
@@ -1828,7 +1984,7 @@ function App() {
   }
   async function openModify(n: NodeDescriptor) {
     await loadDetail(n.schema!, n.name, false);
-    const d = details()[`${n.schema}.${n.name}`];
+    const d = details()[relKey(n.schema!, n.name)];
     if (d) setActiveDialog({ kind: "modifyTable", ctx: n, detail: d });
   }
 
@@ -2044,9 +2200,9 @@ function App() {
       x: e.clientX,
       y: e.clientY,
       items: [
-        { label: "Cut", icon: "scissors", disabled: !hasSel, onClick: async () => { const s = api.getSelection(); if (await clipWrite(s)) api.replaceSelection(""); } },
+        { label: "Cut", icon: "scissors", disabled: !hasSel, onClick: async () => { const tab = activeTabId(); const s = api.getSelection(); if (await clipWrite(s) && activeTabId() === tab) api.replaceSelection(""); } },
         { label: "Copy", icon: "copy", disabled: !hasSel, onClick: () => copyText(api.getSelection(), "copied selection") },
-        { label: "Paste", icon: "download", onClick: async () => { const t = await clipRead(); if (t != null) api.replaceSelection(t); else setRunErr("clipboard read blocked — use ⌘/Ctrl+V"); } },
+        { label: "Paste", icon: "download", onClick: async () => { const tab = activeTabId(); const t = await clipRead(); if (t != null && activeTabId() === tab) api.replaceSelection(t); else if (t == null) setRunErr("clipboard read blocked — use ⌘/Ctrl+V"); } },
         { sep: true },
         { label: "Select all", icon: "table", onClick: () => api.selectAll() },
         { label: "Toggle comment", icon: "slash", onClick: () => api.toggleComment() },
@@ -2295,7 +2451,7 @@ function App() {
                   <>
                     <div class="field-row host-port">
                       <label>Host<input value={host()} onInput={(e) => setHost(e.currentTarget.value)} /></label>
-                      <label>Port<input type="number" value={port()} onInput={(e) => setPort(Number(e.currentTarget.value))} /></label>
+                      <label>Port<input type="number" min="1" max="65535" step="1" value={port()} onInput={(e) => setPort(Number(e.currentTarget.value))} /></label>
                     </div>
                     <label>User<input value={user()} onInput={(e) => setUser(e.currentTarget.value)} placeholder={driver() === "mysql" ? "root" : "postgres"} /></label>
                     <label>Password<input type="password" value={password()} onInput={(e) => setPassword(e.currentTarget.value)} placeholder={editingId() && savePassword() ? "•••••• (stored)" : ""} /></label>
@@ -2590,6 +2746,7 @@ function App() {
                   columns={columns}
                   rows={rows}
                   done={done}
+                  rowOrder={localRowOrder}
                   view={gridView}
                   setView={setGridView}
                   activeTabId={activeTabId}
@@ -2599,7 +2756,8 @@ function App() {
                   onMenu={(x, y, items) => setMenu({ x, y, items })}
                   onViewValue={(col, val) => setCellView({ col, val })}
                   onStatus={setStatus}
-                  canSortFilter={canSortFilter}
+                  canSort={canSort}
+                  canFilter={canFilter}
                   editable={() => editCtx().editable}
                   editReason={() => editCtx().reason}
                   canEditCol={(oi) => editCtx().plan?.isTableCol[oi] ?? false}
@@ -2782,7 +2940,7 @@ function App() {
                       >
                         <label>Target table
                           <select value={importTarget()} onChange={(e) => setImportTarget(e.currentTarget.value)}>
-                            <For each={schema()}>{(t) => <option value={`${t.schema}.${t.name}`}>{t.schema}.{t.name}</option>}</For>
+                            <For each={schema()}>{(t) => <option value={relKey(t.schema, t.name)}>{t.schema}.{t.name}</option>}</For>
                           </select>
                         </label>
                       </Show>

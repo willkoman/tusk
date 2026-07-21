@@ -19,7 +19,7 @@ describe("wrapQuery dialects", () => {
   it("mysql uses CAST AS CHAR + LIKE with backticks", () => {
     setSqlDialect("mysql");
     const sql = wrapQuery("SELECT * FROM t", SORTS, FILTERS, COLS, "mysql");
-    expect(sql).toBe("SELECT * FROM (SELECT * FROM t) AS _tusk WHERE CAST(`id` AS CHAR) LIKE '%abc%' ORDER BY 2 DESC");
+    expect(sql).toBe("SELECT * FROM (SELECT * FROM t) AS _tusk WHERE CAST(`id` AS CHAR) LIKE _utf8mb4 X'2561626325' ORDER BY 2 DESC");
   });
 
   it("sqlite uses CAST AS TEXT + LIKE", () => {

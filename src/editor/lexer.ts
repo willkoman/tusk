@@ -185,10 +185,25 @@ export function lexState(state: EditorState): LexResult {
   const key = state.doc as unknown as object;
   let r = lexCache.get(key);
   if (!r) {
-    r = lex(state.doc.toString());
+    r = lex(docString(state));
     lexCache.set(key, r);
   }
   return r;
+}
+
+// Full-document string, cached per immutable Text instance. CM's doc.toString()
+// materializes the whole rope every call; extensions that need the string in a
+// per-line service (fold gutter) or per-pass (linters) must share one copy.
+const strCache = new WeakMap<object, string>();
+
+export function docString(state: EditorState): string {
+  const key = state.doc as unknown as object;
+  let s = strCache.get(key);
+  if (s === undefined) {
+    s = state.doc.toString();
+    strCache.set(key, s);
+  }
+  return s;
 }
 
 /** Binary-search the span covering `pos` (spans cover [0, len] with no gaps). */
@@ -227,8 +242,21 @@ export function maskNonCode(
   keepDquote = false,
 ): string {
   const arr = doc.slice(from, to).split("");
-  for (const s of spans) {
-    if (s.kind === "code" || (keepDquote && s.kind === "dquote") || s.to <= from || s.from >= to) continue;
+  // Spans are sorted and non-overlapping: binary-search the first span that can
+  // intersect [from, to) and stop at the first one past it. The previous full walk
+  // made every call O(total spans in the document); linters call this once per
+  // statement, so a many-statement script went quadratic and froze the UI.
+  let lo = 0;
+  let hi = spans.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (spans[mid].to <= from) lo = mid + 1;
+    else hi = mid;
+  }
+  for (let i = lo; i < spans.length; i++) {
+    const s = spans[i];
+    if (s.from >= to) break;
+    if (s.kind === "code" || (keepDquote && s.kind === "dquote")) continue;
     const a = Math.max(s.from, from);
     const b = Math.min(s.to, to);
     for (let p = a; p < b; p++) {

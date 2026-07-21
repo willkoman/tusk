@@ -88,6 +88,10 @@ export function parsePgText(lines: string[]): ParsedPlan | null {
       while (stack.length > 1 && stack[stack.length - 1].indent >= indent) stack.pop();
       stack[stack.length - 1].node.children.push(node);
       stack.push({ node, indent });
+      // Same depth ceiling as the JSON parsers: a crafted result with ever-increasing
+      // indents would otherwise build a tree deep enough to overflow the stack in the
+      // recursive layout/render walks. Fall back to the styled-text view.
+      if (stack.length > 256) return null;
       last = node;
       continue;
     }

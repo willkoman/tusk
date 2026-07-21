@@ -50,7 +50,8 @@ async fn rel_oid(client: &Client, schema: &str, name: &str) -> Result<u32, AppEr
         )
         .await?;
     let row = rows.first().ok_or_else(|| AppError::new("relation not found"))?;
-    Ok(row.get::<_, u32>(0))
+    row.try_get::<_, u32>(0)
+        .map_err(|e| AppError::new(format!("unexpected catalog shape: {e}")))
 }
 
 async fn table_ddl(client: &Client, schema: &str, name: &str) -> Result<String, AppError> {
@@ -181,12 +182,15 @@ async fn sequence_ddl(client: &Client, schema: &str, name: &str) -> Result<Strin
         )
         .await?;
     let r = rows.first().ok_or_else(|| AppError::new("sequence not found"))?;
-    let start: i64 = r.get(0);
-    let minv: i64 = r.get(1);
-    let maxv: i64 = r.get(2);
-    let inc: i64 = r.get(3);
-    let cycle: bool = r.get(4);
-    let cache: i64 = r.get(5);
+    // try_get: typed `get` panics on NULL or a type mismatch (compat servers, or a
+    // pg_sequences row this role can only partially see).
+    let seq_err = |e: tokio_postgres::Error| AppError::new(format!("unexpected pg_sequences shape: {e}"));
+    let start: i64 = r.try_get(0).map_err(seq_err)?;
+    let minv: i64 = r.try_get(1).map_err(seq_err)?;
+    let maxv: i64 = r.try_get(2).map_err(seq_err)?;
+    let inc: i64 = r.try_get(3).map_err(seq_err)?;
+    let cycle: bool = r.try_get(4).map_err(seq_err)?;
+    let cache: i64 = r.try_get(5).map_err(seq_err)?;
     Ok(format!(
         "CREATE SEQUENCE {}\n    INCREMENT BY {inc}\n    MINVALUE {minv}\n    MAXVALUE {maxv}\n    START WITH {start}\n    CACHE {cache}{};",
         qual(schema, name),
@@ -208,8 +212,9 @@ async fn function_ddl(client: &Client, schema: &str, name: &str) -> Result<Strin
     }
     let mut out = String::new();
     for row in &rows {
-        let oid: u32 = row.get(0);
-        let prokind: String = row.get(1);
+        let (Ok(oid), Ok(prokind)) = (row.try_get::<_, u32>(0), row.try_get::<_, String>(1)) else {
+            continue; // unexpected catalog shape (compat server) — skip, don't panic
+        };
         if prokind != "f" && prokind != "p" {
             // pg_get_functiondef errors on aggregates ('a') / window funcs ('w').
             out.push_str(&format!(

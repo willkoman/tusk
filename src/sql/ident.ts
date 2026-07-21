@@ -39,7 +39,11 @@ export function qualifyIn(schema: string, name: string, activeSchema?: string | 
   return activeSchema && schema === activeSchema ? ident(name) : qualify(schema, name);
 }
 
-/** Quote a string literal: `O'Brien` → `'O''Brien'` (standard_conforming_strings assumed on). */
+/** Quote a string literal. MySQL uses a UTF-8 hex literal so backslash modes and control chars cannot realign quotes. */
 export function lit(s: string): string {
+  if (dialect === "mysql" && s !== "") {
+    const hex = Array.from(new TextEncoder().encode(s), (b) => b.toString(16).padStart(2, "0")).join("");
+    return `_utf8mb4 X'${hex}'`;
+  }
   return `'${s.replace(/'/g, "''")}'`;
 }

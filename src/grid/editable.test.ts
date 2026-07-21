@@ -58,6 +58,16 @@ describe("editTarget", () => {
     expect(editTarget("SELECT 1", IDX)).toMatchObject({ ok: false });
   });
 
+  it("rejects ambiguous bare and case-colliding table identities", () => {
+    const ambiguous = buildIndex([
+      ...TABLES,
+      { schema: "other", name: "users", columns: [] },
+      { schema: "public", name: "Users", columns: [] },
+    ]);
+    expect(editTarget("SELECT * FROM users", ambiguous)).toMatchObject({ ok: false });
+    expect(editTarget("SELECT * FROM public.users", ambiguous)).toMatchObject({ ok: false });
+  });
+
   it("rejects expressions/aliases in the select list (wrong-row hazard)", () => {
     // `id*2 AS id` would make the commit WHERE clause target the wrong row.
     for (const q of [
@@ -117,5 +127,6 @@ describe("editPlan", () => {
     expect(editPlan(detail("table", [col("id")]), ["id"], target)).toMatchObject({ ok: false });
     expect(editPlan(detail("table", [col("id", true)]), ["email"], target)).toMatchObject({ ok: false });
     expect(editPlan(detail("table", [col("id", true)]), ["id", "ID"], target)).toMatchObject({ ok: false });
+    expect(editPlan(detail("table", [col("id", true), col("ID")]), ["ID"], target)).toMatchObject({ ok: false });
   });
 });

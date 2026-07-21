@@ -1,4 +1,4 @@
-import { type ParsedPlan, type PlanNode, finishTree, propStr } from "./types";
+import { type ParsedPlan, type PlanNode, finishTree, planInputWithinLimits, propStr } from "./types";
 
 // DuckDB has TWO JSON plan shapes:
 //   • `EXPLAIN (FORMAT json)` — array of `{name, children[], extra_info:{…}}`.
@@ -87,6 +87,7 @@ export function parseDuck(jsonText: string): ParsedPlan | null {
   } catch {
     return null;
   }
+  if (!planInputWithinLimits(parsed)) return null;
 
   let nodes: Record<string, unknown>[];
   let executionMs: number | undefined;

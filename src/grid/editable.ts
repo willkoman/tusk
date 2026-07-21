@@ -76,7 +76,16 @@ export function editTarget(baseQuery: string, idx: Index): EditTarget {
   for (const ref of aliasMap(masked).values()) refs.add(ref.toLowerCase());
   if (refs.size === 0) return { ok: false, reason: "no table detected in the query" };
   if (refs.size > 1) return { ok: false, reason: "multi-table queries aren't editable" };
-  const t = tableByRef(idx, [...refs][0]);
+  const ref = [...refs][0];
+  const cleanRef = ref.replace(/"/g, "").toLowerCase();
+  const matches = idx.tables.filter((t) =>
+    cleanRef.includes(".")
+      ? `${t.schema}.${t.name}`.toLowerCase() === cleanRef
+      : t.name.toLowerCase() === cleanRef,
+  );
+  if (matches.length > 1)
+    return { ok: false, reason: "case-colliding or ambiguous table names aren't editable; qualify an exact unique table" };
+  const t = tableByRef(idx, ref);
   if (!t) return { ok: false, reason: "table not found in the schema" };
   return { ok: true, table: t };
 }
@@ -98,6 +107,8 @@ export function editPlan(detail: RelationDetail, resultColumns: string[], target
   if (detail.kind !== "table") return { ok: false, reason: `${detail.kind}s aren't editable` };
   if (hasDuplicateColumns(resultColumns))
     return { ok: false, reason: "duplicate column names in the result" };
+  if (new Set(detail.columns.map((c) => c.name.toLowerCase())).size !== detail.columns.length)
+    return { ok: false, reason: "tables with case-colliding column names aren't safely editable" };
 
   const pk = detail.columns.filter((c) => c.is_pk).map((c) => c.name);
   if (!pk.length) return { ok: false, reason: `table ${target.name} has no primary key` };

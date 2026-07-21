@@ -14,6 +14,8 @@ use crate::relgraph;
 use crate::script;
 use crate::tree;
 
+type TextRows = (Vec<String>, Vec<Vec<Option<String>>>);
+
 fn de<E: std::fmt::Display>(e: E) -> AppError {
     AppError::new(e.to_string())
 }
@@ -27,6 +29,9 @@ fn embedded_script<C>(
     user_txn: bool,
     exec: impl Fn(&C, &str) -> Result<(), AppError>,
 ) -> Result<String, AppError> {
+    // Separators sit on their own line: a statement ending in a `--` comment would
+    // otherwise swallow the appended `;` and merge with the next statement (or eat
+    // the `;` before COMMIT, turning the wrapper into a phantom syntax error).
     let sql = items
         .iter()
         .filter_map(|it| match it {
@@ -34,12 +39,12 @@ fn embedded_script<C>(
             _ => None,
         })
         .collect::<Vec<_>>()
-        .join(";\n");
+        .join("\n;\n");
     if user_txn {
         exec(conn, &sql)?;
         return Ok("OK".to_string());
     }
-    match exec(conn, &format!("BEGIN;\n{sql};\nCOMMIT;")) {
+    match exec(conn, &format!("BEGIN;\n{sql}\n;\nCOMMIT;")) {
         Ok(()) => Ok("OK".to_string()),
         Err(e) => {
             let _ = exec(conn, "ROLLBACK");
@@ -162,8 +167,23 @@ impl CancelHandle {
                 Ok(())
             }
             CancelHandle::Duck(handle) => {
-                handle.interrupt();
-                Ok(())
+                // Windows bundled DuckDB: interrupt() leaves the connection in the
+                // #209 poisoned state — every later statement fails with "resource
+                // deadlock would occur" and the leaked handle keeps a file-backed
+                // .duckdb locked until app restart. A query that can't be cancelled
+                // beats a database that can't be reopened.
+                #[cfg(windows)]
+                {
+                    let _ = handle;
+                    Err(AppError::new(
+                        "cancel isn't available for DuckDB on Windows — the query will run to completion",
+                    ))
+                }
+                #[cfg(not(windows))]
+                {
+                    handle.interrupt();
+                    Ok(())
+                }
             }
             CancelHandle::None => Ok(()),
         }
@@ -195,6 +215,10 @@ pub struct DuckConn {
     pub config: ConnectionConfig,
     pub stream_sql: Option<String>,
     pub offset: usize,
+    /// Scratch in-memory connection that parse-checks user SQL before it reaches the
+    /// real connection (`parse_check`). Lazily opened, replaced after it absorbs a
+    /// parse error, released alongside the main connection when idle.
+    gate: Mutex<Option<duckdb::Connection>>,
 }
 
 /// Deref'able lock guard so every existing `d.lock()` call site is unchanged: it borrows
@@ -236,7 +260,115 @@ impl DuckConn {
     /// stream keeps it for fast paging + a valid cancel handle).
     fn release_idle(&self) {
         if !self.keep_open && self.stream_sql.is_none() {
-            *self.conn.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            let taken = self.conn.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(c) = taken {
+                forget_if_poisoned(c);
+            }
+            *self.gate.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// Post-error net for poison classes the parse gate can't intercept (an
+    /// interrupt mid-query, an unforeseen error path): if the live connection is in
+    /// the #209 poisoned state, discard it — take + leak, dropping would abort the
+    /// process — so `ensure_alive` opens a fresh one next command. Returns the
+    /// user-facing consequence when a quarantine happened.
+    fn quarantine_poisoned(&self) -> Option<&'static str> {
+        let mut g = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let poisoned = g.as_ref().is_some_and(|c| c.prepare("SELECT 1").is_err());
+        if !poisoned {
+            return None;
+        }
+        if let Some(c) = g.take() {
+            std::mem::forget(c);
+        }
+        Some(if self.keep_open {
+            "the in-memory database was discarded (its data is lost) — the next query starts fresh"
+        } else {
+            "the connection was discarded — the next query reopens the file (if it stays locked, restart Tusk)"
+        })
+    }
+
+    /// Wrap an operation error with the quarantine consequence when the error also
+    /// poisoned the connection — otherwise "resource deadlock would occur" repeats
+    /// on every later statement with no way out.
+    fn quarantine_if_poisoned(&self, err: AppError) -> AppError {
+        match self.quarantine_poisoned() {
+            Some(hint) => AppError::new(format!(
+                "{} — DuckDB left the connection unusable; {hint}",
+                err.message
+            )),
+            None => err,
+        }
+    }
+
+    /// Parse-check ONE statement before it touches the real connection.
+    ///
+    /// The bundled libduckdb (duckdb-rs #209, observed on Windows) leaves an internal
+    /// mutex locked after a PARSER error: every later statement on that connection
+    /// fails with "Invalid Error: resource deadlock would occur", and dropping the
+    /// poisoned connection throws a C++ exception across the FFI boundary — a hard
+    /// process abort ("Rust cannot catch foreign exceptions"). Binder/catalog/runtime
+    /// errors are unaffected.
+    ///
+    /// So user SQL is prepared on a scratch in-memory connection first. Single-
+    /// statement prepare never executes anything (duckdb-rs only auto-executes the
+    /// LEADING statements of a multi-statement string — callers must pass one
+    /// statement). Outcomes:
+    /// - prepares cleanly → parse fine, run on the real connection;
+    /// - fails but the scratch stays usable (probe succeeds) → binder/catalog error
+    ///   from the empty scratch DB (missing tables etc.) → parse fine, run for real
+    ///   so the real catalog produces the real error;
+    /// - fails and the scratch is poisoned (probe fails) → exactly the error class
+    ///   that would brick the real connection → report it, and `mem::forget` the
+    ///   scratch (dropping it would abort the process). On platforms where parse
+    ///   errors don't poison, the probe succeeds and the error surfaces from the
+    ///   real connection — same behavior, no leak.
+    fn parse_check(&self, sql: &str) -> Result<(), AppError> {
+        let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = match g.take() {
+            Some(c) => c,
+            None => duckdb::Connection::open_in_memory().map_err(de)?,
+        };
+        let err = match conn.prepare(sql) {
+            Ok(_stmt) => None,
+            Err(e) => Some(e),
+        };
+        match err {
+            None => {
+                *g = Some(conn);
+                Ok(())
+            }
+            Some(e) => {
+                let poisoned = conn.prepare("SELECT 1").is_err();
+                if poisoned {
+                    std::mem::forget(conn);
+                    Err(de(e))
+                } else {
+                    *g = Some(conn);
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// Drop a DuckDB connection only if it is still healthy; a poisoned one (see
+/// `parse_check`) is leaked instead — its destructor throws a foreign exception
+/// that aborts the whole process.
+fn forget_if_poisoned(conn: duckdb::Connection) {
+    if conn.prepare("SELECT 1").is_err() {
+        std::mem::forget(conn);
+    }
+}
+
+impl Drop for DuckConn {
+    fn drop(&mut self) {
+        for m in [&self.conn, &self.gate] {
+            let taken = m.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(c) = taken {
+                forget_if_poisoned(c);
+            }
         }
     }
 }
@@ -267,6 +399,7 @@ pub enum Backend {
 /// Open a connection for the configured driver. PG = network (TLS); DuckDB = a local
 /// file (or `:memory:`), opened read-only when the connection is read-only.
 pub async fn connect(config: &ConnectionConfig) -> Result<(Backend, String), AppError> {
+    config.validate()?;
     match config.driver.as_deref().unwrap_or("postgres") {
         "postgres" => {
             let (client, version) = db::open(config).await?;
@@ -437,7 +570,20 @@ impl Backend {
         let user_txn = script::has_txn_control(items);
         match self {
             Backend::Pg(p) => script::run(&p.client, items, read_only).await,
-            Backend::Duck(d) => embedded_script(&d.lock(), items, user_txn, |c, s| c.execute_batch(s).map_err(de)),
+            Backend::Duck(d) => {
+                // Parse-gate every statement before any of them executes (duckdb-rs
+                // #209 — a parse error mid-batch would poison the connection).
+                for it in items {
+                    if let script::Item::Sql(s) = it {
+                        d.parse_check(s)?;
+                    }
+                }
+                // Two statements on purpose: the `d.lock()` temporary lives to the
+                // end of the full expression, and quarantine_if_poisoned re-locks —
+                // chaining map_err onto the same expression would self-deadlock.
+                let r = embedded_script(&d.lock(), items, user_txn, |c, s| c.execute_batch(s).map_err(de));
+                r.map_err(|e| d.quarantine_if_poisoned(e))
+            }
             Backend::Sqlite(s) => embedded_script(&s.lock(), items, user_txn, |c, s| c.execute_batch(s).map_err(de)),
             Backend::MySql(m) => m.run_script(items, user_txn).await,
         }
@@ -452,17 +598,33 @@ impl Backend {
     ) -> Result<QueryOutcome, AppError> {
         match self {
             Backend::Pg(p) => p.run_single(trimmed, page, cursorable).await,
-            Backend::Duck(d) => d.run_single(trimmed, page, cursorable),
+            Backend::Duck(d) => d
+                .run_single(trimmed, page, cursorable)
+                .map_err(|e| d.quarantine_if_poisoned(e)),
             Backend::Sqlite(s) => s.run_single(trimmed, page, cursorable),
             Backend::MySql(m) => m.run_single(trimmed, page, cursorable).await,
         }
+    }
+
+    /// Run a Slack-approved read on a separately opened read-only backend. Refuse a
+    /// writable backend rather than relying on SQL classification alone.
+    pub async fn run_single_read_only(
+        &mut self,
+        trimmed: &str,
+        page: u32,
+        cursorable: bool,
+    ) -> Result<QueryOutcome, AppError> {
+        if !self.config().read_only {
+            return Err(AppError::new("isolated Slack backend is not read-only"));
+        }
+        self.run_single(trimmed, page, cursorable).await
     }
 
     /// Fetch the next page from the open stream.
     pub async fn fetch_page(&mut self, page: u32) -> Result<FetchResult, AppError> {
         match self {
             Backend::Pg(p) => p.fetch_page(page).await,
-            Backend::Duck(d) => d.fetch_page(page),
+            Backend::Duck(d) => d.fetch_page(page).map_err(|e| d.quarantine_if_poisoned(e)),
             Backend::Sqlite(s) => s.fetch_page(page),
             Backend::MySql(m) => m.fetch_page(page).await,
         }
@@ -493,9 +655,20 @@ impl Backend {
                 Err(_) => Vec::new(),
             },
             Backend::Duck(d) => {
+                // Parse-gate the COMPOSED statement, not the raw sql: statements
+                // that parse fine on their own (SHOW TABLES, SET, EXPLAIN …) are
+                // parser errors under DESCRIBE, and that parser error would poison
+                // the real connection (duckdb-rs #209). Best-effort contract.
+                let wrapped = format!("DESCRIBE {sql}");
+                if d.parse_check(&wrapped).is_err() {
+                    return Vec::new();
+                }
                 // DESCRIBE returns one row per result column, in order; find the
                 // column_type field by name so a layout change can't misread it.
-                match duck_query(&d.lock(), &format!("DESCRIBE {sql}")) {
+                // Bind before matching — the lock temporary must drop before the
+                // Err arm's quarantine probe re-locks.
+                let described = duck_query(&d.lock(), &wrapped);
+                match described {
                     Ok((cols, rows)) => {
                         let Some(ty) = cols.iter().position(|c| c == "column_type") else {
                             return Vec::new();
@@ -506,7 +679,10 @@ impl Backend {
                             .map(|(i, _)| i)
                             .collect()
                     }
-                    Err(_) => Vec::new(),
+                    Err(_) => {
+                        let _ = d.quarantine_poisoned(); // best-effort result, but never leave the connection bricked
+                        Vec::new()
+                    }
                 }
             }
             Backend::Sqlite(s) => {
@@ -686,12 +862,14 @@ impl Backend {
                         tables.push(relgraph::ErdTable { schema: schema.to_string(), name: t.clone(), columns: Vec::new() });
                     }
                     let cname = dcell(r, 1);
-                    tables.last_mut().unwrap().columns.push(relgraph::ErdColumn {
-                        is_pk: pk.contains(&(t.clone(), cname.clone())),
-                        is_fk: fk.contains(&(t, cname.clone())),
-                        name: cname,
-                        data_type: dcell(r, 2),
-                    });
+                    if let Some(table) = tables.last_mut() {
+                        table.columns.push(relgraph::ErdColumn {
+                            is_pk: pk.contains(&(t.clone(), cname.clone())),
+                            is_fk: fk.contains(&(t, cname.clone())),
+                            name: cname,
+                            data_type: dcell(r, 2),
+                        });
+                    }
                 }
                 Ok(relgraph::SchemaGraph { tables, edges })
             }
@@ -1012,6 +1190,7 @@ impl DuckConn {
                 config: config.clone(),
                 stream_sql: None,
                 offset: 0,
+                gate: Mutex::new(None),
             }),
             version,
         ))
@@ -1023,11 +1202,16 @@ impl DuckConn {
         page: u32,
         cursorable: bool,
     ) -> Result<QueryOutcome, AppError> {
+        // Gate the user text first (error positions match what they typed), then the
+        // wrap we actually execute (a trailing `--` comment in the user text would
+        // swallow the wrap's closing paren — a parse error the first gate can't see).
+        self.parse_check(trimmed)?;
         if cursorable {
             // CAST(COLUMNS(*) AS VARCHAR) renders every column as text (matching the
             // all-text model — handles dates/decimals/etc. cleanly); LIMIT pages it.
             let wrapped =
                 format!("SELECT CAST(COLUMNS(*) AS VARCHAR) FROM ({trimmed}) AS _tusk LIMIT {page}");
+            self.parse_check(&wrapped)?;
             let (columns, rows) = {
                 let g = self.lock();
                 duck_query(&g, &wrapped)?
@@ -1217,7 +1401,7 @@ fn sqlite_value(v: rusqlite::types::ValueRef) -> Option<String> {
 fn sqlite_query(
     conn: &rusqlite::Connection,
     sql: &str,
-) -> Result<(Vec<String>, Vec<Vec<Option<String>>>), AppError> {
+) -> Result<TextRows, AppError> {
     let mut stmt = conn.prepare(sql).map_err(de)?;
     let columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
     let ncols = columns.len();
@@ -1344,6 +1528,13 @@ impl MySqlConn {
             .pass(Some(config.password.clone()));
         if !config.dbname.is_empty() {
             builder = builder.db_name(Some(config.dbname.clone()));
+        }
+        if config.read_only {
+            // Applied to every pooled connection, not merely the first one checked
+            // out. This catches side-effecting functions that a SQL token scan cannot.
+            // `setup` is rerun after mysql_async resets a pooled connection;
+            // `init` only runs at creation and would be cleared on first return.
+            builder = builder.setup(vec!["SET SESSION TRANSACTION READ ONLY"]);
         }
         match config.sslmode.as_deref().unwrap_or("prefer") {
             "disable" => {}
@@ -1735,7 +1926,7 @@ fn duck_interval(months: i32, days: i32, nanos: i64) -> String {
 fn duck_query(
     conn: &duckdb::Connection,
     sql: &str,
-) -> Result<(Vec<String>, Vec<Vec<Option<String>>>), AppError> {
+) -> Result<TextRows, AppError> {
     let mut stmt = conn.prepare(sql).map_err(de)?;
     // Column metadata is only valid AFTER the statement is executed (duckdb-rs panics
     // otherwise), so query first, then read names from the Rows' statement.
@@ -1860,6 +2051,77 @@ mod tests {
     }
     fn duck_mem() -> ConnectionConfig {
         mem("duckdb")
+    }
+
+    /// FROM-first / PIVOT forms must stream through the LIMIT/OFFSET pager like any
+    /// SELECT (they classify as cursorable in lib.rs): the subquery wrap must accept
+    /// them, and the non-cursorable path would buffer entire tables in RAM.
+    #[tokio::test]
+    async fn duck_from_first_and_pivot_stream() {
+        let (mut b, _) = connect(&duck_mem()).await.unwrap();
+        b.run_single("CREATE TABLE t(a INT, k TEXT)", 1, false).await.unwrap();
+        b.run_single("INSERT INTO t VALUES (1,'x'),(2,'y'),(3,'x')", 1, false).await.unwrap();
+        match b.run_single("FROM t", 2, true).await.unwrap() {
+            QueryOutcome::Rows { rows, done, .. } => {
+                assert_eq!(rows.len(), 2);
+                assert!(!done);
+            }
+            _ => panic!("expected rows from FROM-first"),
+        }
+        b.rollback_cursor().await;
+        match b.run_single("PIVOT t ON k USING sum(a)", 10, true).await.unwrap() {
+            QueryOutcome::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+            _ => panic!("expected rows from PIVOT"),
+        }
+    }
+
+    /// duckdb-rs #209: a parser error poisons the connection ("resource deadlock
+    /// would occur" on every later statement) and dropping the poisoned connection
+    /// aborts the whole process via a foreign C++ exception. The parse gate must
+    /// absorb the parse error so (a) it surfaces as a normal Err, (b) the connection
+    /// keeps working afterwards, and (c) dropping the backend doesn't abort the test
+    /// process — this test completing IS the drop assertion.
+    #[tokio::test]
+    async fn duck_syntax_error_survivable() {
+        let (mut b, _) = connect(&duck_mem()).await.unwrap();
+        b.run_single("CREATE TABLE t(a INT)", 1, false).await.unwrap();
+        b.run_single("INSERT INTO t VALUES (1),(2)", 1, false).await.unwrap();
+
+        // comment-eaten comma → NOT IN (1 2) → parser error
+        let bad = "SELECT * FROM t WHERE a NOT IN (\n  1 -- one,\n  2 -- two\n)";
+        let e = b.run_single(bad, 100, true).await.unwrap_err();
+        assert!(e.message.contains("Parser Error"), "want parser error, got: {}", e.message);
+        assert!(!e.message.contains("deadlock"), "poisoned connection leaked through: {}", e.message);
+
+        // connection still works after the syntax error
+        match b.run_single("SELECT a FROM t ORDER BY a", 100, true).await.unwrap() {
+            QueryOutcome::Rows { rows, .. } => assert_eq!(rows.len(), 2),
+            _ => panic!("expected rows"),
+        }
+
+        // repeat: bad DDL (execute_batch path), bad script path, then a good query
+        let e2 = b.run_single("CREATE TABLEX u(a INT)", 1, false).await.unwrap_err();
+        assert!(e2.message.contains("Parser Error"), "got: {}", e2.message);
+        let items = script::split("INSERT INTO t VALUES (3);\nSELCT * FROM t;");
+        let e3 = b.run_script(&items, false).await.unwrap_err();
+        assert!(e3.message.contains("Parser Error"), "got: {}", e3.message);
+        // the script's leading INSERT must not have executed (gated before the batch ran)
+        match b.run_single("SELECT count(*) FROM t", 100, true).await.unwrap() {
+            QueryOutcome::Rows { rows, .. } => assert_eq!(rows[0][0].as_deref(), Some("2")),
+            _ => panic!("expected rows"),
+        }
+
+        // binder errors (valid parse, missing table) still come from the real catalog
+        let e4 = b.run_single("SELECT * FROM no_such_table", 100, true).await.unwrap_err();
+        assert!(e4.message.contains("no_such_table"), "got: {}", e4.message);
+
+        // bool_columns on unparseable SQL degrades to empty, doesn't poison
+        assert!(b.bool_columns("SELCT 1").await.is_empty());
+        match b.run_single("SELECT a FROM t ORDER BY a", 100, true).await.unwrap() {
+            QueryOutcome::Rows { rows, .. } => assert_eq!(rows.len(), 2),
+            _ => panic!("expected rows"),
+        }
+        // implicit: dropping `b` here must not abort the process
     }
 
     /// A file-backed DuckDB connection must drop (free its exclusive file lock) when idle,
@@ -2067,6 +2329,7 @@ mod tests {
     }
 }
 
+#[allow(clippy::items_after_test_module)]
 fn duck_table_detail(
     conn: &duckdb::Connection,
     schema: &str,

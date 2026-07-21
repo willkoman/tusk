@@ -1,4 +1,4 @@
-import { type ParsedPlan, type PlanNode, finishTree, propStr } from "./types";
+import { type ParsedPlan, type PlanNode, finishTree, planInputWithinLimits, propStr } from "./types";
 
 // Postgres EXPLAIN (FORMAT JSON) → PlanTree. The JSON arrives as a single text
 // cell over the simple protocol (possibly pretty-printed across lines — the
@@ -8,7 +8,11 @@ import { type ParsedPlan, type PlanNode, finishTree, propStr } from "./types";
 const EXTRACTED = new Set(["Plans"]);
 
 function pgNode(raw: Record<string, unknown>): PlanNode {
-  const children = Array.isArray(raw["Plans"]) ? (raw["Plans"] as Record<string, unknown>[]).map(pgNode) : [];
+  const children = Array.isArray(raw["Plans"])
+    ? (raw["Plans"] as unknown[])
+      .filter((v): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v))
+      .map(pgNode)
+    : [];
   const num = (k: string): number | undefined => (typeof raw[k] === "number" ? (raw[k] as number) : undefined);
   const str = (k: string): string | undefined => (typeof raw[k] === "string" ? (raw[k] as string) : undefined);
 
@@ -61,6 +65,7 @@ export function parsePg(jsonText: string): ParsedPlan | null {
     return null;
   }
   const arr = Array.isArray(parsed) ? parsed : [parsed];
+  if (!planInputWithinLimits(arr)) return null;
   const first = arr[0] as Record<string, unknown> | undefined;
   const planRaw = first?.["Plan"];
   if (!planRaw || typeof planRaw !== "object") return null;

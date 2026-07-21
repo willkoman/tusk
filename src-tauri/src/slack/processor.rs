@@ -28,13 +28,15 @@ pub async fn handle_event(app: &AppHandle, api: &SlackApi, cfg: &SlackConfig, ev
             let _ = app.emit("slack:status", runtime.status_info());
         }
         SlackEvent::Message { channel, user, text, thread_ts, ts } => {
-            if !allowed(cfg, &channel, &user) {
+            if !cfg.enabled || !allowed(cfg, &channel, &user) {
                 return;
             }
             handle_question(app, api, cfg, channel, user, text, thread_ts, ts).await;
         }
         SlackEvent::Interaction { payload } => {
-            handle_interaction(app, api, cfg, payload).await;
+            if cfg.enabled {
+                handle_interaction(app, api, cfg, payload).await;
+            }
         }
     }
 }
@@ -81,7 +83,7 @@ async fn handle_question(
                 .update_message(&channel, &thinking_ts, &reply, blocks::status_card(&reply))
                 .await;
         }
-        Ok(Proposal::Sql { explanation, sql, chart: chart_spec }) => {
+        Ok(Proposal::Sql { explanation, sql, chart: chart_spec, connection_id, database }) => {
             let runtime = app.state::<SlackRuntime>();
             let id = runtime.approvals.new_id();
             // The proposal card advertises the chart request so the approver
@@ -94,11 +96,13 @@ async fn handle_question(
                 id: id.clone(),
                 sql: sql.clone(),
                 explanation: shown.clone(),
-                chart: chart_spec,
+                chart: chart_spec.map(|spec| *spec),
                 channel: channel.clone(),
                 user,
                 thread_ts: thread,
                 message_ts: thinking_ts.clone(),
+                connection_id,
+                database,
                 created: std::time::Instant::now(),
             });
             // Fallback text carries the SQL so thread-history reads see the proposal.
@@ -122,7 +126,13 @@ async fn handle_question(
 /// What the AI produced for a question.
 enum Proposal {
     /// A runnable (validated read-only) query + optional chart request.
-    Sql { explanation: String, sql: String, chart: Option<ChartSpec> },
+    Sql {
+        explanation: String,
+        sql: String,
+        chart: Option<Box<ChartSpec>>,
+        connection_id: String,
+        database: String,
+    },
     /// A plain reply with no SQL — e.g. a refusal of a destructive ask.
     Reply(String),
 }
@@ -173,9 +183,9 @@ async fn generate_proposal(
 
     // Snapshot schema/permissions/samples under the connection lock, then RELEASE it
     // before the (slow) AI call so the UI is never blocked on a Slack question.
-    let system = {
+    let (system, connection_id, database) = {
         let state = app.state::<crate::AppState>();
-        let (_id, conn) = state.active()?;
+        let (connection_id, conn) = state.active()?;
         let mut c = crate::lock_conn(&conn).await;
         crate::ensure_alive(&mut c).await?;
         let caps = c.backend.capabilities();
@@ -244,7 +254,11 @@ async fn generate_proposal(
             permissions_enforced: perms.enforced,
             destructive_policy: cfg.destructive_policy.clone(),
         };
-        context::build_system_prompt(&ctx, &tables, &focus, &samples, &fks, fks_known, &skills)
+        (
+            context::build_system_prompt(&ctx, &tables, &focus, &samples, &fks, fks_known, &skills),
+            connection_id,
+            database,
+        )
     };
 
     let req = ai::AiRequest {
@@ -297,7 +311,7 @@ async fn generate_proposal(
     // (masked scan — catches writable CTEs / smuggled DDL / row locks). The same
     // gate re-runs at execution time; the AI's SQL is never trusted.
     validate_read_only(&sql)?;
-    Ok(Proposal::Sql { explanation, sql, chart: chart_spec })
+    Ok(Proposal::Sql { explanation, sql, chart: chart_spec.map(Box::new), connection_id, database })
 }
 
 /// Mutation keywords that must never appear ANYWHERE in a Slack-run statement —
@@ -306,8 +320,10 @@ async fn generate_proposal(
 /// comments, dollar-quotes, quoted identifiers blanked), word-boundary matched.
 /// A false positive (a bare column literally named `delete`) safely degrades to
 /// "run it in the Tusk editor".
-const MUTATION_WORDS: [&str; 10] =
-    ["insert", "update", "delete", "merge", "drop", "alter", "truncate", "create", "grant", "revoke"];
+const MUTATION_WORDS: [&str; 15] = [
+    "insert", "update", "delete", "merge", "replace", "drop", "alter", "truncate",
+    "create", "grant", "revoke", "outfile", "dumpfile", "into", "lock",
+];
 
 /// Blank out string literals, quoted identifiers, comments, and dollar-quoted
 /// bodies so keyword scanning can't be fooled by values like 'DROP TABLE…'.
@@ -380,14 +396,21 @@ fn dollar_tag_end(b: &[u8], i: usize) -> Option<usize> {
 
 /// The first mutation keyword found anywhere in the (masked) statement, if any.
 /// (`FOR UPDATE` row locks are caught by "update"; `FOR SHARE` checked separately.)
-fn find_mutation_word(sql: &str) -> Option<&'static str> {
+pub(crate) fn find_mutation_word(sql: &str) -> Option<&'static str> {
     let masked = mask_sql(sql);
+    let mut previous = "";
     for token in masked.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
         if let Some(w) = MUTATION_WORDS.iter().find(|w| **w == token) {
             return Some(w);
         }
+        if previous == "for" && token == "share" {
+            return Some("share");
+        }
+        if !token.is_empty() {
+            previous = token;
+        }
     }
-    masked.contains(" for share").then_some("share")
+    None
 }
 
 /// A statement that can be wrapped as a derived table `SELECT * FROM (<it>) …`.
@@ -423,6 +446,80 @@ fn validate_read_only(sql: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+const MAX_RESULT_COLUMNS: usize = 10_000;
+const MAX_RESULT_CELLS: usize = 2_000_000;
+const MAX_RESULT_VALUE_BYTES: usize = 1024 * 1024;
+const MAX_RESULT_TOTAL_BYTES: usize = 48 * 1024 * 1024;
+
+fn add_result_page(
+    columns: &[String],
+    rows: &[Vec<Option<String>>],
+    bytes: &mut usize,
+    cells: &mut usize,
+    first: bool,
+) -> Result<(), AppError> {
+    if columns.is_empty() || columns.len() > MAX_RESULT_COLUMNS
+        || rows.iter().any(|r| r.len() != columns.len())
+    {
+        return Err(AppError::new("Slack result exceeds the supported row/column shape"));
+    }
+    if first {
+        *bytes = columns.iter().map(|s| s.len().saturating_add(std::mem::size_of::<String>())).sum::<usize>();
+    }
+    *cells = cells.saturating_add(rows.len().saturating_mul(columns.len()));
+    if *cells > MAX_RESULT_CELLS {
+        return Err(AppError::new("Slack result exceeds the 2000000-cell limit"));
+    }
+    *bytes = bytes
+        .saturating_add(rows.len().saturating_mul(std::mem::size_of::<Vec<Option<String>>>()));
+    *bytes = bytes
+        .saturating_add(rows.len().saturating_mul(columns.len()).saturating_mul(std::mem::size_of::<Option<String>>()));
+    if *bytes > MAX_RESULT_TOTAL_BYTES {
+        return Err(AppError::new("Slack result exceeds the 48 MiB memory budget"));
+    }
+    for value in rows.iter().flatten().flatten() {
+        if value.len() > MAX_RESULT_VALUE_BYTES {
+            return Err(AppError::new("Slack result contains a value larger than 1 MiB"));
+        }
+        *bytes = bytes.saturating_add(value.len());
+        if *bytes > MAX_RESULT_TOTAL_BYTES {
+            return Err(AppError::new("Slack result exceeds the 48 MiB memory budget"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn validate_result_payload(columns: &[String], rows: &[Vec<Option<String>>]) -> Result<(), AppError> {
+    let mut bytes = 0;
+    let mut cells = 0;
+    add_result_page(columns, rows, &mut bytes, &mut cells, true)
+}
+
+async fn collect_read_limited(
+    backend: &mut crate::driver::Backend,
+    sql: &str,
+    cap: usize,
+) -> Result<(Vec<String>, Vec<Vec<Option<String>>>), AppError> {
+    let page = (cap.saturating_add(1).min(1_000)) as u32;
+    let out = backend.run_single_read_only(sql, page, true).await?;
+    let (columns, mut rows, mut done) = match out {
+        QueryOutcome::Rows { columns, rows, done, .. } => (columns, rows, done),
+        QueryOutcome::Exec { .. } => return Err(AppError::new("the query returned no result set")),
+    };
+    let mut bytes = 0;
+    let mut cells = 0;
+    add_result_page(&columns, &rows, &mut bytes, &mut cells, true)?;
+    while !done && rows.len() <= cap {
+        let next = backend.fetch_page(page).await?;
+        add_result_page(&columns, &next.rows, &mut bytes, &mut cells, false)?;
+        rows.extend(next.rows);
+        done = next.done;
+    }
+    rows.truncate(cap.saturating_add(1));
+    Ok((columns, rows))
+}
+
 async fn handle_interaction(app: &AppHandle, api: &SlackApi, cfg: &SlackConfig, payload: serde_json::Value) {
     if payload["type"].as_str() != Some("block_actions") {
         return;
@@ -452,14 +549,17 @@ async fn handle_interaction(app: &AppHandle, api: &SlackApi, cfg: &SlackConfig, 
     }
 
     let runtime = app.state::<SlackRuntime>();
-    match runtime.approvals.owner(id) {
+    if !allowed(cfg, &channel, &user) {
+        return;
+    }
+    match runtime.approvals.authorization(id) {
         None => {
             let _ = api
                 .post_ephemeral(&channel, &user, "⏰ This proposal has expired — ask the question again.")
                 .await;
             return;
         }
-        Some(owner) if owner != user => {
+        Some((owner, proposal_channel)) if owner != user || proposal_channel != channel => {
             let _ = api
                 .post_ephemeral(&channel, &user, "Only the requester can approve or reject this query.")
                 .await;
@@ -494,7 +594,7 @@ async fn handle_interaction(app: &AppHandle, api: &SlackApi, cfg: &SlackConfig, 
         .await;
 
     let started = std::time::Instant::now();
-    match run_proposal(app, cfg, &prop.sql).await {
+    match run_proposal(app, cfg, &prop.sql, &prop.connection_id, &prop.database).await {
         Ok((columns, rows, truncated)) => {
             let ms = started.elapsed().as_millis();
             let _ = app.emit(
@@ -532,23 +632,15 @@ async fn handle_interaction(app: &AppHandle, api: &SlackApi, cfg: &SlackConfig, 
     }
 }
 
-/// Roll back the PG read-only transaction if one was opened (ends it after the query,
-/// win or lose — so a Slack-side error can't leave the shared session in an aborted txn).
-async fn rollback_pg(c: &mut crate::driver::ConnState, pg_txn: bool) {
-    if pg_txn {
-        if let Ok(client) = c.backend.pg() {
-            let _ = client.batch_execute("ROLLBACK").await;
-        }
-    }
-}
-
 /// Execute an approved query on the active connection: LIMIT-capped, buffered
 /// (NEVER the shared server cursor), timeout-enforced with a real server-side
-/// cancel, and wrapped in a read-only transaction on Postgres when possible.
+/// cancel, on a fresh engine-enforced read-only connection.
 async fn run_proposal(
     app: &AppHandle,
     cfg: &SlackConfig,
     sql: &str,
+    expected_connection_id: &str,
+    expected_database: &str,
 ) -> Result<(Vec<String>, Vec<Vec<Option<String>>>, bool), AppError> {
     validate_read_only(sql)?;
     let cap = cfg.max_rows_file;
@@ -558,8 +650,18 @@ async fn run_proposal(
 
     let state = app.state::<crate::AppState>();
     let (conn_id, conn) = state.active()?;
+    if conn_id != expected_connection_id {
+        return Err(AppError::new(
+            "the active Tusk connection changed after this proposal was created — ask the question again before approving",
+        ));
+    }
     let mut c = crate::lock_conn(&conn).await;
     crate::ensure_alive(&mut c).await?;
+    if c.backend.database_name().await != expected_database {
+        return Err(AppError::new(
+            "the connected database changed after this proposal was created — ask the question again before approving",
+        ));
+    }
 
     // Roll back any UI streaming cursor FIRST — same contract every sidebar command
     // honors (the owner tab's stream just stops, snapshot frozen). This means the Slack
@@ -567,28 +669,39 @@ async fn run_proposal(
     // timeout can't leave that transaction aborted and poison the UI's session.
     c.backend.rollback_cursor().await;
 
-    // Server-enforced read-only on PG (defense-in-depth over the keyword gate): a
-    // side-effecting function in an otherwise-SELECT statement can't write. Best-effort;
-    // embedded/MySQL have no equivalent and rely on the gate + open-mode.
-    let pg_txn = match c.backend.pg() {
-        Ok(client) => client.batch_execute("BEGIN READ ONLY").await.is_ok(),
-        Err(_) => false,
-    };
+    let mut isolated_cfg = c.backend.config().clone();
+    isolated_cfg.read_only = true;
+    let kind = c.backend.capabilities().kind;
+    if matches!(kind, "duckdb" | "sqlite")
+        && (isolated_cfg.path.as_deref().unwrap_or("").trim().is_empty()
+            || matches!(isolated_cfg.path.as_deref(), Some(":memory:")))
+    {
+        return Err(AppError::new(
+            "Slack cannot safely isolate queries against an in-memory embedded database; use the Tusk editor or a file-backed database",
+        ));
+    }
+    // File-backed DuckDB otherwise holds an exclusive idle handle. Release it before
+    // opening the isolated read-only backend; the UI backend reopens lazily later.
+    c.backend.release_idle();
+    let (mut isolated, _) = crate::driver::connect(&isolated_cfg).await?;
+    if isolated.database_name().await != expected_database {
+        return Err(AppError::new("isolated Slack connection resolved to a different database"));
+    }
 
-    state.arm_cancel(&conn_id, c.backend.cancel_handle(), c.backend.config().clone());
+    state.arm_cancel(&conn_id, isolated.cancel_handle(), isolated.config().clone());
     let timeout = std::time::Duration::from_secs(cfg.query_timeout_secs.max(1));
-    let mut res = tokio::time::timeout(timeout, c.backend.run_single(&wrapped, (cap + 1) as u32, false)).await;
+    let mut res = tokio::time::timeout(timeout, collect_read_limited(&mut isolated, &wrapped, cap)).await;
 
-    // MySQL can't wrap a derived table with duplicate output columns (error 1060) —
-    // fall back to appending LIMIT, mirroring `mysql_page`.
+    // MySQL can't wrap a derived table with duplicate output columns (error 1060).
+    // Retry the original read: `mysql_page` then uses its direct LIMIT/OFFSET fallback,
+    // while this collector still enforces cap+1 and all memory budgets.
     if let Ok(Err(e)) = &res {
         if e.message.contains("Duplicate column name") {
-            let appended = format!("{sql}\nLIMIT {}", cap + 1);
-            res = tokio::time::timeout(timeout, c.backend.run_single(&appended, (cap + 1) as u32, false)).await;
+            res = tokio::time::timeout(timeout, collect_read_limited(&mut isolated, sql, cap)).await;
         }
     }
 
-    let outcome = match res {
+    let (columns, mut rows) = match res {
         Err(_elapsed) => {
             // Timeout: the client future is dropped but the SERVER may keep executing —
             // request a cancel (real CancelRequest on PG; best-effort/no-op elsewhere).
@@ -598,7 +711,6 @@ async fn run_proposal(
                 let _ = handle.cancel(&cfg2).await;
             }
             state.disarm_cancel(&conn_id);
-            rollback_pg(&mut c, pg_txn).await;
             return Err(AppError::new(format!(
                 "query timed out after {}s (cancel requested; the server may still be finishing it) — try a more specific query or raise the timeout in Settings → Slack",
                 cfg.query_timeout_secs
@@ -606,19 +718,12 @@ async fn run_proposal(
         }
         Ok(r) => {
             state.disarm_cancel(&conn_id);
-            rollback_pg(&mut c, pg_txn).await;
             r?
         }
     };
-
-    match outcome {
-        QueryOutcome::Rows { columns, mut rows, .. } => {
-            let truncated = rows.len() > cap;
-            rows.truncate(cap);
-            Ok((columns, rows, truncated))
-        }
-        QueryOutcome::Exec { .. } => Err(AppError::new("the query returned no result set")),
-    }
+    let truncated = rows.len() > cap;
+    rows.truncate(cap);
+    Ok((columns, rows, truncated))
 }
 
 /// Format a stored result on demand (export button click) and attach it in-thread.
@@ -689,7 +794,11 @@ async fn post_result(
     // Keep the result exportable via its format buttons (TTL'd, capped). The store
     // takes ownership and hands back a shared handle — no deep copy of the rows.
     let runtime = app.state::<SlackRuntime>();
-    let (result_id, stored) = runtime.results.insert(columns, rows);
+    let Some((result_id, stored)) = runtime.results.insert(columns, rows) else {
+        let text = "Query completed, but the result exceeded Slack's retained-export memory budget. Run a narrower query.";
+        let _ = api.post_message(&prop.channel, text, Some(blocks::status_card(text)), thread).await;
+        return;
+    };
     let columns = &stored.columns;
     let rows = &stored.rows;
 
@@ -762,6 +871,32 @@ async fn post_export_prompt(api: &SlackApi, prop: &PendingProposal, result_id: &
         .await;
 }
 
+async fn attach(
+    api: &SlackApi,
+    prop: &PendingProposal,
+    columns: &[String],
+    rows: &[Vec<Option<String>>],
+    summary: &str,
+    fmt: &str,
+) {
+    let mut opts: crate::export::ExportOptions = match serde_json::from_value(json!({ "format": fmt })) {
+        Ok(o) => o,
+        Err(_) => return,
+    };
+    opts.bool_cols = crate::export::detect_bool_cols(columns.len(), rows);
+    match crate::export::export_rows_to_bytes(columns, rows, &opts).await {
+        Ok(bytes) => {
+            let filename = format!("result.{fmt}");
+            let _ = api.upload_file(&prop.channel, Some(&prop.thread_ts), &filename, bytes, Some(summary)).await;
+        }
+        Err(e) => {
+            let _ = api
+                .post_message(&prop.channel, &format!("Export failed: {}", e.message), Some(blocks::error_card(&e.message)), Some(&prop.thread_ts))
+                .await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,6 +935,8 @@ mod tests {
             "WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x",
             "SELECT * FROM t FOR UPDATE",                                 // row lock
             "SELECT * FROM t FOR SHARE",
+            "SELECT * FROM t FOR\nSHARE",
+            "SELECT * FROM t INTO OUTFILE '/tmp/leak'",
             "SELECT 1; DROP TABLE users",                                 // multi-statement
             "TRUNCATE t",
             "CREATE TABLE x (id int)",
@@ -816,30 +953,11 @@ mod tests {
         // …but real keywords outside masked regions still trip it.
         assert!(validate_read_only("SELECT $tag$x$tag$ FROM t; DELETE FROM t").is_err());
     }
-}
 
-async fn attach(
-    api: &SlackApi,
-    prop: &PendingProposal,
-    columns: &[String],
-    rows: &[Vec<Option<String>>],
-    summary: &str,
-    fmt: &str,
-) {
-    let mut opts: crate::export::ExportOptions = match serde_json::from_value(json!({ "format": fmt })) {
-        Ok(o) => o,
-        Err(_) => return,
-    };
-    opts.bool_cols = crate::export::detect_bool_cols(columns.len(), rows);
-    match crate::export::export_rows_to_bytes(columns, rows, &opts).await {
-        Ok(bytes) => {
-            let filename = format!("result.{fmt}");
-            let _ = api.upload_file(&prop.channel, Some(&prop.thread_ts), &filename, bytes, Some(summary)).await;
-        }
-        Err(e) => {
-            let _ = api
-                .post_message(&prop.channel, &format!("Export failed: {}", e.message), Some(blocks::error_card(&e.message)), Some(&prop.thread_ts))
-                .await;
-        }
+    #[test]
+    fn result_memory_budget_rejects_oversized_values_and_shapes() {
+        assert!(validate_result_payload(&["a".into()], &[vec![Some("ok".into())]]).is_ok());
+        assert!(validate_result_payload(&["a".into(), "b".into()], &[vec![Some("ragged".into())]]).is_err());
+        assert!(validate_result_payload(&["a".into()], &[vec![Some("x".repeat(1024 * 1024 + 1))]]).is_err());
     }
 }

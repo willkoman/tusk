@@ -115,11 +115,20 @@ pub(crate) fn numeric(values: &[Option<String>]) -> bool {
     let mut saw = false;
     for v in values.iter().flatten() {
         saw = true;
-        if v.parse::<f64>().is_err() {
+        // Finite only: f64::parse accepts "Infinity"/"inf"/"NaN"/"1e999" (the render
+        // token PG/DuckDB emit for float 'Infinity'), and an infinite axis range
+        // sends plotters' key-point loop into an INFINITE LOOP — the Slack consumer
+        // task spins at 100% CPU forever and the bot never answers again.
+        if !v.parse::<f64>().map(|f| f.is_finite()).unwrap_or(false) {
             return false;
         }
     }
     saw
+}
+
+/// Parse a cell as a chartable value: finite f64 or nothing (see `numeric`).
+fn finite(v: Option<&str>) -> Option<f64> {
+    v.and_then(|s| s.parse::<f64>().ok()).filter(|f| f.is_finite())
 }
 
 fn prepare(spec: &ChartSpec, columns: &[String], rows: &[Vec<Option<String>>]) -> Result<Prepared, AppError> {
@@ -157,12 +166,14 @@ fn prepare(spec: &ChartSpec, columns: &[String], rows: &[Vec<Option<String>>]) -
     let x_vals = col(xi);
     let labels: Vec<String> = x_vals.iter().map(|v| v.clone().unwrap_or_else(|| "NULL".into())).collect();
     let x_numeric = numeric(&x_vals)
-        .then(|| x_vals.iter().map(|v| v.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0.0)).collect());
+        .then(|| x_vals.iter().map(|v| finite(v.as_deref()).unwrap_or(0.0)).collect());
 
     let series = series_idx
         .into_iter()
         .map(|k| {
-            let vals: Vec<Option<f64>> = col(k).iter().map(|v| v.as_deref().and_then(|s| s.parse().ok())).collect();
+            // `finite`, not bare parse: one "Infinity" cell in an explicitly requested
+            // series would otherwise reach the axis range and hang the renderer.
+            let vals: Vec<Option<f64>> = col(k).iter().map(|v| finite(v.as_deref())).collect();
             if vals.iter().all(|v| v.is_none()) {
                 return Err(AppError::new(format!("chart series column \"{}\" has no numeric values", columns[k])));
             }
@@ -196,7 +207,16 @@ fn y_range(series: &[(String, Vec<Option<f64>>)]) -> (f64, f64) {
 }
 
 /// Render a chart spec against a result to PNG bytes.
+///
+/// Panic-contained: plotters asserts internally (e.g. on a NaN range), and a panic
+/// here would kill the sequential Slack consumer task while the status badge still
+/// says "connected". A failed render must degrade to the table/file fallback.
 pub fn render_png(spec: &ChartSpec, columns: &[String], rows: &[Vec<Option<String>>]) -> Result<Vec<u8>, AppError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render_png_inner(spec, columns, rows)))
+        .unwrap_or_else(|_| Err(AppError::new("chart render failed unexpectedly — falling back")))
+}
+
+fn render_png_inner(spec: &ChartSpec, columns: &[String], rows: &[Vec<Option<String>>]) -> Result<Vec<u8>, AppError> {
     ensure_font();
     let p = prepare(spec, columns, rows)?;
     let mut buf = vec![0u8; (W * H * 3) as usize];
@@ -225,8 +245,7 @@ fn draw_xy(root: &Area, spec: &ChartSpec, p: &Prepared) -> Result<(), AppError> 
     let scatter_x = spec.kind == "scatter";
     // Scatter with a numeric x column plots real x values; everything else
     // (and non-numeric scatter) uses category indices with label formatting.
-    let (xlo, xhi) = if scatter_x && p.x_numeric.is_some() {
-        let xs = p.x_numeric.as_ref().unwrap();
+    let (xlo, xhi) = if let (true, Some(xs)) = (scatter_x, p.x_numeric.as_ref()) {
         let lo = xs.iter().cloned().fold(f64::MAX, f64::min);
         let hi = xs.iter().cloned().fold(f64::MIN, f64::max);
         let pad = ((hi - lo).abs()).max(1.0) * 0.05;
@@ -368,6 +387,38 @@ mod tests {
 
     fn png_ok(bytes: &[u8]) -> bool {
         bytes.starts_with(&[0x89, b'P', b'N', b'G'])
+    }
+
+    /// "Infinity"/"inf"/"NaN"/"1e999" cells must never reach the axis range — an
+    /// infinite range hangs plotters' key-point loop forever (found rendering PG
+    /// float8 'Infinity'). The renderer must return quickly: chart or clean error.
+    #[test]
+    fn non_finite_values_never_hang_the_renderer() {
+        for bad in ["Infinity", "-Infinity", "inf", "NaN", "1e999"] {
+            let columns = vec!["month".to_string(), "revenue".to_string()];
+            let rows = vec![
+                vec![Some("jan".to_string()), Some("10".to_string())],
+                vec![Some("feb".to_string()), Some(bad.to_string())],
+            ];
+            for kind in ["line", "bar", "scatter"] {
+                let spec = ChartSpec {
+                    kind: kind.to_string(),
+                    x: Some("month".to_string()),
+                    series: vec!["revenue".to_string()],
+                    ..Default::default()
+                };
+                // Finite cell survives, non-finite becomes a gap; either way this
+                // returns (the old behavior looped forever).
+                let r = render_png(&spec, &columns, &rows);
+                if let Ok(bytes) = r {
+                    assert!(png_ok(&bytes), "[{kind}/{bad}] png header");
+                }
+            }
+        }
+        // A column that is entirely non-finite is not numeric → clean error.
+        assert!(!numeric(&[Some("Infinity".to_string())]));
+        assert!(!numeric(&[Some("NaN".to_string())]));
+        assert!(numeric(&[Some("1.5".to_string())]));
     }
 
     #[test]

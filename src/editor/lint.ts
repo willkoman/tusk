@@ -16,7 +16,17 @@ import { serverLintSource } from "./serverLint";
 export function clientLint(getSchema: () => Table[], getFuncs: () => ReadonlySet<string>): Extension {
   const heuristic = heuristicLintSource();
   const schema = schemaLintSource(getSchema, getFuncs);
-  const combined = (view: EditorView): Diagnostic[] => [...heuristic(view), ...schema(view)];
+  // Contain lint bugs: @codemirror/lint runs sync sources unprotected, so a throw
+  // here would escape to window.onerror and put a full-screen crash overlay over the
+  // workbench on every keystroke. Losing squiggles beats losing the editor.
+  const combined = (view: EditorView): Diagnostic[] => {
+    try {
+      return [...heuristic(view), ...schema(view)];
+    } catch (e) {
+      console.error("client lint failed", e);
+      return [];
+    }
+  };
   return linter(combined, { delay: 300 });
 }
 

@@ -65,6 +65,30 @@ pub struct ConnectionConfig {
     pub path: Option<String>,
 }
 
+impl ConnectionConfig {
+    pub fn validate(&self) -> Result<(), AppError> {
+        let driver = self.driver.as_deref().unwrap_or("postgres");
+        if !matches!(driver, "postgres" | "duckdb" | "sqlite" | "mysql") {
+            return Err(AppError::new(format!("unknown driver: {driver}")));
+        }
+        if matches!(driver, "postgres" | "mysql") {
+            if self.port == 0 {
+                return Err(AppError::new("port must be between 1 and 65535"));
+            }
+            if self.host.len() > 1_000 || self.user.len() > 1_000 || self.dbname.len() > 1_000 || self.password.len() > 64 * 1024 {
+                return Err(AppError::new("connection field exceeds its size limit"));
+            }
+            let ssl = self.sslmode.as_deref().unwrap_or("prefer");
+            if !matches!(ssl, "disable" | "prefer" | "require" | "verify-ca" | "verify-full") {
+                return Err(AppError::new(format!("unknown sslmode: {ssl}")));
+            }
+        } else if self.path.as_ref().is_some_and(|p| p.len() > 32_768) {
+            return Err(AppError::new("database path is too long"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct ConnectResult {
     pub connection_id: String,
@@ -101,11 +125,12 @@ pub const CURSOR_NAME: &str = "tusk_cur";
 
 /// Open a Postgres connection (TLS per sslmode) and return the client + server version.
 /// Map an sslmode string to a `SslMode` (encrypt) flag.
-fn ssl_mode_of(cfg: &ConnectionConfig) -> SslMode {
+fn ssl_mode_of(cfg: &ConnectionConfig) -> Result<SslMode, AppError> {
     match cfg.sslmode.as_deref().unwrap_or("prefer") {
-        "disable" => SslMode::Disable,
-        "require" | "verify-ca" | "verify-full" => SslMode::Require,
-        _ => SslMode::Prefer, // prefer: TLS if available, else plaintext
+        "disable" => Ok(SslMode::Disable),
+        "prefer" => Ok(SslMode::Prefer),
+        "require" | "verify-ca" | "verify-full" => Ok(SslMode::Require),
+        other => Err(AppError::new(format!("unknown sslmode: {other}"))),
     }
 }
 
@@ -124,7 +149,7 @@ pub fn make_tls(cfg: &ConnectionConfig) -> Result<postgres_native_tls::MakeTlsCo
 }
 
 pub async fn open(cfg: &ConnectionConfig) -> Result<(Client, String), AppError> {
-    let ssl_mode = ssl_mode_of(cfg);
+    let ssl_mode = ssl_mode_of(cfg)?;
     let tls = make_tls(cfg)?;
 
     let mut pgcfg = tokio_postgres::Config::new();
@@ -166,7 +191,7 @@ pub async fn open(cfg: &ConnectionConfig) -> Result<(Client, String), AppError> 
         .await?
         .into_iter()
         .find_map(|m| match m {
-            SimpleQueryMessage::Row(r) => r.get(0).map(|s| s.to_string()),
+            SimpleQueryMessage::Row(r) => r.try_get(0).ok().flatten().map(|s| s.to_string()),
             _ => None,
         })
         .unwrap_or_else(|| "unknown".to_string());
@@ -194,7 +219,14 @@ pub fn collect_rows(messages: &[SimpleQueryMessage]) -> (Vec<String>, Vec<Vec<Op
                 }
                 let mut row = Vec::with_capacity(cols.len());
                 for i in 0..cols.len() {
-                    row.push(r.get(i).map(|s| s.to_string()));
+                    // try_get, never get: `get` PANICS when the value isn't valid
+                    // UTF-8, which is reachable with zero malice — an SQL_ASCII
+                    // database holding latin1 bytes fails here on every SELECT.
+                    // A visible placeholder beats killing the whole app.
+                    row.push(match r.try_get(i) {
+                        Ok(v) => v.map(|s| s.to_string()),
+                        Err(_) => Some("<invalid UTF-8>".to_string()),
+                    });
                 }
                 rows.push(row);
             }

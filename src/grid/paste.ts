@@ -35,6 +35,12 @@ export type PastePlan = {
   colCount: number;
 };
 
+const MAX_CLIPBOARD_CHARS = 10_000_000;
+const MAX_CLIPBOARD_ROWS = 50_000;
+const MAX_CLIPBOARD_COLS = 10_000;
+const MAX_CLIPBOARD_CELLS = 250_000;
+const MAX_CLIPBOARD_FIELD_CHARS = 1_000_000;
+
 /**
  * Parse clipboard text into a row/column grid. Delimiter is auto-detected: TAB when
  * any tab is present (Excel / another grid), else comma. Quoted fields (`"…"` with
@@ -43,19 +49,25 @@ export type PastePlan = {
  */
 export function parseClipboardTable(text: string): string[][] {
   if (text === "") return [];
+  if (text.length > MAX_CLIPBOARD_CHARS) throw new Error("clipboard data exceeds 10,000,000 characters");
   const delim = text.includes("\t") ? "\t" : ",";
   const rows: string[][] = [];
   let field = "";
   let row: string[] = [];
   let inQuotes = false;
   let started = false; // any char seen on the current row (so a blank line is still a row)
+  let cells = 0;
   let i = 0;
   const pushField = () => {
+    if (row.length >= MAX_CLIPBOARD_COLS) throw new Error("clipboard data has too many columns");
     row.push(field);
     field = "";
   };
   const pushRow = () => {
+    if (rows.length >= MAX_CLIPBOARD_ROWS) throw new Error("clipboard data has too many rows");
     pushField();
+    cells += row.length;
+    if (cells > MAX_CLIPBOARD_CELLS) throw new Error("clipboard data has too many cells");
     rows.push(row);
     row = [];
     started = false;
@@ -74,6 +86,7 @@ export function parseClipboardTable(text: string): string[][] {
         continue;
       }
       field += ch;
+      if (field.length > MAX_CLIPBOARD_FIELD_CHARS) throw new Error("clipboard field is too large");
       i++;
       continue;
     }
@@ -99,9 +112,11 @@ export function parseClipboardTable(text: string): string[][] {
       continue;
     }
     field += ch;
+    if (field.length > MAX_CLIPBOARD_FIELD_CHARS) throw new Error("clipboard field is too large");
     started = true;
     i++;
   }
+  if (inQuotes) throw new Error("clipboard data has an unterminated quoted field");
   if (started || field !== "" || row.length) pushRow();
   // Drop a single trailing empty row (the artifact of a terminating newline).
   if (rows.length && rows[rows.length - 1].length === 1 && rows[rows.length - 1][0] === "") rows.pop();
@@ -122,6 +137,8 @@ export type PlanPasteInput = {
   anchor: RowRef;
   /** Count of loaded snapshot rows. */
   nLoaded: number;
+  /** Canonical loaded-row indices in current display order (identity when absent). */
+  loadedOrder?: number[];
   /** Count of existing pending insert rows. */
   nInsExisting: number;
 };
@@ -135,6 +152,13 @@ const cellValue = (s: string): string | null => (s === "" ? null : s);
  */
 export function planPaste(input: PlanPasteInput): PastePlan {
   const { table, resultColumns, isTableCol, displayOrigCols, anchorDisplayIdx, anchor, nLoaded, nInsExisting } = input;
+  if (table.length > MAX_CLIPBOARD_ROWS) throw new Error("clipboard data has too many rows");
+  let inputCells = 0;
+  for (const row of table) {
+    if (row.length > MAX_CLIPBOARD_COLS) throw new Error("clipboard data has too many columns");
+    inputCells += row.length;
+    if (inputCells > MAX_CLIPBOARD_CELLS) throw new Error("clipboard data has too many cells");
+  }
   const updates: PastePlan["updates"] = [];
 
   // --- header-mapped: first row names editable columns, ≥1 data row follows ---
@@ -170,6 +194,8 @@ export function planPaste(input: PlanPasteInput): PastePlan {
     const oc = displayOrigCols[anchorDisplayIdx + k];
     return oc !== undefined && isTableCol[oc] ? oc : -1;
   };
+  const loadedOrder = input.loadedOrder ?? Array.from({ length: nLoaded }, (_, i) => i);
+  const loadedAnchor = anchor.kind === "loaded" ? loadedOrder.indexOf(anchor.i) : -1;
   const base = anchor.kind === "loaded" ? nLoaded : nInsExisting;
   const overflow = new Map<number, InsertRow>();
   let colCount = 0;
@@ -180,11 +206,12 @@ export function planPaste(input: PlanPasteInput): PastePlan {
       const col = origColAt(k);
       if (col < 0) continue;
       const val = cellValue(r[k]);
-      const idx = anchor.i + j;
-      if (idx < base) {
-        updates.push({ ref: { kind: anchor.kind, i: idx }, col, val });
+      const displayIdx = anchor.kind === "loaded" ? loadedAnchor + j : anchor.i + j;
+      if (displayIdx >= 0 && displayIdx < base) {
+        const idx = anchor.kind === "loaded" ? loadedOrder[displayIdx] : displayIdx;
+        if (idx !== undefined) updates.push({ ref: { kind: anchor.kind, i: idx }, col, val });
       } else {
-        const o = idx - base;
+        const o = Math.max(0, displayIdx - base);
         if (!overflow.has(o)) overflow.set(o, {});
         overflow.get(o)![col] = val;
       }
@@ -193,7 +220,8 @@ export function planPaste(input: PlanPasteInput): PastePlan {
     colCount = Math.max(colCount, wrote);
   }
   const inserts: InsertRow[] = [];
-  const maxO = overflow.size ? Math.max(...overflow.keys()) : -1;
+  let maxO = -1;
+  for (const o of overflow.keys()) if (o > maxO) maxO = o;
   for (let o = 0; o <= maxO; o++) inserts.push(overflow.get(o) ?? {});
   return { mode: "positional", updates, inserts, rowCount: table.length, colCount };
 }

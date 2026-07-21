@@ -91,7 +91,7 @@ describe("buildCommitScript", () => {
       dialect: "mysql",
     }));
     expect(out).toEqual([
-      "UPDATE `public`.`users` SET `email` = 'z' WHERE `id` = '1'",
+      "UPDATE `public`.`users` SET `email` = _utf8mb4 X'7a' WHERE `id` = _utf8mb4 X'31'",
       "INSERT INTO `public`.`users` () VALUES ()",
     ]);
   });

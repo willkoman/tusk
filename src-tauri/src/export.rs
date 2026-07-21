@@ -113,6 +113,34 @@ fn d_true() -> bool {
 }
 
 impl ExportOptions {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if !matches!(self.format.as_str(), "csv" | "tsv" | "json" | "sql" | "markdown" | "xlsx") {
+            return Err(AppError::new("unsupported export format"));
+        }
+        if !matches!(self.delimiter.as_str(), "comma" | "tab" | "semicolon" | "pipe" | "custom")
+            || !matches!(self.quote.as_str(), "always" | "asNeeded" | "never")
+            || !matches!(self.null_mode.as_str(), "empty" | "literal" | "custom")
+            || !matches!(self.line_ending.as_str(), "lf" | "crlf")
+        {
+            return Err(AppError::new("invalid export formatting option"));
+        }
+        if self.quote_char.chars().count() != 1
+            || (self.delimiter == "custom" && self.custom_delimiter.chars().count() != 1)
+            || self.custom_delimiter.chars().any(|c| matches!(c, '\r' | '\n'))
+            || self.quote_char.chars().any(|c| matches!(c, '\r' | '\n'))
+        {
+            return Err(AppError::new("export delimiter and quote character must each be one non-newline character"));
+        }
+        if self.null_text.len() > 1024 * 1024 || self.sql.table.len() > 1_000
+            || self.column_indices.len() > 10_000 || self.bool_cols.len() > 10_000
+            || self.xlsx.sheet_name.is_empty() || self.xlsx.sheet_name.chars().count() > 31
+            || self.xlsx.sheet_name.chars().any(|c| matches!(c, '[' | ']' | ':' | '*' | '?' | '/' | '\\'))
+        {
+            return Err(AppError::new("export option exceeds its size limit"));
+        }
+        Ok(())
+    }
+
     fn delim(&self) -> char {
         match self.delimiter.as_str() {
             "tab" => '\t',
@@ -140,11 +168,13 @@ impl ExportOptions {
         }
     }
     /// Resolve the included column indices for a result with `ncols` columns.
-    fn indices(&self, ncols: usize) -> Vec<usize> {
+    fn indices(&self, ncols: usize) -> Result<Vec<usize>, AppError> {
         if self.column_indices.is_empty() {
-            (0..ncols).collect()
+            Ok((0..ncols).collect())
+        } else if self.column_indices.iter().any(|&i| i >= ncols) {
+            Err(AppError::new("export column selection contains an out-of-range index"))
         } else {
-            self.column_indices.iter().copied().filter(|&i| i < ncols).collect()
+            Ok(self.column_indices.clone())
         }
     }
 }
@@ -340,7 +370,7 @@ impl<'a> TextEmit<'a> {
     async fn write(&mut self, bytes: &[u8]) -> Result<(), AppError> {
         self.writer
             .as_mut()
-            .unwrap()
+            .ok_or_else(|| AppError::new("export writer was not initialized"))?
             .write_all(bytes)
             .await
             .map_err(|e| AppError::new(e.to_string()))
@@ -447,7 +477,12 @@ impl<'a> TextEmit<'a> {
             let nl = self.opts.newline();
             self.write(format!("{nl}]{nl}").as_bytes()).await?;
         }
-        self.writer.as_mut().unwrap().flush().await.map_err(|e| AppError::new(e.to_string()))
+        self.writer
+            .as_mut()
+            .ok_or_else(|| AppError::new("export writer disappeared before flush"))?
+            .flush()
+            .await
+            .map_err(|e| AppError::new(e.to_string()))
     }
 }
 
@@ -602,6 +637,7 @@ pub async fn run_export_query(
     opts: &ExportOptions,
     path: &str,
 ) -> Result<u64, AppError> {
+    opts.validate()?;
     client.batch_execute("BEGIN").await?;
     let declare = format!("DECLARE {EXPORT_CURSOR} CURSOR FOR {sql}");
     if let Err(e) = client.batch_execute(&declare).await {
@@ -634,6 +670,7 @@ struct SinkFeeder<'a> {
     path: &'a str,
     is_xlsx: bool,
     indices: Vec<usize>,
+    initialized: bool,
     text: Option<TextEmit<'a>>,
     xlsx: Option<XlsxSink<'a>>,
     total: u64,
@@ -641,14 +678,18 @@ struct SinkFeeder<'a> {
 
 impl<'a> SinkFeeder<'a> {
     fn new(opts: &'a ExportOptions, path: &'a str) -> Self {
-        Self { opts, path, is_xlsx: opts.format == "xlsx", indices: Vec::new(), text: None, xlsx: None, total: 0 }
+        Self { opts, path, is_xlsx: opts.format == "xlsx", indices: Vec::new(), initialized: false, text: None, xlsx: None, total: 0 }
     }
 
-    fn init_cols(&mut self, cols: &[String]) {
-        if cols.is_empty() || !self.indices.is_empty() {
-            return;
+    fn init_cols(&mut self, cols: &[String]) -> Result<(), AppError> {
+        if cols.is_empty() || self.initialized {
+            return Ok(());
         }
-        self.indices = self.opts.indices(cols.len());
+        self.indices = self.opts.indices(cols.len())?;
+        if self.opts.bool_cols.iter().any(|&i| i >= cols.len()) {
+            return Err(AppError::new("export boolean-column metadata contains an out-of-range index"));
+        }
+        self.initialized = true;
         let pcols = project_cols(cols, &self.indices);
         let pbool = project_bools(self.opts, &self.indices);
         if self.is_xlsx {
@@ -656,15 +697,26 @@ impl<'a> SinkFeeder<'a> {
         } else {
             self.text = Some(TextEmit::new(self.opts, pcols, pbool, self.path));
         }
+        Ok(())
     }
 
     async fn feed(&mut self, rows: &[Vec<Option<String>>]) -> Result<(), AppError> {
+        if !rows.is_empty() && self.text.is_none() && self.xlsx.is_none() {
+            return Err(AppError::new("the export result contains rows but no columns"));
+        }
         for row in rows {
             let prow = project_row(row, &self.indices);
             if self.is_xlsx {
-                self.xlsx.as_mut().unwrap().write_row(&prow)?;
+                self.xlsx
+                    .as_mut()
+                    .ok_or_else(|| AppError::new("xlsx export sink was not initialized"))?
+                    .write_row(&prow)?;
             } else {
-                self.text.as_mut().unwrap().row(&prow).await?;
+                self.text
+                    .as_mut()
+                    .ok_or_else(|| AppError::new("text export sink was not initialized"))?
+                    .row(&prow)
+                    .await?;
             }
             self.total += 1;
         }
@@ -689,7 +741,7 @@ async fn stream_to_sink(client: &Client, opts: &ExportOptions, path: &str) -> Re
         let fetch = format!("FETCH FORWARD {BATCH} FROM {EXPORT_CURSOR}");
         let messages = client.simple_query(&fetch).await?;
         let (cols, rows) = collect_rows(&messages);
-        feeder.init_cols(&cols);
+        feeder.init_cols(&cols)?;
         if rows.is_empty() {
             break;
         }
@@ -713,6 +765,7 @@ pub async fn run_export_paged(
     opts: &ExportOptions,
     path: &str,
 ) -> Result<u64, AppError> {
+    opts.validate()?;
     backend.rollback_cursor().await;
     match paged_inner(backend, sql, opts, path).await {
         Ok(n) => {
@@ -739,7 +792,7 @@ async fn paged_inner(
         db::QueryOutcome::Rows { columns, rows, done, .. } => (columns, rows, done),
         db::QueryOutcome::Exec { .. } => return Err(AppError::new("the export query returned no result set")),
     };
-    feeder.init_cols(&cols);
+    feeder.init_cols(&cols)?;
     feeder.feed(&rows).await?;
     while !done {
         let page = backend.fetch_page(BATCH).await?;
@@ -788,7 +841,11 @@ pub async fn run_export_rows(
     opts: &ExportOptions,
     path: &str,
 ) -> Result<u64, AppError> {
-    let indices = opts.indices(columns.len());
+    opts.validate()?;
+    let indices = opts.indices(columns.len())?;
+    if opts.bool_cols.iter().any(|&i| i >= columns.len()) {
+        return Err(AppError::new("export boolean-column metadata contains an out-of-range index"));
+    }
     let pcols = project_cols(columns, &indices);
     let pbool = project_bools(opts, &indices);
     let mut total: u64 = 0;
@@ -823,6 +880,21 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
+    #[test]
+    fn hostile_export_options_are_rejected() {
+        let mut o = opts(r#"{"format":"csv"}"#);
+        assert!(o.validate().is_ok());
+        o.format = "exe".into();
+        assert!(o.validate().is_err());
+        o.format = "csv".into();
+        o.delimiter = "custom".into();
+        o.custom_delimiter = "\n".into();
+        assert!(o.validate().is_err());
+        o.custom_delimiter = ",".into();
+        o.xlsx.sheet_name = "bad/name".into();
+        assert!(o.validate().is_err());
+    }
+
     /// `note` deliberately holds bool-looking tokens: NOT in bool_cols, must pass raw.
     fn data() -> (Vec<String>, Vec<Vec<Option<String>>>) {
         let cols = vec!["id".into(), "active".into(), "note".into()];
@@ -832,6 +904,26 @@ mod tests {
             vec![Some("3".into()), None, None],
         ];
         (cols, rows)
+    }
+
+    #[tokio::test]
+    async fn zero_column_rows_return_an_error_instead_of_panicking() {
+        let options = opts(r#"{"format":"csv"}"#);
+        let mut feeder = SinkFeeder::new(&options, "unused.csv");
+        feeder.init_cols(&[]).unwrap();
+        let err = feeder.feed(&[vec![]]).await.unwrap_err();
+        assert!(err.message.contains("no columns"));
+    }
+
+    #[test]
+    fn out_of_range_projection_is_rejected_before_writing() {
+        let mut options = opts(r#"{"format":"csv","columnIndices":[99]}"#);
+        let mut feeder = SinkFeeder::new(&options, "unused.csv");
+        assert!(feeder.init_cols(&["only".into()]).is_err());
+        drop(feeder);
+        options.column_indices = vec![0];
+        options.quote_char = "\n".into();
+        assert!(options.validate().is_err());
     }
 
     async fn export(o: &ExportOptions, name: &str) -> String {

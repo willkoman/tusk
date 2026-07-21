@@ -32,6 +32,11 @@ describe("parseClipboardTable", () => {
   it("returns [] for empty text", () => {
     expect(parseClipboardTable("")).toEqual([]);
   });
+
+  it("rejects malformed quotes and excessive columns", () => {
+    expect(() => parseClipboardTable('"unterminated')).toThrow(/unterminated/i);
+    expect(() => parseClipboardTable("\t".repeat(10_001))).toThrow(/too many columns/i);
+  });
 });
 
 const baseInput = (over: Partial<PlanPasteInput> = {}): PlanPasteInput => ({
@@ -121,6 +126,20 @@ describe("planPaste — positional mode", () => {
     expect(plan.inserts).toEqual([{ 1: "Cy", 2: "cy@x" }]);
   });
 
+  it("maps vertical paste through locally sorted display order", () => {
+    const plan = planPaste(baseInput({
+      anchor: { kind: "loaded", i: 2 },
+      loadedOrder: [2, 0, 1],
+      table: [["first"], ["second"], ["third"], ["new"]],
+    }));
+    expect(plan.updates).toEqual([
+      { ref: { kind: "loaded", i: 2 }, col: 0, val: "first" },
+      { ref: { kind: "loaded", i: 0 }, col: 0, val: "second" },
+      { ref: { kind: "loaded", i: 1 }, col: 0, val: "third" },
+    ]);
+    expect(plan.inserts).toEqual([{ 0: "new" }]);
+  });
+
   it("skips columns that run past the visible columns", () => {
     const plan = planPaste(baseInput({
       anchor: { kind: "loaded", i: 0 },
@@ -157,6 +176,11 @@ describe("planPaste — positional mode", () => {
       { ref: { kind: "loaded", i: 0 }, col: 0, val: null },
       { ref: { kind: "loaded", i: 0 }, col: 1, val: "n" },
     ]);
+  });
+
+  it("rejects argument-limit-scale row counts predictably", () => {
+    const table = Array.from({ length: 50_001 }, (_, i) => [String(i)]);
+    expect(() => planPaste(baseInput({ anchor: { kind: "insert", i: 0 }, table }))).toThrow(/too many rows/i);
   });
 });
 

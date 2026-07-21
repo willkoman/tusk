@@ -43,6 +43,7 @@ export type AiConfig = {
 export const activeBaseUrl = (c: AiConfig): string => c.baseUrls[c.provider] ?? "";
 
 const KEY = "tusk.ai.config";
+const MAX_CONFIG_CHARS = 100_000;
 
 /** Configs written before the provider registry existed used the ids "anthropic",
  *  "openai", and "gemini" — all three are still registry ids with the same keychain
@@ -51,35 +52,53 @@ const KEY = "tusk.ai.config";
  *  to reach a compatible endpoint before the registry) keeps working exactly as before:
  *  `openai` is still an openai-wire provider with an editable base. Nothing to migrate —
  *  the only guard needed is against a provider id this build doesn't know. */
-function normalize(raw: Partial<AiConfig> & { baseUrl?: string }): AiConfig {
-  const known = AI_PROVIDERS.some((p) => p.id === raw.provider);
-  const provider = (known ? raw.provider : "anthropic") as AiProvider;
+export function normalizeAiConfig(raw: unknown): AiConfig {
+  const obj = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+  const known = typeof obj.provider === "string" && AI_PROVIDERS.some((p) => p.id === obj.provider);
+  const provider = (known ? obj.provider : "anthropic") as AiProvider;
   // A model saved for a provider we fell back off of is meaningless; otherwise the user's
   // model (including a custom id the registry doesn't list) is preserved.
-  const model = known ? (raw.model ?? "") : defaultModel(provider);
+  const model = known && typeof obj.model === "string" ? obj.model.slice(0, 500) : defaultModel(provider);
   // v1 → v2: a single global `baseUrl`/`model` becomes per-provider maps, attributed to
   // the provider that was active when they were saved. Nothing is lost and no key moves.
-  const models = { ...(raw.models ?? {}) } as Partial<Record<AiProvider, string>>;
-  const baseUrls = { ...(raw.baseUrls ?? {}) } as Partial<Record<AiProvider, string>>;
+  const stringMap = (value: unknown, max: number): Partial<Record<AiProvider, string>> => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    const out: Partial<Record<AiProvider, string>> = {};
+    for (const [k, v] of Object.entries(value))
+      if (AI_PROVIDERS.some((p) => p.id === k) && typeof v === "string") out[k as AiProvider] = v.slice(0, max);
+    return out;
+  };
+  const models = stringMap(obj.models, 500);
+  const baseUrls = stringMap(obj.baseUrls, 2_000);
   if (model && models[provider] === undefined) models[provider] = model;
-  if (raw.baseUrl && baseUrls[provider] === undefined) baseUrls[provider] = raw.baseUrl;
-  return { provider, model, models, baseUrls, shareSamples: raw.shareSamples !== false };
+  if (typeof obj.baseUrl === "string" && baseUrls[provider] === undefined) baseUrls[provider] = obj.baseUrl.slice(0, 2_000);
+  return { provider, model, models, baseUrls, shareSamples: obj.shareSamples !== false };
 }
 
 export const aiStore = {
   load(): AiConfig {
     try {
-      const r = JSON.parse(localStorage.getItem(KEY) || "");
-      if (r && r.provider) return normalize(r);
+      const raw = localStorage.getItem(KEY) || "";
+      if (raw.length > MAX_CONFIG_CHARS) throw new Error("AI config is too large");
+      const r = JSON.parse(raw);
+      if (r && r.provider) return normalizeAiConfig(r);
     } catch {
       /* ignore */
     }
     return { provider: "anthropic", model: defaultModel("anthropic"), models: {}, baseUrls: {}, shareSamples: true };
   },
-  save(c: AiConfig) {
+  save(c: AiConfig): boolean {
     // Keep the per-provider memory in step with the active selection.
-    const next: AiConfig = { ...c, models: { ...c.models, [c.provider]: c.model } };
-    localStorage.setItem(KEY, JSON.stringify(next));
+    const next = normalizeAiConfig({ ...c, models: { ...c.models, [c.provider]: c.model } });
+    try {
+      const json = JSON.stringify(next);
+      if (json.length > MAX_CONFIG_CHARS) return false;
+      localStorage.setItem(KEY, json);
+      return true;
+    } catch {
+      /* localStorage unavailable/full — keep live config in memory */
+      return false;
+    }
   },
 };
 

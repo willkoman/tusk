@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cross-engine driver conformance suite.
+# Cross-engine driver conformance suite (kept LF-only for Bash on Windows).
 #
 # Embedded engines (DuckDB, SQLite) always run. Postgres + MySQL run against throwaway
 # Docker containers this script spins up and tears down. Requires Docker running.

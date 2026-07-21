@@ -77,18 +77,20 @@ fn pg_edge_select(filter: &str) -> String {
     )
 }
 
-fn pg_edge(row: &tokio_postgres::Row) -> FkEdge {
-    let src: Option<String> = row.get(3);
-    let dst: Option<String> = row.get(6);
-    FkEdge {
-        constraint: row.get(0),
-        src_schema: row.get(1),
-        src_table: row.get(2),
+// Fallible on purpose: typed `get` panics on a type mismatch, and this module's
+// contract is best-effort (a weird row is dropped, never a process abort).
+fn pg_edge(row: &tokio_postgres::Row) -> Option<FkEdge> {
+    let src: Option<String> = row.try_get(3).ok()?;
+    let dst: Option<String> = row.try_get(6).ok()?;
+    Some(FkEdge {
+        constraint: row.try_get(0).ok()?,
+        src_schema: row.try_get(1).ok()?,
+        src_table: row.try_get(2).ok()?,
         src_cols: split_cols(&src.unwrap_or_default()),
-        dst_schema: row.get(4),
-        dst_table: row.get(5),
+        dst_schema: row.try_get(4).ok()?,
+        dst_table: row.try_get(5).ok()?,
         dst_cols: split_cols(&dst.unwrap_or_default()),
-    }
+    })
 }
 
 pub async fn pg_table_relationships(
@@ -105,7 +107,9 @@ pub async fn pg_table_relationships(
         )
         .await?;
     let oid: u32 = match rows.first() {
-        Some(r) => r.get(0),
+        Some(r) => r
+            .try_get(0)
+            .map_err(|e| AppError::new(format!("unexpected catalog shape: {e}")))?,
         None => return Err(AppError::new("relation not found")),
     };
     let q = pg_edge_select("con.conrelid = $1 OR con.confrelid = $1");
@@ -113,7 +117,7 @@ pub async fn pg_table_relationships(
     let mut outbound = Vec::new();
     let mut inbound = Vec::new();
     for row in &rows {
-        let e = pg_edge(row);
+        let Some(e) = pg_edge(row) else { continue };
         // Self-referencing FKs land in both lists on purpose.
         if e.src_schema == schema && e.src_table == name {
             outbound.push(e.clone());
@@ -128,7 +132,7 @@ pub async fn pg_table_relationships(
 pub async fn pg_schema_relationships(client: &Client, schema: &str) -> Result<SchemaGraph, AppError> {
     let q = pg_edge_select("sn.nspname = $1 OR dn.nspname = $1");
     let edge_rows = client.query(q.as_str(), &[&schema]).await?;
-    let edges: Vec<FkEdge> = edge_rows.iter().map(pg_edge).collect();
+    let edges: Vec<FkEdge> = edge_rows.iter().filter_map(pg_edge).collect();
 
     let col_rows = client
         .query(
@@ -156,8 +160,15 @@ pub async fn pg_schema_relationships(client: &Client, schema: &str) -> Result<Sc
     let mut pk: std::collections::HashSet<(String, String)> = Default::default();
     let mut fk: std::collections::HashSet<(String, String)> = Default::default();
     for r in &key_rows {
-        let key = (r.get::<_, String>(0), r.get::<_, String>(1));
-        match r.get::<_, String>(2).as_str() {
+        let (Ok(t), Ok(c), Ok(ty)) = (
+            r.try_get::<_, String>(0),
+            r.try_get::<_, String>(1),
+            r.try_get::<_, String>(2),
+        ) else {
+            continue; // best-effort: drop the weird row, never panic
+        };
+        let key = (t, c);
+        match ty.as_str() {
             "p" => {
                 pk.insert(key);
             }
@@ -169,18 +180,21 @@ pub async fn pg_schema_relationships(client: &Client, schema: &str) -> Result<Sc
 
     let mut tables: Vec<ErdTable> = Vec::new();
     for r in &col_rows {
-        let tname: String = r.get(0);
-        let cname: String = r.get(1);
+        let (Ok(tname), Ok(cname)) = (r.try_get::<_, String>(0), r.try_get::<_, String>(1)) else {
+            continue;
+        };
         if tables.last().map(|t: &ErdTable| t.name != tname).unwrap_or(true) {
             tables.push(ErdTable { schema: schema.to_string(), name: tname.clone(), columns: Vec::new() });
         }
         let k = (tname, cname.clone());
-        tables.last_mut().unwrap().columns.push(ErdColumn {
-            is_pk: pk.contains(&k),
-            is_fk: fk.contains(&k),
-            name: cname,
-            data_type: r.get(2),
-        });
+        if let Some(table) = tables.last_mut() {
+            table.columns.push(ErdColumn {
+                is_pk: pk.contains(&k),
+                is_fk: fk.contains(&k),
+                name: cname,
+                data_type: r.try_get(2).unwrap_or_default(),
+            });
+        }
     }
     Ok(SchemaGraph { tables, edges })
 }
@@ -235,7 +249,7 @@ fn sqlite_outbound(q: TextQuery, table: &str) -> Vec<FkEdge> {
                 dst_cols: Vec::new(),
             });
         }
-        let e = edges.last_mut().unwrap();
+        let Some(e) = edges.last_mut() else { continue };
         e.src_cols.push(cell(r, 3));
         let to = r.get(4).and_then(|v| v.clone());
         if let Some(t) = to {
@@ -319,7 +333,7 @@ fn mysql_group_edges(rows: &[Vec<Option<String>>]) -> Vec<FkEdge> {
                 dst_cols: Vec::new(),
             });
         }
-        let e = edges.last_mut().unwrap();
+        let Some(e) = edges.last_mut() else { continue };
         e.src_cols.push(cell(r, 3));
         e.dst_cols.push(cell(r, 6));
     }
@@ -383,12 +397,14 @@ pub fn mysql_schema_graph(
             tables.push(ErdTable { schema: schema.to_string(), name: t.clone(), columns: Vec::new() });
         }
         let cname = cell(r, 1);
-        tables.last_mut().unwrap().columns.push(ErdColumn {
-            is_pk: cell(r, 3) == "PRI",
-            is_fk: fk_cols.contains(&(t, cname.clone())),
-            name: cname,
-            data_type: cell(r, 2),
-        });
+        if let Some(table) = tables.last_mut() {
+            table.columns.push(ErdColumn {
+                is_pk: cell(r, 3) == "PRI",
+                is_fk: fk_cols.contains(&(t, cname.clone())),
+                name: cname,
+                data_type: cell(r, 2),
+            });
+        }
     }
     SchemaGraph { tables, edges }
 }
@@ -415,7 +431,11 @@ fn duck_list(s: &str) -> Vec<String> {
 
 /// Fallback: pull "FOREIGN KEY (a, b) REFERENCES tbl(x, y)" apart without regex.
 fn duck_parse_constraint_text(text: &str) -> Option<(Vec<String>, String, Vec<String>)> {
-    let up = text.to_uppercase();
+    // ASCII uppercase ONLY: `to_uppercase()` can change byte length (ǰ→J̌, ﬁ→FI),
+    // and the offsets found in `up` are used to slice `text` — a length drift lands
+    // mid-char and panics. The keywords being matched are pure ASCII, so ASCII
+    // case-folding is byte-length-preserving and exactly as good here.
+    let up = text.to_ascii_uppercase();
     let fk = up.find("FOREIGN KEY")?;
     let open = text[fk..].find('(')? + fk;
     let close = text[open..].find(')')? + open;
@@ -468,6 +488,28 @@ pub fn duck_edges(rows: &[Vec<Option<String>>], structured: bool) -> Vec<FkEdge>
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ǰ` uppercases to a 3-byte `J̌` via Unicode folding — with `to_uppercase()`
+    /// the offsets found in the folded string desynced from the original and the
+    /// slice panicked mid-char. ASCII folding keeps byte offsets identical.
+    #[test]
+    fn duck_constraint_text_survives_multibyte_identifiers() {
+        let (src, table, dst) = duck_parse_constraint_text("FOREIGN KEY (ǰ) REFERENCES a(x)").unwrap();
+        assert_eq!(src, vec!["ǰ"]);
+        assert_eq!(table, "a");
+        assert_eq!(dst, vec!["x"]);
+
+        let (src2, table2, dst2) =
+            duck_parse_constraint_text("FOREIGN KEY (ﬁrst_id, b) REFERENCES übertabelle(x, y)").unwrap();
+        assert_eq!(src2, vec!["ﬁrst_id", "b"]);
+        assert_eq!(table2, "übertabelle");
+        assert_eq!(dst2, vec!["x", "y"]);
+    }
 }
 
 pub const DUCK_FK_STRUCTURED: &str = "SELECT schema_name, table_name, constraint_text, referenced_table, \

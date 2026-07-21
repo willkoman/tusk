@@ -5,8 +5,9 @@ import { type DialectId } from "../sql/dialects";
 import { THEMES } from "../themes";
 import { SlackPane } from "./SlackPane";
 import { AiPane } from "./AiPane";
+import { crashConsent, setCrashConsent } from "../store";
 
-export type SettingsTab = "editor" | "appearance" | "grid" | "plans" | "ai" | "slack" | "shortcuts";
+export type SettingsTab = "editor" | "appearance" | "grid" | "plans" | "ai" | "slack" | "shortcuts" | "privacy";
 
 const TABS: { id: SettingsTab; label: string }[] = [
   { id: "editor", label: "Editor" },
@@ -16,6 +17,7 @@ const TABS: { id: SettingsTab; label: string }[] = [
   { id: "ai", label: "AI" },
   { id: "slack", label: "Slack" },
   { id: "shortcuts", label: "Shortcuts" },
+  { id: "privacy", label: "Privacy" },
 ];
 
 const FONT_PRESETS = ["JetBrains Mono", "Cascadia Code", "Fira Code", "SF Mono", "Menlo", "Consolas", "Courier New"];
@@ -230,6 +232,28 @@ export function SettingsDialog(props: {
               <Show when={props.shortcutsPane} fallback={<div class="settings-note">Keyboard shortcut customization coming soon.</div>}>
                 {props.shortcutsPane!()}
               </Show>
+            </Match>
+
+            <Match when={tab() === "privacy"}>
+              <label class="settings-row">
+                <span>Offer crash reports after a crash</span>
+                <input
+                  type="checkbox"
+                  checked={crashConsent() === "on"}
+                  onChange={(e) => setCrashConsent(e.currentTarget.checked ? "on" : "off")}
+                />
+              </label>
+              <div class="settings-note">
+                When on, a crash (or a crash recovered from the previous run) shows its details with
+                one-click copy/email actions. When off, Tusk recovers quietly and clears prior-run
+                reports unshown. Nothing is ever transmitted automatically in either mode — sending a
+                report is always an explicit action, and reports never intentionally include connection
+                settings, credentials, or saved queries.
+              </div>
+              <div class="settings-note">
+                Also here: the AI tab's "share sample rows" toggle controls whether real table values
+                are sent to your AI provider, and Slack tokens/AI keys live only in the OS keychain.
+              </div>
             </Match>
           </Switch>
         </div>

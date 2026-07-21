@@ -44,6 +44,23 @@ export type PlanTree = {
 
 export type ParsedPlan = PlanTree | { kind: "text"; text: string };
 
+const MAX_PLAN_DEPTH = 256;
+const MAX_PLAN_VALUES = 50_000;
+
+/** Bound provider/database-controlled JSON before recursive engine normalization. */
+export function planInputWithinLimits(root: unknown): boolean {
+  const stack: { value: unknown; depth: number }[] = [{ value: root, depth: 0 }];
+  let count = 0;
+  while (stack.length) {
+    const { value, depth } = stack.pop()!;
+    if (++count > MAX_PLAN_VALUES || depth > MAX_PLAN_DEPTH) return false;
+    if (!value || typeof value !== "object") continue;
+    const children = Array.isArray(value) ? value : Object.values(value as Record<string, unknown>);
+    for (const child of children) stack.push({ value: child, depth: depth + 1 });
+  }
+  return true;
+}
+
 /** Preorder-number a tree, compute maxima, and wrap it. */
 export function finishTree(
   engine: EngineKind,
@@ -55,16 +72,17 @@ export function finishTree(
   let maxSelfTimeMs = 0;
   let maxRows = 0;
   let hasActual = extra?.hasActual ?? false;
-  const walk = (n: PlanNode) => {
+  const stack = [root];
+  while (stack.length) {
+    const n = stack.pop()!;
     n.id = id++;
     if (n.selfCost !== undefined) maxSelfCost = Math.max(maxSelfCost, n.selfCost);
     if (n.selfTimeMs !== undefined) maxSelfTimeMs = Math.max(maxSelfTimeMs, n.selfTimeMs);
     const r = n.actualRows ?? n.planRows;
     if (r !== undefined) maxRows = Math.max(maxRows, r);
     if (n.actualRows !== undefined || n.totalTimeMs !== undefined) hasActual = true;
-    n.children.forEach(walk);
-  };
-  walk(root);
+    for (let i = n.children.length - 1; i >= 0; i--) stack.push(n.children[i]);
+  }
   return {
     kind: "tree",
     engine,

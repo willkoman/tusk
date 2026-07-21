@@ -23,6 +23,7 @@ export function ContextMenu(props: {
   const onKey = (e: KeyboardEvent) => {
     if (e.key === "Escape") props.onClose();
   };
+  let installTimer: ReturnType<typeof setTimeout> | undefined;
   onMount(() => {
     if (el) {
       const r = el.getBoundingClientRect();
@@ -31,12 +32,13 @@ export function ContextMenu(props: {
       if (x !== props.x || y !== props.y) setPos({ x, y });
     }
     // Defer so the click that opened the menu doesn't immediately dismiss it.
-    setTimeout(() => {
+    installTimer = setTimeout(() => {
       document.addEventListener("mousedown", onDocDown);
       document.addEventListener("keydown", onKey);
     });
   });
   onCleanup(() => {
+    clearTimeout(installTimer);
     document.removeEventListener("mousedown", onDocDown);
     document.removeEventListener("keydown", onKey);
   });

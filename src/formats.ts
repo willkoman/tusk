@@ -2,19 +2,38 @@
 
 export type Dataset = { columns: string[]; rows: (string | null)[][] };
 
+export const IMPORT_LIMITS = {
+  bytes: 20_000_000,
+  chars: 20_000_000,
+  rows: 200_000,
+  columns: 10_000,
+  cells: 2_000_000,
+  fieldChars: 1_000_000,
+} as const;
+
+function importLimit(message: string): never {
+  throw new Error(`import is too large: ${message}`);
+}
+
 // ---------- parsing (import) ----------
 
-export function parseCSV(text: string, hasHeader: boolean): Dataset {
+export function parseCSV(text: string, hasHeader: boolean, delimiter = ","): Dataset {
+  if (text.length > IMPORT_LIMITS.chars) importLimit(`file exceeds ${IMPORT_LIMITS.chars.toLocaleString()} characters`);
+  if (delimiter !== "," && delimiter !== "\t") throw new Error("unsupported import delimiter");
   const rows: string[][] = [];
   let field = "";
   let row: string[] = [];
   let inQuotes = false;
   let i = 0;
+  let parsedCells = 0;
   const pushField = () => {
+    if (row.length >= IMPORT_LIMITS.columns) importLimit(`more than ${IMPORT_LIMITS.columns.toLocaleString()} columns`);
+    if (++parsedCells > IMPORT_LIMITS.cells) importLimit(`more than ${IMPORT_LIMITS.cells.toLocaleString()} cells`);
     row.push(field);
     field = "";
   };
   const pushRow = () => {
+    if (rows.length >= IMPORT_LIMITS.rows) importLimit(`more than ${IMPORT_LIMITS.rows.toLocaleString()} rows`);
     rows.push(row);
     row = [];
   };
@@ -32,6 +51,7 @@ export function parseCSV(text: string, hasHeader: boolean): Dataset {
         continue;
       }
       field += ch;
+      if (field.length > IMPORT_LIMITS.fieldChars) importLimit(`a field exceeds ${IMPORT_LIMITS.fieldChars.toLocaleString()} characters`);
       i++;
       continue;
     }
@@ -40,7 +60,7 @@ export function parseCSV(text: string, hasHeader: boolean): Dataset {
       i++;
       continue;
     }
-    if (ch === ",") {
+    if (ch === delimiter) {
       pushField();
       i++;
       continue;
@@ -56,8 +76,10 @@ export function parseCSV(text: string, hasHeader: boolean): Dataset {
       continue;
     }
     field += ch;
+    if (field.length > IMPORT_LIMITS.fieldChars) importLimit(`a field exceeds ${IMPORT_LIMITS.fieldChars.toLocaleString()} characters`);
     i++;
   }
+  if (inQuotes) throw new Error("malformed delimited file: unterminated quoted field");
   if (field.length > 0 || row.length > 0) {
     pushField();
     pushRow();
@@ -66,6 +88,8 @@ export function parseCSV(text: string, hasHeader: boolean): Dataset {
   if (data.length === 0) return { columns: [], rows: [] };
   const columns = hasHeader ? data[0] : data[0].map((_, k) => `col${k + 1}`);
   const body = hasHeader ? data.slice(1) : data;
+  if (columns.length * body.length > IMPORT_LIMITS.cells)
+    importLimit(`dense result would exceed ${IMPORT_LIMITS.cells.toLocaleString()} cells`);
   return {
     columns,
     rows: body.map((r) => columns.map((_, k) => (k < r.length ? r[k] : null))),
@@ -73,19 +97,33 @@ export function parseCSV(text: string, hasHeader: boolean): Dataset {
 }
 
 export function parseJSON(text: string): Dataset {
+  if (text.length > IMPORT_LIMITS.chars) importLimit(`file exceeds ${IMPORT_LIMITS.chars.toLocaleString()} characters`);
   const parsed = JSON.parse(text);
   const arr: any[] = Array.isArray(parsed) ? parsed : [parsed];
+  if (arr.length > IMPORT_LIMITS.rows) importLimit(`more than ${IMPORT_LIMITS.rows.toLocaleString()} rows`);
+  if (arr.some((o) => !o || typeof o !== "object" || Array.isArray(o)))
+    throw new Error("JSON import requires an object or an array of objects");
   const columns: string[] = [];
+  const seen = new Set<string>();
   for (const o of arr) {
-    if (o && typeof o === "object") {
-      for (const k of Object.keys(o)) if (!columns.includes(k)) columns.push(k);
+    for (const k of Object.keys(o)) {
+      if (!seen.has(k)) {
+        if (columns.length >= IMPORT_LIMITS.columns) importLimit(`more than ${IMPORT_LIMITS.columns.toLocaleString()} columns`);
+        seen.add(k);
+        columns.push(k);
+      }
     }
   }
+  if (columns.length * arr.length > IMPORT_LIMITS.cells)
+    importLimit(`dense result would exceed ${IMPORT_LIMITS.cells.toLocaleString()} cells`);
   const rows = arr.map((o) =>
     columns.map((c) => {
       const v = o?.[c];
       if (v === undefined || v === null) return null;
-      return typeof v === "object" ? JSON.stringify(v) : String(v);
+      const rendered = typeof v === "object" ? JSON.stringify(v) : String(v);
+      if (rendered.length > IMPORT_LIMITS.fieldChars)
+        importLimit(`a field exceeds ${IMPORT_LIMITS.fieldChars.toLocaleString()} characters`);
+      return rendered;
     }),
   );
   return { columns, rows };
