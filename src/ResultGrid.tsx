@@ -41,11 +41,13 @@ export type ResultGridProps = {
   activeTabId: Accessor<string>;
   /** Bumped on each new query (not on append) — grid resets scroll/selection. */
   epoch: Accessor<number>;
+  /** Identity of the backend result loaded into this tab. */
+  resultGeneration: Accessor<number>;
   onLoadMore: () => void;
   onSortFilter: (sorts: SortKey[], filters: Filter[], kind: "sort" | "filter") => void;
   onMenu: (x: number, y: number, items: MenuItem[]) => void;
   onViewValue: (col: string, val: string | null) => void;
-  onStatus: (text: string) => void;
+  onStatus: (text: string, tabId: string, resultGeneration: number) => void;
   canSort: Accessor<boolean>;
   canFilter: Accessor<boolean>;
   /** Canonical loaded-row indices in visible order; null = identity. */
@@ -175,6 +177,7 @@ export function ResultGrid(props: ResultGridProps) {
   const scrollMem = new Map<string, { top: number; left: number }>();
   let rafPending = false;
   let scrollRaf: number | undefined;
+  let measureRaf: number | undefined;
   let resizeObserver: ResizeObserver | undefined;
   function onScroll() {
     if (!scroller || rafPending) return;
@@ -197,7 +200,7 @@ export function ResultGrid(props: ResultGridProps) {
       setViewportH(el.clientHeight);
       setViewportW(el.clientWidth);
     };
-    requestAnimationFrame(measure);
+    measureRaf = requestAnimationFrame(measure);
     resizeObserver?.disconnect();
     resizeObserver = new ResizeObserver(measure);
     resizeObserver.observe(el);
@@ -213,7 +216,7 @@ export function ResultGrid(props: ResultGridProps) {
   // so a plain function here fired the reset on every grid mutation, yanking scroll to 0
   // and clearing the selection. The memo dedupes by string value, so the callback runs
   // only on a real tab switch or new-query epoch bump.
-  const resultKey = createMemo(() => `${props.activeTabId()}:${props.epoch()}`);
+  const resultKey = createMemo(() => `${props.activeTabId()}:${props.resultGeneration()}:${props.epoch()}`);
   createEffect(
     on(resultKey, (key, prev) => {
       setSel(EMPTY_SEL);
@@ -380,6 +383,7 @@ export function ResultGrid(props: ResultGridProps) {
   let editOrig: string | null = null; // displayed value when the editor opened
   let editCancelled = false;
   const NULL_OPT = "~null~"; // select-option sentinel for SQL NULL
+  const DEFAULT_OPT = "~default~"; // untouched insert cell: omit column from INSERT
   function beginEdit(r: number, dc: number) {
     if (!props.editable() || isDeleted(r)) return;
     const oi = displayCols()[dc];
@@ -399,7 +403,8 @@ export function ResultGrid(props: ResultGridProps) {
       if (!editSelect) return;
       const v = editSelect.value;
       setEditing(null);
-      if (v === NULL_OPT) props.onEditCell(rowRef(ed.r), oi, null);
+      if (v === DEFAULT_OPT) props.onEditCell(rowRef(ed.r), oi, undefined);
+      else if (v === NULL_OPT) props.onEditCell(rowRef(ed.r), oi, null);
       else {
         // Re-picking the original value reverts the pending edit instead of
         // recording a no-op write (PG snapshot "t" vs dropdown "true" would
@@ -493,7 +498,12 @@ export function ResultGrid(props: ResultGridProps) {
       case "Delete":
       case "Backspace":
         // Row-selection only — a stray Delete on a cell selection must not mark rows.
-        if (props.editable() && s.mode === "rows") { props.onMarkDelete(selectedRowIndices().map(rowRef)); e.preventDefault(); }
+        if (props.editable() && s.mode === "rows") {
+          const count = Math.max(0, rect().r1 - rect().r0 + 1);
+          if (count > 100_000) props.onStatus("select at most 100,000 rows per edit", props.activeTabId(), props.resultGeneration());
+          else props.onMarkDelete(selectedRowIndices().map(rowRef));
+          e.preventDefault();
+        }
         break;
     }
   }
@@ -501,6 +511,7 @@ export function ResultGrid(props: ResultGridProps) {
   // --- paste (Mod+V) — parse the clipboard and hand a grid + anchor to App ---
   async function doPaste() {
     const tabId = props.activeTabId();
+    const generation = props.resultGeneration();
     const key = resultKey();
     const selected = { ...sel() };
     const dc = [...displayCols()];
@@ -512,7 +523,7 @@ export function ResultGrid(props: ResultGridProps) {
     try {
       const text = await clipRead();
       if (props.activeTabId() !== tabId || resultKey() !== key || props.pending() !== pending) {
-        props.onStatus("paste cancelled because the result changed");
+        props.onStatus("paste cancelled because the result changed", tabId, generation);
         return;
       }
       if (text == null || text === "") return;
@@ -522,7 +533,7 @@ export function ResultGrid(props: ResultGridProps) {
       // loaded rows; otherwise anchor at the focused cell captured before clipboard I/O.
       props.onPaste(anchor, selected.mode === "none" ? 0 : anchorCol, dc, table);
     } catch (e) {
-      props.onStatus(`paste rejected: ${e instanceof Error ? e.message : String(e)}`);
+      props.onStatus(`paste rejected: ${e instanceof Error ? e.message : String(e)}`, tabId, generation);
     }
   }
 
@@ -530,7 +541,8 @@ export function ResultGrid(props: ResultGridProps) {
   // Hard ceiling on synchronous clipboard materialization. Beyond this the string
   // build (JSON pretty-print ≈ 2-4× expansion) freezes the UI thread and can OOM-kill
   // the WebView — the one crash class CrashGuard cannot catch. Export streams instead.
-  const MAX_COPY_CELLS = 5_000_000;
+  const MAX_COPY_CELLS = 1_000_000;
+  const MAX_COPY_CHARS = 8 * 1024 * 1024;
   function selectionBounds(): { r0: number; r1: number; cols: number[] } {
     const dc = displayCols();
     const s = sel();
@@ -548,9 +560,9 @@ export function ResultGrid(props: ResultGridProps) {
     }
     return { r0, r1, cols };
   }
-  function selectionDataset(): Dataset {
+  function selectionDataset(bounds = selectionBounds()): Dataset {
     const names = props.columns();
-    const { r0, r1, cols } = selectionBounds();
+    const { r0, r1, cols } = bounds;
     // Read through the pending overlay + bool mapping so copy matches what's
     // displayed (edited cells, insert rows, TRUE/FALSE pills).
     const rows: (string | null)[][] = [];
@@ -558,21 +570,48 @@ export function ResultGrid(props: ResultGridProps) {
     return { columns: cols.map((oi) => names[oi]), rows };
   }
   async function copySelection(fmt: "tsv" | "csv" | "json" | "md") {
+    const tabId = props.activeTabId();
+    const generation = props.resultGeneration();
     const b = selectionBounds();
     const cells = (b.r1 - b.r0 + 1) * b.cols.length;
     if (cells > MAX_COPY_CELLS) {
-      props.onStatus(`selection too large to copy (${cells.toLocaleString()} cells) — use Export… instead`);
+      props.onStatus(`selection too large to copy (${cells.toLocaleString()} cells) — use Export… instead`, tabId, generation);
       return;
     }
-    const d = selectionDataset();
+    let chars = props.copyHeaders() ? b.cols.reduce((n, oi) => n + (props.columns()[oi]?.length ?? 0), 0) : 0;
+    outer: for (let r = b.r0; r <= b.r1; r++) {
+      for (const oi of b.cols) {
+        chars += copyVal(r, oi)?.length ?? 0;
+        if (chars > MAX_COPY_CHARS) break outer;
+      }
+    }
+    if (chars > MAX_COPY_CHARS) {
+      props.onStatus(`selection too large to copy (${chars.toLocaleString()}+ characters) — use Export… instead`, tabId, generation);
+      return;
+    }
+    const d = selectionDataset(b);
     const h = props.copyHeaders();
-    const text = fmt === "csv" ? toCSV(d, h) : fmt === "json" ? toJSON(d, h) : fmt === "md" ? toMarkdown(d, h) : toTSV(d, h);
-    const ok = await clipWrite(text);
-    props.onStatus(ok ? `copied ${d.rows.length}×${d.columns.length}` : "clipboard unavailable");
+    try {
+      const text = fmt === "csv" ? toCSV(d, h) : fmt === "json" ? toJSON(d, h) : fmt === "md" ? toMarkdown(d, h) : toTSV(d, h);
+      const ok = await clipWrite(text);
+      props.onStatus(ok ? `copied ${d.rows.length}×${d.columns.length}` : "clipboard unavailable", tabId, generation);
+    } catch (e) {
+      props.onStatus(`copy rejected: ${e instanceof Error ? e.message : String(e)}`, tabId, generation);
+    }
   }
   async function copyText(t: string, msg: string) {
-    const ok = await clipWrite(t);
-    props.onStatus(ok ? msg : "clipboard unavailable");
+    const tabId = props.activeTabId();
+    const generation = props.resultGeneration();
+    if (t.length > MAX_COPY_CHARS) {
+      props.onStatus(`value too large to copy (${t.length.toLocaleString()} characters) — use Export… instead`, tabId, generation);
+      return;
+    }
+    try {
+      const ok = await clipWrite(t);
+      props.onStatus(ok ? msg : "clipboard unavailable", tabId, generation);
+    } catch (e) {
+      props.onStatus(`copy rejected: ${e instanceof Error ? e.message : String(e)}`, tabId, generation);
+    }
   }
   const columnDataset = (oi: number): Dataset => ({
     columns: [props.columns()[oi]],
@@ -580,10 +619,31 @@ export function ResultGrid(props: ResultGridProps) {
   });
   function copyColumn(oi: number) {
     if (nRows() > MAX_COPY_CELLS) {
-      props.onStatus(`column too large to copy (${nRows().toLocaleString()} rows) — use Export… instead`);
+      props.onStatus(`column too large to copy (${nRows().toLocaleString()} rows) — use Export… instead`, props.activeTabId(), props.resultGeneration());
+      return;
+    }
+    let chars = props.copyHeaders() ? props.columns()[oi]?.length ?? 0 : 0;
+    for (let r = 0; r < nRows() && chars <= MAX_COPY_CHARS; r++) chars += copyVal(r, oi)?.length ?? 0;
+    if (chars > MAX_COPY_CHARS) {
+      props.onStatus(`column too large to copy (${chars.toLocaleString()}+ characters) — use Export… instead`, props.activeTabId(), props.resultGeneration());
       return;
     }
     void copyText(toTSV(columnDataset(oi), props.copyHeaders()), "copied column");
+  }
+
+  function bindMenuItems(items: MenuItem[]): MenuItem[] {
+    const tabId = props.activeTabId();
+    const key = resultKey();
+    const pending = props.pending();
+    const order = props.rowOrder();
+    const view = props.view();
+    const valid = () =>
+      props.activeTabId() === tabId &&
+      resultKey() === key &&
+      props.pending() === pending &&
+      props.rowOrder() === order &&
+      props.view() === view;
+    return items.map((item) => "sep" in item ? item : { ...item, valid });
   }
 
   // --- context menus ---
@@ -592,9 +652,12 @@ export function ResultGrid(props: ResultGridProps) {
     e.stopPropagation();
     if (!isSel(r, dc)) setSel({ mode: "cell", ar: r, ac: dc, fr: r, fc: dc });
     const name = props.columns()[oi];
+    const clickedRef = rowRef(r);
     const editItems: MenuItem[] = [];
     if (props.editable()) {
-      const selRows = selectedRowIndices(r);
+      const selectedCount = sel().mode === "none" || sel().mode === "cols" ? 1 : Math.max(0, rect().r1 - rect().r0 + 1);
+      const editSelectionTooLarge = selectedCount > 100_000;
+      const selRows = editSelectionTooLarge ? [] : selectedRowIndices(r);
       // "Undelete" only when every LOADED row in the selection is already marked
       // (insert rows aren't delete-marked — they're removed outright).
       const loadedSel = selRows.filter((x) => !isInsRow(x));
@@ -602,28 +665,36 @@ export function ResultGrid(props: ResultGridProps) {
       const colOk = props.canEditCol(oi) && !isDeleted(r);
       editItems.push(
         { label: "Edit cell", icon: "edit", disabled: !colOk, title: colOk ? undefined : "column doesn't belong to the table", onClick: () => beginEdit(r, dc) },
-        { label: "Set NULL", icon: "slash", disabled: !colOk, onClick: () => props.onEditCell(rowRef(r), oi, null) },
+        { label: "Set NULL", icon: "slash", disabled: !colOk, onClick: () => props.onEditCell(clickedRef, oi, null) },
       );
-      if (isDirty(r, oi)) editItems.push({ label: "Revert cell", icon: "eraser", onClick: () => props.onEditCell(rowRef(r), oi, undefined) });
+      if (isDirty(r, oi)) editItems.push({ label: "Revert cell", icon: "eraser", onClick: () => props.onEditCell(clickedRef, oi, undefined) });
       editItems.push(
-        { label: allDel ? `Undelete row${selRows.length > 1 ? "s" : ""}` : `Delete row${selRows.length > 1 ? "s" : ""}`, icon: "trash", danger: !allDel, onClick: () => props.onMarkDelete(selRows.map(rowRef)) },
+        {
+          label: editSelectionTooLarge ? "Delete rows" : allDel ? `Undelete row${selRows.length > 1 ? "s" : ""}` : `Delete row${selRows.length > 1 ? "s" : ""}`,
+          icon: "trash",
+          danger: !allDel,
+          disabled: editSelectionTooLarge,
+          title: editSelectionTooLarge ? "Select at most 100,000 rows per edit" : undefined,
+          onClick: () => props.onMarkDelete(selRows.map(rowRef)),
+        },
         { label: "Insert row", icon: "plus", onClick: () => props.onAddRow() },
         { sep: true },
       );
     } else if (props.editReason()) {
       editItems.push({ label: "Edit cell", icon: "edit", disabled: true, title: props.editReason(), onClick: () => {} }, { sep: true });
     }
-    props.onMenu(e.clientX, e.clientY, [
+    const copiedVal = copyVal(r, oi);
+    props.onMenu(e.clientX, e.clientY, bindMenuItems([
       ...editItems,
       { label: "Copy", icon: "copy", onClick: () => void copySelection("tsv") },
       { label: "Copy as CSV", icon: "copy", onClick: () => void copySelection("csv") },
       { label: "Copy as JSON", icon: "copy", onClick: () => void copySelection("json") },
       { label: "Copy as Markdown", icon: "copy", onClick: () => void copySelection("md") },
       { sep: true },
-      { label: val === null ? "Copy value (NULL→empty)" : "Copy cell value", icon: "copy", onClick: () => void copyText(copyVal(r, oi) ?? "", "copied value") },
+      { label: val === null ? "Copy value (NULL→empty)" : "Copy cell value", icon: "copy", onClick: () => void copyText(copiedVal ?? "", "copied value") },
       { label: "Copy column", icon: "copy", onClick: () => copyColumn(oi) },
       { label: "View value…", icon: "search", onClick: () => props.onViewValue(name, val) },
-    ]);
+    ]));
   }
   function onHeaderContext(e: MouseEvent, oi: number, dc: number) {
     e.preventDefault();
@@ -654,7 +725,7 @@ export function ResultGrid(props: ResultGridProps) {
     }
     items.push({ sep: true }, { label: "Copy column", icon: "copy", onClick: () => copyColumn(oi) });
     void dc;
-    props.onMenu(e.clientX, e.clientY, items);
+    props.onMenu(e.clientX, e.clientY, bindMenuItems(items));
   }
 
   // --- sort / filter ---
@@ -703,6 +774,7 @@ export function ResultGrid(props: ResultGridProps) {
     clearTimeout(filterTimer);
     resizeObserver?.disconnect();
     if (scrollRaf !== undefined) cancelAnimationFrame(scrollRaf);
+    if (measureRaf !== undefined) cancelAnimationFrame(measureRaf);
     dragMode = null;
     cancelAnimationFrame(autoRAF);
     window.removeEventListener("mousemove", onDragMove);
@@ -960,6 +1032,7 @@ export function ResultGrid(props: ResultGridProps) {
                 >
                   {(be) => {
                     const cur = () => {
+                      if (isInsUntouched(ed().r, oi())) return DEFAULT_OPT;
                       const v = cellVal(ed().r, oi());
                       return v === null ? NULL_OPT : boolWord(v) ?? "TRUE";
                     };
@@ -980,6 +1053,9 @@ export function ResultGrid(props: ResultGridProps) {
                         onBlur={() => { if (!editCancelled && editing()) commitEdit(); }}
                         onMouseDown={(e) => e.stopPropagation()}
                       >
+                        <Show when={isInsUntouched(ed().r, oi())}>
+                          <option value={DEFAULT_OPT}>{"<default>"}</option>
+                        </Show>
                         <option value="TRUE">TRUE</option>
                         <option value="FALSE">FALSE</option>
                         <Show when={be().nullable}>

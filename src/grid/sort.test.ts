@@ -33,8 +33,10 @@ describe("sortedRowOrder", () => {
     expect(sortedRowOrder(input, [{ col: 0, dir: "asc" }])).toEqual([0, 1, 3, 2]);
   });
 
-  it("ignores unusable columns and safely materializes valid order entries", () => {
+  it("ignores unusable columns and never drops or duplicates row identities", () => {
     expect(sortedRowOrder(rows([["a"], ["b"]]), [{ col: -1, dir: "asc" }])).toEqual([0, 1]);
-    expect(orderedRows(["a", "b", "c"], [2, 99, 0])).toEqual(["c", "a"]);
+    expect(orderedRows(["a", "b", "c"], [2, 99, 0])).toEqual(["a", "b", "c"]);
+    expect(orderedRows(["a", "b", "c"], [2, 2, 0])).toEqual(["a", "b", "c"]);
+    expect(orderedRows(["a", "b", "c"], [2, 0, 1])).toEqual(["c", "a", "b"]);
   });
 });

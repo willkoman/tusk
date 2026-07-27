@@ -29,8 +29,8 @@ describe("buildCommitScript", () => {
       },
     }));
     expect(out).toEqual([
-      `UPDATE "public"."users" SET "email" = 'new@x.com' WHERE "id" = '1'`,
-      `DELETE FROM "public"."users" WHERE "id" = '2'`,
+      `UPDATE "public"."users" SET "email" = 'new@x.com' WHERE (("id" = '1'))`,
+      `DELETE FROM "public"."users" WHERE (("id" = '2'))`,
       `INSERT INTO "public"."users" ("email") VALUES ('c@x.com')`,
     ]);
   });
@@ -39,7 +39,7 @@ describe("buildCommitScript", () => {
     const out = buildCommitScript(base({
       pending: { cells: { 0: { 0: "99" } }, deletes: [], inserts: [] },
     }));
-    expect(out).toEqual([`UPDATE "public"."users" SET "id" = '99' WHERE "id" = '1'`]);
+    expect(out).toEqual([`UPDATE "public"."users" SET "id" = '99' WHERE (("id" = '1'))`]);
   });
 
   it("NULL original PK compares with IS NULL; NULL edit writes NULL", () => {
@@ -47,7 +47,7 @@ describe("buildCommitScript", () => {
       pkIdx: [2],
       pending: { cells: { 0: { 1: null } }, deletes: [], inserts: [] },
     }));
-    expect(out).toEqual([`UPDATE "public"."users" SET "email" = NULL WHERE "note" IS NULL`]);
+    expect(out).toEqual([`UPDATE "public"."users" SET "email" = NULL WHERE (("note" IS NULL))`]);
   });
 
   it("composite PK AND-ed; quotes escaped", () => {
@@ -57,7 +57,7 @@ describe("buildCommitScript", () => {
       pending: { cells: {}, deletes: [0], inserts: [] },
     }));
     expect(out).toEqual([
-      `DELETE FROM "public"."users" WHERE "id" = '1' AND "email" = 'o''brien@x.com'`,
+      `DELETE FROM "public"."users" WHERE (("id" = '1') AND ("email" = 'o''brien@x.com'))`,
     ]);
   });
 
@@ -65,7 +65,7 @@ describe("buildCommitScript", () => {
     const out = buildCommitScript(base({
       pending: { cells: { 1: { 1: "x@x.com" } }, deletes: [1], inserts: [] },
     }));
-    expect(out).toEqual([`DELETE FROM "public"."users" WHERE "id" = '2'`]);
+    expect(out).toEqual([`DELETE FROM "public"."users" WHERE (("id" = '2'))`]);
   });
 
   it("skips non-table columns and rows with no effective edits", () => {
@@ -91,8 +91,17 @@ describe("buildCommitScript", () => {
       dialect: "mysql",
     }));
     expect(out).toEqual([
-      "UPDATE `public`.`users` SET `email` = _utf8mb4 X'7a' WHERE `id` = _utf8mb4 X'31'",
+      "UPDATE `public`.`users` SET `email` = _utf8mb4 X'7a' WHERE ((`id` = _utf8mb4 X'31'))",
       "INSERT INTO `public`.`users` () VALUES ()",
     ]);
+  });
+
+  it("uses mode-independent PostgreSQL literals in composite identities", () => {
+    const out = buildCommitScript(base({
+      pkIdx: [0, 1],
+      rows: [["path\\1", "o'b", null]],
+      pending: { cells: {}, deletes: [0], inserts: [] },
+    }));
+    expect(out[0]).toContain(`(("id" = E'path\\\\1') AND ("email" = 'o''b'))`);
   });
 });

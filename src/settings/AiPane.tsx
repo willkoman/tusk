@@ -8,15 +8,18 @@
 //   (every connection) or database-scoped. Stored on disk as Markdown-with-frontmatter by
 //   `skills.rs`, so export is a file copy and any .md can be imported.
 
-import { For, Show, createMemo, createSignal, onMount } from "solid-js";
+import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { save as saveDialog, open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   AI_PROVIDERS, aiStore, defaultModel, groupByTier, isKeyless, modelNote,
-  providerInfo, providerModels, resolveBaseUrl, type AiConfig, type AiProvider,
+  approvedBaseOverride, connectionTestProbe, endpointOrigin, normalizeAiConfig, originApproved,
+  originNeedsConsent, providerInfo, providerModels, resolveBaseUrl,
+  withProviderModel, type AiConfig, type AiProvider,
 } from "../ai/store";
 import { emptySkill, type Skill } from "../ai/skills";
+import { KeyedSerialQueue } from "../asyncQueue";
 
 const errMsg = (e: unknown): string => (e as { message?: string })?.message ?? String(e);
 
@@ -25,10 +28,18 @@ type ProbeState = { hasKey: boolean; testing: boolean; note: string; ok: boolean
 
 export function AiPane(props: { database: string }) {
   const [cfg, setCfg] = createSignal<AiConfig>(aiStore.load());
+  const [configError, setConfigError] = createSignal("");
   const setConfig = (patch: Partial<AiConfig>) => {
-    const next = { ...cfg(), ...patch };
-    setCfg(next);
-    aiStore.save(next);
+    const next = normalizeAiConfig({ ...cfg(), ...patch });
+    if (!aiStore.save(next)) {
+      setCfg({ ...next, shareSamples: false });
+      setConfigError("Could not save AI settings. Sample sharing remains off unless its privacy choice is stored successfully.");
+      return false;
+    }
+    // aiStore synchronously publishes its canonical value (including models[provider]);
+    // do not overwrite that subscriber update with the pre-normalized input.
+    setConfigError("");
+    return true;
   };
 
   const [probe, setProbe] = createSignal<Record<string, ProbeState>>({});
@@ -39,59 +50,134 @@ export function AiPane(props: { database: string }) {
   const [expanded, setExpanded] = createSignal<AiProvider | null>(null);
   const [liveModels, setLiveModels] = createSignal<Partial<Record<AiProvider, string[]>>>({});
   const modelsFor = (pid: AiProvider) => liveModels()[pid] ?? providerModels(pid);
-
-  const refreshKeys = async () => {
-    for (const p of AI_PROVIDERS) {
-      const hasKey = isKeyless(p.id) || (await invoke<boolean>("ai_has_key", { provider: p.id }).catch(() => false));
-      patchProbe(p.id, { hasKey });
-    }
+  const probeGeneration = new Map<AiProvider, number>();
+  const keyMutations = new KeyedSerialQueue<AiProvider>();
+  let mounted = true;
+  const nextProbe = (pid: AiProvider) => {
+    const generation = (probeGeneration.get(pid) ?? 0) + 1;
+    probeGeneration.set(pid, generation);
+    return generation;
   };
-  onMount(() => { void refreshKeys(); void refreshSkills(); });
+  const probeCurrent = (pid: AiProvider, generation: number) => mounted && probeGeneration.get(pid) === generation;
+
+  const providerBase = (pid: AiProvider) =>
+    originApproved(cfg(), pid) ? resolveBaseUrl(pid, approvedBaseOverride(cfg(), pid)) : "";
+  const refreshKeys = async () => {
+    await Promise.all(AI_PROVIDERS.map(async (p) => {
+      const generation = nextProbe(p.id);
+      const baseUrl = providerBase(p.id);
+      const hasKey = isKeyless(p.id) || (!!baseUrl && await invoke<boolean>("ai_has_key", {
+        provider: p.id,
+        baseUrl,
+      }).catch(() => false));
+      if (probeCurrent(p.id, generation)) patchProbe(p.id, { hasKey });
+    }));
+  };
+  let unsubscribeConfig = () => {};
+  onMount(() => {
+    unsubscribeConfig = aiStore.subscribe((next) => {
+      for (const provider of AI_PROVIDERS) nextProbe(provider.id);
+      setProbe((current) => Object.fromEntries(
+        Object.entries(current).map(([provider, state]) => [provider, { ...state, testing: false, note: "", ok: null }]),
+      ));
+      setCfg(next);
+      void refreshKeys();
+    });
+    void refreshKeys();
+    void refreshSkills();
+  });
+  onCleanup(() => {
+    mounted = false;
+    for (const provider of AI_PROVIDERS) nextProbe(provider.id);
+    unsubscribeConfig();
+  });
 
   /** Test = fetch the provider's model catalog with the stored key. A reachable provider
    *  returns ids; anything else surfaces the real error rather than a green tick. */
   async function testProvider(pid: AiProvider) {
     const spec = providerInfo(pid);
-    const base = resolveBaseUrl(pid, cfg().baseUrls[pid] ?? "");
+    if (!originApproved(cfg(), pid)) {
+      patchProbe(pid, { ok: false, note: "Approve the custom API origin before testing it." });
+      return;
+    }
+    const base = resolveBaseUrl(pid, approvedBaseOverride(cfg(), pid));
     if (!base) { patchProbe(pid, { ok: false, note: "Set an API base URL first." }); return; }
+    const probe = connectionTestProbe(cfg(), pid);
+    const generation = nextProbe(pid);
     patchProbe(pid, { testing: true, note: "", ok: null });
     try {
       const list = await invoke<string[]>("ai_list_models", {
         provider: pid, wire: spec.wire, baseUrl: base, allowNoKey: !spec.needsKey,
+        // `/models` is public on some gateways. Keyed providers also make a tiny
+        // completion request so a green result proves the credential itself works.
+        probe,
       });
+      if (!probeCurrent(pid, generation)) return;
       if (list.length) setLiveModels((m) => ({ ...m, [pid]: list }));
-      patchProbe(pid, { testing: false, ok: true, note: `${list.length} models available` });
+      patchProbe(pid, {
+        testing: false,
+        ok: true,
+        note: `${spec.needsKey ? "Authenticated; " : ""}${list.length} models available`,
+      });
     } catch (e) {
-      patchProbe(pid, { testing: false, ok: false, note: errMsg(e) });
+      if (probeCurrent(pid, generation)) patchProbe(pid, { testing: false, ok: false, note: errMsg(e) });
     }
   }
 
   async function saveKey(pid: AiProvider) {
     const k = (keyInput()[pid] ?? "").trim();
     if (!k) return;
+    const override = cfg().baseUrls[pid] ?? "";
+    if (!originApproved(cfg(), pid)) {
+      patchProbe(pid, { note: "Approve the custom API origin before saving a key for it.", ok: false });
+      return;
+    }
+    const baseUrl = resolveBaseUrl(pid, approvedBaseOverride(cfg(), pid));
+    if (!baseUrl) {
+      patchProbe(pid, { note: "Set an API base URL first.", ok: false });
+      return;
+    }
+    const generation = nextProbe(pid);
     try {
-      await invoke("ai_save_key", { provider: pid, key: k });
+      await keyMutations.run(pid, () => invoke("ai_save_key", {
+          provider: pid,
+          key: k,
+          baseUrl,
+          approveOrigin: originNeedsConsent(pid, override),
+        }));
+      if (!probeCurrent(pid, generation)) return;
       setKeyInput((m) => ({ ...m, [pid]: "" }));
       patchProbe(pid, { hasKey: true, note: "Key saved.", ok: null });
+      aiStore.broadcast(cfg());
       void testProvider(pid);
     } catch (e) {
-      patchProbe(pid, { note: errMsg(e), ok: false });
+      if (probeCurrent(pid, generation)) patchProbe(pid, { note: errMsg(e), ok: false });
     }
   }
   async function clearKey(pid: AiProvider) {
-    await invoke("ai_clear_key", { provider: pid }).catch(() => {});
-    patchProbe(pid, { hasKey: false, note: "", ok: null });
+    const generation = nextProbe(pid);
+    try {
+      await keyMutations.run(pid, () => invoke("ai_clear_key", { provider: pid }));
+      if (!probeCurrent(pid, generation)) return;
+      patchProbe(pid, { hasKey: false, note: "", ok: null });
+      aiStore.broadcast(cfg());
+    } catch (e) {
+      if (probeCurrent(pid, generation)) patchProbe(pid, { note: errMsg(e), ok: false });
+    }
   }
 
   const status = (pid: AiProvider) => {
     const p = probe()[pid];
+    if (!originApproved(cfg(), pid)) return { label: "Origin approval needed", cls: "off" };
     if (isKeyless(pid)) return { label: "No key needed", cls: "ok" };
     if (p?.hasKey) return { label: "Connected", cls: "ok" };
     return { label: "No key", cls: "off" };
   };
   const isActive = (pid: AiProvider) => cfg().provider === pid;
   /** How many providers are usable right now — a key saved, or keyless and local. */
-  const configured = createMemo(() => AI_PROVIDERS.filter((p) => probe()[p.id]?.hasKey).length);
+  const configured = createMemo(() =>
+    AI_PROVIDERS.filter((p) => originApproved(cfg(), p.id) && probe()[p.id]?.hasKey).length,
+  );
 
   // ---------------------------------------------------------------- skills
 
@@ -155,6 +241,7 @@ export function AiPane(props: { database: string }) {
           Each provider stores its key separately in your OS keychain — add several and switch
           models from the chat header. Keys never reach the web view.
         </div>
+        <Show when={configError()}><div class="error">{configError()}</div></Show>
 
       <div class="ai-cards">
         <For each={AI_PROVIDERS}>
@@ -203,7 +290,10 @@ export function AiPane(props: { database: string }) {
                       <span>Default model</span>
                       <select
                         value={cfg().models[p.id] ?? defaultModel(p.id)}
-                        onChange={(e) => setConfig({ models: { ...cfg().models, [p.id]: e.currentTarget.value } })}
+                        onChange={(e) => {
+                          const next = withProviderModel(cfg(), p.id, e.currentTarget.value);
+                          setConfig(next);
+                        }}
                       >
                         <For each={groupByTier(p.id, modelsFor(p.id))}>
                           {(g) => (
@@ -223,6 +313,36 @@ export function AiPane(props: { database: string }) {
                         onInput={(e) => setConfig({ baseUrls: { ...cfg().baseUrls, [p.id]: e.currentTarget.value } })}
                       />
                     </label>
+
+                    <Show when={originNeedsConsent(p.id, cfg().baseUrls[p.id] ?? "")}>
+                      <label class="settings-row" title="A saved key, prompts, schema context, and enabled sample rows may be sent to this origin.">
+                        <span>Allow custom origin</span>
+                        <input
+                          type="checkbox"
+                          checked={originApproved(cfg(), p.id)}
+                          onChange={(e) => {
+                            const next = { ...cfg().approvedOrigins };
+                            const origin = endpointOrigin(cfg().baseUrls[p.id] ?? "");
+                            if (e.currentTarget.checked && origin) next[p.id] = origin;
+                            else delete next[p.id];
+                            if (e.currentTarget.checked && !origin) {
+                              setConfigError("Enter a valid HTTP(S) API base before approving its origin.");
+                              return;
+                            }
+                            if (!setConfig({ approvedOrigins: next })) {
+                              e.currentTarget.checked = originApproved(cfg(), p.id);
+                              return;
+                            }
+                          }}
+                        />
+                      </label>
+                      <div class="ai-note">
+                        Custom origin: <code>{endpointOrigin(cfg().baseUrls[p.id] ?? "") ?? "invalid URL"}</code>. Approval is required before credentials or database context can be sent there.
+                      </div>
+                    </Show>
+                    <Show when={isKeyless(p.id)}>
+                      <div class="ai-note">Keyless endpoints are accepted only on localhost or a loopback IP.</div>
+                    </Show>
 
                     <div class="ai-card-actions">
                       <button class="ghost" disabled={probe()[p.id]?.testing} onClick={() => void testProvider(p.id)}>
@@ -249,7 +369,15 @@ export function AiPane(props: { database: string }) {
 
         <label class="settings-row" title="Send a few sample rows of relevant tables so the model understands your real data. Real values leave your machine.">
           <span>Share sample data with the model</span>
-          <input type="checkbox" checked={cfg().shareSamples !== false} onChange={(e) => setConfig({ shareSamples: e.currentTarget.checked })} />
+          <input
+            type="checkbox"
+            checked={cfg().shareSamples}
+            onChange={(e) => {
+              if (!setConfig({ shareSamples: e.currentTarget.checked })) {
+                e.currentTarget.checked = cfg().shareSamples;
+              }
+            }}
+          />
         </label>
       </section>
 

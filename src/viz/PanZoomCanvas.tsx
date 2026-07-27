@@ -51,6 +51,7 @@ export function PanZoomCanvas(props: {
       onPointerDown={pz.onPointerDown}
       onPointerMove={pz.onPointerMove}
       onPointerUp={pz.onPointerUp}
+      onPointerCancel={pz.onPointerUp}
       onDblClick={doFit}
       classList={{ dragging: pz.dragging() }}
     >

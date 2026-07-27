@@ -14,6 +14,7 @@ import {
 } from "./aliases";
 import { joinConditions } from "./joinHints";
 import { docString } from "../editor/lexer";
+import { LIVE_ANALYSIS_MAX_CHARS } from "../editor/limits";
 import { type FkEdge } from "./fk";
 
 export type { Col, Table };
@@ -66,14 +67,15 @@ export function makeSqlCompletion(
 
   return (ctx: CompletionContext): CompletionResult | null => {
     try {
+      if (ctx.state.doc.length > LIVE_ANALYSIS_MAX_CHARS) return null;
       const word = ctx.matchBefore(/\w*/);
       const from = word ? word.from : ctx.pos;
       const doc = docString(ctx.state);
       // Enter/Tab accept completion. Never offer one for the `s` in a DB-API
       // `%s` placeholder or accepting it can rewrite the placeholder itself.
       if (word?.text === "s" && from > 0 && doc[from - 1] === "%") return null;
-      const before = doc.slice(Math.max(0, from - 240), from);
       const { text: stmt, start: stmtStart } = currentStatement(doc, ctx.pos);
+      const before = doc.slice(Math.max(stmtStart, from - 240), from);
       const idx = indexOf(getTables());
       const aliases = aliasMap(stmt);
 

@@ -1,7 +1,11 @@
-use crate::db::{collect_rows, AppError};
+use crate::db::{collect_rows_limited, AppError, CATALOG_TEXT_LIMITS};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use tokio_postgres::Client;
+
+const MAX_CATALOG_ROWS: usize = 100_000;
+const MAX_CATALOG_CELL_BYTES: usize = 1024 * 1024;
+const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Serialize, Clone)]
 pub struct Column {
@@ -127,7 +131,28 @@ fn cell(r: &[Option<String>], i: usize) -> String {
 
 async fn query(client: &Client, sql: &str) -> Result<Vec<Vec<Option<String>>>, AppError> {
     let msgs = client.simple_query(sql).await?;
-    Ok(collect_rows(&msgs).1)
+    let rows = collect_rows_limited(&msgs, CATALOG_TEXT_LIMITS)?.1;
+    validate_catalog_rows(&rows)?;
+    Ok(rows)
+}
+
+fn validate_catalog_rows(rows: &[Vec<Option<String>>]) -> Result<(), AppError> {
+    if rows.len() > MAX_CATALOG_ROWS {
+        return Err(AppError::new("catalog result exceeds the 100000-row limit"));
+    }
+    let mut bytes = 0usize;
+    for value in rows.iter().flatten().flatten() {
+        if value.len() > MAX_CATALOG_CELL_BYTES {
+            return Err(AppError::new(
+                "catalog metadata value exceeds the 1 MiB limit",
+            ));
+        }
+        bytes = bytes.saturating_add(value.len());
+        if bytes > MAX_CATALOG_BYTES {
+            return Err(AppError::new("catalog result exceeds the 64 MiB limit"));
+        }
+    }
+    Ok(())
 }
 
 const NS: &str = "n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') AND n.nspname NOT LIKE 'pg_temp%' AND n.nspname NOT LIKE 'pg_toast_temp%'";
@@ -263,11 +288,17 @@ pub async fn table_detail(
             &[&schema, &name],
         )
         .await?;
-    let row = rows.first().ok_or_else(|| AppError::new("relation not found"))?;
+    let row = rows
+        .first()
+        .ok_or_else(|| AppError::new("relation not found"))?;
     // try_get: typed `get` panics on a type mismatch, which a PG-wire-compatible
     // server (CockroachDB, proxies) can produce where real Postgres never would.
-    let oid: u32 = row.try_get(0).map_err(|e| AppError::new(format!("unexpected catalog shape: {e}")))?;
-    let relkind: String = row.try_get(1).map_err(|e| AppError::new(format!("unexpected catalog shape: {e}")))?;
+    let oid: u32 = row
+        .try_get(0)
+        .map_err(|e| AppError::new(format!("unexpected catalog shape: {e}")))?;
+    let relkind: String = row
+        .try_get(1)
+        .map_err(|e| AppError::new(format!("unexpected catalog shape: {e}")))?;
     let kind = match relkind.as_str() {
         "v" => "view",
         "m" => "matview",
@@ -277,20 +308,35 @@ pub async fn table_detail(
 
     // NOTE: do NOT cast booleans to ::text — `bool::text` yields 'true'/'false',
     // but the text protocol returns 't'/'f' for a bare bool (which `== "t"` expects).
-    let col_rows = query(client, &format!(
-        "SELECT a.attname, format_type(a.atttypid,a.atttypmod), (NOT a.attnotnull), \
+    let col_rows = query(
+        client,
+        &format!(
+            "SELECT a.attname, format_type(a.atttypid,a.atttypmod), (NOT a.attnotnull), \
          pg_get_expr(d.adbin,d.adrelid), col_description(a.attrelid,a.attnum) \
          FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum \
-         WHERE a.attrelid={oid} AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum")).await?;
+         WHERE a.attrelid={oid} AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum"
+        ),
+    )
+    .await?;
 
-    let pk_rows = query(client, &format!(
-        "SELECT a.attname FROM pg_constraint con \
+    let pk_rows = query(
+        client,
+        &format!(
+            "SELECT a.attname FROM pg_constraint con \
          JOIN pg_attribute a ON a.attrelid=con.conrelid AND a.attnum=ANY(con.conkey) \
-         WHERE con.conrelid={oid} AND con.contype='p'")).await?;
-    let fk_rows = query(client, &format!(
-        "SELECT a.attname FROM pg_constraint con \
+         WHERE con.conrelid={oid} AND con.contype='p'"
+        ),
+    )
+    .await?;
+    let fk_rows = query(
+        client,
+        &format!(
+            "SELECT a.attname FROM pg_constraint con \
          JOIN pg_attribute a ON a.attrelid=con.conrelid AND a.attnum=ANY(con.conkey) \
-         WHERE con.conrelid={oid} AND con.contype='f'")).await?;
+         WHERE con.conrelid={oid} AND con.contype='f'"
+        ),
+    )
+    .await?;
     let pk: HashSet<String> = pk_rows.iter().map(|r| cell(r, 0)).collect();
     let fk: HashSet<String> = fk_rows.iter().map(|r| cell(r, 0)).collect();
 
@@ -311,10 +357,15 @@ pub async fn table_detail(
         .collect();
 
     // Indexes — fetched for tables and materialized views (both can have them).
-    let idx_rows = query(client, &format!(
-        "SELECT ic.relname, i.indisunique, i.indisprimary, pg_get_indexdef(i.indexrelid) \
+    let idx_rows = query(
+        client,
+        &format!(
+            "SELECT ic.relname, i.indisunique, i.indisprimary, pg_get_indexdef(i.indexrelid) \
          FROM pg_index i JOIN pg_class ic ON ic.oid=i.indexrelid \
-         WHERE i.indrelid={oid} ORDER BY ic.relname")).await?;
+         WHERE i.indrelid={oid} ORDER BY ic.relname"
+        ),
+    )
+    .await?;
     let indexes = idx_rows
         .iter()
         .map(|r| Index {
@@ -328,14 +379,16 @@ pub async fn table_detail(
     let con_rows = query(client, &format!(
         "SELECT con.conname, con.contype::text, pg_get_constraintdef(con.oid) FROM pg_constraint con \
          WHERE con.conrelid={oid} AND con.contype IN ('p','f','u','c') ORDER BY con.contype, con.conname")).await?;
-    let kind_of = |c: &str| match c {
-        "p" => "primary_key",
-        "f" => "foreign_key",
-        "u" => "unique",
-        "c" => "check",
-        _ => "other",
-    }
-    .to_string();
+    let kind_of = |c: &str| {
+        match c {
+            "p" => "primary_key",
+            "f" => "foreign_key",
+            "u" => "unique",
+            "c" => "check",
+            _ => "other",
+        }
+        .to_string()
+    };
     let constraints = con_rows
         .iter()
         .map(|r| Constraint {
@@ -346,9 +399,14 @@ pub async fn table_detail(
         .collect();
 
     // User triggers only — FK-internal triggers are noise (tgisinternal).
-    let trg_rows = query(client, &format!(
-        "SELECT t.tgname, pg_get_triggerdef(t.oid) FROM pg_trigger t \
-         WHERE t.tgrelid={oid} AND NOT t.tgisinternal ORDER BY t.tgname")).await?;
+    let trg_rows = query(
+        client,
+        &format!(
+            "SELECT t.tgname, pg_get_triggerdef(t.oid) FROM pg_trigger t \
+         WHERE t.tgrelid={oid} AND NOT t.tgisinternal ORDER BY t.tgname"
+        ),
+    )
+    .await?;
     let triggers = trg_rows
         .iter()
         .map(|r| Trigger {
@@ -372,4 +430,47 @@ pub async fn table_detail(
         constraints,
         triggers,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_metadata_limits_cover_cells_rows_and_total_bytes() {
+        assert!(validate_catalog_rows(&[vec![Some("ok".into())]]).is_ok());
+        assert!(
+            validate_catalog_rows(&[vec![Some("x".repeat(MAX_CATALOG_CELL_BYTES + 1))]]).is_err()
+        );
+
+        let too_many = vec![Vec::<Option<String>>::new(); MAX_CATALOG_ROWS + 1];
+        assert!(validate_catalog_rows(&too_many).is_err());
+    }
+
+    #[test]
+    fn table_row_grouping_preserves_order() {
+        let tables = tables_from_rows(vec![
+            vec![
+                Some("s".into()),
+                Some("a".into()),
+                Some("x".into()),
+                Some("text".into()),
+            ],
+            vec![
+                Some("s".into()),
+                Some("a".into()),
+                Some("y".into()),
+                Some("int".into()),
+            ],
+            vec![
+                Some("s".into()),
+                Some("b".into()),
+                Some("z".into()),
+                Some("bool".into()),
+            ],
+        ]);
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0].columns.len(), 2);
+        assert_eq!(tables[1].name, "b");
+    }
 }

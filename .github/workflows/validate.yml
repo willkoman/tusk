@@ -1,0 +1,167 @@
+name: validate
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch: {}
+  schedule:
+    - cron: "17 9 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+jobs:
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check manifest versions
+        run: npm run check:versions
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Type-check frontend
+        run: npm run typecheck
+
+      - name: Test frontend
+        run: npx vitest run
+
+  rust:
+    name: Rust and driver conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev libsecret-1-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt --no-self-update
+          rustup default stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: linux-validation
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Build backend
+        run: cargo build --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Lint backend
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious
+
+      - name: Test backend
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Test all database drivers
+        run: scripts/conformance.sh
+
+  release-cache:
+    name: Warm ${{ matrix.cache-key }} release cache
+    if: github.event_name == 'push'
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            cache-key: macos-arm64
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+            cache-key: macos-x64
+          - platform: windows-latest
+            target: ""
+            cache-key: windows
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          if [[ -n "${{ matrix.target }}" ]]; then rustup target add "${{ matrix.target }}"; fi
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: ${{ matrix.cache-key }}
+
+      - name: Build release target
+        shell: bash
+        run: cargo build --release --locked ${{ matrix.target && format('--target {0}', matrix.target) || '' }} --manifest-path src-tauri/Cargo.toml
+
+  dependencies:
+    name: Dependencies
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Audit JavaScript dependencies
+        run: npm audit --audit-level=high
+
+      - name: Check production JavaScript licenses
+        run: npm run check:licenses
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+
+      - name: Check Rust advisories, licenses, and sources
+        run: cargo deny --manifest-path src-tauri/Cargo.toml check advisories licenses sources

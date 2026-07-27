@@ -1,6 +1,7 @@
 import { StateField, RangeSetBuilder, type EditorState, type Extension } from "@codemirror/state";
 import { Decoration, type DecorationSet, EditorView, WidgetType } from "@codemirror/view";
 import { docString, lexState } from "./lexer";
+import { FOLD_CANDIDATE_LIMIT, LIVE_ANALYSIS_MAX_CHARS } from "./limits";
 
 // Auto-fold large inline literals (the headline editor feature).
 //
@@ -23,18 +24,22 @@ const OPEN_PAREN = 40,
   CLOSE_BRACKET = 93,
   COMMA = 44;
 
-type Candidate = { from: number; to: number; label: string };
+export type FoldCandidate = { from: number; to: number; label: string };
 
 function fmtSize(chars: number): string {
   return chars >= 1024 ? `${(chars / 1024).toFixed(1)} KB` : `${chars.toLocaleString()} chars`;
 }
 
 /** Find foldable regions in the doc. Pure, runs only when the doc changes. */
-function detect(state: EditorState): Candidate[] {
+export function detectFoldCandidates(state: EditorState): FoldCandidate[] {
+  if (state.doc.length > LIVE_ANALYSIS_MAX_CHARS) return [];
   const doc = docString(state);
   if (!doc) return [];
   const { spans } = lexState(state);
-  const cands: Candidate[] = [];
+  const cands: FoldCandidate[] = [];
+  const add = (candidate: FoldCandidate) => {
+    if (cands.length < FOLD_CANDIDATE_LIMIT) cands.push(candidate);
+  };
 
   // (1) Big bracketed comma-lists: `( … )` / `[ … ]` with >= threshold items.
   // A stack tracks nesting; commas increment the innermost frame's item count.
@@ -52,7 +57,7 @@ function detect(state: EditorState): Candidate[] {
           stack.pop();
           const items = fr.commas + 1;
           if (items >= FOLD_ITEM_THRESHOLD && p > fr.interiorFrom) {
-            cands.push({ from: fr.interiorFrom, to: p, label: ` …${items.toLocaleString()} items… ` });
+            add({ from: fr.interiorFrom, to: p, label: ` …${items.toLocaleString()} items… ` });
           }
         }
       } else if (cc === COMMA && stack.length) {
@@ -72,13 +77,13 @@ function detect(state: EditorState): Candidate[] {
     }
     const from = s.from + dl;
     const to = s.to - dl >= from ? s.to - dl : s.to; // unterminated literal: fold to EOF
-    if (to > from + 8) cands.push({ from, to, label: ` …${fmtSize(to - from)}… ` });
+    if (to > from + 8) add({ from, to, label: ` …${fmtSize(to - from)}… ` });
   }
 
   // Normalize: sort and drop overlaps (outer/larger region wins) so the
   // RangeSetBuilder gets a sorted, non-overlapping set.
   cands.sort((a, b) => a.from - b.from || b.to - a.to);
-  const out: Candidate[] = [];
+  const out: FoldCandidate[] = [];
   let lastTo = -1;
   for (const c of cands) {
     if (c.from >= lastTo) {
@@ -115,7 +120,7 @@ class FoldWidget extends WidgetType {
 }
 
 /** Fold every candidate the cursor/selection is not currently touching. */
-function build(cands: Candidate[], state: EditorState): DecorationSet {
+function build(cands: FoldCandidate[], state: EditorState): DecorationSet {
   const sel = state.selection;
   const builder = new RangeSetBuilder<Decoration>();
   for (const c of cands) {
@@ -133,18 +138,18 @@ function build(cands: Candidate[], state: EditorState): DecorationSet {
   return builder.finish();
 }
 
-type FoldValue = { cands: Candidate[]; deco: DecorationSet };
+type FoldValue = { cands: FoldCandidate[]; deco: DecorationSet };
 
 const foldField = StateField.define<FoldValue>({
   create(state) {
-    const cands = detect(state);
+    const cands = detectFoldCandidates(state);
     return { cands, deco: build(cands, state) };
   },
   update(value, tr) {
     const selMoved = !tr.state.selection.eq(tr.startState.selection);
     if (!tr.docChanged && !selMoved) return value;
     // Candidate geometry only changes on edits; selection-only moves reuse it.
-    const cands = tr.docChanged ? detect(tr.state) : value.cands;
+    const cands = tr.docChanged ? detectFoldCandidates(tr.state) : value.cands;
     return { cands, deco: build(cands, tr.state) };
   },
   provide: (f) => EditorView.decorations.from(f, (v) => v.deco),

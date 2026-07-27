@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { KeyedSerialQueue } from "../asyncQueue";
 
 // Per-connection query history, file-backed via the `load_history`/`save_history`
 // commands (<app-config>/history/<conn>.json — survives WebView storage resets).
@@ -29,6 +30,17 @@ export const makeEntryId = (ts: number) => `${ts}-${++counter}`;
 
 const cache = new Map<string, HistoryEntry[]>();
 const timers = new Map<string, ReturnType<typeof setTimeout>>();
+const loads = new Map<string, Promise<HistoryEntry[]>>();
+const revisions = new Map<string, number>();
+const loaded = new Set<string>();
+const saves = new KeyedSerialQueue<string>();
+
+const bump = (connKey: string) => revisions.set(connKey, (revisions.get(connKey) ?? 0) + 1);
+
+function mergeHistory(newer: HistoryEntry[], older: HistoryEntry[]): HistoryEntry[] {
+  const seen = new Set(newer.map((e) => e.id));
+  return normalizeHistory([...newer, ...older.filter((e) => !seen.has(e.id))]);
+}
 
 function historyEntry(value: unknown): HistoryEntry | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
@@ -62,9 +74,15 @@ function scheduleSave(connKey: string) {
   timers.set(
     connKey,
     setTimeout(() => {
-      const list = cache.get(connKey) ?? [];
-      invoke("save_history", { connKey, json: JSON.stringify(list) }).catch(() => {
-        /* degrade to in-memory */
+      timers.delete(connKey);
+      void saves.run(connKey, async () => {
+        if (!loaded.has(connKey)) await historyStore.load(connKey);
+        const list = cache.get(connKey) ?? [];
+        try {
+          await invoke("save_history", { connKey, json: JSON.stringify(list) });
+        } catch {
+          /* degrade to in-memory */
+        }
       });
     }, SAVE_DEBOUNCE_MS),
   );
@@ -74,18 +92,29 @@ export const historyStore = {
   /** Newest-first list for a connection (loads from disk once, then cached). */
   async load(connKey: string): Promise<HistoryEntry[]> {
     const hit = cache.get(connKey);
-    if (hit) return hit;
-    let list: HistoryEntry[] = [];
-    try {
-      const raw = await invoke<string>("load_history", { connKey });
-      if (raw.length > MAX_HISTORY_CHARS) throw new Error("history is too large");
-      const parsed = JSON.parse(raw);
-      list = normalizeHistory(parsed);
-    } catch {
-      /* missing/corrupt/unavailable → start empty */
-    }
-    cache.set(connKey, list);
-    return list;
+    if (hit && loaded.has(connKey)) return hit;
+    const pending = loads.get(connKey);
+    if (pending) return pending;
+    const revision = revisions.get(connKey) ?? 0;
+    const request = (async () => {
+      let list: HistoryEntry[] = [];
+      try {
+        const raw = await invoke<string>("load_history", { connKey });
+        if (raw.length > MAX_HISTORY_CHARS) throw new Error("history is too large");
+        list = normalizeHistory(JSON.parse(raw));
+      } catch {
+        /* missing/corrupt/unavailable -> start empty */
+      }
+      // clear/replace intentionally supersede disk. An append before/during the
+      // first load instead merges with disk so an early query cannot erase history.
+      if ((revisions.get(connKey) ?? 0) !== revision && loaded.has(connKey)) return cache.get(connKey) ?? [];
+      const merged = mergeHistory(cache.get(connKey) ?? [], list);
+      cache.set(connKey, merged);
+      loaded.add(connKey);
+      return merged;
+    })().finally(() => loads.delete(connKey));
+    loads.set(connKey, request);
+    return request;
   },
 
   /** Prepend an entry (dedupes a re-run of the identical newest SQL), cap, save. */
@@ -101,18 +130,23 @@ export const historyStore = {
     }
     next = normalizeHistory(next);
     cache.set(connKey, next);
+    bump(connKey);
     scheduleSave(connKey);
     return next;
   },
 
   clear(connKey: string): void {
     cache.set(connKey, []);
+    loaded.add(connKey); // a deliberate clear must never resurrect disk state
+    bump(connKey);
     scheduleSave(connKey);
   },
 
   /** Seed a renamed connection key without losing existing persisted history. */
   replace(connKey: string, entries: HistoryEntry[]): void {
     cache.set(connKey, normalizeHistory(entries));
+    loaded.add(connKey);
+    bump(connKey);
     scheduleSave(connKey);
   },
 
@@ -122,9 +156,14 @@ export const historyStore = {
       const raw = await invoke<string>("migrate_history", { fromKey: from, toKey: to });
       if (raw.length > MAX_HISTORY_CHARS) throw new Error("history is too large");
       const migrated = normalizeHistory(JSON.parse(raw));
-      cache.set(to, migrated);
+      const merged = mergeHistory(cache.get(to) ?? [], migrated);
+      cache.set(to, merged);
+      loaded.add(to);
+      bump(to);
       cache.delete(from);
-      return migrated;
+      loaded.delete(from);
+      bump(from);
+      return merged;
     } catch {
       return historyStore.load(to);
     }

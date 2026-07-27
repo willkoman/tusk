@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { layoutTree } from "./layout";
-import { type PlanNode } from "./types";
+import { MAX_PLAN_DEPTH, MAX_PLAN_NODES, type PlanNode } from "./types";
 
 const N = (id: number, ...children: PlanNode[]): PlanNode => ({
   id,
@@ -73,5 +73,23 @@ describe("layoutTree", () => {
     expect(l.pos.get(0)!.x).toBe(0);
     expect(l.pos.get(1)!.x).toBe(100 + 40);
     expect(l.pos.get(1)!.y).not.toBe(l.pos.get(2)!.y);
+  });
+
+  it("falls back without recursion overflow for cyclic or over-deep trees", () => {
+    const cyclic = N(0);
+    cyclic.children.push(cyclic);
+    const cycleLayout = layoutTree(cyclic, OPTS);
+    expect(cycleLayout.visible).toEqual([cyclic]);
+    expect(cycleLayout.edges).toEqual([]);
+
+    let deep = N(MAX_PLAN_DEPTH + 2);
+    for (let i = MAX_PLAN_DEPTH + 1; i >= 0; i--) deep = N(i, deep);
+    const deepLayout = layoutTree(deep, OPTS);
+    expect(deepLayout.visible).toEqual([deep]);
+    expect(deepLayout.bbox).toEqual({ x: 0, y: 0, w: OPTS.nodeW, h: OPTS.nodeH });
+
+    const wide = N(0);
+    wide.children = Array.from({ length: MAX_PLAN_NODES + 1 }, (_, i) => N(i + 1));
+    expect(layoutTree(wide, OPTS).visible).toEqual([wide]);
   });
 });

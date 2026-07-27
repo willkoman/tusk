@@ -62,7 +62,11 @@ fn focus_words(focus_lower: &str) -> HashSet<String> {
 }
 
 /// Tables actually relevant to the focus (score ≤ 1), most-relevant first, capped.
-pub fn relevant_tables<'a>(tables: &'a [TableInfo], focus: &str, limit: usize) -> Vec<&'a TableInfo> {
+pub fn relevant_tables<'a>(
+    tables: &'a [TableInfo],
+    focus: &str,
+    limit: usize,
+) -> Vec<&'a TableInfo> {
     let f = focus.to_lowercase();
     let words = focus_words(&f);
     let mut scored: Vec<(u8, usize, &TableInfo)> = tables
@@ -115,7 +119,12 @@ pub fn format_samples(samples: &[SampleTable]) -> String {
             continue;
         }
         let plural = if s.rows.len() == 1 { "" } else { "s" };
-        let mut block = format!("\n{}.{} ({} sample row{plural}):\n", s.schema, s.name, s.rows.len());
+        let mut block = format!(
+            "\n{}.{} ({} sample row{plural}):\n",
+            s.schema,
+            s.name,
+            s.rows.len()
+        );
         block.push_str(&s.columns.join(" | "));
         block.push('\n');
         for r in &s.rows {
@@ -190,12 +199,25 @@ fn schema_summary(tables: &[TableInfo], focus: &str) -> String {
 
 /// Skills that apply to `database`, database-scoped first (the specific instruction
 /// survives a budget cutoff). PARITY: mirrors `activeSkills` in `src/ai/skills.ts`.
-pub fn active_skills<'a>(all: &'a [crate::skills::Skill], database: &str) -> Vec<&'a crate::skills::Skill> {
+pub fn active_skills<'a>(
+    all: &'a [crate::skills::Skill],
+    database: &str,
+) -> Vec<&'a crate::skills::Skill> {
     let mut v: Vec<(u8, usize, &crate::skills::Skill)> = all
         .iter()
         .enumerate()
         .filter(|(_, s)| s.applies_to(database))
-        .map(|(i, s)| (if s.scope == crate::skills::SCOPE_DATABASE { 0 } else { 1 }, i, s))
+        .map(|(i, s)| {
+            (
+                if s.scope == crate::skills::SCOPE_DATABASE {
+                    0
+                } else {
+                    1
+                },
+                i,
+                s,
+            )
+        })
         .collect();
     v.sort_by_key(|(r, i, _)| (*r, *i));
     v.into_iter().map(|(_, _, s)| s).collect()
@@ -229,7 +251,10 @@ pub fn format_skills(skills: &[&crate::skills::Skill]) -> String {
         }
     }
     if !dropped.is_empty() {
-        out.push_str(&format!("\n(Not included, over the context budget: {})\n", dropped.join(", ")));
+        out.push_str(&format!(
+            "\n(Not included, over the context budget: {})\n",
+            dropped.join(", ")
+        ));
     }
     out
 }
@@ -238,9 +263,19 @@ pub fn format_skills(skills: &[&crate::skills::Skill]) -> String {
 /// PARITY: mirrors `fkLine` in `src/ai/context.ts`.
 fn fk_line(e: &crate::relgraph::FkEdge) -> String {
     let rel = |schema: &str, table: &str| {
-        if !schema.is_empty() && schema != "public" { format!("{schema}.{table}") } else { table.to_string() }
+        if !schema.is_empty() && schema != "public" {
+            format!("{schema}.{table}")
+        } else {
+            table.to_string()
+        }
     };
-    let cols = |c: &[String]| if c.len() == 1 { c[0].clone() } else { format!("({})", c.join(", ")) };
+    let cols = |c: &[String]| {
+        if c.len() == 1 {
+            c[0].clone()
+        } else {
+            format!("({})", c.join(", "))
+        }
+    };
     format!(
         "{}.{} -> {}.{}",
         rel(&e.src_schema, &e.src_table),
@@ -260,7 +295,11 @@ pub fn foreign_key_summary(fks: &[crate::relgraph::FkEdge], focus: &str) -> Stri
     let touches = |t: &str| f.contains(&t.to_lowercase());
     let mut ranked: Vec<(usize, &crate::relgraph::FkEdge)> = fks.iter().enumerate().collect();
     ranked.sort_by_key(|(i, e)| {
-        let rel = if touches(&e.src_table) || touches(&e.dst_table) { 0 } else { 1 };
+        let rel = if touches(&e.src_table) || touches(&e.dst_table) {
+            0
+        } else {
+            1
+        };
         (rel, *i)
     });
 
@@ -310,6 +349,7 @@ pub fn build_system_prompt(
         String::new(),
         "Rules:".to_string(),
         "- Only SELECT queries. No INSERT/UPDATE/DELETE/DDL, no writable CTEs, no FOR UPDATE/FOR SHARE, and exactly one statement. This is enforced — mutating SQL will be rejected, never executed.".to_string(),
+        "- Use only common deterministic built-in SQL functions. Never call user-defined/schema-qualified routines or file, network, session-state, locking, extension-loading, sequence-mutating, sleep, or administrative functions.".to_string(),
         if ctx.destructive_policy == "refuse" {
             "- If the user asks for anything destructive or mutating (insert/update/delete/drop/alter/truncate/any DDL/grants), do NOT write that SQL and do NOT emit any code block. Politely refuse and tell them to run it themselves in the Tusk desktop editor.".to_string()
         } else {
@@ -323,7 +363,8 @@ pub fn build_system_prompt(
         "  Column names must exactly match the SQL output columns. Honor the user's requested chart type, axis assignment, labels, and series choices; pick sensible defaults for anything unspecified. Keep chartable results small (LIMIT ≤ 100). Never emit a chart block when no chart was asked for.".to_string(),
     ];
     if ctx.permissions_enforced && !ctx.is_superuser {
-        lines.push("- This role has limited privileges — stick to tables listed below.".to_string());
+        lines
+            .push("- This role has limited privileges — stick to tables listed below.".to_string());
     }
     // User-authored skills: instructions, so they land BEFORE the data (the model should
     // know the house rules before it reads the schema). Safety rules still outrank them —
@@ -370,7 +411,9 @@ pub fn extract_blocks(text: &str) -> Vec<(String, String)> {
         let Some(nl) = after.find('\n') else { break };
         let lang = after[..nl].trim().to_lowercase();
         let body_start = &after[nl + 1..];
-        let Some(close) = body_start.find("```") else { break };
+        let Some(close) = body_start.find("```") else {
+            break;
+        };
         let body = body_start[..close].trim();
         if !body.is_empty() {
             out.push((lang, body.to_string()));
@@ -392,7 +435,10 @@ pub fn extract_sql_blocks(text: &str) -> Vec<String> {
 
 /// The first ```chart block's body, if any (JSON chart spec).
 pub fn extract_chart_block(text: &str) -> Option<String> {
-    extract_blocks(text).into_iter().find(|(lang, _)| lang == "chart").map(|(_, b)| b)
+    extract_blocks(text)
+        .into_iter()
+        .find(|(lang, _)| lang == "chart")
+        .map(|(_, b)| b)
 }
 
 #[cfg(test)]
@@ -406,14 +452,21 @@ mod tests {
             name: name.into(),
             columns: cols
                 .iter()
-                .map(|(n, d)| ColumnInfo { name: n.to_string(), data_type: d.to_string() })
+                .map(|(n, d)| ColumnInfo {
+                    name: n.to_string(),
+                    data_type: d.to_string(),
+                })
                 .collect(),
         }
     }
 
     #[test]
     fn relevance_ranks_verbatim_then_shared_word() {
-        let tables = vec![t("orders", &[("id", "int")]), t("order_items", &[("id", "int")]), t("users", &[("id", "int")])];
+        let tables = vec![
+            t("orders", &[("id", "int")]),
+            t("order_items", &[("id", "int")]),
+            t("users", &[("id", "int")]),
+        ];
         let rel = relevant_tables(&tables, "top orders by items sold", 10);
         let names: Vec<&str> = rel.iter().map(|t| t.name.as_str()).collect();
         // "orders" appears verbatim (score 0); "order_items" shares the word "items"
@@ -437,7 +490,11 @@ mod tests {
     #[test]
     fn fk_summary_matches_the_ts_rendering() {
         assert_eq!(
-            foreign_key_summary(&[edge("orders", &["customer_id"], "customers", &["id"])], "").trim(),
+            foreign_key_summary(
+                &[edge("orders", &["customer_id"], "customers", &["id"])],
+                ""
+            )
+            .trim(),
             "orders.customer_id -> customers.id"
         );
         assert_eq!(
@@ -448,12 +505,19 @@ mod tests {
 
     #[test]
     fn fk_summary_ranks_focus_tables_first_and_reports_drops() {
-        let mut many: Vec<_> = (0..400).map(|i| edge(&format!("t{i}"), &["a"], &format!("u{i}"), &["id"])).collect();
+        let mut many: Vec<_> = (0..400)
+            .map(|i| edge(&format!("t{i}"), &["a"], &format!("u{i}"), &["id"]))
+            .collect();
         many.push(edge("orders", &["customer_id"], "customers", &["id"]));
         let out = foreign_key_summary(&many, "join orders to customers");
-        assert!(out.starts_with("orders.customer_id -> customers.id
-"));
-        assert!(out.contains("more foreign keys"), "dropped edges must be acknowledged");
+        assert!(out.starts_with(
+            "orders.customer_id -> customers.id
+"
+        ));
+        assert!(
+            out.contains("more foreign keys"),
+            "dropped edges must be acknowledged"
+        );
         assert!(out.len() < FK_BUDGET + 100);
     }
 
@@ -476,15 +540,28 @@ mod tests {
         let fetched = build_system_prompt(&ctx, &tables, "", &[], &[], true, &[]);
         assert!(fetched.contains("declares no foreign keys"));
 
-        let with_fks = build_system_prompt(&ctx, &tables, "", &[], &[edge("orders", &["customer_id"], "customers", &["id"])], true, &[]);
+        let with_fks = build_system_prompt(
+            &ctx,
+            &tables,
+            "",
+            &[],
+            &[edge("orders", &["customer_id"], "customers", &["id"])],
+            true,
+            &[],
+        );
         assert!(with_fks.contains("orders.customer_id -> customers.id"));
         assert!(with_fks.contains("JOIN on these rather than guessing"));
     }
 
     fn skill(name: &str, scope: &str, db: &str, body: &str) -> crate::skills::Skill {
         crate::skills::Skill {
-            id: name.into(), name: name.into(), description: String::new(),
-            scope: scope.into(), database: db.into(), enabled: true, body: body.into(),
+            id: name.into(),
+            name: name.into(),
+            description: String::new(),
+            scope: scope.into(),
+            database: db.into(),
+            enabled: true,
+            body: body.into(),
         }
     }
 
@@ -497,17 +574,26 @@ mod tests {
             skill("db", "database", "pagila", "specific"),
             skill("other", "database", "elsewhere", "nope"),
         ];
-        let got: Vec<&str> = active_skills(&all, "pagila").iter().map(|s| s.name.as_str()).collect();
+        let got: Vec<&str> = active_skills(&all, "pagila")
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
         assert_eq!(got, vec!["db", "ws"]); // database-scoped ranks first
-        let none: Vec<&str> = active_skills(&all, "unknown-db").iter().map(|s| s.name.as_str()).collect();
+        let none: Vec<&str> = active_skills(&all, "unknown-db")
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
         assert_eq!(none, vec!["ws"]); // only workspace applies
     }
 
     #[test]
     fn skills_reach_the_prompt_and_a_dropped_one_is_named() {
         let ctx = SlackAiCtx {
-            dialect: "postgres".into(), user: "me".into(), is_superuser: false,
-            permissions_enforced: false, destructive_policy: "proposeReadonly".into(),
+            dialect: "postgres".into(),
+            user: "me".into(),
+            is_superuser: false,
+            permissions_enforced: false,
+            destructive_policy: "proposeReadonly".into(),
         };
         let tables = vec![t("orders", &[("id", "int")])];
         let s1 = skill("Revenue", "database", "pagila", "Revenue excludes refunds.");
@@ -527,7 +613,14 @@ mod tests {
 
     #[test]
     fn schema_summary_lists_overflow_by_name() {
-        let many: Vec<TableInfo> = (0..2000).map(|i| t(&format!("table_{i}"), &[("col_a", "text"), ("col_b", "integer")])).collect();
+        let many: Vec<TableInfo> = (0..2000)
+            .map(|i| {
+                t(
+                    &format!("table_{i}"),
+                    &[("col_a", "text"), ("col_b", "integer")],
+                )
+            })
+            .collect();
         let s = schema_summary(&many, "");
         assert!(s.len() < SCHEMA_BUDGET + NAME_LIST_BUDGET + 200);
         assert!(s.contains("Other tables"));
@@ -536,13 +629,19 @@ mod tests {
     #[test]
     fn extract_sql_blocks_finds_fenced() {
         let text = "Here you go:\n```sql\nSELECT 1;\n```\nand also\n```\nSELECT 2\n```";
-        assert_eq!(extract_sql_blocks(text), vec!["SELECT 1;".to_string(), "SELECT 2".to_string()]);
+        assert_eq!(
+            extract_sql_blocks(text),
+            vec!["SELECT 1;".to_string(), "SELECT 2".to_string()]
+        );
     }
 
     #[test]
     fn chart_blocks_split_from_sql() {
         let text = "Sales by month.\n```sql\nSELECT \"month\", \"total\" FROM \"s\"\n```\n```chart\n{\"type\":\"bar\",\"x\":\"month\",\"series\":[\"total\"]}\n```";
-        assert_eq!(extract_sql_blocks(text), vec!["SELECT \"month\", \"total\" FROM \"s\"".to_string()]);
+        assert_eq!(
+            extract_sql_blocks(text),
+            vec!["SELECT \"month\", \"total\" FROM \"s\"".to_string()]
+        );
         let chart = extract_chart_block(text).unwrap();
         assert!(chart.contains("\"type\":\"bar\""));
         assert!(extract_chart_block("no charts here ```sql\nSELECT 1\n```").is_none());

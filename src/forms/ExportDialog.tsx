@@ -16,16 +16,20 @@ export function ExportDialog(props: {
   columns: string[];
   loadedRows: (string | null)[][];
   defaultTable: string;
+  /** Source backend kind; SQL preview must use the same quoting as file/clipboard export. */
+  dialect: string;
   /** Source indices of boolean columns (grid detection); exported as TRUE/FALSE. */
   boolCols?: number[];
   onClose: () => void;
-  onExportFile: (opts: ExportOptions, scope: ExportScope) => Promise<void>;
-  onExportClipboard: (opts: ExportOptions) => Promise<void>;
+  onExportFile: (opts: ExportOptions, scope: ExportScope) => Promise<boolean>;
+  onExportClipboard: (opts: ExportOptions) => Promise<boolean>;
+  /** Full-query export is blocked while a manual transaction owns the connection. */
+  allowAllRows?: boolean;
   /** Immediately cancel + roll back an in-flight (streaming) export. */
   onCancel?: () => void | Promise<void>;
 }) {
   const [opts, setOpts] = createSignal<ExportOptions>(defaultExportOptions(props.defaultTable));
-  const [scope, setScope] = createSignal<ExportScope>("all");
+  const [scope, setScope] = createSignal<ExportScope>(props.allowAllRows === false ? "loaded" : "all");
   const [dest, setDest] = createSignal<"file" | "clipboard">("file");
   const [cols, setCols] = createSignal<ColState[]>(
     props.columns.map((name, idx) => ({ idx, name, on: true })),
@@ -55,7 +59,7 @@ export function ExportDialog(props: {
     if (isXlsx()) return "";
     const sample = { columns: props.columns, rows: props.loadedRows.slice(0, 12) };
     try {
-      return formatWithOptions(sample, finalOpts());
+      return formatWithOptions(sample, finalOpts(), props.dialect);
     } catch {
       return "";
     }
@@ -79,9 +83,10 @@ export function ExportDialog(props: {
     setBusy(true);
     setErr("");
     try {
-      if (dest() === "clipboard") await props.onExportClipboard(finalOpts());
-      else await props.onExportFile(finalOpts(), scope());
-      props.onClose();
+      const completed = dest() === "clipboard"
+        ? await props.onExportClipboard(finalOpts())
+        : await props.onExportFile(finalOpts(), scope());
+      if (completed) props.onClose();
     } catch (e) {
       const m = e instanceof Object && "message" in e ? String((e as any).message) : String(e);
       setErr(/cancel/i.test(m) ? "Export cancelled." : m);
@@ -210,7 +215,7 @@ export function ExportDialog(props: {
           <div class="export-row">
             <label>Rows
               <select value={scope()} onChange={(e) => setScope(e.currentTarget.value as ExportScope)} disabled={dest() === "clipboard"}>
-                <option value="all">All rows (re-run query)</option>
+                <option value="all" disabled={props.allowAllRows === false}>All rows (re-run query)</option>
                 <option value="loaded">Loaded rows ({props.loadedRows.length})</option>
               </select>
             </label>
@@ -231,7 +236,7 @@ export function ExportDialog(props: {
         </Show>
 
         <Show when={isXlsx()}>
-          <div class="export-note">Excel buffers the whole file in memory; rows past 1,048,576 roll into additional sheets.</div>
+          <div class="export-note">Excel streams through temporary worksheet files; rows past 1,048,576 roll into additional sheets.</div>
         </Show>
       </fieldset>
 

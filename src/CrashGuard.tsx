@@ -1,11 +1,12 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { ErrorBoundary, Show, createSignal, onCleanup, onMount, type JSX } from "solid-js";
+import { ErrorBoundary, Show, createEffect, createSignal, onCleanup, onMount, type JSX } from "solid-js";
 import { crashConsent, setCrashConsent } from "./store";
 
 const SUPPORT_EMAIL = "willko@willko.dev";
-const MAX_REPORT_CHARS = 96_000;
+const MAX_REPORT_BYTES = 96_000;
+const REPORT_TRUNCATED = "\n[report truncated]";
 
 function errorDetail(reason: unknown): string {
   if (reason instanceof Error) return reason.stack || `${reason.name}: ${reason.message}`;
@@ -27,9 +28,12 @@ export function formatFrontendCrash(source: string, reason: unknown, version = "
     "",
     errorDetail(reason),
   ].join("\n");
-  return report.length <= MAX_REPORT_CHARS
-    ? report
-    : `${report.slice(0, MAX_REPORT_CHARS)}\n[report truncated]`;
+  const bytes = new TextEncoder().encode(report);
+  if (bytes.length <= MAX_REPORT_BYTES) return report;
+  const suffix = new TextEncoder().encode(REPORT_TRUNCATED);
+  // Leave room for a replacement code point if the byte cut splits UTF-8.
+  const body = new TextDecoder().decode(bytes.slice(0, MAX_REPORT_BYTES - suffix.length - 3));
+  return `${body}${REPORT_TRUNCATED}`;
 }
 
 function CrashPanel(props: { report: string; prior?: boolean; onContinue: () => void }) {
@@ -105,6 +109,11 @@ function CapturedCrash(props: { source: string; reason: unknown; prior?: boolean
 
   onMount(() => {
     if (props.prior) return;
+    if (crashConsent() !== "on") {
+      // Consent off/unset still shows the contained error, but retains no details on disk.
+      void invoke("crash_report_clear").catch(() => undefined);
+      return;
+    }
     void getVersion()
       .then((version) => {
         const next = formatFrontendCrash(props.source, props.reason, version);
@@ -156,12 +165,21 @@ export function CrashGuard(props: { children: JSX.Element }) {
     }
   };
 
+  createEffect(() => {
+    if (crashConsent() !== "off") return;
+    setPriorReport(null);
+    if (unexpected()?.prior) setUnexpected(null);
+    void invoke("crash_report_clear").catch(() => undefined);
+  });
+
   onMount(() => {
-    void invoke<string | null>("crash_report_get")
-      .then((report) => {
-        if (report) routePrior(report);
-      })
-      .catch(() => undefined);
+    if (crashConsent() !== "off") {
+      void invoke<string | null>("crash_report_get")
+        .then((report) => {
+          if (report) routePrior(report);
+        })
+        .catch(() => undefined);
+    }
 
     const onError = (event: ErrorEvent) => {
       setUnexpected({ source: `${event.filename || "window"}:${event.lineno || 0}`, reason: event.error ?? event.message });

@@ -15,21 +15,56 @@ mod slack;
 mod tree;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::io::AsyncReadExt;
+use tokio::sync::Mutex as AsyncMutex;
 
-use db::{AppError, ConnectResult, ConnectionConfig, FetchResult, QueryOutcome};
+use db::{
+    AppError, ConnectResult, ConnectionConfig, FetchResponse, QueryOutcome, QueryResult,
+    TransactionState, TransactionStatus,
+};
 use driver::{Backend, CancelHandle, ConnState};
 use profiles::Profile;
 
-type Conn = Arc<AsyncMutex<ConnState>>;
+pub(crate) struct RegisteredConn {
+    inner: AsyncMutex<ConnState>,
+    closed: AtomicBool,
+}
+
+type Conn = Arc<RegisteredConn>;
+
+#[derive(Clone)]
+struct CancelEntry {
+    generation: u64,
+    handle: CancelHandle,
+    config: ConnectionConfig,
+    cancelling: bool,
+    completed: Arc<AtomicBool>,
+    completed_notify: Arc<tokio::sync::Notify>,
+    owner: Option<String>,
+    transaction: TransactionStatus,
+}
+
+struct CancelRegistration<'a> {
+    state: &'a AppState,
+    id: String,
+    generation: u64,
+}
+
+impl Drop for CancelRegistration<'_> {
+    fn drop(&mut self) {
+        self.state
+            .complete_cancel_generation(&self.id, self.generation);
+    }
+}
 
 pub(crate) fn lock_sync<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[derive(Default)]
@@ -44,8 +79,9 @@ pub(crate) struct AppState {
     // can reach it without blocking. The `CancelToken` opens its own short-lived
     // connection to issue a Postgres CancelRequest; the config is stored so we can build
     // a matching TLS connector for it.
-    cancels: Mutex<HashMap<String, (CancelHandle, ConnectionConfig)>>,
+    cancels: Mutex<HashMap<String, CancelEntry>>,
     next_id: AtomicU64,
+    next_cancel_generation: AtomicU64,
 }
 
 impl AppState {
@@ -59,20 +95,113 @@ impl AppState {
     }
 
     /// Arm cancellation for an operation about to run on `id` (call after `ensure_alive`,
-    /// with the *current* client's token). `disarm_cancel` must be called when it ends.
-    pub(crate) fn arm_cancel(&self, id: &str, handle: CancelHandle, cfg: ConnectionConfig) {
-        lock_sync(&self.cancels).insert(id.to_string(), (handle, cfg));
-    }
-    pub(crate) fn disarm_cancel(&self, id: &str) {
-        lock_sync(&self.cancels).remove(id);
-    }
-    pub(crate) fn cancel_handle(&self, id: &str) -> Option<(CancelHandle, ConnectionConfig)> {
-        lock_sync(&self.cancels).get(id).cloned()
+    /// with the current client's token). Generation-aware cleanup must run when it ends.
+    fn arm_cancel(
+        &self,
+        id: &str,
+        handle: CancelHandle,
+        config: ConnectionConfig,
+        owner: Option<&str>,
+        transaction: TransactionStatus,
+    ) -> Result<CancelRegistration<'_>, AppError> {
+        // Hold registry visibility through insertion. Disconnect removes the entry
+        // under this same lock, so an already-detached command cannot arm afterwards.
+        let conns = lock_sync(&self.conns);
+        let Some(conn) = conns.get(id) else {
+            return Err(AppError::new("connection is disconnecting"));
+        };
+        if conn.closed.load(Ordering::Acquire) {
+            return Err(AppError::new("connection is disconnecting"));
+        }
+        let generation = self.next_cancel_generation.fetch_add(1, Ordering::Relaxed);
+        let mut cancels = lock_sync(&self.cancels);
+        if cancels.get(id).is_some_and(|entry| entry.cancelling) {
+            return Err(AppError::new(
+                "the previous cancellation is still completing",
+            ));
+        }
+        cancels.insert(
+            id.to_string(),
+            CancelEntry {
+                generation,
+                handle,
+                config,
+                cancelling: false,
+                completed: Arc::new(AtomicBool::new(false)),
+                completed_notify: Arc::new(tokio::sync::Notify::new()),
+                owner: owner.map(str::to_string),
+                transaction,
+            },
+        );
+        drop(cancels);
+        drop(conns);
+        Ok(CancelRegistration {
+            state: self,
+            id: id.to_string(),
+            generation,
+        })
     }
 
+    fn complete_cancel_generation(&self, id: &str, generation: u64) {
+        let mut cancels = lock_sync(&self.cancels);
+        let Some(entry) = cancels.get(id) else {
+            return;
+        };
+        if entry.generation != generation {
+            return;
+        }
+        if entry.cancelling {
+            entry.completed.store(true, Ordering::Release);
+            entry.completed_notify.notify_waiters();
+        } else {
+            cancels.remove(id);
+        }
+    }
+
+    fn begin_cancel(&self, id: &str) -> Option<CancelEntry> {
+        let mut cancels = lock_sync(&self.cancels);
+        let entry = cancels.get_mut(id)?;
+        if entry.cancelling {
+            return None;
+        }
+        entry.cancelling = true;
+        Some(entry.clone())
+    }
+
+    fn abort_cancel_generation(&self, id: &str, generation: u64) {
+        let mut cancels = lock_sync(&self.cancels);
+        let Some(entry) = cancels.get_mut(id) else {
+            return;
+        };
+        if entry.generation != generation {
+            return;
+        }
+        if entry.completed.load(Ordering::Acquire) {
+            cancels.remove(id);
+        } else {
+            entry.cancelling = false;
+        }
+    }
+
+    fn finish_cancel_generation(&self, id: &str, generation: u64) {
+        let mut cancels = lock_sync(&self.cancels);
+        if cancels.get(id).map(|entry| entry.generation) == Some(generation) {
+            cancels.remove(id);
+        }
+    }
+    fn clear_cancel(&self, id: &str) {
+        lock_sync(&self.cancels).remove(id);
+    }
+    #[cfg(test)]
+    fn cancel_entry(&self, id: &str) -> Option<CancelEntry> {
+        lock_sync(&self.cancels).get(id).cloned()
+    }
     fn register(&self, backend: Backend, read_only: bool) -> String {
         let id = format!("conn-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
-        let conn = Arc::new(AsyncMutex::new(ConnState { backend, read_only }));
+        let conn = Arc::new(RegisteredConn {
+            inner: AsyncMutex::new(ConnState::new(backend, read_only)),
+            closed: AtomicBool::new(false),
+        });
         lock_sync(&self.conns).insert(id.clone(), conn);
         *lock_sync(&self.active_conn_id) = Some(id.clone());
         id
@@ -103,7 +232,27 @@ impl AppState {
 /// or a network drop that TCP keepalives surfaced as `is_closed`. Resets cursor
 /// state since a fresh connection has none. Never caps query duration.
 pub(crate) async fn ensure_alive(c: &mut ConnState) -> Result<(), AppError> {
+    if c.transaction.state == TransactionState::Lost {
+        return Err(
+            AppError::new("manual transaction session was lost; disconnect and reconnect")
+                .with_transaction(c.transaction.clone()),
+        );
+    }
+    if c.transaction.owns_session() && c.backend.manual_session_ended() {
+        c.mark_transaction_lost();
+        return Err(AppError::new(
+            "the database ended the manual transaction unexpectedly; reconnect required",
+        )
+        .with_transaction(c.transaction.clone()));
+    }
     if c.backend.is_closed() {
+        if c.transaction.owns_session() {
+            c.mark_transaction_lost();
+            return Err(AppError::new(
+                "connection was lost during a manual transaction; reconnect required",
+            )
+            .with_transaction(c.transaction.clone()));
+        }
         c.backend.reopen().await?;
     }
     Ok(())
@@ -119,7 +268,9 @@ pub(crate) struct ConnGuard<'a> {
 }
 impl Drop for ConnGuard<'_> {
     fn drop(&mut self) {
-        self.inner.backend.release_idle();
+        self.inner
+            .backend
+            .release_idle(self.inner.transaction.owns_session());
     }
 }
 impl std::ops::Deref for ConnGuard<'_> {
@@ -133,8 +284,15 @@ impl std::ops::DerefMut for ConnGuard<'_> {
         &mut self.inner
     }
 }
-pub(crate) async fn lock_conn(conn: &Conn) -> ConnGuard<'_> {
-    ConnGuard { inner: conn.lock().await }
+pub(crate) async fn lock_conn(conn: &Conn) -> Result<ConnGuard<'_>, AppError> {
+    if conn.closed.load(Ordering::Acquire) {
+        return Err(AppError::new("connection is disconnected"));
+    }
+    let inner = conn.inner.lock().await;
+    if conn.closed.load(Ordering::Acquire) {
+        return Err(AppError::new("connection is disconnected"));
+    }
+    Ok(ConnGuard { inner })
 }
 
 /// Only plain read queries can be wrapped in a server-side cursor for streaming.
@@ -155,7 +313,12 @@ pub(crate) fn is_read_only_stmt(sql: &str) -> bool {
         first.as_str(),
         "select" | "with" | "show" | "explain" | "table" | "values" | "from" | "pivot"
     );
-    allowed && (matches!(first.as_str(), "show" | "explain") || slack::processor::find_mutation_word(sql).is_none())
+    allowed
+        && !script::contains_code_word(sql, "set_config")
+        && !(first == "explain"
+            && (script::contains_code_word(sql, "analyze")
+                || script::contains_code_word(sql, "analyse")))
+        && (first == "show" || slack::processor::find_mutation_word(sql).is_none())
 }
 
 fn first_sql_word(sql: &str) -> String {
@@ -164,6 +327,13 @@ fn first_sql_word(sql: &str) -> String {
         .take_while(|c| c.is_ascii_alphabetic())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+fn transaction_requests_write(sql: &str, action: Option<script::TransactionAction>) -> bool {
+    matches!(
+        action,
+        Some(script::TransactionAction::Begin | script::TransactionAction::SetTransaction)
+    ) && script::contains_code_word(sql, "write")
 }
 
 const DEFAULT_PAGE_SIZE: u32 = 1000;
@@ -176,6 +346,16 @@ const MAX_IPC_COLUMNS: usize = 10_000;
 const MAX_IPC_CELLS: usize = 2_000_000;
 const MAX_IPC_CELL_BYTES: usize = 1024 * 1024;
 const MAX_IPC_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TRANSACTION_OWNER_BYTES: usize = 256;
+
+fn validate_transaction_owner(owner: &str) -> Result<(), AppError> {
+    if owner.trim().is_empty() || owner.len() > MAX_TRANSACTION_OWNER_BYTES {
+        return Err(AppError::new(format!(
+            "transaction owner must be between 1 and {MAX_TRANSACTION_OWNER_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
 
 fn checked_page_size(page: Option<u32>) -> Result<u32, AppError> {
     let page = page.unwrap_or(DEFAULT_PAGE_SIZE);
@@ -189,29 +369,96 @@ fn checked_page_size(page: Option<u32>) -> Result<u32, AppError> {
 
 fn validate_sql_size(sql: &str) -> Result<(), AppError> {
     if sql.len() > MAX_SQL_BYTES {
-        return Err(AppError::new(format!("SQL exceeds the {MAX_SQL_BYTES}-byte limit")));
+        return Err(AppError::new(format!(
+            "SQL exceeds the {MAX_SQL_BYTES}-byte limit"
+        )));
     }
     Ok(())
 }
 
-fn validate_tabular_payload(columns: &[String], rows: &[Vec<Option<String>>]) -> Result<(), AppError> {
+fn validate_tabular_payload(
+    columns: &[String],
+    rows: &[Vec<Option<String>>],
+) -> Result<(), AppError> {
     if columns.is_empty() || columns.len() > MAX_IPC_COLUMNS {
-        return Err(AppError::new(format!("column count must be between 1 and {MAX_IPC_COLUMNS}")));
+        return Err(AppError::new(format!(
+            "column count must be between 1 and {MAX_IPC_COLUMNS}"
+        )));
     }
     if rows.len() > MAX_IPC_ROWS || rows.len().saturating_mul(columns.len()) > MAX_IPC_CELLS {
-        return Err(AppError::new(format!("row payload exceeds the {MAX_IPC_CELLS}-cell limit")));
+        return Err(AppError::new(format!(
+            "row payload exceeds the {MAX_IPC_CELLS}-cell limit"
+        )));
     }
     if rows.iter().any(|r| r.len() != columns.len()) {
-        return Err(AppError::new("every row must have exactly the same number of values as columns"));
+        return Err(AppError::new(
+            "every row must have exactly the same number of values as columns",
+        ));
     }
     let mut bytes = 0usize;
     for value in columns.iter().chain(rows.iter().flatten().flatten()) {
         if value.len() > MAX_IPC_CELL_BYTES {
-            return Err(AppError::new(format!("a column name or value exceeds the {MAX_IPC_CELL_BYTES}-byte limit")));
+            return Err(AppError::new(format!(
+                "a column name or value exceeds the {MAX_IPC_CELL_BYTES}-byte limit"
+            )));
         }
         bytes = bytes.saturating_add(value.len());
         if bytes > MAX_IPC_PAYLOAD_BYTES {
-            return Err(AppError::new(format!("row payload exceeds the {MAX_IPC_PAYLOAD_BYTES}-byte limit")));
+            return Err(AppError::new(format!(
+                "row payload exceeds the {MAX_IPC_PAYLOAD_BYTES}-byte limit"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_result_page(columns: &[String], rows: &[Vec<Option<String>>]) -> Result<(), AppError> {
+    if columns.len() > MAX_IPC_COLUMNS {
+        return Err(AppError::new(format!(
+            "query result exceeds the {MAX_IPC_COLUMNS}-column limit"
+        )));
+    }
+    if rows.len() > MAX_IPC_ROWS || rows.len().saturating_mul(columns.len()) > MAX_IPC_CELLS {
+        return Err(AppError::new(format!(
+            "query result exceeds the {MAX_IPC_CELLS}-cell page limit"
+        )));
+    }
+    if rows.iter().any(|r| r.len() != columns.len()) {
+        return Err(AppError::new("query returned an inconsistent row shape"));
+    }
+    validate_result_bytes(columns.iter(), rows)
+}
+
+fn validate_fetch_page(rows: &[Vec<Option<String>>]) -> Result<(), AppError> {
+    let columns = rows.first().map_or(0, Vec::len);
+    if columns > MAX_IPC_COLUMNS
+        || rows.len() > MAX_IPC_ROWS
+        || rows.len().saturating_mul(columns) > MAX_IPC_CELLS
+        || rows.iter().any(|r| r.len() != columns)
+    {
+        return Err(AppError::new(
+            "fetched result page exceeds IPC shape limits",
+        ));
+    }
+    validate_result_bytes(std::iter::empty::<&String>(), rows)
+}
+
+fn validate_result_bytes<'a>(
+    columns: impl Iterator<Item = &'a String>,
+    rows: &'a [Vec<Option<String>>],
+) -> Result<(), AppError> {
+    let mut bytes = 0usize;
+    for value in columns.chain(rows.iter().flatten().flatten()) {
+        if value.len() > MAX_IPC_CELL_BYTES {
+            return Err(AppError::new(format!(
+                "query result contains a value over the {MAX_IPC_CELL_BYTES}-byte limit"
+            )));
+        }
+        bytes = bytes.saturating_add(value.len());
+        if bytes > MAX_IPC_PAYLOAD_BYTES {
+            return Err(AppError::new(format!(
+                "query result page exceeds the {MAX_IPC_PAYLOAD_BYTES}-byte limit"
+            )));
         }
     }
     Ok(())
@@ -243,7 +490,11 @@ async fn connect_profile(
         .ok_or_else(|| AppError::new("no such profile"))?;
     // Embedded drivers have no password — skip the keychain entirely.
     let embedded = matches!(p.driver.as_deref(), Some("duckdb") | Some("sqlite"));
-    let password = if embedded { None } else { profiles::get_password(&id) };
+    let password = if embedded {
+        None
+    } else {
+        profiles::get_password(&id)
+    };
     if !embedded && p.save_password && password.as_deref().unwrap_or("").is_empty() {
         return Err(AppError::new(
             "couldn't read the saved password from the keychain (macOS may block keychain access for unsigned dev builds) — reconnect via the form, or re-save the connection",
@@ -274,18 +525,35 @@ async fn disconnect(
     state: tauri::State<'_, AppState>,
     connection_id: String,
 ) -> Result<(), AppError> {
-    state.disarm_cancel(&connection_id);
+    disconnect_registered(&state, &connection_id).await
+}
+
+async fn disconnect_registered(state: &AppState, connection_id: &str) -> Result<(), AppError> {
     {
         let mut active = lock_sync(&state.active_conn_id);
-        if active.as_deref() == Some(connection_id.as_str()) {
+        if active.as_deref() == Some(connection_id) {
             *active = None;
         }
     }
-    let removed = lock_sync(&state.conns).remove(&connection_id);
+    let removed = lock_sync(&state.conns).remove(connection_id);
     if let Some(conn) = removed {
-        let mut c = lock_conn(&conn).await;
-        c.backend.rollback_cursor().await;
+        conn.closed.store(true, Ordering::Release);
+        // Remove registry visibility first, then best-effort cancel any operation that
+        // already armed itself. A command that raced before removal may still hold its
+        // Arc; waiting for its lock below makes disconnect deterministic.
+        if let Some(entry) = state.begin_cancel(connection_id) {
+            let _ = entry.handle.cancel(&entry.config).await;
+        }
+        let mut c = conn.inner.lock().await;
+        if c.transaction.owns_session() {
+            c.backend.rollback_manual().await;
+        } else {
+            c.backend.rollback_cursor().await;
+        }
     }
+    // Clear after the removed connection is quiescent so a racing operation cannot arm
+    // a stale handle after an earlier clear.
+    state.clear_cancel(connection_id);
     Ok(())
 }
 
@@ -312,78 +580,133 @@ async fn delete_profile(app: tauri::AppHandle, id: String) -> Result<(), AppErro
 async fn run_query(
     state: tauri::State<'_, AppState>,
     connection_id: String,
+    owner_id: String,
     sql: String,
     page_size: Option<u32>,
     search_path: Option<String>,
-) -> Result<QueryOutcome, AppError> {
-    validate_sql_size(&sql)?;
+) -> Result<QueryResult, AppError> {
+    validate_transaction_owner(&owner_id)?;
     let conn = state.get(&connection_id)?;
-    let mut c = lock_conn(&conn).await;
-    let page = checked_page_size(page_size)?;
-    ensure_alive(&mut c).await?;
-
-    let items = script::split(sql.trim());
+    let mut c = lock_conn(&conn).await?;
+    // A run takes over the single result stream (exec_items closes the old cursor
+    // and clears `stream_owner`), so only the manual-transaction owner gate applies
+    // here — otherwise one tab's unfinished page would lock every other tab out.
+    c.require_transaction_owner(&owner_id)?;
+    ensure_alive(&mut c)
+        .await
+        .map_err(|error| error.with_transaction(c.transaction.clone()))?;
+    validate_sql_size(&sql).map_err(|error| error.with_transaction(c.transaction.clone()))?;
+    let page = checked_page_size(page_size)
+        .map_err(|error| error.with_transaction(c.transaction.clone()))?;
+    let items = script::parse_for_engine(sql.trim(), c.transaction_engine())
+        .map_err(|error| error.with_transaction(c.transaction.clone()))?;
     if items.is_empty() {
-        return Ok(QueryOutcome::Exec {
-            message: "OK (nothing to run)".to_string(),
+        return Ok(QueryResult {
+            outcome: QueryOutcome::Exec {
+                message: "OK (nothing to run)".to_string(),
+            },
+            transaction: c.transaction.clone(),
         });
     }
+    let actions = script::preflight_transactions(&items, c.transaction_engine(), &c.transaction)
+        .map_err(|error| error.with_transaction(c.transaction.clone()))?;
 
+    if c.read_only
+        && items.iter().zip(&actions).any(|(item, action)| match item {
+            script::Item::Sql(sql) => {
+                (action.is_none() && !is_read_only_stmt(sql.trim()))
+                    || transaction_requests_write(sql, *action)
+            }
+            script::Item::Copy { .. } => true,
+        })
+    {
+        return Err(
+            AppError::new("connection is read-only — writes and DDL are blocked")
+                .with_transaction(c.transaction.clone()),
+        );
+    }
     // Arm cancellation so the Run button can interrupt this query (Postgres CancelRequest)
     // by re-clicking. Armed after ensure_alive so the handle matches the live backend; the
     // handle lives outside the per-connection lock we hold here so `cancel_operation` reaches it.
-    state.arm_cancel(&connection_id, c.backend.cancel_handle(), c.backend.config().clone());
-    let retry_safe = c.read_only
-        && c.backend.capabilities().kind != "mysql"
-        && items.len() == 1
-        && matches!(&items[0], script::Item::Sql(s) if is_read_only_stmt(s));
-    let out = match exec_items(&mut c, &items, page, &search_path).await {
-        Ok(out) => Ok(out),
-        // Only an engine-enforced read-only single statement is safe to replay.
-        // A dropped write has an ambiguous commit outcome and must never run twice.
-        Err(_) if c.backend.is_closed() && retry_safe => match ensure_alive(&mut c).await {
-            Ok(()) => {
-                state.arm_cancel(&connection_id, c.backend.cancel_handle(), c.backend.config().clone());
-                exec_items(&mut c, &items, page, &search_path).await
-            }
-            Err(e) => Err(e),
-        },
-        Err(e) if c.backend.is_closed() => {
+    let cancel_registration = state
+        .arm_cancel(
+            &connection_id,
+            c.backend.cancel_handle(),
+            c.backend.config().clone(),
+            Some(&owner_id),
+            c.transaction.clone(),
+        )
+        .map_err(|error| error.with_transaction(c.transaction.clone()))?;
+    let out = match exec_items(&mut c, &items, &actions, page, &search_path, &owner_id).await {
+        Ok(outcome) => Ok(QueryResult {
+            outcome,
+            transaction: c.transaction.clone(),
+        }),
+        // Never replay a statement after it reached the server. Even read-only SQL may
+        // call volatile functions or external systems, so its effects are ambiguous.
+        // `ensure_alive` reconnects before the user's next explicit run instead.
+        Err(e)
+            if c.backend.is_closed()
+                || (c.transaction.owns_session() && c.backend.manual_session_ended()) =>
+        {
+            c.mark_transaction_lost();
             Err(AppError::new(format!(
                 "connection dropped while the query was running; execution outcome is unknown. Verify database state before retrying. ({})",
                 e.message
-            )))
+            ))
+            .with_transaction(c.transaction.clone()))
         }
-        Err(e) => Err(e),
+        Err(e) => {
+            if c.backend.manual_errors_require_recovery() {
+                c.mark_transaction_failed();
+            }
+            Err(e.with_transaction(c.transaction.clone()))
+        }
     };
-    state.disarm_cancel(&connection_id);
+    drop(c);
+    drop(cancel_registration);
     out
 }
 
 async fn exec_items(
     c: &mut ConnState,
     items: &[script::Item],
+    actions: &[Option<script::TransactionAction>],
     page: u32,
     search_path: &Option<String>,
+    owner: &str,
 ) -> Result<QueryOutcome, AppError> {
-    // Abandon any previously open cursor/transaction before starting a new query.
-    c.backend.rollback_cursor().await;
-    c.backend.apply_search_path(search_path).await?;
-
-    // Read-only enforcement, uniform across drivers AND single/multi-statement input.
-    // PG also sets `default_transaction_read_only` and embedded files open read-only, but
-    // MySQL has no engine-level read-only — so this app-layer guard is what protects it.
-    // Any write/DDL statement (or a COPY block) on a read-only connection is rejected.
-    if c.read_only {
-        let has_write = items.iter().any(|it| match it {
-            script::Item::Sql(s) => !is_read_only_stmt(s.trim()),
+    if c.read_only
+        && items.iter().zip(actions).any(|(item, action)| match item {
+            script::Item::Sql(sql) => {
+                (action.is_none() && !is_read_only_stmt(sql.trim()))
+                    || transaction_requests_write(sql, *action)
+            }
             script::Item::Copy { .. } => true,
+        })
+    {
+        return Err(AppError::new(
+            "connection is read-only — writes and DDL are blocked",
+        ));
+    }
+    let manual = c.transaction.owns_session();
+    c.backend.close_stream(manual).await?;
+    c.stream_owner = None;
+
+    let recovery_only = c.transaction.state == TransactionState::Failed
+        && actions.iter().all(|action| {
+            matches!(
+                action,
+                Some(
+                    script::TransactionAction::Rollback
+                        | script::TransactionAction::RollbackTo
+                        | script::TransactionAction::Commit
+                )
+            )
         });
-        if has_write {
-            return Err(AppError::new(
-                "connection is read-only — writes and DDL are blocked",
-            ));
-        }
+    let control_only = actions.iter().all(Option::is_some);
+    if !recovery_only && !control_only {
+        c.backend.apply_search_path(search_path).await?;
     }
 
     // A single plain statement runs interactively (streaming result grid).
@@ -391,77 +714,189 @@ async fn exec_items(
     if items.len() == 1 {
         if let script::Item::Sql(stmt) = &items[0] {
             let trimmed = stmt.trim();
-            return c.backend.run_single(trimmed, page, is_cursorable(trimmed, duck)).await;
+            let out = if let Some(action) = actions[0] {
+                let mode = c.transaction.mode;
+                let owned_before = c.transaction.owns_session();
+                let result = c
+                    .backend
+                    .run_transaction_statement(trimmed, action, mode)
+                    .await;
+                let out = match result {
+                    Ok(out) => out,
+                    Err(error) => {
+                        if !owned_before {
+                            c.backend.rollback_manual().await;
+                        }
+                        return Err(error);
+                    }
+                };
+                c.apply_transaction_action(action, owner);
+                out
+            } else if c.transaction.owns_session() {
+                c.backend
+                    .run_manual_single(
+                        trimmed,
+                        page,
+                        is_cursorable(trimmed, duck),
+                        c.transaction.mode,
+                    )
+                    .await?
+            } else {
+                c.backend
+                    .run_single(trimmed, page, is_cursorable(trimmed, duck))
+                    .await?
+            };
+            if let QueryOutcome::Rows { columns, rows, .. } = &out {
+                if let Err(e) = validate_result_page(columns, rows) {
+                    c.backend.close_stream(c.transaction.owns_session()).await?;
+                    return Err(e);
+                }
+            }
+            if matches!(&out, QueryOutcome::Rows { done: false, .. }) {
+                c.stream_owner = Some(owner.to_string());
+            }
+            return Ok(out);
         }
     }
 
-    // Multiple statements where the LAST one is a cursorable read: run the leading
-    // statements as a transactional script (atomic — rolls back on error), then STREAM
-    // the last statement to the grid so its result is shown, with full pagination just
-    // like a single-statement run. (A trailing read can't dirty state, so the only
-    // semantic shift vs. one big transaction is that a *failing* trailing SELECT no
-    // longer rolls the already-committed leading statements back.)
-    if items.len() > 1 {
-        if let Some(script::Item::Sql(last)) = items.last() {
-            let last_trimmed = last.trim();
-            if is_cursorable(last_trimmed, duck) {
-                c.backend
-                    .run_script(&items[..items.len() - 1], c.read_only)
-                    .await?;
-                // The leading statements are now committed. Never replay even the
-                // trailing SELECT after a disconnect: SELECT can call side-effecting
-                // functions, and its outcome is ambiguous on a writable connection.
-                let mut out = c.backend.run_single(last_trimmed, page, true).await;
-                // Tell the user the earlier statements ran too — when several
-                // are reads, their results were silently superseded by this one.
-                if let Ok(QueryOutcome::Rows { note, .. }) = &mut out {
-                    let leading_reads = items[..items.len() - 1].iter().any(|it| {
-                        matches!(it, script::Item::Sql(s) if is_cursorable(s.trim(), duck))
-                    });
-                    *note = Some(if leading_reads {
-                        "earlier statements executed — only the last result is shown".into()
-                    } else {
-                        format!("{} earlier statement(s) executed", items.len() - 1)
-                    });
+    if actions.iter().all(Option::is_none) && !c.transaction.owns_session() {
+        // Preserve the app-owned atomic wrapper for ordinary idle scripts.
+        let message = c.backend.run_script(items, c.read_only).await?;
+        return Ok(QueryOutcome::Exec { message });
+    }
+
+    let mut statements = 0u64;
+    let mut copied = 0u64;
+    for (item, action) in items.iter().zip(actions) {
+        match item {
+            script::Item::Sql(sql) => {
+                let trimmed = sql.trim();
+                if let Some(action) = action {
+                    let mode = c.transaction.mode;
+                    let owned_before = c.transaction.owns_session();
+                    let result = c
+                        .backend
+                        .run_transaction_statement(trimmed, *action, mode)
+                        .await;
+                    if let Err(error) = result {
+                        if !owned_before {
+                            c.backend.rollback_manual().await;
+                        }
+                        return Err(error);
+                    }
+                    c.apply_transaction_action(*action, owner);
+                } else if c.transaction.owns_session() {
+                    c.backend
+                        .run_manual_single(trimmed, page, false, c.transaction.mode)
+                        .await?;
+                } else {
+                    c.backend.run_single(trimmed, page, false).await?;
                 }
-                return out;
+            }
+            script::Item::Copy { stmt, data } => {
+                copied = copied.saturating_add(c.backend.run_manual_copy(stmt, data).await?);
             }
         }
+        statements = statements.saturating_add(1);
     }
-
-    // Multiple statements (or a COPY block) run as a script.
-    let msg = c.backend.run_script(items, c.read_only).await?;
-    Ok(QueryOutcome::Exec { message: msg })
+    Ok(QueryOutcome::Exec {
+        message: format!("OK — {statements} statements run, {copied} rows copied"),
+    })
 }
 
 #[tauri::command]
 async fn fetch_more(
     state: tauri::State<'_, AppState>,
     connection_id: String,
+    owner_id: String,
     page_size: Option<u32>,
-) -> Result<FetchResult, AppError> {
+) -> Result<FetchResponse, AppError> {
+    validate_transaction_owner(&owner_id)?;
     let conn = state.get(&connection_id)?;
-    let mut c = lock_conn(&conn).await;
+    let mut c = lock_conn(&conn).await?;
+    c.require_owner(&owner_id)?;
     let was_streaming = c.backend.cursor_open();
-    ensure_alive(&mut c).await?;
+    ensure_alive(&mut c)
+        .await
+        .map_err(|error| error.with_transaction(c.transaction.clone()))?;
+    let page = checked_page_size(page_size)
+        .map_err(|error| error.with_transaction(c.transaction.clone()))?;
     // A live stream whose connection had to be re-opened (idle timeout, server restart,
     // or a network drop surfaced by TCP keepalives) has lost its server-side cursor — it
     // lived in a transaction on the old connection. Don't silently report `done`: that
     // truncates the result with no indication. Surface the break so the UI can show it;
     // the user re-runs to load the rest.
     if was_streaming && !c.backend.cursor_open() {
+        c.mark_transaction_lost();
         return Err(AppError::new(
             "connection dropped mid-stream — the result is incomplete. Re-run the query to load the rest.",
-        ));
+        )
+        .with_transaction(c.transaction.clone()));
     }
-    let page = checked_page_size(page_size)?;
     if !c.backend.cursor_open() {
-        return Ok(FetchResult {
+        return Ok(FetchResponse {
             rows: vec![],
             done: true,
+            transaction: c.transaction.clone(),
         });
     }
-    c.backend.fetch_page(page).await
+    let cancel_registration = state
+        .arm_cancel(
+            &connection_id,
+            c.backend.cancel_handle(),
+            c.backend.config().clone(),
+            Some(&owner_id),
+            c.transaction.clone(),
+        )
+        .map_err(|error| error.with_transaction(c.transaction.clone()))?;
+    let result = c.backend.fetch_page(page).await;
+    let result = match result {
+        Ok(page) => {
+            if let Err(e) = validate_fetch_page(&page.rows) {
+                if c.transaction.owns_session() {
+                    let _ = c.backend.close_stream(true).await;
+                } else {
+                    c.backend.rollback_cursor().await;
+                }
+                Err(e)
+            } else {
+                Ok(page)
+            }
+        }
+        Err(e) => {
+            if c.transaction.owns_session() {
+                let _ = c.backend.close_stream(true).await;
+            } else {
+                c.backend.rollback_cursor().await;
+            }
+            Err(e)
+        }
+    };
+    let result = match result {
+        Ok(page) => {
+            if page.done {
+                c.stream_owner = None;
+            }
+            Ok(FetchResponse {
+                rows: page.rows,
+                done: page.done,
+                transaction: c.transaction.clone(),
+            })
+        }
+        Err(error) => {
+            if c.backend.is_closed()
+                || (c.transaction.owns_session() && c.backend.manual_session_ended())
+            {
+                c.mark_transaction_lost();
+            } else if c.backend.manual_errors_require_recovery() {
+                c.mark_transaction_failed();
+            }
+            Err(error.with_transaction(c.transaction.clone()))
+        }
+    };
+    drop(c);
+    drop(cancel_registration);
+    result
 }
 
 /// One diagnostic from `validate_sql`: a statement that failed to PREPARE.
@@ -479,11 +914,48 @@ struct StmtDiag {
 /// (the old allow-list meant a misspelled first keyword produced no lint at all).
 fn is_prepareable(sql: &str) -> bool {
     const SKIP: &[&str] = &[
-        "create", "alter", "drop", "truncate", "grant", "revoke", "comment", "set", "reset",
-        "show", "copy", "vacuum", "analyze", "analyse", "begin", "start", "commit", "end",
-        "rollback", "abort", "savepoint", "release", "do", "call", "declare", "fetch", "move",
-        "close", "prepare", "execute", "deallocate", "listen", "notify", "unlisten", "lock",
-        "reindex", "cluster", "refresh", "checkpoint", "discard", "import", "security",
+        "create",
+        "alter",
+        "drop",
+        "truncate",
+        "grant",
+        "revoke",
+        "comment",
+        "set",
+        "reset",
+        "show",
+        "copy",
+        "vacuum",
+        "analyze",
+        "analyse",
+        "begin",
+        "start",
+        "commit",
+        "end",
+        "rollback",
+        "abort",
+        "savepoint",
+        "release",
+        "do",
+        "call",
+        "declare",
+        "fetch",
+        "move",
+        "close",
+        "prepare",
+        "execute",
+        "deallocate",
+        "listen",
+        "notify",
+        "unlisten",
+        "lock",
+        "reindex",
+        "cluster",
+        "refresh",
+        "checkpoint",
+        "discard",
+        "import",
+        "security",
         "explain",
     ];
     let t = script::effective_start(sql).to_ascii_lowercase();
@@ -508,13 +980,17 @@ fn has_bind_params(sql: &str) -> bool {
         let c = b[i];
         // skip line comment
         if c == b'-' && i + 1 < n && b[i + 1] == b'-' {
-            while i < n && b[i] != b'\n' { i += 1; }
+            while i < n && b[i] != b'\n' {
+                i += 1;
+            }
             continue;
         }
         // skip block comment
         if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
             i += 2;
-            while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') { i += 1; }
+            while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
             i = (i + 2).min(n);
             continue;
         }
@@ -524,7 +1000,10 @@ fn has_bind_params(sql: &str) -> bool {
             i += 1;
             while i < n {
                 if b[i] == q {
-                    if i + 1 < n && b[i + 1] == q { i += 2; continue; }
+                    if i + 1 < n && b[i + 1] == q {
+                        i += 2;
+                        continue;
+                    }
                     i += 1;
                     break;
                 }
@@ -541,10 +1020,15 @@ fn has_bind_params(sql: &str) -> bool {
                 let tag = &b[i..tag_end];
                 let mut j = tag_end;
                 while j + tag.len() <= n {
-                    if &b[j..j + tag.len()] == tag { i = j + tag.len(); break; }
+                    if &b[j..j + tag.len()] == tag {
+                        i = j + tag.len();
+                        break;
+                    }
                     j += 1;
                 }
-                if j + tag.len() > n { return false; } // unterminated — nothing further to find
+                if j + tag.len() > n {
+                    return false;
+                } // unterminated — nothing further to find
                 continue;
             }
             i += 1;
@@ -554,9 +1038,16 @@ fn has_bind_params(sql: &str) -> bool {
             // `::cast` is two colons; word-adjacent colons aren't params either.
             let prev = if i > 0 { b[i - 1] } else { b' ' };
             let next = if i + 1 < n { b[i + 1] } else { b' ' };
-            if next == b':' || prev == b':' { i += 2.min(n - i); continue; }
+            if next == b':' || prev == b':' {
+                i += 2.min(n - i);
+                continue;
+            }
             if (next.is_ascii_alphabetic() || next == b'_')
-                && !(prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'"' || prev == b'\'' || prev == b']')
+                && !(prev.is_ascii_alphanumeric()
+                    || prev == b'_'
+                    || prev == b'"'
+                    || prev == b'\''
+                    || prev == b']')
             {
                 return true; // :name-style
             }
@@ -596,7 +1087,14 @@ fn dollar_tag_end(b: &[u8], i: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod bind_param_tests {
-    use super::{checked_page_size, has_bind_params, is_cursorable, is_read_only_stmt, validate_sql_size, validate_tabular_payload, ConnectionConfig, MAX_SQL_BYTES};
+    use super::{
+        checked_page_size, disconnect_registered, exec_items, has_bind_params, is_cursorable,
+        is_read_only_stmt, lock_conn, persist_export_temp, validate_fetch_page,
+        validate_result_page, validate_sql_size, validate_tabular_payload, AppState, CancelHandle,
+        ConnectionConfig, TransactionStatus, MAX_IPC_CELL_BYTES, MAX_SQL_BYTES,
+    };
+    use crate::driver;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn detects_supported_bind_styles() {
@@ -624,7 +1122,9 @@ mod bind_param_tests {
     #[test]
     fn query_classification_skips_comments_and_matches_whole_keywords() {
         assert!(is_cursorable("-- heading\nSELECT 1", false));
-        assert!(is_read_only_stmt("/* heading */ WITH x AS (SELECT 1) SELECT * FROM x"));
+        assert!(is_read_only_stmt(
+            "/* heading */ WITH x AS (SELECT 1) SELECT * FROM x"
+        ));
         assert!(!is_cursorable("selection FROM t", false));
         assert!(!is_read_only_stmt("showcase"));
         // DuckDB-only forms stream (buffering FROM <big table> whole was an OOM-abort
@@ -638,7 +1138,9 @@ mod bind_param_tests {
 
     #[test]
     fn readonly_guard_rejects_writable_ctes_and_row_locks() {
-        assert!(!is_read_only_stmt("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"));
+        assert!(!is_read_only_stmt(
+            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"
+        ));
         assert!(!is_read_only_stmt("SELECT * FROM t FOR UPDATE"));
         assert!(!is_read_only_stmt("SELECT * FROM t FOR SHARE"));
         assert!(!is_read_only_stmt("SELECT * FROM t FOR\nSHARE"));
@@ -660,16 +1162,47 @@ mod bind_param_tests {
     fn ipc_resource_limits_reject_oversized_and_ragged_payloads() {
         assert!(validate_sql_size(&"x".repeat(MAX_SQL_BYTES + 1)).is_err());
         assert!(validate_tabular_payload(&[], &[]).is_err());
-        assert!(validate_tabular_payload(&["a".into(), "b".into()], &[vec![Some("1".into())]]).is_err());
+        assert!(
+            validate_tabular_payload(&["a".into(), "b".into()], &[vec![Some("1".into())]]).is_err()
+        );
         assert!(validate_tabular_payload(&["a".into()], &[vec![Some("1".into())]]).is_ok());
+        assert!(validate_result_page(
+            &["a".into()],
+            &[vec![Some("x".repeat(MAX_IPC_CELL_BYTES + 1))]]
+        )
+        .is_err());
+        assert!(validate_fetch_page(&[
+            vec![Some("1".into())],
+            vec![Some("2".into()), Some("ragged".into())],
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn zero_row_command_temp_replaces_stale_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("empty.csv");
+        std::fs::write(&destination, "stale").unwrap();
+        let temp = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        std::fs::write(temp.path(), "id\n").unwrap();
+
+        persist_export_temp(temp.into_temp_path(), &destination).unwrap();
+
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), "id\n");
     }
 
     #[test]
     fn connection_config_rejects_unknown_security_modes_and_ports() {
         let mut cfg = ConnectionConfig {
-            driver: Some("postgres".into()), host: "localhost".into(), port: 5432,
-            user: "u".into(), password: String::new(), dbname: "d".into(),
-            sslmode: Some("verify-full".into()), read_only: false, path: None,
+            driver: Some("postgres".into()),
+            host: "localhost".into(),
+            port: 5432,
+            user: "u".into(),
+            password: String::new(),
+            dbname: "d".into(),
+            sslmode: Some("verify-full".into()),
+            read_only: false,
+            path: None,
         };
         assert!(cfg.validate().is_ok());
         cfg.sslmode = Some("verfy-full".into());
@@ -679,6 +1212,131 @@ mod bind_param_tests {
         assert!(cfg.validate().is_err());
         cfg.driver = Some("oracle".into());
         assert!(cfg.validate().is_err());
+    }
+
+    fn sqlite_cancel_config() -> ConnectionConfig {
+        ConnectionConfig {
+            driver: Some("sqlite".into()),
+            host: String::new(),
+            port: 1,
+            user: String::new(),
+            password: String::new(),
+            dbname: String::new(),
+            sslmode: None,
+            read_only: false,
+            path: Some(":memory:".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_cancel_cleanup_cannot_remove_new_operation() {
+        let state = AppState::default();
+        let cfg = sqlite_cancel_config();
+        let (backend, _) = driver::connect(&cfg).await.unwrap();
+        let id = state.register(backend, false);
+        let old = state
+            .arm_cancel(
+                &id,
+                CancelHandle::None,
+                cfg.clone(),
+                None,
+                TransactionStatus::default(),
+            )
+            .unwrap();
+        let new = state
+            .arm_cancel(
+                &id,
+                CancelHandle::None,
+                cfg,
+                None,
+                TransactionStatus::default(),
+            )
+            .unwrap();
+        let new_generation = new.generation;
+        drop(old);
+        assert_eq!(state.cancel_entry(&id).unwrap().generation, new_generation);
+        drop(new);
+        assert!(state.cancel_entry(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_generation_blocks_replacement_until_owner_completes() {
+        let state = AppState::default();
+        let cfg = sqlite_cancel_config();
+        let (backend, _) = driver::connect(&cfg).await.unwrap();
+        let id = state.register(backend, false);
+        let registration = state
+            .arm_cancel(
+                &id,
+                CancelHandle::None,
+                cfg.clone(),
+                None,
+                TransactionStatus::default(),
+            )
+            .unwrap();
+        let cancelling = state.begin_cancel(&id).unwrap();
+        assert!(state
+            .arm_cancel(
+                &id,
+                CancelHandle::None,
+                cfg,
+                None,
+                TransactionStatus::default(),
+            )
+            .is_err());
+        drop(registration);
+        assert!(cancelling.completed.load(Ordering::Acquire));
+        assert!(state.cancel_entry(&id).is_some());
+        state.finish_cancel_generation(&id, cancelling.generation);
+        assert!(state.cancel_entry(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn disconnect_rolls_back_manual_transaction_on_owned_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disconnect.sqlite");
+        let cfg = ConnectionConfig {
+            driver: Some("sqlite".into()),
+            host: String::new(),
+            port: 1,
+            user: String::new(),
+            password: String::new(),
+            dbname: String::new(),
+            sslmode: None,
+            read_only: false,
+            path: Some(path.to_string_lossy().into_owned()),
+        };
+        let (mut backend, _) = driver::connect(&cfg).await.unwrap();
+        backend
+            .run_single("CREATE TABLE t(a INTEGER)", 100, false)
+            .await
+            .unwrap();
+        let state = AppState::default();
+        let id = state.register(backend, false);
+        let conn = state.get(&id).unwrap();
+        {
+            let mut c = lock_conn(&conn).await.unwrap();
+            for sql in ["BEGIN", "INSERT INTO t VALUES (1)"] {
+                let items = crate::script::parse(sql).unwrap();
+                let actions = crate::script::preflight_transactions(
+                    &items,
+                    c.transaction_engine(),
+                    &c.transaction,
+                )
+                .unwrap();
+                exec_items(&mut c, &items, &actions, 100, &None, "tab-1")
+                    .await
+                    .unwrap();
+            }
+        }
+
+        disconnect_registered(&state, &id).await.unwrap();
+
+        let observer = rusqlite::Connection::open(path).unwrap();
+        let count: i64 = observer
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }
 
@@ -726,14 +1384,15 @@ async fn validate_sql(
 ) -> Result<Vec<StmtDiag>, AppError> {
     validate_sql_size(&sql)?;
     let conn = state.get(&connection_id)?;
-    let mut c = lock_conn(&conn).await;
+    let mut c = lock_conn(&conn).await?;
     ensure_alive(&mut c).await?;
+    c.require_idle("SQL validation")?;
     c.backend.rollback_cursor().await;
     c.backend.apply_search_path(&search_path).await?;
     let client = c.backend.pg()?;
     let _ = client.batch_execute("DEALLOCATE ALL").await;
 
-    let items = script::split(sql.trim());
+    let items = script::parse(sql.trim())?;
     let mut diags: Vec<StmtDiag> = Vec::new();
     for (i, item) in items.iter().enumerate() {
         let stmt = match item {
@@ -762,8 +1421,9 @@ async fn list_schema(
     connection_id: String,
 ) -> Result<Vec<tree::TableInfo>, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = lock_conn(&conn).await;
+    let mut c = lock_conn(&conn).await?;
     ensure_alive(&mut c).await?;
+    c.require_idle("schema metadata")?;
     c.backend.rollback_cursor().await;
     c.backend.list_tables().await
 }
@@ -774,8 +1434,9 @@ async fn db_tree(
     connection_id: String,
 ) -> Result<tree::DbTree, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = lock_conn(&conn).await;
+    let mut c = lock_conn(&conn).await?;
     ensure_alive(&mut c).await?;
+    c.require_idle("database metadata")?;
     c.backend.rollback_cursor().await;
     c.backend.build_tree().await
 }
@@ -788,8 +1449,9 @@ async fn table_detail(
     name: String,
 ) -> Result<tree::RelationDetail, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = lock_conn(&conn).await;
+    let mut c = lock_conn(&conn).await?;
     ensure_alive(&mut c).await?;
+    c.require_idle("relation metadata")?;
     c.backend.rollback_cursor().await;
     c.backend.table_detail(&schema, &name).await
 }
@@ -813,9 +1475,14 @@ async fn sample_rows(
     limit: Option<u32>,
 ) -> Result<SampleResult, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = lock_conn(&conn).await;
+    let mut c = lock_conn(&conn).await?;
     ensure_alive(&mut c).await?;
-    let (columns, rows) = c.backend.sample_rows(&schema, &name, limit.unwrap_or(5)).await?;
+    c.require_idle("sample-row metadata")?;
+    let (columns, rows) = c
+        .backend
+        .sample_rows(&schema, &name, limit.unwrap_or(5))
+        .await?;
+    validate_result_page(&columns, &rows)?;
     Ok(SampleResult { columns, rows })
 }
 
@@ -828,8 +1495,9 @@ async fn object_ddl(
     name: String,
 ) -> Result<String, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = lock_conn(&conn).await;
+    let mut c = lock_conn(&conn).await?;
     ensure_alive(&mut c).await?;
+    c.require_idle("DDL metadata")?;
     c.backend.rollback_cursor().await;
     // Multi-engine: PG full reconstruction, SQLite sqlite_master, MySQL SHOW
     // CREATE, DuckDB duckdb_tables()/views() best-effort.
@@ -844,8 +1512,9 @@ async fn list_functions(
     connection_id: String,
 ) -> Result<Vec<String>, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = lock_conn(&conn).await;
+    let mut c = lock_conn(&conn).await?;
     ensure_alive(&mut c).await?;
+    c.require_idle("function metadata")?;
     c.backend.rollback_cursor().await;
     c.backend.list_functions().await
 }
@@ -863,12 +1532,15 @@ async fn table_relationships(
         return Err(AppError::new("schema or relation name is too long"));
     }
     let conn = state.get(&connection_id)?;
-    let mut c = lock_conn(&conn).await;
+    let mut c = lock_conn(&conn).await?;
     ensure_alive(&mut c).await?;
+    c.require_idle("relationship metadata")?;
     c.backend.rollback_cursor().await;
     let graph = c.backend.table_relationships(&schema, &name).await?;
     if graph.outbound.len().saturating_add(graph.inbound.len()) > 50_000 {
-        return Err(AppError::new("relationship graph exceeds the 50000-edge limit"));
+        return Err(AppError::new(
+            "relationship graph exceeds the 50000-edge limit",
+        ));
     }
     Ok(graph)
 }
@@ -884,21 +1556,20 @@ async fn schema_relationships(
         return Err(AppError::new("schema name is too long"));
     }
     let conn = state.get(&connection_id)?;
-    let mut c = lock_conn(&conn).await;
+    let mut c = lock_conn(&conn).await?;
     ensure_alive(&mut c).await?;
+    c.require_idle("schema relationship metadata")?;
     c.backend.rollback_cursor().await;
     let graph = c.backend.schema_relationships(&schema).await?;
     let columns = graph.tables.iter().map(|t| t.columns.len()).sum::<usize>();
     if graph.tables.len() > 5_000 || graph.edges.len() > 50_000 || columns > 100_000 {
-        return Err(AppError::new("schema graph exceeds the 5000-table/50000-edge/100000-column limits"));
+        return Err(AppError::new(
+            "schema graph exceeds the 5000-table/50000-edge/100000-column limits",
+        ));
     }
     Ok(graph)
 }
 
-/// Immediately cancel the cancellable operation in flight on a connection (a streaming
-/// export or an import). Sends a Postgres CancelRequest over a fresh connection, which
-/// interrupts the running query; the operation's own command then rolls back (and an
-/// export deletes its partial file). A no-op if nothing is armed.
 /// Report what the connected driver supports, so the UI can gate features (hide
 /// COPY-import / search-path / etc. where unsupported). PG today; per-driver later.
 #[tauri::command]
@@ -907,8 +1578,21 @@ async fn capabilities(
     connection_id: String,
 ) -> Result<driver::Capabilities, AppError> {
     let conn = state.get(&connection_id)?;
-    let c = lock_conn(&conn).await;
+    let c = lock_conn(&conn).await?;
     Ok(c.backend.capabilities())
+}
+
+#[tauri::command]
+async fn transaction_status(
+    state: tauri::State<'_, AppState>,
+    connection_id: String,
+) -> Result<TransactionStatus, AppError> {
+    let conn = state.get(&connection_id)?;
+    let mut c = lock_conn(&conn).await?;
+    if c.transaction.owns_session() && c.backend.manual_session_ended() {
+        c.mark_transaction_lost();
+    }
+    Ok(c.transaction.clone())
 }
 
 /// The connected role's effective privileges (Postgres). The frontend gates sidebar DDL
@@ -919,20 +1603,101 @@ async fn permissions(
     connection_id: String,
 ) -> Result<perms::Permissions, AppError> {
     let conn = state.get(&connection_id)?;
-    let mut c = lock_conn(&conn).await;
+    let mut c = lock_conn(&conn).await?;
     ensure_alive(&mut c).await?;
+    c.require_idle("permission metadata")?;
     c.backend.rollback_cursor().await;
     c.backend.permissions().await
 }
 
+/// Immediately cancel the query, fetch, export, or import currently armed on this
+/// connection. PostgreSQL uses an out-of-band CancelRequest; the operation command
+/// owns rollback and partial-output cleanup. A no-op if nothing is armed.
 #[tauri::command]
 async fn cancel_operation(
     state: tauri::State<'_, AppState>,
     connection_id: String,
-) -> Result<(), AppError> {
-    if let Some((handle, cfg)) = state.cancel_handle(&connection_id) {
-        handle.cancel(&cfg).await?;
+    owner_id: String,
+) -> Result<TransactionStatus, AppError> {
+    validate_transaction_owner(&owner_id)?;
+    let Some(entry) = state.begin_cancel(&connection_id) else {
+        let conn = state.get(&connection_id)?;
+        let mut c = lock_conn(&conn).await?;
+        if c.transaction.owns_session() && c.backend.manual_session_ended() {
+            c.mark_transaction_lost();
+        }
+        c.require_owner(&owner_id)?;
+        return Ok(c.transaction.clone());
+    };
+    if entry
+        .owner
+        .as_deref()
+        .is_some_and(|owner| owner != owner_id)
+    {
+        state.abort_cancel_generation(&connection_id, entry.generation);
+        return Err(AppError::new("in-flight operation is owned by another tab")
+            .with_transaction(entry.transaction));
     }
+    if matches!(entry.handle, CancelHandle::None) {
+        state.abort_cancel_generation(&connection_id, entry.generation);
+        return Err(
+            AppError::new("this database driver cannot cancel an in-flight query")
+                .with_transaction(entry.transaction),
+        );
+    }
+    if let Err(error) = entry.handle.clone().cancel(&entry.config).await {
+        state.abort_cancel_generation(&connection_id, entry.generation);
+        return Err(error.with_transaction(entry.transaction));
+    }
+
+    // Keep the generation tombstone until the owning command has observed the
+    // cancellation and released its connection lock. Otherwise a delayed PostgreSQL
+    // CancelRequest can land on the next operation using the same backend PID.
+    while !entry.completed.load(Ordering::Acquire) {
+        let notified = entry.completed_notify.notified();
+        tokio::pin!(notified);
+        // Register the waiter BEFORE re-checking: `notify_waiters` stores no permit,
+        // so a completion landing between an unregistered check and the first poll
+        // would be lost and this await would hang forever.
+        notified.as_mut().enable();
+        if entry.completed.load(Ordering::Acquire) {
+            break;
+        }
+        notified.await;
+    }
+    state.finish_cancel_generation(&connection_id, entry.generation);
+    let conn = state.get(&connection_id)?;
+    let mut c = lock_conn(&conn).await?;
+    if c.transaction.owns_session() && c.backend.manual_session_ended() {
+        c.mark_transaction_lost();
+    }
+    Ok(c.transaction.clone())
+}
+
+fn persist_export_temp(
+    temp_path: tempfile::TempPath,
+    destination: &std::path::Path,
+) -> Result<(), AppError> {
+    let parent = destination.parent().map(std::path::Path::to_path_buf);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&temp_path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| AppError::new(format!("cannot sync export temp file: {error}")))?;
+    temp_path.persist(destination).map_err(|error| {
+        AppError::new(format!(
+            "cannot replace export destination: {}",
+            error.error
+        ))
+    })?;
+    #[cfg(unix)]
+    if let Some(parent) = parent {
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| AppError::new(format!("cannot sync export directory: {e}")))?;
+    }
+    #[cfg(not(unix))]
+    let _ = parent;
     Ok(())
 }
 
@@ -952,66 +1717,103 @@ async fn export_to_file(
 ) -> Result<u64, AppError> {
     options.validate()?;
     let destination = std::path::PathBuf::from(&path);
-    let parent = destination.parent().filter(|p| !p.as_os_str().is_empty())
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
         .ok_or_else(|| AppError::new("export destination must include a parent directory"))?;
     let temp = tempfile::Builder::new()
         .prefix(".tusk-export-")
         .tempfile_in(parent)
         .map_err(|e| AppError::new(format!("cannot create export temp file: {e}")))?;
     if let Ok(meta) = std::fs::metadata(&destination) {
-        temp.as_file().set_permissions(meta.permissions()).map_err(|e| AppError::new(e.to_string()))?;
+        temp.as_file()
+            .set_permissions(meta.permissions())
+            .map_err(|e| AppError::new(e.to_string()))?;
     }
     let temp_path = temp.into_temp_path();
-    let temp_name = temp_path.to_string_lossy().to_string();
+    let temp_name = temp_path
+        .to_str()
+        .ok_or_else(|| AppError::new("export temp path is not valid UTF-8"))?
+        .to_string();
 
     let result = if let Some(q) = sql {
         validate_sql_size(&q)?;
         let id = connection_id.ok_or_else(|| AppError::new("no connection"))?;
         let conn = state.get(&id)?;
-        let mut c = lock_conn(&conn).await;
+        let mut c = lock_conn(&conn).await?;
         ensure_alive(&mut c).await?;
-        c.backend.rollback_cursor().await;
-        c.backend.apply_search_path(&search_path).await?;
+        c.require_idle("query export")?;
         // Export streams exactly one query through a cursor. Split (dollar-quote aware)
         // so a multi-statement input can't smuggle extra statements (e.g. a trailing
         // DROP) into the DECLARE … CURSOR FOR.
-        let items = script::split(q.trim());
+        let items = script::parse_for_engine(q.trim(), c.transaction_engine())?;
+        script::preflight_transactions(&items, c.transaction_engine(), &c.transaction)?;
         let export_sql = match items.as_slice() {
             [script::Item::Sql(s)] if !s.trim_end_matches(';').trim().is_empty() => {
                 s.trim_end_matches(';').trim().to_string()
             }
-            _ => return Err(AppError::new("export streams exactly one SQL query — select one statement")),
+            _ => {
+                return Err(AppError::new(
+                    "export streams exactly one SQL query — select one statement",
+                ))
+            }
         };
+        let duck = matches!(c.backend, driver::Backend::Duck(_));
+        if !is_read_only_stmt(&export_sql) || !is_cursorable(&export_sql, duck) {
+            return Err(AppError::new(
+                "export can re-run exactly one read-only result query",
+            ));
+        }
+        let cancel_registration = state.arm_cancel(
+            &id,
+            c.backend.cancel_handle(),
+            c.backend.config().clone(),
+            None,
+            c.transaction.clone(),
+        )?;
+        c.backend.rollback_cursor().await;
+        c.backend.apply_search_path(&search_path).await?;
         // Scope=all re-runs the query, so the frontend's grid-based bool detection
         // (typed or heuristic over the LOADED rows) can't vouch for rows it never
         // saw. Override with the server-reported column types — exact for the full
         // stream, including expression columns. Best-effort: empty on failure.
         let mut options = options;
         options.bool_cols = c.backend.bool_columns(&export_sql).await;
-        // Arm cancellation for the duration of the stream, then always disarm.
+        // Cancellation covers type discovery and the full stream.
         // PG streams through a server-side cursor (snapshot-consistent);
         // other drivers page via LIMIT/OFFSET through the same sink feeder.
-        state.arm_cancel(&id, c.backend.cancel_handle(), c.backend.config().clone());
         let result = if matches!(c.backend, driver::Backend::Pg(_)) {
             export::run_export_query(c.backend.pg()?, &export_sql, &options, &temp_name).await
         } else {
             export::run_export_paged(&mut c.backend, &export_sql, &options, &temp_name).await
         };
-        state.disarm_cancel(&id);
+        drop(c);
+        drop(cancel_registration);
         result
     } else if let (Some(cols), Some(rs)) = (columns, rows) {
         validate_tabular_payload(&cols, &rs)?;
-        export::run_export_rows(&cols, &rs, &options, &temp_name).await
+        // Loaded rows carry no backend handle in their payload. Resolve the source
+        // dialect from the still-active connection; App's frozen-origin check ensures
+        // this is the connection that produced the rows.
+        let conn = match connection_id {
+            Some(id) => state.get(&id)?,
+            None => state.active()?.1,
+        };
+        let dialect = {
+            let c = lock_conn(&conn).await?;
+            c.backend.capabilities().kind
+        };
+        export::run_export_rows_for_dialect(&cols, &rs, &options, dialect, &temp_name).await
     } else {
-        Err(AppError::new("export: provide either a query or inline rows"))
+        Err(AppError::new(
+            "export: provide either a query or inline rows",
+        ))
     };
     match result {
         Ok(n) => {
-            if n > 0 {
-                temp_path
-                    .persist(&destination)
-                    .map_err(|e| AppError::new(format!("cannot replace export destination: {}", e.error)))?;
-            }
+            // Empty exports are still valid files (headers, `[]`, CREATE DDL, or an
+            // empty workbook) and must replace stale destination content.
+            persist_export_temp(temp_path, &destination)?;
             Ok(n)
         }
         Err(e) => Err(e),
@@ -1030,8 +1832,9 @@ async fn import_rows(
 ) -> Result<u64, AppError> {
     validate_tabular_payload(&columns, &rows)?;
     let conn = state.get(&connection_id)?;
-    let mut c = lock_conn(&conn).await;
+    let mut c = lock_conn(&conn).await?;
     ensure_alive(&mut c).await?;
+    c.require_idle("import")?;
     if c.read_only {
         return Err(AppError::new("connection is read-only — import blocked"));
     }
@@ -1039,7 +1842,13 @@ async fn import_rows(
     // Run create + copy in one transaction so a cancel (or any error) rolls the whole
     // import back — no half-created table, no partial rows. Cancellable via the token.
     let client = c.backend.pg()?;
-    state.arm_cancel(&connection_id, c.backend.cancel_handle(), c.backend.config().clone());
+    let cancel_registration = state.arm_cancel(
+        &connection_id,
+        c.backend.cancel_handle(),
+        c.backend.config().clone(),
+        None,
+        c.transaction.clone(),
+    )?;
     let res = async {
         client.batch_execute("BEGIN").await?;
         if create {
@@ -1048,27 +1857,42 @@ async fn import_rows(
         db::copy_rows(client, &schema, &table, &columns, &rows).await
     }
     .await;
-    state.disarm_cancel(&connection_id);
-    match res {
+    let result = match res {
         Ok(n) => {
-            client.batch_execute("COMMIT").await?;
+            client.batch_execute("COMMIT").await.map_err(|e| {
+                AppError::new(format!(
+                    "import commit acknowledgement failed; transaction outcome is unknown — verify database state before retrying ({e})"
+                ))
+            })?;
             Ok(n)
         }
         Err(e) => {
             let _ = client.batch_execute("ROLLBACK").await;
             Err(e)
         }
-    }
+    };
+    drop(c);
+    drop(cancel_registration);
+    result
 }
 
 /// Read a UTF-8 text file by absolute path (the path comes from a native open dialog,
 /// i.e. an explicit user gesture). Used by the editor's Open flow.
 #[tauri::command]
 async fn read_text_file(path: String) -> Result<String, AppError> {
-    read_utf8_bounded(std::path::Path::new(&path), MAX_TEXT_FILE_BYTES as usize, "text file").await
+    read_utf8_bounded(
+        std::path::Path::new(&path),
+        MAX_TEXT_FILE_BYTES as usize,
+        "text file",
+    )
+    .await
 }
 
-async fn read_utf8_bounded(path: &std::path::Path, max: usize, label: &str) -> Result<String, AppError> {
+async fn read_utf8_bounded(
+    path: &std::path::Path,
+    max: usize,
+    label: &str,
+) -> Result<String, AppError> {
     let file = tokio::fs::File::open(path)
         .await
         .map_err(|e| AppError::new(format!("cannot read {}: {e}", path.display())))?;
@@ -1078,7 +1902,9 @@ async fn read_utf8_bounded(path: &std::path::Path, max: usize, label: &str) -> R
         .await
         .map_err(|e| AppError::new(format!("cannot read {}: {e}", path.display())))?;
     if bytes.len() > max {
-        return Err(AppError::new(format!("{label} exceeds the {max}-byte limit")));
+        return Err(AppError::new(format!(
+            "{label} exceeds the {max}-byte limit"
+        )));
     }
     String::from_utf8(bytes).map_err(|_| AppError::new(format!("{label} is not valid UTF-8")))
 }
@@ -1087,7 +1913,9 @@ async fn read_utf8_bounded(path: &std::path::Path, max: usize, label: &str) -> R
 #[tauri::command]
 async fn write_text_file(path: String, contents: String) -> Result<(), AppError> {
     if contents.len() as u64 > MAX_TEXT_FILE_BYTES {
-        return Err(AppError::new(format!("text file exceeds the {MAX_TEXT_FILE_BYTES}-byte limit")));
+        return Err(AppError::new(format!(
+            "text file exceeds the {MAX_TEXT_FILE_BYTES}-byte limit"
+        )));
     }
     atomic_write(std::path::PathBuf::from(path), contents.into_bytes()).await
 }
@@ -1095,14 +1923,27 @@ async fn write_text_file(path: String, contents: String) -> Result<(), AppError>
 async fn atomic_write(path: std::path::PathBuf, bytes: Vec<u8>) -> Result<(), AppError> {
     tokio::task::spawn_blocking(move || {
         use std::io::Write;
-        let parent = path.parent().ok_or_else(|| AppError::new("destination has no parent directory"))?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| AppError::new(e.to_string()))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| AppError::new("destination has no parent directory"))?;
+        let mut temp =
+            tempfile::NamedTempFile::new_in(parent).map_err(|e| AppError::new(e.to_string()))?;
         if let Ok(meta) = std::fs::metadata(&path) {
-            temp.as_file().set_permissions(meta.permissions()).map_err(|e| AppError::new(e.to_string()))?;
+            temp.as_file()
+                .set_permissions(meta.permissions())
+                .map_err(|e| AppError::new(e.to_string()))?;
         }
-        temp.write_all(&bytes).map_err(|e| AppError::new(e.to_string()))?;
-        temp.as_file_mut().sync_all().map_err(|e| AppError::new(e.to_string()))?;
-        temp.persist(&path).map_err(|e| AppError::new(e.error.to_string()))?;
+        temp.write_all(&bytes)
+            .map_err(|e| AppError::new(e.to_string()))?;
+        temp.as_file_mut()
+            .sync_all()
+            .map_err(|e| AppError::new(e.to_string()))?;
+        temp.persist(&path)
+            .map_err(|e| AppError::new(e.error.to_string()))?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| AppError::new(format!("cannot sync destination directory: {e}")))?;
         Ok(())
     })
     .await
@@ -1125,23 +1966,45 @@ fn history_path(app: &tauri::AppHandle, conn_key: &str) -> Result<std::path::Pat
     }
     let safe: String = conn_key
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(80)
         .collect();
     // Stable FNV-1a suffix prevents different punctuation-heavy keys from mapping
     // to the same sanitized filename.
-    let hash = conn_key.as_bytes().iter().fold(0xcbf29ce484222325u64, |h, b| {
-        (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
-    });
+    let hash = conn_key
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325u64, |h, b| {
+            (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
+        });
     Ok(dir.join(format!("{safe}-{hash:016x}.json")))
 }
 
-fn legacy_history_path(app: &tauri::AppHandle, conn_key: &str) -> Result<std::path::PathBuf, AppError> {
+fn legacy_history_path(
+    app: &tauri::AppHandle,
+    conn_key: &str,
+) -> Result<std::path::PathBuf, AppError> {
     use tauri::Manager;
-    let dir = app.path().app_config_dir().map_err(|e| AppError::new(e.to_string()))?.join("history");
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| AppError::new(e.to_string()))?
+        .join("history");
     let safe: String = conn_key
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     Ok(dir.join(format!("{safe}.json")))
 }
@@ -1172,9 +2035,15 @@ fn validate_history_json(json: &str) -> Result<(), AppError> {
 }
 
 #[tauri::command]
-async fn save_history(app: tauri::AppHandle, conn_key: String, json: String) -> Result<(), AppError> {
+async fn save_history(
+    app: tauri::AppHandle,
+    conn_key: String,
+    json: String,
+) -> Result<(), AppError> {
     if json.len() > MAX_HISTORY_BYTES {
-        return Err(AppError::new(format!("history exceeds the {MAX_HISTORY_BYTES}-byte limit")));
+        return Err(AppError::new(format!(
+            "history exceeds the {MAX_HISTORY_BYTES}-byte limit"
+        )));
     }
     validate_history_json(&json)?;
     let path = history_path(&app, &conn_key)?;
@@ -1187,7 +2056,11 @@ async fn save_history(app: tauri::AppHandle, conn_key: String, json: String) -> 
 }
 
 #[tauri::command]
-async fn migrate_history(app: tauri::AppHandle, from_key: String, to_key: String) -> Result<String, AppError> {
+async fn migrate_history(
+    app: tauri::AppHandle,
+    from_key: String,
+    to_key: String,
+) -> Result<String, AppError> {
     let target = history_path(&app, &to_key)?;
     // New-key state is authoritative, including an intentionally cleared `[]`.
     if target.exists() {
@@ -1197,17 +2070,23 @@ async fn migrate_history(app: tauri::AppHandle, from_key: String, to_key: String
     }
 
     let hashed_source = history_path(&app, &from_key)?;
-    let legacy_source = (from_key.len() <= 180).then(|| legacy_history_path(&app, &from_key)).transpose()?;
+    let legacy_source = (from_key.len() <= 180)
+        .then(|| legacy_history_path(&app, &from_key))
+        .transpose()?;
     let source = if hashed_source.exists() {
         Some(hashed_source)
     } else {
         legacy_source.filter(|p| p.exists())
     };
-    let Some(source) = source else { return Ok("[]".into()) };
+    let Some(source) = source else {
+        return Ok("[]".into());
+    };
     let json = read_utf8_bounded(&source, MAX_HISTORY_BYTES, "legacy history file").await?;
     validate_history_json(&json)?;
     if let Some(dir) = target.parent() {
-        tokio::fs::create_dir_all(dir).await.map_err(|e| AppError::new(e.to_string()))?;
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| AppError::new(e.to_string()))?;
     }
     atomic_write(target, json.as_bytes().to_vec()).await?;
     // Delete only after the new file is durable and validated. Failure leaves a
@@ -1233,7 +2112,11 @@ struct SlackConfigInfo {
 async fn slack_load_config(app: tauri::AppHandle) -> Result<SlackConfigInfo, AppError> {
     let config = slack::config::load(&app)?;
     let (has_bot_token, has_app_token) = slack::config::has_tokens();
-    Ok(SlackConfigInfo { config, has_bot_token, has_app_token })
+    Ok(SlackConfigInfo {
+        config,
+        has_bot_token,
+        has_app_token,
+    })
 }
 
 #[tauri::command]
@@ -1246,12 +2129,57 @@ async fn slack_save_config(
     config.validate()?;
     let previous = slack::config::load(&app)?;
     let old_tokens = (slack::config::bot_token(), slack::config::app_token());
-    slack::config::save(&app, &config)?;
+    let replace_bot = bot_token.as_ref().is_some_and(|token| !token.is_empty());
+    let replace_app = app_token.as_ref().is_some_and(|token| !token.is_empty());
+    // A token identifies a Slack workspace. Pass through a credential-free state so a
+    // crash can never pair newly supplied workspace credentials with the old config.
+    if let Err(e) = slack::config::clear_selected_tokens(replace_bot, replace_app) {
+        if let Err(rollback) =
+            slack::config::restore_tokens(old_tokens.0.clone(), old_tokens.1.clone())
+        {
+            return Err(AppError::new(format!(
+                "{}; Slack token rollback also failed: {}",
+                e.message, rollback.message
+            )));
+        }
+        return Err(e);
+    }
+    if let Err(e) = slack::config::save(&app, &config) {
+        let config_rollback = slack::config::save(&app, &previous);
+        let token_rollback =
+            slack::config::restore_tokens(old_tokens.0.clone(), old_tokens.1.clone());
+        if config_rollback.is_err() || token_rollback.is_err() {
+            return Err(AppError::new(format!(
+                "{}; Slack rollback also failed: config: {}; tokens: {}",
+                e.message,
+                config_rollback
+                    .err()
+                    .map(|error| error.message)
+                    .unwrap_or_else(|| "restored".into()),
+                token_rollback
+                    .err()
+                    .map(|error| error.message)
+                    .unwrap_or_else(|| "restored".into())
+            )));
+        }
+        return Err(e);
+    }
     if let Err(e) = slack::config::save_tokens(bot_token, app_token) {
-        let rollback = slack::config::save(&app, &previous);
-        slack::config::restore_tokens(old_tokens.0, old_tokens.1);
-        if let Err(r) = rollback {
-            return Err(AppError::new(format!("{}; Slack config rollback also failed: {}", e.message, r.message)));
+        let config_rollback = slack::config::save(&app, &previous);
+        let token_rollback = slack::config::restore_tokens(old_tokens.0, old_tokens.1);
+        if config_rollback.is_err() || token_rollback.is_err() {
+            return Err(AppError::new(format!(
+                "{}; Slack rollback also failed: config: {}; tokens: {}",
+                e.message,
+                config_rollback
+                    .err()
+                    .map(|error| error.message)
+                    .unwrap_or_else(|| "restored".into()),
+                token_rollback
+                    .err()
+                    .map(|error| error.message)
+                    .unwrap_or_else(|| "restored".into())
+            )));
         }
         return Err(e);
     }
@@ -1261,8 +2189,7 @@ async fn slack_save_config(
 #[tauri::command]
 async fn slack_clear_tokens(app: tauri::AppHandle) -> Result<(), AppError> {
     slack::stop(&app);
-    slack::config::clear_tokens();
-    Ok(())
+    slack::config::clear_tokens()
 }
 
 #[tauri::command]
@@ -1285,10 +2212,9 @@ fn slack_status(runtime: tauri::State<'_, slack::SlackRuntime>) -> slack::Status
 /// apps.connections.open (app-level token). Returns the workspace name.
 #[tauri::command]
 async fn slack_test() -> Result<String, AppError> {
-    let bot = slack::config::bot_token()
-        .ok_or_else(|| AppError::new("no bot token saved"))?;
-    let app_token = slack::config::app_token()
-        .ok_or_else(|| AppError::new("no app-level token saved"))?;
+    let bot = slack::config::bot_token().ok_or_else(|| AppError::new("no bot token saved"))?;
+    let app_token =
+        slack::config::app_token().ok_or_else(|| AppError::new("no app-level token saved"))?;
     let api = slack::api::SlackApi::new(bot);
     let (team, _bot_user) = api.auth_test().await?;
     // Mint (and discard) a socket URL to prove the xapp token + connections:write scope.
@@ -1334,7 +2260,10 @@ pub fn run() {
             // Auto-start the Slack bot when enabled + tokens saved. Failures are
             // non-fatal: the settings pane shows the status and can retry.
             let handle = app.handle().clone();
-            if slack::config::load(&handle).map(|c| c.enabled).unwrap_or(false) {
+            if slack::config::load(&handle)
+                .map(|c| c.enabled)
+                .unwrap_or(false)
+            {
                 tauri::async_runtime::spawn(async move {
                     if let Err(e) = slack::start(handle).await {
                         eprintln!("[tusk-slack] autostart failed: {}", e.message);
@@ -1363,6 +2292,7 @@ pub fn run() {
             list_functions,
             export_to_file,
             capabilities,
+            transaction_status,
             permissions,
             cancel_operation,
             import_rows,

@@ -16,6 +16,14 @@ const H: u32 = 500;
 /// Charts are for shapes, not dumps — beyond this the bot suggests a file export.
 const MAX_POINTS: usize = 400;
 const MAX_PIE_SLICES: usize = 12;
+const MAX_SERIES: usize = 8;
+const MAX_SPEC_BYTES: usize = 32 * 1024;
+const MAX_NAME_CHARS: usize = 256;
+const MAX_TITLE_CHARS: usize = 200;
+const MAX_AXIS_LABEL_CHARS: usize = 100;
+const MAX_POINT_LABEL_CHARS: usize = 120;
+/// Keep all arithmetic far from f64 overflow and plotters' pathological ranges.
+const MAX_ABS_VALUE: f64 = 1.0e100;
 
 /// Matches the app's accent palette family.
 const PALETTE: [RGBColor; 8] = [
@@ -65,8 +73,52 @@ pub struct ChartSpec {
 impl ChartSpec {
     /// Tolerant parse of the AI's chart-block JSON; None when it isn't a usable spec.
     pub fn parse(text: &str) -> Option<ChartSpec> {
+        if text.len() > MAX_SPEC_BYTES {
+            return None;
+        }
         let spec: ChartSpec = serde_json::from_str(text).ok()?;
-        matches!(spec.kind.as_str(), "line" | "bar" | "scatter" | "pie").then_some(spec)
+        spec.valid().then_some(spec)
+    }
+
+    fn valid(&self) -> bool {
+        if !matches!(self.kind.as_str(), "line" | "bar" | "scatter" | "pie")
+            || self.series.len() > MAX_SERIES
+            || self
+                .series
+                .iter()
+                .any(|s| s.is_empty() || s.chars().count() > MAX_NAME_CHARS)
+            || self
+                .x
+                .as_ref()
+                .is_some_and(|s| s.is_empty() || s.chars().count() > MAX_NAME_CHARS)
+            || self
+                .title
+                .as_ref()
+                .is_some_and(|s| s.chars().count() > MAX_TITLE_CHARS)
+            || self
+                .x_label
+                .as_ref()
+                .is_some_and(|s| s.chars().count() > MAX_AXIS_LABEL_CHARS)
+            || self
+                .y_label
+                .as_ref()
+                .is_some_and(|s| s.chars().count() > MAX_AXIS_LABEL_CHARS)
+            || self.extra.len() > 16
+            || serde_json::to_vec(&self.extra)
+                .map(|v| v.len() > MAX_SPEC_BYTES / 2)
+                .unwrap_or(true)
+        {
+            return false;
+        }
+        let mut names = std::collections::HashSet::new();
+        if self
+            .series
+            .iter()
+            .any(|s| !names.insert(s.to_ascii_lowercase()))
+        {
+            return false;
+        }
+        true
     }
 
     /// Short human description for the proposal card (incl. any unsupported
@@ -92,7 +144,10 @@ impl ChartSpec {
             return None;
         }
         let keys: Vec<&str> = self.extra.keys().map(String::as_str).collect();
-        Some(format!("note: not yet supported, ignored: {}", keys.join(", ")))
+        Some(format!(
+            "note: not yet supported, ignored: {}",
+            keys.join(", ")
+        ))
     }
 }
 
@@ -119,7 +174,7 @@ pub(crate) fn numeric(values: &[Option<String>]) -> bool {
         // token PG/DuckDB emit for float 'Infinity'), and an infinite axis range
         // sends plotters' key-point loop into an INFINITE LOOP — the Slack consumer
         // task spins at 100% CPU forever and the bot never answers again.
-        if !v.parse::<f64>().map(|f| f.is_finite()).unwrap_or(false) {
+        if finite_number(v).is_none() {
             return false;
         }
     }
@@ -127,13 +182,36 @@ pub(crate) fn numeric(values: &[Option<String>]) -> bool {
 }
 
 /// Parse a cell as a chartable value: finite f64 or nothing (see `numeric`).
-fn finite(v: Option<&str>) -> Option<f64> {
-    v.and_then(|s| s.parse::<f64>().ok()).filter(|f| f.is_finite())
+fn finite_number(s: &str) -> Option<f64> {
+    s.parse::<f64>()
+        .ok()
+        .filter(|f| f.is_finite() && f.abs() <= MAX_ABS_VALUE)
 }
 
-fn prepare(spec: &ChartSpec, columns: &[String], rows: &[Vec<Option<String>>]) -> Result<Prepared, AppError> {
+fn finite(v: Option<&str>) -> Option<f64> {
+    v.and_then(finite_number)
+}
+
+fn point_label(value: Option<&str>) -> String {
+    let value = value.unwrap_or("NULL").replace(['\n', '\r', '\t'], " ");
+    if value.chars().count() <= MAX_POINT_LABEL_CHARS {
+        value
+    } else {
+        let mut out: String = value.chars().take(MAX_POINT_LABEL_CHARS - 1).collect();
+        out.push('…');
+        out
+    }
+}
+
+fn prepare(
+    spec: &ChartSpec,
+    columns: &[String],
+    rows: &[Vec<Option<String>>],
+) -> Result<Prepared, AppError> {
     if rows.is_empty() {
-        return Err(AppError::new("nothing to chart — the query returned no rows"));
+        return Err(AppError::new(
+            "nothing to chart — the query returned no rows",
+        ));
     }
     if rows.len() > MAX_POINTS {
         return Err(AppError::new(format!(
@@ -141,54 +219,85 @@ fn prepare(spec: &ChartSpec, columns: &[String], rows: &[Vec<Option<String>>]) -
             rows.len()
         )));
     }
-    let col = |k: usize| -> Vec<Option<String>> { rows.iter().map(|r| r.get(k).cloned().flatten()).collect() };
+    let col = |k: usize| -> Vec<Option<String>> {
+        rows.iter().map(|r| r.get(k).cloned().flatten()).collect()
+    };
 
     let xi = match &spec.x {
-        Some(name) => col_index(columns, name)
-            .ok_or_else(|| AppError::new(format!("chart x column \"{name}\" is not in the result")))?,
+        Some(name) => col_index(columns, name).ok_or_else(|| {
+            AppError::new(format!("chart x column \"{name}\" is not in the result"))
+        })?,
         None => 0,
     };
     let series_idx: Vec<usize> = if spec.series.is_empty() {
-        (0..columns.len()).filter(|&k| k != xi && numeric(&col(k))).collect()
+        (0..columns.len())
+            .filter(|&k| k != xi && numeric(&col(k)))
+            .collect()
     } else {
         spec.series
             .iter()
             .map(|name| {
-                col_index(columns, name)
-                    .ok_or_else(|| AppError::new(format!("chart series column \"{name}\" is not in the result")))
+                col_index(columns, name).ok_or_else(|| {
+                    AppError::new(format!(
+                        "chart series column \"{name}\" is not in the result"
+                    ))
+                })
             })
             .collect::<Result<_, _>>()?
     };
     if series_idx.is_empty() {
         return Err(AppError::new("no numeric columns to chart"));
     }
+    if series_idx.len() > MAX_SERIES {
+        return Err(AppError::new(format!(
+            "too many chart series ({} > {MAX_SERIES})",
+            series_idx.len()
+        )));
+    }
 
     let x_vals = col(xi);
-    let labels: Vec<String> = x_vals.iter().map(|v| v.clone().unwrap_or_else(|| "NULL".into())).collect();
-    let x_numeric = numeric(&x_vals)
-        .then(|| x_vals.iter().map(|v| finite(v.as_deref()).unwrap_or(0.0)).collect());
+    let labels: Vec<String> = x_vals.iter().map(|v| point_label(v.as_deref())).collect();
+    let x_numeric = numeric(&x_vals).then(|| {
+        x_vals
+            .iter()
+            .map(|v| finite(v.as_deref()).unwrap_or(0.0))
+            .collect()
+    });
 
     let series = series_idx
         .into_iter()
         .map(|k| {
-            // `finite`, not bare parse: one "Infinity" cell in an explicitly requested
-            // series would otherwise reach the axis range and hang the renderer.
-            let vals: Vec<Option<f64>> = col(k).iter().map(|v| finite(v.as_deref())).collect();
+            let source = col(k);
+            if let Some(bad) = source.iter().flatten().find(|v| finite_number(v).is_none()) {
+                return Err(AppError::new(format!(
+                    "chart series column \"{}\" contains a non-numeric or out-of-range value ({})",
+                    columns[k],
+                    point_label(Some(bad))
+                )));
+            }
+            let vals: Vec<Option<f64>> = source.iter().map(|v| finite(v.as_deref())).collect();
             if vals.iter().all(|v| v.is_none()) {
-                return Err(AppError::new(format!("chart series column \"{}\" has no numeric values", columns[k])));
+                return Err(AppError::new(format!(
+                    "chart series column \"{}\" has no numeric values",
+                    columns[k]
+                )));
             }
             Ok((columns[k].clone(), vals))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(Prepared { labels, x_numeric, series })
+    Ok(Prepared {
+        labels,
+        x_numeric,
+        series,
+    })
 }
 
 fn ce<E: std::fmt::Display>(e: E) -> AppError {
     AppError::new(format!("chart render: {e}"))
 }
 
-fn y_range(series: &[(String, Vec<Option<f64>>)]) -> (f64, f64) {
+fn y_range(series: &[(String, Vec<Option<f64>>)]) -> Result<(f64, f64), AppError> {
     let mut lo = 0.0f64;
     let mut hi = f64::MIN;
     for (_, vals) in series {
@@ -203,7 +312,13 @@ fn y_range(series: &[(String, Vec<Option<f64>>)]) -> (f64, f64) {
     if (hi - lo).abs() < f64::EPSILON {
         hi = lo + 1.0;
     }
-    (lo, hi + (hi - lo) * 0.05)
+    let upper = hi + (hi - lo) * 0.05;
+    if !lo.is_finite() || !upper.is_finite() || upper <= lo {
+        return Err(AppError::new(
+            "chart values produce an invalid y-axis range",
+        ));
+    }
+    Ok((lo, upper))
 }
 
 /// Render a chart spec against a result to PNG bytes.
@@ -211,12 +326,31 @@ fn y_range(series: &[(String, Vec<Option<f64>>)]) -> (f64, f64) {
 /// Panic-contained: plotters asserts internally (e.g. on a NaN range), and a panic
 /// here would kill the sequential Slack consumer task while the status badge still
 /// says "connected". A failed render must degrade to the table/file fallback.
-pub fn render_png(spec: &ChartSpec, columns: &[String], rows: &[Vec<Option<String>>]) -> Result<Vec<u8>, AppError> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render_png_inner(spec, columns, rows)))
-        .unwrap_or_else(|_| Err(AppError::new("chart render failed unexpectedly — falling back")))
+pub fn render_png(
+    spec: &ChartSpec,
+    columns: &[String],
+    rows: &[Vec<Option<String>>],
+) -> Result<Vec<u8>, AppError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        render_png_inner(spec, columns, rows)
+    }))
+    .unwrap_or_else(|_| {
+        Err(AppError::new(
+            "chart render failed unexpectedly — falling back",
+        ))
+    })
 }
 
-fn render_png_inner(spec: &ChartSpec, columns: &[String], rows: &[Vec<Option<String>>]) -> Result<Vec<u8>, AppError> {
+fn render_png_inner(
+    spec: &ChartSpec,
+    columns: &[String],
+    rows: &[Vec<Option<String>>],
+) -> Result<Vec<u8>, AppError> {
+    if !spec.valid() {
+        return Err(AppError::new(
+            "chart specification exceeds supported string or series limits",
+        ));
+    }
     ensure_font();
     let p = prepare(spec, columns, rows)?;
     let mut buf = vec![0u8; (W * H * 3) as usize];
@@ -233,7 +367,10 @@ fn render_png_inner(spec: &ChartSpec, columns: &[String], rows: &[Vec<Option<Str
     let mut enc = png::Encoder::new(&mut out, W, H);
     enc.set_color(png::ColorType::Rgb);
     enc.set_depth(png::BitDepth::Eight);
-    enc.write_header().map_err(ce)?.write_image_data(&buf).map_err(ce)?;
+    enc.write_header()
+        .map_err(ce)?
+        .write_image_data(&buf)
+        .map_err(ce)?;
     Ok(out)
 }
 
@@ -241,7 +378,7 @@ type Area<'a> = DrawingArea<BitMapBackend<'a>, plotters::coord::Shift>;
 
 fn draw_xy(root: &Area, spec: &ChartSpec, p: &Prepared) -> Result<(), AppError> {
     let n = p.labels.len();
-    let (ylo, yhi) = y_range(&p.series);
+    let (ylo, yhi) = y_range(&p.series)?;
     let scatter_x = spec.kind == "scatter";
     // Scatter with a numeric x column plots real x values; everything else
     // (and non-numeric scatter) uses category indices with label formatting.
@@ -249,12 +386,21 @@ fn draw_xy(root: &Area, spec: &ChartSpec, p: &Prepared) -> Result<(), AppError> 
         let lo = xs.iter().cloned().fold(f64::MAX, f64::min);
         let hi = xs.iter().cloned().fold(f64::MIN, f64::max);
         let pad = ((hi - lo).abs()).max(1.0) * 0.05;
-        (lo - pad, hi + pad)
+        let range = (lo - pad, hi + pad);
+        if !range.0.is_finite() || !range.1.is_finite() || range.1 <= range.0 {
+            return Err(AppError::new(
+                "chart values produce an invalid x-axis range",
+            ));
+        }
+        range
     } else {
         (-0.6, n as f64 - 0.4)
     };
 
-    let title = spec.title.clone().unwrap_or_else(|| "Query results".to_string());
+    let title = spec
+        .title
+        .clone()
+        .unwrap_or_else(|| "Query results".to_string());
     let mut chart = ChartBuilder::on(root)
         .caption(&title, ("sans-serif", 22))
         .margin(14)
@@ -299,7 +445,9 @@ fn draw_xy(root: &Area, spec: &ChartSpec, p: &Prepared) -> Result<(), AppError> 
                     }))
                     .map_err(ce)?
                     .label(name.clone())
-                    .legend(move |(x, y)| Rectangle::new([(x, y - 5), (x + 10, y + 5)], color.filled()));
+                    .legend(move |(x, y)| {
+                        Rectangle::new([(x, y - 5), (x + 10, y + 5)], color.filled())
+                    });
             }
             "scatter" => {
                 let xs = p.x_numeric.clone();
@@ -316,13 +464,18 @@ fn draw_xy(root: &Area, spec: &ChartSpec, p: &Prepared) -> Result<(), AppError> 
             }
             // line (default)
             _ => {
-                let pts: Vec<(f64, f64)> =
-                    vals.iter().enumerate().filter_map(|(i, v)| v.map(|v| (i as f64, v))).collect();
+                let pts: Vec<(f64, f64)> = vals
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, v)| v.map(|v| (i as f64, v)))
+                    .collect();
                 chart
                     .draw_series(LineSeries::new(pts, color.stroke_width(2)))
                     .map_err(ce)?
                     .label(name.clone())
-                    .legend(move |(x, y)| PathElement::new([(x, y), (x + 16, y)], color.stroke_width(2)));
+                    .legend(move |(x, y)| {
+                        PathElement::new([(x, y), (x + 16, y)], color.stroke_width(2))
+                    });
             }
         }
     }
@@ -351,7 +504,9 @@ fn draw_pie(root: &Area, spec: &ChartSpec, p: &Prepared) -> Result<(), AppError>
     for (i, v) in vals.iter().enumerate() {
         let v = v.unwrap_or(0.0);
         if v < 0.0 {
-            return Err(AppError::new("pie charts need non-negative values — try a bar chart"));
+            return Err(AppError::new(
+                "pie charts need non-negative values — try a bar chart",
+            ));
         }
         if v > 0.0 {
             sizes.push(v);
@@ -361,8 +516,20 @@ fn draw_pie(root: &Area, spec: &ChartSpec, p: &Prepared) -> Result<(), AppError>
     if sizes.is_empty() {
         return Err(AppError::new("all values are zero — nothing to chart"));
     }
-    let colors: Vec<RGBColor> = (0..sizes.len()).map(|i| PALETTE[i % PALETTE.len()]).collect();
-    let title = spec.title.clone().unwrap_or_else(|| format!("{name} — Query results"));
+    let total = sizes.iter().try_fold(0.0f64, |sum, value| {
+        let next = sum + value;
+        next.is_finite().then_some(next)
+    });
+    if total.is_none() {
+        return Err(AppError::new("pie values produce an invalid total"));
+    }
+    let colors: Vec<RGBColor> = (0..sizes.len())
+        .map(|i| PALETTE[i % PALETTE.len()])
+        .collect();
+    let title = spec
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("{name} — Query results"));
     root.draw(&Text::new(title, (20, 14), ("sans-serif", 22).into_font()))
         .map_err(ce)?;
     let center = (W as i32 / 2, H as i32 / 2 + 10);
@@ -381,7 +548,9 @@ mod tests {
     fn rows_of(data: &[(&str, f64)]) -> (Vec<String>, Vec<Vec<Option<String>>>) {
         (
             vec!["month".to_string(), "revenue".to_string()],
-            data.iter().map(|(m, v)| vec![Some(m.to_string()), Some(v.to_string())]).collect(),
+            data.iter()
+                .map(|(m, v)| vec![Some(m.to_string()), Some(v.to_string())])
+                .collect(),
         )
     }
 
@@ -426,17 +595,29 @@ mod tests {
         assert!(ChartSpec::parse(r#"{"type":"bar","x":"month","series":["revenue"]}"#).is_some());
         assert!(ChartSpec::parse(r#"{"type":"treemap"}"#).is_none());
         assert!(ChartSpec::parse("not json").is_none());
+        assert!(ChartSpec::parse(&format!(
+            r#"{{"type":"line","title":"{}"}}"#,
+            "x".repeat(MAX_TITLE_CHARS + 1)
+        ))
+        .is_none());
+        assert!(ChartSpec::parse(r#"{"type":"line","series":["a","A"]}"#).is_none());
     }
 
     #[test]
     fn unsupported_particulars_are_surfaced_not_dropped() {
-        let spec = ChartSpec::parse(r#"{"type":"bar","x":"region","series":["rev"],"stacked":true,"horizontal":true}"#).unwrap();
-        let note = spec.unsupported_note().expect("should flag unsupported keys");
+        let spec = ChartSpec::parse(
+            r#"{"type":"bar","x":"region","series":["rev"],"stacked":true,"horizontal":true}"#,
+        )
+        .unwrap();
+        let note = spec
+            .unsupported_note()
+            .expect("should flag unsupported keys");
         assert!(note.contains("stacked"));
         assert!(note.contains("horizontal"));
         assert!(spec.describe().contains("stacked"));
         // A fully-supported spec has no note.
-        let clean = ChartSpec::parse(r#"{"type":"line","x":"month","series":["rev"],"title":"T"}"#).unwrap();
+        let clean = ChartSpec::parse(r#"{"type":"line","x":"month","series":["rev"],"title":"T"}"#)
+            .unwrap();
         assert!(clean.unsupported_note().is_none());
     }
 
@@ -444,8 +625,14 @@ mod tests {
     fn renders_each_kind_to_png() {
         let (cols, rows) = rows_of(&[("Jan", 10.0), ("Feb", 25.5), ("Mar", 17.0)]);
         for kind in ["line", "bar", "scatter", "pie"] {
-            let spec = ChartSpec { kind: kind.into(), x: Some("month".into()), series: vec!["revenue".into()], ..Default::default() };
-            let png = render_png(&spec, &cols, &rows).unwrap_or_else(|e| panic!("{kind}: {}", e.message));
+            let spec = ChartSpec {
+                kind: kind.into(),
+                x: Some("month".into()),
+                series: vec!["revenue".into()],
+                ..Default::default()
+            };
+            let png =
+                render_png(&spec, &cols, &rows).unwrap_or_else(|e| panic!("{kind}: {}", e.message));
             assert!(png_ok(&png), "{kind} did not produce a PNG");
             assert!(png.len() > 1000, "{kind} PNG suspiciously small");
         }
@@ -454,27 +641,92 @@ mod tests {
     #[test]
     fn honors_axis_assignment_and_defaults() {
         let cols = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let rows: Vec<Vec<Option<String>>> =
-            (0..5).map(|i| vec![Some(format!("r{i}")), Some(format!("{i}")), Some(format!("{}", i * 2))]).collect();
+        let rows: Vec<Vec<Option<String>>> = (0..5)
+            .map(|i| {
+                vec![
+                    Some(format!("r{i}")),
+                    Some(format!("{i}")),
+                    Some(format!("{}", i * 2)),
+                ]
+            })
+            .collect();
         // Defaults: x = first column, series = all numeric others.
-        let spec = ChartSpec { kind: "line".into(), ..Default::default() };
+        let spec = ChartSpec {
+            kind: "line".into(),
+            ..Default::default()
+        };
         assert!(render_png(&spec, &cols, &rows).is_ok());
         // Explicit x on a named column; unknown columns error clearly.
-        let bad = ChartSpec { kind: "line".into(), x: Some("nope".into()), ..Default::default() };
-        assert!(render_png(&bad, &cols, &rows).unwrap_err().message.contains("nope"));
+        let bad = ChartSpec {
+            kind: "line".into(),
+            x: Some("nope".into()),
+            ..Default::default()
+        };
+        assert!(render_png(&bad, &cols, &rows)
+            .unwrap_err()
+            .message
+            .contains("nope"));
     }
 
     #[test]
     fn rejects_unchartable_data() {
         let cols = vec!["name".to_string(), "city".to_string()];
         let rows = vec![vec![Some("bob".into()), Some("nyc".into())]];
-        let spec = ChartSpec { kind: "bar".into(), ..Default::default() };
-        assert!(render_png(&spec, &cols, &rows).unwrap_err().message.contains("no numeric"));
+        let spec = ChartSpec {
+            kind: "bar".into(),
+            ..Default::default()
+        };
+        assert!(render_png(&spec, &cols, &rows)
+            .unwrap_err()
+            .message
+            .contains("no numeric"));
         let (c2, r2) = rows_of(&[("x", 1.0)]);
-        let too_many: Vec<Vec<Option<String>>> =
-            (0..500).map(|i| vec![Some(format!("l{i}")), Some("1".into())]).collect();
-        let spec2 = ChartSpec { kind: "line".into(), ..Default::default() };
-        assert!(render_png(&spec2, &c2, &too_many).unwrap_err().message.contains("too many rows"));
+        let too_many: Vec<Vec<Option<String>>> = (0..500)
+            .map(|i| vec![Some(format!("l{i}")), Some("1".into())])
+            .collect();
+        let spec2 = ChartSpec {
+            kind: "line".into(),
+            ..Default::default()
+        };
+        assert!(render_png(&spec2, &c2, &too_many)
+            .unwrap_err()
+            .message
+            .contains("too many rows"));
         assert!(render_png(&spec2, &c2, &r2).is_ok());
+    }
+
+    #[test]
+    fn bounds_series_labels_magnitudes_and_derived_ranges() {
+        let too_many = (0..=MAX_SERIES)
+            .map(|i| format!("s{i}"))
+            .collect::<Vec<_>>()
+            .join("\",\"");
+        assert!(
+            ChartSpec::parse(&format!(r#"{{"type":"line","series":["{too_many}"]}}"#)).is_none()
+        );
+
+        let columns = vec!["x".into(), "y".into()];
+        let huge = vec![vec![Some("1".into()), Some("1e101".into())]];
+        let spec = ChartSpec {
+            kind: "line".into(),
+            x: Some("x".into()),
+            series: vec!["y".into()],
+            ..Default::default()
+        };
+        let oversized_spec = ChartSpec {
+            title: Some("x".repeat(MAX_TITLE_CHARS + 1)),
+            ..spec.clone()
+        };
+        assert!(render_png(&oversized_spec, &columns, &huge).is_err());
+        assert!(render_png(&spec, &columns, &huge)
+            .unwrap_err()
+            .message
+            .contains("out-of-range"));
+
+        let long_label = vec![vec![
+            Some("x".repeat(MAX_POINT_LABEL_CHARS * 4)),
+            Some("1".into()),
+        ]];
+        assert!(render_png(&spec, &columns, &long_label).is_ok());
     }
 }

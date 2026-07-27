@@ -1,4 +1,13 @@
-import { type ParsedPlan, type PlanNode, finishTree } from "./types";
+import {
+  MAX_PLAN_DEPTH,
+  MAX_PLAN_LABEL_CHARS,
+  MAX_PLAN_NODES,
+  MAX_PLAN_PROPS,
+  boundPlanText,
+  type ParsedPlan,
+  type PlanNode,
+  finishTree,
+} from "./types";
 
 // Best-effort parser for hand-typed text `EXPLAIN` output (one line per row).
 // Strict: any line that doesn't fit the known shapes bails to null and the
@@ -19,7 +28,7 @@ type Parsed = { node: PlanNode; indent: number };
 function parseNodeText(text: string): PlanNode | null {
   const costM = COST_RE.exec(text);
   if (!costM) return null;
-  const head = text.slice(0, costM.index).trim();
+  const head = boundPlanText(text.slice(0, costM.index).trim(), MAX_PLAN_LABEL_CHARS);
   if (!head) return null;
   const node: PlanNode = { id: 0, label: head, props: [], children: [] };
   // "Seq Scan on films f" / "Index Scan using idx on films" → object after " on ".
@@ -48,22 +57,30 @@ function parseNodeText(text: string): PlanNode | null {
 }
 
 /** Fill selfCost/selfTimeMs bottom-up (same math as the JSON parser). */
-function computeSelf(n: PlanNode) {
-  n.children.forEach(computeSelf);
-  if (n.totalCost !== undefined) {
-    let s = n.totalCost;
-    for (const c of n.children) if (c.totalCost !== undefined) s -= c.totalCost;
-    n.selfCost = Math.max(0, s);
-  }
-  if (n.totalTimeMs !== undefined) {
-    let s = n.totalTimeMs * (n.loops ?? 1);
-    for (const c of n.children) if (c.totalTimeMs !== undefined) s -= c.totalTimeMs * (c.loops ?? 1);
-    n.selfTimeMs = Math.max(0, s);
+function computeSelf(root: PlanNode) {
+  const stack: { node: PlanNode; done: boolean }[] = [{ node: root, done: false }];
+  while (stack.length) {
+    const { node: n, done } = stack.pop()!;
+    if (!done) {
+      stack.push({ node: n, done: true });
+      for (let i = n.children.length - 1; i >= 0; i--) stack.push({ node: n.children[i], done: false });
+      continue;
+    }
+    if (n.totalCost !== undefined) {
+      let s = n.totalCost;
+      for (const c of n.children) if (c.totalCost !== undefined) s -= c.totalCost;
+      n.selfCost = Math.max(0, s);
+    }
+    if (n.totalTimeMs !== undefined) {
+      let s = n.totalTimeMs * (n.loops ?? 1);
+      for (const c of n.children) if (c.totalTimeMs !== undefined) s -= c.totalTimeMs * (c.loops ?? 1);
+      n.selfTimeMs = Math.max(0, s);
+    }
   }
 }
 
 export function parsePgText(lines: string[]): ParsedPlan | null {
-  if (!lines.length) return null;
+  if (!lines.length || lines.length > MAX_PLAN_NODES * (MAX_PLAN_PROPS + 1)) return null;
   let planningMs: number | undefined;
   let executionMs: number | undefined;
 
@@ -71,6 +88,7 @@ export function parsePgText(lines: string[]): ParsedPlan | null {
   if (!root || /^\s/.test(lines[0])) return null;
   const stack: Parsed[] = [{ node: root, indent: -1 }];
   let last: PlanNode = root;
+  let nodes = 1;
 
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i];
@@ -85,13 +103,14 @@ export function parsePgText(lines: string[]): ParsedPlan | null {
       const indent = arrow[1].length;
       const node = parseNodeText(arrow[2]);
       if (!node) return null; // an arrow line we can't parse → don't guess
+      if (++nodes > MAX_PLAN_NODES) return null;
       while (stack.length > 1 && stack[stack.length - 1].indent >= indent) stack.pop();
       stack[stack.length - 1].node.children.push(node);
       stack.push({ node, indent });
       // Same depth ceiling as the JSON parsers: a crafted result with ever-increasing
       // indents would otherwise build a tree deep enough to overflow the stack in the
       // recursive layout/render walks. Fall back to the styled-text view.
-      if (stack.length > 256) return null;
+      if (stack.length > MAX_PLAN_DEPTH) return null;
       last = node;
       continue;
     }
@@ -99,8 +118,10 @@ export function parsePgText(lines: string[]): ParsedPlan | null {
       // Detail line ("Filter: …", "Sort Key: …", "Buckets: …") → prop on the
       // nearest node above.
       const kv = /^\s*([A-Za-z][A-Za-z0-9 _-]*):\s*(.*)$/.exec(line);
-      if (kv) last.props.push([kv[1], kv[2]]);
-      else last.props.push(["", line.trim()]);
+      if (last.props.length < MAX_PLAN_PROPS) {
+        if (kv) last.props.push([boundPlanText(kv[1]), boundPlanText(kv[2], 4_096)]);
+        else last.props.push(["", boundPlanText(line.trim(), 4_096)]);
+      }
       continue;
     }
     // A second top-level node (multi-statement EXPLAIN) or anything else

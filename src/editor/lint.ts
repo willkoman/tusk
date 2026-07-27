@@ -6,6 +6,7 @@ import { type ValidateFn } from "./types";
 import { heuristicLintSource } from "./heuristicLint";
 import { schemaLintSource } from "./schemaLint";
 import { serverLintSource } from "./serverLint";
+import { LINT_DIAGNOSTIC_LIMIT } from "./limits";
 
 // Two linter instances, not one merged source:
 //   • client (sync, 300ms) — heuristics + schema check; both share the lexer pass
@@ -21,7 +22,9 @@ export function clientLint(getSchema: () => Table[], getFuncs: () => ReadonlySet
   // workbench on every keystroke. Losing squiggles beats losing the editor.
   const combined = (view: EditorView): Diagnostic[] => {
     try {
-      return [...heuristic(view), ...schema(view)];
+      const first = heuristic(view);
+      if (first.length >= LINT_DIAGNOSTIC_LIMIT) return first.slice(0, LINT_DIAGNOSTIC_LIMIT);
+      return [...first, ...schema(view)].slice(0, LINT_DIAGNOSTIC_LIMIT);
     } catch (e) {
       console.error("client lint failed", e);
       return [];
@@ -30,8 +33,8 @@ export function clientLint(getSchema: () => Table[], getFuncs: () => ReadonlySet
   return linter(combined, { delay: 300 });
 }
 
-export function serverLint(getValidate: () => ValidateFn | null): Extension {
-  return linter(serverLintSource(getValidate), { delay: 600 });
+export function serverLint(getValidate: () => ValidateFn | null, getIdentity?: () => unknown): Extension {
+  return linter(serverLintSource(getValidate, getIdentity), { delay: 600 });
 }
 
 export function lintUi(): Extension {

@@ -268,10 +268,16 @@ export function maskNonCode(
 
 /** The statement containing `pos` (inclusive of its trailing `;`); last statement as a fallback. */
 export function statementAt(stmts: Stmt[], pos: number): { stmt: Stmt; index: number } | null {
-  for (let k = 0; k < stmts.length; k++) {
-    const s = stmts[k];
-    if (pos >= s.from && pos <= s.to) return { stmt: s, index: k };
+  // First statement whose end reaches pos. Binary search keeps cursor moves O(log n)
+  // in scripts with thousands of statements.
+  let lo = 0;
+  let hi = stmts.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (stmts[mid].to < pos) lo = mid + 1;
+    else hi = mid;
   }
+  if (lo < stmts.length && pos >= stmts[lo].from) return { stmt: stmts[lo], index: lo };
   if (stmts.length) return { stmt: stmts[stmts.length - 1], index: stmts.length - 1 };
   return null;
 }

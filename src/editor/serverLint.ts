@@ -2,6 +2,7 @@ import { type Diagnostic } from "@codemirror/lint";
 import { type EditorView } from "@codemirror/view";
 import { docString, lexState } from "./lexer";
 import { type ServerDiag, type ValidateFn } from "./types";
+import { LINT_DIAGNOSTIC_LIMIT, LIVE_ANALYSIS_MAX_CHARS } from "./limits";
 
 // Async linter source: round-trips the buffer to the backend `validate_sql`
 // command (PREPARE-only — never executes) for parser-grade Postgres diagnostics,
@@ -11,11 +12,15 @@ import { type ServerDiag, type ValidateFn } from "./types";
 // which case this is a no-op. CodeMirror's `delay` debounces re-runs; a newer edit
 // supersedes an in-flight request.
 
-export function serverLintSource(getValidate: () => ValidateFn | null) {
+export function serverLintSource(getValidate: () => ValidateFn | null, getIdentity: () => unknown = () => undefined) {
   return async (view: EditorView): Promise<Diagnostic[]> => {
     const validate = getValidate();
     if (!validate) return [];
-    const doc = docString(view.state);
+    const state = view.state;
+    if (state.doc.length > LIVE_ANALYSIS_MAX_CHARS) return [];
+    const sourceDoc = state.doc;
+    const sourceIdentity = getIdentity();
+    const doc = docString(state);
     if (!doc.trim()) return [];
 
     let diags: ServerDiag[];
@@ -25,9 +30,12 @@ export function serverLintSource(getValidate: () => ValidateFn | null) {
       return []; // transport/connection error — stay silent, client lints still apply
     }
 
-    const { stmts } = lexState(view.state);
+    // Validation is async. Ignore diagnostics if either document or owning tab
+    // changed while request was in flight, even when replacement text is identical.
+    if (view.state.doc !== sourceDoc || getIdentity() !== sourceIdentity) return [];
+    const { stmts } = lexState(state);
     const out: Diagnostic[] = [];
-    for (const d of diags) {
+    for (const d of diags.slice(0, LINT_DIAGNOSTIC_LIMIT)) {
       const stmt = stmts[d.stmtIndex];
       if (!stmt) continue;
       // The backend prepared the whitespace-trimmed statement; account for leading

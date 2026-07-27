@@ -1,8 +1,9 @@
-import { createSignal, createEffect, Index, Show, onMount, type Accessor } from "solid-js";
+import { createSignal, createEffect, createMemo, Index, Show, onCleanup, onMount, type Accessor } from "solid-js";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import {
-  aiStore, activeBaseUrl, defaultModel, providerModels, providerInfo, AI_PROVIDERS, isKeyless,
-  resolveWire, resolveBaseUrl, modelSupported,
+  aiStore, activeBaseUrl, approvedBaseOverride, defaultModel, normalizeAiConfig,
+  providerModels, providerInfo, AI_PROVIDERS, isKeyless, resolveWire, resolveBaseUrl,
+  modelSupported, originApproved,
   type AiConfig, type AiProvider, type AiEvent,
 } from "./store";
 import { buildSystemPrompt, relevantTables, type AiContext, type SampleTable } from "./context";
@@ -50,6 +51,7 @@ export function AiPanel(props: {
   onClose: () => void;
 }) {
   const [cfg, setCfg] = createSignal<AiConfig>(aiStore.load());
+  const [configError, setConfigError] = createSignal("");
   const [hasKey, setHasKey] = createSignal(false);
   const [keyed, setKeyed] = createSignal<AiProvider[]>([]); // providers with a saved key
   // Live model catalog per provider (fetched via the backend with the keychain key);
@@ -60,10 +62,22 @@ export function AiPanel(props: {
    *  OpenCode gateways are fully covered today, so nothing is filtered in practice. */
   const modelsFor = (pid: AiProvider) =>
     (liveModels()[pid] ?? providerModels(pid)).filter((m) => modelSupported(pid, m));
+  const modelFetchGeneration = new Map<AiProvider, number>();
+  let keyGeneration = 0;
+  let keyedGeneration = 0;
+  let mounted = true;
+  const nextModelFetch = (pid: AiProvider) => {
+    const generation = (modelFetchGeneration.get(pid) ?? 0) + 1;
+    modelFetchGeneration.set(pid, generation);
+    return generation;
+  };
   async function fetchModels(pid: AiProvider) {
+    const generation = nextModelFetch(pid);
+    const config = cfg();
     // The base override only applies to the provider it was configured for; every other
     // provider is fetched at its registry default.
-    const override = cfg().baseUrls[pid] ?? "";
+    if (!originApproved(config, pid)) return;
+    const override = approvedBaseOverride(config, pid);
     const spec = providerInfo(pid);
     const baseUrl = resolveBaseUrl(pid, override);
     if (!baseUrl) return; // no default, no override — never let the backend guess (see runTurn)
@@ -74,7 +88,8 @@ export function AiPanel(props: {
         baseUrl,
         allowNoKey: !spec.needsKey,
       });
-      if (list.length) setLiveModels((m) => ({ ...m, [pid]: list }));
+      if (mounted && modelFetchGeneration.get(pid) === generation && list.length)
+        setLiveModels((m) => ({ ...m, [pid]: list }));
     } catch {
       /* keep the curated fallback */
     }
@@ -94,23 +109,42 @@ export function AiPanel(props: {
   };
 
   const setConfig = (patch: Partial<AiConfig>) => {
-    const next = { ...cfg(), ...patch };
-    setCfg(next);
-    aiStore.save(next);
+    const next = normalizeAiConfig({ ...cfg(), ...patch });
+    if (!aiStore.save(next)) {
+      setCfg({ ...next, shareSamples: false });
+      setConfigError("Could not save AI settings. Sample sharing remains off unless its privacy choice is stored successfully.");
+      return false;
+    }
+    // aiStore synchronously publishes its canonical value (including models[provider]);
+    // do not overwrite that subscriber update with the pre-normalized input.
+    setConfigError("");
+    return true;
   };
   // A keyless local server is always "ready" — never gate it behind the key prompt.
-  const providerReady = async (p: AiProvider) =>
-    isKeyless(p) || (await invoke<boolean>("ai_has_key", { provider: p }).catch(() => false));
-  const refreshKey = async () => setHasKey(await providerReady(cfg().provider));
+  const providerReady = async (p: AiProvider, config = cfg()) => {
+    if (!originApproved(config, p)) return false;
+    if (isKeyless(p)) return true;
+    const baseUrl = resolveBaseUrl(p, approvedBaseOverride(config, p));
+    return !!baseUrl && await invoke<boolean>("ai_has_key", { provider: p, baseUrl }).catch(() => false);
+  };
+  const refreshKey = async () => {
+    const generation = ++keyGeneration;
+    const config = cfg();
+    const ready = await providerReady(config.provider, config);
+    if (mounted && keyGeneration === generation && cfg() === config) setHasKey(ready);
+  };
   // First-open routing happens HERE, once the async keychain check resolves: no
   // saved key anywhere → show the setup form (provider/model/key prompt); a key
   // exists → land straight in the chat. Deciding before the check (or in an
   // effect over keyed(), which starts []) wrongly flashed settings open on every
   // panel open even after setup.
   const refreshKeyed = async () => {
+    const generation = ++keyedGeneration;
+    const config = cfg();
     const checks = await Promise.all(
-      AI_PROVIDERS.map((p) => providerReady(p.id).then((ok) => (ok ? p.id : null))),
+      AI_PROVIDERS.map((p) => providerReady(p.id, config).then((ok) => (ok ? p.id : null))),
     );
+    if (!mounted || keyedGeneration !== generation || cfg() !== config) return;
     const list = checks.filter((x): x is AiProvider => !!x);
     setKeyed(list);
     // Keyless providers are "ready" but may have no server running — fetching their
@@ -120,15 +154,50 @@ export function AiPanel(props: {
     // which opens Settings → AI. No drawer to flash open.
   };
 
-  onMount(() => { void refreshKey(); void refreshKeyed(); });
+  let unsubscribeConfig = () => {};
+  onMount(() => {
+    unsubscribeConfig = aiStore.subscribe((next) => {
+      const previous = cfg();
+      const changedBases = AI_PROVIDERS
+        .map((provider) => provider.id)
+        .filter((provider) =>
+          (previous.baseUrls[provider] ?? "") !== (next.baseUrls[provider] ?? "") ||
+          previous.approvedOrigins[provider] !== next.approvedOrigins[provider]);
+      if (changedBases.length) {
+        for (const provider of changedBases) nextModelFetch(provider);
+        setLiveModels((models) => {
+          const updated = { ...models };
+          for (const provider of changedBases) delete updated[provider];
+          return updated;
+        });
+      }
+      setCfg(next);
+      setConfigError("");
+      void refreshKeyed();
+    });
+    void refreshKey();
+    void refreshKeyed();
+  });
   // Re-check the current provider's key when it changes.
-  createEffect(() => { cfg().provider; void refreshKey(); });
+  const readinessKey = createMemo(() => {
+    const c = cfg();
+    return JSON.stringify([c.provider, c.baseUrls[c.provider] ?? "", c.approvedOrigins[c.provider] ?? ""]);
+  });
+  createEffect(() => {
+    readinessKey();
+    setHasKey(false);
+    void refreshKey();
+  });
   // Refetch the current provider's models when its base URL changes (debounced —
   // OpenAI-compatible/local servers expose different catalogs per base).
   let modelsTimer: ReturnType<typeof setTimeout> | undefined;
-  createEffect(() => {
+  const modelSourceKey = createMemo(() => {
     const p = cfg().provider;
-    cfg().baseUrls[p]; // track
+    return JSON.stringify([p, cfg().baseUrls[p] ?? "", cfg().approvedOrigins[p] ?? ""]);
+  });
+  createEffect(() => {
+    modelSourceKey();
+    const p = cfg().provider;
     if (!keyed().includes(p)) return;
     clearTimeout(modelsTimer);
     modelsTimer = setTimeout(() => void fetchModels(p), 600);
@@ -154,6 +223,26 @@ export function AiPanel(props: {
   // The in-flight turn's request id. Every event is checked against it, so a cancelled
   // or superseded stream can never write into the message list after the fact.
   let curReq: string | null = null;
+  let pendingDelta = "";
+  let pendingDeltaId: string | null = null;
+  let deltaTimer: ReturnType<typeof setTimeout> | undefined;
+  const flushDelta = (id: string) => {
+    if (pendingDeltaId !== id || !pendingDelta) return;
+    clearTimeout(deltaTimer);
+    deltaTimer = undefined;
+    const text = pendingDelta;
+    pendingDelta = "";
+    appendAssistant(text);
+  };
+  const queueDelta = (id: string, text: string) => {
+    if (pendingDeltaId !== id) {
+      pendingDelta = "";
+      pendingDeltaId = id;
+    }
+    pendingDelta += text;
+    if (pendingDelta.length >= 4096) flushDelta(id);
+    else if (!deltaTimer) deltaTimer = setTimeout(() => flushDelta(id), 32);
+  };
   // Automatic restarts left for the current user turn. Reset on every fresh send, so a
   // conversation can't accumulate retries and a dying provider can't loop forever.
   let autoRetries = AUTO_RETRY_BUDGET;
@@ -163,7 +252,9 @@ export function AiPanel(props: {
    *  duplicate what's on screen), so it lands here as an error — restart it once. */
   function finishTurn(id: string, patch: Pick<ChatMsg, "error" | "cancelled" | "truncated">) {
     if (curReq !== id) return; // already ended (or superseded)
+    flushDelta(id);
     curReq = null;
+    pendingDeltaId = null;
     setStreaming(false);
     let diedMidStream = false;
     setMessages((ms) => {
@@ -197,17 +288,38 @@ export function AiPanel(props: {
     setStreaming(true);
     const id = newRequestId();
     curReq = id;
+    pendingDelta = "";
+    pendingDeltaId = id;
 
     const channel = new Channel<AiEvent>();
     channel.onmessage = (ev) => {
       if (curReq !== id) return; // stale stream — cancelled or superseded
-      if (ev.type === "delta") appendAssistant(ev.text);
+      if (ev.type === "delta") queueDelta(id, ev.text);
       else if (ev.type === "error") finishTurn(id, { error: ev.message });
       else if (ev.type === "cancelled") finishTurn(id, { cancelled: true });
       else finishTurn(id, { truncated: ev.truncated });
     };
     try {
       const c = cfg();
+      const model = c.model || defaultModel(c.provider);
+      if (!model) {
+        finishTurn(id, { error: `No model selected for ${providerInfo(c.provider).label}. Pick one in AI settings.` });
+        return;
+      }
+      if (!originApproved(c, c.provider)) {
+        finishTurn(id, { error: `Approve the custom API origin for ${providerInfo(c.provider).label} in AI settings before using it.` });
+        return;
+      }
+      const wire = resolveWire(c.provider, model);
+      if (!wire) {
+        finishTurn(id, { error: `${providerInfo(c.provider).label} doesn't serve ${model} on an API shape Tusk supports.` });
+        return;
+      }
+      const baseUrl = resolveBaseUrl(c.provider, activeBaseUrl(c), wire);
+      if (!baseUrl) {
+        finishTurn(id, { error: `Set an API base URL for ${providerInfo(c.provider).label} in AI settings.` });
+        return;
+      }
       // Prime the join graph BEFORE snapshotting ctx — `fks`/`fksKnown` are read off it.
       await props.ensureFks?.().catch(() => { /* best-effort — prompt omits the FK section */ });
       const ctx = props.ctx();
@@ -215,37 +327,30 @@ export function AiPanel(props: {
       // Ground the model in real data: fetch a few sample rows of the tables most
       // relevant to the conversation (read-only, best-effort, off if the user opted out).
       let samples: SampleTable[] = [];
-      if (c.shareSamples !== false) {
+      if (c.shareSamples) {
         const targets = relevantTables(ctx.tables, `${convoText} ${ctx.currentSql} ${ctx.selection}`, 5)
           .map((t) => ({ schema: t.schema, name: t.name }));
         if (targets.length) {
           try { samples = await props.sampleRows(targets); } catch { /* best-effort — no samples */ }
         }
       }
+      // Settings can remain open beside the mounted panel. If sharing was turned off
+      // while samples were loading, discard them before constructing the request.
+      if (!cfg().shareSamples) samples = [];
       // Stop pressed while sampling: the stream was never registered, so `ai_cancel`
       // has nothing to interrupt — just don't start it.
       if (curReq !== id) return;
-      const model = c.model || defaultModel(c.provider);
-      // Live-catalog-only providers (routers, local servers) have no curated default,
-      // so an unreachable server or an unset model must say so, not 404 at the provider.
-      if (!model) {
-        finishTurn(id, { error: `No model selected for ${providerInfo(c.provider).label}. Pick one in AI settings.` });
-        return;
-      }
-      // OpenCode serves each family on a different endpoint; the wire is per MODEL,
-      // not per provider. `null` = a shape we don't speak (should be unreachable —
-      // modelsFor already filters those out of the picker).
-      const wire = resolveWire(c.provider, model);
-      if (!wire) {
-        finishTurn(id, { error: `${providerInfo(c.provider).label} doesn't serve ${model} on an API shape Tusk supports.` });
-        return;
-      }
-      // A provider with no registry default and no override resolves to "". Sending null
-      // would make the backend fall back to api.openai.com — quietly shipping the schema,
-      // FK graph, sample rows and the user's key to a third party. Refuse instead.
-      const baseUrl = resolveBaseUrl(c.provider, activeBaseUrl(c), wire);
-      if (!baseUrl) {
-        finishTurn(id, { error: `Set an API base URL for ${providerInfo(c.provider).label} in AI settings.` });
+      // Provider settings can change while FK/sample reads are pending. Revalidate
+      // the exact destination immediately before sending schema or row context;
+      // revoking an origin must take effect before the network request starts.
+      const latest = cfg();
+      const latestModel = latest.model || defaultModel(latest.provider);
+      const latestWire = latestModel ? resolveWire(latest.provider, latestModel) : null;
+      const latestBase = latestWire && originApproved(latest, latest.provider)
+        ? resolveBaseUrl(latest.provider, activeBaseUrl(latest), latestWire)
+        : "";
+      if (latest.provider !== c.provider || latestModel !== model || latestWire !== wire || latestBase !== baseUrl) {
+        finishTurn(id, { error: "AI provider settings changed while preparing the request. Send again to use the new destination." });
         return;
       }
       await invoke("ai_chat", {
@@ -320,6 +425,21 @@ export function AiPanel(props: {
     return !streaming() && last?.role === "assistant" && (last.error || last.cancelled) ? last : undefined;
   };
 
+  onCleanup(() => {
+    mounted = false;
+    keyGeneration++;
+    keyedGeneration++;
+    for (const provider of AI_PROVIDERS) nextModelFetch(provider.id);
+    unsubscribeConfig();
+    clearTimeout(modelsTimer);
+    clearTimeout(deltaTimer);
+    const id = curReq;
+    curReq = null;
+    pendingDelta = "";
+    pendingDeltaId = null;
+    if (id) void invoke("ai_cancel", { requestId: id }).catch(() => {});
+  });
+
 
   return (
     <div class="ai-panel" style={{ width: `${props.width}px` }}>
@@ -343,11 +463,20 @@ export function AiPanel(props: {
 
       <Show when={settingsOpen()}>
         <div class="ai-settings">
+          <Show when={configError()}><div class="ai-msg-error">{configError()}</div></Show>
           {/* Provider/model/key management lives in Settings → AI now (provider cards,
               Test connection, skills). This drawer keeps only the one control that is a
               per-conversation privacy decision rather than configuration. */}
           <label class="ai-check" title="Send a few sample rows of relevant tables so the model understands your real data. Real values leave your machine for the provider.">
-            <input type="checkbox" checked={cfg().shareSamples !== false} onChange={(e) => setConfig({ shareSamples: e.currentTarget.checked })} />
+            <input
+              type="checkbox"
+              checked={cfg().shareSamples}
+              onChange={(e) => {
+                if (!setConfig({ shareSamples: e.currentTarget.checked })) {
+                  e.currentTarget.checked = cfg().shareSamples;
+                }
+              }}
+            />
             Share sample data with the model
           </label>
           <div class="ai-settings-actions">

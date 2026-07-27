@@ -1,4 +1,4 @@
-import { type JSX, Show } from "solid-js";
+import { type JSX, Show, onCleanup, onMount } from "solid-js";
 import { Icon } from "./Icons";
 
 /** Generic modal shell — reuses the `.modal` / `.modal-overlay` CSS. */
@@ -12,11 +12,60 @@ export function Dialog(props: {
   dismissable?: boolean;
   children: JSX.Element;
 }) {
+  let modal: HTMLDivElement | undefined;
+  let priorFocus: HTMLElement | null = null;
   const canClose = () => props.dismissable !== false;
+  const focusable = () => modal
+    ? [...modal.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [href], [tabindex]:not([tabindex="-1"])')]
+      .filter((el) => !el.hasAttribute("hidden") && el.getClientRects().length > 0)
+    : [];
+  onMount(() => {
+    priorFocus = document.activeElement as HTMLElement | null;
+    queueMicrotask(() => {
+      if (modal?.isConnected && !modal.contains(document.activeElement)) modal.focus();
+    });
+  });
+  onCleanup(() => {
+    if (priorFocus?.isConnected) priorFocus.focus();
+  });
   return (
-    <div class="modal-overlay" onClick={() => canClose() && props.onClose()}>
+    <div
+      class="modal-overlay"
+      data-blocking-dialog="true"
+      onClick={() => canClose() && props.onClose()}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          e.stopPropagation();
+          if (canClose()) props.onClose();
+          return;
+        }
+        if (e.key !== "Tab") return;
+        const items = focusable();
+        if (!items.length) {
+          e.preventDefault();
+          modal?.focus();
+          return;
+        }
+        const first = items[0];
+        const last = items[items.length - 1];
+        const active = document.activeElement;
+        if (e.shiftKey && (active === first || active === modal || !modal?.contains(active))) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && active === last) {
+          e.preventDefault();
+          first.focus();
+        }
+      }}
+    >
       <div
+        ref={modal}
         class="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={props.title}
+        tabindex={-1}
         classList={{ [props.class ?? ""]: !!props.class }}
         style={props.width ? { width: `${props.width}px` } : undefined}
         onClick={(e) => e.stopPropagation()}
@@ -24,7 +73,7 @@ export function Dialog(props: {
         <div class="modal-head">
           {props.title}
           <span class="spacer" />
-          <button class="icon modal-x" disabled={!canClose()} onClick={props.onClose}><Icon name="close" /></button>
+          <button class="icon modal-x" title="Close" aria-label="Close" disabled={!canClose()} onClick={props.onClose}><Icon name="close" /></button>
         </div>
         {props.children}
       </div>

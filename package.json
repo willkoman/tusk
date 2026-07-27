@@ -1,12 +1,15 @@
 {
   "name": "tusk",
-  "version": "0.8.7",
+  "version": "0.9.0",
   "description": "",
   "type": "module",
   "scripts": {
     "start": "vite",
     "dev": "vite",
     "build": "vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "check:versions": "node scripts/check-version.mjs",
+    "check:licenses": "node scripts/check-js-licenses.mjs",
     "serve": "vite preview",
     "test": "vitest run",
     "tauri": "tauri"

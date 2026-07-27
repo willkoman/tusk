@@ -12,10 +12,13 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_util::sync::CancellationToken;
 
+const SEEN_CAP: usize = 2_048;
+
 #[derive(Debug)]
 pub enum SlackEvent {
     /// A plain message (DM or channel the bot is in). `text` has mentions stripped.
     Message {
+        workspace: String,
         channel: String,
         user: String,
         text: String,
@@ -23,7 +26,9 @@ pub enum SlackEvent {
         ts: String,
     },
     /// A button click (block_actions payload, parsed by the processor).
-    Interaction { payload: Value },
+    Interaction {
+        payload: Value,
+    },
     Connected,
     Disconnected(String),
 }
@@ -36,24 +41,26 @@ struct Seen {
 
 impl Seen {
     fn new() -> Self {
-        Self { order: VecDeque::new(), set: HashSet::new() }
+        Self {
+            order: VecDeque::new(),
+            set: HashSet::new(),
+        }
     }
     /// Returns true when the id was already seen (a retry to drop).
-    fn check(&mut self, id: &str) -> bool {
+    fn contains(&self, id: &str) -> bool {
+        !id.is_empty() && self.set.contains(id)
+    }
+    fn remember(&mut self, id: &str) {
         if id.is_empty() {
-            return false;
-        }
-        if self.set.contains(id) {
-            return true;
+            return;
         }
         self.set.insert(id.to_string());
         self.order.push_back(id.to_string());
-        if self.order.len() > 256 {
+        if self.order.len() > SEEN_CAP {
             if let Some(old) = self.order.pop_front() {
                 self.set.remove(&old);
             }
         }
-        false
     }
 }
 
@@ -65,10 +72,7 @@ async fn open_connection(client: &reqwest::Client, app_token: &str) -> Result<St
         .send()
         .await
         .map_err(|e| AppError::new(format!("apps.connections.open: {e}")))?;
-    let v: Value = resp
-        .json()
-        .await
-        .map_err(|e| AppError::new(format!("apps.connections.open: {e}")))?;
+    let v = super::api::read_json_response(resp, "apps.connections.open", 256 * 1024).await?;
     if v["ok"].as_bool() != Some(true) {
         let err = v["error"].as_str().unwrap_or("unknown error");
         return Err(AppError::new(format!(
@@ -116,16 +120,47 @@ fn parse_event(payload: &Value, bot_user_id: &str) -> Option<SlackEvent> {
         return None;
     }
     let text = strip_mentions(ev["text"].as_str().unwrap_or_default());
-    if text.is_empty() {
+    if text.is_empty() || text.len() > 64 * 1024 {
+        return None;
+    }
+    let workspace = payload["team_id"]
+        .as_str()
+        .or(ev["team"].as_str())
+        .unwrap_or_default();
+    let channel = ev["channel"].as_str().unwrap_or_default();
+    let ts = ev["ts"].as_str().unwrap_or_default();
+    if workspace.is_empty() || channel.is_empty() || ts.is_empty() {
         return None;
     }
     Some(SlackEvent::Message {
-        channel: ev["channel"].as_str().unwrap_or_default().to_string(),
+        workspace: workspace.to_string(),
+        channel: channel.to_string(),
         user,
         text,
         thread_ts: ev["thread_ts"].as_str().map(str::to_string),
-        ts: ev["ts"].as_str().unwrap_or_default().to_string(),
+        ts: ts.to_string(),
     })
+}
+
+fn interaction_key(v: &Value) -> Option<String> {
+    let payload = &v["payload"];
+    let trigger = payload["trigger_id"].as_str().unwrap_or_default();
+    if !trigger.is_empty() {
+        return Some(format!("interaction:{trigger}"));
+    }
+    let envelope = v["envelope_id"].as_str().unwrap_or_default();
+    (!envelope.is_empty()).then(|| format!("interaction:{envelope}"))
+}
+
+fn enqueue_once(tx: &mpsc::Sender<SlackEvent>, seen: &mut Seen, key: &str, event: SlackEvent) {
+    if seen.contains(key) {
+        return;
+    }
+    // Never wait behind long sequential AI/query work after ACKing. A bounded full
+    // queue drops load rather than stalling the socket and missing later ACKs.
+    if tx.try_send(event).is_ok() {
+        seen.remember(key);
+    }
 }
 
 /// Run the Socket Mode loop until cancelled. Emits Connected/Disconnected around
@@ -137,7 +172,7 @@ pub async fn run_socket_mode(
     tx: mpsc::Sender<SlackEvent>,
     cancel: CancellationToken,
 ) {
-    let client = reqwest::Client::new();
+    let client = super::api::http_client();
     let mut seen = Seen::new();
     let mut backoff_secs: u64 = 1;
 
@@ -148,7 +183,7 @@ pub async fn run_socket_mode(
         let url = match open_connection(&client, &app_token).await {
             Ok(u) => u,
             Err(e) => {
-                let _ = tx.send(SlackEvent::Disconnected(e.message)).await;
+                let _ = tx.try_send(SlackEvent::Disconnected(e.message));
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
@@ -160,12 +195,21 @@ pub async fn run_socket_mode(
 
         let ws = tokio::select! {
             _ = cancel.cancelled() => return,
-            r = tokio_tungstenite::connect_async(&url) => r,
+            r = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                tokio_tungstenite::connect_async(&url),
+            ) => match r {
+                Ok(result) => result,
+                Err(_) => Err(tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Slack WebSocket connect timed out after 20 seconds",
+                ))),
+            },
         };
         let (mut ws, _resp) = match ws {
             Ok(x) => x,
             Err(e) => {
-                let _ = tx.send(SlackEvent::Disconnected(e.to_string())).await;
+                let _ = tx.try_send(SlackEvent::Disconnected(e.to_string()));
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
@@ -186,47 +230,83 @@ pub async fn run_socket_mode(
             let msg = match msg {
                 Some(Ok(m)) => m,
                 Some(Err(e)) => {
-                    let _ = tx.send(SlackEvent::Disconnected(e.to_string())).await;
+                    let _ = tx.try_send(SlackEvent::Disconnected(e.to_string()));
                     break;
                 }
                 None => {
-                    let _ = tx.send(SlackEvent::Disconnected("socket closed".into())).await;
+                    let _ = tx.try_send(SlackEvent::Disconnected("socket closed".into()));
                     break;
                 }
             };
             match msg {
                 WsMessage::Ping(p) => {
-                    let _ = ws.send(WsMessage::Pong(p)).await;
+                    if !matches!(
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            ws.send(WsMessage::Pong(p)),
+                        )
+                        .await,
+                        Ok(Ok(()))
+                    ) {
+                        break;
+                    }
                 }
                 WsMessage::Close(_) => {
-                    let _ = tx.send(SlackEvent::Disconnected("closed by Slack".into())).await;
+                    let _ = tx.try_send(SlackEvent::Disconnected("closed by Slack".into()));
                     break;
                 }
                 WsMessage::Text(t) => {
-                    let Ok(v) = serde_json::from_str::<Value>(t.as_str()) else { continue };
+                    if t.len() > 2 * 1024 * 1024 {
+                        break;
+                    }
+                    let Ok(v) = serde_json::from_str::<Value>(t.as_str()) else {
+                        continue;
+                    };
                     // Ack FIRST (3s deadline) — processing happens downstream.
                     if let Some(envelope_id) = v["envelope_id"].as_str() {
                         let ack = json!({ "envelope_id": envelope_id }).to_string();
-                        let _ = ws.send(WsMessage::text(ack)).await;
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            ws.send(WsMessage::text(ack)),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            _ => break,
+                        }
                     }
                     match v["type"].as_str().unwrap_or_default() {
                         "hello" => {
                             backoff_secs = 1; // healthy session → reset backoff
-                            let _ = tx.send(SlackEvent::Connected).await;
+                            let _ = tx.try_send(SlackEvent::Connected);
                         }
                         // Slack wants a refreshed connection — reconnect immediately.
                         "disconnect" => break,
                         "events_api" => {
                             let event_id = v["payload"]["event_id"].as_str().unwrap_or_default();
-                            if seen.check(event_id) {
-                                continue; // at-least-once retry — already handled
-                            }
                             if let Some(ev) = parse_event(&v["payload"], &bot_user_id) {
-                                let _ = tx.send(ev).await;
+                                let envelope = v["envelope_id"].as_str().unwrap_or_default();
+                                let key = if event_id.is_empty() {
+                                    format!("event-envelope:{envelope}")
+                                } else {
+                                    format!("event:{event_id}")
+                                };
+                                if !key.ends_with(':') {
+                                    enqueue_once(&tx, &mut seen, &key, ev);
+                                }
                             }
                         }
                         "interactive" => {
-                            let _ = tx.send(SlackEvent::Interaction { payload: v["payload"].clone() }).await;
+                            if let Some(key) = interaction_key(&v) {
+                                enqueue_once(
+                                    &tx,
+                                    &mut seen,
+                                    &key,
+                                    SlackEvent::Interaction {
+                                        payload: v["payload"].clone(),
+                                    },
+                                );
+                            }
                         }
                         _ => {}
                     }
@@ -263,19 +343,20 @@ mod tests {
     #[test]
     fn seen_dedupes_and_bounds() {
         let mut s = Seen::new();
-        assert!(!s.check("a"));
-        assert!(s.check("a"));
-        for i in 0..300 {
-            s.check(&format!("x{i}"));
+        assert!(!s.contains("a"));
+        s.remember("a");
+        assert!(s.contains("a"));
+        for i in 0..(SEEN_CAP + 50) {
+            s.remember(&format!("x{i}"));
         }
-        assert!(s.order.len() <= 256);
-        assert!(!s.check("a")); // evicted → treated as new
+        assert!(s.order.len() <= SEEN_CAP);
+        assert!(!s.contains("a")); // evicted → treated as new
     }
 
     #[test]
     fn parse_filters_bots_and_subtypes() {
         let mk = |extra: Value| {
-            let mut base = json!({ "event": {
+            let mut base = json!({ "team_id": "T1", "event": {
                 "type": "message", "channel": "C1", "user": "U9",
                 "text": "hi", "ts": "1.2"
             }});
@@ -294,16 +375,33 @@ mod tests {
 
     #[test]
     fn parse_carries_thread_ts() {
-        let v = json!({ "event": {
+        let v = json!({ "team_id": "T1", "event": {
             "type": "app_mention", "channel": "C1", "user": "U9",
             "text": "<@UBOT> count users", "ts": "9.9", "thread_ts": "9.1"
         }});
         match parse_event(&v, "UBOT") {
-            Some(SlackEvent::Message { text, thread_ts, .. }) => {
+            Some(SlackEvent::Message {
+                text, thread_ts, ..
+            }) => {
                 assert_eq!(text, "count users");
                 assert_eq!(thread_ts.as_deref(), Some("9.1"));
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn interactions_have_retry_stable_dedupe_keys() {
+        let with_trigger = json!({ "envelope_id": "e1", "payload": { "trigger_id": "t1" } });
+        assert_eq!(
+            interaction_key(&with_trigger).as_deref(),
+            Some("interaction:t1")
+        );
+        let envelope_only = json!({ "envelope_id": "e2", "payload": {} });
+        assert_eq!(
+            interaction_key(&envelope_only).as_deref(),
+            Some("interaction:e2")
+        );
+        assert!(interaction_key(&json!({ "payload": {} })).is_none());
     }
 }

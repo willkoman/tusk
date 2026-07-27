@@ -5,11 +5,15 @@
 //! streaming, server-lint, and import still reach the raw client via `Backend::pg()`
 //! (errors on non-PG drivers) until each is abstracted per driver.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio_postgres::{CancelToken, Client, SimpleQueryMessage};
 
-use crate::db::{self, AppError, ConnectionConfig, FetchResult, QueryOutcome, CURSOR_NAME};
+use crate::db::{
+    self, AppError, ConnectionConfig, FetchResult, QueryOutcome, TransactionHealth,
+    TransactionMode, TransactionState, TransactionStatus,
+};
 use crate::relgraph;
 use crate::script;
 use crate::tree;
@@ -20,13 +24,24 @@ fn de<E: std::fmt::Display>(e: E) -> AppError {
     AppError::new(e.to_string())
 }
 
+/// Reversible text-protocol representation for binary cells. Matches PostgreSQL's
+/// bytea hex output, so all drivers expose one explicit convention.
+fn binary_text(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(2usize.saturating_add(bytes.len().saturating_mul(2)));
+    out.push_str("\\x");
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 /// Shared embedded-driver script runner: joins the SQL items and executes them
-/// inside an explicit BEGIN…COMMIT (best-effort ROLLBACK on error), unless the
-/// script manages its own transaction.
+/// inside an explicit BEGIN…COMMIT (best-effort ROLLBACK on error).
 fn embedded_script<C>(
     conn: &C,
     items: &[script::Item],
-    user_txn: bool,
     exec: impl Fn(&C, &str) -> Result<(), AppError>,
 ) -> Result<String, AppError> {
     // Separators sit on their own line: a statement ending in a `--` comment would
@@ -40,10 +55,6 @@ fn embedded_script<C>(
         })
         .collect::<Vec<_>>()
         .join("\n;\n");
-    if user_txn {
-        exec(conn, &sql)?;
-        return Ok("OK".to_string());
-    }
     match exec(conn, &format!("BEGIN;\n{sql}\n;\nCOMMIT;")) {
         Ok(()) => Ok("OK".to_string()),
         Err(e) => {
@@ -75,6 +86,10 @@ pub struct Capabilities {
     pub relationships: bool,
     /// EXPLAIN ANALYZE exists on this engine (SQLite has no ANALYZE variant).
     pub explain_analyze: bool,
+    pub manual_transactions: bool,
+    pub transaction_savepoints: bool,
+    pub set_transaction: bool,
+    pub autocommit_mode: bool,
 }
 
 impl Capabilities {
@@ -93,6 +108,10 @@ impl Capabilities {
             ddl: true,
             relationships: true,
             explain_analyze: true,
+            manual_transactions: true,
+            transaction_savepoints: true,
+            set_transaction: true,
+            autocommit_mode: false,
         }
     }
     pub fn duckdb() -> Self {
@@ -107,9 +126,13 @@ impl Capabilities {
             tls: false,
             keychain: false,
             permissions: false,
-            ddl: true, // best-effort via duckdb_tables()/duckdb_views()
+            ddl: true,           // best-effort via duckdb_tables()/duckdb_views()
             relationships: true, // best-effort via duckdb_constraints()
             explain_analyze: true,
+            manual_transactions: true,
+            transaction_savepoints: false,
+            set_transaction: false,
+            autocommit_mode: false,
         }
     }
     pub fn sqlite() -> Self {
@@ -124,9 +147,13 @@ impl Capabilities {
             tls: false,
             keychain: false,
             permissions: false,
-            ddl: true, // sqlite_master.sql
-            relationships: true, // pragma_foreign_key_list
+            ddl: true,              // sqlite_master.sql
+            relationships: true,    // pragma_foreign_key_list
             explain_analyze: false, // no EXPLAIN ANALYZE in SQLite
+            manual_transactions: true,
+            transaction_savepoints: true,
+            set_transaction: false,
+            autocommit_mode: false,
         }
     }
     pub fn mysql() -> Self {
@@ -134,16 +161,20 @@ impl Capabilities {
             kind: "mysql",
             server_cursor: false,
             bulk_copy: false,
-            export: true,             // paged export (not snapshot-consistent under writes)
-            schemas: true,            // databases-as-schemas
-            search_path: false,       // MySQL uses `USE db`, not search_path
+            export: true,       // paged export (not snapshot-consistent under writes)
+            schemas: true,      // databases-as-schemas
+            search_path: false, // MySQL uses `USE db`, not search_path
             transactional_ddl: false, // MySQL DDL auto-commits
             tls: true,
             keychain: false,
             permissions: false,
-            ddl: true, // SHOW CREATE TABLE/VIEW
+            ddl: true,           // SHOW CREATE TABLE/VIEW
             relationships: true, // information_schema.KEY_COLUMN_USAGE
             explain_analyze: true,
+            manual_transactions: true,
+            transaction_savepoints: true,
+            set_transaction: true,
+            autocommit_mode: true,
         }
     }
 }
@@ -194,7 +225,8 @@ impl CancelHandle {
 pub struct PgConn {
     pub client: Client,
     pub config: ConnectionConfig,
-    pub cursor_open: bool,
+    cursor_name: Option<String>,
+    cursor_auto_transaction: bool,
 }
 
 /// A live embedded DuckDB connection. Paging is by LIMIT/OFFSET over the stored base
@@ -219,7 +251,12 @@ pub struct DuckConn {
     /// real connection (`parse_check`). Lazily opened, replaced after it absorbs a
     /// parse error, released alongside the main connection when idle.
     gate: Mutex<Option<duckdb::Connection>>,
+    /// Each parser poison must be leaked because DuckDB aborts while dropping it.
+    /// Bound repeated bad-input leaks; restart resets the budget.
+    gate_poison_leaks: AtomicUsize,
 }
+
+const MAX_DUCK_GATE_POISON_LEAKS: usize = 16;
 
 /// Deref'able lock guard so every existing `d.lock()` call site is unchanged: it borrows
 /// the live `Connection` out of the `Option`. The connection is guaranteed present at any
@@ -243,7 +280,10 @@ impl DuckConn {
 
     /// Whether the connection is currently open (a file lock is held).
     fn is_open(&self) -> bool {
-        self.conn.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        self.conn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     /// Open the connection if it was released while idle (no-op if already open).
@@ -258,11 +298,13 @@ impl DuckConn {
     /// Release the connection (drop it → free the file lock) when it isn't needed:
     /// only a file-backed DB, and only when no result stream is mid-flight (an open
     /// stream keeps it for fast paging + a valid cancel handle).
-    fn release_idle(&self) {
-        if !self.keep_open && self.stream_sql.is_none() {
+    fn release_idle(&self, manual_session: bool) {
+        if !manual_session && !self.keep_open && self.stream_sql.is_none() {
             let taken = self.conn.lock().unwrap_or_else(|e| e.into_inner()).take();
             if let Some(c) = taken {
-                forget_if_poisoned(c);
+                if forget_if_poisoned(c) {
+                    self.gate_poison_leaks.fetch_add(1, Ordering::Relaxed);
+                }
             }
             *self.gate.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
@@ -275,12 +317,16 @@ impl DuckConn {
     /// user-facing consequence when a quarantine happened.
     fn quarantine_poisoned(&self) -> Option<&'static str> {
         let mut g = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let poisoned = g.as_ref().is_some_and(|c| c.prepare("SELECT 1").is_err());
+        let poisoned = g.as_ref().is_some_and(|c| {
+            c.prepare("SELECT 1")
+                .is_err_and(|error| duck_error_is_poison(&error))
+        });
         if !poisoned {
             return None;
         }
         if let Some(c) = g.take() {
             std::mem::forget(c);
+            self.gate_poison_leaks.fetch_add(1, Ordering::Relaxed);
         }
         Some(if self.keep_open {
             "the in-memory database was discarded (its data is lost) — the next query starts fresh"
@@ -300,6 +346,22 @@ impl DuckConn {
             )),
             None => err,
         }
+    }
+
+    fn manual_transaction_aborted(&self) -> bool {
+        self.conn
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_some_and(|conn| {
+                conn.prepare("SELECT 1").is_err_and(|error| {
+                    !duck_error_is_poison(&error)
+                        && error
+                            .to_string()
+                            .to_ascii_lowercase()
+                            .contains("current transaction is aborted")
+                })
+            })
     }
 
     /// Parse-check ONE statement before it touches the real connection.
@@ -325,15 +387,17 @@ impl DuckConn {
     ///   errors don't poison, the probe succeeds and the error surfaces from the
     ///   real connection — same behavior, no leak.
     fn parse_check(&self, sql: &str) -> Result<(), AppError> {
+        if self.gate_poison_leaks.load(Ordering::Relaxed) >= MAX_DUCK_GATE_POISON_LEAKS {
+            return Err(AppError::new(
+                "DuckDB parser safety budget exhausted after repeated parser failures — restart Tusk before running more SQL",
+            ));
+        }
         let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
         let conn = match g.take() {
             Some(c) => c,
             None => duckdb::Connection::open_in_memory().map_err(de)?,
         };
-        let err = match conn.prepare(sql) {
-            Ok(_stmt) => None,
-            Err(e) => Some(e),
-        };
+        let err = conn.prepare(sql).err();
         match err {
             None => {
                 *g = Some(conn);
@@ -342,6 +406,7 @@ impl DuckConn {
             Some(e) => {
                 let poisoned = conn.prepare("SELECT 1").is_err();
                 if poisoned {
+                    self.gate_poison_leaks.fetch_add(1, Ordering::Relaxed);
                     std::mem::forget(conn);
                     Err(de(e))
                 } else {
@@ -356,10 +421,26 @@ impl DuckConn {
 /// Drop a DuckDB connection only if it is still healthy; a poisoned one (see
 /// `parse_check`) is leaked instead — its destructor throws a foreign exception
 /// that aborts the whole process.
-fn forget_if_poisoned(conn: duckdb::Connection) {
-    if conn.prepare("SELECT 1").is_err() {
+fn forget_if_poisoned(conn: duckdb::Connection) -> bool {
+    if conn
+        .prepare("SELECT 1")
+        .is_err_and(|error| duck_error_is_poison(&error))
+    {
         std::mem::forget(conn);
+        true
+    } else {
+        false
     }
+}
+
+fn duck_error_is_poison(error: &duckdb::Error) -> bool {
+    // A normal statement error aborts a DuckDB manual transaction. Until ROLLBACK,
+    // every probe reports this state; it is recoverable and must not be confused with
+    // the libduckdb parser/interrupt poison that requires leaking the handle.
+    !error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("current transaction is aborted")
 }
 
 impl Drop for DuckConn {
@@ -367,7 +448,7 @@ impl Drop for DuckConn {
         for m in [&self.conn, &self.gate] {
             let taken = m.lock().unwrap_or_else(|e| e.into_inner()).take();
             if let Some(c) = taken {
-                forget_if_poisoned(c);
+                let _ = forget_if_poisoned(c);
             }
         }
     }
@@ -407,7 +488,8 @@ pub async fn connect(config: &ConnectionConfig) -> Result<(Backend, String), App
                 Backend::Pg(PgConn {
                     client,
                     config: config.clone(),
-                    cursor_open: false,
+                    cursor_name: None,
+                    cursor_auto_transaction: false,
                 }),
                 version,
             ))
@@ -444,7 +526,23 @@ impl Backend {
             // DuckDB reports "closed" once it's been released while idle, so `ensure_alive`
             // re-opens it (and its file lock) lazily on the next command.
             Backend::Duck(d) => !d.is_open(),
-            _ => false, // SQLite/MySQL — embedded/pooled, never "drops"
+            Backend::MySql(m) => m.manual_lost,
+            Backend::Sqlite(_) => false,
+        }
+    }
+
+    /// True when a tracked manual session no longer has a physical transaction to own.
+    /// Callers must only use this while `TransactionStatus::owns_session()` is true.
+    pub fn manual_session_ended(&self) -> bool {
+        match self {
+            Backend::Pg(pg) => pg.client.is_closed(),
+            Backend::Duck(duck) => duck
+                .conn
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_none(),
+            Backend::Sqlite(sqlite) => sqlite.lock().is_autocommit(),
+            Backend::MySql(mysql) => mysql.manual_lost,
         }
     }
 
@@ -452,18 +550,31 @@ impl Backend {
     /// open so it doesn't hold a file lock while idle. Currently only file-backed DuckDB
     /// (SQLite takes no exclusive idle lock; PG/MySQL are network). Re-opened by
     /// `ensure_alive` on the next command.
-    pub fn release_idle(&self) {
+    pub fn release_idle(&self, manual_session: bool) {
         if let Backend::Duck(d) = self {
-            d.release_idle();
+            d.release_idle(manual_session);
         }
     }
 
     pub fn cursor_open(&self) -> bool {
         match self {
-            Backend::Pg(p) => p.cursor_open,
+            Backend::Pg(p) => p.cursor_name.is_some(),
             Backend::Duck(d) => d.stream_sql.is_some(),
             Backend::Sqlite(s) => s.stream_sql.is_some(),
             Backend::MySql(m) => m.stream_sql.is_some(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn mysql_manual_session_pinned(&self) -> bool {
+        matches!(self, Backend::MySql(mysql) if mysql.pinned.is_some())
+    }
+
+    pub fn manual_errors_require_recovery(&self) -> bool {
+        match self {
+            Backend::Pg(_) => true,
+            Backend::Duck(duck) => duck.manual_transaction_aborted(),
+            _ => false,
         }
     }
 
@@ -492,7 +603,8 @@ impl Backend {
             Backend::Pg(p) => {
                 let (client, _version) = db::open(&p.config).await?;
                 p.client = client;
-                p.cursor_open = false;
+                p.cursor_name = None;
+                p.cursor_auto_transaction = false;
                 Ok(())
             }
             // Re-open only the released connection; keep the pager/stream state intact
@@ -532,14 +644,18 @@ impl Backend {
         }
     }
 
-    /// Roll back + drop any open streaming cursor/transaction (no-op if none open).
+    /// Roll back + drop any open streaming cursor/transaction. PostgreSQL issues
+    /// ROLLBACK only when cursor state is tracked — an idle autocommit session has
+    /// nothing to roll back, and doing it anyway costs a round trip plus a server
+    /// `WARNING: there is no transaction in progress` on every metadata command.
     pub async fn rollback_cursor(&mut self) {
         match self {
             Backend::Pg(p) => {
-                if p.cursor_open {
+                if p.cursor_name.is_some() || p.cursor_auto_transaction {
                     let _ = p.client.batch_execute("ROLLBACK").await;
-                    p.cursor_open = false;
                 }
+                p.cursor_name = None;
+                p.cursor_auto_transaction = false;
             }
             Backend::Duck(d) => {
                 d.stream_sql = None;
@@ -556,20 +672,117 @@ impl Backend {
         }
     }
 
+    /// Close an existing result stream without ending a user-owned transaction.
+    pub async fn close_stream(&mut self, manual_transaction: bool) -> Result<(), AppError> {
+        match self {
+            Backend::Pg(p) if p.cursor_name.is_some() && manual_transaction => {
+                let name = p.cursor_name.take().expect("checked above");
+                p.cursor_auto_transaction = false;
+                p.client
+                    .batch_execute(&format!("CLOSE {}", db::ident(&name)))
+                    .await
+                    .map_err(Into::into)
+            }
+            Backend::Pg(p) if p.cursor_name.is_some() => {
+                let result = p.client.batch_execute("ROLLBACK").await;
+                p.cursor_name = None;
+                p.cursor_auto_transaction = false;
+                result.map_err(Into::into)
+            }
+            Backend::Pg(_) => Ok(()),
+            Backend::Duck(d) => {
+                d.stream_sql = None;
+                d.offset = 0;
+                Ok(())
+            }
+            Backend::Sqlite(s) => {
+                s.stream_sql = None;
+                s.offset = 0;
+                Ok(())
+            }
+            Backend::MySql(m) => {
+                m.stream_sql = None;
+                m.offset = 0;
+                Ok(())
+            }
+        }
+    }
+
+    /// Best-effort disconnect cleanup on the same physical session.
+    pub async fn rollback_manual(&mut self) {
+        self.rollback_cursor().await;
+        match self {
+            Backend::Pg(p) => {
+                // A manual transaction owns the session without tracked cursor state,
+                // and `rollback_cursor` only rolls back when a cursor is tracked —
+                // end the unit explicitly (a redundant ROLLBACK is just a warning).
+                let _ = p.client.batch_execute("ROLLBACK").await;
+            }
+            Backend::Duck(d) => {
+                if d.is_open() {
+                    let result = d.lock().execute_batch("ROLLBACK").map_err(de);
+                    if result.is_err() {
+                        let _ = d.quarantine_poisoned();
+                    }
+                }
+            }
+            Backend::Sqlite(s) => {
+                let _ = s.lock().execute_batch("ROLLBACK");
+            }
+            Backend::MySql(m) => m.rollback_pinned().await,
+        }
+    }
+
     /// Run a multi-statement script — ONE transaction on every driver (PG via
     /// script::run; DuckDB/SQLite via an explicit BEGIN…COMMIT batch wrap;
     /// MySQL via START TRANSACTION around the loop, though MySQL DDL still
-    /// auto-commits). Scripts that manage their own transaction (a BEGIN/
-    /// COMMIT/SAVEPOINT statement anywhere) are run unwrapped — nesting would
-    /// error on SQLite and silently misbehave elsewhere.
+    /// auto-commits). This idle-only app wrapper rejects transaction control;
+    /// `exec_items` routes manual lifecycle scripts statement-by-statement instead.
     pub async fn run_script(
         &self,
         items: &[script::Item],
         read_only: bool,
     ) -> Result<String, AppError> {
-        let user_txn = script::has_txn_control(items);
+        if script::has_txn_control(items) {
+            return Err(AppError::new(
+                "transaction-control statements are not supported; run the statements as one script without BEGIN/COMMIT",
+            ));
+        }
+        if !matches!(self, Backend::Pg(_))
+            && items
+                .iter()
+                .any(|item| matches!(item, script::Item::Copy { .. }))
+        {
+            return Err(AppError::new(
+                "COPY FROM stdin is only supported by PostgreSQL",
+            ));
+        }
+        if matches!(self, Backend::MySql(_))
+            && items.iter().any(|item| {
+                let sql = match item {
+                    script::Item::Sql(sql) => sql,
+                    script::Item::Copy { stmt, .. } => stmt,
+                };
+                script::contains_mysql_executable_comment(sql)
+            })
+        {
+            return Err(AppError::new(
+                "MySQL/MariaDB executable comments are blocked because they can hide transaction control",
+            ));
+        }
+        let enforce_read_only = read_only || self.config().read_only;
+        if enforce_read_only
+            && items.iter().any(|item| match item {
+                script::Item::Sql(sql) => !crate::is_read_only_stmt(sql),
+                script::Item::Copy { .. } => true,
+            })
+        {
+            return Err(AppError::new(
+                "connection is read-only — script contains writes or side effects",
+            ));
+        }
         match self {
-            Backend::Pg(p) => script::run(&p.client, items, read_only).await,
+            Backend::Pg(p) => script::run(&p.client, items, enforce_read_only).await,
             Backend::Duck(d) => {
                 // Parse-gate every statement before any of them executes (duckdb-rs
                 // #209 — a parse error mid-batch would poison the connection).
@@ -581,28 +794,109 @@ impl Backend {
                 // Two statements on purpose: the `d.lock()` temporary lives to the
                 // end of the full expression, and quarantine_if_poisoned re-locks —
                 // chaining map_err onto the same expression would self-deadlock.
-                let r = embedded_script(&d.lock(), items, user_txn, |c, s| c.execute_batch(s).map_err(de));
+                let r = embedded_script(&d.lock(), items, |c, s| c.execute_batch(s).map_err(de));
                 r.map_err(|e| d.quarantine_if_poisoned(e))
             }
-            Backend::Sqlite(s) => embedded_script(&s.lock(), items, user_txn, |c, s| c.execute_batch(s).map_err(de)),
-            Backend::MySql(m) => m.run_script(items, user_txn).await,
+            Backend::Sqlite(s) => {
+                embedded_script(&s.lock(), items, |c, s| c.execute_batch(s).map_err(de))
+            }
+            Backend::MySql(m) => m.run_script(items).await,
         }
     }
 
-    /// Run a single statement: stream a cursorable read, else execute + report.
+    /// Run a single idle statement: stream a cursorable read, else execute + report.
     pub async fn run_single(
         &mut self,
         trimmed: &str,
         page: u32,
         cursorable: bool,
     ) -> Result<QueryOutcome, AppError> {
+        if script::effective_start(trimmed).starts_with('\\') {
+            return Err(AppError::new("psql meta-commands are not supported"));
+        }
+        if self.config().read_only && !crate::is_read_only_stmt(trimmed) {
+            return Err(AppError::new(
+                "connection is read-only — writes and side effects are blocked",
+            ));
+        }
         match self {
-            Backend::Pg(p) => p.run_single(trimmed, page, cursorable).await,
+            Backend::Pg(p) => p.run_single(trimmed, page, cursorable, false).await,
             Backend::Duck(d) => d
                 .run_single(trimmed, page, cursorable)
                 .map_err(|e| d.quarantine_if_poisoned(e)),
             Backend::Sqlite(s) => s.run_single(trimmed, page, cursorable),
             Backend::MySql(m) => m.run_single(trimmed, page, cursorable).await,
+        }
+    }
+
+    /// Run SQL on the physical session owned by a manual transaction. PostgreSQL
+    /// cursors do not add a nested BEGIN; MySQL uses its pinned connection.
+    pub async fn run_manual_single(
+        &mut self,
+        trimmed: &str,
+        page: u32,
+        cursorable: bool,
+        mode: TransactionMode,
+    ) -> Result<QueryOutcome, AppError> {
+        // Same driver-level guards as `run_single`: the command layer already
+        // enforces these, but the manual-transaction path must not be the one
+        // route with a single enforcement layer.
+        if script::effective_start(trimmed).starts_with('\\') {
+            return Err(AppError::new("psql meta-commands are not supported"));
+        }
+        if self.config().read_only && !crate::is_read_only_stmt(trimmed) {
+            return Err(AppError::new(
+                "connection is read-only — writes and side effects are blocked",
+            ));
+        }
+        match self {
+            Backend::Pg(p) => p.run_single(trimmed, page, cursorable, true).await,
+            Backend::Duck(d) => d
+                .run_single(trimmed, page, cursorable)
+                .map_err(|e| d.quarantine_if_poisoned(e)),
+            Backend::Sqlite(s) => s.run_single(trimmed, page, cursorable),
+            Backend::MySql(m) => m.run_manual_single(trimmed, page, cursorable, mode).await,
+        }
+    }
+
+    pub async fn run_transaction_statement(
+        &mut self,
+        sql: &str,
+        action: script::TransactionAction,
+        current_mode: TransactionMode,
+    ) -> Result<QueryOutcome, AppError> {
+        match self {
+            Backend::Pg(p) => p.run_single(sql, 1, false, true).await,
+            Backend::Duck(d) => {
+                d.parse_check(sql)?;
+                let result = d.lock().execute_batch(sql).map_err(de);
+                result
+                    .map(|()| QueryOutcome::Exec {
+                        message: "OK".to_string(),
+                    })
+                    .map_err(|e| d.quarantine_if_poisoned(e))
+            }
+            Backend::Sqlite(s) => {
+                s.lock().execute_batch(sql).map_err(de)?;
+                Ok(QueryOutcome::Exec {
+                    message: "OK".to_string(),
+                })
+            }
+            Backend::MySql(m) => m.run_transaction_statement(sql, action, current_mode).await,
+        }
+    }
+
+    pub async fn run_manual_copy(&mut self, stmt: &str, data: &str) -> Result<u64, AppError> {
+        if self.config().read_only {
+            return Err(AppError::new(
+                "connection is read-only — COPY FROM stdin is blocked",
+            ));
+        }
+        match self {
+            Backend::Pg(p) => script::copy_in_text(&p.client, stmt, data).await,
+            _ => Err(AppError::new(
+                "COPY FROM stdin is only supported by PostgreSQL",
+            )),
         }
     }
 
@@ -675,7 +969,9 @@ impl Backend {
                         };
                         rows.iter()
                             .enumerate()
-                            .filter(|(_, r)| r.get(ty).and_then(|v| v.as_deref()) == Some("BOOLEAN"))
+                            .filter(|(_, r)| {
+                                r.get(ty).and_then(|v| v.as_deref()) == Some("BOOLEAN")
+                            })
                             .map(|(i, _)| i)
                             .collect()
                     }
@@ -694,7 +990,10 @@ impl Backend {
                         .enumerate()
                         .filter(|(_, c)| {
                             c.decl_type()
-                                .map(|t| t.trim().eq_ignore_ascii_case("bool") || t.trim().eq_ignore_ascii_case("boolean"))
+                                .map(|t| {
+                                    t.trim().eq_ignore_ascii_case("bool")
+                                        || t.trim().eq_ignore_ascii_case("boolean")
+                                })
                                 .unwrap_or(false)
                         })
                         .map(|(i, _)| i)
@@ -708,22 +1007,30 @@ impl Backend {
     }
 
     /// Run an internal text-returning query (introspection): columns + text rows.
-    async fn query_text(
+    async fn query_text_limited(
         &self,
         sql: &str,
+        limits: db::TextLimits,
     ) -> Result<(Vec<String>, Vec<Vec<Option<String>>>), AppError> {
         match self {
             Backend::Pg(p) => {
                 let m = p.client.simple_query(sql).await?;
-                Ok(db::collect_rows(&m))
+                db::collect_rows_limited(&m, limits)
             }
-            Backend::Duck(d) => duck_query(&d.lock(), sql),
-            Backend::Sqlite(s) => sqlite_query(&s.lock(), sql),
+            Backend::Duck(d) => duck_query_limited(&d.lock(), sql, limits),
+            Backend::Sqlite(s) => sqlite_query_limited(&s.lock(), sql, limits),
             Backend::MySql(m) => {
-                let (c, r, _a) = mysql_run(&m.pool, sql).await?;
+                let (c, r, _a) = mysql_run_limited(&m.pool, sql, limits).await?;
                 Ok((c, r))
             }
         }
+    }
+
+    async fn query_text(
+        &self,
+        sql: &str,
+    ) -> Result<(Vec<String>, Vec<Vec<Option<String>>>), AppError> {
+        self.query_text_limited(sql, db::CATALOG_TEXT_LIMITS).await
     }
 
     /// Shallow object tree (sidebar). PG = rich pg_catalog; embedded = catalog views.
@@ -812,14 +1119,30 @@ impl Backend {
                 Ok(relgraph::sqlite_table_relationships(&q, name))
             }
             Backend::MySql(m) => {
-                let (_c, rows, _a) = mysql_run(&m.pool, &relgraph::mysql_relationship_queries(schema, name)).await?;
+                let sql = "SELECT kcu.CONSTRAINT_NAME, kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.COLUMN_NAME, \
+                           kcu.REFERENCED_TABLE_SCHEMA, kcu.REFERENCED_TABLE_NAME, kcu.REFERENCED_COLUMN_NAME \
+                           FROM information_schema.KEY_COLUMN_USAGE kcu \
+                           WHERE kcu.REFERENCED_TABLE_NAME IS NOT NULL \
+                           AND ((kcu.TABLE_SCHEMA = ? AND kcu.TABLE_NAME = ?) \
+                             OR (kcu.REFERENCED_TABLE_SCHEMA = ? AND kcu.REFERENCED_TABLE_NAME = ?)) \
+                           ORDER BY kcu.CONSTRAINT_NAME, kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.ORDINAL_POSITION";
+                let params = mysql_async::Params::Positional(vec![
+                    schema.into(),
+                    name.into(),
+                    schema.into(),
+                    name.into(),
+                ]);
+                let (_c, rows, _a) = mysql_run_params(&m.pool, sql, params).await?;
                 Ok(relgraph::mysql_split(&rows, schema, name))
             }
         }
     }
 
     /// All FK edges + table/column summaries of a schema, for the ERD view.
-    pub async fn schema_relationships(&self, schema: &str) -> Result<relgraph::SchemaGraph, AppError> {
+    pub async fn schema_relationships(
+        &self,
+        schema: &str,
+    ) -> Result<relgraph::SchemaGraph, AppError> {
         match self {
             Backend::Pg(p) => relgraph::pg_schema_relationships(&p.client, schema).await,
             Backend::Duck(d) => {
@@ -859,7 +1182,11 @@ impl Backend {
                 for r in &col_rows {
                     let t = dcell(r, 0);
                     if tables.last().map(|x| x.name != t).unwrap_or(true) {
-                        tables.push(relgraph::ErdTable { schema: schema.to_string(), name: t.clone(), columns: Vec::new() });
+                        tables.push(relgraph::ErdTable {
+                            schema: schema.to_string(),
+                            name: t.clone(),
+                            columns: Vec::new(),
+                        });
                     }
                     let cname = dcell(r, 1);
                     if let Some(table) = tables.last_mut() {
@@ -879,8 +1206,20 @@ impl Backend {
                 Ok(relgraph::sqlite_schema_relationships(&q))
             }
             Backend::MySql(m) => {
-                let (_c, edge_rows, _a) = mysql_run(&m.pool, &relgraph::mysql_schema_edges_query(schema)).await?;
-                let (_c2, col_rows, _a2) = mysql_run(&m.pool, &relgraph::mysql_columns_query(schema)).await?;
+                let edge_sql = "SELECT kcu.CONSTRAINT_NAME, kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.COLUMN_NAME, \
+                                kcu.REFERENCED_TABLE_SCHEMA, kcu.REFERENCED_TABLE_NAME, kcu.REFERENCED_COLUMN_NAME \
+                                FROM information_schema.KEY_COLUMN_USAGE kcu \
+                                WHERE kcu.REFERENCED_TABLE_NAME IS NOT NULL \
+                                AND (kcu.TABLE_SCHEMA = ? OR kcu.REFERENCED_TABLE_SCHEMA = ?) \
+                                ORDER BY kcu.CONSTRAINT_NAME, kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.ORDINAL_POSITION";
+                let edge_params =
+                    mysql_async::Params::Positional(vec![schema.into(), schema.into()]);
+                let (_c, edge_rows, _a) = mysql_run_params(&m.pool, edge_sql, edge_params).await?;
+                let col_sql = "SELECT table_name, column_name, data_type, column_key \
+                               FROM information_schema.columns WHERE table_schema = ? \
+                               ORDER BY table_name, ordinal_position";
+                let col_params = mysql_async::Params::Positional(vec![schema.into()]);
+                let (_c2, col_rows, _a2) = mysql_run_params(&m.pool, col_sql, col_params).await?;
                 Ok(relgraph::mysql_schema_graph(&col_rows, &edge_rows, schema))
             }
         }
@@ -889,26 +1228,39 @@ impl Backend {
     /// Reconstructed CREATE DDL for one relation, per engine: PG pg_catalog
     /// (full reconstruction in ddl.rs), SQLite sqlite_master (+ index DDL),
     /// MySQL SHOW CREATE, DuckDB duckdb_tables()/duckdb_views() best-effort.
-    pub async fn relation_ddl(&self, kind: &str, schema: &str, name: &str) -> Result<String, AppError> {
+    pub async fn relation_ddl(
+        &self,
+        kind: &str,
+        schema: &str,
+        name: &str,
+    ) -> Result<String, AppError> {
         match self {
             Backend::Pg(p) => crate::ddl::object_ddl(&p.client, kind, schema, name).await,
             Backend::Sqlite(s) => {
                 let conn = s.lock();
                 let lit = |x: &str| format!("'{}'", x.replace('\'', "''"));
-                let (_c, rows) = sqlite_query(
+                let (_c, rows) = sqlite_query_limited(
                     &conn,
-                    &format!("SELECT sql FROM sqlite_master WHERE name = {} AND sql IS NOT NULL", lit(name)),
+                    &format!(
+                        "SELECT sql FROM sqlite_master WHERE name = {} AND sql IS NOT NULL",
+                        lit(name)
+                    ),
+                    db::DDL_TEXT_LIMITS,
                 )?;
-                let mut parts: Vec<String> = rows.iter().filter_map(|r| r.first().cloned().flatten()).collect();
+                let mut parts: Vec<String> = rows
+                    .iter()
+                    .filter_map(|r| r.first().cloned().flatten())
+                    .collect();
                 if parts.is_empty() {
                     return Err(AppError::new("no stored DDL for this object"));
                 }
-                let (_c2, idx) = sqlite_query(
+                let (_c2, idx) = sqlite_query_limited(
                     &conn,
                     &format!(
                         "SELECT sql FROM sqlite_master WHERE tbl_name = {} AND type = 'index' AND sql IS NOT NULL ORDER BY name",
                         lit(name)
                     ),
+                    db::DDL_TEXT_LIMITS,
                 )?;
                 parts.extend(idx.iter().filter_map(|r| r.first().cloned().flatten()));
                 Ok(parts.join(";\n\n") + ";\n")
@@ -921,7 +1273,7 @@ impl Backend {
                     schema.replace('`', "``"),
                     name.replace('`', "``")
                 );
-                let (_c, rows, _a) = mysql_run(&m.pool, &q).await?;
+                let (_c, rows, _a) = mysql_run_limited(&m.pool, &q, db::DDL_TEXT_LIMITS).await?;
                 rows.first()
                     .and_then(|r| r.get(1).cloned().flatten())
                     .map(|s| s + ";\n")
@@ -929,20 +1281,35 @@ impl Backend {
             }
             Backend::Duck(d) => {
                 let conn = d.lock();
-                let src = if kind == "view" { "duckdb_views()" } else { "duckdb_tables()" };
+                let src = if kind == "view" {
+                    "duckdb_views()"
+                } else {
+                    "duckdb_tables()"
+                };
                 let q = format!(
                     "SELECT sql FROM {src} WHERE schema_name = {} AND {} = {}",
                     dlit(schema),
-                    if kind == "view" { "view_name" } else { "table_name" },
+                    if kind == "view" {
+                        "view_name"
+                    } else {
+                        "table_name"
+                    },
                     dlit(name)
                 );
-                let (_c, rows) = duck_query(&conn, &q).map_err(|_| {
-                    AppError::new("DDL reconstruction isn't supported on this DuckDB build")
-                })?;
+                let (_c, rows) =
+                    duck_query_limited(&conn, &q, db::DDL_TEXT_LIMITS).map_err(|_| {
+                        AppError::new("DDL reconstruction isn't supported on this DuckDB build")
+                    })?;
                 rows.first()
                     .and_then(|r| r.first().cloned().flatten())
                     .filter(|s| !s.trim().is_empty())
-                    .map(|s| if s.trim_end().ends_with(';') { s + "\n" } else { s + ";\n" })
+                    .map(|s| {
+                        if s.trim_end().ends_with(';') {
+                            s + "\n"
+                        } else {
+                            s + ";\n"
+                        }
+                    })
                     .ok_or_else(|| AppError::new("no stored DDL for this object"))
             }
         }
@@ -960,18 +1327,31 @@ impl Backend {
                     .client
                     .simple_query("SELECT DISTINCT proname FROM pg_proc")
                     .await?;
-                let (_c, rows) = db::collect_rows(&msgs);
-                Ok(rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect())
+                let (_c, rows) = db::collect_rows(&msgs)?;
+                Ok(rows
+                    .into_iter()
+                    .filter_map(|r| r.into_iter().next().flatten())
+                    .collect())
             }
             Backend::Duck(d) => {
                 let conn = d.lock();
-                let (_c, rows) = duck_query(&conn, "SELECT DISTINCT function_name FROM duckdb_functions()")?;
-                Ok(rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect())
+                let (_c, rows) = duck_query(
+                    &conn,
+                    "SELECT DISTINCT function_name FROM duckdb_functions()",
+                )?;
+                Ok(rows
+                    .into_iter()
+                    .filter_map(|r| r.into_iter().next().flatten())
+                    .collect())
             }
             Backend::Sqlite(s) => {
                 let conn = s.lock();
-                let (_c, rows) = sqlite_query(&conn, "SELECT DISTINCT name FROM pragma_function_list")?;
-                Ok(rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect())
+                let (_c, rows) =
+                    sqlite_query(&conn, "SELECT DISTINCT name FROM pragma_function_list")?;
+                Ok(rows
+                    .into_iter()
+                    .filter_map(|r| r.into_iter().next().flatten())
+                    .collect())
             }
             // MySQL has no catalog of BUILTIN functions (information_schema.routines
             // is user routines only) — a partial list would false-positive on every
@@ -1021,7 +1401,11 @@ impl Backend {
         table: &str,
         limit: u32,
     ) -> Result<(Vec<String>, Vec<Vec<Option<String>>>), AppError> {
-        self.query_text(&sample_sql(self, schema, table, limit.clamp(1, 50))).await
+        self.query_text_limited(
+            &sample_sql(self, schema, table, limit.clamp(1, 50)),
+            db::USER_TEXT_LIMITS,
+        )
+        .await
     }
 }
 
@@ -1036,46 +1420,101 @@ fn sample_sql(b: &Backend, schema: &str, table: &str, limit: u32) -> String {
             format!("\"{}\"", s.replace('"', "\"\""))
         }
     };
-    let rel = if schema.is_empty() { q(table) } else { format!("{}.{}", q(schema), q(table)) };
+    let rel = if schema.is_empty() {
+        q(table)
+    } else {
+        format!("{}.{}", q(schema), q(table))
+    };
     format!("SELECT * FROM {rel} LIMIT {limit}")
 }
 
 impl PgConn {
+    fn next_cursor_name() -> String {
+        static NEXT_CURSOR: AtomicUsize = AtomicUsize::new(1);
+        let serial = NEXT_CURSOR.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("tusk_{}_{}_{}", std::process::id(), nanos, serial)
+    }
+
+    async fn finish_cursor(&mut self) -> Result<(), AppError> {
+        let Some(name) = self.cursor_name.take() else {
+            return Ok(());
+        };
+        let auto_transaction = self.cursor_auto_transaction;
+        self.cursor_auto_transaction = false;
+        if let Err(e) = self
+            .client
+            .batch_execute(&format!("CLOSE {}", db::ident(&name)))
+            .await
+        {
+            if auto_transaction {
+                let _ = self.client.batch_execute("ROLLBACK").await;
+            }
+            return Err(e.into());
+        }
+        if !auto_transaction {
+            return Ok(());
+        }
+        if let Err(e) = self.client.batch_execute("COMMIT").await {
+            let _ = self.client.batch_execute("ROLLBACK").await;
+            return Err(AppError::new(format!(
+                "commit acknowledgement failed; query outcome is unknown — verify database state before retrying ({e})"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn fail_cursor(&mut self) {
+        let auto_transaction = self.cursor_auto_transaction;
+        self.cursor_name = None;
+        self.cursor_auto_transaction = false;
+        if auto_transaction {
+            let _ = self.client.batch_execute("ROLLBACK").await;
+        }
+    }
+
     async fn run_single(
         &mut self,
         trimmed: &str,
         page: u32,
         cursorable: bool,
+        manual_transaction: bool,
     ) -> Result<QueryOutcome, AppError> {
         if cursorable {
-            self.client.batch_execute("BEGIN").await?;
-            let declare = format!("DECLARE {CURSOR_NAME} CURSOR FOR {trimmed}");
+            if !manual_transaction {
+                self.client.batch_execute("BEGIN").await?;
+            }
+            let cursor_name = Self::next_cursor_name();
+            let declare = format!("DECLARE {} CURSOR FOR {trimmed}", db::ident(&cursor_name));
             if let Err(e) = self.client.batch_execute(&declare).await {
-                let _ = self.client.batch_execute("ROLLBACK").await;
+                if !manual_transaction {
+                    let _ = self.client.batch_execute("ROLLBACK").await;
+                }
                 return Err(e.into());
             }
-            let fetch = format!("FETCH FORWARD {page} FROM {CURSOR_NAME}");
-            // On a failed/cancelled FETCH the BEGIN transaction is left aborted — roll it
-            // back so the next query on this (still-alive) session isn't poisoned.
+            self.cursor_name = Some(cursor_name.clone());
+            self.cursor_auto_transaction = !manual_transaction;
+            let fetch = format!("FETCH FORWARD {page} FROM {}", db::ident(&cursor_name));
             let messages = match self.client.simple_query(&fetch).await {
                 Ok(m) => m,
                 Err(e) => {
-                    let _ = self.client.batch_execute("ROLLBACK").await;
-                    self.cursor_open = false;
+                    self.fail_cursor().await;
                     return Err(e.into());
                 }
             };
-            let (columns, rows) = db::collect_rows(&messages);
+            let (columns, rows) = match db::collect_rows_limited(&messages, db::USER_TEXT_LIMITS) {
+                Ok(result) => result,
+                Err(error) => {
+                    self.fail_cursor().await;
+                    return Err(error);
+                }
+            };
             let done = (rows.len() as u32) < page;
             if done {
-                let _ = self
-                    .client
-                    .batch_execute(&format!("CLOSE {CURSOR_NAME}"))
-                    .await;
-                let _ = self.client.batch_execute("COMMIT").await;
-                self.cursor_open = false;
-            } else {
-                self.cursor_open = true;
+                self.finish_cursor().await?;
             }
             Ok(QueryOutcome::Rows {
                 columns,
@@ -1085,7 +1524,7 @@ impl PgConn {
             })
         } else {
             let messages = self.client.simple_query(trimmed).await?;
-            let (columns, rows) = db::collect_rows(&messages);
+            let (columns, rows) = db::collect_rows_limited(&messages, db::USER_TEXT_LIMITS)?;
             if !columns.is_empty() {
                 Ok(QueryOutcome::Rows {
                     columns,
@@ -1104,24 +1543,41 @@ impl PgConn {
                     .unwrap_or(0);
                 Ok(QueryOutcome::Exec {
                     // "(0 rows affected)" after a successful ALTER reads like failure.
-                    message: if script::is_ddl(trimmed) { "OK".to_string() } else { format!("OK ({affected} rows affected)") },
+                    message: if script::is_ddl(trimmed) {
+                        "OK".to_string()
+                    } else {
+                        format!("OK ({affected} rows affected)")
+                    },
                 })
             }
         }
     }
 
     async fn fetch_page(&mut self, page: u32) -> Result<FetchResult, AppError> {
-        let fetch = format!("FETCH FORWARD {page} FROM {CURSOR_NAME}");
-        let messages = self.client.simple_query(&fetch).await?;
-        let (_cols, rows) = db::collect_rows(&messages);
+        let Some(name) = self.cursor_name.clone() else {
+            return Ok(FetchResult {
+                rows: Vec::new(),
+                done: true,
+            });
+        };
+        let fetch = format!("FETCH FORWARD {page} FROM {}", db::ident(&name));
+        let messages = match self.client.simple_query(&fetch).await {
+            Ok(messages) => messages,
+            Err(e) => {
+                self.fail_cursor().await;
+                return Err(e.into());
+            }
+        };
+        let (_cols, rows) = match db::collect_rows_limited(&messages, db::USER_TEXT_LIMITS) {
+            Ok(result) => result,
+            Err(error) => {
+                self.fail_cursor().await;
+                return Err(error);
+            }
+        };
         let done = (rows.len() as u32) < page;
         if done {
-            let _ = self
-                .client
-                .batch_execute(&format!("CLOSE {CURSOR_NAME}"))
-                .await;
-            let _ = self.client.batch_execute("COMMIT").await;
-            self.cursor_open = false;
+            self.finish_cursor().await?;
         }
         Ok(FetchResult { rows, done })
     }
@@ -1166,13 +1622,15 @@ impl DuckConn {
         // potentially once per command. `INSTALL` is a blocking network download, so on a
         // cold + offline machine an un-memoized fallback would stall every single query on
         // a connect timeout. Once it has failed, don't reach for the network again.
-        static ICU_UNAVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        use std::sync::atomic::Ordering;
+        static ICU_UNAVAILABLE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         if conn.execute("LOAD icu", []).is_err() && !ICU_UNAVAILABLE.load(Ordering::Relaxed) {
             let _ = conn.execute("INSTALL icu", []);
             if let Err(e) = conn.execute("LOAD icu", []) {
                 ICU_UNAVAILABLE.store(true, Ordering::Relaxed);
-                eprintln!("[tusk] DuckDB ICU extension unavailable ({e}); TIMESTAMPTZ casts will fail");
+                eprintln!(
+                    "[tusk] DuckDB ICU extension unavailable ({e}); TIMESTAMPTZ casts will fail"
+                );
             }
         }
         Ok(conn)
@@ -1191,6 +1649,7 @@ impl DuckConn {
                 stream_sql: None,
                 offset: 0,
                 gate: Mutex::new(None),
+                gate_poison_leaks: AtomicUsize::new(0),
             }),
             version,
         ))
@@ -1207,14 +1666,14 @@ impl DuckConn {
         // swallow the wrap's closing paren — a parse error the first gate can't see).
         self.parse_check(trimmed)?;
         if cursorable {
-            // CAST(COLUMNS(*) AS VARCHAR) renders every column as text (matching the
-            // all-text model — handles dates/decimals/etc. cleanly); LIMIT pages it.
-            let wrapped =
-                format!("SELECT CAST(COLUMNS(*) AS VARCHAR) FROM ({trimmed}) AS _tusk LIMIT {page}");
+            // Read native values and render them in `duck_value_repr`. A blanket
+            // VARCHAR cast uses DuckDB's mixed printable/escaped BLOB syntax, which
+            // diverges from the reversible `\x...` convention used by every driver.
+            let wrapped = format!("SELECT * FROM ({trimmed}) AS _tusk LIMIT {page}");
             self.parse_check(&wrapped)?;
             let (columns, rows) = {
                 let g = self.lock();
-                duck_query(&g, &wrapped)?
+                duck_query_limited(&g, &wrapped, db::USER_TEXT_LIMITS)?
             };
             let done = (rows.len() as u32) < page;
             if done {
@@ -1243,7 +1702,7 @@ impl DuckConn {
             }
             let (columns, rows) = {
                 let g = self.lock();
-                duck_query(&g, trimmed)?
+                duck_query_limited(&g, trimmed, db::USER_TEXT_LIMITS)?
             };
             if !columns.is_empty() {
                 Ok(QueryOutcome::Rows {
@@ -1271,12 +1730,12 @@ impl DuckConn {
             }
         };
         let wrapped = format!(
-            "SELECT CAST(COLUMNS(*) AS VARCHAR) FROM ({base}) AS _tusk LIMIT {page} OFFSET {}",
+            "SELECT * FROM ({base}) AS _tusk LIMIT {page} OFFSET {}",
             self.offset
         );
         let (_cols, rows) = {
             let g = self.lock();
-            duck_query(&g, &wrapped)?
+            duck_query_limited(&g, &wrapped, db::USER_TEXT_LIMITS)?
         };
         let done = (rows.len() as u32) < page;
         self.offset += rows.len();
@@ -1327,7 +1786,7 @@ impl SqliteConn {
             let wrapped = format!("SELECT * FROM ({trimmed}) LIMIT {page}");
             let (columns, rows) = {
                 let g = self.lock();
-                sqlite_query(&g, &wrapped)?
+                sqlite_query_limited(&g, &wrapped, db::USER_TEXT_LIMITS)?
             };
             let done = (rows.len() as u32) < page;
             if done {
@@ -1345,7 +1804,7 @@ impl SqliteConn {
             })
         } else {
             let g = self.lock();
-            let (columns, rows) = sqlite_query(&g, trimmed)?;
+            let (columns, rows) = sqlite_query_limited(&g, trimmed, db::USER_TEXT_LIMITS)?;
             if !columns.is_empty() {
                 Ok(QueryOutcome::Rows {
                     columns,
@@ -1357,7 +1816,11 @@ impl SqliteConn {
                 Ok(QueryOutcome::Exec {
                     // sqlite `changes()` is STALE after DDL (reports the previous
                     // statement's count) — and DDL counts are noise anyway.
-                    message: if script::is_ddl(trimmed) { "OK".to_string() } else { format!("OK ({} rows affected)", g.changes()) },
+                    message: if script::is_ddl(trimmed) {
+                        "OK".to_string()
+                    } else {
+                        format!("OK ({} rows affected)", g.changes())
+                    },
                 })
             }
         }
@@ -1376,7 +1839,7 @@ impl SqliteConn {
         let wrapped = format!("SELECT * FROM ({base}) LIMIT {page} OFFSET {}", self.offset);
         let (_cols, rows) = {
             let g = self.lock();
-            sqlite_query(&g, &wrapped)?
+            sqlite_query_limited(&g, &wrapped, db::USER_TEXT_LIMITS)?
         };
         let done = (rows.len() as u32) < page;
         self.offset += rows.len();
@@ -1387,31 +1850,42 @@ impl SqliteConn {
     }
 }
 
-fn sqlite_value(v: rusqlite::types::ValueRef) -> Option<String> {
+fn sqlite_value(v: rusqlite::types::ValueRef) -> Result<Option<String>, AppError> {
     use rusqlite::types::ValueRef as V;
     match v {
-        V::Null => None,
-        V::Integer(n) => Some(n.to_string()),
-        V::Real(f) => Some(f.to_string()),
-        V::Text(b) => Some(String::from_utf8_lossy(b).into_owned()),
-        V::Blob(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        V::Null => Ok(None),
+        V::Integer(n) => Ok(Some(n.to_string())),
+        V::Real(f) => Ok(Some(f.to_string())),
+        V::Text(bytes) => std::str::from_utf8(bytes)
+            .map(|text| Some(text.to_string()))
+            .map_err(|error| {
+                AppError::new(format!("SQLite text value contains invalid UTF-8: {error}"))
+            }),
+        V::Blob(bytes) => Ok(Some(binary_text(bytes))),
     }
 }
 
-fn sqlite_query(
+fn sqlite_query(conn: &rusqlite::Connection, sql: &str) -> Result<TextRows, AppError> {
+    sqlite_query_limited(conn, sql, db::CATALOG_TEXT_LIMITS)
+}
+
+fn sqlite_query_limited(
     conn: &rusqlite::Connection,
     sql: &str,
+    limits: db::TextLimits,
 ) -> Result<TextRows, AppError> {
     let mut stmt = conn.prepare(sql).map_err(de)?;
     let columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
     let ncols = columns.len();
+    let mut budget = db::TextBudget::new(&columns, limits)?;
     let mut rows = stmt.query([]).map_err(de)?;
     let mut data: Vec<Vec<Option<String>>> = Vec::new();
     while let Some(row) = rows.next().map_err(de)? {
         let mut r = Vec::with_capacity(ncols);
         for i in 0..ncols {
-            r.push(sqlite_value(row.get_ref(i).map_err(de)?));
+            r.push(sqlite_value(row.get_ref(i).map_err(de)?)?);
         }
+        budget.add_row(&r)?;
         data.push(r);
     }
     Ok((columns, data))
@@ -1517,6 +1991,15 @@ pub struct MySqlConn {
     pub config: ConnectionConfig,
     pub stream_sql: Option<String>,
     pub offset: usize,
+    pinned: Option<mysql_async::Conn>,
+    manual_lost: bool,
+    autocommit_off: bool,
+}
+
+#[derive(Clone, Copy)]
+struct MySqlSessionState {
+    active: Option<bool>,
+    autocommit: bool,
 }
 
 impl MySqlConn {
@@ -1561,9 +2044,287 @@ impl MySqlConn {
                 config: config.clone(),
                 stream_sql: None,
                 offset: 0,
+                pinned: None,
+                manual_lost: false,
+                autocommit_off: false,
             }),
             format!("MySQL {version}"),
         ))
+    }
+
+    async fn ensure_pinned(&mut self) -> Result<(), AppError> {
+        if self.manual_lost {
+            return Err(AppError::new(
+                "MySQL manual transaction connection was lost; reconnect required",
+            ));
+        }
+        if self.pinned.is_none() {
+            self.pinned = Some(self.pool.get_conn().await.map_err(de)?);
+        }
+        Ok(())
+    }
+
+    async fn probe_pinned(&mut self) -> Result<(u32, MySqlSessionState), AppError> {
+        use mysql_async::consts::StatusFlags;
+
+        let conn = self
+            .pinned
+            .as_mut()
+            .ok_or_else(|| AppError::new("MySQL manual transaction has no pinned connection"))?;
+        let connection_id = conn.id();
+        let (_columns, rows, _) =
+            mysql_run_conn_limited(conn, "SELECT @@session.autocommit", db::USER_TEXT_LIMITS)
+                .await?;
+        let row = rows
+            .first()
+            .ok_or_else(|| AppError::new("MySQL transaction status probe returned no row"))?;
+        let autocommit = row
+            .first()
+            .and_then(|value| value.as_deref())
+            .ok_or_else(|| AppError::new("MySQL returned no autocommit status"))?
+            == "1";
+        // The final protocol packet reports state after the probe statement. Unlike a
+        // Performance Schema query, SERVER_STATUS_IN_TRANS does not mistake the probe's
+        // own in-flight autocommit statement for a surviving explicit transaction.
+        let flags = conn
+            .last_ok_packet()
+            .ok_or_else(|| AppError::new("MySQL returned no transaction status flags"))?
+            .status_flags();
+        Ok((
+            connection_id,
+            MySqlSessionState {
+                active: Some(flags.contains(StatusFlags::SERVER_STATUS_IN_TRANS)),
+                autocommit,
+            },
+        ))
+    }
+
+    async fn verify_pinned_result<T>(
+        &mut self,
+        result: Result<T, AppError>,
+        success: MySqlSessionState,
+        failure: MySqlSessionState,
+    ) -> Result<T, AppError> {
+        match self.probe_pinned().await {
+            Ok((_connection_id, actual))
+                if if result.is_ok() {
+                    success.active
+                } else {
+                    failure.active
+                }
+                .is_none_or(|expected| actual.active == Some(expected))
+                    && actual.autocommit
+                        == if result.is_ok() {
+                            success.autocommit
+                        } else {
+                            failure.autocommit
+                        } =>
+            {
+                result
+            }
+            Ok((_connection_id, actual)) => {
+                self.manual_lost = true;
+                Err(match result {
+                    Ok(_) => AppError::new(format!(
+                        "MySQL ended or changed the manual transaction unexpectedly (active={}, autocommit={}); reconnect required",
+                        actual.active.unwrap_or(false), actual.autocommit
+                    )),
+                    Err(error) => AppError::new(format!(
+                        "{}; MySQL transaction state also changed unexpectedly (active={}, autocommit={}); reconnect required",
+                        error.message,
+                        actual.active.unwrap_or(false),
+                        actual.autocommit
+                    )),
+                })
+            }
+            Err(probe_error) => {
+                self.manual_lost = true;
+                Err(match result {
+                    Ok(_) => AppError::new(format!(
+                        "MySQL manual transaction connection was lost: {}",
+                        probe_error.message
+                    )),
+                    Err(error) => AppError::new(format!(
+                        "{}; MySQL transaction status is unavailable: {}",
+                        error.message, probe_error.message
+                    )),
+                })
+            }
+        }
+    }
+
+    async fn run_manual_single(
+        &mut self,
+        trimmed: &str,
+        page: u32,
+        cursorable: bool,
+        mode: TransactionMode,
+    ) -> Result<QueryOutcome, AppError> {
+        self.ensure_pinned().await?;
+        let result = if cursorable {
+            let result = {
+                let conn = self.pinned.as_mut().expect("pinned above");
+                mysql_page_conn(conn, trimmed, page, 0).await
+            };
+            result.map(|(columns, rows)| {
+                let done = (rows.len() as u32) < page;
+                if done {
+                    self.stream_sql = None;
+                    self.offset = 0;
+                } else {
+                    self.stream_sql = Some(trimmed.to_string());
+                    self.offset = page as usize;
+                }
+                QueryOutcome::Rows {
+                    columns,
+                    rows,
+                    done,
+                    note: None,
+                }
+            })
+        } else {
+            let result = {
+                let conn = self.pinned.as_mut().expect("pinned above");
+                mysql_run_conn_limited(conn, trimmed, db::USER_TEXT_LIMITS).await
+            };
+            result.map(|(columns, rows, affected)| {
+                if columns.is_empty() {
+                    QueryOutcome::Exec {
+                        message: if script::is_ddl(trimmed) {
+                            "OK".to_string()
+                        } else {
+                            format!("OK ({affected} rows affected)")
+                        },
+                    }
+                } else {
+                    QueryOutcome::Rows {
+                        columns,
+                        rows,
+                        done: true,
+                        note: None,
+                    }
+                }
+            })
+        };
+        self.autocommit_off = mode == TransactionMode::AutocommitOff;
+        let expected = MySqlSessionState {
+            active: (mode == TransactionMode::Explicit).then_some(true),
+            autocommit: mode != TransactionMode::AutocommitOff,
+        };
+        self.verify_pinned_result(result, expected, expected).await
+    }
+
+    async fn run_transaction_statement(
+        &mut self,
+        sql: &str,
+        action: script::TransactionAction,
+        current_mode: TransactionMode,
+    ) -> Result<QueryOutcome, AppError> {
+        self.ensure_pinned().await?;
+        let result = {
+            let conn = self.pinned.as_mut().expect("pinned above");
+            mysql_run_conn_limited(conn, sql, db::USER_TEXT_LIMITS).await
+        };
+        let (columns, rows, affected) = if action == script::TransactionAction::SetTransaction {
+            // MySQL's unscoped SET TRANSACTION applies to the next transaction. Any
+            // status SELECT here would consume it before the user's START TRANSACTION.
+            result?
+        } else {
+            let current = match action {
+                script::TransactionAction::Begin => MySqlSessionState {
+                    active: Some(false),
+                    autocommit: true,
+                },
+                script::TransactionAction::AutocommitOff
+                    if current_mode != TransactionMode::AutocommitOff =>
+                {
+                    MySqlSessionState {
+                        active: Some(false),
+                        autocommit: true,
+                    }
+                }
+                script::TransactionAction::AutocommitOn
+                    if current_mode != TransactionMode::AutocommitOff =>
+                {
+                    MySqlSessionState {
+                        active: Some(false),
+                        autocommit: true,
+                    }
+                }
+                _ => MySqlSessionState {
+                    active: (current_mode != TransactionMode::AutocommitOff).then_some(true),
+                    autocommit: current_mode != TransactionMode::AutocommitOff,
+                },
+            };
+            let success = match action {
+                script::TransactionAction::Begin
+                | script::TransactionAction::Savepoint
+                | script::TransactionAction::Release
+                | script::TransactionAction::RollbackTo => MySqlSessionState {
+                    active: Some(true),
+                    autocommit: current_mode != TransactionMode::AutocommitOff,
+                },
+                script::TransactionAction::Commit | script::TransactionAction::Rollback
+                    if current_mode != TransactionMode::AutocommitOff =>
+                {
+                    MySqlSessionState {
+                        active: Some(false),
+                        autocommit: true,
+                    }
+                }
+                script::TransactionAction::AutocommitOn => MySqlSessionState {
+                    active: Some(false),
+                    autocommit: true,
+                },
+                script::TransactionAction::Commit
+                | script::TransactionAction::Rollback
+                | script::TransactionAction::AutocommitOff => MySqlSessionState {
+                    active: None,
+                    autocommit: false,
+                },
+                script::TransactionAction::SetTransaction => unreachable!("handled above"),
+            };
+            self.verify_pinned_result(result, success, current).await?
+        };
+        if action == script::TransactionAction::AutocommitOff {
+            self.autocommit_off = true;
+        } else if action == script::TransactionAction::AutocommitOn {
+            self.autocommit_off = false;
+        }
+        if action == script::TransactionAction::AutocommitOn
+            || (matches!(
+                action,
+                script::TransactionAction::Commit | script::TransactionAction::Rollback
+            ) && current_mode != TransactionMode::AutocommitOff)
+        {
+            self.pinned.take();
+        }
+        Ok(if columns.is_empty() {
+            QueryOutcome::Exec {
+                message: format!("OK ({affected} rows affected)"),
+            }
+        } else {
+            QueryOutcome::Rows {
+                columns,
+                rows,
+                done: true,
+                note: None,
+            }
+        })
+    }
+
+    async fn rollback_pinned(&mut self) {
+        use mysql_async::prelude::Queryable;
+        if let Some(mut conn) = self.pinned.take() {
+            // Never follow an unacknowledged rollback with SET autocommit=1: that SET
+            // commits an active autocommit-off transaction in MySQL. Dropping the
+            // connection is the safe fallback when rollback acknowledgement is lost.
+            if conn.query_drop("ROLLBACK").await.is_ok() && self.autocommit_off {
+                let _ = conn.query_drop("SET autocommit=1").await;
+            }
+        }
+        self.manual_lost = false;
+        self.autocommit_off = false;
     }
 
     async fn run_single(
@@ -1589,7 +2350,8 @@ impl MySqlConn {
                 note: None,
             })
         } else {
-            let (columns, rows, affected) = mysql_run(&self.pool, trimmed).await?;
+            let (columns, rows, affected) =
+                mysql_run_limited(&self.pool, trimmed, db::USER_TEXT_LIMITS).await?;
             if !columns.is_empty() {
                 Ok(QueryOutcome::Rows {
                     columns,
@@ -1599,7 +2361,11 @@ impl MySqlConn {
                 })
             } else {
                 Ok(QueryOutcome::Exec {
-                    message: if script::is_ddl(trimmed) { "OK".to_string() } else { format!("OK ({affected} rows affected)") },
+                    message: if script::is_ddl(trimmed) {
+                        "OK".to_string()
+                    } else {
+                        format!("OK ({affected} rows affected)")
+                    },
                 })
             }
         }
@@ -1615,7 +2381,21 @@ impl MySqlConn {
                 })
             }
         };
-        let (_c, rows) = mysql_page(&self.pool, &base, page, self.offset).await?;
+        let result = if let Some(conn) = self.pinned.as_mut() {
+            mysql_page_conn(conn, &base, page, self.offset).await
+        } else {
+            mysql_page(&self.pool, &base, page, self.offset).await
+        };
+        let (_c, rows) = if self.pinned.is_some() {
+            let expected = MySqlSessionState {
+                active: (!self.autocommit_off).then_some(true),
+                autocommit: !self.autocommit_off,
+            };
+            self.verify_pinned_result(result, expected, expected)
+                .await?
+        } else {
+            result?
+        };
         let done = (rows.len() as u32) < page;
         self.offset += rows.len();
         if done {
@@ -1624,57 +2404,127 @@ impl MySqlConn {
         Ok(FetchResult { rows, done })
     }
 
-    /// Transactional unless the script manages its own transaction. NOTE:
-    /// MySQL DDL statements implicitly commit — DML-only scripts are atomic.
-    async fn run_script(&self, items: &[script::Item], user_txn: bool) -> Result<String, AppError> {
+    /// MySQL DDL statements implicitly commit; DML-only scripts are atomic.
+    async fn run_script(&self, items: &[script::Item]) -> Result<String, AppError> {
         use mysql_async::prelude::Queryable;
         let mut conn = self.pool.get_conn().await.map_err(de)?;
-        if !user_txn {
-            conn.query_drop("START TRANSACTION").await.map_err(de)?;
-        }
+        conn.query_drop("START TRANSACTION").await.map_err(de)?;
         for it in items {
             if let script::Item::Sql(s) = it {
                 if let Err(e) = conn.query_drop(s.trim()).await.map_err(de) {
-                    if !user_txn {
-                        let _ = conn.query_drop("ROLLBACK").await;
-                    }
+                    let _ = conn.query_drop("ROLLBACK").await;
                     return Err(e);
                 }
             }
         }
-        if !user_txn {
-            conn.query_drop("COMMIT").await.map_err(de)?;
-        }
+        conn.query_drop("COMMIT").await.map_err(|e| {
+            AppError::new(format!(
+                "commit acknowledgement failed; transaction outcome is unknown — verify database state before retrying ({e})"
+            ))
+        })?;
         Ok("OK".to_string())
     }
 }
 
-fn mysql_value_to_string(v: &mysql_async::Value) -> Option<String> {
+#[derive(Clone, Copy)]
+struct MySqlColumnMeta {
+    column_type: mysql_async::consts::ColumnType,
+    binary: bool,
+}
+
+fn mysql_value_to_string(
+    v: &mysql_async::Value,
+    metadata: Option<MySqlColumnMeta>,
+) -> Result<Option<String>, AppError> {
     use mysql_async::Value as V;
     match v {
-        V::NULL => None,
-        V::Bytes(b) => Some(String::from_utf8_lossy(b).into_owned()),
-        V::Int(n) => Some(n.to_string()),
-        V::UInt(n) => Some(n.to_string()),
-        V::Float(f) => Some(f.to_string()),
-        V::Double(f) => Some(f.to_string()),
+        V::NULL => Ok(None),
+        V::Bytes(bytes) if metadata.is_some_and(|meta| meta.binary) => Ok(Some(binary_text(bytes))),
+        V::Bytes(bytes) => String::from_utf8(bytes.clone()).map(Some).map_err(|error| {
+            AppError::new(format!("MySQL text value contains invalid UTF-8: {error}"))
+        }),
+        V::Int(n) => Ok(Some(n.to_string())),
+        V::UInt(n) => Ok(Some(n.to_string())),
+        V::Float(f) => Ok(Some(f.to_string())),
+        V::Double(f) => Ok(Some(f.to_string())),
         V::Date(y, mo, d, h, mi, s, us) => {
-            // A pure DATE (and DATETIME/TIMESTAMP at exact midnight) renders date-only;
-            // a non-zero time renders the full timestamp. (Value::Date can't distinguish
-            // DATE from DATETIME, so the zero-time heuristic keeps DATE columns clean.)
-            if *h == 0 && *mi == 0 && *s == 0 && *us == 0 {
-                Some(format!("{y:04}-{mo:02}-{d:02}"))
+            // Value::Date carries DATE and DATETIME/TIMESTAMP. Preserve midnight on
+            // timestamp-like columns by consulting result metadata.
+            if metadata.map(|meta| meta.column_type)
+                == Some(mysql_async::consts::ColumnType::MYSQL_TYPE_DATE)
+            {
+                Ok(Some(format!("{y:04}-{mo:02}-{d:02}")))
             } else {
                 let base = format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}");
-                Some(if *us > 0 { format!("{base}.{us:06}") } else { base })
+                Ok(Some(if *us > 0 {
+                    format!("{base}.{us:06}")
+                } else {
+                    base
+                }))
             }
         }
         V::Time(neg, d, h, mi, s, us) => {
             let hours = d * 24 + *h as u32;
             let base = format!("{}{hours:02}:{mi:02}:{s:02}", if *neg { "-" } else { "" });
-            Some(if *us > 0 { format!("{base}.{us:06}") } else { base })
+            Ok(Some(if *us > 0 {
+                format!("{base}.{us:06}")
+            } else {
+                base
+            }))
         }
     }
+}
+
+fn mysql_metadata(
+    columns: Option<&std::sync::Arc<[mysql_async::Column]>>,
+) -> (Vec<String>, Vec<MySqlColumnMeta>) {
+    let Some(columns) = columns else {
+        return (Vec::new(), Vec::new());
+    };
+    let names = columns
+        .iter()
+        .map(|column| column.name_str().to_string())
+        .collect();
+    let metadata = columns
+        .iter()
+        .map(|column| MySqlColumnMeta {
+            column_type: column.column_type(),
+            binary: mysql_is_binary_column(column.column_type(), column.character_set()),
+        })
+        .collect();
+    (names, metadata)
+}
+
+fn mysql_is_binary_column(
+    column_type: mysql_async::consts::ColumnType,
+    character_set: u16,
+) -> bool {
+    use mysql_async::consts::ColumnType;
+    let binary_capable = matches!(
+        column_type,
+        ColumnType::MYSQL_TYPE_VARCHAR
+            | ColumnType::MYSQL_TYPE_BIT
+            | ColumnType::MYSQL_TYPE_TINY_BLOB
+            | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
+            | ColumnType::MYSQL_TYPE_LONG_BLOB
+            | ColumnType::MYSQL_TYPE_BLOB
+            | ColumnType::MYSQL_TYPE_VAR_STRING
+            | ColumnType::MYSQL_TYPE_STRING
+            | ColumnType::MYSQL_TYPE_GEOMETRY
+    );
+    binary_capable && character_set == 63
+}
+
+fn mysql_text_row(
+    row: &mysql_async::Row,
+    metadata: &[MySqlColumnMeta],
+) -> Result<Vec<Option<String>>, AppError> {
+    (0..metadata.len())
+        .map(|i| match row.as_ref(i) {
+            Some(value) => mysql_value_to_string(value, metadata.get(i).copied()),
+            None => Err(AppError::new("MySQL returned an inconsistent row shape")),
+        })
+        .collect()
 }
 
 /// Page a MySQL query by LIMIT/OFFSET. Wraps as a derived table (robust to a query's own
@@ -1688,11 +2538,11 @@ async fn mysql_page(
     offset: usize,
 ) -> Result<(Vec<String>, Vec<Vec<Option<String>>>), AppError> {
     let wrapped = format!("SELECT * FROM ({base}) AS _tusk LIMIT {limit} OFFSET {offset}");
-    match mysql_run(pool, &wrapped).await {
+    match mysql_run_limited(pool, &wrapped, db::USER_TEXT_LIMITS).await {
         Ok((c, r, _)) => Ok((c, r)),
         Err(e) if e.message.contains("Duplicate column name") => {
             let appended = format!("{base} LIMIT {limit} OFFSET {offset}");
-            let (c, r, _) = mysql_run(pool, &appended).await?;
+            let (c, r, _) = mysql_run_limited(pool, &appended, db::USER_TEXT_LIMITS).await?;
             Ok((c, r))
         }
         Err(e) => Err(e),
@@ -1704,25 +2554,91 @@ async fn mysql_run(
     pool: &mysql_async::Pool,
     sql: &str,
 ) -> Result<(Vec<String>, Vec<Vec<Option<String>>>, u64), AppError> {
+    mysql_run_limited(pool, sql, db::CATALOG_TEXT_LIMITS).await
+}
+
+async fn mysql_run_limited(
+    pool: &mysql_async::Pool,
+    sql: &str,
+    limits: db::TextLimits,
+) -> Result<(Vec<String>, Vec<Vec<Option<String>>>, u64), AppError> {
+    mysql_single_statement(sql)?;
+    let mut conn = pool.get_conn().await.map_err(de)?;
+    mysql_run_conn_limited(&mut conn, sql, limits).await
+}
+
+async fn mysql_run_conn_limited(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+    limits: db::TextLimits,
+) -> Result<(Vec<String>, Vec<Vec<Option<String>>>, u64), AppError> {
+    mysql_single_statement(sql)?;
+    use mysql_async::prelude::Queryable;
+    let mut result = conn.query_iter(sql).await.map_err(de)?;
+    let (columns, metadata) = mysql_metadata(result.columns().as_ref());
+    let affected = result.affected_rows();
+    let mut budget = db::TextBudget::new(&columns, limits)?;
+    let mut data = Vec::new();
+    while let Some(row) = result.next().await.map_err(de)? {
+        let row = mysql_text_row(&row, &metadata)?;
+        budget.add_row(&row)?;
+        data.push(row);
+    }
+    Ok((columns, data, affected))
+}
+
+async fn mysql_page_conn(
+    conn: &mut mysql_async::Conn,
+    base: &str,
+    limit: u32,
+    offset: usize,
+) -> Result<(Vec<String>, Vec<Vec<Option<String>>>), AppError> {
+    let wrapped = format!("SELECT * FROM ({base}) AS _tusk LIMIT {limit} OFFSET {offset}");
+    match mysql_run_conn_limited(conn, &wrapped, db::USER_TEXT_LIMITS).await {
+        Ok((columns, rows, _)) => Ok((columns, rows)),
+        Err(error) if error.message.contains("Duplicate column name") => {
+            let appended = format!("{base} LIMIT {limit} OFFSET {offset}");
+            let (columns, rows, _) =
+                mysql_run_conn_limited(conn, &appended, db::USER_TEXT_LIMITS).await?;
+            Ok((columns, rows))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn mysql_run_params(
+    pool: &mysql_async::Pool,
+    sql: &str,
+    params: mysql_async::Params,
+) -> Result<(Vec<String>, Vec<Vec<Option<String>>>, u64), AppError> {
+    mysql_single_statement(sql)?;
     use mysql_async::prelude::Queryable;
     let mut conn = pool.get_conn().await.map_err(de)?;
-    let mut result = conn.query_iter(sql).await.map_err(de)?;
-    let columns: Vec<String> = result
-        .columns()
-        .map(|arc| arc.iter().map(|c| c.name_str().to_string()).collect())
-        .unwrap_or_default();
+    let mut result = conn.exec_iter(sql, params).await.map_err(de)?;
+    let (columns, metadata) = mysql_metadata(result.columns().as_ref());
     let affected = result.affected_rows();
-    let raw: Vec<mysql_async::Row> = result.collect().await.map_err(de)?;
-    let ncols = columns.len();
-    let data: Vec<Vec<Option<String>>> = raw
-        .iter()
-        .map(|row| {
-            (0..ncols)
-                .map(|i| row.as_ref(i).and_then(mysql_value_to_string))
-                .collect()
-        })
-        .collect();
+    let mut budget = db::TextBudget::new(&columns, db::CATALOG_TEXT_LIMITS)?;
+    let mut data = Vec::new();
+    while let Some(row) = result.next().await.map_err(de)? {
+        let row = mysql_text_row(&row, &metadata)?;
+        budget.add_row(&row)?;
+        data.push(row);
+    }
     Ok((columns, data, affected))
+}
+
+fn mysql_single_statement(sql: &str) -> Result<(), AppError> {
+    if script::contains_mysql_executable_comment(sql) {
+        return Err(AppError::new(
+            "MySQL/MariaDB executable comments are not supported",
+        ));
+    }
+    match script::parse_for_engine(sql, script::TransactionEngine::MySql)?.as_slice() {
+        [script::Item::Sql(_)] => Ok(()),
+        _ => Err(AppError::new(
+            "MySQL driver refused a multi-statement or COPY query",
+        )),
+    }
 }
 
 async fn mysql_build_tree(pool: &mysql_async::Pool) -> Result<tree::DbTree, AppError> {
@@ -1772,14 +2688,11 @@ async fn mysql_table_detail(
     schema: &str,
     name: &str,
 ) -> Result<tree::RelationDetail, AppError> {
-    let q = format!(
-        "SELECT column_name, data_type, is_nullable, column_default, column_key \
-         FROM information_schema.columns \
-         WHERE table_schema = {} AND table_name = {} ORDER BY ordinal_position",
-        dlit(schema),
-        dlit(name)
-    );
-    let (_c, rows, _a) = mysql_run(pool, &q).await?;
+    let q = "SELECT column_name, data_type, is_nullable, column_default, column_key \
+             FROM information_schema.columns \
+             WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position";
+    let params = mysql_async::Params::Positional(vec![schema.into(), name.into()]);
+    let (_c, rows, _a) = mysql_run_params(pool, q, params).await?;
     let columns = rows
         .iter()
         .map(|r| tree::Column {
@@ -1807,6 +2720,147 @@ async fn mysql_table_detail(
 pub struct ConnState {
     pub backend: Backend,
     pub read_only: bool,
+    pub transaction: TransactionStatus,
+    next_transaction_id: u64,
+    pub stream_owner: Option<String>,
+}
+
+impl ConnState {
+    pub fn new(backend: Backend, read_only: bool) -> Self {
+        Self {
+            backend,
+            read_only,
+            transaction: TransactionStatus::default(),
+            next_transaction_id: 1,
+            stream_owner: None,
+        }
+    }
+
+    pub fn transaction_engine(&self) -> script::TransactionEngine {
+        match &self.backend {
+            Backend::Pg(_) => script::TransactionEngine::Postgres,
+            Backend::Duck(_) => script::TransactionEngine::DuckDb,
+            Backend::Sqlite(_) => script::TransactionEngine::Sqlite,
+            Backend::MySql(_) => script::TransactionEngine::MySql,
+        }
+    }
+
+    /// Transaction-ownership gate only. A new run may take over the shared result
+    /// stream (it closes the old cursor before executing), so `run_query` must not
+    /// be blocked by `stream_owner`; paging and cancel must be (`require_owner`).
+    pub fn require_transaction_owner(&self, owner: &str) -> Result<(), AppError> {
+        if self.transaction.owns_session() && self.transaction.owner.as_deref() != Some(owner) {
+            return Err(AppError::new(format!(
+                "manual transaction is owned by `{}`",
+                self.transaction.owner.as_deref().unwrap_or("unknown")
+            ))
+            .with_transaction(self.transaction.clone()));
+        }
+        Ok(())
+    }
+
+    pub fn require_owner(&self, owner: &str) -> Result<(), AppError> {
+        self.require_transaction_owner(owner)?;
+        if self
+            .stream_owner
+            .as_deref()
+            .is_some_and(|active| active != owner)
+        {
+            return Err(AppError::new("result stream is owned by another tab")
+                .with_transaction(self.transaction.clone()));
+        }
+        Ok(())
+    }
+
+    pub fn require_idle(&self, operation: &str) -> Result<(), AppError> {
+        if self.transaction.owns_session() {
+            return Err(AppError::new(format!(
+                "{operation} is blocked while a manual transaction owns the session"
+            ))
+            .with_transaction(self.transaction.clone()));
+        }
+        Ok(())
+    }
+
+    fn start_transaction(&mut self, owner: &str, state: TransactionState, mode: TransactionMode) {
+        let id = format!("tx-{}", self.next_transaction_id);
+        self.next_transaction_id = self.next_transaction_id.saturating_add(1);
+        self.transaction.id = Some(id);
+        self.transaction.owner = Some(owner.to_string());
+        self.transaction.state = state;
+        self.transaction.mode = mode;
+        self.transaction.health = TransactionHealth::Healthy;
+    }
+
+    fn finish_transaction(&mut self) {
+        self.transaction.state = TransactionState::Idle;
+        self.transaction.id = None;
+        self.transaction.owner = None;
+        self.transaction.mode = TransactionMode::None;
+        self.transaction.health = TransactionHealth::Healthy;
+    }
+
+    pub fn apply_transaction_action(&mut self, action: script::TransactionAction, owner: &str) {
+        use script::TransactionAction as A;
+        match action {
+            A::Begin => {
+                if self.transaction.state == TransactionState::Configured {
+                    self.transaction.state = TransactionState::Active;
+                } else {
+                    self.start_transaction(
+                        owner,
+                        TransactionState::Active,
+                        TransactionMode::Explicit,
+                    );
+                }
+            }
+            A::Commit | A::Rollback => {
+                if self.transaction.mode == TransactionMode::AutocommitOff {
+                    self.transaction.state = TransactionState::Active;
+                    self.transaction.health = TransactionHealth::Healthy;
+                } else {
+                    self.finish_transaction();
+                }
+            }
+            A::RollbackTo => {
+                self.transaction.state = TransactionState::Active;
+                self.transaction.health = TransactionHealth::Healthy;
+            }
+            A::SetTransaction if self.transaction.state == TransactionState::Idle => {
+                self.start_transaction(
+                    owner,
+                    TransactionState::Configured,
+                    TransactionMode::Explicit,
+                );
+            }
+            A::AutocommitOff if self.transaction.state == TransactionState::Idle => {
+                self.start_transaction(
+                    owner,
+                    TransactionState::Active,
+                    TransactionMode::AutocommitOff,
+                );
+            }
+            A::AutocommitOn => self.finish_transaction(),
+            A::Savepoint | A::Release | A::SetTransaction | A::AutocommitOff => {}
+        }
+        self.transaction.revision = self.transaction.revision.saturating_add(1);
+    }
+
+    pub fn mark_transaction_failed(&mut self) {
+        if self.transaction.state == TransactionState::Active {
+            self.transaction.state = TransactionState::Failed;
+            self.transaction.health = TransactionHealth::RecoveryRequired;
+            self.transaction.revision = self.transaction.revision.saturating_add(1);
+        }
+    }
+
+    pub fn mark_transaction_lost(&mut self) {
+        if self.transaction.owns_session() && self.transaction.state != TransactionState::Lost {
+            self.transaction.state = TransactionState::Lost;
+            self.transaction.health = TransactionHealth::Lost;
+            self.transaction.revision = self.transaction.revision.saturating_add(1);
+        }
+    }
 }
 
 // --- DuckDB helpers ---
@@ -1829,7 +2883,10 @@ fn duck_time_parts(unit: duckdb::types::TimeUnit, v: i64) -> (i64, u32) {
         U::Nanosecond => 1_000_000_000,
     };
     let scale = 1_000_000_000 / per_sec; // sub-unit → nanos
-    (v.div_euclid(per_sec), (v.rem_euclid(per_sec) * scale) as u32)
+    (
+        v.div_euclid(per_sec),
+        (v.rem_euclid(per_sec) * scale) as u32,
+    )
 }
 
 /// `.123` style fractional-seconds suffix (micro precision, trailing zeros trimmed) —
@@ -1864,7 +2921,7 @@ fn duck_value_repr(v: duckdb::types::Value) -> String {
         V::Decimal(d) => d.to_string(),
         V::Text(s) => s,
         V::Enum(s) => s,
-        V::Blob(b) => String::from_utf8_lossy(&b).into_owned(),
+        V::Blob(bytes) => binary_text(&bytes),
         // DATE: days since the Unix epoch → YYYY-MM-DD.
         V::Date32(days) => chrono::DateTime::from_timestamp(days as i64 * 86_400, 0)
             .map(|dt| dt.format("%Y-%m-%d").to_string())
@@ -1880,14 +2937,30 @@ fn duck_value_repr(v: duckdb::types::Value) -> String {
         V::Time64(unit, t) => {
             let (secs, nanos) = duck_time_parts(unit, t);
             let s = secs.rem_euclid(86_400) as u32;
-            format!("{:02}:{:02}:{:02}{}", s / 3600, (s % 3600) / 60, s % 60, duck_frac(nanos))
+            format!(
+                "{:02}:{:02}:{:02}{}",
+                s / 3600,
+                (s % 3600) / 60,
+                s % 60,
+                duck_frac(nanos)
+            )
         }
         // INTERVAL: a readable "N years N months N days HH:MM:SS" (best-effort).
-        V::Interval { months, days, nanos } => duck_interval(months, days, nanos),
+        V::Interval {
+            months,
+            days,
+            nanos,
+        } => duck_interval(months, days, nanos),
         // Nested types — recurse so a list/array reads like `[a, b, c]`, a struct like
         // `{'k': v}` (close to DuckDB's VARCHAR form; readable rather than Debug).
         V::List(xs) | V::Array(xs) => {
-            format!("[{}]", xs.into_iter().map(duck_value_repr).collect::<Vec<_>>().join(", "))
+            format!(
+                "[{}]",
+                xs.into_iter()
+                    .map(duck_value_repr)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         }
         V::Struct(m) => {
             let body = m
@@ -1897,7 +2970,21 @@ fn duck_value_repr(v: duckdb::types::Value) -> String {
                 .join(", ");
             format!("{{{body}}}")
         }
-        other => format!("{other:?}"),
+        V::Map(m) => {
+            let body = m
+                .iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}: {}",
+                        duck_value_repr(key.clone()),
+                        duck_value_repr(value.clone())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{{body}}}")
+        }
+        V::Union(value) => duck_value_repr(*value),
     }
 }
 
@@ -1918,14 +3005,25 @@ fn duck_interval(months: i32, days: i32, nanos: i64) -> String {
     let sub = (nanos % 1_000_000_000) as u32;
     let s = total_secs.rem_euclid(86_400);
     if s != 0 || sub != 0 || parts.is_empty() {
-        parts.push(format!("{:02}:{:02}:{:02}{}", s / 3600, (s % 3600) / 60, s % 60, duck_frac(sub)));
+        parts.push(format!(
+            "{:02}:{:02}:{:02}{}",
+            s / 3600,
+            (s % 3600) / 60,
+            s % 60,
+            duck_frac(sub)
+        ));
     }
     parts.join(" ")
 }
 
-fn duck_query(
+fn duck_query(conn: &duckdb::Connection, sql: &str) -> Result<TextRows, AppError> {
+    duck_query_limited(conn, sql, db::CATALOG_TEXT_LIMITS)
+}
+
+fn duck_query_limited(
     conn: &duckdb::Connection,
     sql: &str,
+    limits: db::TextLimits,
 ) -> Result<TextRows, AppError> {
     let mut stmt = conn.prepare(sql).map_err(de)?;
     // Column metadata is only valid AFTER the statement is executed (duckdb-rs panics
@@ -1933,6 +3031,7 @@ fn duck_query(
     let mut rows = stmt.query([]).map_err(de)?;
     let columns: Vec<String> = rows.as_ref().map(|s| s.column_names()).unwrap_or_default();
     let ncols = columns.len();
+    let mut budget = db::TextBudget::new(&columns, limits)?;
     let mut data: Vec<Vec<Option<String>>> = Vec::new();
     while let Some(row) = rows.next().map_err(de)? {
         let mut r = Vec::with_capacity(ncols);
@@ -1940,6 +3039,7 @@ fn duck_query(
             let v: duckdb::types::Value = row.get(i).map_err(de)?;
             r.push(duck_value_to_string(v));
         }
+        budget.add_row(&r)?;
         data.push(r);
     }
     Ok((columns, data))
@@ -1955,8 +3055,11 @@ fn dcell(r: &[Option<String>], i: usize) -> String {
 /// the MySQL and DuckDB build paths (both feed `information_schema.tables`-shaped rows:
 /// col 0 = schema, 1 = name, 2 = table_type where "VIEW" ⇒ view).
 fn attach_rels(schemas: &mut [tree::Schema], table_rows: &[Vec<Option<String>>]) {
-    let idx: std::collections::HashMap<String, usize> =
-        schemas.iter().enumerate().map(|(i, s)| (s.name.clone(), i)).collect();
+    let idx: std::collections::HashMap<String, usize> = schemas
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name.clone(), i))
+        .collect();
     for r in table_rows {
         let schema = dcell(r, 0);
         let Some(&i) = idx.get(&schema) else { continue };
@@ -2053,14 +3156,113 @@ mod tests {
         mem("duckdb")
     }
 
+    #[test]
+    fn mysql_date_rendering_preserves_midnight_timestamp_type() {
+        use mysql_async::consts::ColumnType::{MYSQL_TYPE_DATE, MYSQL_TYPE_DATETIME};
+
+        let midnight = mysql_async::Value::Date(2026, 7, 23, 0, 0, 0, 0);
+        let meta = |column_type| MySqlColumnMeta {
+            column_type,
+            binary: false,
+        };
+        assert_eq!(
+            mysql_value_to_string(&midnight, Some(meta(MYSQL_TYPE_DATE)))
+                .unwrap()
+                .as_deref(),
+            Some("2026-07-23")
+        );
+        assert_eq!(
+            mysql_value_to_string(&midnight, Some(meta(MYSQL_TYPE_DATETIME)))
+                .unwrap()
+                .as_deref(),
+            Some("2026-07-23 00:00:00")
+        );
+    }
+
+    #[test]
+    fn binary_cells_use_reversible_hex_and_invalid_text_fails() {
+        let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+        let (_, rows) = sqlite_query(&sqlite, "SELECT X'00FF41'").unwrap();
+        assert_eq!(rows, vec![vec![Some("\\x00ff41".into())]]);
+        let error = sqlite_query(&sqlite, "SELECT CAST(X'80' AS TEXT)").unwrap_err();
+        assert!(error.message.contains("invalid UTF-8"));
+
+        let duck = duckdb::Connection::open_in_memory().unwrap();
+        let (_, rows) = duck_query(&duck, "SELECT from_hex('00ff41')").unwrap();
+        assert_eq!(rows, vec![vec![Some("\\x00ff41".into())]]);
+        let (backend, _) = DuckConn::open(&duck_mem()).unwrap();
+        let mut duck = match backend {
+            Backend::Duck(duck) => duck,
+            _ => panic!("expected DuckDB backend"),
+        };
+        match duck
+            .run_single("SELECT from_hex('00ff41')", 10, true)
+            .unwrap()
+        {
+            QueryOutcome::Rows { rows, .. } => {
+                assert_eq!(rows, vec![vec![Some("\\x00ff41".into())]])
+            }
+            _ => panic!("expected rows"),
+        }
+
+        let binary = MySqlColumnMeta {
+            column_type: mysql_async::consts::ColumnType::MYSQL_TYPE_BLOB,
+            binary: true,
+        };
+        assert_eq!(
+            mysql_value_to_string(
+                &mysql_async::Value::Bytes(vec![0x00, 0xff, 0x41]),
+                Some(binary),
+            )
+            .unwrap(),
+            Some("\\x00ff41".into())
+        );
+        let text = MySqlColumnMeta {
+            binary: false,
+            ..binary
+        };
+        assert!(
+            mysql_value_to_string(&mysql_async::Value::Bytes(vec![0xff]), Some(text),).is_err()
+        );
+        use mysql_async::consts::ColumnType;
+        assert!(!mysql_is_binary_column(ColumnType::MYSQL_TYPE_LONG, 63,));
+        assert!(mysql_is_binary_column(ColumnType::MYSQL_TYPE_BLOB, 63,));
+    }
+
+    #[test]
+    fn mysql_query_boundary_refuses_multiple_statements() {
+        assert!(mysql_single_statement("SELECT 1").is_ok());
+        assert!(mysql_single_statement("SELECT ';' AS value").is_ok());
+        assert!(mysql_single_statement("SELECT 1; DROP TABLE t").is_err());
+        assert!(mysql_single_statement("SELECT 1 /*! COMMIT */").is_err());
+        assert!(mysql_single_statement("COPY t FROM stdin;\n1\n\\.\n").is_err());
+    }
+
+    #[test]
+    fn duck_parser_poison_leak_budget_stops_new_gates() {
+        let (backend, _) = DuckConn::open(&duck_mem()).unwrap();
+        let d = match backend {
+            Backend::Duck(d) => d,
+            _ => panic!("expected DuckDB backend"),
+        };
+        d.gate_poison_leaks
+            .store(MAX_DUCK_GATE_POISON_LEAKS, Ordering::Relaxed);
+        let err = d.parse_check("SELECT 1").unwrap_err();
+        assert!(err.message.contains("safety budget exhausted"));
+    }
+
     /// FROM-first / PIVOT forms must stream through the LIMIT/OFFSET pager like any
     /// SELECT (they classify as cursorable in lib.rs): the subquery wrap must accept
     /// them, and the non-cursorable path would buffer entire tables in RAM.
     #[tokio::test]
     async fn duck_from_first_and_pivot_stream() {
         let (mut b, _) = connect(&duck_mem()).await.unwrap();
-        b.run_single("CREATE TABLE t(a INT, k TEXT)", 1, false).await.unwrap();
-        b.run_single("INSERT INTO t VALUES (1,'x'),(2,'y'),(3,'x')", 1, false).await.unwrap();
+        b.run_single("CREATE TABLE t(a INT, k TEXT)", 1, false)
+            .await
+            .unwrap();
+        b.run_single("INSERT INTO t VALUES (1,'x'),(2,'y'),(3,'x')", 1, false)
+            .await
+            .unwrap();
         match b.run_single("FROM t", 2, true).await.unwrap() {
             QueryOutcome::Rows { rows, done, .. } => {
                 assert_eq!(rows.len(), 2);
@@ -2069,7 +3271,11 @@ mod tests {
             _ => panic!("expected rows from FROM-first"),
         }
         b.rollback_cursor().await;
-        match b.run_single("PIVOT t ON k USING sum(a)", 10, true).await.unwrap() {
+        match b
+            .run_single("PIVOT t ON k USING sum(a)", 10, true)
+            .await
+            .unwrap()
+        {
             QueryOutcome::Rows { rows, .. } => assert_eq!(rows.len(), 1),
             _ => panic!("expected rows from PIVOT"),
         }
@@ -2084,40 +3290,70 @@ mod tests {
     #[tokio::test]
     async fn duck_syntax_error_survivable() {
         let (mut b, _) = connect(&duck_mem()).await.unwrap();
-        b.run_single("CREATE TABLE t(a INT)", 1, false).await.unwrap();
-        b.run_single("INSERT INTO t VALUES (1),(2)", 1, false).await.unwrap();
+        b.run_single("CREATE TABLE t(a INT)", 1, false)
+            .await
+            .unwrap();
+        b.run_single("INSERT INTO t VALUES (1),(2)", 1, false)
+            .await
+            .unwrap();
 
         // comment-eaten comma → NOT IN (1 2) → parser error
         let bad = "SELECT * FROM t WHERE a NOT IN (\n  1 -- one,\n  2 -- two\n)";
         let e = b.run_single(bad, 100, true).await.unwrap_err();
-        assert!(e.message.contains("Parser Error"), "want parser error, got: {}", e.message);
-        assert!(!e.message.contains("deadlock"), "poisoned connection leaked through: {}", e.message);
+        assert!(
+            e.message.contains("Parser Error"),
+            "want parser error, got: {}",
+            e.message
+        );
+        assert!(
+            !e.message.contains("deadlock"),
+            "poisoned connection leaked through: {}",
+            e.message
+        );
 
         // connection still works after the syntax error
-        match b.run_single("SELECT a FROM t ORDER BY a", 100, true).await.unwrap() {
+        match b
+            .run_single("SELECT a FROM t ORDER BY a", 100, true)
+            .await
+            .unwrap()
+        {
             QueryOutcome::Rows { rows, .. } => assert_eq!(rows.len(), 2),
             _ => panic!("expected rows"),
         }
 
         // repeat: bad DDL (execute_batch path), bad script path, then a good query
-        let e2 = b.run_single("CREATE TABLEX u(a INT)", 1, false).await.unwrap_err();
+        let e2 = b
+            .run_single("CREATE TABLEX u(a INT)", 1, false)
+            .await
+            .unwrap_err();
         assert!(e2.message.contains("Parser Error"), "got: {}", e2.message);
         let items = script::split("INSERT INTO t VALUES (3);\nSELCT * FROM t;");
         let e3 = b.run_script(&items, false).await.unwrap_err();
         assert!(e3.message.contains("Parser Error"), "got: {}", e3.message);
         // the script's leading INSERT must not have executed (gated before the batch ran)
-        match b.run_single("SELECT count(*) FROM t", 100, true).await.unwrap() {
+        match b
+            .run_single("SELECT count(*) FROM t", 100, true)
+            .await
+            .unwrap()
+        {
             QueryOutcome::Rows { rows, .. } => assert_eq!(rows[0][0].as_deref(), Some("2")),
             _ => panic!("expected rows"),
         }
 
         // binder errors (valid parse, missing table) still come from the real catalog
-        let e4 = b.run_single("SELECT * FROM no_such_table", 100, true).await.unwrap_err();
+        let e4 = b
+            .run_single("SELECT * FROM no_such_table", 100, true)
+            .await
+            .unwrap_err();
         assert!(e4.message.contains("no_such_table"), "got: {}", e4.message);
 
         // bool_columns on unparseable SQL degrades to empty, doesn't poison
         assert!(b.bool_columns("SELCT 1").await.is_empty());
-        match b.run_single("SELECT a FROM t ORDER BY a", 100, true).await.unwrap() {
+        match b
+            .run_single("SELECT a FROM t ORDER BY a", 100, true)
+            .await
+            .unwrap()
+        {
             QueryOutcome::Rows { rows, .. } => assert_eq!(rows.len(), 2),
             _ => panic!("expected rows"),
         }
@@ -2134,16 +3370,22 @@ mod tests {
         cfg.path = Some(path.to_string_lossy().into_owned());
 
         let (mut b, _) = connect(&cfg).await.unwrap();
-        b.run_single("CREATE TABLE t(a INT)", 1, false).await.unwrap();
-        b.run_single("INSERT INTO t VALUES (42)", 1, false).await.unwrap();
+        b.run_single("CREATE TABLE t(a INT)", 1, false)
+            .await
+            .unwrap();
+        b.run_single("INSERT INTO t VALUES (42)", 1, false)
+            .await
+            .unwrap();
         assert!(!b.is_closed(), "open while in use");
 
         // A command finishing with nothing streaming releases the connection → lock freed.
-        b.release_idle();
+        b.release_idle(false);
         assert!(b.is_closed(), "released when idle");
 
         // The same file can now be opened by a fresh connection (the lock is gone).
-        let (b2, _) = connect(&cfg).await.expect("file lock freed after release_idle");
+        let (b2, _) = connect(&cfg)
+            .await
+            .expect("file lock freed after release_idle");
         drop(b2); // DuckDB is single-writer — free it before reopening b.
 
         // Reopen the original; the data written before the release must still be there.
@@ -2156,6 +3398,37 @@ mod tests {
             _ => panic!("expected rows"),
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn duckdb_manual_session_suppresses_idle_release() {
+        let path =
+            std::env::temp_dir().join(format!("tusk_manual_idle_{}.duckdb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = duck_mem();
+        cfg.path = Some(path.to_string_lossy().into_owned());
+        let (mut backend, _) = connect(&cfg).await.unwrap();
+        backend
+            .run_transaction_statement(
+                "BEGIN",
+                script::TransactionAction::Begin,
+                TransactionMode::None,
+            )
+            .await
+            .unwrap();
+
+        backend.release_idle(true);
+        assert!(
+            !backend.is_closed(),
+            "manual transaction must retain file lock"
+        );
+        backend.rollback_manual().await;
+        backend.release_idle(false);
+        assert!(
+            backend.is_closed(),
+            "finished transaction releases file lock"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     /// DuckDB temporal/decimal values must render like `CAST(… AS VARCHAR)` on the raw
@@ -2173,11 +3446,22 @@ mod tests {
         // `duck_query` runs values through `duck_value_to_string`.
         let (_c, raw) = duck_query(&conn, sel).unwrap();
         // VARCHAR cast is the authoritative rendering.
-        let (_c2, cast) = duck_query(&conn, &format!("SELECT CAST(COLUMNS(*) AS VARCHAR) FROM ({sel}) _t")).unwrap();
+        let (_c2, cast) = duck_query(
+            &conn,
+            &format!("SELECT CAST(COLUMNS(*) AS VARCHAR) FROM ({sel}) _t"),
+        )
+        .unwrap();
         assert_eq!(raw[0], cast[0], "formatter must match the VARCHAR cast");
-        assert_eq!(raw[0][0].as_deref(), Some("2024-03-15"), "DATE renders ISO, not Date32(..)");
+        assert_eq!(
+            raw[0][0].as_deref(),
+            Some("2024-03-15"),
+            "DATE renders ISO, not Date32(..)"
+        );
         assert!(
-            !raw[0].iter().flatten().any(|s| s.contains("Date32") || s.contains("Timestamp(") || s.contains("Time64")),
+            !raw[0]
+                .iter()
+                .flatten()
+                .any(|s| s.contains("Date32") || s.contains("Timestamp(") || s.contains("Time64")),
             "no Rust Debug leaks: {:?}",
             raw[0]
         );
@@ -2187,8 +3471,26 @@ mod tests {
     #[tokio::test]
     async fn duckdb_memory_stays_open_when_idle() {
         let (b, _) = connect(&duck_mem()).await.unwrap();
-        b.release_idle();
-        assert!(!b.is_closed(), ":memory: must stay open across idle (closing loses data)");
+        b.release_idle(false);
+        assert!(
+            !b.is_closed(),
+            ":memory: must stay open across idle (closing loses data)"
+        );
+    }
+
+    #[test]
+    fn duckdb_manual_error_state_is_recoverable() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t(a INTEGER PRIMARY KEY); BEGIN; INSERT INTO t VALUES (1)",
+        )
+        .unwrap();
+        let error = conn.execute_batch("INSERT INTO t VALUES (1)").unwrap_err();
+        assert!(error.to_string().contains("duplicate key"));
+        let probe = conn.execute_batch("SELECT 1").unwrap_err();
+        assert!(!duck_error_is_poison(&probe));
+        conn.execute_batch("ROLLBACK").unwrap();
+        conn.execute_batch("SELECT 1").unwrap();
     }
 
     #[test]
@@ -2208,7 +3510,12 @@ mod tests {
 
         let p1 = s.run_single("SELECT * FROM t ORDER BY a", 2, true).unwrap();
         let (cols, mut all, done1) = match p1 {
-            QueryOutcome::Rows { columns, rows, done, .. } => (columns, rows, done),
+            QueryOutcome::Rows {
+                columns,
+                rows,
+                done,
+                ..
+            } => (columns, rows, done),
             _ => panic!("expected rows"),
         };
         assert_eq!(cols, vec!["a", "b"]);
@@ -2218,8 +3525,12 @@ mod tests {
         assert_eq!(p2.rows.len(), 1);
         assert!(p2.done);
         all.extend(p2.rows);
-        assert!(all.iter().any(|r| r[0] == Some("1".to_string()) && r[1] == Some("x".to_string())));
-        assert!(all.iter().any(|r| r[0] == Some("3".to_string()) && r[1].is_none()));
+        assert!(all
+            .iter()
+            .any(|r| r[0] == Some("1".to_string()) && r[1] == Some("x".to_string())));
+        assert!(all
+            .iter()
+            .any(|r| r[0] == Some("3".to_string()) && r[1].is_none()));
 
         let tree = sqlite_build_tree(&s.lock()).unwrap();
         assert!(tree.schemas[0].tables.iter().any(|t| t.name == "t"));
@@ -2228,6 +3539,53 @@ mod tests {
         assert_eq!(det.columns[0].name, "a");
         let list = sqlite_list_tables(&s.lock()).unwrap();
         assert!(list.iter().any(|t| t.name == "t" && t.columns.len() == 2));
+    }
+
+    #[test]
+    fn transaction_tracker_recovery_loss_and_owner_are_revisioned() {
+        let (backend, _) = SqliteConn::open(&mem("sqlite")).unwrap();
+        let mut state = ConnState::new(backend, false);
+        state.apply_transaction_action(script::TransactionAction::Begin, "tab-a");
+        let id = state.transaction.id.clone();
+        assert_eq!(state.transaction.state, TransactionState::Active);
+        assert_eq!(state.transaction.revision, 1);
+        assert!(state.require_owner("tab-b").is_err());
+
+        state.mark_transaction_failed();
+        assert_eq!(state.transaction.state, TransactionState::Failed);
+        assert_eq!(
+            state.transaction.health,
+            TransactionHealth::RecoveryRequired
+        );
+        state.apply_transaction_action(script::TransactionAction::RollbackTo, "tab-a");
+        assert_eq!(state.transaction.state, TransactionState::Active);
+        assert_eq!(state.transaction.id, id);
+        assert_eq!(state.transaction.health, TransactionHealth::Healthy);
+
+        state.mark_transaction_lost();
+        assert_eq!(state.transaction.state, TransactionState::Lost);
+        assert_eq!(state.transaction.health, TransactionHealth::Lost);
+        assert_eq!(state.transaction.revision, 4);
+        state.mark_transaction_lost();
+        assert_eq!(state.transaction.revision, 4);
+    }
+
+    /// A new run takes over the shared result stream, so another tab's unfinished
+    /// page must not block `run_query` (transaction gate only) — while paging and
+    /// cancel keep the strict stream-owner gate.
+    #[test]
+    fn stream_owner_blocks_paging_but_not_new_runs() {
+        let (backend, _) = SqliteConn::open(&mem("sqlite")).unwrap();
+        let mut state = ConnState::new(backend, false);
+        state.stream_owner = Some("tab-a".to_string());
+        assert!(state.require_transaction_owner("tab-b").is_ok());
+        assert!(state.require_owner("tab-b").is_err());
+        assert!(state.require_owner("tab-a").is_ok());
+
+        // Under a manual transaction, both gates still refuse non-owner tabs.
+        state.apply_transaction_action(script::TransactionAction::Begin, "tab-a");
+        assert!(state.require_transaction_owner("tab-b").is_err());
+        assert!(state.require_transaction_owner("tab-a").is_ok());
     }
 
     /// The bundled libduckdb ships ICU installed-but-not-loaded, so
@@ -2246,12 +3604,18 @@ mod tests {
         b.run_single(
             "CREATE TABLE inventory_action (id INT, item_id INT, created_at TIMESTAMPTZ, \
              qty_delta INT, cost_delta INT, location_key VARCHAR, type VARCHAR)",
-            1, false,
-        ).await.unwrap();
+            1,
+            false,
+        )
+        .await
+        .unwrap();
         b.run_single(
             "INSERT INTO inventory_action VALUES (1, 1, now(), 5, 10, 'MAIN', 'PURCHASE')",
-            1, false,
-        ).await.unwrap();
+            1,
+            false,
+        )
+        .await
+        .unwrap();
 
         let q = "SELECT CAST(ia.created_at AS DATE) AS action_date FROM inventory_action ia";
         // The point is that the TIMESTAMPTZ→DATE cast SUCCEEDS (ICU loaded) — assert a
@@ -2271,7 +3635,7 @@ mod tests {
         }
 
         // Release + reopen (simulates idle lock release) — ICU must re-load.
-        b.release_idle();
+        b.release_idle(false);
         b.reopen().await.unwrap();
         match b.run_single(q, 50, true).await.unwrap() {
             QueryOutcome::Rows { rows, .. } => {
@@ -2301,7 +3665,12 @@ mod tests {
         // Page 1 of 2 over 3 rows: every value is text (COLUMNS(*) cast), not done.
         let p1 = d.run_single("SELECT * FROM t ORDER BY a", 2, true).unwrap();
         let (cols, mut all, done1) = match p1 {
-            QueryOutcome::Rows { columns, rows, done, .. } => (columns, rows, done),
+            QueryOutcome::Rows {
+                columns,
+                rows,
+                done,
+                ..
+            } => (columns, rows, done),
             _ => panic!("expected rows"),
         };
         assert_eq!(cols, vec!["a", "b"]);
@@ -2314,8 +3683,12 @@ mod tests {
         all.extend(p2.rows);
         assert_eq!(all.len(), 3);
         // Values are text; NULL is None.
-        assert!(all.iter().any(|r| r[0] == Some("1".to_string()) && r[1] == Some("x".to_string())));
-        assert!(all.iter().any(|r| r[0] == Some("3".to_string()) && r[1].is_none()));
+        assert!(all
+            .iter()
+            .any(|r| r[0] == Some("1".to_string()) && r[1] == Some("x".to_string())));
+        assert!(all
+            .iter()
+            .any(|r| r[0] == Some("3".to_string()) && r[1].is_none()));
 
         // Introspection: the table shows up; detail has 2 columns.
         let tree = duck_build_tree(&d.lock()).unwrap();

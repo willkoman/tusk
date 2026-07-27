@@ -6,6 +6,21 @@ import { highlightSql } from "../ai/sqlHighlight";
 import { PanZoomCanvas } from "../viz/PanZoomCanvas";
 import { type PanZoom } from "../viz/panzoom";
 import { layoutErd, type ErdNode } from "./erdLayout";
+import {
+  edgeDisplayLabel,
+  graphDisplayText,
+  graphError,
+  readDetailColumns,
+  readRelationships,
+  readSchemaGraph,
+  schemaGraphFallback,
+  type DetailCol,
+  type ErdColumn,
+  type ErdTable,
+  type FkEdge,
+  type SchemaGraphLoad,
+  type ValueLoad,
+} from "./graphLimits";
 
 // "DDL & relationships" viewer (explorer right-click): left = reconstructed
 // CREATE DDL (highlighted, copy / open-in-editor); right = FK graph in two
@@ -15,23 +30,10 @@ import { layoutErd, type ErdNode } from "./erdLayout";
 // schema_relationships (best-effort per driver — empty results render an
 // honest empty state, errors render a calm note).
 
-export type FkEdge = {
-  constraint: string;
-  srcSchema: string;
-  srcTable: string;
-  srcCols: string[];
-  dstSchema: string;
-  dstTable: string;
-  dstCols: string[];
-};
-type Relationships = { outbound: FkEdge[]; inbound: FkEdge[] };
-type ErdColumn = { name: string; dataType: string; isPk: boolean; isFk: boolean };
-type ErdTable = { schema: string; name: string; columns: ErdColumn[] };
-type SchemaGraph = { tables: ErdTable[]; edges: FkEdge[] };
-type DetailCol = { name: string; data_type: string; is_pk: boolean; is_fk: boolean };
+export type { FkEdge } from "./graphLimits";
 
 const errMsg = (e: unknown): string =>
-  e instanceof Object && "message" in e ? String((e as { message: unknown }).message) : String(e);
+  graphError(e);
 
 // Deterministic per-table hue (14 well-spaced steps — collisions possible on
 // big schemas but adjacent hubs almost never collide). Edges take the color of
@@ -40,7 +42,7 @@ const errMsg = (e: unknown): string =>
 const HUES = [210, 12, 130, 268, 35, 175, 322, 56, 232, 95, 290, 152, 20, 200];
 function tableHue(name: string): number {
   let h = 5381;
-  for (let i = 0; i < name.length; i++) h = ((h << 5) + h + name.charCodeAt(i)) | 0;
+  for (let i = 0; i < Math.min(name.length, 512); i++) h = ((h << 5) + h + name.charCodeAt(i)) | 0;
   return HUES[Math.abs(h) % HUES.length];
 }
 const edgeColor = (name: string) => `hsl(${tableHue(name)}, 60%, 52%)`;
@@ -64,11 +66,16 @@ const ERD_W = 240;
 const ERD_HEAD = 32;
 const ERD_ROW = 19;
 const ERD_MAX_ROWS = 12;
-const erdCardH = (t: ErdTable) => {
+type ErdTableMeta = { keys: ErdColumn[]; rowByName: Map<string, number>; h: number };
+const erdTableMeta = (t: ErdTable): ErdTableMeta => {
   const keys = t.columns.filter((c) => c.isPk || c.isFk);
   const rows = Math.min(keys.length, ERD_MAX_ROWS);
   const more = keys.length > ERD_MAX_ROWS || keys.length === 0 ? 1 : 0;
-  return ERD_HEAD + (rows + more) * ERD_ROW + 8;
+  return {
+    keys,
+    rowByName: new Map(keys.slice(0, ERD_MAX_ROWS).map((c, i) => [c.name, i])),
+    h: ERD_HEAD + (rows + more) * ERD_ROW + 8,
+  };
 };
 
 export function DdlGraphDialog(props: {
@@ -111,26 +118,25 @@ export function DdlGraphDialog(props: {
   });
   const [rels] = createResource(centered, async (c) => {
     try {
-      return await invoke<Relationships>("table_relationships", { connectionId: props.connectionId, schema: c.schema, name: c.name });
-    } catch {
-      return { outbound: [], inbound: [] } as Relationships;
+      return readRelationships(await invoke<unknown>("table_relationships", { connectionId: props.connectionId, schema: c.schema, name: c.name }));
+    } catch (e) {
+      return { kind: "error", message: errMsg(e) } as ValueLoad<never>;
     }
   });
   const [detail] = createResource(centered, async (c) => {
     try {
-      const d = await invoke<{ columns: DetailCol[] }>("table_detail", { connectionId: props.connectionId, schema: c.schema, name: c.name });
-      return d.columns;
-    } catch {
-      return [] as DetailCol[];
+      return readDetailColumns(await invoke<unknown>("table_detail", { connectionId: props.connectionId, schema: c.schema, name: c.name }));
+    } catch (e) {
+      return { kind: "error", message: errMsg(e) } as ValueLoad<never>;
     }
   });
   const [erd] = createResource(
     () => (scope() === "schema" ? center().schema : null),
     async (schema) => {
       try {
-        return await invoke<SchemaGraph>("schema_relationships", { connectionId: props.connectionId, schema });
+        return readSchemaGraph(await invoke<unknown>("schema_relationships", { connectionId: props.connectionId, schema }));
       } catch (e) {
-        return { tables: [], edges: [], err: errMsg(e) } as SchemaGraph & { err?: string };
+        return { kind: "error", message: errMsg(e) } as SchemaGraphLoad;
       }
     },
   );
@@ -140,18 +146,21 @@ export function DdlGraphDialog(props: {
     setCenter({ schema, name, kind: "table" });
   };
 
-  const edgeLabel = (e: FkEdge) => `${e.srcCols.join(", ")} → ${e.dstCols.join(", ")}`;
+  const edgeLabel = edgeDisplayLabel;
 
   // ---- neighborhood layout (deterministic 3-column) ----
   const hood = createMemo(() => {
-    const r = rels();
-    const cols = (detail() ?? []).slice(0, MAX_COLS);
-    if (!r) return null;
+    const relLoad = rels();
+    if (!relLoad || relLoad.kind !== "ok") return null;
+    const r = relLoad.value;
+    const detailLoad = detail();
+    const allCols = detailLoad?.kind === "ok" ? detailLoad.value : [];
+    const cols = allCols.slice(0, MAX_COLS);
     const self = (e: FkEdge) => e.srcTable === center().name && e.dstTable === center().name && e.srcSchema === e.dstSchema;
     const inbound = r.inbound.filter((e) => !self(e));
     const outbound = r.outbound.filter((e) => !self(e));
     const selfRefs = r.outbound.filter(self);
-    const ctrH = CTR_HEAD + Math.max(1, cols.length + ((detail()?.length ?? 0) > MAX_COLS ? 1 : 0)) * COL_ROW_H + 8;
+    const ctrH = CTR_HEAD + Math.max(1, cols.length + (allCols.length > MAX_COLS ? 1 : 0)) * COL_ROW_H + 8;
     const colH = (n: number) => n * NB_H + Math.max(0, n - 1) * GAP_Y;
     const totalH = Math.max(ctrH, colH(inbound.length), colH(outbound.length), NB_H);
     const stack = (n: number, i: number) => (totalH - colH(n)) / 2 + i * (NB_H + GAP_Y);
@@ -192,31 +201,38 @@ export function DdlGraphDialog(props: {
       selfRefs,
       ctr,
       cols,
-      moreCols: Math.max(0, (detail()?.length ?? 0) - MAX_COLS),
+      moreCols: Math.max(0, allCols.length - MAX_COLS),
       colY,
       bbox: { x: 0, y: 0, w: outX + NB_W, h: totalH },
     };
   });
+  const relError = createMemo(() => {
+    const load = rels();
+    return load?.kind === "error" ? load.message : null;
+  });
 
   // ---- ERD layout ----
-  // Hard ceiling: layout cost grows superlinearly with table count and runs
-  // synchronously inside this memo — thousands of tables would freeze the UI for
-  // minutes. Above the cap we skip layout entirely and say so (the Neighborhood
-  // view still works per-table at any schema size).
-  const ERD_MAX_TABLES = 600;
-  const erdTooBig = createMemo(() => (erd()?.tables.length ?? 0) > ERD_MAX_TABLES);
+  // Validation rejects malformed/oversized values before synchronous layout or
+  // DOM rendering. Above the table cap, keep only the count for the empty state.
+  const erdTableCount = createMemo(() => {
+    const load = erd();
+    return load?.kind === "ok" ? load.graph.tables.length : load?.kind === "too-large" ? load.tableCount : 0;
+  });
   const erdLayoutMemo = createMemo(() => {
-    const g = erd();
-    if (!g || !g.tables.length || erdTooBig()) return null;
+    const load = erd();
+    if (!load || load.kind !== "ok" || !load.graph.tables.length) return null;
+    const g = load.graph;
     const names = new Set(g.tables.map((t) => t.name));
     // schema_relationships includes cross-schema edges touching this schema,
     // while this ERD only has cards for this schema. Skip unresolved endpoints
     // rather than dereferencing a missing card (or misrouting to a same-name card).
     const edges = g.edges.filter((e) =>
       e.srcSchema === center().schema && e.dstSchema === center().schema && names.has(e.srcTable) && names.has(e.dstTable));
-    const nodes: ErdNode[] = g.tables.map((t) => ({ id: t.name, w: ERD_W, h: erdCardH(t) }));
+    const meta = new Map(g.tables.map((t) => [t.name, erdTableMeta(t)]));
+    const nodes: ErdNode[] = g.tables.map((t) => ({ id: t.name, w: ERD_W, h: meta.get(t.name)!.h }));
     const l = layoutErd(nodes, edges.map((e) => ({ from: e.srcTable, to: e.dstTable })));
-    return { ...l, graph: { ...g, edges } };
+    if (l.pos.size !== nodes.length) return null;
+    return { ...l, graph: { ...g, edges }, meta };
   });
 
   // ---- ERD manual drag: click = drill in, click-DRAG = reposition (pinned
@@ -290,11 +306,11 @@ export function DdlGraphDialog(props: {
     }
     if (d && !d.moved) onClick?.(); // a true click, not a drag
   };
+  const cancelDrag = (e: PointerEvent) => endDrag(e);
 
   // O(1) lookups for the render hot paths (93 tables × 100+ edges re-render on
   // every hover/drag frame — no linear scans inside <For> bodies).
   const erdGraph = createMemo(() => erdLayoutMemo()?.graph);
-  const erdTableByName = createMemo(() => new Map((erdGraph()?.tables ?? []).map((t) => [t.name, t])));
   const erdAdj = createMemo(() => {
     const m = new Map<string, Set<string>>();
     const add = (a: string, b: string) => (m.get(a) ?? m.set(a, new Set()).get(a)!).add(b);
@@ -319,7 +335,9 @@ export function DdlGraphDialog(props: {
 
   // Per-edge fan indices: edges sharing an anchor point (same destination PK
   // row, or same source column) get spread by a few px so they never coincide.
-  const edgeKey = (e: FkEdge) => `${e.constraint}:${e.srcTable}`;
+  const edgeKey = (e: FkEdge) => JSON.stringify([
+    e.constraint, e.srcSchema, e.srcTable, e.srcCols, e.dstSchema, e.dstTable, e.dstCols,
+  ]);
   const erdFan = createMemo(() => {
     const g = erdGraph();
     const out = new Map<string, { si: number; sn: number; di: number; dn: number }>();
@@ -344,15 +362,14 @@ export function DdlGraphDialog(props: {
     }
     return out;
   });
-  const erdRowY = (t: ErdTable, col: string, topY: number): number => {
-    const keys = t.columns.filter((c) => c.isPk || c.isFk).slice(0, ERD_MAX_ROWS);
-    const i = keys.findIndex((c) => c.name === col);
-    return i >= 0 ? topY + ERD_HEAD + i * ERD_ROW + ERD_ROW / 2 : topY + erdCardH(t) / 2;
+  const erdRowY = (meta: ErdTableMeta, col: string, topY: number): number => {
+    const i = meta.rowByName.get(col);
+    return i !== undefined ? topY + ERD_HEAD + i * ERD_ROW + ERD_ROW / 2 : topY + meta.h / 2;
   };
 
   return (
     <Dialog
-      title={center().name ? `DDL & relationships — ${center().schema}.${center().name}` : `Schema diagram — ${center().schema}`}
+      title={center().name ? `DDL & relationships — ${graphDisplayText(center().schema)}.${graphDisplayText(center().name!)}` : `Schema diagram — ${graphDisplayText(center().schema)}`}
       width={Math.min(window.innerWidth - 64, 1280)}
       class="modal-tall"
       onClose={props.onClose}
@@ -402,8 +419,8 @@ export function DdlGraphDialog(props: {
               <button classList={{ active: scope() === "schema" }} onClick={() => setScope("schema")}>Whole schema</button>
             </span>
             <span class="spacer" />
-            <Show when={scope() === "schema" && (erd()?.tables.length ?? 0) > 300}>
-              <span class="relviz-warn">large schema — {erd()!.tables.length} tables</span>
+            <Show when={scope() === "schema" && erdTableCount() > 300}>
+              <span class="relviz-warn">large schema — {erdTableCount()} tables</span>
             </Show>
             <button
               class="ghost"
@@ -424,8 +441,11 @@ export function DdlGraphDialog(props: {
 
           <Switch>
             <Match when={scope() === "neighborhood"}>
-              <Show when={hood()} fallback={<div class="relviz-note">loading…</div>}>
-                {(h) => (
+              <Switch>
+                <Match when={rels.loading}><div class="relviz-note">loading…</div></Match>
+                <Match when={relError()}>{(message) => <div class="relviz-empty">{message()}</div>}</Match>
+                <Match when={hood()}>
+                  {(h) => (
                   <Show
                     when={h().inbound.length || h().outbound.length || h().selfRefs.length}
                     fallback={
@@ -490,6 +510,7 @@ export function DdlGraphDialog(props: {
                             onPointerDown={(e) => beginDrag(e, "hood", `in:${i()}`, -1, [])}
                             onPointerMove={moveDrag}
                             onPointerUp={(e) => endDrag(e, () => recenter(n.e.srcSchema, n.e.srcTable))}
+                            onPointerCancel={cancelDrag}
                           />
                         )}
                       </For>
@@ -499,6 +520,7 @@ export function DdlGraphDialog(props: {
                         onPointerDown={(e) => beginDrag(e, "hood", "ctr", -1, [])}
                         onPointerMove={moveDrag}
                         onPointerUp={(e) => endDrag(e)}
+                        onPointerCancel={cancelDrag}
                       >
                         <CenterCard name={center().name ?? ""} cols={h().cols} more={h().moreCols} selfRefs={h().selfRefs.length} />
                       </div>
@@ -512,13 +534,15 @@ export function DdlGraphDialog(props: {
                             onPointerDown={(e) => beginDrag(e, "hood", `out:${i()}`, -1, [])}
                             onPointerMove={moveDrag}
                             onPointerUp={(e) => endDrag(e, () => recenter(n.e.dstSchema, n.e.dstTable))}
+                            onPointerCancel={cancelDrag}
                           />
                         )}
                       </For>
                     </PanZoomCanvas>
                   </Show>
-                )}
-              </Show>
+                  )}
+                </Match>
+              </Switch>
             </Match>
 
             <Match when={scope() === "schema"}>
@@ -527,9 +551,7 @@ export function DdlGraphDialog(props: {
                   when={erdLayoutMemo()}
                   fallback={
                     <div class="relviz-empty">
-                      {erdTooBig()
-                        ? `Schema too large for the ERD (${erd()!.tables.length} tables, limit ${ERD_MAX_TABLES}) — use the Neighborhood view per table.`
-                        : `No tables found in schema “${center().schema}”.`}
+                      {schemaGraphFallback(erd(), center().schema)}
                     </div>
                   }
                 >
@@ -546,6 +568,7 @@ export function DdlGraphDialog(props: {
                                 onPointerDown={(e) => beginDrag(e, "group", gr.label, gi(), gr.members)}
                                 onPointerMove={moveDrag}
                                 onPointerUp={(e) => endDrag(e)}
+                                onPointerCancel={cancelDrag}
                               >
                                 {gr.label}
                               </div>
@@ -562,9 +585,9 @@ export function DdlGraphDialog(props: {
                       >
                         <For each={l().graph.edges}>
                           {(e) => {
-                            const st = erdTableByName().get(e.srcTable);
-                            const dt = erdTableByName().get(e.dstTable);
-                            if (!st || !dt) return null;
+                            const sm = l().meta.get(e.srcTable);
+                            const dm = l().meta.get(e.dstTable);
+                            if (!sm || !dm) return null;
                             const key = edgeKey(e);
                             const fan = erdFan().get(key) ?? { si: 0, sn: 1, di: 0, dn: 1 };
                             // Geometry is a memo over epos so edges FOLLOW manual
@@ -574,8 +597,8 @@ export function DdlGraphDialog(props: {
                               const dp = epos(l(), e.dstTable);
                               if (!sp || !dp) return null;
                               const clamp = (y: number, top: number, h: number) => Math.max(top + 8, Math.min(top + h - 8, y));
-                              const y1 = clamp(erdRowY(st, e.srcCols[0] ?? "", sp.y) + fanOffset(fan.si, fan.sn), sp.y, erdCardH(st));
-                              const y2 = clamp(erdRowY(dt, e.dstCols[0] ?? "", dp.y) + fanOffset(fan.di, fan.dn), dp.y, erdCardH(dt));
+                              const y1 = clamp(erdRowY(sm, e.srcCols[0] ?? "", sp.y) + fanOffset(fan.si, fan.sn), sp.y, sm.h);
+                              const y2 = clamp(erdRowY(dm, e.dstCols[0] ?? "", dp.y) + fanOffset(fan.di, fan.dn), dp.y, dm.h);
                               // Vertically stacked cards (heavy x-overlap) get a
                               // right-side loop — the left/right S-curve degenerates
                               // into a near-vertical squiggle through the cards.
@@ -616,7 +639,8 @@ export function DdlGraphDialog(props: {
                       <For each={l().graph.tables}>
                         {(t) => {
                           const p = () => epos(l(), t.name);
-                          const keys = t.columns.filter((c) => c.isPk || c.isFk);
+                          const meta = l().meta.get(t.name)!;
+                          const keys = meta.keys;
                           return (
                             <Show when={p()}>
                               <div
@@ -626,6 +650,7 @@ export function DdlGraphDialog(props: {
                                 onPointerDown={(e) => beginDrag(e, "table", t.name, -1, [])}
                                 onPointerMove={moveDrag}
                                 onPointerUp={(e) => endDrag(e, () => recenter(t.schema, t.name))}
+                                onPointerCancel={cancelDrag}
                                 onMouseEnter={() => setHoverTable(t.name)}
                                 onMouseLeave={() => setHoverTable(null)}
                                 title="Click: neighborhood view · drag: reposition"
@@ -662,7 +687,7 @@ export function DdlGraphDialog(props: {
 function CenterCard(props: { name: string; cols: DetailCol[]; more: number; selfRefs?: number }) {
   return (
     <div class="hood-center" style={{ width: `${CTR_W}px` }}>
-      <div class="hood-center-head"><Icon name="table" /> {props.name}{(props.selfRefs ?? 0) > 0 ? <span class="hood-self" title="Self-referencing foreign key">↺</span> : null}</div>
+      <div class="hood-center-head"><Icon name="table" /> {graphDisplayText(props.name)}{(props.selfRefs ?? 0) > 0 ? <span class="hood-self" title="Self-referencing foreign key">↺</span> : null}</div>
       <For each={props.cols}>
         {(c) => (
           <div class="erd-col" style={{ height: `${COL_ROW_H}px` }}>
@@ -685,6 +710,7 @@ function NeighborCard(props: {
   onPointerDown: (e: PointerEvent) => void;
   onPointerMove: (e: PointerEvent) => void;
   onPointerUp: (e: PointerEvent) => void;
+  onPointerCancel: (e: PointerEvent) => void;
 }) {
   const name = () => (props.side === "in" ? props.edge.srcTable : props.edge.dstTable);
   const schema = () => (props.side === "in" ? props.edge.srcSchema : props.edge.dstSchema);
@@ -695,6 +721,7 @@ function NeighborCard(props: {
       onPointerDown={(e) => props.onPointerDown(e)}
       onPointerMove={(e) => props.onPointerMove(e)}
       onPointerUp={(e) => props.onPointerUp(e)}
+      onPointerCancel={(e) => props.onPointerCancel(e)}
       title={`${schema()}.${name()} — click: re-center · drag: reposition`}
     >
       <div class="hood-card-name"><span class="erd-hue" style={{ background: edgeColor(name()) }} /><Icon name="table" /> {name()}</div>

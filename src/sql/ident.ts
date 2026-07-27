@@ -39,11 +39,26 @@ export function qualifyIn(schema: string, name: string, activeSchema?: string | 
   return activeSchema && schema === activeSchema ? ident(name) : qualify(schema, name);
 }
 
+const hexText = (s: string): string =>
+  Array.from(new TextEncoder().encode(s), (byte) => byte.toString(16).padStart(2, "0")).join("");
+const hasControl = (s: string): boolean => Array.from(s).some((ch) => {
+  const code = ch.charCodeAt(0);
+  return code <= 0x1f || (code >= 0x7f && code <= 0x9f);
+});
+
 /** Quote a string literal. MySQL uses a UTF-8 hex literal so backslash modes and control chars cannot realign quotes. */
 export function lit(s: string): string {
   if (dialect === "mysql" && s !== "") {
     const hex = Array.from(new TextEncoder().encode(s), (b) => b.toString(16).padStart(2, "0")).join("");
     return `_utf8mb4 X'${hex}'`;
   }
+  if (dialect === "postgres") {
+    if (s.includes("\0")) throw new Error("PostgreSQL text literals cannot contain a zero byte");
+    // Explicit escape syntax makes backslashes deterministic even when the session
+    // has `standard_conforming_strings = off`. Quotes still use SQL doubling.
+    if (s.includes("\\")) return `E'${s.replace(/\\/g, "\\\\").replace(/'/g, "''")}'`;
+  }
+  if (dialect === "sqlite" && hasControl(s)) return `CAST(X'${hexText(s)}' AS TEXT)`;
+  if (dialect === "duckdb" && hasControl(s)) return `decode(from_hex('${hexText(s)}'))`;
   return `'${s.replace(/'/g, "''")}'`;
 }

@@ -193,6 +193,34 @@ export const TOPICS: Topic[] = [
             "— (auto-commits)"
           ],
           [
+            "Manual transactions",
+            "yes",
+            "yes",
+            "yes",
+            "yes (pinned session)"
+          ],
+          [
+            "Savepoints",
+            "yes",
+            "—",
+            "yes",
+            "yes"
+          ],
+          [
+            "`SET TRANSACTION`",
+            "yes (active, before work)",
+            "—",
+            "—",
+            "yes (before START)"
+          ],
+          [
+            "Persistent autocommit-off mode",
+            "—",
+            "—",
+            "—",
+            "yes (pinned session)"
+          ],
+          [
             "TLS",
             "yes",
             "n/a",
@@ -214,12 +242,12 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
-        "text": "Dropped connections heal themselves",
+        "text": "Dropped idle connections heal themselves",
         "id": "resilience"
       },
       {
         "k": "p",
-        "md": "Query duration is never capped, but dead-connection detection is: a **10-second connect timeout** plus aggressive TCP keepalives (5s idle, 2s interval, 3 retries, 15s user-timeout) surface a dead Postgres connection in roughly 10–15 seconds. Every command re-opens a closed connection transparently (the config, password included, stays server-side) and retries a query that dies mid-flight once — an idle-timeout or server restart heals on your next action."
+        "md": "Query duration is never capped, but dead-connection detection is: a **10-second connect timeout** plus aggressive TCP keepalives (5s idle, 2s interval, 3 retries, 15s user-timeout) surface a dead Postgres connection in roughly 10–15 seconds. An idle connection can reopen before your next explicit action, but Tusk **never replays** a statement after the server may have seen it. A dropped manual transaction is marked lost rather than reconstructed; reconnect and verify its outcome."
       },
       {
         "k": "tip",
@@ -232,11 +260,11 @@ export const TOPICS: Topic[] = [
   {
     "id": "editor",
     "title": "SQL editor, tabs & files",
-    "blurb": "Tabs, files, run controls, parameters, formatting, and per-tab active schema.",
+    "blurb": "Tabs, files, run controls, manual transactions, parameters, and per-tab active schema.",
     "blocks": [
       {
         "k": "p",
-        "md": "Every tab owns its SQL buffer, undo history, cursor, fold state, result snapshot, and grid view — but one server cursor per connection means only the last-run tab keeps streaming (see [[topic:results|Results & streaming]]). The tab set (SQL text, file bindings, titles, active schema) persists per connection and restores on reconnect; results and pending grid edits don't."
+        "md": "Every tab owns its SQL buffer, undo history, cursor, fold state, result snapshot, and grid view — but one server cursor per connection means only the last-run tab keeps streaming (see [[topic:results|Results & streaming]]). The tab set (SQL text, dirty state, file bindings, titles, active schema) persists per connection and restores on reconnect; results and pending grid edits don't."
       },
       {
         "k": "h",
@@ -247,7 +275,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**Open** — the **＋** button or [[kbd:Mod-t]].",
-          "**Close** — **×**, [[kbd:Mod-w]], or **middle-click**. A dirty tab (● dot) prompts an *Unsaved changes* dialog: **Save** / **Don't save** / **Cancel**.",
+          "**Close** — **×**, [[kbd:Mod-w]], or **middle-click**. A dirty tab (● dot) prompts an *Unsaved changes* dialog: **Save** / **Don't save** / **Cancel**. Closing the transaction owner first opens **Resolve transaction first**.",
           "**Right-click** — **Rename…**, **Close**, **Close others**, **Close tabs to the right**; bulk-close skips dirty tabs and reports how many were kept.",
           "**Reorder** — drag tabs; a vertical scroll wheel pans an overflowing strip.",
           "Closing the last tab leaves a fresh empty one."
@@ -279,7 +307,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**Run ▶** ([[kbd:Mod-Enter]]) runs the selection — *exactly* the selected text — otherwise the buffer. In flight, the button becomes **✕ Cancel** with a live elapsed counter; clicking it fires a real server-side cancel (a Postgres `CancelRequest` on PG) and reports a calm \"Query cancelled\" status, not an error."
+        "md": "**Run ▶** ([[kbd:Mod-Enter]]) runs the selection — *exactly* the selected text — otherwise the buffer. In flight, the button becomes **✕ Cancel** with a live elapsed counter. PostgreSQL uses a real server-side `CancelRequest`; engines without safe interruption finish the operation and report that cancellation is unavailable."
       },
       {
         "k": "p",
@@ -337,16 +365,50 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "A multi-statement run executes as a **transactional script** — any failure rolls everything back and reports the failing statement. One exception: when the *last* statement is a plain read, the leading statements run as a script and the trailing SELECT **streams to the grid** with pagination."
+        "md": "An ordinary idle multi-statement run with no transaction control uses one **app-owned transaction**. Any failure rolls back prior DML and reports the failing statement. A trailing read stays inside that wrapper, so the UI returns a summary instead of splitting it out for streaming. MySQL DDL and nontransactional tables retain their engine-level rollback limits."
       },
       {
         "k": "p",
         "md": "Pasted `pg_dump` output works: `COPY … FROM stdin` data blocks (terminated by `\\.`) are fed through `COPY`, even behind a leading `--` comment block."
       },
       {
+        "k": "h",
+        "text": "Manual transaction control",
+        "id": "manual-transactions"
+      },
+      {
+        "k": "p",
+        "md": "Run raw `BEGIN` or `START TRANSACTION`, `COMMIT` or `END`, and `ROLLBACK` or `ABORT` directly. Transaction-control scripts are lifecycle-preflighted and run statement by statement on one owner session — self-contained (`BEGIN; …; COMMIT`) or across separate runs. Savepoint / rollback-to / release work on PostgreSQL, SQLite, and MySQL. PostgreSQL supports `SET TRANSACTION` while active and before work; MySQL supports it before `START TRANSACTION`. DuckDB has neither savepoints nor `SET TRANSACTION`; SQLite has no `SET TRANSACTION`."
+      },
+      {
+        "k": "p",
+        "md": "The transaction bar shows mode, id, state, owner tab, and elapsed time. Only the owner can run database work; other tabs stay editable but their queries and session-backed metadata are frozen. The bar offers **Switch to owner**, Commit/Rollback, MySQL next-transaction Start/Clear, and lost-session reconnect actions."
+      },
+      {
+        "k": "keys",
+        "rows": [
+          {
+            "action": "commitTransaction",
+            "does": "Commit the current transaction unit"
+          },
+          {
+            "action": "rollbackTransaction",
+            "does": "Roll back the current transaction unit"
+          }
+        ]
+      },
+      {
+        "k": "p",
+        "md": "MySQL `SET autocommit=0` keeps one physical connection pinned. **Commit unit** or **Rollback unit** ends only the current unit; **Commit & enable autocommit** runs `SET autocommit=1`, commits the current unit, and releases the owner session. Recognized implicit-commit DDL is blocked inside a tracked MySQL transaction, but DDL outside it still auto-commits and nontransactional tables cannot be rolled back."
+      },
+      {
         "k": "tip",
         "kind": "warn",
-        "md": "In the script-then-stream case, leading writes **commit before** the trailing SELECT runs — a failure there no longer rolls them back. A multi-statement run also can't be re-wrapped, so the grid's server-side sort/filter is disabled for it."
+        "md": "A PostgreSQL statement error or cancellation requires `ROLLBACK` or `ROLLBACK TO` before more work. A dropped or unexpectedly ended owner session becomes **Lost**: Tusk never reconnects or replays it. Disconnect, reconnect, and verify the outcome. Closing the owner tab, disconnecting, or closing Tusk requires resolving a healthy unit first; pending grid changes must be applied or discarded before its outer Commit/Rollback."
+      },
+      {
+        "k": "p",
+        "md": "Results and pending edits carry transaction id + revision provenance. Pre-BEGIN rows must be rerun before editing; commit, rollback, rollback-to, autocommit-unit boundaries, and loss leave affected rows visible but stale until rerun. Query history records scoped transaction-control and grid-Apply markers."
       },
       {
         "k": "h",
@@ -574,7 +636,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**While running** — Run becomes **✕ Cancel** with a live elapsed counter (updated every 200 ms); the final duration sits at the right of the result toolbar.",
-          "**One cursor per connection** (`tusk_cur`) — running in another tab or any sidebar action closes the previous stream; the old tab keeps its rows as a frozen snapshot marked done.",
+          "**One cursor per connection** (`tusk_cur`) — while idle, running in another tab or using the sidebar closes the previous stream; the old tab keeps its rows as a frozen snapshot marked done. During a manual transaction, other tabs/sidebar database actions are frozen and an owner run closes only its prior stream, not the outer transaction.",
           "**Dropped mid-stream** — the grid keeps what it has, shows an error banner plus a `streaming stopped — …` status; re-run to resume."
         ]
       },
@@ -705,16 +767,16 @@ export const TOPICS: Topic[] = [
   {
     "id": "grid-editing",
     "title": "Editing data in the grid",
-    "blurb": "Edit cells, delete, insert, paste — commit one reviewed transaction.",
+    "blurb": "Edit cells, delete, insert, paste — apply or commit one reviewed script.",
     "blocks": [
       {
         "k": "p",
-        "md": "Results from a plain single-table `SELECT` are editable: change cells, mark deletes, add rows, paste spreadsheet blocks — all as a **pending overlay** that touches nothing until you press **Commit…** and approve the script. The result toolbar holds **+ Row**, the pending counter (`✎ N changes`), **Commit…**, and **Discard**."
+        "md": "Results from a plain single-table `SELECT` are editable: change cells, mark deletes, add rows, paste spreadsheet blocks — all as a **pending overlay** that touches nothing until you preview the script. The result toolbar holds **+ Row**, the pending counter (`✎ N changes`), **Commit…** (or **Apply…** in the transaction owner), and **Discard**."
       },
       {
         "k": "demo",
         "id": "grid-edit",
-        "caption": "Edit cells, mark deletes, add rows — then commit one reviewed transaction."
+        "caption": "Edit cells, mark deletes, add rows — then preview and Apply or Commit."
       },
       {
         "k": "h",
@@ -841,23 +903,24 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
-        "text": "Commit: one reviewed transaction",
+        "text": "Apply or Commit: one reviewed script",
         "id": "commit"
       },
       {
         "k": "p",
-        "md": "**Commit…** shows the literal script in a preview dialog before anything runs — **UPDATEs, then DELETEs, then INSERTs** (a row both edited and delete-marked only deletes)."
+        "md": "**Commit…** / **Apply…** shows the literal script in a preview dialog before anything runs — **UPDATEs, then DELETEs, then INSERTs** (a row both edited and delete-marked only deletes)."
       },
       {
         "k": "code",
         "text": "UPDATE \"public\".\"users\" SET \"email\" = 'a@b.co' WHERE \"id\" = '42';\nDELETE FROM \"public\".\"users\" WHERE \"id\" = '7';\nINSERT INTO \"public\".\"users\" (\"name\") VALUES ('New');",
-        "caption": "A commit script — fully qualified, one transaction"
+        "caption": "A fully qualified script — app-owned or applied to the outer transaction"
       },
       {
         "k": "list",
         "ordered": false,
         "items": [
-          "**All-or-nothing** — one transaction; on failure it rolls back wholesale, pending edits are **kept**, and the error shows in the dialog.",
+          "**Outside a manual transaction:** Commit uses one app-owned transaction; failure rolls it back wholesale, keeps pending edits, and shows the error in the dialog.",
+          "**Inside the owner transaction:** Apply runs in the existing outer unit, clears the pending overlay on success, and leaves the outer transaction open. Use the transaction bar's Commit/Rollback separately. Pending edits must be applied or discarded before that outer unit can end.",
           "**WHERE clauses use the ORIGINAL loaded values** — edit a primary-key cell and the UPDATE still locates the old row. Composite PKs are AND-ed; a `NULL` original compares with `IS NULL`.",
           "Statements are fully qualified — the tab's active schema is ignored.",
           "On success the grid refreshes in place, keeping your [[topic:results|sort and filter]] view."
@@ -870,7 +933,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Pending edits are per-tab and index into the loaded snapshot, so scrolling and streaming more rows can't shift them. Anything that **replaces** the rows — re-running the query, a header sort, a column filter — first asks *\"Discard pending changes?\"* with the change count; toolbar **Discard** asks the same, and pending edits are never persisted (closing the tab or app drops them)."
+        "md": "Pending edits are per-tab and index into the loaded snapshot, so scrolling and streaming more rows can't shift them. Anything that **replaces** the rows — re-running the query, a header sort, a column filter — first asks *\"Discard pending changes?\"* with the change count; toolbar **Discard** asks the same, and pending edits are never persisted. Transaction id/revision provenance also matters: pre-BEGIN rows must be rerun before editing, and commit, rollback, rollback-to, autocommit-unit boundaries, or a lost session leave affected rows/pending edits stale until rerun."
       },
       {
         "k": "tip",
@@ -1003,7 +1066,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "Sidebar DDL shares your query connection: any sidebar action rolls back an open streaming cursor — a tab still paging a big result stops where it is (loaded rows stay)."
+        "md": "Sidebar DDL shares your query connection: while idle, a sidebar action rolls back an open streaming cursor — a tab still paging a big result stops where it is (loaded rows stay). Sidebar DDL is frozen while a manual transaction owns the session."
       },
       {
         "k": "h",
@@ -1115,12 +1178,12 @@ export const TOPICS: Topic[] = [
         "ordered": false,
         "items": [
           "**Loaded rows (N)** — formats what the grid currently holds, in memory.",
-          "**All rows (re-run query)** — re-executes server-side. Postgres streams via a dedicated cursor (`tusk_export_cur`) in **10,000-row batches** (constant memory); DuckDB, SQLite, and MySQL page via `LIMIT`/`OFFSET`."
+          "**All rows (re-run query)** — re-executes server-side. Postgres streams via a dedicated cursor (`tusk_export_cur`) in **10,000-row batches** (constant memory); DuckDB, SQLite, and MySQL page via `LIMIT`/`OFFSET`. This scope is frozen while a manual transaction owns the session; export Loaded rows instead."
         ]
       },
       {
         "k": "p",
-        "md": "The re-run honors the producing tab's active schema (the frozen snapshot carries its `search_path`), so unqualified names resolve as they did in the editor. The file is created lazily on the first row — an empty result writes nothing."
+        "md": "The re-run honors the producing tab's active schema (the frozen snapshot carries its `search_path`), so unqualified names resolve as they did in the editor. Empty results still atomically replace the destination with a valid configured artifact, such as headers, `[]`, SQL DDL, or an empty workbook."
       },
       {
         "k": "tip",
@@ -1683,12 +1746,12 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Before each send, Tusk fetches **5 rows** from up to **5 conversation-relevant tables** via the backend `sample_rows` command — a read-only `SELECT * FROM rel LIMIT 5` that never touches the streaming cursor, so a mid-stream question won't truncate a [[topic:results|running result]]. Rows format into a budgeted pipe-table (4,000 chars total, 80 per cell), cached per table until schema reload — grounding the model in your real date formats, id styles, and enum spellings."
+        "md": "When sample sharing is enabled, Tusk fetches **5 rows** from up to **5 conversation-relevant tables** via the backend `sample_rows` command — a read-only `SELECT * FROM rel LIMIT 5` that never touches the streaming cursor, so a mid-stream question won't truncate a [[topic:results|running result]]. Rows format into a budgeted pipe-table (4,000 chars total, 80 per cell), cached per table until schema reload — grounding the model in your real date formats, id styles, and enum spellings."
       },
       {
         "k": "tip",
         "kind": "warn",
-        "md": "Sample sharing is **on by default** — real cell values go to your AI provider. Untick **Share sample data with the model** in the panel's ⚙ drawer for a schema-only prompt. (It never applies to local providers, which have no third party.) The [[topic:slack|Slack bot]] builds its own context, sample rows included."
+        "md": "Sample sharing is **off by default** and fails closed if its preference cannot be saved. Tick **Share sample data with the model** in the panel's ⚙ drawer to opt in. Slack has its own default-off sample setting; neither path sends real cell values without that explicit consent."
       },
       {
         "k": "h",
@@ -1846,8 +1909,8 @@ export const TOPICS: Topic[] = [
           "**Wrappable reads only**: `SELECT` / `WITH` / `TABLE` / `VALUES`. `EXPLAIN` and `SHOW` are read-only but can't be a subquery, so they're rejected too.",
           "**Masked mutation scan** — strings, comments, dollar-quotes, and quoted identifiers are blanked, then `insert` / `update` / `delete` / `merge` / `drop` / `alter` / `truncate` / `create` / `grant` / `revoke` are word-boundary matched **anywhere** — catching writable CTEs like `WITH d AS (DELETE …) SELECT`, smuggled DDL, and `FOR UPDATE` / `FOR SHARE` row locks.",
           "**Hard row cap** — execution wraps the query as `SELECT * FROM (…) AS _tusk LIMIT cap+1` (*Max rows (file / hard cap)*, default **10,000**) with a \"(truncated at N rows)\" note.",
-          "**Timeout with a real cancel** — *Query timeout* (default **30 s**) races the query; expiry requests a server-side cancel (a real CancelRequest on Postgres, best-effort elsewhere).",
-          "**Postgres runs inside `BEGIN READ ONLY`** — even a side-effecting function in a SELECT can't write.",
+          "**Engine-aware timeout** — *Query timeout* (default **30 s**) uses a real server-side CancelRequest on Postgres; other engines report when a query may finish after Tusk stops waiting.",
+          "**Fresh engine-enforced read-only connection** — plus a conservative allowlist of common deterministic functions; unknown, file/network, session, sleep, extension, and sequence routines are rejected.",
           "**Never the UI's streaming cursor** — Slack queries run buffered, never through the shared server cursor a grid stream owns."
         ],
         "ordered": false
@@ -1892,7 +1955,7 @@ export const TOPICS: Topic[] = [
           [
             "Max rows (file / hard cap)",
             "10,000",
-            "100–1,000,000; the subquery `LIMIT` cap on every run"
+            "100–100,000; the subquery `LIMIT` cap on every run"
           ],
           [
             "Query timeout (seconds)",
@@ -1919,12 +1982,12 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "The bot targets the **most recently connected database** — a proposal approved after you switch connections runs against the *new* one (read-only gates still apply). An approved query also **rolls back any open streaming cursor** (same contract as sidebar commands): a mid-stream grid stops loading more rows, what's loaded stays; sample-row grounding never touches the cursor."
+        "md": "Every proposal is pinned to the exact Tusk connection, server-reported database, workspace, channel, thread, source message, and requester that created it. Switching connection or database makes approval fail closed. Execution uses a fresh read-only backend and does not join or roll back the UI cursor."
       },
       {
         "k": "list",
         "items": [
-          "Config edits (allowlists, caps, timeout, policy, AI provider) reload per-question — Save says *\"Saved — applies to the running bot on the next question.\"* **Token changes need a bot restart** (toggle off/on).",
+          "Config edits (allowlists, caps, timeout, policy, AI provider, sample consent) reload per-question. Replacing tokens validates them and restarts the running bot; restart failure stops and disables it.",
           "The timeout only preempts the async network drivers (Postgres/MySQL) — **DuckDB and SQLite run synchronously**, so a pathological embedded query holds the connection until it finishes (the timeout message notes the server may still be finishing it).",
           "The bot lives inside the desktop app — Tusk must be **open and connected**.",
           "One Slack query at a time (events handled sequentially)."
@@ -1970,7 +2033,7 @@ export const TOPICS: Topic[] = [
           "**Recorded** — anything launched from the editor: Run, run-selection, panel re-runs, multi-statement scripts (one entry).",
           "**Recorded with a marker** — queries approved through the [[topic:slack|Slack bot]] log with a leading `-- [Slack] asked by <user>` comment.",
           "**Not recorded** — grid sort/filter re-streams (internal `wrapped`-mode runs of `SELECT * FROM (…) _tusk`); only the original `base` query is kept.",
-          "**Not recorded** — [[topic:grid-editing|grid-edit]] commits: the UPDATE/DELETE/INSERT batch bypasses the shared executor."
+          "**Recorded** — [[topic:grid-editing|grid Commit/Apply]] scripts. Raw transaction controls and work inside a manual unit carry a leading transaction id/revision/event marker."
         ],
         "ordered": false
       },
@@ -2498,7 +2561,7 @@ export const TOPICS: Topic[] = [
     "blocks": [
       {
         "k": "p",
-        "md": "Read-only is enforced at three independent layers, the sidebar only offers actions your role can perform, and long-running work supports a real server-side cancel. This page covers what's blocked, what's disabled, and what leaves your machine."
+        "md": "Read-only is enforced at independent application and engine layers, the sidebar only offers actions your role can perform, and PostgreSQL long-running work supports a real server-side cancel. This page covers what's blocked, what's disabled, and what leaves your machine."
       },
       {
         "k": "h",
@@ -2513,8 +2576,8 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "ordered": true,
         "items": [
-          "**Engine-level** — Postgres gets `SET default_transaction_read_only = on`; file-backed DuckDB opens with `AccessMode::ReadOnly`; SQLite with `SQLITE_OPEN_READ_ONLY`.",
-          "**Statement classification** — only `SELECT`, `WITH`, `SHOW`, `EXPLAIN`, `TABLE`, and `VALUES` pass; anything else (even a `COPY` block in a pasted `pg_dump` file) rejects the whole run with *\"connection is read-only — writes and DDL are blocked\"*. MySQL has no engine-level read-only mode, so this guard is its protection.",
+          "**Engine-level** — Postgres gets `SET default_transaction_read_only = on`; file-backed DuckDB opens with `AccessMode::ReadOnly`; SQLite with `SQLITE_OPEN_READ_ONLY`; MySQL applies `SET SESSION TRANSACTION READ ONLY` on every pooled connection.",
+          "**Statement classification** — read forms and non-writable manual transaction control pass; writes, writable transaction modes, DDL, and `COPY` reject before execution with *\"connection is read-only — writes and DDL are blocked\"*.",
           "**UI gating** — mutating sidebar items disable with a *\"Connection is read-only\"* tooltip; [[topic:grid-editing|in-grid editing]] refuses to start (the grid menu shows *\"connection is read-only\"*); imports are blocked by the backend (*\"connection is read-only — import blocked\"*)."
         ]
       },
@@ -2565,7 +2628,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "While a query runs, the Run button becomes **✕ Cancel** with a live elapsed counter. It sends a real **Postgres `CancelRequest`** over a fresh short-lived connection — the server actually stops the query; DuckDB fires its interrupt handle; SQLite and MySQL have no out-of-band cancel, so their queries run to completion."
+        "md": "While a query runs, the Run button becomes **✕ Cancel** with a live elapsed counter. It sends a real **Postgres `CancelRequest`** over a fresh short-lived connection — the server actually stops the query; DuckDB fires its interrupt handle except on Windows, where unsafe interruption is disabled; SQLite and MySQL have no out-of-band cancel, so their queries run to completion. Cancelling work inside a PostgreSQL manual transaction normally leaves it in **Recovery required** until `ROLLBACK` or `ROLLBACK TO`."
       },
       {
         "k": "keys",
@@ -2582,16 +2645,16 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Streaming [[topic:import-export|exports and imports]] cancel the same way and clean up: a cancelled or failed export **deletes the partial file** (xlsx only writes at finish), and an import runs `CREATE` + `COPY` in one transaction that **rolls back wholesale**. Multi-statement scripts are transactional on every driver — an error rolls everything back and reports the failing statement."
+        "md": "Streaming [[topic:import-export|exports and imports]] cancel the same way and clean up: a cancelled or failed export **deletes the partial file** (xlsx only writes at finish), and an import runs `CREATE` + `COPY` in one transaction that **rolls back wholesale**. Ordinary multi-statement scripts get one transaction wrapper on every driver; MySQL DDL and nontransactional tables keep their native rollback limits."
       },
       {
         "k": "tip",
         "kind": "warn",
-        "md": "When the *last* statement of a batch is a plain read, the leading statements commit **before** it streams to the grid — a failing final `SELECT` won't roll them back. Cancel also can't abort the fast in-memory formatting of already-loaded rows."
+        "md": "An ordinary idle multi-statement batch with no transaction control stays inside one app-owned transaction and returns a summary; a trailing read is not split out for streaming. Explicit-control scripts use the owner session instead. Cancel can't abort the fast in-memory formatting of already-loaded rows."
       },
       {
         "k": "h",
-        "text": "Dropped connections heal themselves",
+        "text": "Dropped idle connections heal themselves",
         "id": "resilience"
       },
       {
@@ -2601,8 +2664,8 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "Every command checks liveness first and reconnects transparently after a drop (idle timeout, server restart, network blip).",
-          "A query that dies mid-flight because the connection closed is **retried once** on a fresh connection.",
+          "Every idle command checks liveness first and reconnects transparently before the next explicit action after a drop (idle timeout, server restart, network blip). An owned manual transaction is never reconnected; it becomes Lost.",
+          "A query is **never replayed automatically** after it may have reached the server; even a SELECT can call volatile or external functions. Tusk reports that the outcome may be unknown and asks you to verify state before retrying.",
           "A drop **mid-stream** shows an explicit error banner (*\"connection dropped mid-stream — the result is incomplete. Re-run the query to load the rest.\"*) over the rows fetched so far — never a silently truncated result presented as complete."
         ]
       },
@@ -2696,7 +2759,7 @@ export const TOPICS: Topic[] = [
         "ordered": false,
         "items": [
           "DM or `@mention` the bot with a question → the AI proposes SQL with **Approve / Reject** buttons. Only the requester can click; proposals expire after 5 minutes.",
-          "Approved queries are **read-only by construction**: single SELECT statement, a masked keyword scan that catches writable CTEs and smuggled DDL, a hard row cap, a timeout backed by a real server-side cancel, and `BEGIN READ ONLY` on Postgres — layered guards, never prompt-only (see [[topic:safety|Safety]]).",
+          "Approved queries are **read-only by construction**: one wrappable read, mutation/output/lock scans, executable-comment rejection, a conservative deterministic-function allowlist, a hard row cap, and a fresh engine-enforced read-only backend — layered guards, never prompt-only (see [[topic:safety|Safety]]).",
           "Results reply in-thread as an inline table, CSV/XLSX attachment, or a **chart rendered fully locally** (plotters → PNG, embedded font — nothing leaves your machine). Ask explicitly (\"as a bar chart, months on x\") and the AI's chart spec controls type, axes, and series; date+numeric results auto-chart too (Settings toggle, default on).",
           "Every result carries **Export as… CSV / Excel / JSON / Markdown** buttons (results cached 15 minutes).",
           "Every approved run lands in [[topic:history|query history]] with a `-- [Slack] asked by <user>` marker.",
@@ -2744,11 +2807,12 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "ordered": false,
         "items": [
-          "**[[topic:grid-editing|In-grid data editing]]** — single-table SELECTs with the full primary key become editable on every driver; cell edits, delete marks, and new rows stage until **Commit…** previews the UPDATE/DELETE/INSERT script and runs it as one transaction. Later releases added **clipboard paste** (TSV/CSV, header-mapped or positional), boolean TRUE/FALSE pills with a dropdown editor, and insert rows pinned to the **top**.",
+          "**[[topic:grid-editing|In-grid data editing]]** — single-table SELECTs with the full primary key become editable on every driver; cell edits, delete marks, and new rows stage until **Commit…** previews the UPDATE/DELETE/INSERT script and runs it atomically, or **Apply…** joins an existing owner transaction without committing it. Later releases added **clipboard paste** (TSV/CSV, header-mapped or positional), boolean TRUE/FALSE pills with a dropdown editor, and insert rows pinned to the **top**.",
           "**Parameter prompts** — `$1` or `:name` parameters open a per-parameter dialog (value, NULL, or raw splice) with live preview; values remembered per tab.",
           "**FK-aware JOIN completion** — after `JOIN orders o ON `, the [[topic:editor-intel|editor]] proposes complete join conditions from the live foreign-key catalog.",
-          "**Every-driver parity** — atomic multi-statement scripts on all four engines, per-dialect grid sort/filter SQL for MySQL/SQLite, streaming [[topic:import-export|export]] on every driver, saved profiles for DuckDB/SQLite/MySQL (file path or `:memory:`).",
-          "**AI upgrades** — model pickers list each provider's **live model catalog**, schema context is relevance-ranked instead of silently truncated, and the [[topic:ai|assistant]] auto-fetches **sample rows** from relevant tables before each message (toggleable, default on).",
+          "**Enterprise manual transactions** — raw BEGIN/START, COMMIT/END, ROLLBACK/ABORT, savepoints, supported SET TRANSACTION forms, and MySQL autocommit-off mode can own one tab/session across runs, with a transaction bar, frozen non-owner work, grid Apply vs outer Commit, provenance invalidation, and failed/lost recovery.",
+          "**Every-driver parity** — app-owned multi-statement wrappers on all four engines (subject to MySQL DDL/nontransactional-table semantics), per-dialect grid sort/filter SQL for MySQL/SQLite, streaming [[topic:import-export|export]] on every driver, saved profiles for DuckDB/SQLite/MySQL (file path or `:memory:`).",
+          "**AI upgrades** — model pickers list each provider's **live model catalog**, schema context is relevance-ranked instead of silently truncated, and the [[topic:ai|assistant]] can fetch **sample rows** from relevant tables after explicit opt-in (default off).",
           "**Appearance** — six new themes (Catppuccin Mocha, Dracula, Tokyo Night, Solarized Light, GitHub Light, Gruvbox Light), a refreshed app icon, responsive toolbars, and resizable docked panels with sizes persisted across sessions ([[topic:workspace|Workspace]]).",
           "**Sidebar QoL** — row estimates and sizes on Postgres tables, trigger listings, *Filter rows…* opens a table with the filter row pre-shown, and reliable double-click-to-run."
         ]

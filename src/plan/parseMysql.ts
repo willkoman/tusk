@@ -1,4 +1,13 @@
-import { type ParsedPlan, type PlanNode, finishTree, planInputWithinLimits, propStr } from "./types";
+import {
+  MAX_PLAN_JSON_CHARS,
+  MAX_PLAN_PROPS,
+  boundPlanText,
+  type ParsedPlan,
+  type PlanNode,
+  finishTree,
+  planInputWithinLimits,
+  propStr,
+} from "./types";
 
 // MySQL `EXPLAIN FORMAT=JSON` → PlanTree. Root is { query_block: {...} };
 // children hide under a zoo of wrapper keys that varies by version. Known
@@ -30,6 +39,7 @@ const LABELS: Record<string, string> = {
   union_result: "Union",
   table: "Table",
 };
+const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 
 function costOf(obj: Record<string, unknown>): { total?: number; self?: number } {
   const ci = obj["cost_info"];
@@ -52,16 +62,16 @@ function myNode(key: string, obj: Record<string, unknown>): PlanNode {
   const props: [string, string][] = [];
 
   for (const [k, v] of Object.entries(obj)) {
-    if (v && typeof v === "object" && !Array.isArray(v) && (CHILD_KEYS as readonly string[]).includes(k)) {
+    if (isRecord(v) && (CHILD_KEYS as readonly string[]).includes(k)) {
       children.push(myNode(k, v as Record<string, unknown>));
     } else if (Array.isArray(v) && (CHILD_LIST_KEYS as readonly string[]).includes(k)) {
       for (const item of v) {
-        if (item && typeof item === "object") {
+        if (isRecord(item)) {
           const it = item as Record<string, unknown>;
           // list items are wrappers like {table: {...}} or {query_block: {...}}
           let wrapped = false;
           for (const ck of CHILD_KEYS) {
-            if (it[ck] && typeof it[ck] === "object") {
+            if (isRecord(it[ck])) {
               children.push(myNode(ck, it[ck] as Record<string, unknown>));
               wrapped = true;
             }
@@ -69,8 +79,8 @@ function myNode(key: string, obj: Record<string, unknown>): PlanNode {
           if (!wrapped) children.push(myNode(k, it));
         }
       }
-    } else if (k !== "cost_info") {
-      props.push([k, propStr(v)]);
+    } else if (k !== "cost_info" && props.length < MAX_PLAN_PROPS) {
+      props.push([boundPlanText(k), propStr(v)]);
     }
   }
 
@@ -78,8 +88,8 @@ function myNode(key: string, obj: Record<string, unknown>): PlanNode {
   const access = typeof obj["access_type"] === "string" ? (obj["access_type"] as string) : undefined;
   const node: PlanNode = {
     id: 0,
-    label: key === "table" && access ? `Access (${access})` : (LABELS[key] ?? key),
-    object: typeof obj["table_name"] === "string" ? (obj["table_name"] as string) : undefined,
+    label: boundPlanText(key === "table" && access ? `Access (${access})` : (LABELS[key] ?? key)),
+    object: typeof obj["table_name"] === "string" ? boundPlanText(obj["table_name"] as string) : undefined,
     props,
     totalCost: total,
     selfCost: self,
@@ -96,16 +106,17 @@ function myNode(key: string, obj: Record<string, unknown>): PlanNode {
 }
 
 export function parseMysql(jsonText: string): ParsedPlan | null {
+  if (jsonText.length > MAX_PLAN_JSON_CHARS) return null;
   let parsed: unknown;
   try {
     parsed = JSON.parse(jsonText);
   } catch {
     return null;
   }
-  if (!parsed || typeof parsed !== "object") return null;
+  if (!isRecord(parsed)) return null;
   if (!planInputWithinLimits(parsed)) return null;
   const qb = (parsed as Record<string, unknown>)["query_block"];
-  if (!qb || typeof qb !== "object") return null;
+  if (!isRecord(qb)) return null;
   const root = myNode("query_block", qb as Record<string, unknown>);
   return finishTree("mysql", root, { hasActual: false });
 }

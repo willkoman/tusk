@@ -23,11 +23,15 @@ const TYPES = new Set(
     "datetime interval json jsonb uuid bytea blob clob money bit"
   ).split(/\s+/),
 );
+export const MAX_HIGHLIGHT_CHARS = 250_000;
 
 // comment | string | quoted-ident | number | word | whitespace | punctuation
 const TOKEN = /(--[^\n]*|\/\*[\s\S]*?\*\/)|('(?:[^']|'')*'?)|("(?:[^"]|"")*"?)|(`(?:[^`]|``)*`?)|(\d[\d.]*\b)|([A-Za-z_][\w$]*)|(\s+)|([^\w\s])/g;
 
 export function highlightSql(code: string): Tok[] {
+  // Preserve the full preview as one text node above the tokenization budget.
+  // Millions of tiny span nodes can OOM the WebView even when the source string fits.
+  if (code.length > MAX_HIGHLIGHT_CHARS) return [{ text: code, cls: "" }];
   const out: Tok[] = [];
   let m: RegExpExecArray | null;
   TOKEN.lastIndex = 0;

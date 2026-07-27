@@ -1,15 +1,15 @@
-import { createSignal, createMemo, createEffect, onMount, onCleanup, For, Show, lazy } from "solid-js";
+import { createSignal, createMemo, createEffect, on, onMount, onCleanup, For, Show, lazy } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "./App.css";
 import { isDarkTheme, normalizeTheme, type ThemeId } from "./themes";
-import { SqlEditor, type EditorApi } from "./SqlEditor";
+import { type EditorApi } from "./SqlEditor";
 import { driverDialect, type DialectId } from "./sql/dialects";
 import { type AiContext, type SampleTable } from "./ai/context";
 import { type CursorInfo, type EditorPrefs, type ServerDiag } from "./editor/types";
-import { prefsStore, tabsStore, layoutStore, type PersistedTabs } from "./store";
-import { makeTab, basename, gridViewFor, pendingCount, type Tab, type ResultSnapshot, type GridView, type SortKey, type Filter, type PendingEdits } from "./tabs";
+import { prefsStore, tabsStore, layoutStore, type PersistedTabs, type TabsPersistenceFailure } from "./store";
+import { makeTab, basename, gridViewFor, pendingCount, snapshotTabs as recoverySnapshot, type Tab, type ResultSnapshot, type GridView, type SortKey, type Filter, type PendingEdits } from "./tabs";
 import { ResultGrid } from "./ResultGrid";
 import { UpdateBadge } from "./UpdateBadge";
 import { wrapQuery, wrappableQuery, stripTrailingSemi, hasDuplicateColumns, hasViewRules } from "./grid/query";
@@ -42,6 +42,28 @@ import { Icon } from "./Icons";
 import { ident, qualify, qualifyIn, setSqlDialect } from "./sql/ident";
 import * as ddl from "./sql/ddl";
 import { clipWrite, clipRead } from "./clipboard";
+import { slackHistoryKey, type SlackExecuted } from "./slackEvents";
+import { KeyedSerialQueue } from "./asyncQueue";
+import {
+  IDLE_TRANSACTION,
+  INTERRUPTED_TRANSACTION_KEY,
+  acceptTransactionStatus,
+  decodeInterruptedTransaction,
+  encodeInterruptedTransaction,
+  transactionDatabaseAllowed,
+  transactionBoundaryStaleReason,
+  transactionControlAvailability,
+  transactionEvent,
+  transactionFromError,
+  transactionHistoryScope,
+  transactionHistorySql,
+  transactionOpen,
+  transactionOwnedBy,
+  transactionProvenanceNeedsRefresh,
+  transactionRecoveryAllowed,
+  type TransactionEvent,
+  type TransactionStatus,
+} from "./transaction";
 
 type ColumnInfo = { name: string; data_type: string };
 type TableInfo = { schema: string; name: string; columns: ColumnInfo[] };
@@ -62,17 +84,36 @@ type Profile = {
 type QueryOutcome =
   | { kind: "rows"; columns: string[]; rows: (string | null)[][]; done: boolean; note?: string }
   | { kind: "exec"; message: string };
-type FetchResult = { rows: (string | null)[][]; done: boolean };
-// Slack bot events (mirrors slack::StatusInfo / the slack:executed payload in Rust).
+type QueryResult = QueryOutcome & { transaction: TransactionStatus };
+type FetchResult = { rows: (string | null)[][]; done: boolean; transaction: TransactionStatus };
+type Connected = {
+  id: string;
+  version: string;
+  readOnly: boolean;
+  driver: string;
+  generation: number;
+  key: string;
+  target: string;
+};
+type UiOrigin = {
+  connectionId: string | null;
+  connectionGeneration: number;
+  tabId: string | null;
+  resultGeneration: number;
+  resultEpoch: number;
+  transactionRevision: number;
+};
+// Slack bot status mirrors slack::StatusInfo in Rust.
 type SlackStatus = { running: boolean; state: string; error: string | null };
-type SlackExecuted = { sql: string; durationMs: number; status: string; rows?: number; error?: string; slackUser: string };
 
 const PAGE = 1000;
+const MAX_LOCAL_SORT_ROWS = 250_000;
 const DDL_RE = /^\s*(create|alter|drop|truncate|comment|grant|revoke)\b/i;
 
 // Heavy, conditionally-rendered panels load as separate chunks on first open —
 // keeps the startup bundle (and its parse time) lean. All are behind <Show>,
 // so the chunk fetch happens only when the user actually opens the surface.
+const SqlEditor = lazy(() => import("./SqlEditor").then((m) => ({ default: m.SqlEditor })));
 const AiPanel = lazy(() => import("./ai/AiPanel").then((m) => ({ default: m.AiPanel })));
 const ExportDialog = lazy(() => import("./forms/ExportDialog").then((m) => ({ default: m.ExportDialog })));
 const WorkbenchDialogs = lazy(() => import("./WorkbenchDialogs").then((m) => ({ default: m.WorkbenchDialogs })));
@@ -110,6 +151,10 @@ type Capabilities = {
   ddl: boolean;
   relationships: boolean;
   explainAnalyze: boolean;
+  manualTransactions: boolean;
+  transactionSavepoints: boolean;
+  setTransaction: boolean;
+  autocommitMode: boolean;
 };
 
 // The connected role's effective privileges (from the `permissions` command). `enforced`
@@ -144,7 +189,19 @@ function fmtDur(ms: number): string {
 }
 
 function App() {
-  const [conn, setConn] = createSignal<{ id: string; version: string; readOnly: boolean } | null>(null);
+  const [conn, setConn] = createSignal<Connected | null>(null);
+  const [transaction, setTransaction] = createSignal<TransactionStatus>({ ...IDLE_TRANSACTION });
+  const [transactionStartedAt, setTransactionStartedAt] = createSignal<number | null>(null);
+  const [transactionNow, setTransactionNow] = createSignal(Date.now());
+  const [transactionWarning, setTransactionWarning] = createSignal("");
+  let transactionHistoryKey: string | null = null;
+  let deferredSchemaRefresh = false;
+  let connectionGeneration = 0;
+  let resultGeneration = 0;
+  let queryGeneration = 0;
+  let fetchGeneration = 0;
+  let schemaGeneration = 0;
+  let fkGeneration = 0;
 
   // saved profiles + connection form
   const [profiles, setProfiles] = createSignal<Profile[]>([]);
@@ -153,6 +210,7 @@ function App() {
   const [driver, setDriver] = createSignal("postgres");
   const [path, setPath] = createSignal(""); // DuckDB/SQLite file (empty = :memory:)
   const [caps, setCaps] = createSignal<Capabilities | null>(null);
+  const connectionKind = () => caps()?.kind ?? conn()?.driver ?? "postgres";
   const [perms, setPerms] = createSignal<Permissions | null>(null);
   const [aiOpen, setAiOpen] = createSignal(false);
   const [settingsOpen, setSettingsOpen] = createSignal<SettingsTab | null>(null); // non-null = open on that tab
@@ -162,12 +220,12 @@ function App() {
   const [helpOpen, setHelpOpen] = createSignal(false);
   // "DDL & relationships" viewer (read-only — standalone signal, not DialogState).
   // name=null = opened from a schema node, straight into the whole-schema ERD.
-  const [ddlGraph, setDdlGraph] = createSignal<{ schema: string; name: string | null; kind: string } | null>(null);
+  const [ddlGraph, setDdlGraph] = createSignal<{ schema: string; name: string | null; kind: string; connectionId: string; origin: UiOrigin } | null>(null);
   // Context handed to the AI: connected DB dialect/version, schema summary, the role's
   // privileges, the active schema, and the current editor SQL/selection/last error.
   const aiContext = (): AiContext => ({
-    dialect: caps()?.kind ?? "postgres",
-    driverLabel: driverLabel(caps()?.kind),
+    dialect: connectionKind(),
+    driverLabel: driverLabel(connectionKind()),
     version: conn()?.version ?? "",
     user: perms()?.currentUser ?? "",
     isSuperuser: !!perms()?.isSuperuser,
@@ -177,8 +235,9 @@ function App() {
     database: tree()?.database ?? "",
     skills: skills(),
     fks: fkEdges(),
-    // Only true once a fetch actually landed for some schema and the driver supports it.
-    fksKnown: caps()?.relationships !== false && fkFetched.size > 0,
+    // True only when every schema this prompt relies on (active + public) fetched
+    // successfully; one successful schema must not mask another failed lookup.
+    fksKnown: caps()?.relationships !== false && [...aiFkSchemas()].every((schemaName) => fkFetched.has(schemaName)),
     currentSql: editorApi()?.getDoc() ?? activeTab().sql,
     selection: editorApi()?.getSelection() ?? "",
     lastError: activeTab().result.runErr,
@@ -191,7 +250,8 @@ function App() {
   // between writer and reader showed every expanded table as "loading…" forever.
   async function aiSampleRows(targets: { schema: string; name: string }[]): Promise<SampleTable[]> {
     const c = conn();
-    if (!c) return [];
+    if (!c || metadataFrozen()) return [];
+    const transactionRevision = transaction().revision;
     const results = await Promise.all(
       targets.map(async (t): Promise<SampleTable | null> => {
         const key = relKey(t.schema, t.name);
@@ -201,7 +261,7 @@ function App() {
           const r = await invoke<{ columns: string[]; rows: (string | null)[][] }>("sample_rows", {
             connectionId: c.id, schema: t.schema, name: t.name, limit: 5,
           });
-          if (conn()?.id !== c.id) return null;
+          if (!connectionCurrent(c) || transaction().revision !== transactionRevision || metadataFrozen()) return null;
           const s: SampleTable = { schema: t.schema, name: t.name, columns: r.columns, rows: r.rows };
           sampleCache.set(key, s);
           return s;
@@ -231,17 +291,18 @@ function App() {
   // engine supports (the `sql/ddl.ts` builders emit DuckDB-compatible syntax) — the few
   // operations DuckDB can't do via ALTER are gated per-action with `noDuck`. MySQL/SQLite
   // still route to PG-syntax builders, so they stay off.
-  const ddlDriver = () => caps()?.kind === "postgres" || caps()?.kind === "duckdb";
+  const ddlDriver = () => connectionKind() === "postgres" || connectionKind() === "duckdb";
   const gate = (allowed: boolean, reason: string): { disabled?: boolean; title?: string } => {
+    if (metadataFrozen()) return { disabled: true, title: "Explorer database actions are frozen during a manual transaction" };
     if (conn()?.readOnly) return { disabled: true, title: "Connection is read-only" };
-    if (caps() && !ddlDriver())
-      return { disabled: true, title: `DDL editing isn't supported for ${driverLabel(caps()!.kind)} yet` };
+    if (conn() && !ddlDriver())
+      return { disabled: true, title: `DDL editing isn't supported for ${driverLabel(connectionKind())} yet` };
     return allowed ? {} : { disabled: true, title: reason };
   };
   // Disable an item that DuckDB's engine can't do (constraint ALTERs, rename index/
   // sequence/constraint, ALTER SEQUENCE RESTART, CREATE DATABASE). Spread AFTER gate().
   const noDuck = (reason: string): { disabled?: boolean; title?: string } =>
-    caps()?.kind === "duckdb" ? { disabled: true, title: reason } : {};
+    connectionKind() === "duckdb" ? { disabled: true, title: reason } : {};
   const [host, setHost] = createSignal("localhost");
   const [port, setPort] = createSignal(5432);
   const [user, setUser] = createSignal("");
@@ -275,7 +336,16 @@ function App() {
   // User-authored AI skills (stored on disk by Rust). Reloaded whenever Settings closes,
   // since that's the only place they're created/edited/imported/removed.
   const [skills, setSkills] = createSignal<Skill[]>([]);
-  const refreshSkills = () => invoke<Skill[]>("skills_list").then(setSkills).catch(() => setSkills([]));
+  let skillsGeneration = 0;
+  const refreshSkills = async () => {
+    const generation = ++skillsGeneration;
+    try {
+      const next = await invoke<Skill[]>("skills_list");
+      if (skillsGeneration === generation) setSkills(next);
+    } catch {
+      if (skillsGeneration === generation) setSkills([]);
+    }
+  };
   const fkFetched = new Set<string>(); // schemas fetched SUCCESSFULLY (cleared per introspection)
   const fkInFlight = new Set<string>(); // dedupe concurrent fetches of the same schema
   // Per-table detail (columns/indexes/constraints), fetched lazily on expand and cached.
@@ -283,27 +353,185 @@ function App() {
   const loadedRels = new Map<string, { schema: string; name: string }>();
   const detailInflight = new Set<string>();
   // Sidebar context menu + active workbench dialog.
-  const [menu, setMenu] = createSignal<MenuState>(null);
-  const [activeDialog, setActiveDialog] = createSignal<DialogState | null>(null);
+  const [menuState, setMenuState] = createSignal<MenuState>(null);
+  const menu = menuState;
+  const [dialogBinding, setDialogBinding] = createSignal<{ state: DialogState; origin: UiOrigin } | null>(null);
+  const activeDialog = () => dialogBinding()?.state ?? null;
   const [treeFilter, setTreeFilter] = createSignal("");
   // Currently-selected sidebar node (drives the context-aware "+" menu).
   const [selected, setSelected] = createSignal<NodeDescriptor | null>(null);
   // "View value" modal for a result-grid cell.
-  const [cellView, setCellView] = createSignal<{ col: string; val: string | null } | null>(null);
+  const [cellView, setCellView] = createSignal<{ col: string; val: string | null; origin: UiOrigin } | null>(null);
   // Editor tabs — each owns a SQL buffer + a snapshot of its last result grid.
   const [tabs, setTabs] = createSignal<Tab[]>([makeTab({ sql: "SELECT * FROM information_schema.tables;" })]);
   const [activeTabId, setActiveTabId] = createSignal(tabs()[0].id);
   const activeTab = createMemo(() => tabs().find((t) => t.id === activeTabId()) ?? tabs()[0]);
-  let cursorOwnerTabId: string | null = null; // tab that owns the single backend cursor
+  const aiFkSchemas = () => new Set([activeTab().searchSchema ?? "public", "public"]);
+  const [persistenceWarning, setPersistenceWarning] = createSignal("");
+  let cursorOwner: { tabId: string; connectionGeneration: number; resultGeneration: number; cursorGeneration: number } | null = null;
+  let cursorGeneration = 0;
+  let activeQuery: { generation: number; connectionGeneration: number; tabId: string; transactionRevision: number } | null = null;
 
   const patchTab = (id: string, patch: Partial<Tab>) =>
     setTabs((ts) => ts.map((t) => (t.id === id ? { ...t, ...patch } : t)));
   const patchResult = (id: string, patch: Partial<ResultSnapshot>) =>
     setTabs((ts) => ts.map((t) => (t.id === id ? { ...t, result: { ...t.result, ...patch } } : t)));
 
+  const ownerTab = () => tabs().find((t) => t.id === transaction().owner);
+  const ownerPendingCount = () => pendingCount(ownerTab()?.pending);
+  const activeOwnsTransaction = () => transactionOwnedBy(transaction(), activeTabId());
+  const activeDatabaseAllowed = () => transactionDatabaseAllowed(transaction(), activeTabId());
+  const metadataFrozen = () => transactionOpen(transaction());
+
+  function removeInterruptedMarker(connectionKey: string) {
+    try {
+      const marker = decodeInterruptedTransaction(localStorage.getItem(INTERRUPTED_TRANSACTION_KEY));
+      if (!marker || marker.connectionKey === connectionKey.slice(0, 2048)) localStorage.removeItem(INTERRUPTED_TRANSACTION_KEY);
+    } catch {
+      /* Recovery marker is advisory; storage failure must not affect transaction control. */
+    }
+  }
+
+  function persistInterruptedMarker(status: TransactionStatus) {
+    const c = conn();
+    const startedAt = transactionStartedAt();
+    if (!c || startedAt === null) return;
+    const raw = encodeInterruptedTransaction(c.key, c.target, status, startedAt);
+    if (!raw) return;
+    try {
+      localStorage.setItem(INTERRUPTED_TRANSACTION_KEY, raw);
+    } catch {
+      /* Advisory marker only. */
+    }
+  }
+
+  /** Apply transaction state before result-origin checks; stale UI payloads cannot suppress it. */
+  function applyAuthoritativeTransaction(
+    incoming: unknown,
+    sourceGeneration: number,
+    event: TransactionEvent = "statement",
+    eventBaseline?: TransactionStatus,
+  ): boolean {
+    const c = conn();
+    if (!c) return false;
+    const accepted = acceptTransactionStatus(transaction(), incoming, sourceGeneration, c.generation);
+    if (!accepted.accepted) return false;
+    const previous = transaction();
+    const next = accepted.status;
+    const opening = !transactionOpen(previous) && transactionOpen(next);
+    const newIdentity = transactionOpen(next) && previous.id !== next.id;
+    if (opening || newIdentity) {
+      const startedAt = Date.now();
+      setTransactionStartedAt(startedAt);
+      setTransactionNow(startedAt);
+      transactionHistoryKey = next.id ? `${next.id}@${startedAt.toString(36)}` : null;
+    }
+
+    // A status poll can observe a new revision before the command response arrives.
+    // Use the command's captured baseline for boundary provenance, while still applying
+    // state monotonically against the latest current status above.
+    const boundaryPrevious = eventBaseline && eventBaseline.revision <= next.revision
+      ? eventBaseline
+      : previous;
+    const stale = transactionBoundaryStaleReason(boundaryPrevious, next, event);
+    if (stale) {
+      setTabs((all) => all.map((tab) => {
+        const resultMatches = tab.result.generation > 0 && transactionProvenanceNeedsRefresh(
+          tab.result.transactionId,
+          tab.result.transactionRevision,
+          boundaryPrevious,
+          next,
+        );
+        const pendingMatches = !!tab.pending && transactionProvenanceNeedsRefresh(
+          tab.pending.transactionId,
+          tab.pending.transactionRevision,
+          boundaryPrevious,
+          next,
+        );
+        return {
+          ...tab,
+          ...(pendingMatches ? { pending: { ...tab.pending!, stale } } : {}),
+          ...(resultMatches ? { result: { ...tab.result, transactionStale: stale } } : {}),
+        };
+      }));
+    }
+
+    setTransaction(next);
+    if (transactionOpen(next)) {
+      persistInterruptedMarker(next);
+      setMenuState(null);
+      setDdlGraph(null);
+      setActiveDialog(null);
+      if (importOpen() && !importBusy()) {
+        importReadGeneration++;
+        setImportOpen(false);
+        importOrigin = null;
+      }
+      if (next.state === "lost") {
+        setTransactionWarning(`Transaction ${next.id ?? "session"} was lost. Its outcome may be unknown; disconnect and reconnect before continuing.`);
+      }
+    } else {
+      setTransactionStartedAt(null);
+      transactionHistoryKey = null;
+      removeInterruptedMarker(c.key);
+      queueMicrotask(() => {
+        if (deferredSchemaRefresh && conn()?.generation === sourceGeneration && !transactionOpen(transaction())) {
+          deferredSchemaRefresh = false;
+          void loadSchema(c);
+        }
+      });
+    }
+    return true;
+  }
+
+  const captureOrigin = (): UiOrigin => {
+    const c = conn();
+    const t = tabs().find((x) => x.id === activeTabId());
+    return {
+      connectionId: c?.id ?? null,
+      connectionGeneration: c?.generation ?? connectionGeneration,
+      tabId: t?.id ?? null,
+      resultGeneration: t?.result.generation ?? 0,
+      resultEpoch: t?.result.epoch ?? 0,
+      transactionRevision: transaction().revision,
+    };
+  };
+  const originAlive = (o: UiOrigin, includeResult = false) => {
+    const c = conn();
+    if (o.connectionId !== (c?.id ?? null) || o.connectionGeneration !== (c?.generation ?? connectionGeneration)) return false;
+    const t = tabs().find((x) => x.id === o.tabId);
+    if (!t) return false;
+    if (o.transactionRevision !== transaction().revision) return false;
+    return !includeResult || (t.result.generation === o.resultGeneration && t.result.epoch === o.resultEpoch);
+  };
+  const originCurrent = (o: UiOrigin, includeResult = false) => o.tabId === activeTabId() && originAlive(o, includeResult);
+  const originKey = (o: UiOrigin) => JSON.stringify([o.connectionId, o.connectionGeneration, o.tabId, o.resultGeneration, o.resultEpoch, o.transactionRevision]);
+  const connectionCurrent = (c: Connected) => conn()?.id === c.id && conn()?.generation === c.generation;
+  const setMenu = (next: MenuState) => {
+    if (!next) {
+      setMenuState(null);
+      return;
+    }
+    const origin = captureOrigin();
+    const valid = () => originCurrent(origin, true);
+    setMenuState({
+      ...next,
+      scope: originKey(origin),
+      items: next.items.map((item) => {
+        if ("sep" in item) return item;
+        const itemValid = item.valid;
+        return { ...item, valid: () => valid() && (itemValid?.() ?? true) };
+      }),
+    });
+  };
+  const setActiveDialog = (state: DialogState | null, origin = captureOrigin()) =>
+    setDialogBinding(state ? { state, origin } : null);
+
+  const menuScope = createMemo(() => originKey(captureOrigin()));
+  createEffect(on(menuScope, () => setMenuState(null), { defer: true }));
+
   // Active-tab accessors so the existing editor + result-grid JSX stays unchanged.
   const sql = () => activeTab().sql;
-  const setSql = (v: string) => patchTab(activeTabId(), { sql: v });
   const columns = () => activeTab().result.columns;
   const rows = () => activeTab().result.rows;
   const done = () => activeTab().result.done;
@@ -312,7 +540,19 @@ function App() {
   const elapsed = () => activeTab().result.elapsed;
   const lastQuery = () => activeTab().result.lastQuery;
   const setStatus = (s: string) => patchResult(activeTabId(), { status: s });
-  const setRunErr = (s: string) => patchResult(activeTabId(), { runErr: s });
+  const tryWrapQuery = (
+    tab: Tab,
+    sorts: SortKey[],
+    filters: Filter[],
+    action = "sort/filter",
+  ): string | null => {
+    try {
+      return wrapQuery(tab.result.baseQuery, sorts, filters, tab.result.columns, connectionKind());
+    } catch (e) {
+      patchResult(tab.id, { status: `${action} rejected: ${errMsg(e)}` });
+      return null;
+    }
+  };
   // Distinct schema names for the active-schema (search_path) selector.
   const schemaNames = createMemo(() => [...new Set(schema().map((t) => t.schema))].sort());
 
@@ -333,18 +573,17 @@ function App() {
   // Editor dialect follows the connected driver (DuckDB → Postgres dialect); falls back
   // to the saved pref when disconnected. Drives highlighting, keyword/function/type
   // autocomplete, and identifier quoting (`setSqlDialect` → backticks on MySQL).
-  const activeDialect = createMemo<DialectId>(() => (conn() ? driverDialect(caps()?.kind) : prefs().dialect));
+  const activeDialect = createMemo<DialectId>(() => (conn() ? driverDialect(connectionKind()) : prefs().dialect));
   // ident/DDL quoting uses the REAL driver kind (not the editor dialect, which maps
   // DuckDB→postgres for highlighting). Quoting is identical for pg/duckdb/sqlite (double
   // quotes; only MySQL backticks), but the DDL builders branch on the true driver so they
   // can emit DuckDB-compatible syntax. Falls back to the editor dialect when disconnected.
-  createEffect(() => setSqlDialect(conn() ? (caps()?.kind ?? "postgres") : activeDialect()));
+  createEffect(() => setSqlDialect(conn() ? connectionKind() : activeDialect()));
   const [cursorInfo, setCursorInfo] = createSignal<CursorInfo | null>(null);
-  let connKey: string | null = null;
   let tabsConnKey: string | null = null;
-  let legacyConnKey: string | null = null;
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   let restoring = false;
+  let tabsRecoveryWritable = true;
 
   const updatePrefs = (patch: Partial<EditorPrefs>) => {
     const next = { ...prefs(), ...patch };
@@ -421,7 +660,10 @@ function App() {
     running: running(),
     hasResult: columns().length > 0,
     canExport: caps()?.export !== false,
+    canRunDatabase: activeDatabaseAllowed(),
     canExplainAnalyze: caps()?.explainAnalyze !== false,
+    canCommitTransaction: transactionControls().commit,
+    canRollbackTransaction: transactionControls().rollback,
   });
 
   // Validate the buffer against Postgres for parser-grade diagnostics (PREPARE-only,
@@ -429,20 +671,29 @@ function App() {
   // or when the server-lint pref is off.
   const validate = async (sqlText: string): Promise<ServerDiag[]> => {
     const c = conn();
+    const origin = captureOrigin();
     // Skip while a query is running (shared connection lock) AND while any streaming
     // cursor is open: validate_sql rolls back the open cursor to PREPARE in autocommit,
     // which would truncate a live stream. (Double-clicking a table sets the editor doc,
     // which fires this lint ~600ms later — it must not kill the stream it just opened.)
-    if (!c || running() || cursorOwnerTabId !== null || !prefs().serverLint) return [];
+    if (!c || running() || cursorOwner !== null || metadataFrozen() || !prefs().serverLint) return [];
     try {
-      return await invoke<ServerDiag[]>("validate_sql", { connectionId: c.id, sql: sqlText, searchPath: activeTab().searchSchema });
+      const diagnostics = await invoke<ServerDiag[]>("validate_sql", { connectionId: c.id, sql: sqlText, searchPath: activeTab().searchSchema });
+      return connectionCurrent(c) && originCurrent(origin) ? diagnostics : [];
     } catch {
       return [];
     }
   };
 
   // --- tab management + file flow ---
-  const [confirmClose, setConfirmClose] = createSignal<string | null>(null);
+  const [confirmClose, setConfirmClose] = createSignal<{ tabId: string; dirty: boolean; pending: number } | null>(null);
+  const [confirmDisconnect, setConfirmDisconnect] = createSignal<number | null>(null);
+  const [confirmWindowClose, setConfirmWindowClose] = createSignal<number | null>(null);
+  type TransactionResolution = { kind: "close-tab"; tabId: string } | { kind: "disconnect" } | { kind: "window-close" };
+  const [transactionResolution, setTransactionResolution] = createSignal<TransactionResolution | null>(null);
+  const [transactionResolutionBusy, setTransactionResolutionBusy] = createSignal(false);
+  let allowNativeClose = false;
+  let nativeCloseUnlisten: UnlistenFn | null = null;
   // Snapshot of the result being exported, frozen when the dialog opens so a tab
   // switch while it's open can't redirect the export to a different tab.
   const [exportSrc, setExportSrc] = createSignal<
@@ -454,14 +705,22 @@ function App() {
       searchSchema: string | null;
       /** The grid's bool-column set (source indices) frozen with the snapshot — export shows what the grid shows. */
       boolCols: number[];
+      origin: UiOrigin;
+      connectionId: string;
+      dialect: string;
     } | null
   >(null);
   const openExport = () => {
     const tab = activeTab();
+    const c = conn();
+    if (!c) return;
     const order = localRowOrder();
-    const query = order && tab.gridView.sorts.length && canServerSortFilter()
-      ? wrapQuery(tab.result.baseQuery, tab.gridView.sorts, [], tab.result.columns, caps()?.kind)
-      : lastQuery();
+    let query = lastQuery();
+    if (order && tab.gridView.sorts.length && canServerSortFilter()) {
+      const wrapped = tryWrapQuery(tab, tab.gridView.sorts, [], "export query");
+      if (wrapped === null) return;
+      query = wrapped;
+    }
     setExportSrc({
       columns: columns(),
       rows: orderedRows(rows(), order),
@@ -469,6 +728,9 @@ function App() {
       table: tableNameFromSql(query),
       searchSchema: tab.searchSchema,
       boolCols: [...boolCols()],
+      origin: captureOrigin(),
+      connectionId: c.id,
+      dialect: connectionKind(),
     });
   };
 
@@ -513,15 +775,28 @@ function App() {
   function closeTabsWhere(pred: (t: Tab, i: number, arr: Tab[]) => boolean) {
     const all = tabs();
     const targets = all.filter((t, i) => pred(t, i, all));
-    const kept = targets.filter((t) => t.dirty);
+    const kept = targets.filter((t) => t.dirty || pendingCount(t.pending) > 0 || (running() && runningTabId() === t.id));
     for (const t of targets) {
-      if (!t.dirty) removeTab(t.id);
+      if (!t.dirty && !pendingCount(t.pending) && (!running() || runningTabId() !== t.id)) removeTab(t.id);
     }
-    if (kept.length) setStatus(`kept ${kept.length} unsaved tab${kept.length > 1 ? "s" : ""}`);
+    if (kept.length) setStatus(`kept ${kept.length} tab${kept.length > 1 ? "s" : ""} with unsaved, pending, or running work`);
   }
 
   function removeTab(id: string) {
-    if (cursorOwnerTabId === id) cursorOwnerTabId = null;
+    if (running() && runningTabId() === id) {
+      patchResult(id, { status: "Cancel or wait for this query before closing its owner tab" });
+      return;
+    }
+    if (transactionOwnedBy(transaction(), id)) {
+      switchTab(id);
+      setTransactionResolution({ kind: "close-tab", tabId: id });
+      return;
+    }
+    if (cursorOwner?.tabId === id) {
+      cursorOwner = null;
+      cursorGeneration++;
+    }
+    saveOperations.delete(id);
     editorApi()?.dropTab(id);
     const idx = tabs().findIndex((t) => t.id === id);
     const next = tabs().filter((t) => t.id !== id);
@@ -541,16 +816,28 @@ function App() {
   function closeTab(id: string) {
     const t = tabs().find((x) => x.id === id);
     if (!t) return;
-    if (t.dirty) {
-      setConfirmClose(id);
+    if (running() && runningTabId() === id) {
+      patchResult(id, { status: "Cancel or wait for this query before closing its owner tab" });
+      return;
+    }
+    if (transactionOwnedBy(transaction(), id)) {
+      switchTab(id);
+      setTransactionResolution({ kind: "close-tab", tabId: id });
+      return;
+    }
+    const pending = pendingCount(t.pending);
+    if (t.dirty || pending) {
+      setConfirmClose({ tabId: id, dirty: t.dirty, pending });
       return;
     }
     removeTab(id);
   }
 
   async function openFileDialog() {
+    const origin = captureOrigin();
     try {
       const path = await openDialog({ multiple: false, filters: [{ name: "SQL", extensions: ["sql", "txt"] }] });
+      if (!originCurrent(origin)) return;
       if (typeof path !== "string") return;
       const existing = tabs().find((t) => t.filePath === path);
       if (existing) {
@@ -558,40 +845,66 @@ function App() {
         return;
       }
       const contents = await invoke<string>("read_text_file", { path });
+      if (!originCurrent(origin)) return;
+      const openedWhileReading = tabs().find((t) => t.filePath === path);
+      if (openedWhileReading) {
+        switchTab(openedWhileReading.id);
+        return;
+      }
       const t = makeTab({ sql: contents, filePath: path, title: basename(path), dirty: false });
       setTabs((ts) => [...ts, t]);
       switchTab(t.id);
     } catch (e) {
-      setRunErr(errMsg(e));
+      if (origin.tabId && originCurrent(origin)) patchResult(origin.tabId, { runErr: errMsg(e) });
     }
   }
 
-  async function saveActiveTab() {
-    const t = activeTab();
-    const text = editorApi()?.getDoc() ?? t.sql;
-    if (!t.filePath) return saveAsActiveTab();
+  const saveOperations = new Map<string, number>();
+  const fileWrites = new KeyedSerialQueue<string>();
+  async function saveTab(tabId: string, saveAs: boolean): Promise<boolean> {
+    let t = tabs().find((x) => x.id === tabId);
+    if (!t) return false;
     try {
-      await invoke("write_text_file", { path: t.filePath, contents: text });
-      patchTab(t.id, { dirty: false, sql: text });
-      setStatus(`saved → ${t.filePath}`);
+      let filePath = t.filePath;
+      if (saveAs || !filePath) {
+        filePath = await save({ defaultPath: t.filePath ?? `${t.title}.sql`, filters: [{ name: "SQL", extensions: ["sql"] }] });
+        if (!filePath) return false;
+      }
+      t = tabs().find((x) => x.id === tabId);
+      if (!t) return false;
+      if (tabs().some((x) => x.id !== tabId && x.filePath === filePath))
+        throw new Error("that file is already open in another tab");
+      const live = tabId === activeTabId() ? editorApi()?.getDoc() : undefined;
+      const text = live ?? t.sql;
+      let revision = t.revision;
+      if (text !== t.sql) {
+        revision++;
+        patchTab(tabId, { sql: text, dirty: true, revision });
+      }
+      const operation = (saveOperations.get(tabId) ?? 0) + 1;
+      saveOperations.set(tabId, operation);
+      // Atomic writes still race with each other. Serialize by destination so an
+      // older save can never finish after, and overwrite, a newer invocation.
+      await fileWrites.run(filePath, () => invoke("write_text_file", { path: filePath, contents: text }));
+      if (saveOperations.get(tabId) !== operation) return false;
+      const current = tabs().find((x) => x.id === tabId);
+      if (!current) return false;
+      const unchanged = current.revision === revision && current.sql === text;
+      patchTab(tabId, {
+        filePath,
+        title: basename(filePath),
+        ...(unchanged ? { dirty: false } : {}),
+      });
+      patchResult(tabId, { status: unchanged ? `saved → ${filePath}` : `saved revision → ${filePath}; newer edits remain unsaved` });
+      return unchanged;
     } catch (e) {
-      setRunErr(errMsg(e));
+      if (tabs().some((x) => x.id === tabId)) patchResult(tabId, { runErr: errMsg(e) });
+      return false;
     }
   }
 
-  async function saveAsActiveTab() {
-    const t = activeTab();
-    const text = editorApi()?.getDoc() ?? t.sql;
-    try {
-      const path = await save({ defaultPath: t.filePath ?? `${t.title}.sql`, filters: [{ name: "SQL", extensions: ["sql"] }] });
-      if (!path) return;
-      await invoke("write_text_file", { path, contents: text });
-      patchTab(t.id, { filePath: path, title: basename(path), dirty: false, sql: text });
-      setStatus(`saved → ${path}`);
-    } catch (e) {
-      setRunErr(errMsg(e));
-    }
-  }
+  const saveActiveTab = () => saveTab(activeTabId(), false);
+  const saveAsActiveTab = () => saveTab(activeTabId(), true);
 
   // import dialog
   const [importOpen, setImportOpen] = createSignal(false);
@@ -605,13 +918,14 @@ function App() {
   const [importMsg, setImportMsg] = createSignal("");
   let importReadGeneration = 0;
   let importCloseTimer: ReturnType<typeof setTimeout> | undefined;
+  let importOrigin: { origin: UiOrigin; connection: Connected } | null = null;
 
   // Lazy EXPLAIN detection: null for normal results (the leading-keyword gate
   // makes this free), a ParsedPlan when the active tab's result is a plan.
   const planMemo = createMemo(() => {
     const t = activeTab();
     if (!conn() || !t.result.columns.length) return null;
-    return detectPlan(caps()?.kind, {
+    return detectPlan(connectionKind(), {
       lastQuery: t.result.lastQuery,
       columns: t.result.columns,
       rows: t.result.rows,
@@ -619,19 +933,23 @@ function App() {
   });
   const resultView = () => (planMemo() ? activeTab().resultView ?? "plan" : "grid");
   // EXPLAIN ANALYZE on a mutating statement → explicit confirm (it executes).
-  const [confirmAnalyze, setConfirmAnalyze] = createSignal<string | null>(null);
+  const [confirmAnalyze, setConfirmAnalyze] = createSignal<{ sql: string; origin: UiOrigin } | null>(null);
   // Whether this DuckDB build accepts PG-style `EXPLAIN (FORMAT json)` —
   // probed once at connect time (a probe mid-session could disturb the pager).
   let duckJsonExplain = false;
 
   function runExplain(analyze: boolean) {
+    if (!activeDatabaseAllowed()) {
+      setStatus(`Switch to ${ownerTab()?.title ?? "the transaction owner"} to run database actions`);
+      return;
+    }
     const api = editorApi();
     if (!api) return;
     const stmt = api.getSelection().trim() || api.getCurrentStatement();
     if (!stmt.trim()) return;
-    const wrapped = explainSql(caps()?.kind, analyze, stmt, duckJsonExplain);
+    const wrapped = explainSql(connectionKind(), analyze, stmt, duckJsonExplain);
     if (analyze && analyzeExecutesWrite(stmt)) {
-      setConfirmAnalyze(wrapped);
+      setConfirmAnalyze({ sql: wrapped, origin: captureOrigin() });
       return;
     }
     runParameterized(wrapped, (substituted) => void executeQuery(substituted, "", "base", false, wrapped));
@@ -644,13 +962,13 @@ function App() {
     wrappableQuery(activeTab().result.baseQuery) &&
     // MySQL refuses duplicate column names inside a derived table (error 1060),
     // so the sort/filter wrap can't work on such results there.
-    !(caps()?.kind === "mysql" && hasDuplicateColumns(activeTab().result.columns));
+    !(connectionKind() === "mysql" && hasDuplicateColumns(activeTab().result.columns));
   const localSortEligible = () => {
     const tab = activeTab();
-    return tab.result.done && tab.result.rowsAreBase && tab.gridView.filters.length === 0;
+    return tab.result.done && tab.result.rowsAreBase && tab.gridView.filters.length === 0 && tab.result.rows.length <= MAX_LOCAL_SORT_ROWS;
   };
-  const canSort = () => !running() && (localSortEligible() || canServerSortFilter());
-  const canFilter = () => !running() && canServerSortFilter();
+  const canSort = () => !running() && (localSortEligible() || (activeDatabaseAllowed() && canServerSortFilter()));
+  const canFilter = () => !running() && activeDatabaseAllowed() && canServerSortFilter();
   const localSortRows = createMemo(() => activeTab().result.rows);
   const localSorts = createMemo(() => activeTab().gridView.sorts);
   const localSortDone = createMemo(() => activeTab().result.done);
@@ -658,8 +976,8 @@ function App() {
   const localSortHasFilters = createMemo(() => activeTab().gridView.filters.length > 0);
   const localRowOrder = createMemo(() => {
     const sorts = localSorts();
-    return localSortDone() && localSortBase() && !localSortHasFilters() && sorts.length
-      ? sortedRowOrder(localSortRows(), sorts, caps()?.kind)
+    return localSortDone() && localSortBase() && !localSortHasFilters() && localSortRows().length <= MAX_LOCAL_SORT_ROWS && sorts.length
+      ? sortedRowOrder(localSortRows(), sorts, connectionKind())
       : null;
   });
   // --- in-grid data editing ---
@@ -682,7 +1000,22 @@ function App() {
     const c = conn();
     const cols = editCols();
     if (!c || !cols.length) return { editable: false, reason: "", plan: null };
+    if (running()) return { editable: false, reason: "a query is running", plan: null };
     if (c.readOnly) return { editable: false, reason: "connection is read-only", plan: null };
+    const tx = transaction();
+    const result = activeTab().result;
+    if (result.transactionStale) return { editable: false, reason: result.transactionStale, plan: null };
+    if (activeTab().pending?.stale) return { editable: false, reason: activeTab().pending!.stale!, plan: null };
+    if (transactionOpen(tx)) {
+      if (tx.state === "lost") return { editable: false, reason: "transaction session was lost", plan: null };
+      if (tx.state === "failed") return { editable: false, reason: "transaction failed; roll it back before applying more changes", plan: null };
+      if (tx.owner !== activeTabId()) return { editable: false, reason: `transaction is owned by ${ownerTab()?.title ?? tx.owner ?? "another tab"}`, plan: null };
+      if (result.transactionId !== tx.id) return { editable: false, reason: "result predates the active transaction; rerun it before editing", plan: null };
+    } else if (result.transactionId !== null) {
+      return { editable: false, reason: "transaction ended; rerun before editing", plan: null };
+    } else if (result.generation > 0 && result.transactionRevision !== tx.revision) {
+      return { editable: false, reason: "transaction state changed; rerun before editing", plan: null };
+    }
     const tgt = editTarget(editBaseQ(), editIndexer(schema()));
     if (!tgt.ok) return { editable: false, reason: tgt.reason, plan: null };
     // PG permission model: no write privilege at all → don't offer editing
@@ -727,7 +1060,7 @@ function App() {
     const col = det.columns.find((c) => c.name.toLowerCase() === name);
     if (!col) return null;
     // SQLite stores booleans as 0/1 (no native bool); PG/DuckDB accept true/false.
-    const numeric = caps()?.kind === "sqlite" || caps()?.kind === "mysql";
+    const numeric = connectionKind() === "sqlite" || connectionKind() === "mysql";
     return { trueVal: numeric ? "1" : "true", falseVal: numeric ? "0" : "false", nullable: col.nullable };
   };
 
@@ -737,7 +1070,13 @@ function App() {
   const tabPending = createMemo(() => activeTab().pending);
   const setPendingFor = (tabId: string, p: PendingEdits | undefined) => patchTab(tabId, { pending: p });
   const isPendingEmpty = (p: PendingEdits) => !Object.keys(p.cells).length && !p.deletes.length && !p.inserts.length;
-  const ensurePending = (): PendingEdits => tabPending() ?? { cells: {}, deletes: [], inserts: [] };
+  const ensurePending = (): PendingEdits => tabPending() ?? {
+    cells: {},
+    deletes: [],
+    inserts: [],
+    transactionId: activeTab().result.transactionId,
+    transactionRevision: activeTab().result.transactionRevision,
+  };
 
   // val: string = new value, null = SQL NULL, undefined = revert (drop the entry).
   // `ref` is the stable row identity from the grid (loaded snapshot row vs pending
@@ -822,12 +1161,13 @@ function App() {
     setPendingFor(activeTabId(), { ...p, inserts: [...p.inserts, {}] });
   }
 
-  // Commit dialog: preview the generated script, run it as one transactional
-  // script (run_query → script::run), then clear pending + refresh the grid.
-  const [commitView, setCommitView] = createSignal<{ script: string[] } | null>(null);
+  // Apply dialog: preview the generated script, run it atomically in autocommit or
+  // inside the owner's existing outer transaction, then refresh the grid.
+  const [commitView, setCommitView] = createSignal<{ script: string[]; origin: UiOrigin } | null>(null);
   const [commitBusy, setCommitBusy] = createSignal(false);
   const [commitErr, setCommitErr] = createSignal("");
-  const [confirmDiscard, setConfirmDiscard] = createSignal<{ count: number; run: () => void } | null>(null);
+  let transactionResolutionAfterApply: TransactionResolution | null = null;
+  const [confirmDiscard, setConfirmDiscard] = createSignal<{ count: number; origin: UiOrigin; run: () => void } | null>(null);
 
   function openCommit() {
     const ec = editCtx();
@@ -841,7 +1181,7 @@ function App() {
       pkIdx: ec.plan.pkIdx,
       rows: t.result.rows,
       pending: t.pending,
-      dialect: caps()?.kind,
+      dialect: connectionKind(),
     });
     if (!script.length) {
       // Shouldn't happen (non-table cells can't be edited) — but never open a dialog
@@ -850,34 +1190,95 @@ function App() {
       return;
     }
     setCommitErr("");
-    setCommitView({ script });
+    setCommitView({ script, origin: captureOrigin() });
+  }
+
+  function closeCommit() {
+    const resume = transactionResolutionAfterApply;
+    transactionResolutionAfterApply = null;
+    setCommitView(null);
+    if (resume) setTransactionResolution(resume);
+  }
+
+  function applyPendingBeforeTransactionResolution() {
+    const intent = transactionResolution();
+    const owner = transaction().owner;
+    if (!intent || !owner) return;
+    switchTab(owner);
+    transactionResolutionAfterApply = intent;
+    setTransactionResolution(null);
+    queueMicrotask(() => {
+      openCommit();
+      if (!commitView()) {
+        transactionResolutionAfterApply = null;
+        setTransactionResolution(intent);
+      }
+    });
   }
 
   async function doCommit() {
     const cv = commitView();
     const c = conn();
-    if (!cv || !c || commitBusy() || running()) return;
-    const tabId = activeTabId();
+    if (!cv || !c || commitBusy() || running() || !originCurrent(cv.origin, true)) return;
+    const tabId = cv.origin.tabId;
+    if (!tabId) return;
     setCommitBusy(true);
     setCommitErr("");
+    const t0 = performance.now();
+    const before = transaction();
+    const beforeHistoryKey = transactionHistoryKey;
     try {
       // Fully-qualified statements — no search_path dependence. Multi-statement
       // scripts run in one transaction (rolled back wholesale on failure).
       const sqlText = cv.script.map((s) => s + ";").join("\n");
-      await invoke<QueryOutcome>("run_query", { connectionId: c.id, sql: sqlText, pageSize: PAGE, searchPath: null });
+      const out = await invoke<QueryResult>("run_query", { connectionId: c.id, ownerId: tabId, sql: sqlText, pageSize: PAGE, searchPath: null });
+      const accepted = applyAuthoritativeTransaction(out.transaction, c.generation, "grid_apply", before);
+      const source = tabs().find((tab) => tab.id === tabId);
+      if (!accepted || transaction().revision !== out.transaction.revision || !connectionCurrent(c) ||
+          source?.result.generation !== cv.origin.resultGeneration || source.result.epoch !== cv.origin.resultEpoch) return;
       setPendingFor(tabId, undefined);
       setCommitView(null);
-      setStatus(`${cv.script.length} change${cv.script.length === 1 ? "" : "s"} applied`);
+      patchResult(tabId, { status: transactionOpen(out.transaction)
+        ? `${cv.script.length} change${cv.script.length === 1 ? "" : "s"} applied inside transaction; commit the outer transaction separately`
+        : `${cv.script.length} change${cv.script.length === 1 ? "" : "s"} applied` });
+      recordHistory({
+        sql: historySqlForTransaction(sqlText, before, out.transaction, "grid_apply", beforeHistoryKey),
+        durationMs: Math.round(performance.now() - t0),
+        status: "ok",
+        rows: null,
+        error: null,
+        schema: null,
+      }, c.key);
+      if (transactionResolutionAfterApply) {
+        setTransactionResolution(transactionResolutionAfterApply);
+        transactionResolutionAfterApply = null;
+        return;
+      }
       // Refresh the grid in place, keeping the current sort/filter view.
       const t = tabs().find((x) => x.id === tabId);
       if (t) {
         const v = t.gridView;
         const base = t.result.baseQuery;
-        const sqlToRun = v.sorts.length || v.filters.length ? wrapQuery(base, v.sorts, v.filters, t.result.columns, caps()?.kind) : base;
+        const sqlToRun = v.sorts.length || v.filters.length ? tryWrapQuery(t, v.sorts, v.filters) : base;
+        if (sqlToRun === null) return;
         void executeQuery(sqlToRun, base, "wrapped");
       }
     } catch (e) {
-      setCommitErr(errMsg(e)); // pending kept — the transaction rolled back
+      const embedded = transactionFromError(e);
+      if (embedded) applyAuthoritativeTransaction(embedded, c.generation, "grid_apply", before);
+      const source = tabs().find((tab) => tab.id === tabId);
+      if (connectionCurrent(c) && source?.result.generation === cv.origin.resultGeneration && source.result.epoch === cv.origin.resultEpoch) {
+        const message = errMsg(e);
+        setCommitErr(message);
+        recordHistory({
+          sql: historySqlForTransaction(cv.script.map((s) => s + ";").join("\n"), before, embedded ?? transaction(), "grid_apply", beforeHistoryKey),
+          durationMs: Math.round(performance.now() - t0),
+          status: "error",
+          rows: null,
+          error: message.split("\n")[0],
+          schema: null,
+        }, c.key);
+      }
     } finally {
       setCommitBusy(false);
     }
@@ -886,7 +1287,12 @@ function App() {
   function discardPending() {
     const n = pendingCount(tabPending());
     if (!n) return;
-    setConfirmDiscard({ count: n, run: () => setPendingFor(activeTabId(), undefined) });
+    const origin = captureOrigin();
+    setConfirmDiscard({
+      count: n,
+      origin,
+      run: () => { if (originCurrent(origin, true) && origin.tabId) setPendingFor(origin.tabId, undefined); },
+    });
   }
 
   const [loadingAll, setLoadingAll] = createSignal(false);
@@ -896,21 +1302,120 @@ function App() {
   // Reactive so the "streaming…" spinner spins only during an actual in-flight fetch
   // (not merely while more rows remain, i.e. !done()).
   const [fetchingMore, setFetchingMore] = createSignal(false);
-  let runTimer: ReturnType<typeof setInterval> | undefined;
+  const runTimers = new Set<ReturnType<typeof setInterval>>();
+  let transactionTimer: ReturnType<typeof setInterval> | undefined;
+  const interactionCleanups = new Set<() => void>();
+
+  function transactionControlBusy(): boolean {
+    return running() || fetchingMore() || loadingAll() || commitBusy();
+  }
+
+  function transactionControls() {
+    return transactionControlAvailability(
+      transaction(),
+      activeTabId(),
+      ownerPendingCount(),
+      transactionControlBusy(),
+    );
+  }
+
+  const totalPendingCount = () => tabs().reduce((total, tab) => total + pendingCount(tab.pending), 0);
+  const closeOperationBusy = () => transactionControlBusy() || importBusy();
 
   const [slackStatus, setSlackStatus] = createSignal<SlackStatus>({ running: false, state: "disconnected", error: null });
   const slackUnlisten: UnlistenFn[] = [];
+  const slackHistoryKeys = new Map<string, string>();
+  let slackStatusRevision = 0;
 
+  const preventNativeContextMenu = (e: Event) => e.preventDefault();
+  const showPersistenceFailure = (failure: TabsPersistenceFailure) => {
+    const consequence = failure.operation === "remove"
+      ? "Old recovery data could not be cleaned up."
+      : "Unsaved tabs may not survive closing.";
+    setPersistenceWarning(`Editor recovery ${failure.operation} failed (${failure.message}). ${consequence}`);
+  };
+  const persistRecovery = (key: string, data: PersistedTabs, forClose = false) => {
+    if (!tabsRecoveryWritable && key === tabsConnKey) {
+      const error: TabsPersistenceFailure = {
+        operation: "save",
+        code: "invalid-data",
+        message: "existing recovery snapshot could not be loaded",
+      };
+      showPersistenceFailure(error);
+      return { ok: false as const, error };
+    }
+    const result = forClose ? tabsStore.saveForClose(key, data) : tabsStore.saveResult(key, data);
+    if (result.ok) setPersistenceWarning("");
+    else showPersistenceFailure(result.error);
+    return result;
+  };
+  const onBeforeUnload = (e: BeforeUnloadEvent) => {
+    const snapshot = snapshotTabs();
+    const saved = tabsConnKey ? persistRecovery(tabsConnKey, snapshot, true) : null;
+    const unsafeDirty = saved?.ok === false && snapshot.tabs.some((tab) => tab.dirty);
+    if (allowNativeClose || (!transactionOpen(transaction()) && !unsafeDirty && totalPendingCount() === 0)) return;
+    e.preventDefault();
+    e.returnValue = "";
+  };
+  const refreshTransactionStatus = async () => {
+    const c = conn();
+    if (!c || running() || fetchingMore() || importBusy() || commitBusy()) return;
+    try {
+      const status = await invoke<TransactionStatus>("transaction_status", { connectionId: c.id });
+      if (connectionCurrent(c)) applyAuthoritativeTransaction(status, c.generation);
+    } catch {
+      /* The next transaction-aware command will surface a connection failure. */
+    }
+  };
+  const onWindowFocus = () => void refreshTransactionStatus();
+  let appMounted = true;
   onMount(async () => {
+    transactionTimer = setInterval(() => {
+      if (transactionOpen(transaction())) setTransactionNow(Date.now());
+    }, 1000);
+    try {
+      const unlistenClose = await getCurrentWindow().onCloseRequested((event) => {
+        if (allowNativeClose) return;
+        if (closeOperationBusy()) {
+          event.preventDefault();
+          const tabId = runningTabId() ?? activeTabId();
+          patchResult(tabId, { status: "Cancel or wait for the database operation before closing Tusk" });
+          return;
+        }
+        if (transactionOpen(transaction())) {
+          event.preventDefault();
+          const owner = transaction().owner;
+          if (owner && tabs().some((tab) => tab.id === owner)) switchTab(owner);
+          setTransactionResolution({ kind: "window-close" });
+          return;
+        }
+        const snapshot = snapshotTabs();
+        const saved = tabsConnKey ? persistRecovery(tabsConnKey, snapshot, true) : null;
+        if (saved?.ok === false && snapshot.tabs.some((tab) => tab.dirty)) {
+          event.preventDefault();
+          return;
+        }
+        const pending = totalPendingCount();
+        if (pending > 0) {
+          event.preventDefault();
+          setConfirmWindowClose(pending);
+        }
+      });
+      if (!appMounted) unlistenClose(); else nativeCloseUnlisten = unlistenClose;
+    } catch {
+      /* Browser preview has no native close event; beforeunload remains the fallback. */
+    }
     void refreshSkills();
     // Suppress the WebView's native right-click menu app-wide; the sidebar shows
     // its own context menu, and the editor uses keyboard shortcuts for copy/paste.
-    document.addEventListener("contextmenu", (e) => e.preventDefault());
+    document.addEventListener("contextmenu", preventNativeContextMenu);
     // Window-level editor/tab shortcuts (the in-editor keymap owns Mod-Enter/Shift-Alt-f/
     // Mod-f/Tab — no overlap with T/W/S/O). preventDefault so Cmd-W closes the tab, not the window.
     window.addEventListener("keydown", onWindowKey);
     // Shrinking the window re-clamps every docked panel (see clampPanels).
     window.addEventListener("resize", clampPanels);
+    window.addEventListener("focus", onWindowFocus);
+    window.addEventListener("beforeunload", onBeforeUnload);
     clampPanels();
     // Load profiles + auto-connect FIRST — the core startup path must not depend on
     // the Slack event bridge (a rejected listen() would otherwise abort onMount and
@@ -922,30 +1427,55 @@ function App() {
     // lands in the normal per-connection history with a [Slack] marker comment.
     // Best-effort — a failed listen must never break the app.
     try {
-      invoke<SlackStatus>("slack_status").then(setSlackStatus).catch(() => {});
-      slackUnlisten.push(await listen<SlackStatus>("slack:status", (e) => setSlackStatus(e.payload)));
-      slackUnlisten.push(
-        await listen<SlackExecuted>("slack:executed", (e) => {
-          const p = e.payload;
-          recordHistory({
-            sql: `-- [Slack] asked by ${p.slackUser}\n${p.sql}`,
-            durationMs: p.durationMs,
-            status: p.status === "ok" ? "ok" : "error",
-            rows: p.rows ?? null,
-            error: p.error ? p.error.split("\n")[0] : null,
-            schema: null,
-          });
-        }),
-      );
+      const statusUnlisten = await listen<SlackStatus>("slack:status", (e) => {
+        slackStatusRevision++;
+        setSlackStatus(e.payload);
+      });
+      if (!appMounted) statusUnlisten(); else slackUnlisten.push(statusUnlisten);
     } catch {
-      /* Slack event bridge unavailable — badge + audit degrade silently */
+      /* status events unavailable; the snapshot below still initializes the badge */
     }
+    try {
+      const executedUnlisten = await listen<SlackExecuted>("slack:executed", (e) => {
+        const p = e.payload;
+        const historyKey = slackHistoryKey(p, slackHistoryKeys);
+        if (!historyKey) return;
+        recordHistory({
+          sql: `-- [Slack] asked by ${p.slackUser}\n${p.sql}`,
+          durationMs: p.durationMs,
+          status: p.status === "ok" ? "ok" : "error",
+          rows: p.rows ?? null,
+          error: p.error ? p.error.split("\n")[0] : null,
+          schema: null,
+        }, historyKey);
+      });
+      if (!appMounted) executedUnlisten(); else slackUnlisten.push(executedUnlisten);
+    } catch {
+      /* Slack audit events unavailable */
+    }
+    const statusRevision = slackStatusRevision;
+    void invoke<SlackStatus>("slack_status")
+      .then((current) => {
+        if (appMounted && slackStatusRevision === statusRevision) setSlackStatus(current);
+      })
+      .catch(() => {});
   });
   onCleanup(() => {
+    appMounted = false;
+    skillsGeneration++;
+    document.removeEventListener("contextmenu", preventNativeContextMenu);
     window.removeEventListener("keydown", onWindowKey);
     window.removeEventListener("resize", clampPanels);
+    window.removeEventListener("focus", onWindowFocus);
+    window.removeEventListener("beforeunload", onBeforeUnload);
     for (const u of slackUnlisten) u();
     clearTimeout(importCloseTimer);
+    clearTimeout(saveTimer);
+    if (transactionTimer) clearInterval(transactionTimer);
+    nativeCloseUnlisten?.();
+    for (const timer of runTimers) clearInterval(timer);
+    runTimers.clear();
+    for (const cleanup of [...interactionCleanups]) cleanup();
   });
 
   // Central dispatcher — every action callable from a shortcut, the palette, or
@@ -961,6 +1491,8 @@ function App() {
       case "explain": runExplain(false); break;
       case "explainAnalyze": runExplain(true); break;
       case "cancelQuery": if (running()) void cancelQuery(); break;
+      case "commitTransaction": void runTransactionControl("COMMIT"); break;
+      case "rollbackTransaction": void runTransactionControl("ROLLBACK"); break;
       case "format": editorApi()?.format(); break;
       case "find": editorApi()?.openSearch(); break;
       case "toggleComment": editorApi()?.toggleComment(); break;
@@ -974,7 +1506,7 @@ function App() {
       case "saveFileAs": void saveAsActiveTab(); break;
       case "openSettings": setSettingsOpen("editor"); break;
       case "openShortcuts": setSettingsOpen("shortcuts"); break;
-      case "openHelp": setHelpOpen(true); break;
+      case "openHelp": setHelpOpen((v) => !v); break;
       case "openHistory": setHistoryOpen((v) => !v); break;
       case "openPalette": setPaletteOpen(true); break;
       case "toggleAi": setAiOpen((v) => !v); break;
@@ -988,10 +1520,20 @@ function App() {
     if (e.defaultPrevented) return;
     if (paletteOpen()) return; // the palette owns the keyboard while open
     if (paramPrompt()) return; // the parameter modal owns input; never replace its live state
+    if (runChoice()) return;
     const k = normalizeKeyEvent(e);
     if (!k) return;
     const id = globalBindings().get(k);
     if (!id) return;
+    // Modal surfaces own all keyboard input. In particular, Mod+W/S/Enter must not
+    // close, save, or run the editor hidden behind a confirmation/form dialog.
+    // A short allowlist stays reachable: F1 must close the manual it opened, and a
+    // running query must stay cancellable while any dialog is up.
+    if (
+      id !== "openHelp" &&
+      id !== "cancelQuery" &&
+      document.querySelector("[data-blocking-dialog='true'], .modal-overlay")
+    ) return;
     // On the connect screen only screen-independent actions fire (manual, settings).
     if (!conn() && id !== "openHelp" && id !== "openSettings") return;
     // Chords without Mod/Alt (F5, plain Enter, Shift-X…) must not fire while
@@ -1057,44 +1599,105 @@ function App() {
     else editProfile(p);
   }
 
-  async function afterConnect(r: { connection_id: string; server_version: string; read_only: boolean }) {
-    setConn({ id: r.connection_id, version: r.server_version, readOnly: r.read_only });
+  async function afterConnect(
+    r: { connection_id: string; server_version: string; read_only: boolean },
+    meta: { key: string; legacyKey: string | null; target: string; driver: string },
+  ) {
+    const connected: Connected = {
+      id: r.connection_id,
+      version: r.server_version,
+      readOnly: r.read_only,
+      driver: meta.driver,
+      generation: ++connectionGeneration,
+      key: meta.key,
+      target: meta.target,
+    };
+    tabsConnKey = meta.key;
+    tabsRecoveryWritable = true;
+    setPersistenceWarning("");
+    slackHistoryKeys.set(connected.id, connected.key);
+    if (slackHistoryKeys.size > 100) slackHistoryKeys.delete(slackHistoryKeys.keys().next().value!);
+    setTransaction({ ...IDLE_TRANSACTION });
+    setTransactionStartedAt(null);
+    transactionHistoryKey = null;
+    deferredSchemaRefresh = false;
+    setTransactionWarning("");
+    try {
+      const interrupted = decodeInterruptedTransaction(localStorage.getItem(INTERRUPTED_TRANSACTION_KEY));
+      if (interrupted?.connectionKey === meta.key.slice(0, 2048)) {
+        setTransactionWarning(`Previous ${interrupted.mode === "autocommit_off" ? "autocommit-off unit" : "manual transaction"} ${interrupted.transactionId} was interrupted. No active state was restored; verify its outcome.`);
+      }
+    } catch {
+      /* Advisory recovery warning only. */
+    }
+    setConn(connected);
+    sampleCache.clear();
+    try {
+      const status = await invoke<TransactionStatus>("transaction_status", { connectionId: r.connection_id });
+      if (!connectionCurrent(connected)) return;
+      applyAuthoritativeTransaction(status, connected.generation);
+    } catch {
+      if (!connectionCurrent(connected)) return;
+    }
     try {
       const next = await invoke<Capabilities>("capabilities", { connectionId: r.connection_id });
-      if (conn()?.id !== r.connection_id) return;
+      if (!connectionCurrent(connected)) return;
       setCaps(next);
     } catch {
-      if (conn()?.id !== r.connection_id) return;
+      if (!connectionCurrent(connected)) return;
       setCaps(null);
     }
     // DuckDB: probe PG-style EXPLAIN options once, at connect (safe — nothing
     // is streaming yet). Drives the Explain action's wrapping.
     duckJsonExplain = false;
-    if (caps()?.kind === "duckdb") {
+    if (connectionKind() === "duckdb") {
       try {
-        await invoke<QueryOutcome>("run_query", { connectionId: r.connection_id, sql: "EXPLAIN (FORMAT json) SELECT 1", pageSize: 1, searchPath: null });
-        if (conn()?.id !== r.connection_id) return;
+        const probe = await invoke<QueryResult>("run_query", { connectionId: r.connection_id, ownerId: activeTabId(), sql: "EXPLAIN (FORMAT json) SELECT 1", pageSize: PAGE, searchPath: null });
+        applyAuthoritativeTransaction(probe.transaction, connected.generation);
+        if (!connectionCurrent(connected)) return;
         duckJsonExplain = true;
-      } catch {
-        if (conn()?.id !== r.connection_id) return;
+      } catch (e) {
+        const embedded = transactionFromError(e);
+        if (embedded) applyAuthoritativeTransaction(embedded, connected.generation);
+        if (!connectionCurrent(connected)) return;
         duckJsonExplain = false;
       }
     }
     // Restore this connection's tab set (buffers/paths only — results are ephemeral).
-    if (connKey) {
-      let saved = tabsStore.load(connKey);
-      if (!saved && legacyConnKey) {
-        const legacy = tabsStore.load(legacyConnKey);
-        if (legacy) {
-          saved = legacy;
-          if (tabsStore.save(connKey, legacy)) tabsStore.remove(legacyConnKey);
-          else tabsConnKey = legacyConnKey;
+    if (meta.key) {
+      const current = tabsStore.loadResult(meta.key);
+      let saved = current.ok ? current.value : null;
+      if (!current.ok) {
+        showPersistenceFailure(current.error);
+        // An unreadable existing snapshot is not a failed write: park it aside so
+        // this session can persist recovery normally (and disconnect/close aren't
+        // blocked forever). Only when even the backup fails do writes stay off.
+        const parked = tabsStore.quarantineResult(meta.key);
+        if (!parked.ok) {
+          tabsRecoveryWritable = false;
+          showPersistenceFailure(parked.error);
+        }
+      }
+      // A legacy fallback is valid only when the new key is genuinely absent. A load
+      // failure must not resurrect stale data over an unreadable current snapshot.
+      if (current.ok && current.value === null && meta.legacyKey) {
+        const legacy = tabsStore.loadResult(meta.legacyKey);
+        if (!legacy.ok) showPersistenceFailure(legacy.error);
+        else if (legacy.value) {
+          saved = legacy.value;
+          const migrated = persistRecovery(meta.key, legacy.value);
+          if (migrated.ok) {
+            const removed = tabsStore.removeResult(meta.legacyKey);
+            if (!removed.ok) showPersistenceFailure(removed.error);
+          } else {
+            tabsConnKey = meta.legacyKey;
+          }
         }
       }
       restoring = true;
       if (saved && saved.tabs.length) {
         const restored = saved.tabs.map((pt) =>
-          makeTab({ sql: pt.sql, filePath: pt.filePath, title: pt.title, searchSchema: pt.searchSchema ?? null, dirty: false }),
+          makeTab({ sql: pt.sql, filePath: pt.filePath, title: pt.title, searchSchema: pt.searchSchema ?? null, dirty: pt.dirty }),
         );
         setTabs(restored);
         setActiveTabId(restored[Math.min(saved.activeIndex, restored.length - 1)].id);
@@ -1105,12 +1708,12 @@ function App() {
       }
       restoring = false;
     }
-    const history = connKey
-      ? legacyConnKey ? await historyStore.migrate(legacyConnKey, connKey) : await historyStore.load(connKey)
-      : [];
-    if (conn()?.id !== r.connection_id) return;
+    const history = meta.legacyKey
+      ? await historyStore.migrate(meta.legacyKey, meta.key)
+      : await historyStore.load(meta.key);
+    if (!connectionCurrent(connected)) return;
     setHistory(history);
-    await loadSchema();
+    await loadSchema(connected);
   }
 
   async function doConnect(e: Event) {
@@ -1148,10 +1751,10 @@ function App() {
         ? [submittedDriver, submittedPath || ":memory:"]
         : [submittedDriver, submittedHost, networkPort, submittedDatabase, submittedUser])}`;
       const r = await invoke<{ connection_id: string; server_version: string; read_only: boolean }>("connect", { config });
-      legacyConnKey = submittedLegacyKey;
-      connKey = submittedKey;
-      tabsConnKey = submittedKey;
-      await afterConnect(r);
+      const submittedTarget = isFile
+        ? basename(submittedPath || ":memory:")
+        : submittedDatabase || submittedHost;
+      await afterConnect(r, { key: submittedKey, legacyKey: submittedLegacyKey, target: submittedTarget, driver: submittedDriver });
     } catch (e) {
       setConnErr(errMsg(e));
     } finally {
@@ -1177,14 +1780,15 @@ function App() {
     setConnecting(true);
     setConnErr("");
     try {
+      const profile = profiles().find((p) => p.id === id);
       const r = await invoke<{ connection_id: string; server_version: string; read_only: boolean }>(
         "connect_profile",
         { id },
       );
-      connKey = `profile:${id}`;
-      tabsConnKey = connKey;
-      legacyConnKey = null;
-      await afterConnect(r);
+      const target = profile
+        ? isEmbeddedDriver(profile.driver) ? basename(profile.path || ":memory:") : profile.dbname || profile.host
+        : id;
+      await afterConnect(r, { key: `profile:${id}`, legacyKey: null, target, driver: profile?.driver ?? "postgres" });
     } catch (e) {
       setConnErr(errMsg(e));
     } finally {
@@ -1237,27 +1841,61 @@ function App() {
   // Snapshot the tab set for persistence — capture the active tab's live editor doc
   // (the editor, not tab.sql, is the source of truth while a tab is active).
   function snapshotTabs(): PersistedTabs {
-    const liveDoc = editorApi()?.getDoc();
-    const list = tabs();
-    return {
-      tabs: list.map((t) => ({
-        sql: t.id === activeTabId() && liveDoc != null ? liveDoc : t.sql,
-        filePath: t.filePath,
-        title: t.title,
-        searchSchema: t.searchSchema,
-      })),
-      activeIndex: Math.max(0, list.findIndex((t) => t.id === activeTabId())),
-    };
+    return recoverySnapshot(tabs(), activeTabId(), editorApi()?.getDoc());
   }
 
-  async function disconnect() {
+  async function disconnect(force = false, transactionResolved = false): Promise<boolean> {
+    if (transactionOpen(transaction()) && !transactionResolved) {
+      const owner = transaction().owner;
+      if (owner && tabs().some((tab) => tab.id === owner)) switchTab(owner);
+      setTransactionResolution({ kind: "disconnect" });
+      return false;
+    }
+    const pending = totalPendingCount();
+    if (pending && !force) {
+      setConfirmDisconnect(pending);
+      return false;
+    }
+    setConfirmDisconnect(null);
     const c = conn();
-    if (tabsConnKey) tabsStore.save(tabsConnKey, snapshotTabs());
-    if (c) invoke("disconnect", { connectionId: c.id }).catch(() => {});
-    connKey = null;
+    clearTimeout(saveTimer);
+    if (tabsConnKey) {
+      const snapshot = snapshotTabs();
+      const saved = persistRecovery(tabsConnKey, snapshot, true);
+      // Dirty buffers are recoverable only after a verified write. Keep the workspace
+      // open on failure; users can save files or retry once storage is available.
+      if (!saved.ok && snapshot.tabs.some((tab) => tab.dirty)) return false;
+    }
+    if (c) {
+      try {
+        await invoke("disconnect", { connectionId: c.id });
+      } catch (e) {
+        const embedded = transactionFromError(e);
+        if (embedded) applyAuthoritativeTransaction(embedded, c.generation);
+        setTransactionWarning(`Disconnect failed: ${errMsg(e)}`);
+        return false;
+      }
+    }
+    if (c && transaction().state !== "lost") removeInterruptedMarker(c.key);
+    connectionGeneration++;
+    queryGeneration++;
+    fetchGeneration++;
+    schemaGeneration++;
+    fkGeneration++;
+    activeQuery = null;
+    setRunning(false);
+    setRunningTabId(null);
+    setFetchingMore(false);
+    setLoadingAll(false);
+    setCancelling(false);
+    for (const timer of runTimers) clearInterval(timer);
+    runTimers.clear();
     tabsConnKey = null;
-    legacyConnKey = null;
+    tabsRecoveryWritable = true;
     setConn(null);
+    setTransaction({ ...IDLE_TRANSACTION });
+    setTransactionStartedAt(null);
+    transactionHistoryKey = null;
     setCaps(null);
     setHistory([]);
     setHistoryOpen(false);
@@ -1265,15 +1903,21 @@ function App() {
     setActiveDialog(null);
     setCellView(null);
     setConfirmClose(null);
+    setConfirmDisconnect(null);
+    setConfirmWindowClose(null);
+    setTransactionResolution(null);
+    setTransactionResolutionBusy(false);
     setExportSrc(null);
     importReadGeneration++;
     clearTimeout(importCloseTimer);
     setImportBusy(false);
     setImportOpen(false);
+    importOrigin = null;
     setImportData(null);
     setImportRaw(null);
     setConfirmAnalyze(null);
     setCommitView(null);
+    transactionResolutionAfterApply = null;
     setConfirmDiscard(null);
     setRunChoice(null);
     setParamPrompt(null);
@@ -1281,7 +1925,10 @@ function App() {
     setRenameTab(null);
     setPerms(null);
     setTree(null);
+    setSelected(null);
+    setSchemaLoading(false);
     setSchema([]);
+    sampleCache.clear();
     setFuncs(new Set<string>());
     setDetails({});
     loadedRels.clear();
@@ -1289,16 +1936,18 @@ function App() {
     fkInFlight.clear();
     fkFetched.clear();
     setFkEdges([]);
-    cursorOwnerTabId = null;
+    cursorOwner = null;
+    cursorGeneration++;
     const fresh = makeTab();
     setTabs([fresh]);
     setActiveTabId(fresh.id);
+    return true;
   }
 
   // Reflect the connected database in the OS window title (mascot + driver).
   createEffect(() => {
     const c = conn();
-    const kind = caps()?.kind;
+    const kind = connectionKind();
     const title = c ? `${driverMascot(kind)} Tusk — ${driverLabel(kind)}` : "Tusk";
     void getCurrentWindow().setTitle(title).catch(() => {
       /* not in a Tauri window (e.g. preview) */
@@ -1307,35 +1956,41 @@ function App() {
 
   // Label for the connected target shown in the topbar chip: the database name for
   // server drivers, or the file basename (":memory:" when blank) for embedded ones.
-  const connTarget = () => {
-    const k = caps()?.kind;
-    if (k === "duckdb" || k === "sqlite") {
-      const p = path().trim();
-      return p ? p.split(/[\\/]/).pop() || p : ":memory:";
-    }
-    return dbname() || host();
-  };
+  const connTarget = () => conn()?.target ?? "";
 
   // Debounced per-connection tab-set save as buffers/structure change.
   createEffect(() => {
     const data: PersistedTabs = {
-      tabs: tabs().map((t) => ({ sql: t.sql, filePath: t.filePath, title: t.title, searchSchema: t.searchSchema })),
+      tabs: tabs().map((t) => ({ sql: t.sql, filePath: t.filePath, title: t.title, searchSchema: t.searchSchema, dirty: t.dirty })),
       activeIndex: Math.max(0, tabs().findIndex((t) => t.id === activeTabId())),
     };
     if (restoring || !tabsConnKey) return;
     const key = tabsConnKey;
     if (saveTimer) clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => tabsStore.save(key, data), 800);
+    saveTimer = setTimeout(() => persistRecovery(key, data), 800);
   });
 
-  async function loadSchema() {
-    const c = conn();
+  async function loadSchema(target = conn()) {
+    const c = target;
     if (!c) return;
+    if (!connectionCurrent(c)) return;
+    if (metadataFrozen()) {
+      deferredSchemaRefresh = true;
+      return;
+    }
+    deferredSchemaRefresh = false;
+    const transactionRevision = transaction().revision;
+    const operation = ++schemaGeneration;
+    const isCurrent = () => connectionCurrent(c) && schemaGeneration === operation && transaction().revision === transactionRevision && !metadataFrozen();
+    fkGeneration++;
+    fkFetched.clear();
+    setFkEdges([]);
+    setMenuState(null);
     setSchemaLoading(true);
     sampleCache.clear(); // schema (and likely data) may have changed — drop stale AI samples
     try {
       const t = await invoke<DbTree>("db_tree", { connectionId: c.id });
-      if (conn()?.id !== c.id) return;
+      if (!isCurrent()) return;
       setTree(t);
       // Prune cached detail for relations that no longer exist (dropped / renamed),
       // so refreshLoadedDetails doesn't keep re-fetching dead keys.
@@ -1347,66 +2002,70 @@ function App() {
         for (const k of Object.keys(prev)) if (live.has(k)) next[k] = prev[k];
         return next;
       });
-      void loadTables();
-      void refreshLoadedDetails();
+      void loadTables(c, operation);
+      void refreshLoadedDetails(c, operation);
       // Refresh effective privileges alongside the tree (grants/ownership can change).
       invoke<Permissions>("permissions", { connectionId: c.id })
-        .then((p) => { if (conn()?.id === c.id) setPerms(p); })
-        .catch(() => { if (conn()?.id === c.id) setPerms(null); });
+        .then((p) => { if (isCurrent()) setPerms(p); })
+        .catch(() => { if (isCurrent()) setPerms(null); });
     } catch (e) {
       console.error(e);
     } finally {
-      if (conn()?.id === c.id) setSchemaLoading(false);
+      if (isCurrent()) setSchemaLoading(false);
     }
   }
 
   // Full table+column list for autocomplete (decoupled from the lazy tree),
   // plus the live function catalog feeding the unknown-function lint (empty
   // set = engine can't enumerate → that lint stays off).
-  async function loadTables() {
-    const c = conn();
-    if (!c) return;
+  async function loadTables(target = conn(), schemaOperation = schemaGeneration) {
+    const c = target;
+    if (!c || metadataFrozen()) return;
+    const transactionRevision = transaction().revision;
+    const isCurrent = () => connectionCurrent(c) && schemaGeneration === schemaOperation && transaction().revision === transactionRevision && !metadataFrozen();
     try {
       const tables = await invoke<TableInfo[]>("list_schema", { connectionId: c.id });
-      if (conn()?.id !== c.id) return;
+      if (!isCurrent()) return;
       setSchema(tables);
     } catch (e) {
-      if (conn()?.id !== c.id) return;
+      if (!isCurrent()) return;
       console.error(e);
     }
     try {
       const names = await invoke<string[]>("list_functions", { connectionId: c.id });
-      if (conn()?.id !== c.id) return;
+      if (!isCurrent()) return;
       setFuncs(new Set(names.map((n) => n.toLowerCase())));
     } catch {
-      if (conn()?.id !== c.id) return;
+      if (!isCurrent()) return;
       setFuncs(new Set<string>());
     }
     // FK catalog for JOIN completion: active schema + public, merged.
-    fkFetched.clear();
-    setFkEdges([]);
-    await fetchFkSchema(activeTab().searchSchema ?? "public");
-    if ((activeTab().searchSchema ?? "public") !== "public") await fetchFkSchema("public");
+    const activeSchema = activeTab().searchSchema ?? "public";
+    await fetchFkSchema(activeSchema, c);
+    if (activeSchema !== "public") await fetchFkSchema("public", c);
   }
 
   /** Make sure the AI's join graph is loaded before a send: the same schemas autocomplete
    *  primes (active + public). Without this the panel would ship an empty `fks` on the
    *  first question of a session and the model would guess joins. */
   async function ensureAiFks() {
-    const names = new Set([activeTab().searchSchema ?? "public", "public"]);
-    await Promise.all([...names].map((n) => fetchFkSchema(n)));
+    const c = conn();
+    if (!c || metadataFrozen()) return;
+    await Promise.all([...aiFkSchemas()].map((n) => fetchFkSchema(n, c)));
   }
 
   /** Fetch one schema's FK edges into fkEdges (deduped; best-effort). */
-  async function fetchFkSchema(schemaName: string) {
-    const c = conn();
-    if (!c || caps()?.relationships === false || fkFetched.has(schemaName)) return;
-    const inflightKey = `${c.id}:${schemaName}`;
+  async function fetchFkSchema(schemaName: string, target = conn()) {
+    const c = target;
+    if (!c || metadataFrozen() || caps()?.relationships === false || fkFetched.has(schemaName)) return;
+    const generation = fkGeneration;
+    const transactionRevision = transaction().revision;
+    const inflightKey = `${c.id}:${generation}:${schemaName}`;
     if (fkInFlight.has(inflightKey)) return;
     fkInFlight.add(inflightKey);
     try {
       const g = await invoke<{ tables: unknown[]; edges: FkEdge[] }>("schema_relationships", { connectionId: c.id, schema: schemaName });
-      if (conn()?.id !== c.id) return;
+      if (!connectionCurrent(c) || fkGeneration !== generation || transaction().revision !== transactionRevision || metadataFrozen()) return;
       // Mark fetched ONLY on success. `fksKnown` (which gates the AI prompt's "this schema
       // declares no foreign keys" claim) is derived from this set — marking before the
       // await meant a FAILED fetch asserted the schema had no FKs, the exact lie the
@@ -1425,11 +2084,13 @@ function App() {
   }
 
   // Lazy-load one relation's detail on expand; cached unless `force`.
-  async function loadDetail(schemaName: string, name: string, force = false) {
-    const c = conn();
-    if (!c) return;
+  async function loadDetail(schemaName: string, name: string, force = false, target = conn()) {
+    const c = target;
+    if (!c || metadataFrozen()) return;
+    const generation = schemaGeneration;
+    const transactionRevision = transaction().revision;
     const key = relKey(schemaName, name);
-    const inflightKey = `${c.id}:${key}`;
+    const inflightKey = `${c.id}:${generation}:${key}`;
     if (!force && (details()[key] || detailInflight.has(inflightKey))) return;
     detailInflight.add(inflightKey);
     try {
@@ -1438,29 +2099,48 @@ function App() {
         schema: schemaName,
         name,
       });
-      if (conn()?.id !== c.id) return;
+      if (!connectionCurrent(c) || schemaGeneration !== generation || transaction().revision !== transactionRevision || metadataFrozen()) return;
       loadedRels.set(key, { schema: schemaName, name });
       setDetails((prev) => ({ ...prev, [key]: d }));
     } catch (e) {
       console.error(e);
     } finally {
       detailInflight.delete(inflightKey);
+      // A schema refresh can supersede the first detail request before it ever
+      // reaches the cache. Retry under the new generation so an expanded row or
+      // editability probe cannot remain stuck on "loading table info...".
+      if (connectionCurrent(c) && !metadataFrozen() && schemaGeneration !== generation && !details()[key])
+        void loadDetail(schemaName, name, force, c);
     }
   }
 
   // Re-fetch detail for every already-expanded relation (after refresh / DDL).
-  async function refreshLoadedDetails() {
-    for (const { schema, name } of loadedRels.values()) await loadDetail(schema, name, true);
+  async function refreshLoadedDetails(target = conn(), schemaOperation = schemaGeneration) {
+    for (const { schema, name } of loadedRels.values()) {
+      if (schemaGeneration !== schemaOperation) return;
+      await loadDetail(schema, name, true, target);
+    }
   }
 
   const sameColumns = (a: string[], b: string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
 
   // Record a finished user-issued run into the per-connection history (never a
   // grid sort/filter re-run, never blocks the query path on storage failures).
-  const recordHistory = (e: Omit<HistoryEntry, "id" | "ts">) => {
-    if (!connKey) return;
+  const recordHistory = (e: Omit<HistoryEntry, "id" | "ts">, key: string) => {
     const ts = Date.now();
-    setHistory(historyStore.append(connKey, { id: makeEntryId(ts), ts, ...e }));
+    const next = historyStore.append(key, { id: makeEntryId(ts), ts, ...e });
+    if (conn()?.key === key) setHistory(next);
+  };
+
+  const historySqlForTransaction = (
+    sqlText: string,
+    before: TransactionStatus,
+    after: TransactionStatus,
+    event: TransactionEvent,
+    priorHistoryKey: string | null = transactionHistoryKey,
+  ) => {
+    const key = transactionHistoryScope(before, after, event, transactionHistoryKey, priorHistoryKey);
+    return transactionHistorySql(sqlText, key, after.revision, event);
   };
 
   // Shared query executor. `mode:"base"` = a user-issued query (resets sorts/filters,
@@ -1472,39 +2152,84 @@ function App() {
     mode: "base" | "wrapped",
     force = false,
     historySql = sqlToRun,
-  ) {
+  ): Promise<boolean> {
     const c = conn();
-    if (!c || running() || !sqlToRun.trim()) return;
+    if (!c || running() || !sqlToRun.trim()) return false;
     const runTabId = activeTabId();
+    const runTab = tabs().find((t) => t.id === runTabId);
+    if (!runTab) return false;
+    const event = transactionEvent(sqlToRun);
+    if (!transactionDatabaseAllowed(transaction(), runTabId)) {
+      patchResult(runTabId, { status: transaction().state === "lost"
+        ? "Transaction session lost; disconnect and reconnect"
+        : `Database actions are frozen in this tab while ${ownerTab()?.title ?? transaction().owner ?? "another tab"} owns the transaction` });
+      return false;
+    }
+    if (!transactionRecoveryAllowed(transaction(), sqlToRun)) {
+      patchResult(runTabId, { status: "Transaction failed; ROLLBACK is required before any other database action" });
+      return false;
+    }
     // Re-running replaces the rows the pending edits index into — confirm first.
-    const pcount = pendingCount(tabs().find((t) => t.id === runTabId)?.pending);
+    const pcount = pendingCount(runTab.pending);
     if (pcount && !force) {
-      setConfirmDiscard({ count: pcount, run: () => void executeQuery(sqlToRun, base, mode, true, historySql) });
-      return;
+      const origin = captureOrigin();
+      setConfirmDiscard({
+        count: pcount,
+        origin,
+        run: () => { if (originCurrent(origin, true)) void executeQuery(sqlToRun, base, mode, true, historySql); },
+      });
+      return false;
     }
     if (pcount) patchTab(runTabId, { pending: undefined });
     // Running with the results panel collapsed would hide the output — reopen it.
     if (!resultsOpen()) { setResultsOpen(true); persistLayout(); }
-    const runSchema = activeTab().searchSchema;
-    if (cursorOwnerTabId && cursorOwnerTabId !== runTabId) patchResult(cursorOwnerTabId, { done: true });
-    cursorOwnerTabId = null;
+    const runSchema = runTab.searchSchema;
+    if (cursorOwner && cursorOwner.tabId !== runTabId) patchResult(cursorOwner.tabId, { done: true });
+    cursorOwner = null;
+    cursorGeneration++;
+    fetchGeneration++;
+    setFetchingMore(false);
+    setMenuState(null);
     patchResult(runTabId, { runErr: "", status: "" });
     patchTab(runTabId, { resultView: undefined }); // a new run resets the Plan/Grid choice
+    const runGeneration = ++queryGeneration;
+    const before = transaction();
+    const beforeHistoryKey = transactionHistoryKey;
+    let expectedTransactionRevision = before.revision;
+    activeQuery = { generation: runGeneration, connectionGeneration: c.generation, tabId: runTabId, transactionRevision: before.revision };
+    const originCurrentForRun = () =>
+      activeQuery?.generation === runGeneration &&
+      activeQuery.connectionGeneration === c.generation &&
+      activeQuery.tabId === runTabId &&
+      connectionCurrent(c) &&
+      tabs().some((t) => t.id === runTabId);
+    const isCurrent = () => originCurrentForRun() && transaction().revision === expectedTransactionRevision;
     setRunning(true);
     setRunningTabId(runTabId);
     const t0 = performance.now();
     setRunMs(0);
-    runTimer = setInterval(() => setRunMs(performance.now() - t0), 200);
+    const timer = setInterval(() => {
+      if (isCurrent()) setRunMs(performance.now() - t0);
+    }, 200);
+    runTimers.add(timer);
+    let completed = false;
     try {
-      const out = await invoke<QueryOutcome>("run_query", { connectionId: c.id, sql: sqlToRun, pageSize: PAGE, searchPath: runSchema });
+      const out = await invoke<QueryResult>("run_query", { connectionId: c.id, ownerId: runTabId, sql: sqlToRun, pageSize: PAGE, searchPath: runSchema });
+      expectedTransactionRevision = out.transaction.revision;
+      const accepted = applyAuthoritativeTransaction(out.transaction, c.generation, event, before);
+      if (!accepted || !isCurrent()) return false;
       const rt = tabs().find((t) => t.id === runTabId);
       const epoch = (rt?.result.epoch ?? 0) + 1;
+      const loadedGeneration = ++resultGeneration;
       if (out.kind === "rows") {
         const prevCols = rt?.result.columns ?? [];
         patchResult(runTabId, {
-          columns: out.columns, rows: out.rows, done: out.done, lastQuery: sqlToRun, baseQuery: base, epoch,
+          columns: out.columns, rows: out.rows, done: out.done, lastQuery: sqlToRun, baseQuery: base, epoch, generation: loadedGeneration,
           rowsAreBase: mode === "base" || sqlToRun === base,
           status: `${out.rows.length}${out.done ? "" : "+"} rows${out.note ? ` · ${out.note}` : ""}`,
+          transactionId: transactionOpen(out.transaction) ? out.transaction.id : null,
+          transactionRevision: out.transaction.revision,
+          transactionStale: "",
         });
         if (mode === "base") {
           // A fresh result resets sort/filter, but the filter-row VISIBILITY is a UI
@@ -1515,44 +2240,196 @@ function App() {
               : { ...gridViewFor(out.columns.length), filterRowOpen: rt?.gridView.filterRowOpen ?? false },
           });
         }
-        if (!out.done) cursorOwnerTabId = runTabId;
+        if (!out.done) {
+          cursorOwner = {
+            tabId: runTabId,
+            connectionGeneration: c.generation,
+            resultGeneration: loadedGeneration,
+            cursorGeneration: ++cursorGeneration,
+          };
+        }
       } else {
-        patchResult(runTabId, { columns: [], rows: [], done: true, lastQuery: sqlToRun, baseQuery: base, rowsAreBase: false, epoch, status: out.message });
+        patchResult(runTabId, {
+          columns: [], rows: [], done: true, lastQuery: sqlToRun, baseQuery: base, rowsAreBase: false, epoch, generation: loadedGeneration, status: out.message,
+          transactionId: transactionOpen(out.transaction) ? out.transaction.id : null,
+          transactionRevision: out.transaction.revision,
+          transactionStale: "",
+        });
         if (mode === "base") patchTab(runTabId, { gridView: gridViewFor(0) });
       }
-      if (out.kind === "exec" || DDL_RE.test(sqlToRun)) void loadSchema();
+      if (out.kind === "exec" || DDL_RE.test(sqlToRun)) void loadSchema(c);
       if (mode === "base") {
         recordHistory({
-          sql: historySql,
+          sql: historySqlForTransaction(historySql, before, out.transaction, event, beforeHistoryKey),
           durationMs: Math.round(performance.now() - t0),
           status: "ok",
           rows: out.kind === "rows" ? out.rows.length : null,
           error: null,
           schema: runSchema,
-        });
+        }, c.key);
       }
+      completed = true;
     } catch (e) {
+      const embedded = transactionFromError(e);
+      if (embedded) {
+        expectedTransactionRevision = embedded.revision;
+        if (!applyAuthoritativeTransaction(embedded, c.generation, event, before)) return false;
+      }
+      if (!isCurrent()) return false;
       const msg = errMsg(e);
+      const failed = tabs().find((t) => t.id === runTabId);
+      const failedResult = {
+        epoch: (failed?.result.epoch ?? 0) + 1,
+        generation: ++resultGeneration,
+        lastQuery: sqlToRun,
+        baseQuery: base,
+        transactionId: transactionOpen(transaction()) ? transaction().id : null,
+        transactionRevision: transaction().revision,
+        transactionStale: transaction().state === "lost" ? "transaction session lost; result provenance is no longer trustworthy" : "",
+      };
       // A user cancel surfaces as Postgres' "canceling statement due to user request" —
       // present it as a calm status, not a red error banner.
-      if (/cancel/i.test(msg)) patchResult(runTabId, { runErr: "", status: "Query cancelled", columns: [], rows: [], done: true });
-      else patchResult(runTabId, { runErr: msg, columns: [], rows: [], done: true });
+      if (/cancel/i.test(msg)) patchResult(runTabId, { ...failedResult, runErr: "", status: "Query cancelled", columns: [], rows: [], done: true });
+      else patchResult(runTabId, { ...failedResult, runErr: msg, columns: [], rows: [], done: true });
       if (mode === "base") {
         recordHistory({
-          sql: historySql,
+          sql: historySqlForTransaction(historySql, before, embedded ?? transaction(), event, beforeHistoryKey),
           durationMs: Math.round(performance.now() - t0),
           status: /cancel/i.test(msg) ? "cancelled" : "error",
           rows: null,
           error: msg.split("\n")[0],
           schema: runSchema,
-        });
+        }, c.key);
       }
     } finally {
-      if (runTimer) clearInterval(runTimer);
-      setRunning(false);
-      setRunningTabId(null);
-      setCancelling(false);
-      patchResult(runTabId, { elapsed: Math.round(performance.now() - t0) });
+      clearInterval(timer);
+      runTimers.delete(timer);
+      if (activeQuery?.generation === runGeneration) {
+        activeQuery = null;
+        setRunning(false);
+        setRunningTabId(null);
+        setCancelling(false);
+        if (connectionCurrent(c) && tabs().some((t) => t.id === runTabId))
+          patchResult(runTabId, { elapsed: Math.round(performance.now() - t0) });
+      }
+    }
+    return completed;
+  }
+
+  async function runTransactionControl(sqlText: string): Promise<boolean> {
+    const tx = transaction();
+    if (transactionControlBusy()) return false;
+    if (transactionOpen(tx)) {
+      if (tx.state === "lost") {
+        setStatus("Transaction session lost; disconnect and reconnect");
+        return false;
+      }
+      if (tx.owner !== activeTabId()) {
+        setStatus(`Switch to ${ownerTab()?.title ?? "the transaction owner"} first`);
+        return false;
+      }
+      if (ownerPendingCount()) {
+        setStatus("Apply or discard pending grid changes before ending the transaction");
+        return false;
+      }
+    }
+    return executeQuery(sqlText, "", "base", false, sqlText);
+  }
+
+  function openTransactionStartMenu(e: MouseEvent) {
+    if (running() || transactionOpen(transaction())) return;
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const items: MenuItem[] = [
+      { label: "Begin transaction", icon: "play", onClick: () => void runTransactionControl("BEGIN") },
+    ];
+    if (caps()?.setTransaction) {
+      items.push({
+        label: "Begin read-only transaction",
+        icon: "lock",
+        onClick: () => void runTransactionControl(connectionKind() === "mysql" ? "START TRANSACTION READ ONLY" : "BEGIN READ ONLY"),
+      });
+    }
+    if (caps()?.autocommitMode) {
+      items.push({ sep: true }, { label: "Turn autocommit off", icon: "edit", onClick: () => void runTransactionControl("SET autocommit=0") });
+    }
+    setMenu({ x: rect.left, y: rect.bottom + 4, items });
+  }
+
+  async function closeNativeWindow(forcePending = false): Promise<boolean> {
+    if (closeOperationBusy()) {
+      patchResult(runningTabId() ?? activeTabId(), { status: "Cancel or wait for the database operation before closing Tusk" });
+      return false;
+    }
+    if (transactionOpen(transaction())) {
+      const owner = transaction().owner;
+      if (owner && tabs().some((tab) => tab.id === owner)) switchTab(owner);
+      setTransactionResolution({ kind: "window-close" });
+      return false;
+    }
+    if (tabsConnKey) {
+      const snapshot = snapshotTabs();
+      const saved = persistRecovery(tabsConnKey, snapshot, true);
+      if (!saved.ok && snapshot.tabs.some((tab) => tab.dirty)) return false;
+    }
+    const pending = totalPendingCount();
+    if (pending > 0 && !forcePending) {
+      setConfirmWindowClose(pending);
+      return false;
+    }
+    setConfirmWindowClose(null);
+    allowNativeClose = true;
+    try {
+      await getCurrentWindow().close();
+      return true;
+    } catch {
+      allowNativeClose = false;
+      return false;
+    }
+  }
+
+  function continueAfterTransactionResolution(intent: TransactionResolution) {
+    if (intent.kind === "close-tab") closeTab(intent.tabId);
+    else if (intent.kind === "disconnect") void disconnect();
+    else void closeNativeWindow();
+  }
+
+  async function resolveTransaction(action: "commit" | "rollback") {
+    const intent = transactionResolution();
+    const tx = transaction();
+    if (!intent || transactionResolutionBusy() || transactionControlBusy() || tx.state === "lost" || ownerPendingCount()) return;
+    const owner = tx.owner;
+    if (!owner || !tabs().some((tab) => tab.id === owner)) return;
+    if (tx.state === "configured" && action === "commit") return;
+    switchTab(owner);
+    setTransactionResolutionBusy(true);
+    const command = tx.state === "configured"
+      ? "START TRANSACTION; ROLLBACK"
+      : tx.mode === "autocommit_off"
+      ? `${action === "commit" ? "COMMIT" : "ROLLBACK"}; SET autocommit=1`
+      : action === "commit" ? "COMMIT" : "ROLLBACK";
+    try {
+      const ok = await runTransactionControl(command);
+      if (ok && !transactionOpen(transaction())) {
+        setTransactionResolution(null);
+        continueAfterTransactionResolution(intent);
+      }
+    } finally {
+      setTransactionResolutionBusy(false);
+    }
+  }
+
+  async function disconnectLostTransaction() {
+    const intent = transactionResolution();
+    if (!intent || transactionResolutionBusy()) return;
+    setTransactionResolutionBusy(true);
+    const warning = transactionWarning() || "Transaction session was lost; reconnect and verify its outcome.";
+    try {
+      const disconnected = await disconnect(true, true);
+      if (!disconnected) return;
+      setConnErr(warning);
+      if (intent.kind === "window-close") await closeNativeWindow(true);
+    } finally {
+      if (conn()) setTransactionResolutionBusy(false);
     }
   }
 
@@ -1561,12 +2438,12 @@ function App() {
   function cancelQuery() {
     if (!running() || cancelling()) return;
     setCancelling(true);
-    void cancelOperation();
+    void cancelOperation(conn()?.id, runningTabId() ?? activeTabId());
   }
 
   // Run-target chooser: when Run is hit with the cursor inside one of several statements
   // (and nothing selected), ask whether to run the whole file or just that block.
-  const [runChoice, setRunChoice] = createSignal<{ x: number; y: number } | null>(null);
+  const [runChoice, setRunChoice] = createSignal<{ x: number; y: number; origin: UiOrigin } | null>(null);
   let runBtnRef: HTMLButtonElement | undefined;
 
   // Pre-run parameter prompt state: every run path (Run button, gutter ▶,
@@ -1576,6 +2453,7 @@ function App() {
     text: string;
     params: Param[];
     tabId: string;
+    origin: UiOrigin;
     onRun: (substituted: string) => void;
   } | null>(null);
 
@@ -1588,7 +2466,7 @@ function App() {
     // Global shortcuts are blocked while this is open. Keep this guard too for
     // programmatic paths so a second run cannot swap props under a live dialog.
     if (paramPrompt()) return;
-    setParamPrompt({ text: t, params, tabId: activeTabId(), onRun });
+    setParamPrompt({ text: t, params, tabId: activeTabId(), origin: captureOrigin(), onRun });
   }
 
   function runText(t: string) {
@@ -1596,9 +2474,9 @@ function App() {
   }
 
   function runTextNow(t: string, historySql = t) {
-    // A multi-statement run streams only the *last* statement's result, and we don't have
-    // an isolated single SELECT to re-wrap — so store a non-wrappable base (disabling grid
-    // sort/filter). Conservative: any inner `;` counts as multi (never wrongly wrappable).
+    // A multi-statement run is one atomic script and returns only its summary, so there is
+    // no isolated SELECT to re-wrap. Store a non-wrappable base and disable grid rules.
+    // Conservative: any inner `;` counts as multi (never wrongly wrappable).
     const inner = stripTrailingSemi(t);
     const base = inner.includes(";") ? "" : inner;
     const at = activeTab();
@@ -1606,13 +2484,15 @@ function App() {
     // rules carries them over: re-stream the wrapped query instead of resetting to the
     // raw result. Any edit to the query text breaks the match → fresh result (rules reset).
     if (
+      !transactionOpen(transaction()) &&
       base !== "" &&
       base === stripTrailingSemi(at.result.baseQuery) &&
       wrappableQuery(base) &&
       hasViewRules(at.gridView.sorts, at.gridView.filters)
     ) {
       const gv = at.gridView;
-      void executeQuery(wrapQuery(base, gv.sorts, gv.filters, at.result.columns, caps()?.kind), base, "wrapped");
+      const wrapped = tryWrapQuery(at, gv.sorts, gv.filters);
+      if (wrapped !== null) void executeQuery(wrapped, base, "wrapped");
       return;
     }
     void executeQuery(t, base, "base", false, historySql);
@@ -1633,7 +2513,9 @@ function App() {
     // Multiple statements + cursor inside one → ask: whole file, or just this block.
     if (api && api.getStatementCount() > 1) {
       const r = runBtnRef?.getBoundingClientRect();
-      setRunChoice(r ? { x: r.left, y: r.bottom + 6 } : { x: 16, y: 84 });
+      setRunChoice(r
+        ? { x: r.left, y: r.bottom + 6, origin: captureOrigin() }
+        : { x: 16, y: 84, origin: captureOrigin() });
       return;
     }
     // Single statement (or no editor) → run the whole buffer.
@@ -1641,7 +2523,9 @@ function App() {
   }
 
   function chooseRun(which: "block" | "file") {
+    const choice = runChoice();
     setRunChoice(null);
+    if (!choice || !originCurrent(choice.origin)) return;
     const api = editorApi();
     if (!api) return;
     runText(which === "block" ? api.getCurrentStatement() : api.getDoc());
@@ -1649,42 +2533,71 @@ function App() {
 
   // Re-stream the active tab's result sorted/filtered (server ORDER BY / WHERE).
   function onSortFilter(sorts: SortKey[], filters: Filter[], kind: "sort" | "filter") {
+    const prior = { sorts: activeTab().gridView.sorts, filters: activeTab().gridView.filters };
     setGridView({ sorts, filters });
     const tab = activeTab();
-    if (kind === "sort" && tab.result.done && tab.result.rowsAreBase && filters.length === 0) {
+    if (kind === "sort" && localSortEligible() && filters.length === 0) {
       patchResult(tab.id, { epoch: tab.result.epoch + 1 });
       return;
     }
     const base = tab.result.baseQuery;
-    if (!canServerSortFilter()) return;
-    const sqlToRun = hasViewRules(sorts, filters)
-      ? wrapQuery(base, sorts, filters, tab.result.columns, caps()?.kind)
-      : base;
+    if (!activeDatabaseAllowed() || !canServerSortFilter()) return;
+    const sqlToRun = hasViewRules(sorts, filters) ? tryWrapQuery(tab, sorts, filters) : base;
+    if (sqlToRun === null) {
+      // Wrap refused (unwrappable base, duplicate filter names) — no query will
+      // run, so don't leave a sort glyph/filter chip pretending it applied.
+      setGridView(prior);
+      return;
+    }
     void executeQuery(sqlToRun, base, "wrapped");
   }
 
   async function loadMore() {
     const c = conn();
     const id = activeTabId();
-    if (!c || done() || fetchingMore()) return;
-    if (cursorOwnerTabId !== id) return; // this tab doesn't own the live cursor
+    if (!c || done() || fetchingMore() || !transactionDatabaseAllowed(transaction(), id)) return;
+    const owner = cursorOwner;
+    const tab = tabs().find((t) => t.id === id);
+    if (!owner || owner.tabId !== id || owner.connectionGeneration !== c.generation || tab?.result.generation !== owner.resultGeneration) return;
+    const operation = ++fetchGeneration;
+    const before = transaction();
+    let expectedTransactionRevision = before.revision;
+    const isCurrent = () =>
+      fetchGeneration === operation &&
+      connectionCurrent(c) &&
+      cursorOwner?.cursorGeneration === owner.cursorGeneration &&
+      cursorOwner.resultGeneration === owner.resultGeneration &&
+      tabs().find((t) => t.id === id)?.result.generation === owner.resultGeneration &&
+      transaction().revision === expectedTransactionRevision;
     setFetchingMore(true);
     try {
-      const r = await invoke<FetchResult>("fetch_more", { connectionId: c.id, pageSize: PAGE });
+      const r = await invoke<FetchResult>("fetch_more", { connectionId: c.id, ownerId: id, pageSize: PAGE });
+      expectedTransactionRevision = r.transaction.revision;
+      if (!applyAuthoritativeTransaction(r.transaction, c.generation, "statement", before) || !isCurrent()) return;
       // Read the captured tab's rows (the user may have switched tabs during the fetch).
       const prev = tabs().find((t) => t.id === id)?.result.rows ?? [];
       const merged = r.rows.length ? [...prev, ...r.rows] : prev;
       patchResult(id, { rows: merged, done: r.done, status: `${merged.length}${r.done ? "" : "+"} rows` });
-      if (r.done) cursorOwnerTabId = null;
+      if (r.done) {
+        cursorOwner = null;
+        cursorGeneration++;
+      }
     } catch (e) {
+      const embedded = transactionFromError(e);
+      if (embedded) {
+        expectedTransactionRevision = embedded.revision;
+        if (!applyAuthoritativeTransaction(embedded, c.generation, "statement", before)) return;
+      }
+      if (!isCurrent()) return;
       // Streaming broke (e.g. connection dropped mid-fetch). Surface it instead of
       // silently marking the result complete — show the error banner over the rows
       // fetched so far, and stop paging so we don't hammer a dead cursor.
       const msg = errMsg(e);
       patchResult(id, { runErr: msg, status: `streaming stopped — ${msg}`, done: true });
-      cursorOwnerTabId = null;
+      cursorOwner = null;
+      cursorGeneration++;
     } finally {
-      setFetchingMore(false);
+      if (fetchGeneration === operation) setFetchingMore(false);
     }
   }
 
@@ -1692,9 +2605,16 @@ function App() {
   async function loadAll() {
     if (loadingAll()) { cancelAll = true; return; }
     const id = activeTabId();
+    const ownerGeneration = cursorOwner?.cursorGeneration;
     setLoadingAll(true);
     cancelAll = false;
-    while (!cancelAll && !done() && cursorOwnerTabId === id && activeTabId() === id) {
+    while (
+      !cancelAll &&
+      !tabs().find((t) => t.id === id)?.result.done &&
+      cursorOwner?.tabId === id &&
+      cursorOwner.cursorGeneration === ownerGeneration &&
+      activeTabId() === id
+    ) {
       await loadMore();
       await new Promise((r) => setTimeout(r));
     }
@@ -1706,45 +2626,93 @@ function App() {
     return m ? m[1] : "export";
   }
 
-  async function exportToFile(opts: ExportOptions, scope: ExportScope) {
+  async function exportToFile(opts: ExportOptions, scope: ExportScope): Promise<boolean> {
     const src = exportSrc();
-    if (!src) return;
-    const c = conn();
+    if (!src || !originCurrent(src.origin, true)) return false;
+    if (scope === "all" && transactionOpen(transaction())) {
+      throw new Error("All-rows query export is frozen during a manual transaction; export loaded rows instead");
+    }
     const table = opts.sql.table || src.table;
     const path = await save({
       defaultPath: `${table}.${FORMAT_EXT[opts.format]}`,
       filters: [{ name: opts.format.toUpperCase(), extensions: [FORMAT_EXT[opts.format]] }],
     });
-    if (!path) return;
-    setStatus("exporting…");
+    if (!path) return false;
+    if (!originCurrent(src.origin, true)) return false;
+    if (src.origin.tabId) patchResult(src.origin.tabId, { status: "exporting…" });
     const args =
       scope === "all"
-        ? { connectionId: c?.id, sql: src.query, options: opts, path, searchPath: src.searchSchema }
-        : { columns: src.columns, rows: src.rows, options: opts, path };
-    const n = await invoke<number>("export_to_file", args);
-    setStatus(`exported ${n} rows → ${path}`);
-  }
-
-  // Immediately cancel + roll back the in-flight export/import on this connection.
-  async function cancelOperation() {
-    const c = conn();
-    if (!c) return;
+        ? { connectionId: src.connectionId, sql: src.query, options: opts, path, searchPath: src.searchSchema }
+        : { connectionId: src.connectionId, columns: src.columns, rows: src.rows, options: opts, path };
     try {
-      await invoke("cancel_operation", { connectionId: c.id });
+      const n = await invoke<number>("export_to_file", args);
+      if (originCurrent(src.origin, true) && src.origin.tabId) patchResult(src.origin.tabId, { status: `exported ${n} rows → ${path}` });
+      return true;
     } catch (e) {
-      console.error(e);
+      if (originCurrent(src.origin, true) && src.origin.tabId)
+        patchResult(src.origin.tabId, { status: `export rejected: ${errMsg(e)}` });
+      throw e;
     }
   }
 
-  async function exportToClipboard(opts: ExportOptions) {
+  // Immediately cancel + roll back the in-flight export/import on this connection.
+  async function cancelOperation(connectionId = conn()?.id, ownerId = activeTabId()) {
+    const c = conn();
+    if (!connectionId || !c || c.id !== connectionId) return;
+    try {
+      const status = await invoke<TransactionStatus>("cancel_operation", { connectionId, ownerId });
+      applyAuthoritativeTransaction(status, c.generation);
+    } catch (e) {
+      const embedded = transactionFromError(e);
+      if (embedded) applyAuthoritativeTransaction(embedded, c.generation);
+      else console.error(e);
+    }
+  }
+
+  async function exportToClipboard(opts: ExportOptions): Promise<boolean> {
     const src = exportSrc();
-    if (!src) return;
-    const text = formatWithOptions({ columns: src.columns, rows: src.rows }, opts);
+    if (!src || !originCurrent(src.origin, true)) return false;
+    const cells = src.rows.length * src.columns.length;
+    if (cells > 1_000_000) {
+      const message = `result too large for clipboard (${cells.toLocaleString()} cells) - export to a file instead`;
+      if (src.origin.tabId) patchResult(src.origin.tabId, { status: message });
+      throw new Error(message);
+    }
+    let chars = src.columns.reduce((n, col) => n + col.length, 0);
+    outer: for (const row of src.rows) {
+      for (const value of row) {
+        chars += value?.length ?? 0;
+        if (chars > 8 * 1024 * 1024) break outer;
+      }
+    }
+    if (chars > 8 * 1024 * 1024) {
+      const message = `result too large for clipboard (${chars.toLocaleString()}+ characters) - export to a file instead`;
+      if (src.origin.tabId) patchResult(src.origin.tabId, { status: message });
+      throw new Error(message);
+    }
+    let text: string;
+    try {
+      text = formatWithOptions({ columns: src.columns, rows: src.rows }, opts, src.dialect);
+    } catch (e) {
+      if (src.origin.tabId) patchResult(src.origin.tabId, { status: `format rejected: ${errMsg(e)}` });
+      throw e;
+    }
     const ok = await clipWrite(text);
-    setStatus(ok ? `copied ${src.rows.length} rows` : "clipboard unavailable");
+    if (originCurrent(src.origin, true) && src.origin.tabId)
+      patchResult(src.origin.tabId, { status: ok ? `copied ${src.rows.length} rows` : "clipboard unavailable" });
+    if (!ok) throw new Error("clipboard unavailable");
+    return true;
   }
 
   function openImport() {
+    const c = conn();
+    if (!c || metadataFrozen() || running() || fetchingMore() || commitBusy()) {
+      setStatus(metadataFrozen()
+        ? "Import is frozen during a manual transaction"
+        : "Wait for the current database operation before importing");
+      return;
+    }
+    importOrigin = { origin: captureOrigin(), connection: c };
     importReadGeneration++;
     clearTimeout(importCloseTimer);
     setImportData(null);
@@ -1798,9 +2766,10 @@ function App() {
   }
 
   async function doImport() {
-    const c = conn();
+    const binding = importOrigin;
+    const c = binding?.connection;
     const d = importData();
-    if (!c || !d || !d.columns.length) return;
+    if (!binding || !c || metadataFrozen() || !connectionCurrent(c) || !originCurrent(binding.origin) || !d || !d.columns.length) return;
     let schemaName = "public";
     let table = "";
     let create = false;
@@ -1822,7 +2791,8 @@ function App() {
     }
     const generation = importReadGeneration;
     const connectionId = c.id;
-    const stillCurrent = () => generation === importReadGeneration && conn()?.id === connectionId;
+    const stillCurrent = () => generation === importReadGeneration && connectionCurrent(c) && originCurrent(binding.origin);
+    const operationCurrent = () => generation === importReadGeneration && importOrigin === binding;
     setImportBusy(true);
     setImportMsg("");
     try {
@@ -1835,7 +2805,7 @@ function App() {
         create,
       });
       if (!stillCurrent()) return;
-      await loadSchema();
+      await loadSchema(c);
       if (!stillCurrent()) return;
       setImportMsg(`imported ${n} rows`);
       importCloseTimer = setTimeout(() => {
@@ -1846,7 +2816,13 @@ function App() {
       const m = errMsg(e);
       setImportMsg(/cancel/i.test(m) ? "Import cancelled — rolled back." : m);
     } finally {
-      if (stillCurrent()) setImportBusy(false);
+      if (operationCurrent()) {
+        setImportBusy(false);
+        if (metadataFrozen()) {
+          setImportOpen(false);
+          importOrigin = null;
+        }
+      }
     }
   }
 
@@ -1856,24 +2832,37 @@ function App() {
     const startH = editorH();
     const onMove = (ev: MouseEvent) =>
       setEditorH(Math.max(80, Math.min(startH + (ev.clientY - startY), maxEditorH())));
-    const onUp = () => {
+    const cleanup = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
       document.body.style.userSelect = "";
+      interactionCleanups.delete(cleanup);
+    };
+    const onUp = () => {
+      cleanup();
       persistLayout();
     };
+    interactionCleanups.add(cleanup);
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
     document.body.style.userSelect = "none";
   }
 
+  function rejectFrozenExplorer(): boolean {
+    if (!metadataFrozen()) return false;
+    setStatus("Explorer database actions are frozen until the manual transaction ends");
+    return true;
+  }
+
   function runTable(schemaName: string, name: string) {
+    if (rejectFrozenExplorer()) return;
     const q = `SELECT * FROM ${qualifyIn(schemaName, name, schemaName)}`;
     openGeneratedTab(q, schemaName, name);
     doRun(q);
   }
 
   function runTableLimit(schemaName: string, name: string, limit: number) {
+    if (rejectFrozenExplorer()) return;
     const q = `SELECT * FROM ${qualifyIn(schemaName, name, schemaName)} LIMIT ${limit}`;
     openGeneratedTab(q, schemaName, name);
     doRun(q);
@@ -1881,6 +2870,7 @@ function App() {
 
   /** Open a table in a new tab and run it with the per-column filter row already showing. */
   function filterTable(schemaName: string, name: string) {
+    if (rejectFrozenExplorer()) return;
     const q = `SELECT * FROM ${qualifyIn(schemaName, name, schemaName)}`;
     const t = makeTab({ sql: q, searchSchema: schemaName, title: name });
     t.gridView = { ...t.gridView, filterRowOpen: true };
@@ -1891,50 +2881,72 @@ function App() {
 
   // Run a DDL statement built by a form/confirm dialog, then refresh the tree.
   // Returns ok/error so the dialog can stay open and show failures inline.
-  async function runDDL(sqlText: string): Promise<{ ok: boolean; error?: string }> {
+  async function runDDL(sqlText: string, origin = captureOrigin()): Promise<{ ok: boolean; error?: string }> {
     const c = conn();
-    if (!c) return { ok: false, error: "not connected" };
-    setRunErr("");
+    if (!c || !originCurrent(origin)) return { ok: false, error: "connection or tab changed" };
+    if (metadataFrozen()) return { ok: false, error: "Explorer database actions are frozen during a manual transaction" };
+    const before = transaction();
+    if (origin.tabId) patchResult(origin.tabId, { runErr: "" });
     try {
-      const out = await invoke<QueryOutcome>("run_query", { connectionId: c.id, sql: sqlText, pageSize: PAGE });
-      setStatus(out.kind === "exec" ? out.message : `${out.rows.length}${out.done ? "" : "+"} rows`);
-      await loadSchema();
+      const out = await invoke<QueryResult>("run_query", { connectionId: c.id, ownerId: origin.tabId ?? activeTabId(), sql: sqlText, pageSize: PAGE, searchPath: null });
+      if (!applyAuthoritativeTransaction(out.transaction, c.generation, "statement", before)) return { ok: false, error: "stale transaction response" };
+      if (!connectionCurrent(c) || !originCurrent(origin)) return { ok: false, error: "connection or tab changed" };
+      if (origin.tabId) patchResult(origin.tabId, { status: out.kind === "exec" ? out.message : `${out.rows.length}${out.done ? "" : "+"} rows` });
+      await loadSchema(c);
       return { ok: true };
     } catch (e) {
+      const embedded = transactionFromError(e);
+      if (embedded) applyAuthoritativeTransaction(embedded, c.generation, "statement", before);
       return { ok: false, error: errMsg(e) };
     }
   }
 
   // Fire-and-forget DDL (menu actions with no dialog), surfacing errors.
   function runDDLToast(sqlText: string) {
-    void runDDL(sqlText).then((r) => {
-      if (!r.ok) setRunErr(r.error ?? "failed");
+    const origin = captureOrigin();
+    void runDDL(sqlText, origin).then((r) => {
+      if (!r.ok && origin.tabId && originCurrent(origin)) patchResult(origin.tabId, { runErr: r.error ?? "failed" });
     });
   }
 
   // Insert text into the editor at the cursor (never clobbers the buffer).
-  function scaffoldEditor(text: string) {
+  function scaffoldEditor(text: string, tabId = activeTabId()) {
     const body = text.endsWith("\n") ? text : text + "\n";
     const api = editorApi();
-    if (api) api.insertAtCursor(body);
-    else setSql((sql() ? sql().replace(/\s*$/, "\n\n") : "") + body);
+    if (api && tabId === activeTabId()) api.insertAtCursor(body);
+    else {
+      const t = tabs().find((x) => x.id === tabId);
+      if (t) patchTab(tabId, {
+        sql: (t.sql ? t.sql.replace(/\s*$/, "\n\n") : "") + body,
+        dirty: true,
+        revision: t.revision + 1,
+      });
+    }
   }
 
   // "Edit as SQL" from a dialog: scaffold the single statement, close the dialog.
-  function editAsSql(sqlText: string) {
+  function editAsSql(sqlText: string, origin = dialogBinding()?.origin ?? captureOrigin()) {
+    if (!originCurrent(origin) || !origin.tabId) return;
     const t = sqlText.trim();
-    scaffoldEditor(t.endsWith(";") ? t : t + ";");
+    scaffoldEditor(t.endsWith(";") ? t : t + ";", origin.tabId);
     setActiveDialog(null);
   }
 
-  function copyText(text: string, msg?: string) {
-    void clipWrite(text).then((ok) => setStatus(ok ? msg ?? `copied ${text}` : "clipboard unavailable"));
+  function copyText(text: string, msg?: string, origin = captureOrigin()) {
+    if (text.length > 8 * 1024 * 1024) {
+      if (origin.tabId && originAlive(origin)) patchResult(origin.tabId, { status: `value too large to copy (${text.length.toLocaleString()} characters)` });
+      return;
+    }
+    void clipWrite(text).then((ok) => {
+      if (origin.tabId && originAlive(origin)) patchResult(origin.tabId, { status: ok ? msg ?? `copied ${text}` : "clipboard unavailable" });
+    });
   }
 
   // Reconstruct an object's DDL on the backend, then copy or scaffold it.
   async function copyDDL(n: NodeDescriptor, toEditor: boolean) {
     const c = conn();
-    if (!c) return;
+    if (!c || rejectFrozenExplorer()) return;
+    const origin = captureOrigin();
     try {
       const dd = await invoke<string>("object_ddl", {
         connectionId: c.id,
@@ -1942,10 +2954,11 @@ function App() {
         schema: n.schema ?? "",
         name: n.name,
       });
-      if (toEditor) scaffoldEditor(dd);
-      else copyText(dd, "copied DDL");
+      if (!connectionCurrent(c) || !originAlive(origin) || !origin.tabId) return;
+      if (toEditor) scaffoldEditor(dd, origin.tabId);
+      else copyText(dd, "copied DDL", origin);
     } catch (e) {
-      setRunErr(errMsg(e));
+      if (origin.tabId && originAlive(origin)) patchResult(origin.tabId, { runErr: errMsg(e) });
     }
   }
 
@@ -1953,7 +2966,11 @@ function App() {
   // tab whose schema is the relation's, so the generated query stays unqualified
   // and resolves (rather than clobbering the current tab).
   async function generate(n: NodeDescriptor, kind: "select" | "insert" | "update") {
-    await loadDetail(n.schema!, n.name, false);
+    const c = conn();
+    if (!c || rejectFrozenExplorer()) return;
+    const origin = captureOrigin();
+    await loadDetail(n.schema!, n.name, false, c);
+    if (!connectionCurrent(c) || !originCurrent(origin)) return;
     const d = details()[relKey(n.schema!, n.name)];
     const cols = d?.columns.map((c) => c.name) ?? [];
     const pks = d?.columns.filter((c) => c.is_pk).map((c) => c.name) ?? [];
@@ -1969,29 +2986,42 @@ function App() {
 
   // Index/constraint dialogs need the relation's column list (and FK targets).
   async function openIndexDialog(n: NodeDescriptor) {
-    await loadDetail(n.schema!, n.name, false);
+    const c = conn();
+    if (!c || rejectFrozenExplorer()) return;
+    const origin = captureOrigin();
+    await loadDetail(n.schema!, n.name, false, c);
+    if (!connectionCurrent(c) || !originCurrent(origin)) return;
     const d = details()[relKey(n.schema!, n.name)];
-    setActiveDialog({ kind: "addIndex", ctx: n, columns: d?.columns.map((c) => c.name) ?? [] });
+    setActiveDialog({ kind: "addIndex", ctx: n, columns: d?.columns.map((c) => c.name) ?? [] }, origin);
   }
   async function openConstraintDialog(n: NodeDescriptor) {
-    await loadDetail(n.schema!, n.name, false);
+    const c = conn();
+    if (!c || rejectFrozenExplorer()) return;
+    const origin = captureOrigin();
+    await loadDetail(n.schema!, n.name, false, c);
+    if (!connectionCurrent(c) || !originCurrent(origin)) return;
     const d = details()[relKey(n.schema!, n.name)];
     setActiveDialog({
       kind: "addConstraint",
       ctx: n,
       columns: d?.columns.map((c) => c.name) ?? [],
       tables: schema(),
-    });
+    }, origin);
   }
   async function openModify(n: NodeDescriptor) {
-    await loadDetail(n.schema!, n.name, false);
+    const c = conn();
+    if (!c || rejectFrozenExplorer()) return;
+    const origin = captureOrigin();
+    await loadDetail(n.schema!, n.name, false, c);
+    if (!connectionCurrent(c) || !originCurrent(origin)) return;
     const d = details()[relKey(n.schema!, n.name)];
-    if (d) setActiveDialog({ kind: "modifyTable", ctx: n, detail: d });
+    if (d) setActiveDialog({ kind: "modifyTable", ctx: n, detail: d }, origin);
   }
 
   // Context-aware "+" menu — offers creates relevant to the sidebar selection.
   function openPlusMenu(e: MouseEvent) {
     e.preventDefault();
+    if (rejectFrozenExplorer()) return;
     const sel = selected();
     const items: MenuItem[] = [];
     // Resolve the owning table for column/index/constraint selections.
@@ -2023,10 +3053,24 @@ function App() {
 
   function openMenu(e: MouseEvent, node: NodeDescriptor) {
     e.preventDefault();
+    if (metadataFrozen()) {
+      const items: MenuItem[] = [{ label: "Explorer frozen during manual transaction", disabled: true, onClick: () => {} }];
+      if (!activeOwnsTransaction() && transaction().owner) {
+        items.push({ label: `Switch to ${ownerTab()?.title ?? "transaction owner"}`, icon: "play", onClick: () => switchTab(transaction().owner!) });
+      }
+      setMenu({ x: e.clientX, y: e.clientY, items });
+      return;
+    }
     const items = menuItems(node);
     if (!items.length) return;
     // ContextMenu clamps itself to the viewport after measuring its real size.
     setMenu({ x: e.clientX, y: e.clientY, items });
+  }
+
+  function openDdlGraph(schemaName: string, name: string | null, kind: string) {
+    const c = conn();
+    if (!c || rejectFrozenExplorer()) return;
+    setDdlGraph({ schema: schemaName, name, kind, connectionId: c.id, origin: captureOrigin() });
   }
 
   // Per-node-kind action menu. Mutating items are disabled on read-only
@@ -2066,7 +3110,7 @@ function App() {
           { label: "Generate UPDATE", icon: "code", onClick: () => generate(n, "update") },
           { sep: true },
           ...(caps()?.ddl !== false || caps()?.relationships !== false
-            ? [{ label: "DDL & relationships…", icon: "fileCode" as const, onClick: () => setDdlGraph({ schema: s!, name: n.name, kind: "table" }) }]
+            ? [{ label: "DDL & relationships…", icon: "fileCode" as const, onClick: () => openDdlGraph(s!, n.name, "table") }]
             : []),
           ...copyDdl,
           copyName,
@@ -2092,7 +3136,7 @@ function App() {
           { label: "Drop…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop ${n.name}`, primaryLabel: "Drop", showCascade: true, build: (o) => ddl.dropRelation(kw, s!, n.name, o.cascade) }) },
           { sep: true },
           ...(caps()?.ddl !== false || caps()?.relationships !== false
-            ? [{ label: "DDL & relationships…", icon: "fileCode" as const, onClick: () => setDdlGraph({ schema: s!, name: n.name, kind: kw }) }]
+            ? [{ label: "DDL & relationships…", icon: "fileCode" as const, onClick: () => openDdlGraph(s!, n.name, kw) }]
             : []),
           ...copyDdl,
           copyName,
@@ -2116,7 +3160,7 @@ function App() {
       case "schema":
         items.push(
           ...(caps()?.relationships !== false
-            ? [{ label: "Schema diagram…", icon: "link" as const, onClick: () => setDdlGraph({ schema: n.name, name: null, kind: "table" }) }, { sep: true as const }]
+            ? [{ label: "Schema diagram…", icon: "link" as const, onClick: () => openDdlGraph(n.name, null, "table") }, { sep: true as const }]
             : []),
           { label: "Create table…", icon: "plus", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => setActiveDialog({ kind: "createTable", schema: n.name }) },
           { label: "Rename…", icon: "edit", ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename schema ${n.name}`, current: n.name, build: (nn) => ddl.renameSchema(n.name, nn) }) },
@@ -2201,25 +3245,42 @@ function App() {
       x: e.clientX,
       y: e.clientY,
       items: [
-        { label: "Cut", icon: "scissors", disabled: !hasSel, onClick: async () => { const tab = activeTabId(); const s = api.getSelection(); if (await clipWrite(s) && activeTabId() === tab) api.replaceSelection(""); } },
+        { label: "Cut", icon: "scissors", disabled: !hasSel, onClick: async () => {
+          const origin = captureOrigin();
+          const selection = api.captureSelection();
+          if (await clipWrite(selection.text) && originCurrent(origin)) api.replaceCapturedSelection(selection, "");
+        } },
         { label: "Copy", icon: "copy", disabled: !hasSel, onClick: () => copyText(api.getSelection(), "copied selection") },
-        { label: "Paste", icon: "download", onClick: async () => { const tab = activeTabId(); const t = await clipRead(); if (t != null && activeTabId() === tab) api.replaceSelection(t); else if (t == null) setRunErr("clipboard read blocked — use ⌘/Ctrl+V"); } },
+        { label: "Paste", icon: "download", onClick: async () => {
+          const origin = captureOrigin();
+          const selection = api.captureSelection();
+          const text = await clipRead();
+          if (!originCurrent(origin)) return;
+          if (text !== null) api.replaceCapturedSelection(selection, text);
+          else if (origin.tabId) patchResult(origin.tabId, { runErr: "clipboard read blocked — use ⌘/Ctrl+V" });
+        } },
         { sep: true },
         { label: "Select all", icon: "table", onClick: () => api.selectAll() },
         { label: "Toggle comment", icon: "slash", onClick: () => api.toggleComment() },
         { sep: true },
-        { label: hasSel ? "Run selection" : "Run all", icon: "play", onClick: () => runText(hasSel ? api.getRunText() : api.getDoc()) },
+        {
+          label: hasSel ? "Run selection" : "Run all",
+          icon: "play",
+          disabled: !activeDatabaseAllowed(),
+          title: activeDatabaseAllowed() ? undefined : "This tab is frozen while another tab owns the transaction",
+          onClick: () => runText(hasSel ? api.getRunText() : api.getDoc()),
+        },
       ],
     });
   }
 
   const explainMenuItems = (): MenuItem[] => [
-    { label: "Explain", icon: "eye", onClick: () => runAction("explain") },
+    { label: "Explain", icon: "eye", disabled: !activeDatabaseAllowed(), onClick: () => runAction("explain") },
     {
       label: "Explain Analyze (runs the query)",
       icon: "play",
-      disabled: caps()?.explainAnalyze === false,
-      title: caps()?.explainAnalyze === false ? "Not supported by this engine" : undefined,
+      disabled: caps()?.explainAnalyze === false || !activeDatabaseAllowed(),
+      title: caps()?.explainAnalyze === false ? "Not supported by this engine" : !activeDatabaseAllowed() ? "This tab does not own the transaction" : undefined,
       onClick: () => runAction("explainAnalyze"),
     },
   ];
@@ -2271,6 +3332,10 @@ function App() {
   // --- sidebar background (empty space) menu ---
   function openSidebarMenu(e: MouseEvent) {
     e.preventDefault();
+    if (metadataFrozen()) {
+      setMenu({ x: e.clientX, y: e.clientY, items: [{ label: "Explorer frozen during manual transaction", disabled: true, onClick: () => {} }] });
+      return;
+    }
     setMenu({
       x: e.clientX,
       y: e.clientY,
@@ -2347,12 +3412,17 @@ function App() {
     const startW = getW();
     const onMove = (ev: MouseEvent) =>
       setW(Math.max(min, Math.min(startW + dir * (ev.clientX - startX), max)));
-    const onUp = () => {
+    const cleanup = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
       document.body.style.userSelect = "";
+      interactionCleanups.delete(cleanup);
+    };
+    const onUp = () => {
+      cleanup();
       persistLayout();
     };
+    interactionCleanups.add(cleanup);
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
     document.body.style.userSelect = "none";
@@ -2495,14 +3565,17 @@ function App() {
     >
       <div class="workspace">
         <header class="topbar">
-          <span class="brand-sm">{driverMascot(caps()?.kind)} Tusk</span>
+          <span class="brand-sm">{driverMascot(connectionKind())} Tusk</span>
           <span class="conn-chip" title={connTarget()}>
             <span class="conn-dot" />
             <span class="conn-name">{connTarget()}</span>
           </span>
-          <span class="meta">{driverLabel(caps()?.kind)} {conn()!.version}</span>
+          <span class="meta">{driverLabel(connectionKind())} {conn()!.version}</span>
           <Show when={conn()!.readOnly}>
             <span class="badge badge-ro" title="Writes & DDL are blocked"><Icon name="lock" /> Read-only</span>
+          </Show>
+          <Show when={caps()?.manualTransactions !== false && !transactionOpen(transaction())}>
+            <button class="ghost tx-start" disabled={running()} onClick={openTransactionStartMenu} title="Begin or configure a manual transaction">Transaction ▾</button>
           </Show>
           <span class="spacer" />
           <button class="icon" classList={{ active: sidebarOpen() }} title={`${sidebarOpen() ? "Hide" : "Show"} explorer (${displayKey(effectiveKey("toggleSidebar", keys()))})`} onClick={toggleSidebar}><Icon name="panelLeft" /></button>
@@ -2512,8 +3585,65 @@ function App() {
           <button class="icon" classList={{ active: historyOpen() }} title="Query history" onClick={() => setHistoryOpen((v) => !v)}><Icon name="clock" /></button>
           <button class="icon" classList={{ active: helpOpen() }} title="Manual" onClick={() => setHelpOpen(true)}><Icon name="help" /></button>
           <button class="icon" title="Settings" onClick={() => setSettingsOpen("editor")}><Icon name="gear" /></button>
-          <button class="ghost" onClick={disconnect}>Disconnect</button>
+          <button class="ghost" onClick={() => void disconnect()}>Disconnect</button>
         </header>
+
+        <Show when={transactionOpen(transaction())}>
+          <div class="transaction-bar" classList={{ failed: transaction().state === "failed", lost: transaction().state === "lost" }}>
+            <span class="transaction-pulse" />
+            <span class="transaction-mode">
+              {transaction().mode === "autocommit_off"
+                ? "Autocommit off"
+                : transaction().state === "configured" ? "Next transaction configured" : "Manual transaction"}
+            </span>
+            <code>{transaction().id ?? "unknown"}</code>
+            <span class="transaction-detail">
+              {transaction().state.replace("_", " ")} · {ownerTab()?.title ?? transaction().owner ?? "unknown owner"} · {fmtDur(Math.max(0, transactionNow() - (transactionStartedAt() ?? transactionNow())))}
+            </span>
+            <Show when={transaction().state === "failed"}><span class="transaction-alert">Recovery required</span></Show>
+            <Show when={transaction().state === "lost"}><span class="transaction-alert">Outcome may be unknown</span></Show>
+            <span class="spacer" />
+            <Show when={!activeOwnsTransaction() && transaction().owner}>
+              <button class="ghost" onClick={() => switchTab(transaction().owner!)}>Switch to owner</button>
+            </Show>
+            <Show when={activeOwnsTransaction() && transaction().state !== "lost"}>
+              <Show when={ownerPendingCount() > 0}>
+                <span class="transaction-pending">Apply or discard {ownerPendingCount()} grid change{ownerPendingCount() === 1 ? "" : "s"} first</span>
+              </Show>
+              <Show
+                when={transaction().state === "configured"}
+                fallback={
+                  <>
+                    <button
+                      class="ghost"
+                      disabled={!transactionControls().commit}
+                      onClick={() => void runTransactionControl("COMMIT")}
+                    >{transaction().mode === "autocommit_off" ? "Commit unit" : "Commit"}</button>
+                    <button
+                      class="ghost tx-rollback"
+                      disabled={!transactionControls().rollback}
+                      onClick={() => void runTransactionControl("ROLLBACK")}
+                    >{transaction().mode === "autocommit_off" ? "Rollback unit" : "Rollback"}</button>
+                    <Show when={transaction().mode === "autocommit_off"}>
+                      <button
+                        class="ghost"
+                        disabled={!transactionControls().commit}
+                        title="SET autocommit=1 commits the current MySQL transaction unit"
+                        onClick={() => void runTransactionControl("SET autocommit=1")}
+                      >Commit &amp; enable autocommit</button>
+                    </Show>
+                  </>
+                }
+              >
+                <button class="ghost" disabled={!transactionControls().start} onClick={() => void runTransactionControl("START TRANSACTION")}>Start transaction</button>
+                <button class="ghost tx-rollback" disabled={!transactionControls().clearConfiguration} onClick={() => void runTransactionControl("START TRANSACTION; ROLLBACK")}>Clear configuration</button>
+              </Show>
+            </Show>
+            <Show when={transaction().state === "lost"}>
+              <button class="btn-danger" onClick={() => { setTransactionResolution({ kind: "disconnect" }); }}>Disconnect / reconnect</button>
+            </Show>
+          </div>
+        </Show>
 
         <div class="body">
           <Show when={sidebarOpen()}>
@@ -2521,11 +3651,11 @@ function App() {
             <div class="sidebar-head">
               <span class="panel-title2">Explorer</span>
               <div class="head-actions">
-                <button class="icon" title="New… (based on selection)" onClick={(e) => openPlusMenu(e)}><Icon name="plus" /></button>
+                <button class="icon" title="New… (based on selection)" disabled={metadataFrozen()} onClick={(e) => openPlusMenu(e)}><Icon name="plus" /></button>
                 <Show when={caps()?.bulkCopy !== false}>
-                  <button class="icon" title="Import data" onClick={openImport}><Icon name="download" /></button>
+                  <button class="icon" title="Import data" disabled={metadataFrozen()} onClick={openImport}><Icon name="download" /></button>
                 </Show>
-                <button class="icon" title="Refresh" disabled={schemaLoading()} onClick={() => loadSchema()}>{schemaLoading() ? <span class="spinner-sm" /> : <Icon name="refresh" />}</button>
+                <button class="icon" title={metadataFrozen() ? "Refresh deferred until transaction ends" : "Refresh"} disabled={schemaLoading() || metadataFrozen()} onClick={() => loadSchema()}>{schemaLoading() ? <span class="spinner-sm" /> : <Icon name="refresh" />}</button>
               </div>
             </div>
             <div class="sidebar-filter">
@@ -2580,7 +3710,7 @@ function App() {
                   {(t) => (
                     <div
                       class="tab"
-                      classList={{ active: t.id === activeTabId() }}
+                      classList={{ active: t.id === activeTabId(), "tx-owner": transaction().owner === t.id, frozen: transactionOpen(transaction()) && transaction().owner !== t.id }}
                       title={t.filePath ?? t.title}
                       draggable={true}
                       onDragStart={() => (dragTabId = t.id)}
@@ -2611,6 +3741,7 @@ function App() {
                     >
                       <span class="tab-title">{t.title}</span>
                       <Show when={running() && runningTabId() === t.id}><span class="spinner-sm tab-spin" title="Query running" /></Show>
+                      <Show when={transaction().owner === t.id}><span class="tab-tx" title={`Owns ${transaction().id ?? "manual transaction"}`}>TX</span></Show>
                       <Show when={t.dirty}><span class="tab-dot" title="Unsaved changes">●</span></Show>
                       <button class="tab-close" title="Close (⌘/Ctrl+W)" onClick={(e) => { e.stopPropagation(); closeTab(t.id); }}>×</button>
                     </div>
@@ -2623,13 +3754,19 @@ function App() {
                   ref={(el) => (runBtnRef = el)}
                   class="run"
                   classList={{ cancel: running() }}
-                  onClick={() => (running() ? cancelQuery() : doRun())}
-                  disabled={cancelling()}
-                  title={running() ? "Cancel running query" : "Run selection or all"}
+                  onClick={() => {
+                    if (running()) cancelQuery();
+                    else if (!activeDatabaseAllowed()) {
+                      const owner = transaction().owner;
+                      if (owner) switchTab(owner);
+                    } else doRun();
+                  }}
+                  disabled={cancelling() || transaction().state === "lost"}
+                  title={running() ? "Cancel running query" : activeDatabaseAllowed() ? "Run selection or all" : "Switch to the transaction owner"}
                 >
                   {running()
                     ? (cancelling() ? <><span class="spinner-sm" />Cancelling…</> : <>✕ Cancel {fmtDur(runMs())}</>)
-                    : "Run ▶"}
+                    : transaction().state === "lost" ? "Reconnect required" : !activeDatabaseAllowed() ? "Go to transaction" : "Run ▶"}
                 </button>
                 <button class="ghost tb-text" onClick={openFileDialog}>Open</button>
                 <button class="ghost tb-text" onClick={() => void saveActiveTab()}>Save</button>
@@ -2666,7 +3803,10 @@ function App() {
               </div>
               <SqlEditor
                 value={sql()}
-                onChange={(t, id) => patchTab(id, { sql: t, dirty: true })}
+                onChange={(text, id) => {
+                  const tab = tabs().find((t) => t.id === id);
+                  if (tab && text !== tab.sql) patchTab(id, { sql: text, dirty: true, revision: tab.revision + 1 });
+                }}
                 onRun={() => doRun()}
                 onRunStatement={(t) => doRun(t)}
                 running={running() && runningTabId() === activeTabId()}
@@ -2699,7 +3839,7 @@ function App() {
                   </Show>
                   <span class="spacer" />
                   <Show when={!done()}>
-                    <button class="ghost export-btn" onClick={loadAll}>{loadingAll() ? <><span class="spinner-sm" />Cancel</> : "Load all"}</button>
+                    <button class="ghost export-btn" disabled={!activeDatabaseAllowed()} onClick={loadAll}>{loadingAll() ? <><span class="spinner-sm" />Cancel</> : "Load all"}</button>
                     <span class="streaming" classList={{ idle: !(fetchingMore() || loadingAll()) }}>
                       <Show when={fetchingMore() || loadingAll()} fallback={<><span class="stream-dot" />idle</>}>
                         <span class="spinner-sm" />streaming…
@@ -2710,7 +3850,7 @@ function App() {
                   <Show when={editCtx().editable || pendingCount(tabPending()) > 0}>
                     <Show when={pendingCount(tabPending()) > 0}>
                       <span class="sb-pending" title="Uncommitted in-grid changes">✎ {pendingCount(tabPending())} change{pendingCount(tabPending()) === 1 ? "" : "s"}</span>
-                      <button class="ghost export-btn sb-commit" onClick={openCommit} disabled={!editCtx().editable || running()} title={editCtx().editable ? "Preview & run the change script" : editCtx().reason}>Commit…</button>
+                      <button class="ghost export-btn sb-commit" onClick={openCommit} disabled={!editCtx().editable || running()} title={editCtx().editable ? "Preview & run the change script" : editCtx().reason}>{activeOwnsTransaction() ? "Apply…" : "Commit…"}</button>
                       <button class="ghost export-btn" onClick={discardPending}>Discard</button>
                     </Show>
                     <Show when={editCtx().editable}>
@@ -2723,6 +3863,9 @@ function App() {
                       <input type="checkbox" checked={prefs().copyHeaders} onChange={(e) => updatePrefs({ copyHeaders: e.currentTarget.checked })} />
                       Copy w/ column names
                     </label>
+                  </Show>
+                  <Show when={activeTab().result.transactionStale}>
+                    <span class="transaction-result-stale" title={activeTab().result.transactionStale}>Stale transaction result</span>
                   </Show>
                   <Show when={(lastQuery() || columns().length > 0) && caps()?.export !== false}>
                     <span class="sb-sep" />
@@ -2752,11 +3895,15 @@ function App() {
                   setView={setGridView}
                   activeTabId={activeTabId}
                   epoch={() => activeTab().result.epoch}
+                  resultGeneration={() => activeTab().result.generation}
                   onLoadMore={loadMore}
                   onSortFilter={onSortFilter}
                   onMenu={(x, y, items) => setMenu({ x, y, items })}
-                  onViewValue={(col, val) => setCellView({ col, val })}
-                  onStatus={setStatus}
+                  onViewValue={(col, val) => setCellView({ col, val, origin: captureOrigin() })}
+                  onStatus={(text, tabId, generation) => {
+                    const tab = tabs().find((t) => t.id === tabId);
+                    if (tab?.result.generation === generation) patchResult(tabId, { status: text });
+                  }}
                   canSort={canSort}
                   canFilter={canFilter}
                   editable={() => editCtx().editable}
@@ -2786,7 +3933,7 @@ function App() {
             </Show>
 
             <footer class="statusbar">
-              <span>{status()}</span>
+              <span title={persistenceWarning() || transactionWarning() || undefined}>{persistenceWarning() || transactionWarning() || status()}</span>
               <Show when={slackStatus().state !== "disconnected"}>
                 <span
                   class="slack-badge"
@@ -2826,8 +3973,15 @@ function App() {
               width={historyW()}
               onInsert={(sql) => editorApi()?.insertAtCursor(sql)}
               onOpenTab={(sql, schema) => openGeneratedTab(sql, schema, "History")}
-              onRerun={(sql) => runText(sql)}
-              onClear={() => { if (connKey) { historyStore.clear(connKey); setHistory([]); } }}
+              onRerun={(sql, recordedSchema) => {
+                const tabId = activeTabId();
+                patchTab(tabId, { searchSchema: recordedSchema });
+                runText(sql);
+              }}
+              onClear={() => {
+                const key = conn()?.key;
+                if (key) { historyStore.clear(key); if (conn()?.key === key) setHistory([]); }
+              }}
               onClose={() => setHistoryOpen(false)}
             />
           </Show>
@@ -2840,11 +3994,15 @@ function App() {
         <Show when={ddlGraph()}>
           {(g) => (
             <DdlGraphDialog
-              connectionId={conn()!.id}
+              connectionId={g().connectionId}
               schema={g().schema}
               name={g().name}
               kind={g().kind}
-              onOpenSql={(sql) => { setDdlGraph(null); openGeneratedTab(sql, g().schema, g().name ?? undefined); }}
+              onOpenSql={(sql) => {
+                const binding = g();
+                setDdlGraph(null);
+                if (originCurrent(binding.origin)) openGeneratedTab(sql, binding.schema, binding.name ?? undefined);
+              }}
               onCopy={copyText}
               onClose={() => setDdlGraph(null)}
             />
@@ -2857,9 +4015,13 @@ function App() {
               sql={pp().text}
               params={pp().params}
               initial={tabs().find((t) => t.id === pp().tabId)?.paramValues}
-              onRun={(values: Record<string, ParamValue>, substituted: string) => {
-                const prompt = pp();
-                const source = tabs().find((t) => t.id === prompt.tabId);
+               onRun={(values: Record<string, ParamValue>, substituted: string) => {
+                 const prompt = pp();
+                 if (!originCurrent(prompt.origin)) {
+                   setParamPrompt(null);
+                   return;
+                 }
+                 const source = tabs().find((t) => t.id === prompt.tabId);
                 patchTab(prompt.tabId, { paramValues: { ...source?.paramValues, ...values } });
                 setActiveTabId(prompt.tabId);
                 setParamPrompt(null);
@@ -2885,7 +4047,7 @@ function App() {
                   Title
                   <input
                     value={rt().title}
-                    ref={(el) => setTimeout(() => { el.focus(); el.select(); })}
+                    ref={(el) => queueMicrotask(() => { if (el.isConnected) { el.focus(); el.select(); } })}
                     onInput={(e) => setRenameTab({ id: rt().id, title: e.currentTarget.value })}
                   />
                 </label>
@@ -2906,9 +4068,10 @@ function App() {
             <div class="form-actions">
               <button class="ghost" onClick={() => setConfirmAnalyze(null)}>Cancel</button>
               <button class="btn-danger" onClick={() => {
-                const w = confirmAnalyze()!;
+                const binding = confirmAnalyze()!;
                 setConfirmAnalyze(null);
-                runParameterized(w, (substituted) => void executeQuery(substituted, "", "base", false, w));
+                if (!originCurrent(binding.origin)) return;
+                runParameterized(binding.sql, (substituted) => void executeQuery(substituted, "", "base", false, binding.sql));
               }}>
                 Run it
               </button>
@@ -2917,58 +4080,61 @@ function App() {
         </Show>
 
         <Show when={importOpen()}>
-          <div class="modal-overlay" onClick={() => !importBusy() && setImportOpen(false)}>
-            <div class="modal" onClick={(e) => e.stopPropagation()}>
-              <div class="modal-head">Import data<span class="spacer" /><button class="icon modal-x" disabled={importBusy()} onClick={() => setImportOpen(false)}><Icon name="close" /></button></div>
-              {/* All configuration controls disable while an import is running. */}
-              <fieldset class="import-fieldset" disabled={importBusy()}>
-                <input ref={importFileInput} type="file" accept=".csv,.tsv,.json,.txt" style={{ display: "none" }} onChange={onImportFile} />
-                <button class="ghost full" onClick={() => importFileInput?.click()}>Choose file…</button>
-                <Show when={importRaw()}>
-                  <label class="checkbox"><input type="checkbox" checked={importHasHeader()} onChange={(e) => { setImportHasHeader(e.currentTarget.checked); reparseImport(); }} />First row is header (CSV)</label>
-                </Show>
-                <Show when={importData()}>
-                  {(d) => (
-                    <>
-                      <div class="import-info">{d().columns.length} cols · {d().rows.length} rows · {d().columns.slice(0, 6).join(", ")}{d().columns.length > 6 ? "…" : ""}</div>
-                      <div class="seg">
-                        <button classList={{ active: importMode() === "existing" }} onClick={() => setImportMode("existing")}>Existing table</button>
-                        <button classList={{ active: importMode() === "new" }} onClick={() => setImportMode("new")}>New table</button>
-                      </div>
-                      <Show
-                        when={importMode() === "existing"}
-                        fallback={<label>New table name<input value={importNewName()} onInput={(e) => setImportNewName(e.currentTarget.value)} placeholder="table_name" /></label>}
-                      >
-                        <label>Target table
-                          <select value={importTarget()} onChange={(e) => setImportTarget(e.currentTarget.value)}>
-                            <For each={schema()}>{(t) => <option value={relKey(t.schema, t.name)}>{t.schema}.{t.name}</option>}</For>
-                          </select>
-                        </label>
-                      </Show>
-                    </>
-                  )}
-                </Show>
-              </fieldset>
-              <Show when={importData()}>
-                <Show
-                  when={importBusy()}
-                  fallback={<button class="run full" onClick={doImport}>Import</button>}
-                >
-                  <div class="import-busy"><span class="spinner-sm" />Importing…</div>
-                  <button class="ghost full" onClick={() => void cancelOperation()}>Cancel &amp; roll back</button>
-                </Show>
+          <Dialog title="Import data" onClose={() => setImportOpen(false)} dismissable={!importBusy()}>
+            {/* All configuration controls disable while an import is running. */}
+            <fieldset class="import-fieldset" disabled={importBusy()}>
+              <input ref={importFileInput} type="file" accept=".csv,.tsv,.json,.txt" style={{ display: "none" }} onChange={onImportFile} />
+              <button class="ghost full" onClick={() => importFileInput?.click()}>Choose file…</button>
+              <Show when={importRaw()}>
+                <label class="checkbox"><input type="checkbox" checked={importHasHeader()} onChange={(e) => { setImportHasHeader(e.currentTarget.checked); reparseImport(); }} />First row is header (CSV)</label>
               </Show>
-              <Show when={importMsg()}><div class="import-msg">{importMsg()}</div></Show>
-            </div>
-          </div>
+              <Show when={importData()}>
+                {(d) => (
+                  <>
+                    <div class="import-info">{d().columns.length} cols · {d().rows.length} rows · {d().columns.slice(0, 6).join(", ")}{d().columns.length > 6 ? "…" : ""}</div>
+                    <div class="seg">
+                      <button classList={{ active: importMode() === "existing" }} onClick={() => setImportMode("existing")}>Existing table</button>
+                      <button classList={{ active: importMode() === "new" }} onClick={() => setImportMode("new")}>New table</button>
+                    </div>
+                    <Show
+                      when={importMode() === "existing"}
+                      fallback={<label>New table name<input value={importNewName()} onInput={(e) => setImportNewName(e.currentTarget.value)} placeholder="table_name" /></label>}
+                    >
+                      <label>Target table
+                        <select value={importTarget()} onChange={(e) => setImportTarget(e.currentTarget.value)}>
+                          <For each={schema()}>{(t) => <option value={relKey(t.schema, t.name)}>{t.schema}.{t.name}</option>}</For>
+                        </select>
+                      </label>
+                    </Show>
+                  </>
+                )}
+              </Show>
+            </fieldset>
+            <Show when={importData()}>
+              <Show
+                when={importBusy()}
+                fallback={<button class="run full" onClick={doImport}>Import</button>}
+              >
+                <div class="import-busy"><span class="spinner-sm" />Importing…</div>
+                <button class="ghost full" onClick={() => void cancelOperation(importOrigin?.connection.id, importOrigin?.origin.tabId ?? activeTabId())}>Cancel &amp; roll back</button>
+              </Show>
+            </Show>
+            <Show when={importMsg()}><div class="import-msg">{importMsg()}</div></Show>
+          </Dialog>
         </Show>
 
         <Show when={activeDialog()}>
           <WorkbenchDialogs
             state={activeDialog()}
             onClose={() => setActiveDialog(null)}
-            onRun={runDDL}
-            onEditAsSql={editAsSql}
+            onRun={(sql) => {
+              const binding = dialogBinding();
+              return binding ? runDDL(sql, binding.origin) : Promise.resolve({ ok: false, error: "dialog is stale" });
+            }}
+            onEditAsSql={(sql) => {
+              const binding = dialogBinding();
+              if (binding) editAsSql(sql, binding.origin);
+            }}
           />
         </Show>
         <Show when={exportSrc()}>
@@ -2977,28 +4143,32 @@ function App() {
               columns={src().columns}
               loadedRows={src().rows}
               defaultTable={src().table}
+              dialect={src().dialect}
               boolCols={src().boolCols}
+              allowAllRows={!transactionOpen(transaction())}
               onClose={() => setExportSrc(null)}
               onExportFile={exportToFile}
               onExportClipboard={exportToClipboard}
-              onCancel={cancelOperation}
+              onCancel={() => cancelOperation(src().connectionId, src().origin.tabId ?? activeTabId())}
             />
           )}
         </Show>
         <Show when={commitView()}>
           {(cv) => (
-            <Dialog title="Commit changes" width={620} onClose={() => setCommitView(null)} dismissable={!commitBusy()}>
+            <Dialog title={activeOwnsTransaction() ? "Apply changes" : "Commit changes"} width={620} onClose={closeCommit} dismissable={!commitBusy()}>
               <p class="confirm-text">
-                {cv().script.length} statement{cv().script.length === 1 ? "" : "s"} will run in one transaction (rolled back wholesale on failure).
+                {activeOwnsTransaction()
+                  ? `${cv().script.length} statement${cv().script.length === 1 ? "" : "s"} will run inside ${transaction().id}. The outer transaction remains open.`
+                  : `${cv().script.length} statement${cv().script.length === 1 ? "" : "s"} will run in one transaction (rolled back wholesale on failure).`}
               </p>
               <SqlPreview sql={cv().script.map((s) => s + ";").join("\n")} />
               <Show when={commitErr()}>
                 <div class="error">{commitErr()}</div>
               </Show>
               <div class="form-actions">
-                <button class="ghost" disabled={commitBusy()} onClick={() => setCommitView(null)}>Cancel</button>
+                <button class="ghost" disabled={commitBusy()} onClick={closeCommit}>Cancel</button>
                 <button class="run" disabled={commitBusy()} onClick={() => void doCommit()}>
-                  {commitBusy() ? "Committing…" : "Commit"}
+                  {commitBusy() ? "Applying…" : activeOwnsTransaction() ? "Apply" : "Commit"}
                 </button>
               </div>
             </Dialog>
@@ -3012,34 +4182,135 @@ function App() {
               </p>
               <div class="form-actions">
                 <button class="ghost" onClick={() => setConfirmDiscard(null)}>Keep changes</button>
-                <button class="btn-danger" onClick={() => { const r = cd().run; setConfirmDiscard(null); r(); }}>Discard</button>
+                <button class="btn-danger" onClick={() => {
+                  const binding = cd();
+                  setConfirmDiscard(null);
+                  if (originCurrent(binding.origin, true)) binding.run();
+                }}>Discard</button>
               </div>
             </Dialog>
           )}
         </Show>
         <Show when={confirmClose()}>
-          {(id) => (
-            <Dialog title="Unsaved changes" onClose={() => setConfirmClose(null)} width={420}>
+          {(cc) => (
+            <Dialog title="Uncommitted changes" onClose={() => setConfirmClose(null)} width={460}>
               <p class="confirm-text">
-                “{tabs().find((t) => t.id === id())?.title}” has unsaved changes. Save before closing?
+                “{tabs().find((t) => t.id === cc().tabId)?.title}” has
+                {cc().dirty ? " unsaved editor changes" : ""}
+                {cc().dirty && cc().pending ? " and" : ""}
+                {cc().pending ? ` ${cc().pending} uncommitted grid change${cc().pending === 1 ? "" : "s"}` : ""}.
+                {cc().pending ? " Grid changes cannot be saved to the SQL file and will be discarded if this tab closes." : ""}
               </p>
               <div class="form-actions">
                 <button class="ghost" onClick={() => setConfirmClose(null)}>Cancel</button>
-                <button class="btn-danger" onClick={() => { removeTab(id()); setConfirmClose(null); }}>Don't save</button>
-                <button
-                  class="run"
-                  onClick={async () => {
-                    const tid = id();
-                    setActiveTabId(tid);
-                    await saveActiveTab();
-                    if (!tabs().find((t) => t.id === tid)?.dirty) {
-                      removeTab(tid);
-                      setConfirmClose(null);
-                    }
-                  }}
+                <button class="btn-danger" onClick={() => { removeTab(cc().tabId); setConfirmClose(null); }}>Discard &amp; close</button>
+                <Show when={cc().dirty}>
+                  <button
+                    class="run"
+                     onClick={async () => {
+                       const tid = cc().tabId;
+                       if (await saveTab(tid, false) && confirmClose()?.tabId === tid) {
+                         removeTab(tid);
+                         setConfirmClose(null);
+                      }
+                    }}
+                  >
+                    {cc().pending ? "Save file, discard grid & close" : "Save & close"}
+                  </button>
+                </Show>
+              </div>
+            </Dialog>
+          )}
+        </Show>
+        <Show when={confirmDisconnect()}>
+          {(count) => (
+            <Dialog title="Disconnect with pending changes?" onClose={() => setConfirmDisconnect(null)} width={460}>
+              <p class="confirm-text">
+                Disconnecting discards {count()} uncommitted grid change{count() === 1 ? "" : "s"}. Editor buffers remain saved in this workspace.
+              </p>
+              <div class="form-actions">
+                <button class="ghost" onClick={() => setConfirmDisconnect(null)}>Stay connected</button>
+                <button class="btn-danger" onClick={() => void disconnect(true)}>Discard &amp; disconnect</button>
+              </div>
+            </Dialog>
+          )}
+        </Show>
+        <Show when={confirmWindowClose()}>
+          {(count) => (
+            <Dialog title="Close with pending changes?" onClose={() => setConfirmWindowClose(null)} width={460}>
+              <p class="confirm-text">
+                Closing Tusk discards {count()} uncommitted grid change{count() === 1 ? "" : "s"}. Editor buffers have been saved to workspace recovery.
+              </p>
+              <div class="form-actions">
+                <button class="ghost" onClick={() => setConfirmWindowClose(null)}>Keep Tusk open</button>
+                <button class="btn-danger" onClick={() => void closeNativeWindow(true)}>Discard &amp; close Tusk</button>
+              </div>
+            </Dialog>
+          )}
+        </Show>
+        <Show when={transactionResolution()}>
+          {(intent) => (
+            <Dialog
+              title={transaction().state === "lost" ? "Transaction session lost" : "Resolve transaction first"}
+              onClose={() => setTransactionResolution(null)}
+              dismissable={!transactionResolutionBusy()}
+              width={520}
+            >
+              <p class="confirm-text">
+                <Show
+                  when={transaction().state !== "lost"}
+                  fallback={<>The database session for <b>{transaction().id}</b> was lost. Commit state cannot be proven. Disconnect, reconnect, and verify the outcome before retrying.</>}
                 >
-                  Save
-                </button>
+                  <b>{ownerTab()?.title ?? transaction().owner}</b> owns {transaction().id}.
+                  {transaction().state === "configured" ? " Clear the pending MySQL transaction configuration before" : " Commit or roll it back before"}
+                  {intent().kind === "close-tab" ? " closing its tab" : intent().kind === "disconnect" ? " disconnecting" : " closing Tusk"}.
+                </Show>
+              </p>
+              <Show when={transaction().state === "lost" && totalPendingCount() > 0}>
+                <div class="transaction-resolution-note">
+                  Disconnecting will discard {totalPendingCount()} pending grid change{totalPendingCount() === 1 ? "" : "s"}.
+                </div>
+              </Show>
+              <Show when={transaction().state !== "lost" && ownerPendingCount() > 0}>
+                <div class="transaction-resolution-note">
+                  {ownerPendingCount()} pending grid change{ownerPendingCount() === 1 ? "" : "s"} must be applied or discarded before the outer transaction can end.
+                </div>
+              </Show>
+              <div class="form-actions">
+                <button class="ghost" disabled={transactionResolutionBusy()} onClick={() => setTransactionResolution(null)}>Cancel</button>
+                <Show when={transaction().state === "lost"}>
+                  <button class="btn-danger" disabled={transactionResolutionBusy()} onClick={() => void disconnectLostTransaction()}>
+                    {transactionResolutionBusy() ? "Disconnecting…" : "Disconnect and reconnect"}
+                  </button>
+                </Show>
+                <Show when={transaction().state !== "lost" && ownerPendingCount() > 0}>
+                  <button class="ghost" disabled={!editCtx().editable || transactionResolutionBusy() || transactionControlBusy()} onClick={applyPendingBeforeTransactionResolution}>Apply changes…</button>
+                  <button class="btn-danger" disabled={transactionResolutionBusy() || transactionControlBusy()} onClick={() => {
+                    const owner = transaction().owner;
+                    if (owner) setPendingFor(owner, undefined);
+                  }}>Discard grid changes</button>
+                </Show>
+                <Show when={transaction().state !== "lost" && ownerPendingCount() === 0}>
+                  <Show
+                    when={transaction().state === "configured"}
+                    fallback={
+                      <>
+                        <button
+                          class="ghost"
+                          disabled={transactionResolutionBusy() || !transactionControls().commit}
+                          onClick={() => void resolveTransaction("commit")}
+                        >{transactionResolutionBusy() ? "Resolving…" : transaction().mode === "autocommit_off" ? "Commit & return to autocommit" : "Commit"}</button>
+                        <button class="btn-danger" disabled={transactionResolutionBusy() || !transactionControls().rollback} onClick={() => void resolveTransaction("rollback")}>
+                          {transaction().mode === "autocommit_off" ? "Rollback & return to autocommit" : "Rollback"}
+                        </button>
+                      </>
+                    }
+                  >
+                    <button class="btn-danger" disabled={transactionResolutionBusy() || !transactionControls().clearConfiguration} onClick={() => void resolveTransaction("rollback")}>
+                      {transactionResolutionBusy() ? "Clearing…" : "Clear configuration & continue"}
+                    </button>
+                  </Show>
+                </Show>
               </div>
             </Dialog>
           )}
@@ -3117,7 +4388,7 @@ function App() {
             </Show>
             <div class="form-actions">
               <button class="ghost" onClick={() => setCellView(null)}>Close</button>
-              <button class="run" disabled={cv().val === null} onClick={() => copyText(cv().val ?? "", "copied value")}>Copy</button>
+              <button class="run" disabled={cv().val === null || !originCurrent(cv().origin, true)} onClick={() => copyText(cv().val ?? "", "copied value", cv().origin)}>Copy</button>
             </div>
           </Dialog>
         )}

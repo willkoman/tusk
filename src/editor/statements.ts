@@ -2,6 +2,7 @@ import { StateField, StateEffect, RangeSetBuilder, type EditorState, type Extens
 import { Decoration, type DecorationSet, EditorView, GutterMarker, gutter } from "@codemirror/view";
 import { docString, lexState, statementAt } from "./lexer";
 import { type CursorInfo } from "./types";
+import { ACTIVE_STATEMENT_LINE_LIMIT, LINT_STATEMENT_LIMIT, LIVE_ANALYSIS_MAX_CHARS } from "./limits";
 
 // Per-statement affordances: a "▶" gutter marker that runs just that statement, a
 // subtle highlight on the statement under the cursor (only when there's more than
@@ -9,14 +10,16 @@ import { type CursorInfo } from "./types";
 
 // lineNo-of-first-char → statement index, memoized per document version.
 const startLineCache = new WeakMap<object, Map<number, number>>();
+const noStartLines = new Map<number, number>();
 function startLineMap(state: EditorState): Map<number, number> {
+  if (state.doc.length > LIVE_ANALYSIS_MAX_CHARS) return noStartLines;
   const key = state.doc as unknown as object;
   let map = startLineCache.get(key);
   if (!map) {
     map = new Map();
     const { stmts } = lexState(state);
     const text = docString(state);
-    stmts.forEach((s, i) => {
+    stmts.slice(0, LINT_STATEMENT_LIMIT).forEach((s, i) => {
       let p = s.from;
       while (p < s.to && /\s/.test(text[p])) p++;
       map!.set(state.doc.lineAt(Math.min(p, state.doc.length)).from, i);
@@ -101,7 +104,8 @@ export function statementGutter(onRun: (text: string) => void): Extension {
   ];
 }
 
-function buildActive(state: EditorState): DecorationSet {
+export function buildActiveStatementDecorations(state: EditorState): DecorationSet {
+  if (state.doc.length > LIVE_ANALYSIS_MAX_CHARS) return Decoration.none;
   const { stmts } = lexState(state);
   if (stmts.length <= 1) return Decoration.none;
   const at = statementAt(stmts, state.selection.main.head);
@@ -119,7 +123,9 @@ function buildActive(state: EditorState): DecorationSet {
   const builder = new RangeSetBuilder<Decoration>();
   let pos = state.doc.lineAt(from).from;
   const end = state.doc.lineAt(to - 1).to;
+  let lineCount = 0;
   while (pos <= end) {
+    if (++lineCount > ACTIVE_STATEMENT_LINE_LIMIT) return Decoration.none;
     const line = state.doc.lineAt(pos);
     builder.add(line.from, line.from, Decoration.line({ class: "cm-activeStatement" }));
     if (line.to + 1 > len) break;
@@ -129,9 +135,9 @@ function buildActive(state: EditorState): DecorationSet {
 }
 
 const activeStatementField = StateField.define<DecorationSet>({
-  create: buildActive,
+  create: buildActiveStatementDecorations,
   update(value, tr) {
-    if (tr.docChanged || !tr.state.selection.eq(tr.startState.selection)) return buildActive(tr.state);
+    if (tr.docChanged || !tr.state.selection.eq(tr.startState.selection)) return buildActiveStatementDecorations(tr.state);
     return value;
   },
   provide: (f) => EditorView.decorations.from(f),
@@ -148,8 +154,9 @@ export function cursorReadout(onInfo: (info: CursorInfo) => void): Extension {
     const state = u.state;
     const head = state.selection.main.head;
     const line = state.doc.lineAt(head);
-    const { stmts } = lexState(state);
-    const at = statementAt(stmts, head);
+    const withinLimit = state.doc.length <= LIVE_ANALYSIS_MAX_CHARS;
+    const stmts = withinLimit ? lexState(state).stmts : [];
+    const at = withinLimit ? statementAt(stmts, head) : null;
     let selChars = 0;
     for (const r of state.selection.ranges) selChars += r.to - r.from;
     onInfo({

@@ -8,16 +8,27 @@ import { highlightSql } from "./sqlHighlight";
 // in-progress code block.
 
 type Block = { type: "prose"; text: string } | { type: "code"; lang: string; code: string };
+const MAX_RENDER_BLOCKS = 2_000;
+const MAX_PROSE_PREVIEW_CHARS = 1_000_000;
+const MAX_PROSE_PREVIEW_LINES = 10_000;
+const MAX_INLINE_RUNS = 10_000;
+const PREVIEW_TRUNCATED = "[message preview truncated; full text remains in the conversation]";
 
 function parseBlocks(text: string): Block[] {
   const out: Block[] = [];
   const re = /```([\w+-]*)\n?([\s\S]*?)```/g;
   let last = 0;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(text))) {
+  let blocks = 0;
+  while (blocks < MAX_RENDER_BLOCKS && (m = re.exec(text))) {
     if (m.index > last) out.push({ type: "prose", text: text.slice(last, m.index) });
     out.push({ type: "code", lang: m[1] || "", code: m[2].replace(/\n$/, "") });
+    blocks++;
     last = re.lastIndex;
+  }
+  if (blocks >= MAX_RENDER_BLOCKS && last < text.length) {
+    out.push({ type: "prose", text: PREVIEW_TRUNCATED });
+    return out;
   }
   const tail = text.slice(last);
   const open = tail.indexOf("```"); // an unclosed fence still streaming
@@ -37,7 +48,12 @@ function inline(text: string): JSX.Element[] {
   const re = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*\s][^*]*\*)/g;
   let last = 0;
   let m: RegExpExecArray | null;
+  let runs = 0;
   while ((m = re.exec(text))) {
+    if (runs++ >= MAX_INLINE_RUNS) {
+      out.push(text.slice(last));
+      return out;
+    }
     if (m.index > last) out.push(text.slice(last, m.index));
     const t = m[0];
     if (t.startsWith("`")) out.push(<code class="md-code">{t.slice(1, -1)}</code>);
@@ -50,7 +66,14 @@ function inline(text: string): JSX.Element[] {
 }
 
 function Prose(props: { text: string }) {
-  const lines = () => props.text.replace(/\n{3,}/g, "\n\n").split("\n");
+  const lines = () => {
+    const truncatedChars = props.text.length > MAX_PROSE_PREVIEW_CHARS;
+    const preview = props.text.slice(0, MAX_PROSE_PREVIEW_CHARS).replace(/\n{3,}/g, "\n\n").split("\n");
+    const truncatedLines = preview.length > MAX_PROSE_PREVIEW_LINES;
+    const bounded = preview.slice(0, MAX_PROSE_PREVIEW_LINES);
+    if (truncatedChars || truncatedLines) bounded.push(PREVIEW_TRUNCATED);
+    return bounded;
+  };
   return (
     <For each={lines()}>
       {(line) => {

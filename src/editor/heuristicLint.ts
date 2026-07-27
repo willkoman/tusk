@@ -7,6 +7,7 @@ import { STATEMENT_STARTERS } from "../sql/dialects";
 const STARTER_LIST = [...STATEMENT_STARTERS];
 import { closest } from "./distance";
 import { docString, lexState, maskNonCode, spanAt } from "./lexer";
+import { LINT_DIAGNOSTIC_LIMIT, LINT_STATEMENT_LIMIT, LIVE_ANALYSIS_MAX_CHARS } from "./limits";
 
 // Fast, offline heuristics that run as-you-type. Deliberately limited to checks
 // that are reliably correct on real SQL (read off the masked, code-only view of
@@ -26,11 +27,17 @@ import { docString, lexState, maskNonCode, spanAt } from "./lexer";
 
 export function heuristicLintSource() {
   return (view: EditorView): Diagnostic[] => {
+    if (view.state.doc.length > LIVE_ANALYSIS_MAX_CHARS) return [];
     const { spans, stmts } = lexState(view.state);
     const doc = docString(view.state);
     const out: Diagnostic[] = [];
+    const add = (diag: Diagnostic): boolean => {
+      out.push(diag);
+      return out.length >= LINT_DIAGNOSTIC_LIMIT;
+    };
 
-    for (const stmt of stmts) {
+    for (let stmtIndex = 0; stmtIndex < Math.min(stmts.length, LINT_STATEMENT_LIMIT); stmtIndex++) {
+      const stmt = stmts[stmtIndex];
       const base = stmt.from;
       const m = maskNonCode(doc, spans, stmt.from, stmt.to);
       const stack: number[] = [];
@@ -41,7 +48,7 @@ export function heuristicLintSource() {
           stack.push(p);
         } else if (c === ")") {
           if (stack.length) stack.pop();
-          else out.push({ from: base + p, to: base + p + 1, severity: "error", message: "unmatched ')'" });
+          else if (add({ from: base + p, to: base + p + 1, severity: "error", message: "unmatched ')'" })) return out;
         } else if (c === ",") {
           // Look at what actually follows the comma, span-aware: skip whitespace and
           // comments, but a string/quoted/dollar span IS a value element (the mask
@@ -69,11 +76,11 @@ export function heuristicLintSource() {
             else if (/^[a-zA-Z_]\w*/.exec(doc.slice(q, Math.min(stmt.to, q + 64)))?.[0]?.toUpperCase() === "FROM") trailing = true;
             break;
           }
-          if (trailing) out.push({ from: dp, to: dp + 1, severity: "warning", message: "trailing comma" });
+          if (trailing && add({ from: dp, to: dp + 1, severity: "warning", message: "trailing comma" })) return out;
         }
       }
       for (const openP of stack) {
-        out.push({ from: base + openP, to: base + openP + 1, severity: "warning", message: "unclosed '('" });
+        if (add({ from: base + openP, to: base + openP + 1, severity: "warning", message: "unclosed '('" })) return out;
       }
 
       // Unknown leading keyword: find the first code character (skipping comments),
@@ -99,12 +106,12 @@ export function heuristicLintSource() {
           const isPrefix = typingHere && STARTER_LIST.some((s) => s !== word && s.startsWith(word));
           if (!STATEMENT_STARTERS.has(word) && !isPrefix) {
             const hint = closest(word, STATEMENT_STARTERS);
-            out.push({
+            if (add({
               from: p0,
               to: p0 + tok.length,
               severity: "error",
               message: `unknown statement "${tok}"${hint ? ` — did you mean ${hint}?` : ""}`,
-            });
+            })) return out;
           }
         }
         break; // first real code char handled either way
@@ -113,12 +120,12 @@ export function heuristicLintSource() {
       const du = /^\s*(DELETE|UPDATE)\b/i.exec(m);
       if (du && !/\bWHERE\b/i.test(m)) {
         const kwStart = base + m.search(/\S/);
-        out.push({
+        if (add({
           from: kwStart,
           to: kwStart + du[1].length,
           severity: "warning",
           message: `${du[1].toUpperCase()} without WHERE — affects every row`,
-        });
+        })) return out;
       }
     }
     return out;

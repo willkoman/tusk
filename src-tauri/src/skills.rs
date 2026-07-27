@@ -11,7 +11,10 @@
 //! Both consumers read these: the desktop panel (`src/ai/skills.ts`) and the Slack bot.
 
 use serde::{Deserialize, Serialize};
+use std::fs::{self, File, Metadata};
+use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use crate::db::AppError;
 
@@ -20,6 +23,13 @@ use crate::db::AppError;
 /// database reached two ways should get the same skills.
 pub const SCOPE_WORKSPACE: &str = "workspace";
 pub const SCOPE_DATABASE: &str = "database";
+const MAX_SKILLS: usize = 256;
+const MAX_SKILL_BYTES: usize = 256 * 1024;
+const MAX_ID_BYTES: usize = 128;
+const MAX_NAME_BYTES: usize = 200;
+const MAX_DESCRIPTION_BYTES: usize = 2 * 1024;
+const MAX_DATABASE_BYTES: usize = 512;
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -65,10 +75,31 @@ impl Skill {
 fn safe_id(raw: &str) -> String {
     let s: String = raw
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let s = s.trim_matches('-').to_string();
-    if s.is_empty() { "skill".to_string() } else { s }
+    if s.is_empty() {
+        "skill".to_string()
+    } else {
+        s
+    }
+}
+
+fn canonical_id(raw: &str) -> Result<&str, AppError> {
+    if raw.is_empty()
+        || raw.len() > MAX_ID_BYTES
+        || safe_id(raw) != raw
+        || !raw.bytes().any(|b| b.is_ascii_alphanumeric())
+    {
+        return Err(AppError::new("invalid skill id"));
+    }
+    Ok(raw)
 }
 
 /// `my-skill-1a2b3c` — slug of the name plus a monotonic suffix, so two skills named the
@@ -78,7 +109,7 @@ fn new_id(name: &str) -> String {
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let slug: String = safe_id(&name.to_lowercase()).chars().take(32).collect();
@@ -92,6 +123,175 @@ fn skills_dir(app: &tauri::AppHandle) -> Result<PathBuf, AppError> {
         .app_config_dir()
         .map_err(|e| AppError::new(e.to_string()))?
         .join("skills"))
+}
+
+#[cfg(windows)]
+fn is_reparse(meta: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse(_: &Metadata) -> bool {
+    false
+}
+
+fn ensure_real_dir(dir: &PathBuf) -> Result<(), AppError> {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || is_reparse(&meta) || !meta.is_dir() {
+                return Err(AppError::new("skills path is not a regular directory"));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = dir.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    AppError::new(format!("cannot create app config directory: {e}"))
+                })?;
+            }
+            fs::create_dir(dir)
+                .map_err(|e| AppError::new(format!("cannot create skills directory: {e}")))?;
+            let meta = fs::symlink_metadata(dir)
+                .map_err(|e| AppError::new(format!("cannot inspect skills directory: {e}")))?;
+            if meta.file_type().is_symlink() || is_reparse(&meta) || !meta.is_dir() {
+                return Err(AppError::new("skills path is not a regular directory"));
+            }
+        }
+        Err(e) => {
+            return Err(AppError::new(format!(
+                "cannot inspect skills directory: {e}"
+            )))
+        }
+    }
+    Ok(())
+}
+
+fn regular_file(path: &PathBuf) -> Result<Metadata, AppError> {
+    let meta = fs::symlink_metadata(path)
+        .map_err(|e| AppError::new(format!("cannot inspect skill file: {e}")))?;
+    if meta.file_type().is_symlink() || is_reparse(&meta) || !meta.is_file() {
+        return Err(AppError::new("skill path is not a regular file"));
+    }
+    Ok(meta)
+}
+
+fn read_skill_file(path: &PathBuf) -> Result<String, AppError> {
+    let meta = regular_file(path)?;
+    if meta.len() > MAX_SKILL_BYTES as u64 {
+        return Err(AppError::new("skill exceeds the 256 KiB limit"));
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    File::open(path)
+        .map_err(|e| AppError::new(format!("cannot open skill: {e}")))?
+        .take(MAX_SKILL_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| AppError::new(format!("cannot read skill: {e}")))?;
+    if bytes.len() > MAX_SKILL_BYTES {
+        return Err(AppError::new("skill exceeds the 256 KiB limit"));
+    }
+    String::from_utf8(bytes).map_err(|_| AppError::new("skill is not valid UTF-8"))
+}
+
+fn set_restrictive_permissions(_file: &File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        _file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn sync_dir(_dir: &PathBuf) -> std::io::Result<()> {
+    #[cfg(unix)]
+    File::open(_dir)?.sync_all()?;
+    Ok(())
+}
+
+fn write_temp(dir: &PathBuf, data: &[u8]) -> Result<tempfile::NamedTempFile, AppError> {
+    let mut temp = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|e| AppError::new(format!("cannot create temporary skill: {e}")))?;
+    set_restrictive_permissions(temp.as_file())
+        .map_err(|e| AppError::new(format!("cannot secure temporary skill: {e}")))?;
+    temp.write_all(data)
+        .map_err(|e| AppError::new(format!("cannot write skill: {e}")))?;
+    temp.as_file_mut()
+        .sync_all()
+        .map_err(|e| AppError::new(format!("cannot sync skill: {e}")))?;
+    Ok(temp)
+}
+
+fn atomic_replace(dir: &PathBuf, path: &PathBuf, data: &[u8]) -> Result<(), AppError> {
+    // An existing destination must be a regular file (no symlinks/reparse points),
+    // but a missing one is fine: saving a skill whose file was removed out-of-band
+    // recreates it instead of failing.
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            regular_file(path)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(AppError::new(format!("cannot inspect skill file: {e}"))),
+    }
+    write_temp(dir, data)?
+        .persist(path)
+        .map_err(|e| AppError::new(format!("cannot replace skill: {}", e.error)))?;
+    sync_dir(dir).map_err(|e| AppError::new(format!("cannot sync skills directory: {e}")))
+}
+
+fn atomic_create(dir: &PathBuf, path: &PathBuf, data: &[u8]) -> Result<bool, AppError> {
+    match write_temp(dir, data)?.persist_noclobber(path) {
+        Ok(_) => {
+            sync_dir(dir)
+                .map_err(|e| AppError::new(format!("cannot sync skills directory: {e}")))?;
+            Ok(true)
+        }
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(AppError::new(format!("cannot create skill: {}", e.error))),
+    }
+}
+
+fn normalize_and_validate(skill: &mut Skill) -> Result<(), AppError> {
+    if skill.scope != SCOPE_DATABASE {
+        skill.scope = SCOPE_WORKSPACE.to_string();
+        skill.database.clear();
+    }
+    if skill.name.trim().is_empty() {
+        return Err(AppError::new("a skill needs a name"));
+    }
+    if skill.name.len() > MAX_NAME_BYTES {
+        return Err(AppError::new("skill name exceeds the 200-byte limit"));
+    }
+    if skill.description.len() > MAX_DESCRIPTION_BYTES {
+        return Err(AppError::new("skill description exceeds the 2 KiB limit"));
+    }
+    if skill.database.len() > MAX_DATABASE_BYTES {
+        return Err(AppError::new(
+            "skill database name exceeds the 512-byte limit",
+        ));
+    }
+    if skill.scope == SCOPE_DATABASE && skill.database.trim().is_empty() {
+        return Err(AppError::new(
+            "a database-scoped skill needs a database name",
+        ));
+    }
+    if skill.body.len() > MAX_SKILL_BYTES {
+        return Err(AppError::new("skill exceeds the 256 KiB limit"));
+    }
+    Ok(())
+}
+
+fn entry_count(dir: &PathBuf) -> Result<usize, AppError> {
+    let mut count = 0;
+    for entry in fs::read_dir(dir).map_err(|e| AppError::new(format!("cannot list skills: {e}")))? {
+        entry.map_err(|e| AppError::new(format!("cannot list skills: {e}")))?;
+        count += 1;
+        if count > MAX_SKILLS {
+            return Err(AppError::new(
+                "skills directory exceeds the 256-entry limit",
+            ));
+        }
+    }
+    Ok(count)
 }
 
 /// Escape a frontmatter scalar. Values are single-line; a newline would forge a new key.
@@ -128,7 +328,9 @@ pub fn from_markdown(text: &str, fallback_name: &str) -> Skill {
         Some(after) => match after.split_once("\n---") {
             Some((front, body)) => {
                 for line in front.lines() {
-                    let Some((k, v)) = line.split_once(':') else { continue };
+                    let Some((k, v)) = line.split_once(':') else {
+                        continue;
+                    };
                     let v = v.trim();
                     match k.trim() {
                         "name" if !v.is_empty() => sk.name = v.to_string(),
@@ -158,15 +360,26 @@ pub fn from_markdown(text: &str, fallback_name: &str) -> Skill {
 /// Every skill on disk, name-sorted. Unreadable/garbage files are skipped, never fatal —
 /// one bad file must not take down the AI panel.
 pub fn load_all(app: &tauri::AppHandle) -> Vec<Skill> {
-    let Ok(dir) = skills_dir(app) else { return Vec::new() };
-    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let Ok(dir) = skills_dir(app) else {
+        return Vec::new();
+    };
+    if ensure_real_dir(&dir).is_err() {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
     let mut out: Vec<Skill> = entries
+        .take(MAX_SKILLS)
         .flatten()
         .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
         .filter_map(|e| {
-            let stem = e.path().file_stem()?.to_string_lossy().into_owned();
-            let text = std::fs::read_to_string(e.path()).ok()?;
+            let path = e.path();
+            let stem = path.file_stem()?.to_str()?.to_string();
+            canonical_id(&stem).ok()?;
+            let text = read_skill_file(&path).ok()?;
             let mut sk = from_markdown(&text, &stem);
+            normalize_and_validate(&mut sk).ok()?;
             sk.id = stem;
             Some(sk)
         })
@@ -183,43 +396,78 @@ pub fn skills_list(app: tauri::AppHandle) -> Vec<Skill> {
 /// Create (blank id) or update. Returns the stored skill, id assigned.
 #[tauri::command]
 pub fn skills_save(app: tauri::AppHandle, mut skill: Skill) -> Result<Skill, AppError> {
-    if skill.name.trim().is_empty() {
-        return Err(AppError::new("a skill needs a name"));
-    }
-    if skill.scope == SCOPE_DATABASE && skill.database.trim().is_empty() {
-        return Err(AppError::new("a database-scoped skill needs a database name"));
-    }
+    normalize_and_validate(&mut skill)?;
     let dir = skills_dir(&app)?;
-    std::fs::create_dir_all(&dir).map_err(|e| AppError::new(e.to_string()))?;
-    if skill.id.trim().is_empty() {
-        skill.id = new_id(&skill.name);
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    ensure_real_dir(&dir)?;
+    if skill.id.is_empty() {
+        if entry_count(&dir)? >= MAX_SKILLS {
+            return Err(AppError::new("no more than 256 skills may be stored"));
+        }
+        loop {
+            skill.id = new_id(&skill.name);
+            let data = to_markdown(&skill);
+            if data.len() > MAX_SKILL_BYTES {
+                return Err(AppError::new("skill exceeds the 256 KiB limit"));
+            }
+            let path = dir.join(format!("{}.md", skill.id));
+            if atomic_create(&dir, &path, data.as_bytes())? {
+                return Ok(skill);
+            }
+        }
     }
-    skill.id = safe_id(&skill.id);
-    std::fs::write(dir.join(format!("{}.md", skill.id)), to_markdown(&skill))
-        .map_err(|e| AppError::new(e.to_string()))?;
+    canonical_id(&skill.id)?;
+    let data = to_markdown(&skill);
+    if data.len() > MAX_SKILL_BYTES {
+        return Err(AppError::new("skill exceeds the 256 KiB limit"));
+    }
+    atomic_replace(&dir, &dir.join(format!("{}.md", skill.id)), data.as_bytes())?;
     Ok(skill)
 }
 
 #[tauri::command]
 pub fn skills_delete(app: tauri::AppHandle, id: String) -> Result<(), AppError> {
-    let path = skills_dir(&app)?.join(format!("{}.md", safe_id(&id)));
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), // already gone
-        Err(e) => Err(AppError::new(e.to_string())),
+    canonical_id(&id)?;
+    let dir = skills_dir(&app)?;
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    ensure_real_dir(&dir)?;
+    let path = dir.join(format!("{id}.md"));
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(AppError::new(format!("cannot inspect skill file: {e}"))),
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || is_reparse(&meta) || !meta.is_file() {
+                return Err(AppError::new("skill path is not a regular file"));
+            }
+            fs::remove_file(&path)
+                .map_err(|e| AppError::new(format!("cannot delete skill: {e}")))?;
+            sync_dir(&dir).map_err(|e| AppError::new(format!("cannot sync skills directory: {e}")))
+        }
     }
 }
 
 /// The skill's file text, for the frontend to hand to `write_text_file`.
 #[tauri::command]
 pub fn skills_export(app: tauri::AppHandle, id: String) -> Result<String, AppError> {
-    let path = skills_dir(&app)?.join(format!("{}.md", safe_id(&id)));
-    std::fs::read_to_string(&path).map_err(|e| AppError::new(e.to_string()))
+    canonical_id(&id)?;
+    let dir = skills_dir(&app)?;
+    ensure_real_dir(&dir)?;
+    read_skill_file(&dir.join(format!("{id}.md")))
 }
 
 /// Parse imported text and store it as a NEW skill (never clobbers an existing id).
 #[tauri::command]
-pub fn skills_import(app: tauri::AppHandle, text: String, fallback_name: String) -> Result<Skill, AppError> {
+pub fn skills_import(
+    app: tauri::AppHandle,
+    text: String,
+    fallback_name: String,
+) -> Result<Skill, AppError> {
+    if text.len() > MAX_SKILL_BYTES {
+        return Err(AppError::new("skill exceeds the 256 KiB limit"));
+    }
+    if fallback_name.len() > MAX_NAME_BYTES {
+        return Err(AppError::new("skill name exceeds the 200-byte limit"));
+    }
     let mut sk = from_markdown(&text, &fallback_name);
     if sk.name.trim().is_empty() {
         sk.name = "Imported skill".to_string();
@@ -255,7 +503,10 @@ mod tests {
     #[test]
     fn a_plain_markdown_file_is_a_valid_skill() {
         // Drop any .md in the folder (or import one) and it works: whole text = body.
-        let sk = from_markdown("# Notes\n\nJoin orders to customers on customer_id.", "my-notes");
+        let sk = from_markdown(
+            "# Notes\n\nJoin orders to customers on customer_id.",
+            "my-notes",
+        );
         assert_eq!(sk.name, "my-notes");
         assert_eq!(sk.scope, SCOPE_WORKSPACE);
         assert!(sk.enabled);
@@ -292,13 +543,24 @@ mod tests {
 
     #[test]
     fn applies_to_respects_scope_and_enabled() {
-        let mut db = Skill { name: "d".into(), scope: SCOPE_DATABASE.into(), database: "pagila".into(), enabled: true, ..Default::default() };
+        let mut db = Skill {
+            name: "d".into(),
+            scope: SCOPE_DATABASE.into(),
+            database: "pagila".into(),
+            enabled: true,
+            ..Default::default()
+        };
         assert!(db.applies_to("pagila"));
         assert!(!db.applies_to("other"));
         db.enabled = false;
         assert!(!db.applies_to("pagila"));
 
-        let ws = Skill { name: "w".into(), scope: SCOPE_WORKSPACE.into(), enabled: true, ..Default::default() };
+        let ws = Skill {
+            name: "w".into(),
+            scope: SCOPE_WORKSPACE.into(),
+            enabled: true,
+            ..Default::default()
+        };
         assert!(ws.applies_to("anything"));
     }
 
@@ -306,8 +568,54 @@ mod tests {
     fn ids_are_path_safe_and_frontmatter_cannot_be_forged() {
         assert_eq!(safe_id("../../etc/passwd"), "etc-passwd");
         assert_eq!(safe_id("...."), "skill");
+        assert!(canonical_id("../../etc/passwd").is_err());
+        assert_eq!(canonical_id("etc-passwd").unwrap(), "etc-passwd");
+        assert!(canonical_id("---").is_err());
         // A newline in a scalar would otherwise inject a key.
-        let s = Skill { name: "a\nenabled: false".into(), enabled: true, ..Default::default() };
+        let s = Skill {
+            name: "a\nenabled: false".into(),
+            enabled: true,
+            ..Default::default()
+        };
         assert!(from_markdown(&to_markdown(&s), "f").enabled);
+    }
+
+    #[test]
+    fn skill_fields_and_document_size_are_bounded() {
+        let mut skill = Skill {
+            name: "n".into(),
+            scope: SCOPE_WORKSPACE.into(),
+            enabled: true,
+            body: "x".repeat(MAX_SKILL_BYTES + 1),
+            ..Default::default()
+        };
+        assert!(normalize_and_validate(&mut skill).is_err());
+        skill.body.clear();
+        skill.name = "x".repeat(MAX_NAME_BYTES + 1);
+        assert!(normalize_and_validate(&mut skill).is_err());
+    }
+
+    #[test]
+    fn create_is_collision_safe_and_replace_is_atomic() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let path = dir.join("one.md");
+        assert!(atomic_create(&dir, &path, b"first").unwrap());
+        assert!(!atomic_create(&dir, &path, b"second").unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first");
+        atomic_replace(&dir, &path, b"second").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_skill_files_are_refused() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.md");
+        fs::write(&target, "secret").unwrap();
+        let link = temp.path().join("linked.md");
+        symlink(&target, &link).unwrap();
+        assert!(read_skill_file(&link).is_err());
     }
 }

@@ -1,4 +1,13 @@
-import { type ParsedPlan, type PlanNode, finishTree, planInputWithinLimits, propStr } from "./types";
+import {
+  MAX_PLAN_JSON_CHARS,
+  MAX_PLAN_PROPS,
+  boundPlanText,
+  type ParsedPlan,
+  type PlanNode,
+  finishTree,
+  planInputWithinLimits,
+  propStr,
+} from "./types";
 
 // Postgres EXPLAIN (FORMAT JSON) → PlanTree. The JSON arrives as a single text
 // cell over the simple protocol (possibly pretty-printed across lines — the
@@ -13,8 +22,8 @@ function pgNode(raw: Record<string, unknown>): PlanNode {
       .filter((v): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v))
       .map(pgNode)
     : [];
-  const num = (k: string): number | undefined => (typeof raw[k] === "number" ? (raw[k] as number) : undefined);
-  const str = (k: string): string | undefined => (typeof raw[k] === "string" ? (raw[k] as string) : undefined);
+  const num = (k: string): number | undefined => (typeof raw[k] === "number" && Number.isFinite(raw[k]) ? (raw[k] as number) : undefined);
+  const str = (k: string): string | undefined => (typeof raw[k] === "string" ? boundPlanText(raw[k] as string) : undefined);
 
   const totalCost = num("Total Cost");
   const totalTimeMs = num("Actual Total Time");
@@ -38,7 +47,7 @@ function pgNode(raw: Record<string, unknown>): PlanNode {
 
   const props: [string, string][] = [];
   for (const [k, v] of Object.entries(raw)) {
-    if (!EXTRACTED.has(k)) props.push([k, propStr(v)]);
+    if (!EXTRACTED.has(k) && props.length < MAX_PLAN_PROPS) props.push([boundPlanText(k), propStr(v)]);
   }
 
   return {
@@ -58,6 +67,7 @@ function pgNode(raw: Record<string, unknown>): PlanNode {
 }
 
 export function parsePg(jsonText: string): ParsedPlan | null {
+  if (jsonText.length > MAX_PLAN_JSON_CHARS) return null;
   let parsed: unknown;
   try {
     parsed = JSON.parse(jsonText);
@@ -66,9 +76,9 @@ export function parsePg(jsonText: string): ParsedPlan | null {
   }
   const arr = Array.isArray(parsed) ? parsed : [parsed];
   if (!planInputWithinLimits(arr)) return null;
-  const first = arr[0] as Record<string, unknown> | undefined;
+  const first = arr[0] && typeof arr[0] === "object" && !Array.isArray(arr[0]) ? arr[0] as Record<string, unknown> : undefined;
   const planRaw = first?.["Plan"];
-  if (!planRaw || typeof planRaw !== "object") return null;
+  if (!planRaw || typeof planRaw !== "object" || Array.isArray(planRaw) || typeof (planRaw as Record<string, unknown>)["Node Type"] !== "string") return null;
   const root = pgNode(planRaw as Record<string, unknown>);
   return finishTree("postgres", root, {
     planningMs: typeof first?.["Planning Time"] === "number" ? (first["Planning Time"] as number) : undefined,

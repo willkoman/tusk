@@ -20,26 +20,35 @@ export function isExplainQuery(sql: string): boolean {
 type Snap = { lastQuery: string; columns: string[]; rows: (string | null)[][] };
 const MAX_PLAN_INPUT_CHARS = 5_000_000;
 const MAX_PLAN_TEXT_CHARS = 1_000_000;
+const MAX_PLAN_CELLS = 100_000;
+const MAX_PLAN_COLUMNS = 64;
 
 /** Join a result's cells line-wise — the universal styled-text fallback. */
 function textOf(rows: (string | null)[][], colIndex?: number): string {
   let out = "";
+  let seen = 0;
+  let truncated = false;
   outer: for (const row of rows) {
     const cells = colIndex !== undefined ? [row[colIndex] ?? ""] : row;
     for (let i = 0; i < cells.length; i++) {
+      if (++seen > MAX_PLAN_CELLS) { truncated = true; break outer; }
       const prefix = i ? "  " : out ? "\n" : "";
-      if (MAX_PLAN_TEXT_CHARS - out.length <= prefix.length) break outer;
+      if (MAX_PLAN_TEXT_CHARS - out.length <= prefix.length) { truncated = true; break outer; }
       out += prefix;
-      out += (cells[i] ?? "").slice(0, MAX_PLAN_TEXT_CHARS - out.length);
-      if (out.length >= MAX_PLAN_TEXT_CHARS) break outer;
+      const cell = cells[i] ?? "";
+      const room = MAX_PLAN_TEXT_CHARS - out.length;
+      out += cell.slice(0, room);
+      if (cell.length > room || out.length >= MAX_PLAN_TEXT_CHARS) { truncated = true; break outer; }
     }
   }
-  return out.length >= MAX_PLAN_TEXT_CHARS ? `${out}\n… plan text truncated` : out;
+  return truncated ? `${out}\n… plan text truncated` : out;
 }
 
 function inputWithinLimit(rows: (string | null)[][]): boolean {
   let chars = 0;
+  let cells = 0;
   for (const row of rows) for (const cell of row) {
+    if (++cells > MAX_PLAN_CELLS) return false;
     chars += cell?.length ?? 0;
     if (chars > MAX_PLAN_INPUT_CHARS) return false;
   }
@@ -50,7 +59,9 @@ function firstJsonCell(columns: string[], rows: (string | null)[][]): string | n
   // EXPLAIN JSON arrives as one cell, but pretty-printed JSON can also be split
   // across rows of a single column — join the column and test the head.
   for (let c = 0; c < columns.length; c++) {
-    const joined = rows.map((r) => r[c] ?? "").join("\n").trim();
+    let joined = "";
+    for (const row of rows) joined += `${joined ? "\n" : ""}${row[c] ?? ""}`;
+    joined = joined.trim();
     if (joined.startsWith("[") || joined.startsWith("{")) return joined;
   }
   return null;
@@ -59,7 +70,7 @@ function firstJsonCell(columns: string[], rows: (string | null)[][]): string | n
 export function detectPlan(engine: string | null | undefined, snap: Snap): ParsedPlan | null {
   if (!snap.rows.length || !snap.columns.length) return null;
   if (!isExplainQuery(snap.lastQuery)) return null;
-  if (!inputWithinLimit(snap.rows)) return { kind: "text", text: textOf(snap.rows) };
+  if (snap.columns.length > MAX_PLAN_COLUMNS || !inputWithinLimit(snap.rows)) return { kind: "text", text: textOf(snap.rows) };
 
   try {
     switch (engine) {

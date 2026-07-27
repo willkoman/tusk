@@ -26,7 +26,7 @@ export function HistoryPanel(props: {
   width: number;
   onInsert: (sql: string) => void;
   onOpenTab: (sql: string, schema: string | null) => void;
-  onRerun: (sql: string) => void;
+  onRerun: (sql: string, schema: string | null) => void;
   onClear: () => void;
   onClose: () => void;
 }) {
@@ -82,7 +82,7 @@ export function HistoryPanel(props: {
                     <span class="spacer" />
                     <button class="ghost" onClick={() => props.onInsert(e.sql)}>Insert</button>
                     <button class="ghost" onClick={() => props.onOpenTab(e.sql, e.schema)}>Open in tab</button>
-                    <button class="run" onClick={() => props.onRerun(e.sql)}>Re-run</button>
+                    <button class="run" onClick={() => props.onRerun(e.sql, e.schema)}>Re-run</button>
                   </div>
                 </Show>
               </div>

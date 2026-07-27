@@ -429,6 +429,26 @@ select option { font-weight: 400; }
 .topbar .ghost svg { width: 14px; height: 14px; }
 .topbar .ghost.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 .topbar .icon.active { background: var(--accent); color: #fff; opacity: 1; }
+.tx-start { color: var(--accent-2); border-color: rgba(var(--accent-rgb), 0.35); }
+.transaction-bar {
+  display: flex; align-items: center; gap: 9px; min-height: 38px; padding: 5px 12px;
+  background: rgba(var(--accent-rgb), 0.10); border-bottom: 1px solid rgba(var(--accent-rgb), 0.35);
+  color: var(--text); font-size: 12px; flex-wrap: wrap;
+}
+.transaction-bar.failed { background: rgba(230, 180, 80, 0.11); border-bottom-color: rgba(230, 180, 80, 0.4); }
+.transaction-bar.lost { background: rgba(248, 81, 73, 0.10); border-bottom-color: rgba(248, 81, 73, 0.45); }
+.transaction-pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.20); }
+.transaction-bar.failed .transaction-pulse { background: var(--warn); box-shadow: 0 0 0 3px rgba(230, 180, 80, 0.18); }
+.transaction-bar.lost .transaction-pulse { background: var(--danger); box-shadow: 0 0 0 3px rgba(248, 81, 73, 0.18); }
+.transaction-mode { font-weight: 700; }
+.transaction-bar code { color: var(--accent-2); font-size: 11px; }
+.transaction-detail { color: var(--muted); font-variant-numeric: tabular-nums; }
+.transaction-alert { color: var(--warn); font-weight: 700; }
+.transaction-bar.lost .transaction-alert { color: var(--danger); }
+.transaction-pending { color: var(--warn); }
+.transaction-bar .ghost { padding: 4px 9px; }
+.transaction-bar .tx-rollback { color: var(--danger); }
+.transaction-resolution-note { margin: 8px 16px; padding: 10px 12px; border: 1px solid rgba(230, 180, 80, 0.35); border-radius: 7px; background: rgba(230, 180, 80, 0.08); color: var(--warn); font-size: 12px; }
 
 .body { flex: 1; display: flex; min-height: 0; }
 
@@ -537,6 +557,9 @@ select option { font-weight: 400; }
 .tab { display: flex; align-items: center; gap: 6px; padding: 4px 8px 4px 11px; max-width: 200px; border: 1px solid transparent; border-bottom: none; border-radius: 7px 7px 0 0; color: var(--muted); cursor: pointer; font-size: 12px; white-space: nowrap; }
 .tab:hover { background: var(--panel-2); color: var(--text); }
 .tab.active { background: var(--bg); color: var(--text); border-color: var(--border); }
+.tab.tx-owner { box-shadow: inset 0 2px 0 var(--accent); }
+.tab.frozen:not(.active) { opacity: 0.72; }
+.tab-tx { padding: 1px 4px; border-radius: 4px; background: rgba(var(--accent-rgb), 0.16); color: var(--accent-2); font-size: 8px; font-weight: 800; letter-spacing: 0.3px; }
 .tab-title { overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
 .tab-dot { color: var(--accent-2); font-size: 9px; line-height: 1; }
 .tab-spin { width: 9px; height: 9px; border-width: 1.5px; margin-right: 0; color: var(--accent); flex-shrink: 0; }
@@ -576,6 +599,7 @@ select option { font-weight: 400; }
 .result { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
 .result-error { margin: 10px 12px; }
 .result-empty { padding: 16px; color: var(--muted); }
+.transaction-result-stale { color: var(--warn); font-size: 11px; font-weight: 600; white-space: nowrap; }
 /* Centered loading overlay shown while a query is pending, on top of the (possibly
    stale) output. pointer-events:none so it never traps clicks; faint backdrop dims
    the prior result. Solid colors only (no color-mix) for WKWebView reliability. */
@@ -590,7 +614,7 @@ select option { font-weight: 400; }
 /* Dialog bodies wrapped in a <fieldset> so a single `disabled` greys + disables every
    control while an export/import runs (only the Cancel button stays live). Reset the
    element's native chrome so it lays out like the plain container it replaced. */
-.export-fieldset, .import-fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+.export-fieldset, .import-fieldset, .slack-fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 .export-fieldset:disabled, .import-fieldset:disabled { opacity: 0.5; }
 .busy-label, .import-busy { display: inline-flex; align-items: center; color: var(--muted); }
 .import-busy { justify-content: center; padding: 6px 0; }

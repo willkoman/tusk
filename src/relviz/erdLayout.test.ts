@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { assignFamilies, layoutErd, meanEdgeLength, type ErdEdge, type ErdNode } from "./erdLayout";
+import {
+  ERD_LAYOUT_MAX_EDGES,
+  ERD_LAYOUT_MAX_NODES,
+  assignFamilies,
+  layoutErd,
+  meanEdgeLength,
+  type ErdEdge,
+  type ErdNode,
+} from "./erdLayout";
 
 const node = (id: string, h = 80): ErdNode => ({ id, w: 200, h });
 const E = (from: string, to: string): ErdEdge => ({ from, to });
@@ -40,6 +48,22 @@ describe("layoutErd", () => {
     const l = layoutErd([node("a"), node("b"), node("x")], [E("a", "b"), E("b", "a"), E("x", "a")]);
     expect(l.pos.size).toBe(3);
     expect(l.pos.get("a")).not.toEqual(l.pos.get("b"));
+  });
+
+  it("keeps directed edges whose concatenated endpoint names collide", () => {
+    const nodes = [node("a"), node("ab"), node("bc"), node("c")];
+    const l = layoutErd(nodes, [E("a", "bc"), E("ab", "c")]);
+    // Both pairs are two-node webs. If `from + to` is used as the key, the second
+    // edge is dropped and ab/c collapse into the shared island layer.
+    expect(l.layers.some((layer) => layer.includes("ab") && layer.includes("c"))).toBe(false);
+    expect(l.pos.size).toBe(4);
+  });
+
+  it("rejects oversized or invalid layout inputs before expensive work", () => {
+    expect(layoutErd(Array.from({ length: ERD_LAYOUT_MAX_NODES + 1 }, (_, i) => node(`n${i}`)), []).pos.size).toBe(0);
+    expect(layoutErd([node("a"), node("b")], Array.from({ length: ERD_LAYOUT_MAX_EDGES + 1 }, () => E("a", "b"))).pos.size).toBe(0);
+    expect(layoutErd([{ id: "bad", w: Number.POSITIVE_INFINITY, h: 80 }], []).pos.size).toBe(0);
+    expect(layoutErd([node("dup"), node("dup")], []).pos.size).toBe(0);
   });
 
   it("never overlaps cards (uneven heights, dense star)", () => {

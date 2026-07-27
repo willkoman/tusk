@@ -6,9 +6,9 @@
 import { Show, createSignal, onCleanup, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { activeBaseUrl, aiStore, defaultModel, isKeyless, resolveBaseUrl, resolveWire } from "../ai/store";
+import { activeBaseUrl, aiStore, defaultModel, isKeyless, resolveBaseUrl, resolveWire, type AiConfig } from "../ai/store";
 
-type SlackConfig = {
+export type SlackConfig = {
   enabled: boolean;
   allowlistChannels: string[];
   allowlistUsers: string[];
@@ -16,6 +16,7 @@ type SlackConfig = {
   maxRowsFile: number;
   queryTimeoutSecs: number;
   chartsEnabled: boolean;
+  shareSamples: boolean;
   destructivePolicy: string;
   aiProvider: string;
   /** Wire protocol, resolved from the TS provider registry at save time. */
@@ -29,7 +30,7 @@ type SlackConfig = {
 type SlackConfigInfo = { config: SlackConfig; hasBotToken: boolean; hasAppToken: boolean };
 export type SlackStatus = { running: boolean; state: string; error: string | null };
 
-const DEFAULT_CONFIG: SlackConfig = {
+export const DEFAULT_CONFIG: SlackConfig = {
   enabled: false,
   allowlistChannels: [],
   allowlistUsers: [],
@@ -37,6 +38,7 @@ const DEFAULT_CONFIG: SlackConfig = {
   maxRowsFile: 10000,
   queryTimeoutSecs: 30,
   chartsEnabled: true,
+  shareSamples: false,
   destructivePolicy: "proposeReadonly",
   aiProvider: "",
   aiWire: "",
@@ -48,8 +50,33 @@ const DEFAULT_CONFIG: SlackConfig = {
 
 const errMsg = (e: unknown): string => (e as { message?: string })?.message ?? String(e);
 
+export const normalizeSlackMaxTokens = (raw: string | number, fallback = 2048): number => {
+  const parsed = typeof raw === "number" ? raw : Number(raw);
+  const finite = Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  return Math.round(Math.max(256, Math.min(128000, finite)) / 256) * 256;
+};
+
+/** Normalize newly-added privacy/token fields when loading older config documents. */
+export const normalizeSlackConfig = (raw?: Partial<SlackConfig> | null): SlackConfig => ({
+  ...DEFAULT_CONFIG,
+  ...raw,
+  allowlistChannels: Array.isArray(raw?.allowlistChannels) ? raw.allowlistChannels : [],
+  allowlistUsers: Array.isArray(raw?.allowlistUsers) ? raw.allowlistUsers : [],
+  shareSamples: raw?.shareSamples === true,
+  aiMaxTokens: normalizeSlackMaxTokens(raw?.aiMaxTokens ?? DEFAULT_CONFIG.aiMaxTokens),
+});
+
+export const slackConfigMatches = (expected: SlackConfig, actual: SlackConfig): boolean =>
+  (Object.keys(DEFAULT_CONFIG) as (keyof SlackConfig)[]).every(
+    (key) => JSON.stringify(expected[key]) === JSON.stringify(actual[key]),
+  );
+
+type SaveResult = { tokensChanged: boolean };
+
 export function SlackPane() {
   const [cfg, setCfg] = createSignal<SlackConfig>(DEFAULT_CONFIG);
+  const [configLoaded, setConfigLoaded] = createSignal(false);
+  const [ai, setAi] = createSignal<AiConfig>(aiStore.load());
   const [hasBot, setHasBot] = createSignal(false);
   const [hasApp, setHasApp] = createSignal(false);
   const [botToken, setBotToken] = createSignal("");
@@ -57,25 +84,57 @@ export function SlackPane() {
   const [status, setStatus] = createSignal<SlackStatus>({ running: false, state: "disconnected", error: null });
   const [note, setNote] = createSignal("");
   const [busy, setBusy] = createSignal(false);
+  const [maxTokensInput, setMaxTokensInput] = createSignal(String(DEFAULT_CONFIG.aiMaxTokens));
 
   let unlisten: UnlistenFn | undefined;
-  onMount(async () => {
-    try {
-      const info = await invoke<SlackConfigInfo>("slack_load_config");
-      setCfg({ ...DEFAULT_CONFIG, ...info.config });
-      setHasBot(info.hasBotToken);
-      setHasApp(info.hasAppToken);
-    } catch {
-      /* defaults stand */
-    }
-    try {
-      setStatus(await invoke<SlackStatus>("slack_status"));
-    } catch {
-      /* ignore */
-    }
-    unlisten = await listen<SlackStatus>("slack:status", (e) => setStatus(e.payload));
+  let unsubscribeAi = () => {};
+  let mounted = true;
+  let statusRevision = 0;
+  onMount(() => {
+    unsubscribeAi = aiStore.subscribe(setAi);
+    void (async () => {
+      try {
+        const info = await invoke<SlackConfigInfo>("slack_load_config");
+        if (!mounted) return;
+        const loaded = normalizeSlackConfig(info.config);
+        setCfg(loaded);
+        setMaxTokensInput(String(loaded.aiMaxTokens));
+        setHasBot(info.hasBotToken);
+        setHasApp(info.hasAppToken);
+      } catch {
+        /* defaults stand */
+      } finally {
+        if (mounted) setConfigLoaded(true);
+      }
+    })();
+    void (async () => {
+      try {
+        const stop = await listen<SlackStatus>("slack:status", (e) => {
+          statusRevision++;
+          setStatus(e.payload);
+        });
+        if (!mounted) {
+          stop();
+          return;
+        }
+        unlisten = stop;
+      } catch {
+        /* status events unavailable */
+      }
+      const revision = statusRevision;
+      try {
+        const current = await invoke<SlackStatus>("slack_status");
+        if (mounted && statusRevision === revision) setStatus(current);
+      } catch {
+        /* ignore */
+      }
+    })();
   });
-  onCleanup(() => unlisten?.());
+  onCleanup(() => {
+    mounted = false;
+    unsubscribeAi();
+    unlisten?.();
+  });
 
   const patch = (p: Partial<SlackConfig>) => setCfg({ ...cfg(), ...p });
   const csv = (list: string[]) => list.join(", ");
@@ -83,14 +142,17 @@ export function SlackPane() {
 
   // Persist config + any newly typed tokens; mirror the AI panel's provider/model.
   // `override` lets callers pin fields (notably `enabled`) independent of the signal.
-  const save = async (override: Partial<SlackConfig> = {}): Promise<boolean> => {
-    const ai = aiStore.load();
-    const model = ai.model || defaultModel(ai.provider);
-    const wire = resolveWire(ai.provider, model);
+  const save = async (override: Partial<SlackConfig> = {}): Promise<SaveResult | null> => {
+    const currentAi = ai();
+    const model = currentAi.model || defaultModel(currentAi.provider);
+    const wire = resolveWire(currentAi.provider, model);
+    const tokensChanged = Boolean(botToken().trim() || appToken().trim());
     const config: SlackConfig = {
       ...cfg(),
       ...override,
-      aiProvider: ai.provider,
+      shareSamples: cfg().shareSamples === true,
+      aiMaxTokens: normalizeSlackMaxTokens(maxTokensInput(), cfg().aiMaxTokens),
+      aiProvider: currentAi.provider,
       // The registry lives in TS, so the bot gets the RESOLVED wire and base URL —
       // it can't look them up. Wire is per-model (OpenCode); an unsupported model
       // falls back to the provider's default wire and will surface as a bot error
@@ -98,8 +160,8 @@ export function SlackPane() {
       aiWire: wire ?? "",
       aiModel: model,
       // Wire-resolved: some gateways host a wire under a sub-path (Zen's gemini).
-      aiBaseUrl: resolveBaseUrl(ai.provider, activeBaseUrl(ai), wire ?? undefined) || null,
-      aiAllowNoKey: isKeyless(ai.provider),
+      aiBaseUrl: resolveBaseUrl(currentAi.provider, activeBaseUrl(currentAi), wire ?? undefined) || null,
+      aiAllowNoKey: isKeyless(currentAi.provider),
     };
     try {
       await invoke("slack_save_config", {
@@ -107,16 +169,33 @@ export function SlackPane() {
         botToken: botToken().trim() || null,
         appToken: appToken().trim() || null,
       });
-      if (botToken().trim()) setHasBot(true);
-      if (appToken().trim()) setHasApp(true);
+      // Read-after-write catches stale controlled-input values and serialization/
+      // persistence failures before the UI claims success.
+      const verified = await invoke<SlackConfigInfo>("slack_load_config");
+      const persisted = normalizeSlackConfig(verified.config);
+      if (!slackConfigMatches(config, persisted)) {
+        throw new Error("Slack settings verification failed: saved values did not reload unchanged");
+      }
+      setHasBot(verified.hasBotToken);
+      setHasApp(verified.hasAppToken);
       setBotToken("");
       setAppToken("");
-      setCfg(config);
-      return true;
+      setCfg(persisted);
+      setMaxTokensInput(String(persisted.aiMaxTokens));
+      return { tokensChanged };
     } catch (e) {
       setNote(`Save failed: ${errMsg(e)}`);
-      return false;
+      return null;
     }
+  };
+
+  const disableAfterRestartFailure = async (message: string) => {
+    await invoke("slack_stop").catch(() => {});
+    patch({ enabled: false });
+    const disabled = await save({ enabled: false });
+    setNote(disabled
+      ? message
+      : `${message} Disabling could not be verified; the bot is stopped, but the startup setting may still be enabled.`);
   };
 
   const applyEnabled = async (enabled: boolean) => {
@@ -132,11 +211,18 @@ export function SlackPane() {
           patch({ enabled: false });
           return;
         }
+        await invoke("slack_test");
         await invoke("slack_start");
-        await save({ enabled: true });
+        if (!(await save({ enabled: true }))) {
+          await disableAfterRestartFailure("Bot started, but enabling could not be persisted. Bot stopped and remains disabled.");
+          return;
+        }
         setNote("Bot started.");
       } else {
-        if (!(await save({ enabled: false }))) return;
+        if (!(await save({ enabled: false }))) {
+          patch({ enabled: true });
+          return;
+        }
         await invoke("slack_stop");
         setNote("Bot stopped.");
       }
@@ -152,12 +238,28 @@ export function SlackPane() {
   const test = async () => {
     setBusy(true);
     setNote("");
+    const wasRunning = status().running;
+    let saved: SaveResult | null = null;
+    let tokensValidated = false;
     try {
-      if (!(await save())) return;
+      saved = await save();
+      if (!saved) return;
       const team = await invoke<string>("slack_test");
-      setNote(`✅ Tokens valid — workspace “${team}”.`);
+      tokensValidated = true;
+      if (wasRunning && saved.tokensChanged) {
+        await invoke("slack_start");
+        setNote(`✅ Tokens valid — workspace “${team}”. Bot restarted with the replacement tokens.`);
+      } else {
+        setNote(`✅ Tokens valid — workspace “${team}”.`);
+      }
     } catch (e) {
-      setNote(`❌ ${errMsg(e)}`);
+      if (wasRunning && saved?.tokensChanged) {
+        await disableAfterRestartFailure(tokensValidated
+          ? `❌ ${errMsg(e)} Tokens validated, but the bot could not restart; it was stopped and disabled.`
+          : `❌ ${errMsg(e)} Bot stopped because replacement tokens could not be validated.`);
+      } else {
+        setNote(`❌ ${errMsg(e)}`);
+      }
     } finally {
       setBusy(false);
     }
@@ -166,20 +268,36 @@ export function SlackPane() {
   const saveOnly = async () => {
     setBusy(true);
     setNote("");
-    if (await save()) setNote("Saved — applies to the running bot on the next question.");
+    const wasRunning = status().running;
+    const saved = await save();
+    if (saved) {
+      if (wasRunning && saved.tokensChanged) {
+        try {
+          await invoke("slack_test");
+          await invoke("slack_start");
+          setNote("Saved and validated. Bot restarted with the replacement tokens.");
+        } catch (e) {
+          await disableAfterRestartFailure(`Saved, but token restart failed: ${errMsg(e)} Bot stopped and was disabled.`);
+        }
+      } else {
+        setNote("Saved — non-token changes apply to the running bot on the next question.");
+      }
+    }
     setBusy(false);
   };
 
   const statusDot = () => (status().state === "connected" ? "🟢" : status().state === "connecting" ? "🟡" : "🔴");
 
   return (
-    <>
+    <Show when={configLoaded()} fallback={<div class="settings-note">Loading Slack settings…</div>}>
+      <>
       <div class="settings-note">
         The bot runs inside Tusk (Socket Mode — no server, no public URL) while the app is open, against the
         active connection. Create your own Slack app at api.slack.com/apps (see docs/slack-setup.md), then paste
         its tokens here. Questions in Slack become SQL proposals; nothing runs without an Approve click.
       </div>
 
+      <fieldset class="slack-fieldset" disabled={busy()}>
       <label class="settings-row">
         <span>Enable Slack bot</span>
         <input type="checkbox" checked={cfg().enabled} disabled={busy()} onChange={(e) => void applyEnabled(e.currentTarget.checked)} />
@@ -217,6 +335,9 @@ export function SlackPane() {
           <button class="ghost" disabled={busy()} onClick={() => void saveOnly()}>Save</button>
         </span>
       </div>
+      <Show when={status().running && (botToken().trim() || appToken().trim())}>
+        <div class="settings-note">Saving replacement tokens restarts the running bot. Failed validation stops and disables it.</div>
+      </Show>
 
       <label class="settings-row">
         <span>Max rows (inline table)</span>
@@ -233,9 +354,9 @@ export function SlackPane() {
         <input
           type="number"
           min="100"
-          max="1000000"
+          max="100000"
           value={cfg().maxRowsFile}
-          onChange={(e) => patch({ maxRowsFile: Math.trunc(Math.max(100, Math.min(1000000, Number(e.currentTarget.value) || 10000))) })}
+          onChange={(e) => patch({ maxRowsFile: Math.trunc(Math.max(100, Math.min(100000, Number(e.currentTarget.value) || 10000))) })}
         />
       </label>
       <label class="settings-row">
@@ -258,8 +379,16 @@ export function SlackPane() {
           min="256"
           max="128000"
           step="256"
-          value={cfg().aiMaxTokens}
-          onChange={(e) => patch({ aiMaxTokens: Math.round(Math.max(256, Math.min(128000, Number(e.currentTarget.value) || 2048)) / 256) * 256 })}
+          value={maxTokensInput()}
+          onInput={(e) => {
+            setMaxTokensInput(e.currentTarget.value);
+            if (e.currentTarget.value.trim()) patch({ aiMaxTokens: normalizeSlackMaxTokens(e.currentTarget.value, cfg().aiMaxTokens) });
+          }}
+          onBlur={() => {
+            const normalized = normalizeSlackMaxTokens(maxTokensInput(), cfg().aiMaxTokens);
+            patch({ aiMaxTokens: normalized });
+            setMaxTokensInput(String(normalized));
+          }}
         />
       </label>
 
@@ -304,14 +433,24 @@ export function SlackPane() {
         <input type="checkbox" checked={cfg().chartsEnabled} onChange={(e) => patch({ chartsEnabled: e.currentTarget.checked })} />
       </label>
 
+      <label
+        class="settings-row"
+        title="When enabled, up to five real rows from relevant tables are sent to the configured AI provider with each Slack question. Off by default."
+      >
+        <span>Share sample rows with AI</span>
+        <input type="checkbox" checked={cfg().shareSamples} onChange={(e) => patch({ shareSamples: e.currentTarget.checked })} />
+      </label>
+      </fieldset>
+
       <div class="settings-note">
         AI provider: uses the same provider/model as the in-app AI panel (currently{" "}
-        <b>{aiStore.load().provider} / {aiStore.load().model || "no model"}</b>) — configure it there, then Save here.
+        <b>{ai().provider} / {ai().model || "no model"}</b>) — configure it there, then Save here.
       </div>
 
       <Show when={note()}>
         <div class="settings-note">{note()}</div>
       </Show>
-    </>
+      </>
+    </Show>
   );
 }

@@ -72,7 +72,7 @@ fn s(r: &[Option<String>], i: usize) -> String {
 }
 
 async fn query(client: &Client, sql: &str) -> Result<Vec<Vec<Option<String>>>, AppError> {
-    Ok(collect_rows(&client.simple_query(sql).await?).1)
+    Ok(collect_rows(&client.simple_query(sql).await?)?.1)
 }
 
 const NS: &str = "n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') \

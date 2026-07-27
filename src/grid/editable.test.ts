@@ -49,6 +49,15 @@ describe("editTarget", () => {
     }
   });
 
+  it("strictly rejects derived tables, comma joins, and table functions", () => {
+    for (const q of [
+      "SELECT * FROM (SELECT * FROM users) u",
+      "SELECT users.* FROM users, orders",
+      "SELECT * FROM generate_series(1, 3) g",
+      "SELECT * FROM public.users() u",
+    ]) expect(editTarget(q, IDX), q).toMatchObject({ ok: false });
+  });
+
   it("ignores reject-keywords inside strings and comments", () => {
     expect(editTarget("SELECT * FROM users WHERE email = 'join me' -- union\n", IDX).ok).toBe(true);
   });
@@ -96,6 +105,18 @@ describe("editTarget", () => {
     expect(editTarget("SELECT u.id, u.email FROM users u", IDX).ok).toBe(true);
     expect(editTarget("SELECT u.* FROM users u", IDX).ok).toBe(true);
     expect(editTarget('SELECT "id", u."email" FROM users u', IDX).ok).toBe(true);
+    expect(editTarget("SELECT `u`.`id` FROM `public`.`users` AS `u`", IDX).ok).toBe(true);
+  });
+
+  it("rejects qualifiers that do not identify the source alias/table", () => {
+    expect(editTarget("SELECT o.id FROM users u", IDX)).toMatchObject({ ok: false });
+    expect(editTarget("SELECT users.id FROM users u", IDX)).toMatchObject({ ok: false });
+    expect(editTarget("SELECT u.id FROM users", IDX)).toMatchObject({ ok: false });
+  });
+
+  it("does not treat keywords inside quoted identifiers as query constructs", () => {
+    const idx = buildIndex([{ schema: "public", name: "odd(name", columns: [{ name: "join", data_type: "int" }] }]);
+    expect(editTarget('SELECT "join" FROM "odd(name"', idx).ok).toBe(true);
   });
 
   it("a subquery in WHERE still finds the top-level FROM", () => {
@@ -128,5 +149,6 @@ describe("editPlan", () => {
     expect(editPlan(detail("table", [col("id", true)]), ["email"], target)).toMatchObject({ ok: false });
     expect(editPlan(detail("table", [col("id", true)]), ["id", "ID"], target)).toMatchObject({ ok: false });
     expect(editPlan(detail("table", [col("id", true), col("ID")]), ["ID"], target)).toMatchObject({ ok: false });
+    expect(editPlan({ ...detail("table", [col("id", true)]), name: "orders" }, ["id"], target)).toMatchObject({ ok: false });
   });
 });

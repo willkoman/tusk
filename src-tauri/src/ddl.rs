@@ -5,20 +5,46 @@
 //! Out of scope (degrade gracefully, not silently wrong): partitioning,
 //! inheritance, RLS, triggers, storage params, tablespaces, collations.
 
-use crate::db::{collect_rows, ident, AppError};
+use crate::db::{collect_rows_limited, ident, pg_string_literal, AppError, DDL_TEXT_LIMITS};
 use tokio_postgres::Client;
 
+const MAX_DDL_BYTES: usize = 20 * 1024 * 1024;
+const MAX_CATALOG_ROWS: usize = 100_000;
+const MAX_CATALOG_CELL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CATALOG_BYTES: usize = 32 * 1024 * 1024;
+
 async fn query(client: &Client, sql: &str) -> Result<Vec<Vec<Option<String>>>, AppError> {
-    Ok(collect_rows(&client.simple_query(sql).await?).1)
+    let rows = collect_rows_limited(&client.simple_query(sql).await?, DDL_TEXT_LIMITS)?.1;
+    if rows.len() > MAX_CATALOG_ROWS {
+        return Err(AppError::new("DDL metadata exceeds its row limit"));
+    }
+    let mut bytes = 0usize;
+    for value in rows.iter().flatten().flatten() {
+        if value.len() > MAX_CATALOG_CELL_BYTES {
+            return Err(AppError::new("DDL metadata contains an oversized value"));
+        }
+        bytes = bytes.saturating_add(value.len());
+        if bytes > MAX_CATALOG_BYTES {
+            return Err(AppError::new("DDL metadata exceeds its byte limit"));
+        }
+    }
+    Ok(rows)
 }
 
 fn cell(r: &[Option<String>], i: usize) -> String {
     r.get(i).and_then(|v| v.clone()).unwrap_or_default()
 }
 
-/// Quote a string literal (standard_conforming_strings assumed on).
-fn lit(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+fn checked_ddl(out: String) -> Result<String, AppError> {
+    if out.len() > MAX_DDL_BYTES {
+        Err(AppError::new("reconstructed DDL exceeds the 20 MiB limit"))
+    } else {
+        Ok(out)
+    }
+}
+
+fn comment_text(s: &str) -> String {
+    s.replace(['\r', '\n'], " ")
 }
 
 fn qual(schema: &str, name: &str) -> String {
@@ -49,7 +75,9 @@ async fn rel_oid(client: &Client, schema: &str, name: &str) -> Result<u32, AppEr
             &[&schema, &name],
         )
         .await?;
-    let row = rows.first().ok_or_else(|| AppError::new("relation not found"))?;
+    let row = rows
+        .first()
+        .ok_or_else(|| AppError::new("relation not found"))?;
     row.try_get::<_, u32>(0)
         .map_err(|e| AppError::new(format!("unexpected catalog shape: {e}")))
 }
@@ -62,11 +90,16 @@ async fn table_ddl(client: &Client, schema: &str, name: &str) -> Result<String, 
     // Booleans are NOT cast to ::text ('true'/'false') — the text protocol returns
     // 't'/'f' for a bare bool, which the `== "t"` checks below expect. (`attidentity`
     // / `attgenerated` are "char", kept as ::text to render the readable letter.)
-    let col_rows = query(client, &format!(
-        "SELECT a.attname, format_type(a.atttypid,a.atttypmod), a.attnotnull, a.atthasdef, \
+    let col_rows = query(
+        client,
+        &format!(
+            "SELECT a.attname, format_type(a.atttypid,a.atttypmod), a.attnotnull, a.atthasdef, \
          pg_get_expr(d.adbin,d.adrelid), a.attidentity::text, a.attgenerated::text \
          FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum \
-         WHERE a.attrelid={oid} AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum")).await?;
+         WHERE a.attrelid={oid} AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum"
+        ),
+    )
+    .await?;
 
     let mut lines: Vec<String> = Vec::new();
     for r in &col_rows {
@@ -99,9 +132,14 @@ async fn table_ddl(client: &Client, schema: &str, name: &str) -> Result<String, 
     }
 
     // Constraints: PK/unique/check inline; FKs deferred to trailing ALTERs.
-    let con_rows = query(client, &format!(
-        "SELECT con.conname, con.contype::text, pg_get_constraintdef(con.oid, true) \
-         FROM pg_constraint con WHERE con.conrelid={oid} ORDER BY con.contype DESC, con.conname")).await?;
+    let con_rows = query(
+        client,
+        &format!(
+            "SELECT con.conname, con.contype::text, pg_get_constraintdef(con.oid, true) \
+         FROM pg_constraint con WHERE con.conrelid={oid} ORDER BY con.contype DESC, con.conname"
+        ),
+    )
+    .await?;
     let mut fks: Vec<(String, String)> = Vec::new();
     for r in &con_rows {
         let cn = cell(r, 0);
@@ -117,14 +155,23 @@ async fn table_ddl(client: &Client, schema: &str, name: &str) -> Result<String, 
     let mut out = format!("CREATE TABLE {q} (\n{}\n);", lines.join(",\n"));
 
     for (cn, def) in &fks {
-        out.push_str(&format!("\nALTER TABLE {q} ADD CONSTRAINT {} {};", ident(cn), def));
+        out.push_str(&format!(
+            "\nALTER TABLE {q} ADD CONSTRAINT {} {};",
+            ident(cn),
+            def
+        ));
     }
 
     // Plain indexes only — skip those backing a PK/unique/exclusion constraint.
-    let idx_rows = query(client, &format!(
-        "SELECT pg_get_indexdef(i.indexrelid, 0, true), (con.oid IS NOT NULL) \
+    let idx_rows = query(
+        client,
+        &format!(
+            "SELECT pg_get_indexdef(i.indexrelid, 0, true), (con.oid IS NOT NULL) \
          FROM pg_index i LEFT JOIN pg_constraint con ON con.conindid=i.indexrelid \
-         WHERE i.indrelid={oid} ORDER BY i.indexrelid")).await?;
+         WHERE i.indrelid={oid} ORDER BY i.indexrelid"
+        ),
+    )
+    .await?;
     for r in &idx_rows {
         let def = cell(r, 0);
         let backs = cell(r, 1) == "t";
@@ -140,24 +187,37 @@ async fn table_ddl(client: &Client, schema: &str, name: &str) -> Result<String, 
         .next()
         .and_then(|r| r.into_iter().next().flatten())
     {
-        out.push_str(&format!("\nCOMMENT ON TABLE {q} IS {};", lit(&c)));
+        out.push_str(&format!(
+            "\nCOMMENT ON TABLE {q} IS {};",
+            pg_string_literal(&c)?
+        ));
     }
-    let ccoms = query(client, &format!(
-        "SELECT a.attname, col_description(a.attrelid,a.attnum) FROM pg_attribute a \
+    let ccoms = query(
+        client,
+        &format!(
+            "SELECT a.attname, col_description(a.attrelid,a.attnum) FROM pg_attribute a \
          WHERE a.attrelid={oid} AND a.attnum>0 AND NOT a.attisdropped \
-         AND col_description(a.attrelid,a.attnum) IS NOT NULL ORDER BY a.attnum")).await?;
+         AND col_description(a.attrelid,a.attnum) IS NOT NULL ORDER BY a.attnum"
+        ),
+    )
+    .await?;
     for r in &ccoms {
         out.push_str(&format!(
             "\nCOMMENT ON COLUMN {q}.{} IS {};",
             ident(&cell(r, 0)),
-            lit(&cell(r, 1))
+            pg_string_literal(&cell(r, 1))?
         ));
     }
 
-    Ok(out)
+    checked_ddl(out)
 }
 
-async fn view_ddl(client: &Client, schema: &str, name: &str, mat: bool) -> Result<String, AppError> {
+async fn view_ddl(
+    client: &Client,
+    schema: &str,
+    name: &str,
+    mat: bool,
+) -> Result<String, AppError> {
     let oid = rel_oid(client, schema, name).await?;
     let def = query(client, &format!("SELECT pg_get_viewdef({oid}, true)"))
         .await?
@@ -166,7 +226,7 @@ async fn view_ddl(client: &Client, schema: &str, name: &str, mat: bool) -> Resul
         .and_then(|r| r.into_iter().next().flatten())
         .unwrap_or_default();
     let kw = if mat { "MATERIALIZED VIEW" } else { "VIEW" };
-    Ok(format!(
+    checked_ddl(format!(
         "CREATE {kw} {} AS\n{};",
         qual(schema, name),
         def.trim().trim_end_matches(';').trim()
@@ -181,17 +241,20 @@ async fn sequence_ddl(client: &Client, schema: &str, name: &str) -> Result<Strin
             &[&schema, &name],
         )
         .await?;
-    let r = rows.first().ok_or_else(|| AppError::new("sequence not found"))?;
+    let r = rows
+        .first()
+        .ok_or_else(|| AppError::new("sequence not found"))?;
     // try_get: typed `get` panics on NULL or a type mismatch (compat servers, or a
     // pg_sequences row this role can only partially see).
-    let seq_err = |e: tokio_postgres::Error| AppError::new(format!("unexpected pg_sequences shape: {e}"));
+    let seq_err =
+        |e: tokio_postgres::Error| AppError::new(format!("unexpected pg_sequences shape: {e}"));
     let start: i64 = r.try_get(0).map_err(seq_err)?;
     let minv: i64 = r.try_get(1).map_err(seq_err)?;
     let maxv: i64 = r.try_get(2).map_err(seq_err)?;
     let inc: i64 = r.try_get(3).map_err(seq_err)?;
     let cycle: bool = r.try_get(4).map_err(seq_err)?;
     let cache: i64 = r.try_get(5).map_err(seq_err)?;
-    Ok(format!(
+    checked_ddl(format!(
         "CREATE SEQUENCE {}\n    INCREMENT BY {inc}\n    MINVALUE {minv}\n    MAXVALUE {maxv}\n    START WITH {start}\n    CACHE {cache}{};",
         qual(schema, name),
         if cycle { "\n    CYCLE" } else { "" }
@@ -219,10 +282,17 @@ async fn function_ddl(client: &Client, schema: &str, name: &str) -> Result<Strin
             // pg_get_functiondef errors on aggregates ('a') / window funcs ('w').
             out.push_str(&format!(
                 "-- {}.{}: {} not reconstructable via Copy DDL\n",
-                schema,
-                name,
-                if prokind == "a" { "aggregate" } else { "window function" }
+                comment_text(schema),
+                comment_text(name),
+                if prokind == "a" {
+                    "aggregate"
+                } else {
+                    "window function"
+                }
             ));
+            if out.len() > MAX_DDL_BYTES {
+                return Err(AppError::new("reconstructed DDL exceeds the 20 MiB limit"));
+            }
             continue;
         }
         let def = query(client, &format!("SELECT pg_get_functiondef({oid})"))
@@ -238,6 +308,34 @@ async fn function_ddl(client: &Client, schema: &str, name: &str) -> Result<Strin
         if !def.trim_end().ends_with(';') {
             out.push(';');
         }
+        if out.len() > MAX_DDL_BYTES {
+            return Err(AppError::new("reconstructed DDL exceeds the 20 MiB limit"));
+        }
     }
-    Ok(out)
+    checked_ddl(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ddl_comments_use_mode_independent_postgres_literals() {
+        let literal = pg_string_literal("path\\name's note").unwrap();
+        assert_eq!(literal, "E'path\\\\name''s note'");
+    }
+
+    #[test]
+    fn unsupported_routine_comment_cannot_inject_a_new_line() {
+        assert_eq!(
+            comment_text("safe\nDROP TABLE x;\r--"),
+            "safe DROP TABLE x; --"
+        );
+    }
+
+    #[test]
+    fn reconstructed_ddl_is_bounded() {
+        assert!(checked_ddl("x".repeat(MAX_DDL_BYTES)).is_ok());
+        assert!(checked_ddl("x".repeat(MAX_DDL_BYTES + 1)).is_err());
+    }
 }

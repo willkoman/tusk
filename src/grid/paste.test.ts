@@ -33,9 +33,20 @@ describe("parseClipboardTable", () => {
     expect(parseClipboardTable("")).toEqual([]);
   });
 
-  it("rejects malformed quotes and excessive columns", () => {
+  it("rejects unterminated quotes and excessive columns", () => {
     expect(() => parseClipboardTable('"unterminated')).toThrow(/unterminated/i);
     expect(() => parseClipboardTable("\t".repeat(10_001))).toThrow(/too many columns/i);
+  });
+
+  it("treats bare quotes mid-field as literal data (external clipboards)", () => {
+    expect(parseClipboardTable('5" pipe\tx')).toEqual([['5" pipe', "x"]]);
+    expect(parseClipboardTable('a"b,c')).toEqual([['a"b', "c"]]);
+    expect(parseClipboardTable('"a"x,c')).toEqual([["ax", "c"]]);
+  });
+
+  it("detects delimiters outside quotes and preserves CR row endings", () => {
+    expect(parseClipboardTable('"a\tb",c\r\n1,2')).toEqual([["a\tb", "c"], ["1", "2"]]);
+    expect(parseClipboardTable("a\tb\r1\t2")).toEqual([["a", "b"], ["1", "2"]]);
   });
 });
 
@@ -102,6 +113,12 @@ describe("planPaste — header-mapped mode", () => {
       ],
     }));
     expect(plan.mode).toBe("positional");
+  });
+
+  it("rejects duplicate mapped headers instead of overwriting a field", () => {
+    expect(() => planPaste(baseInput({
+      table: [["id", "ID"], ["1", "2"]],
+    }))).toThrow(/more than once/i);
   });
 });
 
@@ -181,6 +198,14 @@ describe("planPaste — positional mode", () => {
   it("rejects argument-limit-scale row counts predictably", () => {
     const table = Array.from({ length: 50_001 }, (_, i) => [String(i)]);
     expect(() => planPaste(baseInput({ anchor: { kind: "insert", i: 0 }, table }))).toThrow(/too many rows/i);
+  });
+
+  it("rejects stale or duplicate display identity maps", () => {
+    expect(() => planPaste(baseInput({
+      anchor: { kind: "loaded", i: 1 },
+      loadedOrder: [0, 0, 2],
+      table: [["x"]],
+    }))).toThrow(/row order/i);
   });
 });
 

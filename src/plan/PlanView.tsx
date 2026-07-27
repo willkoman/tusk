@@ -1,8 +1,8 @@
-import { For, Show, createMemo, createSignal, type Accessor } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, on, type Accessor } from "solid-js";
 import { type EditorPrefs } from "../editor/types";
 import { PanZoomCanvas } from "../viz/PanZoomCanvas";
 import { edgePath, layoutTree } from "./layout";
-import { type ParsedPlan, type PlanNode, type PlanTree } from "./types";
+import { MAX_PLAN_NODES, type ParsedPlan, type PlanNode, type PlanTree } from "./types";
 
 // Styled, customizable plan visualization. kind:"text" renders as a monospace
 // block (the universal fallback — never a broken view); kind:"tree" renders a
@@ -65,6 +65,13 @@ export function PlanView(props: {
   const [collapsed, setCollapsed] = createSignal<ReadonlySet<number>>(new Set<number>(), { equals: false });
   const [selectedId, setSelectedId] = createSignal<number | null>(null);
 
+  // This component remains mounted while tabs/results swap. Node ids are only
+  // stable inside one parsed plan, so never carry collapse/selection into another.
+  createEffect(on(props.fitKey, () => {
+    setCollapsed(new Set<number>());
+    setSelectedId(null);
+  }, { defer: true }));
+
   const tree = createMemo<PlanTree | null>(() => {
     const p = props.plan();
     return p.kind === "tree" ? p : null;
@@ -87,11 +94,16 @@ export function PlanView(props: {
     const m = new Map<number, PlanNode>();
     const t = tree();
     if (t) {
-      const walk = (n: PlanNode) => {
+      const stack = [t.root];
+      const seen = new Set<PlanNode>();
+      while (stack.length && seen.size < MAX_PLAN_NODES) {
+        const n = stack.pop()!;
+        if (seen.has(n)) continue;
+        seen.add(n);
         m.set(n.id, n);
-        n.children.forEach(walk);
-      };
-      walk(t.root);
+        if (n.children.length > MAX_PLAN_NODES - seen.size - stack.length) break;
+        for (let i = n.children.length - 1; i >= 0; i--) stack.push(n.children[i]);
+      }
     }
     return m;
   });
@@ -106,11 +118,17 @@ export function PlanView(props: {
 
   const hiddenCount = (n: PlanNode): number => {
     let c = 0;
-    const walk = (x: PlanNode) => {
+    const seen = new Set<PlanNode>([n]);
+    if (n.children.length > MAX_PLAN_NODES - 1) return MAX_PLAN_NODES;
+    const stack = [...n.children];
+    while (stack.length && c < MAX_PLAN_NODES) {
+      const x = stack.pop()!;
+      if (seen.has(x)) continue;
+      seen.add(x);
       c++;
-      x.children.forEach(walk);
-    };
-    n.children.forEach(walk);
+      if (x.children.length > MAX_PLAN_NODES - seen.size - stack.length) return MAX_PLAN_NODES;
+      for (const child of x.children) stack.push(child);
+    }
     return c;
   };
 

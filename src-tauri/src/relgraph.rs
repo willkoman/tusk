@@ -53,7 +53,11 @@ pub struct SchemaGraph {
 const SEP: char = '\u{1f}';
 
 fn split_cols(s: &str) -> Vec<String> {
-    s.split(SEP).map(|x| x.to_string()).collect()
+    if s.is_empty() {
+        Vec::new()
+    } else {
+        s.split(SEP).map(|x| x.to_string()).collect()
+    }
 }
 
 // ---------------- Postgres ----------------
@@ -129,7 +133,10 @@ pub async fn pg_table_relationships(
     Ok(Relationships { outbound, inbound })
 }
 
-pub async fn pg_schema_relationships(client: &Client, schema: &str) -> Result<SchemaGraph, AppError> {
+pub async fn pg_schema_relationships(
+    client: &Client,
+    schema: &str,
+) -> Result<SchemaGraph, AppError> {
     let q = pg_edge_select("sn.nspname = $1 OR dn.nspname = $1");
     let edge_rows = client.query(q.as_str(), &[&schema]).await?;
     let edges: Vec<FkEdge> = edge_rows.iter().filter_map(pg_edge).collect();
@@ -183,8 +190,16 @@ pub async fn pg_schema_relationships(client: &Client, schema: &str) -> Result<Sc
         let (Ok(tname), Ok(cname)) = (r.try_get::<_, String>(0), r.try_get::<_, String>(1)) else {
             continue;
         };
-        if tables.last().map(|t: &ErdTable| t.name != tname).unwrap_or(true) {
-            tables.push(ErdTable { schema: schema.to_string(), name: tname.clone(), columns: Vec::new() });
+        if tables
+            .last()
+            .map(|t: &ErdTable| t.name != tname)
+            .unwrap_or(true)
+        {
+            tables.push(ErdTable {
+                schema: schema.to_string(),
+                name: tname.clone(),
+                columns: Vec::new(),
+            });
         }
         let k = (tname, cname.clone());
         if let Some(table) = tables.last_mut() {
@@ -205,8 +220,21 @@ fn cell(r: &[Option<String>], i: usize) -> String {
     r.get(i).and_then(|v| v.clone()).unwrap_or_default()
 }
 
-fn lit(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+fn hex_bytes(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(s.len().saturating_mul(2));
+    for &byte in s.as_bytes() {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// SQLite string literals built from bytes avoid parser ambiguity around quotes,
+/// backslashes, control characters, and embedded zero bytes. (MySQL metadata
+/// queries now bind parameters in `driver.rs` instead of building literals here.)
+fn sqlite_lit(s: &str) -> String {
+    format!("CAST(X'{}' AS TEXT)", hex_bytes(s))
 }
 
 // ---------------- SQLite ----------------
@@ -215,7 +243,10 @@ type TextQuery<'a> = &'a dyn Fn(&str) -> Result<(Vec<String>, Vec<Vec<Option<Str
 
 /// PK column names of one table, in PK order, via pragma_table_info.
 fn sqlite_pk_cols(q: TextQuery, table: &str) -> Vec<String> {
-    let sql = format!("SELECT name, pk FROM pragma_table_info({}) WHERE pk > 0 ORDER BY pk", lit(table));
+    let sql = format!(
+        "SELECT name, pk FROM pragma_table_info({}) WHERE pk > 0 ORDER BY pk",
+        sqlite_lit(table)
+    );
     match q(&sql) {
         Ok((_c, rows)) => rows.iter().map(|r| cell(r, 0)).collect(),
         Err(_) => Vec::new(),
@@ -227,7 +258,7 @@ fn sqlite_pk_cols(q: TextQuery, table: &str) -> Vec<String> {
 fn sqlite_outbound(q: TextQuery, table: &str) -> Vec<FkEdge> {
     let sql = format!(
         "SELECT id, seq, \"table\", \"from\", \"to\" FROM pragma_foreign_key_list({}) ORDER BY id, seq",
-        lit(table)
+        sqlite_lit(table)
     );
     let rows = match q(&sql) {
         Ok((_c, rows)) => rows,
@@ -291,9 +322,14 @@ pub fn sqlite_schema_relationships(q: TextQuery) -> SchemaGraph {
     let mut edges = Vec::new();
     for t in sqlite_user_tables(q) {
         let out = sqlite_outbound(q, &t);
-        let fk_cols: std::collections::HashSet<String> =
-            out.iter().flat_map(|e| e.src_cols.iter().cloned()).collect();
-        let cols = match q(&format!("SELECT name, type, pk FROM pragma_table_info({}) ORDER BY cid", lit(&t))) {
+        let fk_cols: std::collections::HashSet<String> = out
+            .iter()
+            .flat_map(|e| e.src_cols.iter().cloned())
+            .collect();
+        let cols = match q(&format!(
+            "SELECT name, type, pk FROM pragma_table_info({}) ORDER BY cid",
+            sqlite_lit(&t)
+        )) {
             Ok((_c, rows)) => rows
                 .iter()
                 .map(|r| ErdColumn {
@@ -305,7 +341,11 @@ pub fn sqlite_schema_relationships(q: TextQuery) -> SchemaGraph {
                 .collect(),
             Err(_) => Vec::new(),
         };
-        tables.push(ErdTable { schema: "main".into(), name: t, columns: cols });
+        tables.push(ErdTable {
+            schema: "main".into(),
+            name: t,
+            columns: cols,
+        });
         edges.extend(out);
     }
     SchemaGraph { tables, edges }
@@ -340,21 +380,6 @@ fn mysql_group_edges(rows: &[Vec<Option<String>>]) -> Vec<FkEdge> {
     edges
 }
 
-const MYSQL_KCU: &str = "SELECT kcu.CONSTRAINT_NAME, kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.COLUMN_NAME, \
-       kcu.REFERENCED_TABLE_SCHEMA, kcu.REFERENCED_TABLE_NAME, kcu.REFERENCED_COLUMN_NAME \
-     FROM information_schema.KEY_COLUMN_USAGE kcu \
-     WHERE kcu.REFERENCED_TABLE_NAME IS NOT NULL";
-
-pub fn mysql_relationship_queries(schema: &str, name: &str) -> String {
-    format!(
-        "{MYSQL_KCU} AND ((kcu.TABLE_SCHEMA = {s} AND kcu.TABLE_NAME = {t}) \
-           OR (kcu.REFERENCED_TABLE_SCHEMA = {s} AND kcu.REFERENCED_TABLE_NAME = {t})) \
-         ORDER BY kcu.CONSTRAINT_NAME, kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.ORDINAL_POSITION",
-        s = lit(schema),
-        t = lit(name)
-    )
-}
-
 pub fn mysql_split(rows: &[Vec<Option<String>>], schema: &str, name: &str) -> Relationships {
     let edges = mysql_group_edges(rows);
     let mut outbound = Vec::new();
@@ -368,14 +393,6 @@ pub fn mysql_split(rows: &[Vec<Option<String>>], schema: &str, name: &str) -> Re
         }
     }
     Relationships { outbound, inbound }
-}
-
-pub fn mysql_schema_edges_query(schema: &str) -> String {
-    format!(
-        "{MYSQL_KCU} AND (kcu.TABLE_SCHEMA = {s} OR kcu.REFERENCED_TABLE_SCHEMA = {s}) \
-         ORDER BY kcu.CONSTRAINT_NAME, kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.ORDINAL_POSITION",
-        s = lit(schema)
-    )
 }
 
 pub fn mysql_schema_graph(
@@ -393,8 +410,16 @@ pub fn mysql_schema_graph(
     let mut tables: Vec<ErdTable> = Vec::new();
     for r in col_rows {
         let t = cell(r, 0);
-        if tables.last().map(|x: &ErdTable| x.name != t).unwrap_or(true) {
-            tables.push(ErdTable { schema: schema.to_string(), name: t.clone(), columns: Vec::new() });
+        if tables
+            .last()
+            .map(|x: &ErdTable| x.name != t)
+            .unwrap_or(true)
+        {
+            tables.push(ErdTable {
+                schema: schema.to_string(),
+                name: t.clone(),
+                columns: Vec::new(),
+            });
         }
         let cname = cell(r, 1);
         if let Some(table) = tables.last_mut() {
@@ -407,15 +432,6 @@ pub fn mysql_schema_graph(
         }
     }
     SchemaGraph { tables, edges }
-}
-
-pub fn mysql_columns_query(schema: &str) -> String {
-    format!(
-        "SELECT table_name, column_name, data_type, column_key \
-         FROM information_schema.columns WHERE table_schema = {} \
-         ORDER BY table_name, ordinal_position",
-        lit(schema)
-    )
 }
 
 // ---------------- DuckDB ----------------
@@ -439,13 +455,19 @@ fn duck_parse_constraint_text(text: &str) -> Option<(Vec<String>, String, Vec<St
     let fk = up.find("FOREIGN KEY")?;
     let open = text[fk..].find('(')? + fk;
     let close = text[open..].find(')')? + open;
-    let src_cols: Vec<String> = text[open + 1..close].split(',').map(|c| c.trim().trim_matches('"').to_string()).collect();
+    let src_cols: Vec<String> = text[open + 1..close]
+        .split(',')
+        .map(|c| c.trim().trim_matches('"').to_string())
+        .collect();
     let refp = up[close..].find("REFERENCES")? + close + "REFERENCES".len();
     let rest = text[refp..].trim_start();
     let popen = rest.find('(')?;
     let table = rest[..popen].trim().trim_matches('"').to_string();
     let pclose = rest[popen..].find(')')? + popen;
-    let dst_cols: Vec<String> = rest[popen + 1..pclose].split(',').map(|c| c.trim().trim_matches('"').to_string()).collect();
+    let dst_cols: Vec<String> = rest[popen + 1..pclose]
+        .split(',')
+        .map(|c| c.trim().trim_matches('"').to_string())
+        .collect();
     Some((src_cols, table, dst_cols))
 }
 
@@ -490,6 +512,16 @@ pub fn duck_edges(rows: &[Vec<Option<String>>], structured: bool) -> Vec<FkEdge>
     out
 }
 
+pub const DUCK_FK_STRUCTURED: &str =
+    "SELECT schema_name, table_name, constraint_text, referenced_table, \
+       CAST(constraint_column_names AS VARCHAR), CAST(referenced_column_names AS VARCHAR) \
+     FROM duckdb_constraints() WHERE constraint_type = 'FOREIGN KEY'";
+pub const DUCK_FK_TEXT: &str = "SELECT schema_name, table_name, constraint_text \
+     FROM duckdb_constraints() WHERE constraint_type = 'FOREIGN KEY'";
+pub const DUCK_PK: &str =
+    "SELECT schema_name, table_name, CAST(constraint_column_names AS VARCHAR) \
+     FROM duckdb_constraints() WHERE constraint_type = 'PRIMARY KEY'";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,23 +531,32 @@ mod tests {
     /// slice panicked mid-char. ASCII folding keeps byte offsets identical.
     #[test]
     fn duck_constraint_text_survives_multibyte_identifiers() {
-        let (src, table, dst) = duck_parse_constraint_text("FOREIGN KEY (ǰ) REFERENCES a(x)").unwrap();
+        let (src, table, dst) =
+            duck_parse_constraint_text("FOREIGN KEY (ǰ) REFERENCES a(x)").unwrap();
         assert_eq!(src, vec!["ǰ"]);
         assert_eq!(table, "a");
         assert_eq!(dst, vec!["x"]);
 
         let (src2, table2, dst2) =
-            duck_parse_constraint_text("FOREIGN KEY (ﬁrst_id, b) REFERENCES übertabelle(x, y)").unwrap();
+            duck_parse_constraint_text("FOREIGN KEY (ﬁrst_id, b) REFERENCES übertabelle(x, y)")
+                .unwrap();
         assert_eq!(src2, vec!["ﬁrst_id", "b"]);
         assert_eq!(table2, "übertabelle");
         assert_eq!(dst2, vec!["x", "y"]);
     }
-}
 
-pub const DUCK_FK_STRUCTURED: &str = "SELECT schema_name, table_name, constraint_text, referenced_table, \
-       CAST(constraint_column_names AS VARCHAR), CAST(referenced_column_names AS VARCHAR) \
-     FROM duckdb_constraints() WHERE constraint_type = 'FOREIGN KEY'";
-pub const DUCK_FK_TEXT: &str = "SELECT schema_name, table_name, constraint_text \
-     FROM duckdb_constraints() WHERE constraint_type = 'FOREIGN KEY'";
-pub const DUCK_PK: &str = "SELECT schema_name, table_name, CAST(constraint_column_names AS VARCHAR) \
-     FROM duckdb_constraints() WHERE constraint_type = 'PRIMARY KEY'";
+    #[test]
+    fn empty_aggregated_column_list_stays_empty() {
+        assert!(split_cols("").is_empty());
+        assert_eq!(split_cols("a\u{1f}b"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn metadata_literals_do_not_embed_untrusted_text() {
+        let hostile = "x'\\\0 OR 1=1 -- 雪";
+        let sqlite = sqlite_lit(hostile);
+        assert!(!sqlite.contains(hostile));
+        assert!(sqlite.starts_with("CAST(X'"));
+        assert!(sqlite.contains(&hex_bytes(hostile)));
+    }
+}

@@ -1,33 +1,61 @@
 name: release
 
-# Runs on master pushes + PRs (compile-only, to validate the build AND warm the
-# per-target Rust cache on the default branch) and on v* tags (full bundle + draft
-# GitHub release). GitHub Actions caches are ref-scoped: a tag run can only restore
-# caches from its own ref or the DEFAULT branch — so warming on master is what lets a
-# release skip the cold recompile of the bundled DuckDB/SQLite C++ + the whole dep tree.
 on:
   push:
-    branches: [master]
     tags: ["v*"]
-  pull_request:
-    branches: [master]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed tag to release
+        required: true
+        type: string
 
 permissions:
-  contents: write
+  contents: read
 
-# Cancel superseded master/PR runs, but never cancel a release tag mid-build.
 concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
+  verify:
+    name: Verify release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+
+      - name: Require tag and manifest versions to match
+        run: node scripts/check-version.mjs --tag "$RELEASE_TAG"
+
+      - name: Require tag commit on default branch
+        shell: bash
+        run: git merge-base --is-ancestor "${RELEASE_TAG}^{commit}" "origin/${{ github.event.repository.default_branch }}"
+
   build:
+    name: Build ${{ matrix.cache-key }}
+    needs: verify
+    environment:
+      name: release
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ env.RELEASE_TAG }}
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
-        # macOS universal was one job building BOTH arches serially (~2x the heavy
-        # C++ compile). Split into two parallel single-arch jobs → wall-clock ≈ one arch.
         include:
           - platform: macos-latest
             target: aarch64-apple-darwin
@@ -39,24 +67,29 @@ jobs:
             target: ""
             cache-key: windows
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out release tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt --no-self-update
+          rustup default stable
+          if [[ -n "${{ matrix.target }}" ]]; then rustup target add "${{ matrix.target }}"; fi
 
       - name: Cache Rust build
-        uses: swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
         with:
           workspaces: "./src-tauri -> target"
-          # Stable per-target key (NOT the default per-job-id key) so master-warmed
-          # caches are reused by tag releases despite the version-bump lockfile churn.
           shared-key: ${{ matrix.cache-key }}
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
           cache: npm
@@ -64,37 +97,22 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # Non-tag (master / PR / dispatch): compile + type-check only. Warms the
-      # per-target Rust cache and validates the build — no bundling/signing.
-      - name: Build (validate + warm cache)
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - name: Require updater signing key
         shell: bash
-        run: |
-          npm run build
-          cargo build --release ${{ matrix.target && format('--target {0}', matrix.target) || '' }} --manifest-path src-tauri/Cargo.toml
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: test -n "$TAURI_SIGNING_PRIVATE_KEY" || { echo "TAURI_SIGNING_PRIVATE_KEY is missing from the release environment" >&2; exit 1; }
 
-      # Tag (v*): full bundle + draft release, restoring the master-warmed cache.
-      - name: Build and publish release
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
-        uses: tauri-apps/tauri-action@v0
+      - name: Build and draft release
+        uses: tauri-apps/tauri-action@e834788a94591d81e3ae0bd9ec06366f5f5354d7 # v0.5.20
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Updater artifact signing (minisign). The private key lives ONLY in the
-          # repo secret; tauri-action signs the update bundles and writes/merges
-          # the `latest.json` manifest the in-app updater polls. Key generated
-          # with an empty password (the password env stays empty).
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Tusk ${{ github.ref_name }}"
-          releaseBody: "Download the installer for your platform below."
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: Tusk ${{ env.RELEASE_TAG }}
+          releaseBody: Download the installer for your platform below.
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
-# To add Linux later, append to matrix:
-#   - platform: ubuntu-22.04
-#     target: ""
-#     cache-key: linux
-# and add a step before the build to install:
-#   sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsecret-1-dev libayatana-appindicator3-dev librsvg2-dev

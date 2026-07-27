@@ -6,7 +6,7 @@ import { parseSqlite } from "./parseSqlite";
 import { parseDuck } from "./parseDuck";
 import { detectPlan, isExplainQuery } from "./detect";
 import { explainSql, analyzeExecutesWrite } from "./explainSql";
-import { type PlanTree } from "./types";
+import { MAX_PLAN_DEPTH, MAX_PLAN_LABEL_CHARS, MAX_PLAN_NODES, type PlanTree } from "./types";
 
 // ---------- Postgres JSON ----------
 
@@ -228,6 +228,22 @@ describe("parseSqlite", () => {
   it("rejects the bytecode listing signature", () => {
     expect(parseSqlite(["addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment"], [["0", "Init", "0", "1", "0", null, "0", null]])).toBeNull();
   });
+
+  it("rejects duplicate/self ids, excessive node counts, and excessive depth", () => {
+    expect(parseSqlite(EQP_COLS, [["1", "1", "0", "SCAN t"]])).toBeNull();
+    expect(parseSqlite(EQP_COLS, [["1", "0", "0", "SCAN a"], ["1", "0", "0", "SCAN b"]])).toBeNull();
+
+    const wide = Array.from({ length: MAX_PLAN_NODES + 1 }, (_, i) => [String(i + 1), "0", "0", `SCAN t${i}`]);
+    expect(parseSqlite(EQP_COLS, wide)).toBeNull();
+
+    const deep = Array.from({ length: MAX_PLAN_DEPTH + 2 }, (_, i) => [String(i + 1), String(i), "0", `SCAN t${i}`]);
+    expect(parseSqlite(EQP_COLS, deep)).toBeNull();
+  });
+
+  it("bounds database-controlled node labels", () => {
+    const p = parseSqlite(EQP_COLS, [["1", "0", "0", `SCAN ${"x".repeat(MAX_PLAN_LABEL_CHARS * 2)}`]]) as PlanTree;
+    expect(p.root.label.length).toBeLessThanOrEqual(MAX_PLAN_LABEL_CHARS);
+  });
 });
 
 // ---------- DuckDB ----------
@@ -406,6 +422,23 @@ describe("plan parser adversarial totality", () => {
     expect(parseMysql(JSON.stringify({ query_block: mysqlNode }))).toBeNull();
   });
 
+  it("rejects array-spoofed plan objects", () => {
+    expect(parsePg('[{"Plan":[]} ]')).toBeNull();
+    expect(parseMysql('{"query_block":[]}')).toBeNull();
+    expect(parseDuck('{"children":[[]]}')).toBeNull();
+  });
+
+  it("falls back to text when a deep JSON plan reaches detection", () => {
+    let node: Record<string, unknown> = { "Node Type": "Leaf" };
+    for (let i = 0; i < MAX_PLAN_DEPTH + 2; i++) node = { "Node Type": "Node", Plans: [node] };
+    const out = detectPlan("postgres", {
+      lastQuery: "EXPLAIN (FORMAT JSON) SELECT 1",
+      columns: ["QUERY PLAN"],
+      rows: [[JSON.stringify([{ Plan: node }])]],
+    });
+    expect(out?.kind).toBe("text");
+  });
+
   it("never throws for a deterministic malformed corpus", () => {
     const corpus = ["", "null", "[]", "{}", "[null]", '{"Plan":{"Plans":[null]}}', "{", "🦆", "[1,2,3]"];
     for (const value of corpus) {
@@ -424,6 +457,16 @@ describe("plan parser adversarial totality", () => {
     });
     expect(out?.kind).toBe("text");
     expect(out?.kind === "text" ? out.text.length : Infinity).toBeLessThan(1_000_100);
+  });
+
+  it("labels a fallback truncated by the plan cell limit", () => {
+    const out = detectPlan("postgres", {
+      lastQuery: "EXPLAIN SELECT 1",
+      columns: ["plan"],
+      rows: Array.from({ length: 100_001 }, () => ["x"]),
+    });
+    expect(out).toMatchObject({ kind: "text" });
+    expect(out?.kind === "text" ? out.text : "").toContain("plan text truncated");
   });
 });
 

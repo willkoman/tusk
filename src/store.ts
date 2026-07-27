@@ -2,10 +2,11 @@ import { createSignal } from "solid-js";
 import { DEFAULT_PREFS, type EditorPrefs } from "./editor/types";
 import { type KeyOverrides } from "./actions";
 
-// Lightweight, WebView-local persistence (localStorage). Editor prefs are global;
-// the editor buffer is keyed per connection so each database keeps its own scratch
-// query. No security-sensitive data lives here (passwords stay in the OS keychain,
-// server-side). All access is wrapped — localStorage can throw in private modes.
+// Lightweight, WebView-local persistence (localStorage). Passwords and tokens never
+// live here, but editor buffers contain query text and possibly literals copied from a
+// database. They remain readable to this OS user's WebView profile until the connection
+// state is removed. Tab documents are size-capped, and every access handles unavailable
+// or quota-limited storage without destroying the previous recoverable snapshot.
 
 const PREFS_KEY = "tusk.prefs";
 const TABS_PREFIX = "tusk.tabs.";
@@ -157,45 +158,225 @@ export const keymapStore = {
   },
 };
 
-// Per-connection editor tab set. Results are ephemeral (not persisted) — only the
-// buffer, file binding, and title. Keyed by connKey; activeIndex (not id, which is a
-// session counter) survives reloads.
-export type PersistedTab = { sql: string; filePath: string | null; title: string; searchSchema: string | null };
+// Per-connection editor tab set. Results are ephemeral (not persisted) — only editor
+// recovery state. Keyed by connKey; activeIndex (not id, which is a session counter)
+// survives reloads. `dirty` is optional for source compatibility with callers and old
+// documents; normalized loads always return an explicit value.
+export type PersistedTab = {
+  sql: string;
+  filePath: string | null;
+  title: string;
+  searchSchema: string | null;
+  dirty?: boolean;
+};
 export type PersistedTabs = { tabs: PersistedTab[]; activeIndex: number };
+export type RestoredPersistedTab = Omit<PersistedTab, "dirty"> & { dirty: boolean };
+export type RestoredPersistedTabs = { tabs: RestoredPersistedTab[]; activeIndex: number };
+
+export type TabsPersistenceFailure = {
+  operation: "load" | "save" | "remove";
+  code: "invalid-key" | "invalid-data" | "too-large" | "unavailable" | "verification-failed";
+  message: string;
+};
+export type TabsPersistenceResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: TabsPersistenceFailure };
+
+const MAX_TABS = 100;
+const MAX_PATH_CHARS = 32_768;
+const MAX_SCHEMA_CHARS = 1_000;
+const MAX_CONNECTION_KEY_CHARS = 1_024;
+let lastTabsFailure: TabsPersistenceFailure | null = null;
+
+function failure(
+  operation: TabsPersistenceFailure["operation"],
+  code: TabsPersistenceFailure["code"],
+  cause?: unknown,
+): TabsPersistenceFailure {
+  let detail = "";
+  if (cause instanceof Error) detail = cause.message || cause.name;
+  else if (typeof cause === "string") detail = cause;
+  const label = code.replace(/-/g, " ");
+  return { operation, code, message: detail ? `${label}: ${detail.slice(0, 300)}` : label };
+}
+
+function storageKey(key: string, operation: TabsPersistenceFailure["operation"]): TabsPersistenceResult<string> {
+  if (!key || key.length > MAX_CONNECTION_KEY_CHARS) {
+    return { ok: false, error: failure(operation, "invalid-key") };
+  }
+  return { ok: true, value: TABS_PREFIX + key };
+}
+
+function normalizeTabs(value: unknown): RestoredPersistedTabs | null {
+  if (!isRecord(value) || !Array.isArray(value.tabs) || !Number.isInteger(value.activeIndex)) return null;
+  const tabs = value.tabs.flatMap((v): RestoredPersistedTab[] => {
+    if (!isRecord(v) || typeof v.sql !== "string" || typeof v.title !== "string") return [];
+    if (v.sql.length > MAX_TABS_STORE_CHARS) return [];
+    const filePath = v.filePath === null || typeof v.filePath === "string" && v.filePath.length <= MAX_PATH_CHARS
+      ? v.filePath
+      : null;
+    const searchSchema = v.searchSchema === null || typeof v.searchSchema === "string" && v.searchSchema.length <= MAX_SCHEMA_CHARS
+      ? v.searchSchema
+      : null;
+    const dirty = typeof v.dirty === "boolean" ? v.dirty : false;
+    return [{ sql: v.sql, title: v.title.slice(0, 200), filePath, searchSchema, dirty }];
+  });
+  if (!tabs.length) return null;
+  return {
+    tabs,
+    activeIndex: Math.max(0, Math.min(value.activeIndex as number, tabs.length - 1)),
+  };
+}
+
+/** Exact-enough JSON string size without materializing a potentially huge document. */
+function jsonStringChars(value: string): number {
+  let chars = 2; // surrounding quotes
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code === 0x22 || code === 0x5c || code === 0x08 || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d) chars += 2;
+    else if (code < 0x20 || (code >= 0xd800 && code <= 0xdfff && !(code <= 0xdbff && i + 1 < value.length && value.charCodeAt(i + 1) >= 0xdc00 && value.charCodeAt(i + 1) <= 0xdfff))) chars += 6;
+    else {
+      chars++;
+      if (code >= 0xd800 && code <= 0xdbff) { chars++; i++; }
+    }
+    if (chars > MAX_TABS_STORE_CHARS) return chars;
+  }
+  return chars;
+}
+
+function loadTabs(key: string): TabsPersistenceResult<RestoredPersistedTabs | null> {
+  const fullKey = storageKey(key, "load");
+  if (!fullKey.ok) return fullKey;
+  try {
+    const raw = localStorage.getItem(fullKey.value);
+    if (raw === null) return { ok: true, value: null };
+    if (raw.length > MAX_TABS_STORE_CHARS) {
+      return { ok: false, error: failure("load", "too-large") };
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (cause) {
+      return { ok: false, error: failure("load", "invalid-data", cause) };
+    }
+    if (isRecord(parsed) && Array.isArray(parsed.tabs) && parsed.tabs.length > MAX_TABS)
+      return { ok: false, error: failure("load", "too-large") };
+    const normalized = normalizeTabs(parsed);
+    return normalized
+      ? { ok: true, value: normalized }
+      : { ok: false, error: failure("load", "invalid-data") };
+  } catch (cause) {
+    return { ok: false, error: failure("load", "unavailable", cause) };
+  }
+}
+
+function saveTabs(key: string, data: PersistedTabs): TabsPersistenceResult<void> {
+  const fullKey = storageKey(key, "save");
+  if (!fullKey.ok) return fullKey;
+  if (Array.isArray(data.tabs) && data.tabs.length > MAX_TABS)
+    return { ok: false, error: failure("save", "too-large") };
+  if (Array.isArray(data.tabs)) {
+    // Preflight aggregate *serialized* size before JSON.stringify. A hundred
+    // individually valid multi-megabyte tabs otherwise allocate hundreds of MiB.
+    let chars = 128;
+    for (const tab of data.tabs) {
+      if (!tab || typeof tab.sql !== "string" || typeof tab.title !== "string") continue;
+      chars += jsonStringChars(tab.sql) + jsonStringChars(tab.title) + 96;
+      if (typeof tab.filePath === "string") chars += jsonStringChars(tab.filePath);
+      if (typeof tab.searchSchema === "string") chars += jsonStringChars(tab.searchSchema);
+      if (chars > MAX_TABS_STORE_CHARS) return { ok: false, error: failure("save", "too-large") };
+    }
+  }
+  const normalized = normalizeTabs(data);
+  if (!normalized) return { ok: false, error: failure("save", "invalid-data") };
+  let raw: string;
+  try {
+    raw = JSON.stringify({ ...normalized, updatedAt: Date.now() });
+  } catch (cause) {
+    return { ok: false, error: failure("save", "invalid-data", cause) };
+  }
+  if (raw.length > MAX_TABS_STORE_CHARS) {
+    return { ok: false, error: failure("save", "too-large") };
+  }
+  try {
+    localStorage.setItem(fullKey.value, raw);
+    if (localStorage.getItem(fullKey.value) !== raw) {
+      return { ok: false, error: failure("save", "verification-failed") };
+    }
+    return { ok: true, value: undefined };
+  } catch (cause) {
+    return { ok: false, error: failure("save", "unavailable", cause) };
+  }
+}
+
+function remember<T>(result: TabsPersistenceResult<T>): TabsPersistenceResult<T> {
+  lastTabsFailure = result.ok ? null : result.error;
+  return result;
+}
 
 export const tabsStore = {
-  load(key: string): PersistedTabs | null {
-    try {
-      const raw = localStorage.getItem(TABS_PREFIX + key);
-      if (raw && raw.length > MAX_TABS_STORE_CHARS) return null;
-      const parsed: unknown = raw ? JSON.parse(raw) : null;
-      if (isRecord(parsed) && Array.isArray(parsed.tabs) && Number.isInteger(parsed.activeIndex)) {
-        const tabs = parsed.tabs.slice(0, 100).flatMap((v): PersistedTab[] => {
-          if (!isRecord(v) || typeof v.sql !== "string" || typeof v.title !== "string") return [];
-          if (v.sql.length > MAX_TABS_STORE_CHARS) return [];
-          const filePath = v.filePath === null || typeof v.filePath === "string" ? v.filePath : null;
-          const searchSchema = v.searchSchema === null || typeof v.searchSchema === "string" ? v.searchSchema : null;
-          return [{ sql: v.sql, title: v.title.slice(0, 200), filePath, searchSchema }];
-        });
-        if (tabs.length) return { tabs, activeIndex: Math.max(0, Math.min(parsed.activeIndex as number, tabs.length - 1)) };
-      }
-    } catch {
-      /* ignore */
-    }
-    return null;
+  loadResult(key: string): TabsPersistenceResult<RestoredPersistedTabs | null> {
+    return remember(loadTabs(key));
+  },
+  load(key: string): RestoredPersistedTabs | null {
+    const result = remember(loadTabs(key));
+    return result.ok ? result.value : null;
+  },
+  saveResult(key: string, data: PersistedTabs): TabsPersistenceResult<void> {
+    return remember(saveTabs(key, data));
   },
   save(key: string, data: PersistedTabs): boolean {
+    return remember(saveTabs(key, data)).ok;
+  },
+  /** Synchronous, verified write suitable for `beforeunload`/window-close handling. */
+  saveForClose(key: string, data: PersistedTabs): TabsPersistenceResult<void> {
+    return remember(saveTabs(key, data));
+  },
+  /** Move an unreadable snapshot aside (`<key>.corrupt`) so a fresh one can be
+   * written without destroying data that might still be hand-salvageable. If the
+   * backup copy itself fails (storage quota/unavailable), the original stays put
+   * and an error returns — the caller should then keep recovery writes disabled. */
+  quarantineResult(key: string): TabsPersistenceResult<boolean> {
+    const fullKey = storageKey(key, "remove");
+    if (!fullKey.ok) return remember(fullKey);
     try {
-      const chars = data.tabs.reduce((n, t) => n + t.sql.length + t.title.length + (t.filePath?.length ?? 0), 0);
-      if (chars > MAX_TABS_STORE_CHARS) return false;
-      localStorage.setItem(TABS_PREFIX + key, JSON.stringify({ ...data, updatedAt: Date.now() }));
-      return true;
-    } catch {
-      /* ignore */
-      return false;
+      const raw = localStorage.getItem(fullKey.value);
+      if (raw === null) return { ok: true, value: false };
+      try {
+        localStorage.setItem(`${fullKey.value}.corrupt`, raw);
+      } catch (cause) {
+        return remember({ ok: false, error: failure("remove", "unavailable", cause) });
+      }
+      localStorage.removeItem(fullKey.value);
+      return { ok: true, value: true };
+    } catch (cause) {
+      return remember({ ok: false, error: failure("remove", "unavailable", cause) });
+    }
+  },
+  removeResult(key: string): TabsPersistenceResult<void> {
+    const fullKey = storageKey(key, "remove");
+    if (!fullKey.ok) return remember(fullKey);
+    try {
+      localStorage.removeItem(fullKey.value);
+      return remember({ ok: true, value: undefined });
+    } catch (cause) {
+      return remember({ ok: false, error: failure("remove", "unavailable", cause) });
     }
   },
   remove(key: string): void {
-    try { localStorage.removeItem(TABS_PREFIX + key); } catch { /* ignore */ }
+    const fullKey = storageKey(key, "remove");
+    if (!fullKey.ok) {
+      remember(fullKey);
+      return;
+    }
+    try {
+      localStorage.removeItem(fullKey.value);
+      remember({ ok: true, value: undefined });
+    } catch (cause) {
+      remember({ ok: false, error: failure("remove", "unavailable", cause) });
+    }
+  },
+  lastFailure(): TabsPersistenceFailure | null {
+    return lastTabsFailure;
   },
 };

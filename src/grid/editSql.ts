@@ -25,14 +25,16 @@ export type CommitInput = {
 };
 
 function pkWhere(input: CommitInput, row: (string | null)[]): string {
-  return input.pkIdx
+  const predicates = input.pkIdx
     .map((i) => {
       const v = row[i];
       return v === null || v === undefined
         ? `${ident(input.columns[i])} IS NULL`
         : `${ident(input.columns[i])} = ${lit(v)}`;
-    })
-    .join(" AND ");
+    });
+  // Group every component and the conjunction itself. This keeps composite row
+  // identity explicit if callers later compose the predicate with another clause.
+  return `(${predicates.map((predicate) => `(${predicate})`).join(" AND ")})`;
 }
 
 /** The commit script as ordered single statements (joined by the caller). */

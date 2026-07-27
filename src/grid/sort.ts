@@ -44,5 +44,10 @@ export function sortedRowOrder(
 /** Materialize canonical rows in visible order without mutating either input. */
 export function orderedRows<T>(rows: readonly T[], order: readonly number[] | null): T[] {
   if (!order) return [...rows];
-  return order.flatMap((i) => (Number.isInteger(i) && i >= 0 && i < rows.length ? [rows[i]] : []));
+  if (
+    order.length !== rows.length ||
+    new Set(order).size !== rows.length ||
+    order.some((i) => !Number.isInteger(i) || i < 0 || i >= rows.length)
+  ) return [...rows];
+  return order.map((i) => rows[i]);
 }

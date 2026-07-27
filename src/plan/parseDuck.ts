@@ -1,4 +1,13 @@
-import { type ParsedPlan, type PlanNode, finishTree, planInputWithinLimits, propStr } from "./types";
+import {
+  MAX_PLAN_JSON_CHARS,
+  MAX_PLAN_PROPS,
+  boundPlanText,
+  type ParsedPlan,
+  type PlanNode,
+  finishTree,
+  planInputWithinLimits,
+  propStr,
+} from "./types";
 
 // DuckDB has TWO JSON plan shapes:
 //   • `EXPLAIN (FORMAT json)` — array of `{name, children[], extra_info:{…}}`.
@@ -11,7 +20,7 @@ import { type ParsedPlan, type PlanNode, finishTree, planInputWithinLimits, prop
 // Box-drawing text EXPLAIN is handled by the caller as styled text.
 
 function str(v: unknown): string | undefined {
-  return typeof v === "string" && v.trim() ? v.trim() : undefined;
+  return typeof v === "string" && v.trim() ? boundPlanText(v.trim()) : undefined;
 }
 function toNum(v: unknown): number | undefined {
   if (typeof v === "number") return Number.isFinite(v) ? v : undefined;
@@ -21,7 +30,7 @@ function toNum(v: unknown): number | undefined {
   }
   return undefined;
 }
-const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object";
+const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 
 function duckNode(raw: Record<string, unknown>): PlanNode {
   const children = Array.isArray(raw["children"])
@@ -37,12 +46,12 @@ function duckNode(raw: Record<string, unknown>): PlanNode {
   const extra = raw["extra_info"] ?? raw["extra-info"];
   if (isObj(extra)) {
     for (const [k, v] of Object.entries(extra)) {
-      props.push([k, propStr(v)]);
+      if (props.length < MAX_PLAN_PROPS) props.push([boundPlanText(k), propStr(v)]);
       if (/estimated\s*cardinality/i.test(k)) estRows = toNum(v);
       if (/^table$/i.test(k)) object = str(v);
     }
   } else if (typeof extra === "string" && extra.trim()) {
-    props.push(["Info", extra.trim()]);
+    props.push(["Info", propStr(extra.trim())]);
   }
   // Surface the remaining scalar fields (skip ones we've consumed for label/metrics).
   const SKIP = new Set([
@@ -51,7 +60,7 @@ function duckNode(raw: Record<string, unknown>): PlanNode {
   ]);
   for (const [k, v] of Object.entries(raw)) {
     if (SKIP.has(k) || isObj(v)) continue;
-    props.push([k, propStr(v)]);
+    if (props.length < MAX_PLAN_PROPS) props.push([boundPlanText(k), propStr(v)]);
   }
 
   const timingS = toNum(raw["timing"]) ?? toNum(raw["operator_timing"]);
@@ -73,14 +82,23 @@ function duckNode(raw: Record<string, unknown>): PlanNode {
 /** Unwrap the ANALYZE profiling root + the `EXPLAIN_ANALYZE` operator down to the
  *  real operator subtree(s) — those wrappers carry no useful node data. */
 function unwrapAnalyze(o: Record<string, unknown>): Record<string, unknown>[] {
-  const opName = str(o["operator_name"]) ?? str(o["operator_type"]) ?? str(o["name"]);
-  const kids = Array.isArray(o["children"]) ? (o["children"] as unknown[]).filter(isObj) : [];
-  // The profiling root has no operator name; the EXPLAIN_ANALYZE op is a pure wrapper.
-  if (opName === undefined || opName === "EXPLAIN_ANALYZE") return kids.flatMap(unwrapAnalyze);
-  return [o];
+  const out: Record<string, unknown>[] = [];
+  const stack = [o];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    const opName = str(cur["operator_name"]) ?? str(cur["operator_type"]) ?? str(cur["name"]);
+    if (opName !== undefined && opName !== "EXPLAIN_ANALYZE") {
+      out.push(cur);
+      continue;
+    }
+    const kids = Array.isArray(cur["children"]) ? (cur["children"] as unknown[]).filter(isObj) : [];
+    for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
+  }
+  return out;
 }
 
 export function parseDuck(jsonText: string): ParsedPlan | null {
+  if (jsonText.length > MAX_PLAN_JSON_CHARS) return null;
   let parsed: unknown;
   try {
     parsed = JSON.parse(jsonText);

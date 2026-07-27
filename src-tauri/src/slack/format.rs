@@ -56,7 +56,11 @@ pub fn render_inline_table(columns: &[String], rows: &[Vec<Option<String>>]) -> 
     let cell = |k: usize, v: &Option<String>| -> String {
         let s = match v {
             None => "NULL".to_string(),
-            Some(s) => match bools.contains(&k).then(|| crate::export::bool_token(s)).flatten() {
+            Some(s) => match bools
+                .contains(&k)
+                .then(|| crate::export::bool_token(s))
+                .flatten()
+            {
                 Some(true) => "TRUE".to_string(),
                 Some(false) => "FALSE".to_string(),
                 None => s.replace(['\n', '\r'], " "),
@@ -87,14 +91,22 @@ pub fn render_inline_table(columns: &[String], rows: &[Vec<Option<String>>]) -> 
         format!("{s}{}", " ".repeat(w.saturating_sub(n)))
     };
     let mut out = String::new();
-    let head: Vec<String> = columns.iter().enumerate().map(|(k, c)| pad(c, widths[k])).collect();
+    let head: Vec<String> = columns
+        .iter()
+        .enumerate()
+        .map(|(k, c)| pad(c, widths[k]))
+        .collect();
     out.push_str(head.join("  ").trim_end());
     out.push('\n');
     let rule: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
     out.push_str(&rule.join("  "));
     out.push('\n');
     for r in rendered {
-        let line: Vec<String> = r.iter().enumerate().map(|(k, s)| pad(s, widths[k])).collect();
+        let line: Vec<String> = r
+            .iter()
+            .enumerate()
+            .map(|(k, s)| pad(s, widths[k]))
+            .collect();
         out.push_str(line.join("  ").trim_end());
         out.push('\n');
     }
@@ -133,7 +145,9 @@ pub fn auto_chart_spec(columns: &[String], rows: &[Vec<Option<String>>]) -> Opti
     if columns.len() < 2 || columns.len() > 4 || rows.is_empty() || rows.len() > CHART_MAX_ROWS {
         return None;
     }
-    let col = |k: usize| -> Vec<Option<String>> { rows.iter().map(|r| r.get(k).cloned().flatten()).collect() };
+    let col = |k: usize| -> Vec<Option<String>> {
+        rows.iter().map(|r| r.get(k).cloned().flatten()).collect()
+    };
     if !looks_like_date(&columns[0], &col(0)) {
         return None;
     }
@@ -158,7 +172,9 @@ mod tests {
         SlackConfig::default()
     }
     fn rows(n: usize, cols: usize) -> Vec<Vec<Option<String>>> {
-        (0..n).map(|i| (0..cols).map(|k| Some(format!("v{i}_{k}"))).collect()).collect()
+        (0..n)
+            .map(|i| (0..cols).map(|k| Some(format!("v{i}_{k}"))).collect())
+            .collect()
     }
     fn cols(n: usize) -> Vec<String> {
         (0..n).map(|k| format!("c{k}")).collect()
@@ -166,25 +182,40 @@ mod tests {
 
     #[test]
     fn empty_result() {
-        assert!(matches!(decide_format(&cols(2), &[], &cfg()), ResultFormat::Empty));
+        assert!(matches!(
+            decide_format(&cols(2), &[], &cfg()),
+            ResultFormat::Empty
+        ));
     }
 
     #[test]
     fn small_result_inline() {
-        assert!(matches!(decide_format(&cols(3), &rows(5, 3), &cfg()), ResultFormat::InlineTable(_)));
+        assert!(matches!(
+            decide_format(&cols(3), &rows(5, 3), &cfg()),
+            ResultFormat::InlineTable(_)
+        ));
     }
 
     #[test]
     fn medium_result_csv() {
-        assert!(matches!(decide_format(&cols(6), &rows(100, 6), &cfg()), ResultFormat::CsvAttachment));
+        assert!(matches!(
+            decide_format(&cols(6), &rows(100, 6), &cfg()),
+            ResultFormat::CsvAttachment
+        ));
     }
 
     #[test]
     fn huge_or_wide_result_xlsx() {
         let mut c = cfg();
         c.max_rows_file = 50;
-        assert!(matches!(decide_format(&cols(3), &rows(60, 3), &c), ResultFormat::XlsxAttachment));
-        assert!(matches!(decide_format(&cols(20), &rows(10, 20), &cfg()), ResultFormat::XlsxAttachment));
+        assert!(matches!(
+            decide_format(&cols(3), &rows(60, 3), &c),
+            ResultFormat::XlsxAttachment
+        ));
+        assert!(matches!(
+            decide_format(&cols(20), &rows(10, 20), &cfg()),
+            ResultFormat::XlsxAttachment
+        ));
     }
 
     #[test]
@@ -193,12 +224,19 @@ mod tests {
         c.charts_enabled = true;
         c.max_rows_inline = 0; // force past inline
         let columns = vec!["month".to_string(), "revenue".to_string()];
-        let data: Vec<Vec<Option<String>>> =
-            (1..=9).map(|m| vec![Some(format!("2026-0{m}-01")), Some(format!("{}", m * 100))]).collect();
-        assert!(matches!(decide_format(&columns, &data, &c), ResultFormat::ChartImage(_)));
+        let data: Vec<Vec<Option<String>>> = (1..=9)
+            .map(|m| vec![Some(format!("2026-0{m}-01")), Some(format!("{}", m * 100))])
+            .collect();
+        assert!(matches!(
+            decide_format(&columns, &data, &c),
+            ResultFormat::ChartImage(_)
+        ));
         // charts off → falls through to CSV
         c.charts_enabled = false;
-        assert!(matches!(decide_format(&columns, &data, &c), ResultFormat::CsvAttachment));
+        assert!(matches!(
+            decide_format(&columns, &data, &c),
+            ResultFormat::CsvAttachment
+        ));
     }
 
     #[test]
@@ -211,8 +249,9 @@ mod tests {
     #[test]
     fn auto_spec_names_columns() {
         let columns = vec!["month".to_string(), "rev".to_string()];
-        let data: Vec<Vec<Option<String>>> =
-            (1..=9).map(|m| vec![Some(format!("2026-0{m}-01")), Some(format!("{m}"))]).collect();
+        let data: Vec<Vec<Option<String>>> = (1..=9)
+            .map(|m| vec![Some(format!("2026-0{m}-01")), Some(format!("{m}"))])
+            .collect();
         let spec = auto_chart_spec(&columns, &data).unwrap();
         assert_eq!(spec.kind, "bar");
         assert_eq!(spec.x.as_deref(), Some("month"));

@@ -4,6 +4,15 @@ import { aliasMap, makeIndexer, strip, tableByRef, type Index, type Table } from
 import { ALL_SQL_FUNCTIONS, ALL_SQL_WORDS } from "../sql/dialects";
 import { docString, lexState, maskNonCode, type Span, type Stmt } from "./lexer";
 import { closest, damerau } from "./distance";
+import {
+  LINT_DIAGNOSTIC_LIMIT,
+  LINT_STATEMENT_LIMIT,
+  LINT_SUGGESTION_POOL_LIMIT,
+  LINT_SUGGESTION_RUN_LIMIT,
+  LIVE_ANALYSIS_MAX_CHARS,
+  SCHEMA_LINT_COLUMN_LIMIT,
+  SCHEMA_LINT_TABLE_LIMIT,
+} from "./limits";
 
 // `EXTRACT(YEAR FROM x)` / `SUBSTRING(s FROM 2)` / `TRIM(x FROM y)` … contain a
 // grammatical FROM that is NOT a table position. Blank those argument lists
@@ -63,9 +72,34 @@ export function schemaDiagnostics(
   idx: Index,
   funcs: ReadonlySet<string>,
 ): SchemaDiag[] {
+  if (doc.length > LIVE_ANALYSIS_MAX_CHARS) return [];
+  if (idx.tables.length > SCHEMA_LINT_TABLE_LIMIT || idx.schemas.length > SCHEMA_LINT_TABLE_LIMIT) return [];
   const diags: SchemaDiag[] = [];
+  const add = (diag: SchemaDiag): boolean => {
+    diags.push(diag);
+    return diags.length >= LINT_DIAGNOSTIC_LIMIT;
+  };
+  const schemaNames = new Set(idx.schemas.map((s) => s.toLowerCase()));
+  const tableNames = idx.tables.length <= LINT_SUGGESTION_POOL_LIMIT ? idx.tables.map((t) => t.name) : null;
+  const columnCache = new Map<Table, { lower: Set<string>; names: string[] }>();
+  const columnsOf = (table: Table) => {
+    let columns = columnCache.get(table);
+    if (!columns) {
+      const names = table.columns.map((c) => c.name);
+      columns = { names, lower: new Set(names.map((name) => name.toLowerCase())) };
+      columnCache.set(table, columns);
+    }
+    return columns;
+  };
+  let suggestionRuns = 0;
+  const suggest = (word: string, candidates: Iterable<string>, size: number): string | null => {
+    if (size > LINT_SUGGESTION_POOL_LIMIT || suggestionRuns >= LINT_SUGGESTION_RUN_LIMIT) return null;
+    suggestionRuns++;
+    return closest(word, candidates);
+  };
 
-  for (const stmt of stmts) {
+  for (let stmtIndex = 0; stmtIndex < Math.min(stmts.length, LINT_STATEMENT_LIMIT); stmtIndex++) {
+    const stmt = stmts[stmtIndex];
     const masked = maskNonCode(doc, spans, stmt.from, stmt.to, true); // keep "quoted" identifiers
     const base = stmt.from;
     // Table positions are scanned on a copy with EXTRACT/SUBSTRING/… argument
@@ -87,15 +121,16 @@ export function schemaDiagnostics(
       const ref = aliases.get(alias.toLowerCase()) ?? alias;
       const t = tableByRef(idx, ref);
       if (!t || cte.has(alias.toLowerCase())) continue;
-      if (t.columns.some((c) => c.name.toLowerCase() === col.toLowerCase())) continue;
+      const tableColumns = columnsOf(t);
+      if (tableColumns.lower.has(col.toLowerCase())) continue;
       const colStart = base + m.index! + alias.length + 1;
-      const sugg = closest(col, t.columns.map((c) => c.name));
-      diags.push({
+      const sugg = suggest(col, tableColumns.names, tableColumns.names.length);
+      if (add({
         from: colStart,
         to: colStart + col.length,
         message: `no column "${col}" on ${t.name}${sugg ? ` — did you mean "${sugg}"?` : ""}`,
         suggestion: sugg ?? undefined,
-      });
+      })) return diags;
     }
 
     // (2) Table references after FROM / JOIN / UPDATE / INTO.
@@ -114,19 +149,19 @@ export function schemaDiagnostics(
       let after = m.index! + m[0].length;
       while (after < tableScan.length && /\s/.test(tableScan[after])) after++;
       if (after < tableScan.length && tableScan[after] === "(") continue; // table function
-      if (parts.length > 1 && !idx.schemas.some((s) => s.toLowerCase() === parts[parts.length - 2].toLowerCase())) {
+      if (parts.length > 1 && !schemaNames.has(parts[parts.length - 2].toLowerCase())) {
         allTablesResolve = false; // foreign catalog — unverifiable
         continue;
       }
       allTablesResolve = false;
       const tokStart = base + m.index! + (m[0].length - raw.length);
-      const sugg = closest(bare, idx.tables.map((t) => t.name));
-      diags.push({
+      const sugg = tableNames ? suggest(bare, tableNames, tableNames.length) : null;
+      if (add({
         from: tokStart,
         to: tokStart + raw.length,
         message: `unknown table "${name}"${sugg ? ` — did you mean "${sugg}"?` : ""}`,
         suggestion: sugg ?? undefined,
-      });
+      })) return diags;
     }
 
     // (3) Function / procedure calls, against the live catalog.
@@ -142,16 +177,16 @@ export function schemaDiagnostics(
         if (cte.has(lower) || aliases.has(lower) || idx.byBare.has(lower)) continue;
         if (qualifier) {
           // schema-qualified → still the same proname; alias-qualified → not a call we judge
-          if (!idx.schemas.some((s) => s.toLowerCase() === qualifier)) continue;
+          if (!schemaNames.has(qualifier)) continue;
         }
         const start = base + fm.index + (fm[1] ? fm[0].indexOf(name, fm[1].length) : 0);
-        const sugg = closest(lower, funcs);
-        diags.push({
+        const sugg = suggest(lower, funcs, funcs.size);
+        if (add({
           from: start,
           to: start + name.length,
           message: `unknown function "${name}"${sugg ? ` — did you mean "${sugg}"?` : ""}`,
           suggestion: sugg ?? undefined,
-        });
+        })) return diags;
       }
     }
 
@@ -169,6 +204,7 @@ export function schemaDiagnostics(
 
     const scopeCols = new Set<string>();
     const scopeColNames: string[] = [];
+    let scopeTooLarge = false;
     if (fullMode) {
       for (const ref of new Set(aliases.values())) {
         const t = tableByRef(idx, ref);
@@ -178,10 +214,15 @@ export function schemaDiagnostics(
           if (!scopeCols.has(lc)) {
             scopeCols.add(lc);
             scopeColNames.push(c.name);
+            if (scopeCols.size > SCHEMA_LINT_COLUMN_LIMIT) {
+              scopeTooLarge = true;
+              break;
+            }
           }
         }
+        if (scopeTooLarge) break;
       }
-      if (!scopeCols.size) continue;
+      if (!scopeCols.size || scopeTooLarge) continue;
     }
 
     const asTargets = new Set<string>();
@@ -218,22 +259,26 @@ export function schemaDiagnostics(
 
       if (fullMode) {
         if (scopeCols.has(lower)) continue;
-        const sugg = closest(tok, [...scopeColNames, ...KEYWORD_SUGGESTIONS]);
-        diags.push({
+        const poolSize = scopeColNames.length + KEYWORD_SUGGESTIONS.length;
+        const sugg =
+          poolSize <= LINT_SUGGESTION_POOL_LIMIT && suggestionRuns < LINT_SUGGESTION_RUN_LIMIT
+            ? suggest(tok, [...scopeColNames, ...KEYWORD_SUGGESTIONS], poolSize)
+            : null;
+        if (add({
           from: base + at,
           to: base + at + tok.length,
           message: `unknown identifier "${tok}"${sugg ? ` — did you mean "${sugg}"?` : ""}`,
           suggestion: sugg ?? undefined,
-        });
+        })) return diags;
       } else {
         const kw = KEYWORD_SUGGESTIONS.find((k) => damerau(upper, k) === 1);
         if (kw) {
-          diags.push({
+          if (add({
             from: base + at,
             to: base + at + tok.length,
             message: `unknown keyword "${tok}" — did you mean ${kw}?`,
             suggestion: kw,
-          });
+          })) return diags;
         }
       }
     }
@@ -254,8 +299,15 @@ function replaceAction(from: number, to: number, text: string) {
 export function schemaLintSource(getSchema: () => Table[], getFuncs: () => ReadonlySet<string>) {
   const indexOf = makeIndexer();
   return (view: EditorView): Diagnostic[] => {
+    if (view.state.doc.length > LIVE_ANALYSIS_MAX_CHARS) return [];
     const tables = getSchema();
     if (!tables.length) return []; // schema not loaded yet — don't guess
+    if (tables.length > SCHEMA_LINT_TABLE_LIMIT) return [];
+    let columnCount = 0;
+    for (const table of tables) {
+      columnCount += table.columns.length;
+      if (columnCount > SCHEMA_LINT_COLUMN_LIMIT) return [];
+    }
     const idx = indexOf(tables);
     const { spans, stmts } = lexState(view.state);
     const doc = docString(view.state);

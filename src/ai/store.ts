@@ -7,7 +7,10 @@ import {
   AI_PROVIDERS,
   defaultModel,
   providerInfo,
+  resolveBaseUrl,
+  resolveWire,
   type AiProvider,
+  type Wire,
 } from "./providers";
 
 export type { AiProvider, Wire, Tier, ModelSpec, ProviderSpec } from "./providers";
@@ -35,11 +38,45 @@ export type AiConfig = {
    *  provider because a single `baseUrl` leaked across a provider switch: point OpenAI at
    *  a local server, switch to Gemini, and Gemini inherited the local server's URL. */
   baseUrls: Partial<Record<AiProvider, string>>;
-  /** Send a few sample rows of relevant tables to the model (real values leave your machine). Default on. */
+  /** Origins explicitly approved for provider overrides. The backend independently binds
+   *  each key to its approved origin; this map keeps official providers pinned in the UI. */
+  approvedOrigins: Partial<Record<AiProvider, string>>;
+  /** Send a few sample rows of relevant tables to the model (real values leave your machine). */
   shareSamples: boolean;
 };
 
-/** The active provider's base-URL override ("" = use the registry default). */
+/** Canonical HTTP(S) origin, or null for invalid/credential-bearing URLs. */
+export function endpointOrigin(value: string): string | null {
+  try {
+    const url = new URL(value.trim());
+    if (!/^https?:$/.test(url.protocol) || url.username || url.password) return null;
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
+export function originNeedsConsent(provider: AiProvider, override: string): boolean {
+  if (!override.trim()) return false;
+  const requested = endpointOrigin(override);
+  const shipped = endpointOrigin(providerInfo(provider).baseUrl);
+  return !requested || !shipped || requested !== shipped;
+}
+
+export function originApproved(c: AiConfig, provider: AiProvider): boolean {
+  const override = c.baseUrls[provider] ?? "";
+  if (!originNeedsConsent(provider, override)) return true;
+  const origin = endpointOrigin(override);
+  return !!origin && c.approvedOrigins[provider] === origin;
+}
+
+/** Approved override only. Blank pins the provider to its registry default. */
+export const approvedBaseOverride = (c: AiConfig, provider: AiProvider): string =>
+  originApproved(c, provider) ? c.baseUrls[provider] ?? "" : "";
+
+/** The active provider's requested override. An unapproved value is deliberately kept
+ *  here so backend consumers such as Slack fail closed on origin binding instead of
+ *  silently rerouting a legacy proxy key and database context to the registry default. */
 export const activeBaseUrl = (c: AiConfig): string => c.baseUrls[c.provider] ?? "";
 
 const KEY = "tusk.ai.config";
@@ -70,37 +107,126 @@ export function normalizeAiConfig(raw: unknown): AiConfig {
   };
   const models = stringMap(obj.models, 500);
   const baseUrls = stringMap(obj.baseUrls, 2_000);
+  const approvedOrigins = stringMap(obj.approvedOrigins, 500);
   if (model && models[provider] === undefined) models[provider] = model;
   if (typeof obj.baseUrl === "string" && baseUrls[provider] === undefined) baseUrls[provider] = obj.baseUrl.slice(0, 2_000);
-  return { provider, model, models, baseUrls, shareSamples: obj.shareSamples !== false };
+  // Real row values leave the machine. Missing, malformed, and pre-setting values all
+  // fail closed; only an explicit persisted `true` enables sharing.
+  return {
+    provider,
+    model,
+    models,
+    baseUrls,
+    approvedOrigins,
+    shareSamples: known && obj.shareSamples === true,
+  };
 }
+
+const fallbackConfig = (): AiConfig => ({
+  provider: "anthropic",
+  model: defaultModel("anthropic"),
+  models: {},
+  baseUrls: {},
+  approvedOrigins: {},
+  shareSamples: false,
+});
+
+const subscribers = new Set<(config: AiConfig) => void>();
+let volatileConfig: AiConfig | null = null;
+let volatileStorage: Storage | null = null;
+const notify = (config: AiConfig) => {
+  for (const listener of subscribers) {
+    try { listener(config); } catch { /* one mounted consumer must not poison persistence */ }
+  }
+};
 
 export const aiStore = {
   load(): AiConfig {
     try {
-      const raw = localStorage.getItem(KEY) || "";
+      if (volatileConfig && volatileStorage === localStorage) return normalizeAiConfig(volatileConfig);
+      if (volatileConfig && volatileStorage !== localStorage) {
+        volatileConfig = null;
+        volatileStorage = null;
+      }
+      const raw = localStorage.getItem(KEY);
+      if (raw === null) return fallbackConfig();
       if (raw.length > MAX_CONFIG_CHARS) throw new Error("AI config is too large");
       const r = JSON.parse(raw);
       if (r && r.provider) return normalizeAiConfig(r);
     } catch {
-      /* ignore */
+      // Storage denial/corruption must not silently re-enable sample sharing.
     }
-    return { provider: "anthropic", model: defaultModel("anthropic"), models: {}, baseUrls: {}, shareSamples: true };
+    return fallbackConfig();
   },
   save(c: AiConfig): boolean {
     // Keep the per-provider memory in step with the active selection.
     const next = normalizeAiConfig({ ...c, models: { ...c.models, [c.provider]: c.model } });
     try {
       const json = JSON.stringify(next);
-      if (json.length > MAX_CONFIG_CHARS) return false;
+      if (json.length > MAX_CONFIG_CHARS) {
+        const safe = { ...next, shareSamples: false };
+        volatileConfig = safe;
+        volatileStorage = localStorage;
+        notify(safe);
+        return false;
+      }
       localStorage.setItem(KEY, json);
+      volatileConfig = null;
+      volatileStorage = null;
+      notify(next);
       return true;
     } catch {
-      /* localStorage unavailable/full — keep live config in memory */
+      // Persistence is unavailable/full. Mounted consumers still receive a fail-closed
+      // in-memory config so a stale `true` cannot keep sending real sample values.
+      const safe = { ...next, shareSamples: false };
+      volatileConfig = safe;
+      try {
+        volatileStorage = localStorage;
+        // Quota failures can leave an older shareSamples:true snapshot behind.
+        // Removing it is fail-safe across restart; the in-memory override covers
+        // storage backends that reject both operations.
+        try { localStorage.removeItem(KEY); } catch { /* in-memory fail-closed state remains */ }
+      } catch {
+        volatileStorage = null;
+      }
+      notify(safe);
       return false;
     }
   },
+  subscribe(listener: (config: AiConfig) => void): () => void {
+    subscribers.add(listener);
+    return () => subscribers.delete(listener);
+  },
+  /** Notify mounted AI surfaces after keychain-only changes, which do not write config. */
+  broadcast(c: AiConfig): void {
+    notify(normalizeAiConfig(c));
+  },
 };
+
+/** Update one provider's remembered model and its active model when applicable. */
+export function withProviderModel(c: AiConfig, provider: AiProvider, model: string): AiConfig {
+  return {
+    ...c,
+    model: c.provider === provider ? model : c.model,
+    models: { ...c.models, [provider]: model },
+  };
+}
+
+export type AiConnectionProbe = { wire: Wire; model: string; baseUrl: string };
+
+/** Keyed connection tests must hit a completion endpoint: some `/models` catalogs are
+ *  public and therefore cannot prove that the stored credential works. */
+export function connectionTestProbe(c: AiConfig, provider: AiProvider): AiConnectionProbe | null {
+  const spec = providerInfo(provider);
+  if (!spec.needsKey) return null;
+  const model = c.models[provider] ?? defaultModel(provider);
+  const wire = resolveWire(provider, model) ?? spec.wire;
+  return {
+    wire,
+    model,
+    baseUrl: resolveBaseUrl(provider, approvedBaseOverride(c, provider), wire),
+  };
+}
 
 /** Whether this provider can be used without an API key (local model servers). */
 export const isKeyless = (p: AiProvider) => !providerInfo(p).needsKey;

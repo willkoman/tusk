@@ -9,6 +9,8 @@ export type ActionId =
   | "explain"
   | "explainAnalyze"
   | "cancelQuery"
+  | "commitTransaction"
+  | "rollbackTransaction"
   | "format"
   | "find"
   | "toggleComment"
@@ -35,8 +37,11 @@ export type ActionCtx = {
   running: boolean;
   hasResult: boolean;
   canExport: boolean;
+  canRunDatabase: boolean;
   /** The engine has an EXPLAIN ANALYZE variant (caps.explainAnalyze). */
   canExplainAnalyze: boolean;
+  canCommitTransaction: boolean;
+  canRollbackTransaction: boolean;
 };
 
 export type ActionDef = {
@@ -55,12 +60,14 @@ export type ActionDef = {
 };
 
 export const ACTIONS: readonly ActionDef[] = [
-  { id: "run", title: "Run (selection or all)", category: "Query", defaultKey: "Mod-Enter", scope: "editor", enabled: (c) => c.connected },
-  { id: "runStatement", title: "Run current statement", category: "Query", defaultKey: "Mod-Shift-Enter", scope: "editor", enabled: (c) => c.connected },
-  { id: "explain", title: "Explain (plan)", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.connected && !c.running },
-  { id: "explainAnalyze", title: "Explain Analyze (runs the statement)", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.connected && !c.running && c.canExplainAnalyze },
+  { id: "run", title: "Run (selection or all)", category: "Query", defaultKey: "Mod-Enter", scope: "editor", enabled: (c) => c.connected && c.canRunDatabase },
+  { id: "runStatement", title: "Run current statement", category: "Query", defaultKey: "Mod-Shift-Enter", scope: "editor", enabled: (c) => c.connected && c.canRunDatabase },
+  { id: "explain", title: "Explain (plan)", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.connected && !c.running && c.canRunDatabase },
+  { id: "explainAnalyze", title: "Explain Analyze (runs the statement)", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.connected && !c.running && c.canExplainAnalyze && c.canRunDatabase },
   { id: "cancelQuery", title: "Cancel running query", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.running },
-  { id: "loadAllRows", title: "Load all rows", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.hasResult },
+  { id: "commitTransaction", title: "Commit current transaction unit", category: "Query", defaultKey: "Mod-Alt-c", scope: "global", enabled: (c) => c.canCommitTransaction },
+  { id: "rollbackTransaction", title: "Rollback current transaction unit", category: "Query", defaultKey: "Mod-Alt-r", scope: "global", enabled: (c) => c.canRollbackTransaction },
+  { id: "loadAllRows", title: "Load all rows", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.hasResult && c.canRunDatabase },
   { id: "exportResult", title: "Export result…", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.hasResult && c.canExport },
   { id: "format", title: "Format SQL", category: "Editor", defaultKey: "Shift-Alt-f", scope: "editor" },
   { id: "find", title: "Find & replace", category: "Editor", defaultKey: null, scope: "editor" },

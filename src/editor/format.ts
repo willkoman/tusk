@@ -1,6 +1,7 @@
 import { type EditorView } from "@codemirror/view";
 import { lex, maskNonCode } from "./lexer";
 import { type DialectId } from "../sql/dialects";
+import { FORMAT_MAX_CHARS } from "./limits";
 
 // SQL pretty-printer backed by `sql-formatter`. Dollar-quoted bodies are carved out
 // first (the formatter doesn't understand `$tag$ … $tag$`) and restored byte-for-byte
@@ -20,19 +21,39 @@ let formatterMod: Promise<typeof import("sql-formatter")> | null = null;
 const loadFormatter = () => (formatterMod ??= import("sql-formatter"));
 
 export async function formatSql(text: string, dialect: DialectId): Promise<string> {
-  const { format: sqlFormat } = await loadFormatter();
+  if (text.length > FORMAT_MAX_CHARS) return text;
+  let sqlFormat: typeof import("sql-formatter")["format"];
+  try {
+    ({ format: sqlFormat } = await loadFormatter());
+  } catch {
+    // A failed lazy chunk must not become an unhandled rejection or poison every
+    // later attempt. Keep the buffer unchanged and allow a future retry.
+    formatterMod = null;
+    return text;
+  }
   const { spans } = lex(text);
   const bodies: string[] = [];
+  const bodyTokens: string[] = [];
   const modTokens: string[] = [];
-  let modPrefix = "__TUSK_FORMAT_MOD_S_";
-  while (text.includes(modPrefix)) modPrefix = `_${modPrefix}`;
+  // Sentinels must be absent from user text. Fixed markers can replace a real
+  // string/comment when restoring dollar bodies after formatting.
+  let markerPad = "_";
+  let markerPrefix = `__TUSK${markerPad}FORMAT_`;
+  // Double the pad on collision. Even a crafted 1 MiB input can force only
+  // O(log n) full-text checks, unlike adding one character per retry.
+  while (text.includes(markerPrefix)) {
+    markerPad += markerPad;
+    markerPrefix = `__TUSK${markerPad}FORMAT_`;
+  }
   const masked = maskNonCode(text, spans, 0, text.length);
   const protectedRanges: { from: number; to: number; replacement: string }[] = [];
   for (const s of spans) {
     if (s.kind !== "dollar") continue;
     const i = bodies.length;
     bodies.push(text.slice(s.from, s.to));
-    protectedRanges.push({ from: s.from, to: s.to, replacement: `'__TUSK_DQ_${i}__'` });
+    const token = `${markerPrefix}DQ_${i}__`;
+    bodyTokens.push(token);
+    protectedRanges.push({ from: s.from, to: s.to, replacement: `'${token}'` });
   }
   for (const m of masked.matchAll(/%s/g)) {
     const from = m.index;
@@ -41,7 +62,7 @@ export async function formatSql(text: string, dialect: DialectId): Promise<strin
     // temporary identifier, then restore it as `% s` so formatting cannot turn
     // it into a promptable `%s` token.
     if (!/[\w"'\]\)]/.test(prev)) continue;
-    const token = `${modPrefix}${modTokens.length}__`;
+    const token = `${markerPrefix}MOD_S_${modTokens.length}__`;
     modTokens.push(token);
     protectedRanges.push({ from, to: from + 2, replacement: token });
   }
@@ -66,26 +87,32 @@ export async function formatSql(text: string, dialect: DialectId): Promise<strin
   } catch {
     return text; // unparseable — leave the buffer untouched
   }
-  let restored = formatted.replace(/'__TUSK_DQ_(\d+)__'/g, (m, i) => bodies[Number(i)] ?? m);
-  for (const token of modTokens) restored = restored.replace(token, " % s");
+  let restored = formatted;
+  // Function replacers: a string replacement arg treats `$$`/`$&`/`$'` in the
+  // body as substitution patterns, silently corrupting dollar-quoted SQL.
+  for (let i = 0; i < bodyTokens.length; i++) restored = restored.replace(`'${bodyTokens[i]}'`, () => bodies[i]);
+  for (const token of modTokens) restored = restored.replace(token, () => " % s");
   return restored;
 }
 
 /** Format the selection (when non-empty and `selectionOnly`) or the whole buffer. */
-export function formatDoc(view: EditorView, selectionOnly: boolean, dialect: DialectId): void {
+export async function formatDoc(
+  view: EditorView,
+  selectionOnly: boolean,
+  dialect: DialectId,
+  getIdentity: () => unknown = () => undefined,
+): Promise<void> {
   const sel = view.state.selection.main;
   const useSel = selectionOnly && !sel.empty;
   const from = useSel ? sel.from : 0;
   const to = useSel ? sel.to : view.state.doc.length;
   const text = view.state.sliceDoc(from, to);
-  void formatSql(text, dialect).then((out) => {
-    // The formatter load is async — bail if the doc changed underneath (typing
-    // during the first-use chunk load), so we never clobber newer edits.
-    if (out === text || view.state.sliceDoc(from, to) !== text) {
-      view.focus();
-      return;
-    }
-    view.dispatch({ changes: { from, to, insert: out } });
-    view.focus();
-  });
+  const sourceDoc = view.state.doc;
+  const sourceIdentity = getIdentity();
+  const out = await formatSql(text, dialect);
+  // Slice equality alone is insufficient: another tab can contain identical SQL.
+  // Require both immutable CM document and owning tab identity to still match.
+  if (view.state.doc !== sourceDoc || getIdentity() !== sourceIdentity) return;
+  if (out !== text) view.dispatch({ changes: { from, to, insert: out } });
+  view.focus();
 }

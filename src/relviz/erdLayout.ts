@@ -34,6 +34,11 @@ export type ErdLayout = {
   groups: ErdGroup[];
 };
 
+export const ERD_LAYOUT_MAX_NODES = 600;
+export const ERD_LAYOUT_MAX_EDGES = 4_000;
+const ERD_LAYOUT_MAX_ID_CHARS = 512;
+const ERD_LAYOUT_MAX_DIM = 10_000;
+
 const LAYER_GAP = 70;
 const NODE_GAP = 14;
 const SUBCOL_GAP = 20;
@@ -65,6 +70,7 @@ const SHELF_ASPECT = 1.5;
  * Tables with no shared prefix are their own singleton family.
  */
 export function assignFamilies(names: string[]): Map<string, string> {
+  if (names.length > ERD_LAYOUT_MAX_NODES || names.some((n) => typeof n !== "string" || n.length > ERD_LAYOUT_MAX_ID_CHARS)) return new Map();
   const tokensOf = (n: string) => n.replace(/^_+/, "").split("_").filter(Boolean);
   const count = new Map<string, number>();
   for (const n of names) {
@@ -140,7 +146,7 @@ function layeredCore(nodes: CoreNode[], edgesIn: ErdEdge[], budget = 1000): Core
   const ids = nodes.map((n) => n.id).sort();
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const idSet = new Set(ids);
-  const pairKey = (e: ErdEdge) => `${e.from}${e.to}`;
+  const pairKey = (e: ErdEdge) => JSON.stringify([e.from, e.to]);
   const edges = [...new Map(
     edgesIn.filter((e) => idSet.has(e.from) && idSet.has(e.to) && e.from !== e.to).map((e) => [pairKey(e), e]),
   ).values()].sort((a, b) => (pairKey(a) < pairKey(b) ? -1 : 1));
@@ -290,6 +296,7 @@ const PACK_RING_OVERSHOOT = 1.5; // keep scanning this far past the first free r
 const PACK_CENTROID_PULL = 0.18; // gentle pull toward the blob center (curls chains, rounds the blob)
 const PACK_REFINE_PASSES = 2;
 const PACK_RMAX = 240; // normalized-unit search ceiling (absurdly large fallback)
+const PACK_MAX_WORK = 2_000_000;
 
 type Rect = { x: number; y: number; w: number; h: number };
 
@@ -372,6 +379,7 @@ function proximityPack(nodes: CoreNode[], edgesIn: ErdEdge[]): CoreResult {
     return { x: r.x + r.w / 2, y: r.y + r.h / 2 };
   };
   const occ = new Occupancy();
+  let work = 0;
 
   type Spot = { rect: Rect; cost: number };
   const findSpot = (
@@ -390,6 +398,7 @@ function proximityPack(nodes: CoreNode[], edgesIn: ErdEdge[]): CoreResult {
       // ring clashes on both axes and would force horizontal ribboning.
       const m = r === 0 ? 1 : Math.ceil(Math.max(8, Math.ceil((2 * Math.PI * r) / PACK_RING_STEP)) / 4) * 4;
       for (let k = 0; k < m; k++) {
+        if (++work > PACK_MAX_WORK) return best;
         const th = (2 * Math.PI * k) / m;
         const cx = target.x + Math.cos(th) * r * ax;
         const cy = target.y + Math.sin(th) * r * ay;
@@ -398,6 +407,7 @@ function proximityPack(nodes: CoreNode[], edgesIn: ErdEdge[]): CoreResult {
         if (foundR === Number.POSITIVE_INFINITY) foundR = r;
         let cost = PACK_CENTROID_PULL * ndist(cx, cy, centroid.x, centroid.y);
         for (const nb of nbs) {
+          if (++work > PACK_MAX_WORK) return best;
           const c = centerOf(nb.id);
           cost += nb.w * ndist(cx, cy, c.x, c.y);
         }
@@ -442,7 +452,13 @@ function proximityPack(nodes: CoreNode[], edgesIn: ErdEdge[]): CoreResult {
       }
       target = { x: tx / tw, y: ty / tw };
     }
-    const spot = placed.size ? findSpot(n.w, n.h, target, nbs, centroid)! : { rect: { x: -n.w / 2, y: -n.h / 2, w: n.w, h: n.h }, cost: 0 };
+    const found = placed.size ? findSpot(n.w, n.h, target, nbs, centroid) : null;
+    // Work-budget/search-ceiling fallback: append to the right of all placed
+    // rects. This preserves a usable, overlap-free diagram without more search.
+    const fallbackX = Math.max(0, ...[...rects.values()].map((r) => r.x + r.w)) + NODE_GAP;
+    const spot = placed.size
+      ? found ?? { rect: { x: fallbackX, y: centroid.y - n.h / 2, w: n.w, h: n.h }, cost: Number.POSITIVE_INFINITY }
+      : { rect: { x: -n.w / 2, y: -n.h / 2, w: n.w, h: n.h }, cost: 0 };
     rects.set(id, spot.rect);
     occ.insert(spot.rect);
     placed.add(id);
@@ -563,11 +579,24 @@ function components(ids: string[], edges: ErdEdge[]): Comp[] {
 // ---------------- top-level ----------------
 
 export function layoutErd(nodes: ErdNode[], edges: ErdEdge[]): ErdLayout {
+  const empty = (): ErdLayout => ({ pos: new Map(), bbox: { x: 0, y: 0, w: 0, h: 0 }, layers: [], groups: [] });
+  if (nodes.length > ERD_LAYOUT_MAX_NODES || edges.length > ERD_LAYOUT_MAX_EDGES) return empty();
+  const rawIds = new Set<string>();
+  for (const n of nodes) {
+    if (
+      !n || typeof n.id !== "string" || n.id.length > ERD_LAYOUT_MAX_ID_CHARS || rawIds.has(n.id) ||
+      !Number.isFinite(n.w) || !Number.isFinite(n.h) || n.w <= 0 || n.h <= 0 || n.w > ERD_LAYOUT_MAX_DIM || n.h > ERD_LAYOUT_MAX_DIM
+    ) return empty();
+    rawIds.add(n.id);
+  }
+  for (const e of edges) {
+    if (!e || typeof e.from !== "string" || typeof e.to !== "string" || e.from.length > ERD_LAYOUT_MAX_ID_CHARS || e.to.length > ERD_LAYOUT_MAX_ID_CHARS) return empty();
+  }
   const ids = nodes.map((n) => n.id).sort();
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const idSet = new Set(ids);
   const clean = edges.filter((e) => idSet.has(e.from) && idSet.has(e.to) && e.from !== e.to);
-  const pairKey = (e: ErdEdge) => `${e.from}${e.to}`;
+  const pairKey = (e: ErdEdge) => JSON.stringify([e.from, e.to]);
   const uniq = [...new Map(clean.map((e) => [pairKey(e), e])).values()].sort((a, b) =>
     pairKey(a) < pairKey(b) ? -1 : 1,
   );

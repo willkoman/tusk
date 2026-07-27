@@ -1,5 +1,5 @@
 import { lex, maskNonCode } from "../editor/lexer";
-import { aliasMap, tableByRef, type Index, type Table } from "../sql/aliases";
+import { aliasMap, identifierParts, tableByRef, type Index, type Table } from "../sql/aliases";
 import { hasDuplicateColumns, stripTrailingSemi, wrappableQuery } from "./query";
 import type { RelationDetail } from "../Tree";
 
@@ -23,7 +23,71 @@ const REJECT = /\b(join|group\s+by|distinct|union|intersect|except|having|return
 // else (functions, arithmetic, CASE, literals, `expr AS id`) could collide with
 // a table column name and make the commit's PK WHERE clause target the WRONG
 // ROW — so it must reject, never guess.
-const PLAIN_ITEM = /^(?:(?:[A-Za-z_]\w*|"[^"]+")\s*\.\s*)?(?:[A-Za-z_]\w*|"[^"]+"|\*)$/;
+const IDENT = `(?:"(?:[^"]|"")+"|\`(?:[^\`]|\`\`)+\`|[A-Za-z_]\\w*)`;
+const PLAIN_ITEM = new RegExp(`^(?:(${IDENT})\\s*\\.\\s*)?(${IDENT}|\\*)$`);
+const TABLE_SOURCE = new RegExp(
+  `^(${IDENT})(?:\\s*\\.\\s*(${IDENT}))?(?:\\s+(?:AS\\s+)?(${IDENT}))?$`,
+  "i",
+);
+
+type TopToken = { kind: "word" | "comma"; text: string; from: number; to: number };
+
+/** Bare top-level words/commas, skipping quoted identifiers and nested expressions. */
+function topTokens(sql: string): TopToken[] {
+  const out: TopToken[] = [];
+  let depth = 0;
+  for (let i = 0; i < sql.length;) {
+    const ch = sql[i];
+    if (ch === '"' || ch === "`") {
+      const q = ch;
+      i++;
+      while (i < sql.length) {
+        if (sql[i] === q) {
+          if (sql[i + 1] === q) { i += 2; continue; }
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (ch === "(") { depth++; i++; continue; }
+    if (ch === ")") { depth--; i++; continue; }
+    if (depth === 0 && ch === ",") { out.push({ kind: "comma", text: ch, from: i, to: i + 1 }); i++; continue; }
+    if (depth === 0 && /[A-Za-z_]/.test(ch)) {
+      let j = i + 1;
+      while (j < sql.length && /\w/.test(sql[j])) j++;
+      out.push({ kind: "word", text: sql.slice(i, j), from: i, to: j });
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  return out;
+}
+
+function splitItems(list: string): string[] {
+  const out: string[] = [];
+  let start = 0;
+  for (let i = 0; i < list.length; i++) {
+    const q = list[i] === '"' || list[i] === "`" ? list[i] : null;
+    if (q) {
+      i++;
+      while (i < list.length) {
+        if (list[i] === q) {
+          if (list[i + 1] === q) { i += 2; continue; }
+          break;
+        }
+        i++;
+      }
+    } else if (list[i] === ",") {
+      out.push(list.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(list.slice(start));
+  return out;
+}
 
 /**
  * Validate that the select list (masked text between SELECT and the top-level
@@ -31,27 +95,64 @@ const PLAIN_ITEM = /^(?:(?:[A-Za-z_]\w*|"[^"]+")\s*\.\s*)?(?:[A-Za-z_]\w*|"[^"]+
  * subexpression never hides the real FROM; any paren in the list itself fails
  * the per-item shape check.
  */
-function plainSelectList(masked: string): { ok: boolean; reason?: string } {
-  const m = /^\s*select\b/i.exec(masked);
-  if (!m) return { ok: false, reason: "only SELECT results are editable" };
-  let depth = 0;
-  let listEnd = -1;
-  const fromRe = /\(|\)|\bfrom\b/gi;
-  fromRe.lastIndex = m[0].length;
-  let g: RegExpExecArray | null;
-  while ((g = fromRe.exec(masked))) {
-    if (g[0] === "(") depth++;
-    else if (g[0] === ")") depth--;
-    else if (depth === 0) { listEnd = g.index; break; }
-  }
-  if (listEnd < 0) return { ok: false, reason: "no table detected in the query" };
-  const items = masked.slice(m[0].length, listEnd).split(",");
+function plainSelectList(masked: string, selectEnd: number, listEnd: number): { ok: boolean; reason?: string; qualifiers: string[] } {
+  const qualifiers: string[] = [];
+  const items = splitItems(masked.slice(selectEnd, listEnd));
   for (const raw of items) {
     const item = raw.trim();
-    if (!PLAIN_ITEM.test(item))
-      return { ok: false, reason: "only plain column selects are editable (no expressions or aliases)" };
+    const m = PLAIN_ITEM.exec(item);
+    if (!m)
+      return { ok: false, reason: "only plain column selects are editable (no expressions or aliases)", qualifiers };
+    if (m[1]) qualifiers.push(m[1]);
   }
-  return { ok: true };
+  return { ok: true, qualifiers };
+}
+
+function sameQualifier(a: string, b: string): boolean {
+  const ap = identifierParts(a);
+  const bp = identifierParts(b);
+  if (!ap || !bp || ap.length !== 1 || bp.length !== 1) return false;
+  const x = ap[0];
+  const y = bp[0];
+  return x.quoted === '"' || y.quoted === '"'
+    ? (x.quoted === '"' ? x.value : x.value.toLowerCase()) === (y.quoted === '"' ? y.value : y.value.toLowerCase())
+    : x.value.toLowerCase() === y.value.toLowerCase();
+}
+
+function hasCommaJoin(sql: string): boolean {
+  const active = new Set<number>();
+  const stop = new Set(["where", "group", "order", "having", "limit", "offset", "fetch", "for", "union", "intersect", "except", "window", "qualify", "returning"]);
+  let depth = 0;
+  for (let i = 0; i < sql.length;) {
+    const ch = sql[i];
+    if (ch === '"' || ch === "`") {
+      const q = ch;
+      i++;
+      while (i < sql.length) {
+        if (sql[i] === q) {
+          if (sql[i + 1] === q) { i += 2; continue; }
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (ch === "(") { depth++; i++; continue; }
+    if (ch === ")") { active.delete(depth); depth--; i++; continue; }
+    if (ch === "," && active.has(depth)) return true;
+    if (/[A-Za-z_]/.test(ch)) {
+      let j = i + 1;
+      while (j < sql.length && /\w/.test(sql[j])) j++;
+      const word = sql.slice(i, j).toLowerCase();
+      if (word === "from") active.add(depth);
+      else if (stop.has(word)) active.delete(depth);
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  return false;
 }
 
 /** Resolve the single table a base query reads from, or a reason it can't be edited. */
@@ -59,34 +160,60 @@ export function editTarget(baseQuery: string, idx: Index): EditTarget {
   const base = stripTrailingSemi(baseQuery);
   if (!base) return { ok: false, reason: "results from a script — run a single SELECT to edit" };
   // Plain SELECT only — WITH/TABLE/VALUES results can't be safely mapped back to rows.
-  if (!wrappableQuery(base) || !/^select\b/i.test(base))
+  if (!wrappableQuery(base))
     return { ok: false, reason: "only SELECT results are editable" };
   const { spans, stmts } = lex(base);
   if (stmts.length > 1) return { ok: false, reason: "results from a script — run a single SELECT to edit" };
   // keepDquote: quoted identifiers are names the alias map must see (strings stay masked).
   const masked = maskNonCode(base, spans, 0, base.length, true);
-  const m = REJECT.exec(masked);
+  // Reject words only in SQL code, not inside either identifier quote style.
+  const keywordText = masked.replace(/"(?:[^"]|"")*"|`(?:[^`]|``)*`/g, (s) => " ".repeat(s.length));
+  const m = REJECT.exec(keywordText);
   if (m) return { ok: false, reason: `${m[1].toLowerCase().replace(/\s+/g, " ")} queries aren't editable` };
+  if (/\bfrom\s*\(/i.test(keywordText)) return { ok: false, reason: "derived-table queries aren't editable" };
+  const functionSource = /\bfrom\s+[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?\s*\(/i;
+  if (functionSource.test(keywordText)) return { ok: false, reason: "table-function queries aren't editable" };
+  if (hasCommaJoin(masked)) return { ok: false, reason: "comma-join queries aren't editable" };
 
-  const sl = plainSelectList(masked);
+  const tokens = topTokens(masked);
+  const select = tokens.find((token) => token.kind === "word");
+  if (!select || select.text.toLowerCase() !== "select")
+    return { ok: false, reason: "only SELECT results are editable" };
+  const fromAt = tokens.findIndex((token) => token.kind === "word" && token.text.toLowerCase() === "from");
+  if (fromAt < 0) return { ok: false, reason: "no table detected in the query" };
+  const from = tokens[fromAt];
+  const endWords = new Set(["where", "group", "having", "order", "limit", "offset", "fetch", "for", "union", "intersect", "except", "window", "qualify", "returning"]);
+  const sourceEnd = tokens.slice(fromAt + 1).find((token) => token.kind === "word" && endWords.has(token.text.toLowerCase()))?.from ?? masked.length;
+  const sourceTokens = tokens.filter((token) => token.from >= from.to && token.from < sourceEnd);
+  if (sourceTokens.some((token) => token.kind === "comma"))
+    return { ok: false, reason: "comma-join queries aren't editable" };
+  const source = masked.slice(from.to, sourceEnd).trim();
+  if (source.startsWith("(")) return { ok: false, reason: "derived-table queries aren't editable" };
+  const sourceMatch = TABLE_SOURCE.exec(source);
+  if (!sourceMatch) {
+    const functionHead = new RegExp(`^${IDENT}(?:\\s*\\.\\s*${IDENT})?\\s*\\(`, "i");
+    if (functionHead.test(source)) return { ok: false, reason: "table-function queries aren't editable" };
+    return { ok: false, reason: "only one plain table source is editable" };
+  }
+
+  const sl = plainSelectList(masked, select.to, from.from);
   if (!sl.ok) return { ok: false, reason: sl.reason! };
 
-  // Exactly one distinct table reference in scope.
-  const refs = new Set<string>();
-  for (const ref of aliasMap(masked).values()) refs.add(ref.toLowerCase());
-  if (refs.size === 0) return { ok: false, reason: "no table detected in the query" };
-  if (refs.size > 1) return { ok: false, reason: "multi-table queries aren't editable" };
-  const ref = [...refs][0];
-  const cleanRef = ref.replace(/"/g, "").toLowerCase();
-  const matches = idx.tables.filter((t) =>
-    cleanRef.includes(".")
-      ? `${t.schema}.${t.name}`.toLowerCase() === cleanRef
-      : t.name.toLowerCase() === cleanRef,
-  );
-  if (matches.length > 1)
-    return { ok: false, reason: "case-colliding or ambiguous table names aren't editable; qualify an exact unique table" };
+  const ref = sourceMatch[2] ? `${sourceMatch[1]}.${sourceMatch[2]}` : sourceMatch[1];
   const t = tableByRef(idx, ref);
-  if (!t) return { ok: false, reason: "table not found in the schema" };
+  if (!t) return { ok: false, reason: "table not found, case-colliding, or ambiguous in the schema" };
+
+  const effectiveQualifier = sourceMatch[3] ?? sourceMatch[2] ?? sourceMatch[1];
+  if (sl.qualifiers.some((qualifier) => !sameQualifier(qualifier, effectiveQualifier)))
+    return { ok: false, reason: "selected-column qualifier doesn't match the target table or alias" };
+
+  // Subqueries used only for filtering may remain, but every table ref they contain
+  // must resolve to this same physical relation. Never infer identity through an
+  // unknown function/CTE or a second table.
+  for (const nestedRef of new Set(aliasMap(masked).values())) {
+    if (tableByRef(idx, nestedRef) !== t)
+      return { ok: false, reason: "multi-table or unresolved-source queries aren't editable" };
+  }
   return { ok: true, table: t };
 }
 
@@ -104,6 +231,7 @@ export type EditPlan =
 
 /** Validate the loaded relation detail + result columns into a concrete edit plan. */
 export function editPlan(detail: RelationDetail, resultColumns: string[], target: Table): EditPlan {
+  if (detail.name !== target.name) return { ok: false, reason: "relation metadata no longer matches the query target" };
   if (detail.kind !== "table") return { ok: false, reason: `${detail.kind}s aren't editable` };
   if (hasDuplicateColumns(resultColumns))
     return { ok: false, reason: "duplicate column names in the result" };

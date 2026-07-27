@@ -6,8 +6,20 @@
   "permissions": [
     "core:default",
     "core:window:allow-set-title",
-    "opener:default",
-    "opener:allow-open-url",
+    "core:window:allow-close",
+    "core:window:allow-destroy",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://console.anthropic.com/*" },
+        { "url": "https://platform.openai.com/*" },
+        { "url": "https://aistudio.google.com/*" },
+        { "url": "https://opencode.ai/*" },
+        { "url": "https://openrouter.ai/*" },
+        { "url": "https://console.groq.com/*" },
+        { "url": "mailto:willko@willko.dev[?]subject=Tusk%20crash%20report&body=*" }
+      ]
+    },
     "dialog:default",
     "updater:default",
     "process:allow-restart"

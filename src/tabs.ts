@@ -1,3 +1,5 @@
+import type { PersistedTabs } from "./store";
+
 // Editor tab model. Each tab carries its own SQL buffer, file binding, and a
 // snapshot of its last result grid. Only the tab that last ran a cursorable query
 // streams live (there is one server-side cursor per connection); other tabs show a
@@ -17,6 +19,13 @@ export type ResultSnapshot = {
   rowsAreBase: boolean;
   /** Bumped on each NEW query (not on streaming append) so the grid resets scroll/selection. */
   epoch: number;
+  /** Identity of the backend result currently loaded in this snapshot. */
+  generation: number;
+  /** Manual transaction that produced this snapshot; null means normal autocommit. */
+  transactionId: string | null;
+  transactionRevision: number;
+  /** Set when a transaction boundary makes edits against this snapshot unsafe. */
+  transactionStale: string;
 };
 
 export const EMPTY_RESULT: ResultSnapshot = {
@@ -30,6 +39,10 @@ export const EMPTY_RESULT: ResultSnapshot = {
   baseQuery: "",
   rowsAreBase: true,
   epoch: 0,
+  generation: 0,
+  transactionId: null,
+  transactionRevision: 0,
+  transactionStale: "",
 };
 
 // --- result-grid display state (per tab, ephemeral — not persisted) ---
@@ -74,6 +87,10 @@ export type PendingEdits = {
   deletes: number[];
   /** New rows, sparse: only touched cells present (null = explicit NULL; absent = column omitted from INSERT). */
   inserts: Record<number, string | null>[];
+  /** Provenance copied from the immutable result snapshot on the first pending edit. */
+  transactionId?: string | null;
+  transactionRevision?: number;
+  stale?: string;
 };
 
 export const EMPTY_PENDING: PendingEdits = { cells: {}, deletes: [], inserts: [] };
@@ -92,6 +109,8 @@ export type Tab = {
   sql: string;
   filePath: string | null;
   dirty: boolean;
+  /** Bumped for every buffer edit; async saves may only clear the revision they wrote. */
+  revision: number;
   /** Active schema for this console (Postgres search_path); null = connection default. */
   searchSchema: string | null;
   result: ResultSnapshot;
@@ -124,8 +143,29 @@ export function makeTab(init?: Partial<Tab>): Tab {
     sql: init?.sql ?? "",
     filePath: init?.filePath ?? null,
     dirty: init?.dirty ?? false,
+    revision: init?.revision ?? 0,
     searchSchema: init?.searchSchema ?? null,
     result: init?.result ?? { ...EMPTY_RESULT },
     gridView: init?.gridView ?? { ...EMPTY_GRID_VIEW },
+    resultView: init?.resultView,
+    paramValues: init?.paramValues,
+    pending: init?.pending,
+  };
+}
+
+/** Capture editor recovery state, including unsaved status and the active CM document. */
+export function snapshotTabs(tabs: Tab[], activeTabId: string, activeDoc?: string): PersistedTabs {
+  return {
+    tabs: tabs.map((tab) => {
+      const live = tab.id === activeTabId && activeDoc != null ? activeDoc : tab.sql;
+      return {
+        sql: live,
+        filePath: tab.filePath,
+        title: tab.title,
+        searchSchema: tab.searchSchema,
+        dirty: tab.dirty || live !== tab.sql,
+      };
+    }),
+    activeIndex: Math.max(0, tabs.findIndex((tab) => tab.id === activeTabId)),
   };
 }

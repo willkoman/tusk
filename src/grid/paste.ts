@@ -45,23 +45,49 @@ const MAX_CLIPBOARD_FIELD_CHARS = 1_000_000;
  * Parse clipboard text into a row/column grid. Delimiter is auto-detected: TAB when
  * any tab is present (Excel / another grid), else comma. Quoted fields (`"…"` with
  * `""` escaping, embedded delimiters/newlines) are honored for both delimiters —
- * spreadsheets quote tab/newline-bearing cells the same way.
+ * spreadsheets quote tab/newline-bearing cells the same way. Quotes are meaningful
+ * only at FIELD START (Excel-style): a bare `"` mid-field is literal data, so
+ * external clipboards like `5" pipe<TAB>x` paste instead of erroring.
  */
 export function parseClipboardTable(text: string): string[][] {
   if (text === "") return [];
   if (text.length > MAX_CLIPBOARD_CHARS) throw new Error("clipboard data exceeds 10,000,000 characters");
-  const delim = text.includes("\t") ? "\t" : ",";
+  // A quote toggles "inside a quoted field" only when it can open one — at text
+  // start or right after a field/row boundary. A quote glued to data (`5"`) is
+  // literal and must not hide a real tab from delimiter detection.
+  let sniffQuoted = false;
+  let hasUnquotedTab = false;
+  let prev = "";
+  for (let d = 0; d < text.length; d++) {
+    const ch = text[d];
+    if (sniffQuoted) {
+      if (ch === '"') {
+        if (text[d + 1] === '"') d++;
+        else sniffQuoted = false;
+      }
+    } else if (ch === '"' && (d === 0 || prev === "\t" || prev === "\n" || prev === "\r" || prev === ",")) {
+      sniffQuoted = true;
+    } else if (ch === "\t") {
+      hasUnquotedTab = true;
+      break;
+    }
+    prev = text[d];
+  }
+  const delim = hasUnquotedTab ? "\t" : ",";
   const rows: string[][] = [];
   let field = "";
   let row: string[] = [];
   let inQuotes = false;
-  let started = false; // any char seen on the current row (so a blank line is still a row)
+  let afterQuote = false;
+  let fieldStarted = false;
   let cells = 0;
   let i = 0;
   const pushField = () => {
     if (row.length >= MAX_CLIPBOARD_COLS) throw new Error("clipboard data has too many columns");
     row.push(field);
     field = "";
+    fieldStarted = false;
+    afterQuote = false;
   };
   const pushRow = () => {
     if (rows.length >= MAX_CLIPBOARD_ROWS) throw new Error("clipboard data has too many rows");
@@ -70,7 +96,6 @@ export function parseClipboardTable(text: string): string[][] {
     if (cells > MAX_CLIPBOARD_CELLS) throw new Error("clipboard data has too many cells");
     rows.push(row);
     row = [];
-    started = false;
   };
   while (i < text.length) {
     const ch = text[i];
@@ -82,6 +107,7 @@ export function parseClipboardTable(text: string): string[][] {
           continue;
         }
         inQuotes = false;
+        afterQuote = true;
         i++;
         continue;
       }
@@ -91,19 +117,29 @@ export function parseClipboardTable(text: string): string[][] {
       continue;
     }
     if (ch === '"') {
-      inQuotes = true;
-      started = true;
+      if (!fieldStarted && field.length === 0) {
+        inQuotes = true;
+        fieldStarted = true;
+        i++;
+        continue;
+      }
+      // Bare quote mid-field (or trailing a closed quote) is literal data —
+      // external clipboards are not strict CSV, and rejecting loses the paste.
+      field += ch;
+      if (field.length > MAX_CLIPBOARD_FIELD_CHARS) throw new Error("clipboard field is too large");
+      fieldStarted = true;
+      afterQuote = false;
       i++;
       continue;
     }
     if (ch === delim) {
-      started = true;
       pushField();
       i++;
       continue;
     }
     if (ch === "\r") {
-      i++;
+      pushRow();
+      i += text[i + 1] === "\n" ? 2 : 1;
       continue;
     }
     if (ch === "\n") {
@@ -113,13 +149,11 @@ export function parseClipboardTable(text: string): string[][] {
     }
     field += ch;
     if (field.length > MAX_CLIPBOARD_FIELD_CHARS) throw new Error("clipboard field is too large");
-    started = true;
+    fieldStarted = true;
     i++;
   }
   if (inQuotes) throw new Error("clipboard data has an unterminated quoted field");
-  if (started || field !== "" || row.length) pushRow();
-  // Drop a single trailing empty row (the artifact of a terminating newline).
-  if (rows.length && rows[rows.length - 1].length === 1 && rows[rows.length - 1][0] === "") rows.pop();
+  if (fieldStarted || afterQuote || field !== "" || row.length) pushRow();
   return rows;
 }
 
@@ -152,6 +186,10 @@ const cellValue = (s: string): string | null => (s === "" ? null : s);
  */
 export function planPaste(input: PlanPasteInput): PastePlan {
   const { table, resultColumns, isTableCol, displayOrigCols, anchorDisplayIdx, anchor, nLoaded, nInsExisting } = input;
+  if (!Number.isInteger(nLoaded) || nLoaded < 0 || !Number.isInteger(nInsExisting) || nInsExisting < 0)
+    throw new Error("paste row identity is invalid");
+  if (isTableCol.length !== resultColumns.length)
+    throw new Error("paste column metadata no longer matches the result");
   if (table.length > MAX_CLIPBOARD_ROWS) throw new Error("clipboard data has too many rows");
   let inputCells = 0;
   for (const row of table) {
@@ -163,17 +201,23 @@ export function planPaste(input: PlanPasteInput): PastePlan {
 
   // --- header-mapped: first row names editable columns, ≥1 data row follows ---
   if (table.length >= 2) {
-    const lc = resultColumns.map((c) => c.toLowerCase());
+    const byName = new Map<string, number[]>();
+    resultColumns.forEach((column, i) => {
+      const key = column.toLowerCase();
+      byName.set(key, [...(byName.get(key) ?? []), i]);
+    });
     const header = table[0];
     // -2 = empty header cell (ignored), -1 = unmatched/non-table (disqualifies), ≥0 = column.
     const mapped = header.map((h) => {
       const t = h.trim().toLowerCase();
       if (t === "") return -2;
-      const idx = lc.indexOf(t);
-      return idx >= 0 && isTableCol[idx] ? idx : -1;
+      const matches = (byName.get(t) ?? []).filter((i) => isTableCol[i]);
+      return matches.length === 1 ? matches[0] : -1;
     });
     const named = mapped.filter((m) => m !== -2);
     if (named.length > 0 && named.every((m) => m >= 0)) {
+      if (new Set(named).size !== named.length)
+        throw new Error("clipboard header maps the same result column more than once");
       const inserts: InsertRow[] = [];
       for (let j = 1; j < table.length; j++) {
         const r = table[j];
@@ -195,7 +239,15 @@ export function planPaste(input: PlanPasteInput): PastePlan {
     return oc !== undefined && isTableCol[oc] ? oc : -1;
   };
   const loadedOrder = input.loadedOrder ?? Array.from({ length: nLoaded }, (_, i) => i);
+  if (
+    loadedOrder.length !== nLoaded ||
+    new Set(loadedOrder).size !== nLoaded ||
+    loadedOrder.some((i) => !Number.isInteger(i) || i < 0 || i >= nLoaded)
+  ) throw new Error("paste row order no longer matches the loaded result");
   const loadedAnchor = anchor.kind === "loaded" ? loadedOrder.indexOf(anchor.i) : -1;
+  if (anchor.kind === "loaded" && loadedAnchor < 0) throw new Error("paste anchor row is no longer loaded");
+  if (anchor.kind === "insert" && (!Number.isInteger(anchor.i) || anchor.i < 0 || anchor.i > nInsExisting))
+    throw new Error("paste anchor insert row no longer exists");
   const base = anchor.kind === "loaded" ? nLoaded : nInsExisting;
   const overflow = new Map<number, InsertRow>();
   let colCount = 0;
@@ -240,10 +292,13 @@ export function mergePaste(
   const inserts = pending.inserts.map((x) => ({ ...x }));
   for (const u of plan.updates) {
     if (u.ref.kind === "insert") {
-      if (inserts[u.ref.i]) inserts[u.ref.i][u.col] = u.val;
+      if (!inserts[u.ref.i]) throw new Error("paste target insert row no longer exists");
+      inserts[u.ref.i][u.col] = u.val;
     } else {
       const r = u.ref.i;
-      const orig = loadedRows[r]?.[u.col] ?? null;
+      if (!loadedRows[r] || u.col < 0 || u.col >= loadedRows[r].length)
+        throw new Error("paste target loaded cell no longer exists");
+      const orig = loadedRows[r][u.col];
       const rowEdits = { ...(cells[r] ?? {}) };
       if (u.val === orig) delete rowEdits[u.col];
       else rowEdits[u.col] = u.val;

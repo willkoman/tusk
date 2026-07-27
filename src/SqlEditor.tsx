@@ -57,7 +57,8 @@ export type EditorApi = {
   /** Current selection text ("" when nothing is selected). */
   getSelection: () => string;
   /** Replace the current selection (or insert at cursor) with text. */
-  replaceSelection: (text: string) => void;
+  captureSelection: () => EditorSelectionSnapshot;
+  replaceCapturedSelection: (snapshot: EditorSelectionSnapshot, text: string) => boolean;
   selectAll: () => void;
   toggleComment: () => void;
   /** Pretty-print the selection (if any) or the whole buffer. */
@@ -68,6 +69,14 @@ export type EditorApi = {
   getDoc: () => string;
   /** Discard the cached per-tab editor state when a tab is closed. */
   dropTab: (id: string) => void;
+};
+
+export type EditorSelectionSnapshot = {
+  /** Immutable CodeMirror document identity, deliberately opaque outside this module. */
+  doc: unknown;
+  from: number;
+  to: number;
+  text: string;
 };
 
 export function SqlEditor(props: {
@@ -149,10 +158,21 @@ export function SqlEditor(props: {
     const sel = view.state.selection.main;
     return view.state.sliceDoc(sel.from, sel.to);
   };
-  const replaceSelection = (text: string) => {
-    if (!view) return;
-    view.dispatch(view.state.replaceSelection(text));
+  const captureSelection = (): EditorSelectionSnapshot => {
+    if (!view) return { doc: null, from: 0, to: 0, text: "" };
+    const sel = view.state.selection.main;
+    return { doc: view.state.doc, from: sel.from, to: sel.to, text: view.state.sliceDoc(sel.from, sel.to) };
+  };
+  const replaceCapturedSelection = (snapshot: EditorSelectionSnapshot, text: string): boolean => {
+    if (!view) return false;
+    const sel = view.state.selection.main;
+    if (view.state.doc !== snapshot.doc || sel.from !== snapshot.from || sel.to !== snapshot.to) return false;
+    view.dispatch({
+      changes: { from: snapshot.from, to: snapshot.to, insert: text },
+      selection: { anchor: snapshot.from + text.length },
+    });
     view.focus();
+    return true;
   };
   const selectAll = () => {
     if (!view) return;
@@ -178,7 +198,7 @@ export function SqlEditor(props: {
     };
     add("run", () => props.onRun());
     add("runStatement", () => runCurrentStatement());
-    add("format", () => view && formatDoc(view, true, curDialect()));
+    add("format", () => view && formatDoc(view, true, curDialect(), () => curTabId));
     add("find", () => view && openSearchPanel(view));
     add("toggleComment", () => view && toggleComment(view));
     return keymap.of(bindings);
@@ -206,7 +226,7 @@ export function SqlEditor(props: {
       foldComp.of(p.autoFold ? autoFold() : []),
       activeStatement(),
       clientLint(() => props.tables, () => props.functions ?? EMPTY_FUNCS),
-      serverLint(() => props.validate ?? null),
+      serverLint(() => props.validate ?? null, () => curTabId),
       dialectComp.of(dialectExtensions()),
       searchExtensions(),
       themeComp.of(themeFor(p)),
@@ -238,7 +258,7 @@ export function SqlEditor(props: {
         ...defaultKeymap,
       ]),
       EditorView.updateListener.of((u) => {
-        if (u.docChanged && !applyingExternal) props.onChange(u.state.doc.toString(), props.tabId);
+        if (u.docChanged && !applyingExternal) props.onChange(u.state.doc.toString(), curTabId ?? props.tabId);
       }),
     ];
   };
@@ -255,10 +275,11 @@ export function SqlEditor(props: {
       insertAtCursor,
       focus,
       getSelection,
-      replaceSelection,
+      captureSelection,
+      replaceCapturedSelection,
       selectAll,
       toggleComment: toggle,
-      format: (selectionOnly = true) => view && formatDoc(view, selectionOnly, curDialect()),
+      format: (selectionOnly = true) => view && formatDoc(view, selectionOnly, curDialect(), () => curTabId),
       openSearch: () => view && openSearchPanel(view),
       getDoc: () => view?.state.doc.toString() ?? props.value,
       dropTab: (id: string) => stateMap.delete(id),
