@@ -71,7 +71,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
 # MySQL (network). Pure-Rust async driver; its `Pool` is Send+Sync (avoids the
 # !Sync-connection problem) and its `Value` enum makes all-text extraction easy.
-mysql_async = { version = "0.34", default-features = false, features = ["default-rustls"] }
+mysql_async = { version = "0.37", default-features = false, features = ["default-rustls"] }
 
 # Dev builds: full debuginfo for the bundled DuckDB/Arrow/SQLite tree costs
 # ~20 GB of target/ artifacts and regularly fills the disk. line-tables-only
