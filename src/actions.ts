@@ -91,7 +91,9 @@ export const ACTIONS: readonly ActionDef[] = [
 /** Saved overrides: absent = default binding, null = explicitly unbound. */
 export type KeyOverrides = Partial<Record<ActionId, string | null>>;
 
-const isMac = /mac/i.test(navigator.platform);
+// Guarded: module also evaluates under vitest's node environment, where Node 20
+// has no global `navigator` (Node 21+ does — which is why this passes locally).
+const isMac = typeof navigator !== "undefined" && /mac/i.test(navigator.platform);
 
 /** Canonical form: Mod-Alt-Shift-<Key> (dedupes modifier order for map lookups). */
 export function canonicalKey(key: string): string {
