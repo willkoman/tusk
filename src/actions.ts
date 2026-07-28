@@ -22,6 +22,7 @@ export type ActionId =
   | "openSettings"
   | "openShortcuts"
   | "openHelp"
+  | "showWhatsNew"
   | "openHistory"
   | "openPalette"
   | "toggleAi"
@@ -89,6 +90,7 @@ export const ACTIONS: readonly ActionDef[] = [
   { id: "openSettings", title: "Open settings", category: "View", defaultKey: "Mod-,", scope: "global" },
   { id: "openShortcuts", title: "Show keyboard shortcuts", category: "View", defaultKey: null, scope: "global" },
   { id: "openHelp", title: "Open manual", category: "View", defaultKey: "F1", scope: "global" },
+  { id: "showWhatsNew", title: "What's new in this version", category: "View", defaultKey: null, scope: "global" },
   { id: "openHistory", title: "Toggle query history", category: "View", defaultKey: "Mod-Shift-h", scope: "global", enabled: (c) => c.connected },
   // The palette renders inside the connected workbench, so gate it honestly instead
   // of letting Mod-k silently no-op on the connect screen.

@@ -221,6 +221,13 @@ export const TOPICS: Topic[] = [
             "yes (pinned session)"
           ],
           [
+            "Cancel a running query",
+            "yes (`CancelRequest`)",
+            "yes, except on Windows",
+            "—",
+            "—"
+          ],
+          [
             "TLS",
             "yes",
             "n/a",
@@ -307,11 +314,15 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**Run ▶** ([[kbd:Mod-Enter]]) runs the selection — *exactly* the selected text — otherwise the buffer. In flight, the button becomes **✕ Cancel** with a live elapsed counter. PostgreSQL uses a real server-side `CancelRequest`; engines without safe interruption finish the operation and report that cancellation is unavailable."
+        "md": "**Run ▶** ([[kbd:Mod-Enter]]) runs the selection — *exactly* the selected text — otherwise the buffer. In flight the button becomes **✕ Cancel** with a live elapsed counter on engines that can cancel; where cancellation is impossible (SQLite, MySQL, DuckDB on Windows) it shows a disabled **Running 0:12** timer instead of a Cancel that can't work. PostgreSQL uses a real server-side `CancelRequest`; a rejected cancel resets the button and reports why rather than sitting on *Cancelling…*."
       },
       {
         "k": "p",
         "md": "Each statement gets a **▶ gutter marker** — click it to run just that statement (the marker swaps to a spinner, pinned to that statement while it executes). With several statements, the one under your cursor is highlighted and the status bar shows *Stmt N/M*."
+      },
+      {
+        "k": "p",
+        "md": "Statement splitting is **engine-aware**, matching execution. On MySQL, `#` comments and `--` without trailing whitespace lex correctly and backslash escapes inside quotes are honored; backtick identifiers are first-class on MySQL and SQLite. Everything built on the lexer — Run current statement, auto-fold, linting, parameter detection, and grid sort/filter — reads MySQL and SQLite SQL the way the server does."
       },
       {
         "k": "p",
@@ -327,6 +338,10 @@ export const TOPICS: Topic[] = [
           {
             "action": "runStatement",
             "does": "Run the statement under the cursor (no chooser)"
+          },
+          {
+            "action": "cancelQuery",
+            "does": "Cancel the running query"
           },
           {
             "action": "newTab",
@@ -435,7 +450,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "The toolbar schema selector (default *(default schema)*) sets the tab's **active schema** — per-tab, applied per run: `SET search_path TO <schema>, public` runs before every execution, server-side validation, and scope-all export from that tab. Autocomplete offers its tables unqualified; the selector hides on engines without a search path."
+        "md": "The toolbar schema selector (default *(default schema)*) sets the tab's **active schema** — per-tab, applied per run: `SET search_path TO <schema>, public` runs before every execution, server-side validation, and scope-all export from that tab. Autocomplete offers its tables unqualified and the schema linter resolves bare names through the same active-schema-then-`public` resolver, so it can never flag a table completion it just offered; the selector hides on engines without a search path."
       },
       {
         "k": "h",
@@ -485,7 +500,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**Alias resolution** — `u.` after `FROM users u` lists that table's columns; `schema.` lists its tables; `schema.table.` lists its columns.",
-          "**Bare vs qualified** — tables in `public` or the tab's active schema complete bare (matching `search_path`); others complete as `schema.table`. Tables in the active schema rank above the rest.",
+          "**Bare vs qualified** — tables in `public` or the tab's active schema complete bare (matching `search_path`); others complete as `schema.table`. Tables in the active schema rank above the rest. Completion and schema lint share one resolver, so a bare name that completes is a bare name the linter accepts.",
           "**Live db functions** — your functions and procedures appear alongside dialect builtins, tagged `db function`; after `CALL`, `EXEC`/`EXECUTE`, or `PERFORM` they jump to the top, tagged `procedure/function`.",
           "**Accepting** — [[kbd:Tab]] or [[kbd:Enter]] accepts the highlighted entry; with no popup open, Enter is a plain newline."
         ],
@@ -529,7 +544,7 @@ export const TOPICS: Topic[] = [
         "rows": [
           [
             "Heuristic (offline)",
-            "Unmatched `)`; unclosed `(`; trailing comma; `DELETE`/`UPDATE` without `WHERE` (\"affects every row\"); unknown **leading** keyword (`SELCT` → \"did you mean SELECT?\")",
+            "Unmatched `)`; unclosed `(`; trailing comma; `DELETE`/`UPDATE` without `WHERE` (\"affects every row\"); unknown **leading** keyword (`SELCT` → \"did you mean SELECT?\"); a top-level comma between conditions in `WHERE`/`HAVING` (*',' is not valid between conditions — join them with AND or OR*)",
             "error / warning"
           ],
           [
@@ -543,6 +558,10 @@ export const TOPICS: Topic[] = [
             "error"
           ]
         ]
+      },
+      {
+        "k": "p",
+        "md": "`WHERE a = 1, b = 2` — an AND typo, invalid in every engine — is squiggled as you type by the offline layer. Legit commas in `IN` lists, row constructors, function arguments, `SET` lists, and nested subqueries are untouched. The offline check matters because the server linter is deliberately paused while a result stream is open, so this class of error had no other detector."
       },
       {
         "k": "list",
@@ -661,7 +680,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Sort and filter never shuffle rows client-side — you only loaded a page, so the grid re-runs your query wrapped as `SELECT * FROM (<your query>) AS _tusk … ORDER BY <ordinal>`."
+        "md": "Once a base result is **fully loaded**, sort gestures reorder rows in memory — no re-run. While rows are still streaming, or whenever a filter is active, the grid re-runs your query wrapped as `SELECT * FROM (<your query>) AS _tusk … ORDER BY <ordinal>` so ordering happens on the server across the whole result. Local ordering is display-text ordering with each engine's default NULL placement; use an explicit `ORDER BY` when native numeric/date/collation semantics matter."
       },
       {
         "k": "list",
@@ -740,7 +759,7 @@ export const TOPICS: Topic[] = [
         "items": [
           "[[kbd:Mod-c]] copies **TSV**; the cell context menu adds **Copy as CSV / JSON / Markdown**, *Copy cell value* (*Copy value (NULL→empty)* on a NULL cell), and *Copy column*.",
           "Column names are **omitted by default** — tick **Copy w/ column names** in the result toolbar. With headers, JSON becomes an array of objects keyed by column; without, arrays of values.",
-          "Copies read through uncommitted edits and the boolean display mapping — a Postgres `t` or MySQL `1` copies as the displayed `TRUE`/`FALSE`. For files, see [[topic:import-export|Import & export]]."
+          "Copies read through uncommitted edits and the boolean display mapping — a Postgres `t` or MySQL `1` copies as the displayed `TRUE`/`FALSE`. **Copy as CSV/TSV/JSON/Markdown runs the same formatter as Export**, so clipboard bytes match the file byte-for-byte: an empty string stays quoted (`\"\"`) and distinguishable from `NULL`, JSON keeps the exporter's shape, and Markdown always carries its header row. For files, see [[topic:import-export|Import & export]]."
         ]
       },
       {
@@ -796,6 +815,7 @@ export const TOPICS: Topic[] = [
           "**Plain column references only** (`*`, `t.*`, `col`, `t.col`) — no expressions, functions, `CASE`, literals, or aliases. `SELECT id*2 AS id …` could point the commit's PK `WHERE` at the **wrong row**, so anything ambiguous rejects (*\"only plain column selects are editable (no expressions or aliases)\"*).",
           "**A table** (not a view or matview) with a **primary key**, every PK column present in the result — else *\"primary key column \\\"x\\\" isn't in the result\"*.",
           "No **duplicate column names** in the result.",
+          "**An unambiguous table identity** — a bare name that exists in more than one schema is only editable when the tab's active schema resolves it (the same active-schema-then-`public` order the run uses); comma joins, derived tables, table functions, mismatched qualifiers, and case-colliding metadata all reject.",
           "Connection not **read-only**; on Postgres your role needs at least one of `UPDATE`/`INSERT`/`DELETE` (or ownership). Partial privileges still allow editing — the server enforces per statement at commit."
         ]
       },
@@ -1061,6 +1081,10 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
+        "md": "Every Explorer DDL statement lands in [[topic:history|query history]] with a leading `-- [Explorer]` marker, and its result or error surfaces even when the results panel is collapsed — the same audit convention as `-- [Slack]` and `-- [Export]`."
+      },
+      {
+        "k": "p",
         "md": "**Modify table…** is a DataGrip-style diff editor: edit a column's name, type, nullability, default, PK membership, or comment; add and drop columns; tick indexes and constraints for removal; rename or re-comment the table. The preview is the **minimal `ALTER` script** — type/null/default edits run against original column names, renames run last, and a PK change emits `DROP CONSTRAINT` + `ADD PRIMARY KEY` only when the key actually changed."
       },
       {
@@ -1080,7 +1104,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**Read-only connection** — everything mutating disables with *\"Connection is read-only\"* (see [[topic:safety|Safety & read-only mode]]).",
+          "**Read-only connection** — everything mutating disables with *\"Connection is read-only\"* (see [[topic:safety|Safety & read-only mode]]). **Drop database** passes the same gates as every other DDL action — manual-transaction freeze, read-only, driver support — and is blocked outright on DuckDB.",
           "**Driver support** — sidebar DDL is live on **Postgres and DuckDB**; MySQL/SQLite items disable with *\"DDL editing isn't supported for … yet\"*.",
           "**DuckDB engine limits** — individually disabled with a reason: add/drop/rename constraints (*\"define them in CREATE TABLE\"*), rename index or sequence, `ALTER SEQUENCE RESTART`, `CREATE DATABASE` (*\"DuckDB attaches database files rather than CREATE DATABASE\"*). Duplicate uses `CREATE TABLE … AS SELECT`; multi-action ALTERs split into one statement each.",
           "**Postgres effective privileges** — Tusk fetches your role's real privileges (membership, `PUBLIC`, ownership): *Modify/Add/Rename/Drop* need table ownership, *Duplicate* and *Create table* need `CREATE` on the schema, *Truncate* accepts the `TRUNCATE` grant or ownership, *New schema* needs `CREATE` on the database, *New database* needs `CREATEDB`. Tooltips state the missing right, e.g. *\"Requires ownership of orders\"*."
@@ -1242,7 +1266,7 @@ export const TOPICS: Topic[] = [
         "ordered": false,
         "items": [
           "**Headers** — omitted by default; flip **Copy w/ column names** next to Export… (the `copyHeaders` preference).",
-          "**Values** — copies read through pending edits; booleans copy as the displayed `TRUE`/`FALSE`, not raw `t`/`f`/`0`/`1` (**View value…** stays raw).",
+          "**Values** — copies read through pending edits; booleans copy as the displayed `TRUE`/`FALSE`, not raw `t`/`f`/`0`/`1` (**View value…** stays raw). Copy runs the **export formatter**, so a copied CSV/TSV/JSON/Markdown block is byte-identical to the same export written to a file — empty strings stay quoted and distinct from `NULL`, and Markdown always includes its header row.",
           "**Pasting in** — see [[topic:grid-editing|Grid editing]]."
         ]
       }
@@ -1563,6 +1587,10 @@ export const TOPICS: Topic[] = [
         "md": "Everything to do with providers, keys and skills lives in **Settings → AI**. Each provider is a card: paste a key, pick a default model, override the API base, and press **Test connection** — which really does fetch that provider's model catalogue and shows you the actual error if it can't."
       },
       {
+        "k": "p",
+        "md": "**AI reply max tokens** sits in the same tab (256–128,000, snapped to 256). It caps the reply the panel asks for — the ceiling behind *✂️ Cut off at the token limit* — and shares one normalization with the [[topic:slack|Slack]] field, so both surfaces behave identically."
+      },
+      {
         "k": "table",
         "head": [
           "Provider",
@@ -1605,6 +1633,10 @@ export const TOPICS: Topic[] = [
       {
         "k": "p",
         "md": "Keys are stored **per provider** in the **OS keychain** (service `tusk-ai`) and are used only by the Rust backend — never in localStorage, never echoed back to the UI. The panel only ever learns a boolean. Because each provider has its own keychain entry, you can set up several and switch between them mid-conversation without re-entering anything. Non-secret config (active provider, per-provider model and base URL, the sample-data toggle) lives in localStorage under `tusk.ai.config`."
+      },
+      {
+        "k": "p",
+        "md": "A **custom API base must be approved before anything is sent to it** — credentials, prompts, schema context, or sample rows. A saved key is bound in the keychain to the approved HTTPS origin; until you approve one, the provider card shows *Origin approval needed* and Test connection refuses. Legacy keys keep working at the provider's shipped origin until re-saved, and Slack fails closed when its configured origin doesn't match the binding."
       },
       {
         "k": "tip",
@@ -1751,7 +1783,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "Sample sharing is **off by default** and fails closed if its preference cannot be saved. Tick **Share sample data with the model** in the panel's ⚙ drawer to opt in. Slack has its own default-off sample setting; neither path sends real cell values without that explicit consent."
+        "md": "Sample sharing is **off by default** and fails closed if its preference cannot be saved. It is re-checked after sample loading, immediately before the request, so revoking it mid-flight discards the rows. Tick **Share sample data with the model** in the panel's ⚙ drawer to opt in. Slack has its own default-off sample setting; neither path sends real cell values without that explicit consent."
       },
       {
         "k": "h",
@@ -1838,7 +1870,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**DM the bot** (\"show all tables in the public schema\") or **@mention it** in a channel it's been invited to. It threads *\"Generating query…\"*, snapshots your schema, role permissions, and up to 5 sample rows from the 3 most relevant tables, then updates the message into a **proposal card** — explanation, exact SQL, **Approve / Reject** buttons (a requested chart is advertised with 📊)."
+        "md": "**DM the bot** (\"show all tables in the public schema\") or **@mention it** in a channel it's been invited to. It threads *\"Generating query…\"*, snapshots your schema, role permissions, and up to 5 sample rows from the 5 most relevant tables, then updates the message into a **proposal card** — explanation, exact SQL, **Approve / Reject** buttons (a requested chart is advertised with 📊)."
       },
       {
         "k": "demo",
@@ -1971,6 +2003,16 @@ export const TOPICS: Topic[] = [
             "When asked for writes/DDL",
             "Propose read-only preview",
             "Reply shaping only — writes never run regardless"
+          ],
+          [
+            "Share sample rows with AI",
+            "off",
+            "Real cell values only leave the machine after this explicit opt-in"
+          ],
+          [
+            "AI reply max tokens",
+            "2,048",
+            "256–128,000, snapped to 256; the desktop AI pane has the same control"
           ]
         ]
       },
@@ -2031,7 +2073,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**Recorded** — anything launched from the editor: Run, run-selection, panel re-runs, multi-statement scripts (one entry).",
-          "**Recorded with a marker** — queries approved through the [[topic:slack|Slack bot]] log with a leading `-- [Slack] asked by <user>` comment.",
+          "**Recorded with a marker** — server work issued outside the editor carries an audit comment on its first line: `-- [Slack] asked by <user>` for approved bot runs, `-- [Explorer]` for sidebar DDL, and `-- [Export] <format> → <path>` for a full-query file export.",
           "**Not recorded** — grid sort/filter re-streams (internal `wrapped`-mode runs of `SELECT * FROM (…) _tusk`); only the original `base` query is kept.",
           "**Recorded** — [[topic:grid-editing|grid Commit/Apply]] scripts. Raw transaction controls and work inside a manual unit carry a leading transaction id/revision/event marker."
         ],
@@ -2136,7 +2178,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "The chips below are live — a rebound action shows your chord, not the shipped default. Some actions ship unbound on purpose (Explain, Cancel query, Toggle AI, …) but stay reachable from the palette and toolbars."
+        "md": "The chips below are live — a rebound action shows your chord, not the shipped default. Some actions ship unbound on purpose (Explain, Toggle AI, Load all rows, What's new, …) but stay reachable from the palette and toolbars."
       },
       {
         "k": "keys",
@@ -2160,6 +2202,22 @@ export const TOPICS: Topic[] = [
           {
             "action": "cancelQuery",
             "does": "Cancel the running query (enabled only while one runs)"
+          },
+          {
+            "action": "commitTransaction",
+            "does": "Commit the current transaction unit"
+          },
+          {
+            "action": "rollbackTransaction",
+            "does": "Roll back the current transaction unit"
+          },
+          {
+            "action": "openHelp",
+            "does": "Open the manual"
+          },
+          {
+            "action": "showWhatsNew",
+            "does": "Show what changed in this version"
           },
           {
             "action": "loadAllRows",
@@ -2245,6 +2303,7 @@ export const TOPICS: Topic[] = [
           "**Run** — needs a connection",
           "**Explain** / **Explain Analyze** — blocked while a query runs; Explain Analyze also needs engine support (SQLite has no `EXPLAIN ANALYZE`)",
           "**Cancel running query** — only while a query runs",
+          "**Cancel query** and **Open manual** are allowlisted through the window handler, so they fire while a modal dialog is open and while focus is in the editor; Shortcuts-settings keys also work on the connect screen, where the command palette is honestly disabled.",
           "**Load all rows** / **Export result…** — need a result in the grid"
         ]
       },
@@ -2442,7 +2501,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Open with the topbar gear or [[kbd:Mod-,]] (the `openSettings` action). Six tabs; every control applies immediately:"
+        "md": "Open with the topbar gear or [[kbd:Mod-,]] (the `openSettings` action). Eight tabs; every control applies immediately:"
       },
       {
         "k": "table",
@@ -2468,12 +2527,20 @@ export const TOPICS: Topic[] = [
             "Tree orientation (Top-down / Left-to-right), Heat coloring by (Cost / Actual time / Rows / Off), Node detail (Normal / Compact) — see [[topic:plans|EXPLAIN plans]]"
           ],
           [
+            "**AI**",
+            "Provider cards (key, default model, API base, origin approval, Test connection), **AI reply max tokens** (256–128,000), and Skills — see [[topic:ai|AI assistant]]"
+          ],
+          [
             "**Slack**",
             "Bot tokens, enable toggle, Test connection, limits and allowlists — see [[topic:slack|Slack bot]]"
           ],
           [
             "**Shortcuts**",
             "Rebind every registered action, with conflict detection — see [[topic:shortcuts|Shortcuts & palette]]"
+          ],
+          [
+            "**Privacy**",
+            "Crash-report consent — nothing is ever transmitted automatically"
           ]
         ]
       },
@@ -2508,6 +2575,10 @@ export const TOPICS: Topic[] = [
           "Click it for release notes + **Install & restart**: the signed artifact downloads with a progress bar, installs, relaunches",
           "Failed checks (offline, dev build, no published release) are completely silent"
         ]
+      },
+      {
+        "k": "p",
+        "md": "The pill is about an update that's **available**; the **What's new** panel is about one that already **installed**. The first launch on a new version pops it bottom-right with every section between the version you were on and this build, read from the changelog bundled into the app — exact for the running build and fully offline. Dismiss it once and it stays gone until the next update; a fresh install sees nothing. *What's new in this version* in the [[topic:shortcuts|command palette]] reopens it any time."
       },
       {
         "k": "h",
@@ -2628,7 +2699,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "While a query runs, the Run button becomes **✕ Cancel** with a live elapsed counter. It sends a real **Postgres `CancelRequest`** over a fresh short-lived connection — the server actually stops the query; DuckDB fires its interrupt handle except on Windows, where unsafe interruption is disabled; SQLite and MySQL have no out-of-band cancel, so their queries run to completion. Cancelling work inside a PostgreSQL manual transaction normally leaves it in **Recovery required** until `ROLLBACK` or `ROLLBACK TO`."
+        "md": "While a query runs, the Run button becomes **✕ Cancel** with a live elapsed counter. It sends a real **Postgres `CancelRequest`** over a fresh short-lived connection — the server actually stops the query; DuckDB fires its interrupt handle except on Windows, where unsafe interruption is disabled; SQLite and MySQL have no out-of-band cancel, so their queries run to completion. Cancelling work inside a PostgreSQL manual transaction normally leaves it in **Recovery required** until `ROLLBACK` or `ROLLBACK TO`. Where no out-of-band cancel exists — SQLite, MySQL, DuckDB on Windows — the button doesn't pretend: it shows a disabled **Running** timer instead of a Cancel, and a cancel the backend rejects resets the button with the reason rather than hanging on *Cancelling…*. `Mod-F2` is the shipped shortcut (Ctrl+Esc is reserved by Windows) and works while typing and while dialogs are open."
       },
       {
         "k": "keys",
@@ -2639,7 +2710,7 @@ export const TOPICS: Topic[] = [
           },
           {
             "action": "cancelQuery",
-            "does": "Cancel the running query (unbound by default — bind it in Settings → Shortcuts)"
+            "does": "Cancel the running query — default [[kbd:Mod-F2]]; fires while typing and while a dialog is open"
           }
         ]
       },
@@ -2676,11 +2747,11 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Every credential lives in the **OS keychain** (macOS Keychain, Windows Credential Manager), never in a config file and never sent to the frontend: database passwords per saved profile, [[topic:ai|AI provider keys]] (service `tusk-ai`), and [[topic:slack|Slack tokens]] (service `tusk-slack`). Profile metadata — host, port, user — is plain JSON without the password."
+        "md": "Every credential lives in the **OS keychain** (macOS Keychain, Windows Credential Manager), never in a config file and never sent to the frontend: database passwords per saved profile, [[topic:ai|AI provider keys]] (service `tusk-ai`), and [[topic:slack|Slack tokens]] (service `tusk-slack`). AI keys are additionally **bound to the approved HTTPS origin**, so a changed API base can't quietly receive them. Profile metadata — host, port, user — is plain JSON without the password."
       },
       {
         "k": "p",
-        "md": "By default **nothing leaves your machine**. Two opt-ins change that: the AI assistant sends your provider a token-budgeted context (schema summary capped around 8 KB, role privileges, current editor SQL and last error, plus sample rows per relevant table — samples have their own toggle); the Slack bot posts approved query results to your workspace (charts render locally as PNGs, and mutations can never run from Slack)."
+        "md": "By default **nothing leaves your machine**. Two opt-ins change that: the AI assistant sends your provider a token-budgeted context (schema summary capped at 12,000 characters, role privileges, current editor SQL and last error, plus sample rows per relevant table — samples have their own toggle); the Slack bot posts approved query results to your workspace (charts render locally as PNGs, and mutations can never run from Slack)."
       },
       {
         "k": "tip",
@@ -2700,6 +2771,10 @@ export const TOPICS: Topic[] = [
         "md": "When a newer release is published, an **⬆ Update vX.Y.Z** pill appears bottom-right on both the connect screen and the workspace."
       },
       {
+        "k": "p",
+        "md": "After the update installs, the first launch on the new version pops a **What's new** panel in that same bottom-right corner, listing every release between the version you were running and this one — skipped versions included. It reads the changelog bundled into the build, so it is exact and needs no network; dismiss it once and it's gone until the next update, and a fresh install stays quiet. The GitHub release notes are published from the same section, so the story is identical in-app and on the releases page."
+      },
+      {
         "k": "list",
         "ordered": false,
         "items": [
@@ -2712,6 +2787,44 @@ export const TOPICS: Topic[] = [
         "k": "tip",
         "kind": "tip",
         "md": "The updater shipped in v0.4.5 — earlier installs can't auto-update. Grab a fresh installer once; every version after keeps itself current."
+      },
+      {
+        "k": "h",
+        "text": "v0.9.1 — what's new after an update, honest cancel, engine-aware lexing",
+        "id": "v0-9-1"
+      },
+      {
+        "k": "list",
+        "ordered": false,
+        "items": [
+          "Post-update **What's new** panel — bundled changelog, offline, dismiss-once; reopen any time from the command palette.",
+          "**AI reply max tokens** on the desktop (Settings → AI, 256–128,000) — same knob the Slack bot honors.",
+          "Cancel is honest per engine: a **Running** timer where cancel is impossible (SQLite, MySQL, DuckDB on Windows), a rejected cancel reports why, default [[kbd:Mod-F2]].",
+          "Engine-aware editor lexing (MySQL `#` comments and backslash escapes; backticks on MySQL/SQLite) and one shared active-schema resolver for completion, lint, and grid editing.",
+          "`WHERE a = 1, b = 2` squiggles instantly — the comma-for-AND typo is caught offline.",
+          "Grid **Copy as X** is byte-identical to Export; empty strings stay distinct from NULL.",
+          "Explorer DDL and full-query exports land in history as `-- [Explorer]` / `-- [Export]`.",
+          "Slack: TSV and SQL-insert exports, attachments named after the queried table, 5 sample tables (desktop parity)."
+        ]
+      },
+      {
+        "k": "h",
+        "text": "v0.9.0 — enterprise manual transactions, AI destination consent, bounded everything",
+        "id": "v0-9-0"
+      },
+      {
+        "k": "list",
+        "ordered": false,
+        "items": [
+          "Manual transactions own one session across runs: owner bar, frozen non-owner tabs, per-engine savepoints/`SET TRANSACTION`, MySQL `SET autocommit=0` — see [[topic:editor|the editor topic]].",
+          "Explicit **AI destination consent**: keys are origin-bound in the keychain; unapproved custom bases fail closed everywhere, including Slack.",
+          "Stricter read-only (writable CTEs, row locks, `SELECT … INTO`, `EXPLAIN ANALYZE`) and no automatic statement replay after a dropped connection.",
+          "Explicit shape/byte budgets across queries, exports, plans, ERD, AI streams, Slack, history, and crash reports.",
+          "Atomic file exports — the destination is replaced only on success; zero rows still produce a valid file.",
+          "Revision-safe tabs, files, and history; sample sharing fails closed when its preference can't be stored.",
+          "Slack approvals are exact single-use capabilities; result exports are requester-only.",
+          "Fixed: window close, cross-tab runs after a multi-page result, a cancel race that could brick the cancel registry."
+        ]
       },
       {
         "k": "h",

@@ -219,6 +219,8 @@ function App() {
   const [historyOpen, setHistoryOpen] = createSignal(false);
   const [history, setHistory] = createSignal<HistoryEntry[]>([]);
   const [paletteOpen, setPaletteOpen] = createSignal(false);
+  // Incremented to summon the What's-new panel on demand (command palette).
+  const [whatsNewRequest, setWhatsNewRequest] = createSignal(0);
   const [helpOpen, setHelpOpen] = createSignal(false);
   // "DDL & relationships" viewer (read-only — standalone signal, not DialogState).
   // name=null = opened from a schema node, straight into the whole-schema ERD.
@@ -1516,6 +1518,7 @@ function App() {
       case "openSettings": setSettingsOpen("editor"); break;
       case "openShortcuts": setSettingsOpen("shortcuts"); break;
       case "openHelp": setHelpOpen((v) => !v); break;
+      case "showWhatsNew": setWhatsNewRequest((n) => n + 1); break;
       case "openHistory": setHistoryOpen((v) => !v); break;
       case "openPalette": setPaletteOpen(true); break;
       case "toggleAi": setAiOpen((v) => !v); break;
@@ -1544,8 +1547,8 @@ function App() {
       document.querySelector("[data-blocking-dialog='true'], .modal-overlay")
     ) return;
     // On the connect screen only screen-independent actions fire (manual, settings).
-    // Shortcuts is the same shared-tail dialog as Settings, so it works disconnected too.
-    if (!conn() && id !== "openHelp" && id !== "openSettings" && id !== "openShortcuts") return;
+    // Shortcuts/What's-new render in the shared tail like Settings — usable disconnected.
+    if (!conn() && id !== "openHelp" && id !== "openSettings" && id !== "openShortcuts" && id !== "showWhatsNew") return;
     // Chords without Mod/Alt (F5, plain Enter, Shift-X…) must not fire while
     // typing in an input/textarea or the editor.
     if (!/^Mod-|^Alt-/.test(k)) {
@@ -4395,7 +4398,7 @@ function App() {
 
       {/* Update pill renders in both screens (connect + workspace). */}
       <UpdateBadge />
-      <WhatsNew />
+      <WhatsNew requestShow={whatsNewRequest} />
 
       {/* Manual + Settings work on both screens (connect screen has its own buttons). */}
       <Show when={helpOpen()}>

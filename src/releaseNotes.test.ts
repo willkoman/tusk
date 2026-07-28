@@ -60,7 +60,9 @@ describe("changelog parsing", () => {
     const real = (await import("../CHANGELOG.md?raw")).default;
     const all = parseChangelog(real);
     expect(all.length).toBeGreaterThan(3);
-    expect(all[0].version).toBe("0.9.1");
+    // The newest section must match the shipping version (check:versions parity).
+    const pkg = (await import("../package.json")).default as { version: string };
+    expect(all[0].version).toBe(pkg.version);
     expect(all[0].groups.length).toBeGreaterThan(0);
     expect(all[0].groups.every((g) => g.items.length > 0)).toBe(true);
   });

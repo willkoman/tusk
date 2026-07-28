@@ -4,6 +4,12 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-07-28
+
+### Fixed
+- **The What's-new panel now appears on the first update that ships it.** Profiles that ran Tusk before the version marker existed (any pre-0.9.1 install) were indistinguishable from fresh installs and saw nothing after updating; existing profile data now identifies them and they get the running version's notes. The panel is also summonable any time via the command palette ("What's new in this version"), on both screens.
+- **The manual caught up with 0.9.0/0.9.1.** Twenty-seven corrections and additions across twelve topics, including six factual errors (cancel shortcut and availability, always-server-side sorting, Slack sample-table count, Settings tab count) and new What's-new digest sections for both releases. Keeping help current is now an explicit part of shipping any user-facing change.
+
 ## [0.9.1] - 2026-07-28
 
 ### Added

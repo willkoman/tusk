@@ -41,6 +41,7 @@ scripts/conformance.sh                                # + Postgres & MySQL via t
 
 - Update `CHANGELOG.md` (`[Unreleased]`) on every change. **Entries are user-facing release notes**, not commit summaries: each release section is published verbatim as the GitHub release body (`scripts/release-notes.mjs` in the verify job — an empty/missing section FAILS the release) and rendered in-app by the post-update What's-new popup (`src/WhatsNew.tsx` + `src/releaseNotes.ts`, CHANGELOG bundled via vite `?raw`). Write what changed and why, `- **Lead sentence.** detail` bullets under `### Added/Changed/Fixed`, section head `## [x.y.z] - date`.
 - Run the applicable validation commands above after edits; Rust/driver changes require the Rust and conformance gates, frontend changes require build/type/tests, and version changes require `npm run check:versions`.
+- **The manual ships with the feature.** Any user-facing change also updates the affected `src/help/content.ts` facts in the same change (targeted edits are fine — full regeneration is only for wholesale rewrites), and each release adds a digest section to the `whats-new` topic. Stale help is a bug: the 0.9.x releases shipped with six factual errors in the manual because this wasn't enforced.
 - Surfacing errors: `db.rs`'s `From<tokio_postgres::Error>` unwraps the real Postgres message (don't regress to bare "db error").
 - Caveman chat style seen in history is a *session* preference (the `/caveman` skill), **not** a code/docs convention — write code, commits, and docs normally.
 

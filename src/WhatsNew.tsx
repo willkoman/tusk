@@ -1,14 +1,31 @@
-import { For, Show, createSignal, onMount, type JSX } from "solid-js";
+import { For, Show, createEffect, createSignal, onMount, type Accessor, type JSX } from "solid-js";
 import { getVersion } from "@tauri-apps/api/app";
 import { cmpVersion, notesSince, parseChangelog, type ReleaseNotes } from "./releaseNotes";
 
 // Post-update "What's new" panel, bottom-right on both screens (same corner as
 // the update pill). Shows the CHANGELOG sections between the last version this
 // profile ran and the current build — bundled at build time (`?raw`), so it's
-// exact, offline-safe, and needs no network capability. First launch just
-// records the version quietly; the panel appears only after a real update.
+// exact, offline-safe, and needs no network capability. A brand-new profile
+// records the version quietly; a profile that clearly existed before the
+// version marker did (pre-0.9.1 installs have prefs/tabs but no marker) gets
+// the CURRENT version's notes — an update happened, we just can't tell from
+// what. The panel can also be summoned on demand (command palette) via
+// `requestShow`.
 
 const LAST_VERSION_KEY = "tusk.lastVersion";
+
+/** Evidence this profile ran Tusk before the version marker existed. */
+function hasPriorProfile(): boolean {
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith("tusk.") && key !== LAST_VERSION_KEY) return true;
+    }
+  } catch {
+    /* storage denied — treat as fresh */
+  }
+  return false;
+}
 
 const readLast = (): string | null => {
   try {
@@ -42,10 +59,19 @@ function inline(md: string): JSX.Element {
   return <>{parts}</>;
 }
 
-export function WhatsNew() {
+export function WhatsNew(props: { requestShow?: Accessor<number> }) {
   const [notes, setNotes] = createSignal<ReleaseNotes[]>([]);
   const [open, setOpen] = createSignal(false);
   const [current, setCurrent] = createSignal("");
+
+  const loadNotes = async (version: string, last: string | null): Promise<ReleaseNotes[]> => {
+    const raw = (await import("../CHANGELOG.md?raw")).default;
+    const all = parseChangelog(raw);
+    // Unknown starting point (pre-marker install, or explicit request): show
+    // just the running version's section rather than guessing a range.
+    if (!last) return all.filter((r) => r.version === version).slice(0, 1);
+    return notesSince(all, last);
+  };
 
   onMount(() => {
     // Delayed like the update check — startup work wins the first seconds.
@@ -59,17 +85,16 @@ export function WhatsNew() {
         }
         setCurrent(version);
         const last = readLast();
-        if (!last) {
-          writeLast(version); // fresh install/profile — nothing is "new"
+        if (!last && !hasPriorProfile()) {
+          writeLast(version); // genuinely fresh install — nothing is "new"
           return;
         }
-        if (cmpVersion(version, last) <= 0) {
+        if (last && cmpVersion(version, last) <= 0) {
           if (last !== version) writeLast(version); // downgrade — just resync
           return;
         }
         try {
-          const raw = (await import("../CHANGELOG.md?raw")).default;
-          const since = notesSince(parseChangelog(raw), last);
+          const since = await loadNotes(version, last);
           if (!since.length) {
             writeLast(version);
             return;
@@ -81,6 +106,28 @@ export function WhatsNew() {
         }
       })();
     }, 2000);
+  });
+
+  // On-demand (command palette): show the running version's notes regardless of
+  // the last-seen marker. Never writes the marker — viewing isn't dismissing.
+  let lastRequest = 0;
+  createEffect(() => {
+    const req = props.requestShow?.();
+    if (!req || req === lastRequest) return;
+    lastRequest = req;
+    void (async () => {
+      try {
+        const version = current() || (await getVersion());
+        setCurrent(version);
+        const shown = await loadNotes(version, null);
+        if (shown.length) {
+          setNotes(shown);
+          setOpen(true);
+        }
+      } catch {
+        /* no Tauri context or bundle miss — nothing to show */
+      }
+    })();
   });
 
   const dismiss = () => {
