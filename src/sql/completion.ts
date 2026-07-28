@@ -85,7 +85,7 @@ export function makeSqlCompletion(
         const qual = dot[1];
         const last = qual.split(".").pop()!.toLowerCase();
         const ref = aliases.get(last) ?? qual;
-        const t = tableByRef(idx, ref) ?? tableByRef(idx, qual);
+        const t = tableByRef(idx, ref, getActiveSchema()) ?? tableByRef(idx, qual, getActiveSchema());
         if (t) {
           return {
             from,
@@ -112,7 +112,7 @@ export function makeSqlCompletion(
       const scopeRefs = new Set([...aliases.values()].map((r) => r.toLowerCase()));
       const inScopeCols: Completion[] = [];
       for (const ref of scopeRefs) {
-        const t = tableByRef(idx, ref);
+        const t = tableByRef(idx, ref, getActiveSchema());
         if (t) for (const c of t.columns) {
           inScopeCols.push({ label: c.name, type: "property", detail: `${c.data_type} · ${t.name}`, boost: 80 });
         }

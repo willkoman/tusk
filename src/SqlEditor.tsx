@@ -225,7 +225,7 @@ export function SqlEditor(props: {
       closeBrackets(),
       foldComp.of(p.autoFold ? autoFold() : []),
       activeStatement(),
-      clientLint(() => props.tables, () => props.functions ?? EMPTY_FUNCS),
+      clientLint(() => props.tables, () => props.functions ?? EMPTY_FUNCS, () => props.activeSchema ?? null),
       serverLint(() => props.validate ?? null, () => curTabId),
       dialectComp.of(dialectExtensions()),
       searchExtensions(),

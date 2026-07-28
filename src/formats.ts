@@ -299,6 +299,19 @@ function markdownCell(v: string | null): string {
   return v === null ? "" : v.replace(/\|/g, "\\|").replace(/\n/g, " ");
 }
 
+/** Grid "Copy as X": the SAME bytes as Export→Clipboard/file for the same rows,
+ *  with fixed sane options. One formatter for one user-facing concept — the legacy
+ *  toCSV/toTSV/toJSON/toMarkdown helpers below survive only for paste round-trip
+ *  tests. Markdown always emits its header (a headerless markdown table isn't
+ *  valid markdown). */
+export function formatForCopy(d: Dataset, fmt: "tsv" | "csv" | "json" | "md", header: boolean): string {
+  const opts = defaultExportOptions("");
+  opts.format = fmt === "md" ? "markdown" : fmt;
+  opts.delimiter = fmt === "tsv" ? "tab" : "comma";
+  opts.header = fmt === "md" ? true : header;
+  return formatWithOptions(d, opts);
+}
+
 export function toCSV(d: Dataset, header = true): string {
   validateDataset(d);
   ensureFormatBudget(d, 2);
@@ -387,7 +400,7 @@ export function formatDataset(d: Dataset, fmt: string, table: string): string {
 // header / column projection / line ending / boolean mapping). xlsx is never
 // produced here.
 
-import { type ExportOptions, resolvedDelimiter, nullString } from "./export";
+import { type ExportOptions, defaultExportOptions, resolvedDelimiter, nullString } from "./export";
 import { boolWord } from "./grid/bool";
 import { sqlDialect as activeSqlDialect } from "./sql/ident";
 

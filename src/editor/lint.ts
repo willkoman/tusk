@@ -14,9 +14,13 @@ import { LINT_DIAGNOSTIC_LIMIT } from "./limits";
 //   • server (async, 600ms) — Postgres validation; longer debounce, inert when
 //     disconnected. CodeMirror merges diagnostics from multiple linters for us.
 
-export function clientLint(getSchema: () => Table[], getFuncs: () => ReadonlySet<string>): Extension {
+export function clientLint(
+  getSchema: () => Table[],
+  getFuncs: () => ReadonlySet<string>,
+  getActiveSchema: () => string | null = () => null,
+): Extension {
   const heuristic = heuristicLintSource();
-  const schema = schemaLintSource(getSchema, getFuncs);
+  const schema = schemaLintSource(getSchema, getFuncs, getActiveSchema);
   // Contain lint bugs: @codemirror/lint runs sync sources unprotected, so a throw
   // here would escape to window.onerror and put a full-screen crash overlay over the
   // workbench on every keystroke. Losing squiggles beats losing the editor.

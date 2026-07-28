@@ -370,7 +370,8 @@ export function AiPanel(props: {
           messages: convo
             .filter((m) => m.role === "user" || m.content.trim())
             .map((m) => ({ role: m.role, content: m.content })),
-          maxTokens: 2048,
+          // User-configured ceiling (Settings → AI), same knob the Slack bot honors.
+          maxTokens: latest.maxTokens,
           requestId: id,
           allowNoKey: isKeyless(c.provider),
         },

@@ -13,7 +13,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { save as saveDialog, open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
-  AI_PROVIDERS, aiStore, defaultModel, groupByTier, isKeyless, modelNote,
+  AI_PROVIDERS, aiStore, defaultModel, groupByTier, isKeyless, modelNote, normalizeMaxTokens,
   approvedBaseOverride, connectionTestProbe, endpointOrigin, normalizeAiConfig, originApproved,
   originNeedsConsent, providerInfo, providerModels, resolveBaseUrl,
   withProviderModel, type AiConfig, type AiProvider,
@@ -42,6 +42,7 @@ export function AiPane(props: { database: string }) {
     return true;
   };
 
+  const [maxTokensInput, setMaxTokensInput] = createSignal(String(cfg().maxTokens));
   const [probe, setProbe] = createSignal<Record<string, ProbeState>>({});
   const patchProbe = (id: AiProvider, p: Partial<ProbeState>) =>
     setProbe((m) => ({ ...m, [id]: { ...{ hasKey: false, testing: false, note: "", ok: null }, ...m[id], ...p } }));
@@ -376,6 +377,29 @@ export function AiPane(props: { database: string }) {
               if (!setConfig({ shareSamples: e.currentTarget.checked })) {
                 e.currentTarget.checked = cfg().shareSamples;
               }
+            }}
+          />
+        </label>
+
+        <label
+          class="settings-row"
+          title="Upper bound on the AI's reply length, in tokens. Too low cuts replies (and their SQL) off mid-sentence; the provider may cap it lower than this."
+        >
+          <span>AI reply max tokens</span>
+          <input
+            type="number"
+            min="256"
+            max="128000"
+            step="256"
+            value={maxTokensInput()}
+            onInput={(e) => {
+              setMaxTokensInput(e.currentTarget.value);
+              if (e.currentTarget.value.trim()) setConfig({ maxTokens: normalizeMaxTokens(e.currentTarget.value, cfg().maxTokens) });
+            }}
+            onBlur={() => {
+              const normalized = normalizeMaxTokens(maxTokensInput(), cfg().maxTokens);
+              setConfig({ maxTokens: normalized });
+              setMaxTokensInput(String(normalized));
             }}
           />
         </label>

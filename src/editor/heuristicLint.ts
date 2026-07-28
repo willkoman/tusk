@@ -5,6 +5,15 @@ import { STATEMENT_STARTERS } from "../sql/dialects";
 // Hoisted once — the lint source runs per statement per 300ms keystroke window;
 // no per-run spread of the keyword set.
 const STARTER_LIST = [...STATEMENT_STARTERS];
+
+// Words that end a WHERE/HAVING region at the same paren depth. Conservative on
+// purpose: CASE arms (WHEN/THEN/ELSE/END) also end detection so a comma after a
+// CASE expression is never mis-flagged.
+const WHERE_REGION_END = new Set([
+  "GROUP", "ORDER", "HAVING", "WINDOW", "UNION", "INTERSECT", "EXCEPT", "LIMIT",
+  "OFFSET", "FETCH", "FOR", "RETURNING", "QUALIFY", "ON", "WHEN", "THEN", "ELSE",
+  "END", "SELECT", "SET", "VALUES", "JOIN", "USING",
+]);
 import { closest } from "./distance";
 import { docString, lexState, maskNonCode, spanAt } from "./lexer";
 import { LINT_DIAGNOSTIC_LIMIT, LINT_STATEMENT_LIMIT, LIVE_ANALYSIS_MAX_CHARS } from "./limits";
@@ -15,6 +24,9 @@ import { LINT_DIAGNOSTIC_LIMIT, LINT_STATEMENT_LIMIT, LIVE_ANALYSIS_MAX_CHARS } 
 //   • unmatched ')'            → error
 //   • unclosed '('             → warning (you may still be typing)
 //   • trailing comma           → warning
+//   • comma in WHERE/HAVING    → error (`WHERE a = 1, b = 2` — AND/OR intended;
+//     invalid in every engine, and the server linter may be paused while a
+//     result stream is open, so this must not wait for PREPARE)
 //   • DELETE/UPDATE w/o WHERE  → warning (affects every row)
 //   • unknown leading keyword  → error (`SELCT …` — a closed set, unlike functions)
 //
@@ -81,6 +93,45 @@ export function heuristicLintSource() {
       }
       for (const openP of stack) {
         if (add({ from: base + openP, to: base + openP + 1, severity: "warning", message: "unclosed '('" })) return out;
+      }
+
+      // Top-level comma inside a WHERE/HAVING region: no engine accepts it — the
+      // user meant AND/OR. Legit commas (IN lists, row constructors, function
+      // args) always sit one paren level deeper, so this cannot false-positive.
+      // Subquery WHEREs nest via a depth stack; a conservative clause-word set
+      // ends a region (missed detection beats a wrong squiggle).
+      {
+        const whereDepths: number[] = [];
+        let depth = 0;
+        let p = 0;
+        while (p < m.length) {
+          const c = m[p];
+          if (c === "(") { depth++; p++; continue; }
+          if (c === ")") {
+            if (depth > 0) depth--;
+            while (whereDepths.length && whereDepths[whereDepths.length - 1] > depth) whereDepths.pop();
+            p++;
+            continue;
+          }
+          if (c === ",") {
+            if (whereDepths[whereDepths.length - 1] === depth &&
+              add({ from: base + p, to: base + p + 1, severity: "error", message: "',' is not valid between conditions — join them with AND or OR" })) return out;
+            p++;
+            continue;
+          }
+          if (/[A-Za-z_]/.test(c)) {
+            const w = /^[A-Za-z_]\w*/.exec(m.slice(p, p + 64))![0];
+            const W = w.toUpperCase();
+            if (W === "WHERE" || W === "HAVING") {
+              if (whereDepths[whereDepths.length - 1] !== depth) whereDepths.push(depth);
+            } else if (whereDepths[whereDepths.length - 1] === depth && WHERE_REGION_END.has(W)) {
+              whereDepths.pop();
+            }
+            p += w.length;
+            continue;
+          }
+          p++;
+        }
       }
 
       // Unknown leading keyword: find the first code character (skipping comments),

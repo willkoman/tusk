@@ -1,5 +1,5 @@
 import { lex, maskNonCode } from "../editor/lexer";
-import { aliasMap, identifierParts, tableByRef, type Index, type Table } from "../sql/aliases";
+import { aliasMap, identifierParts, tableByRef, tableByRefUnique, type Index, type Table } from "../sql/aliases";
 import { hasDuplicateColumns, stripTrailingSemi, wrappableQuery } from "./query";
 import type { RelationDetail } from "../Tree";
 
@@ -155,8 +155,15 @@ function hasCommaJoin(sql: string): boolean {
   return false;
 }
 
-/** Resolve the single table a base query reads from, or a reason it can't be edited. */
-export function editTarget(baseQuery: string, idx: Index): EditTarget {
+/** Resolve the single table a base query reads from, or a reason it can't be edited.
+ * `activeSchema` = the tab's active schema when set: it pins the server's
+ * `search_path` to `<schema>, public`, so a bare name may resolve through that
+ * chain. With NO active schema the server default (`"$user", public`) is not
+ * knowable client-side, and an ambiguous bare name stays uneditable — a write
+ * must never guess which physical table the query read. */
+export function editTarget(baseQuery: string, idx: Index, activeSchema: string | null = null): EditTarget {
+  const resolve = (ref: string) =>
+    activeSchema != null ? tableByRef(idx, ref, activeSchema) : tableByRefUnique(idx, ref);
   const base = stripTrailingSemi(baseQuery);
   if (!base) return { ok: false, reason: "results from a script — run a single SELECT to edit" };
   // Plain SELECT only — WITH/TABLE/VALUES results can't be safely mapped back to rows.
@@ -200,7 +207,7 @@ export function editTarget(baseQuery: string, idx: Index): EditTarget {
   if (!sl.ok) return { ok: false, reason: sl.reason! };
 
   const ref = sourceMatch[2] ? `${sourceMatch[1]}.${sourceMatch[2]}` : sourceMatch[1];
-  const t = tableByRef(idx, ref);
+  const t = resolve(ref);
   if (!t) return { ok: false, reason: "table not found, case-colliding, or ambiguous in the schema" };
 
   const effectiveQualifier = sourceMatch[3] ?? sourceMatch[2] ?? sourceMatch[1];
@@ -211,7 +218,7 @@ export function editTarget(baseQuery: string, idx: Index): EditTarget {
   // must resolve to this same physical relation. Never infer identity through an
   // unknown function/CTE or a second table.
   for (const nestedRef of new Set(aliasMap(masked).values())) {
-    if (tableByRef(idx, nestedRef) !== t)
+    if (resolve(nestedRef) !== t)
       return { ok: false, reason: "multi-table or unresolved-source queries aren't editable" };
   }
   return { ok: true, table: t };

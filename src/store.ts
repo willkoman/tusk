@@ -85,11 +85,15 @@ export const prefsStore = {
     }
     return { ...DEFAULT_PREFS };
   },
-  save(prefs: EditorPrefs): void {
+  /** False when persistence failed — the pref applies this session but won't
+   *  survive a restart; surface that instead of losing settings silently
+   *  (the AI/Slack panes already report their save failures). */
+  save(prefs: EditorPrefs): boolean {
     try {
       localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+      return true;
     } catch {
-      /* ignore */
+      return false;
     }
   },
 };
@@ -149,11 +153,13 @@ export const keymapStore = {
     }
     return {};
   },
-  save(overrides: KeyOverrides): void {
+  /** False when persistence failed (see prefsStore.save). */
+  save(overrides: KeyOverrides): boolean {
     try {
       localStorage.setItem(KEYS_KEY, JSON.stringify(overrides));
+      return true;
     } catch {
-      /* ignore */
+      return false;
     }
   },
 };

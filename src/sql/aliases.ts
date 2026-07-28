@@ -47,7 +47,32 @@ export function buildIndex(tables: Table[]): Index {
   return { schemas: [...schemas], tables, byQualified, byBare };
 }
 
-export function tableByRef(idx: Index, ref: string): Table | undefined {
+export function tableByRef(idx: Index, ref: string, activeSchema?: string | null): Table | undefined {
+  const parts = identifierParts(ref);
+  if (!parts || parts.length > 2) return undefined;
+  const matches = idx.tables.filter((table) => {
+    const values = parts.length === 2 ? [table.schema, table.name] : [table.name];
+    return parts.every((part, i) =>
+      part.quoted === '"' ? values[i] === part.value : values[i].toLowerCase() === part.value.toLowerCase(),
+    );
+  });
+  if (matches.length === 1) return matches[0];
+  // A bare name matching several schemas resolves like the server's search_path:
+  // the tab's active schema first, then public. Completion and the schema linter
+  // share this preference, so lint can never flag a table completion just offered.
+  if (matches.length > 1 && parts.length === 1) {
+    const bySchema = (s: string) => matches.find((t) => t.schema === s);
+    return bySchema(activeSchema ?? "") ?? bySchema("public");
+  }
+  return undefined;
+}
+
+/** Unique-match resolution only — for WRITE paths (in-grid editing). Advisory
+ *  surfaces may assume the `active → public` chain, but a write may not: with no
+ *  tab schema pinning `SET search_path TO <schema>, public`, the server default
+ *  (`"$user", public`) is not knowable client-side, so an ambiguous bare name
+ *  could target a different physical table than the query read. */
+export function tableByRefUnique(idx: Index, ref: string): Table | undefined {
   const parts = identifierParts(ref);
   if (!parts || parts.length > 2) return undefined;
   const matches = idx.tables.filter((table) => {

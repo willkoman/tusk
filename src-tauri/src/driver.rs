@@ -86,6 +86,10 @@ pub struct Capabilities {
     pub relationships: bool,
     /// EXPLAIN ANALYZE exists on this engine (SQLite has no ANALYZE variant).
     pub explain_analyze: bool,
+    /// An in-flight query can be cancelled out-of-band. PostgreSQL: CancelRequest.
+    /// DuckDB: interrupt handle, except Windows where interrupt poisons the bundled
+    /// connection. SQLite/MySQL expose no UI-query cancel handle.
+    pub cancel_query: bool,
     pub manual_transactions: bool,
     pub transaction_savepoints: bool,
     pub set_transaction: bool,
@@ -108,6 +112,7 @@ impl Capabilities {
             ddl: true,
             relationships: true,
             explain_analyze: true,
+            cancel_query: true,
             manual_transactions: true,
             transaction_savepoints: true,
             set_transaction: true,
@@ -129,6 +134,7 @@ impl Capabilities {
             ddl: true,           // best-effort via duckdb_tables()/duckdb_views()
             relationships: true, // best-effort via duckdb_constraints()
             explain_analyze: true,
+            cancel_query: !cfg!(windows), // interrupt() poisons the bundled connection on Windows
             manual_transactions: true,
             transaction_savepoints: false,
             set_transaction: false,
@@ -150,6 +156,7 @@ impl Capabilities {
             ddl: true,              // sqlite_master.sql
             relationships: true,    // pragma_foreign_key_list
             explain_analyze: false, // no EXPLAIN ANALYZE in SQLite
+            cancel_query: false,    // no out-of-band cancel handle
             manual_transactions: true,
             transaction_savepoints: true,
             set_transaction: false,
@@ -171,6 +178,7 @@ impl Capabilities {
             ddl: true,           // SHOW CREATE TABLE/VIEW
             relationships: true, // information_schema.KEY_COLUMN_USAGE
             explain_analyze: true,
+            cancel_query: false, // no out-of-band cancel handle
             manual_transactions: true,
             transaction_savepoints: true,
             set_transaction: true,

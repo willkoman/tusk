@@ -1,5 +1,5 @@
 import { createSignal, createMemo, createEffect, on, onCleanup, For, Show, type Accessor } from "solid-js";
-import { type Dataset, toTSV, toCSV, toJSON, toMarkdown } from "./formats";
+import { type Dataset, formatForCopy } from "./formats";
 import { clipWrite, clipRead } from "./clipboard";
 import { type MenuItem } from "./ContextMenu";
 import { type GridView, type SortKey, type Filter, type PendingEdits } from "./tabs";
@@ -592,7 +592,7 @@ export function ResultGrid(props: ResultGridProps) {
     const d = selectionDataset(b);
     const h = props.copyHeaders();
     try {
-      const text = fmt === "csv" ? toCSV(d, h) : fmt === "json" ? toJSON(d, h) : fmt === "md" ? toMarkdown(d, h) : toTSV(d, h);
+      const text = formatForCopy(d, fmt, h);
       const ok = await clipWrite(text);
       props.onStatus(ok ? `copied ${d.rows.length}×${d.columns.length}` : "clipboard unavailable", tabId, generation);
     } catch (e) {
@@ -628,7 +628,7 @@ export function ResultGrid(props: ResultGridProps) {
       props.onStatus(`column too large to copy (${chars.toLocaleString()}+ characters) — use Export… instead`, props.activeTabId(), props.resultGeneration());
       return;
     }
-    void copyText(toTSV(columnDataset(oi), props.copyHeaders()), "copied column");
+    void copyText(formatForCopy(columnDataset(oi), "tsv", props.copyHeaders()), "copied column");
   }
 
   function bindMenuItems(items: MenuItem[]): MenuItem[] {

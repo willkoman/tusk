@@ -1,5 +1,5 @@
 import { afterEach, describe, it, expect } from "vitest";
-import { formatWithOptions, parseCSV, parseJSON, toJSON, toMarkdown, toSQL, toTSV, type Dataset } from "./formats";
+import { formatForCopy, formatWithOptions, parseCSV, parseJSON, toJSON, toMarkdown, toSQL, toTSV, type Dataset } from "./formats";
 import { defaultExportOptions, type ExportOptions } from "./export";
 import { boolWord } from "./grid/bool";
 import { setSqlDialect } from "./sql/ident";
@@ -82,6 +82,17 @@ describe("shape-safe formatting", () => {
   it("quotes TSV controls so parsing recovers exact fields", () => {
     const d: Dataset = { columns: ["a", "b"], rows: [["x\ty", "line1\r\nline2"]] };
     expect(parseCSV(toTSV(d), true, "\t")).toEqual(d);
+  });
+
+  it("formatForCopy = export formatter bytes; empty string and NULL stay distinct; md always has headers", () => {
+    const d: Dataset = { columns: ["a", "b"], rows: [["", null]] };
+    const csv = formatForCopy(d, "csv", true);
+    expect(csv).toBe('a,b\n"",\n'); // "" = empty string, bare = NULL — round-trippable
+    expect(formatForCopy(d, "csv", true)).toBe(formatWithOptions(d, { ...defaultExportOptions(""), format: "csv" }));
+    // Markdown without headers would not be a valid table — headers are forced.
+    expect(formatForCopy(d, "md", false).startsWith("| a | b |")).toBe(true);
+    // The TSV bytes keep '' (quoted) and NULL (bare) distinguishable for consumers.
+    expect(formatForCopy(d, "tsv", true)).toBe('a\tb\n""\t\n');
   });
 
   it("escapes pipes and flattens newlines exactly like the Rust file exporter", () => {

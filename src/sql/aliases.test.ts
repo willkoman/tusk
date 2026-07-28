@@ -39,3 +39,24 @@ describe("currentStatement", () => {
     expect(currentStatement("SELECT 1;   ", 12)).toEqual({ text: "   ", start: 9 });
   });
 });
+
+describe("tableByRef active-schema preference", () => {
+  const dup: Table[] = [
+    { schema: "public", name: "orders", columns: [{ name: "id", data_type: "int" }] },
+    { schema: "sales", name: "orders", columns: [{ name: "total", data_type: "int" }] },
+    { schema: "audit", name: "events", columns: [] },
+  ];
+  const idx = buildIndex(dup);
+
+  it("resolves bare ambiguity via active schema, then public — like search_path", () => {
+    expect(tableByRef(idx, "orders", "sales")?.schema).toBe("sales");
+    expect(tableByRef(idx, "orders", null)?.schema).toBe("public");
+    expect(tableByRef(idx, "orders", "audit")?.schema).toBe("public");
+    expect(tableByRef(idx, "events")?.schema).toBe("audit"); // unique bare needs no preference
+  });
+
+  it("qualified refs stay exact regardless of active schema", () => {
+    expect(tableByRef(idx, "sales.orders", "public")?.schema).toBe("sales");
+    expect(tableByRef(idx, "public.orders", "sales")?.schema).toBe("public");
+  });
+});

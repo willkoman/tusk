@@ -397,7 +397,9 @@ async fn generate_proposal(
             .await
             .unwrap_or_else(|_| crate::perms::Permissions::unrestricted());
         let tables = c.backend.list_tables().await?;
-        let relevant = context::relevant_tables(&tables, &focus, 3);
+        // Parity with the desktop panel (AiPanel relevantTables(…, 5)) — every other
+        // context budget in slack/context.rs mirrors src/ai/context.ts exactly.
+        let relevant = context::relevant_tables(&tables, &focus, 5);
         let mut samples: Vec<SampleTable> = Vec::new();
         if cfg.share_samples {
             for t in &relevant {
@@ -1552,6 +1554,12 @@ async fn handle_export(
     // No column-type metadata survives a buffered run; the full result is in hand,
     // so the grid's value heuristic (t/f/true/false-only columns) is exact here.
     opts.bool_cols = crate::export::detect_bool_cols(stored.columns.len(), &stored.rows);
+    if fmt == "sql" {
+        // Same shape as the desktop dialog: INSERTs target the queried table name,
+        // batched multi-row tuples.
+        opts.sql.table = stored.label.clone();
+        opts.sql.multi_row = true;
+    }
     match crate::export::export_rows_to_bytes_for_dialect(
         &stored.columns,
         &stored.rows,
@@ -1570,7 +1578,7 @@ async fn handle_export(
                 .upload_file(
                     channel,
                     Some(thread_ts),
-                    &format!("result.{ext}"),
+                    &format!("{}.{ext}", stored.label),
                     bytes,
                     Some(&comment),
                 )
@@ -1642,6 +1650,7 @@ async fn post_result(
         thread_ts: prop.thread_ts.clone(),
         requester: prop.user.clone(),
         dialect: dialect.to_string(),
+        label: export_label(&prop.sql),
     };
     let Some((result_id, stored)) = runtime.results.insert(binding, columns, rows) else {
         let text = "Query completed, but the result exceeded Slack's retained-export memory budget. Run a narrower query.";
@@ -1788,9 +1797,15 @@ async fn attach(
             Err(_) => return,
         };
     opts.bool_cols = crate::export::detect_bool_cols(columns.len(), rows);
+    let label = export_label(&prop.sql);
+    if fmt == "sql" {
+        opts.sql.table = label.clone();
+        opts.sql.multi_row = true;
+    }
     match crate::export::export_rows_to_bytes_for_dialect(columns, rows, &opts, dialect).await {
         Ok(bytes) if bytes.len() <= super::api::ATTACHMENT_BYTE_CAP => {
-            let filename = format!("result.{fmt}");
+            let ext = if fmt == "markdown" { "md" } else { fmt };
+            let filename = format!("{label}.{ext}");
             let _ = api
                 .upload_file(
                     &prop.channel,
@@ -1825,6 +1840,45 @@ async fn attach(
     }
 }
 
+/// Filename stem for export attachments: the first table named after FROM in the
+/// executed query (schema qualifier and quoting dropped, filename-safe chars only),
+/// so a thread with several exports doesn't collect identically-named `result.csv`s.
+fn export_label(sql: &str) -> String {
+    let lower = mask_sql(sql).to_ascii_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    let candidate = words
+        .windows(2)
+        .find(|w| w[0] == "from")
+        .map(|w| w[1])
+        .unwrap_or("");
+    // Only a bare identifier names the file: `FROM (subquery)` has no table, and
+    // mask_sql erases quoted identifiers to opaque `q…q` tokens (unrecoverable by
+    // design — never expose their content), so both fall back to "result".
+    if !candidate
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    {
+        return "result".to_string();
+    }
+    let token: String = candidate
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        .collect();
+    let label: String = token
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(64)
+        .collect();
+    if label.is_empty() || label == "q" {
+        "result".to_string()
+    } else {
+        label
+    }
+}
+
 fn attachment_preflight(
     columns: &[String],
     rows: &[Vec<Option<String>>],
@@ -1842,8 +1896,10 @@ fn attachment_preflight(
     let expansion = match fmt {
         // JSON can turn every control byte into a six-byte \u00XX escape.
         "json" => raw.saturating_mul(6),
-        // Delimited/markdown escaping can at most double each source byte.
-        "csv" | "markdown" => raw.saturating_mul(2),
+        // Delimited/markdown/SQL escaping can at most double each source byte
+        // (quote doubling); SQL batches tuples, so per-row framing stays within
+        // the structural allowance above.
+        "csv" | "tsv" | "markdown" | "sql" => raw.saturating_mul(2),
         // XML entities can expand one source byte to five, then ZIP framing can add
         // overhead even for incompressible data. Six is a conservative pre-allocation cap.
         "xlsx" => raw.saturating_mul(6),
@@ -1950,6 +2006,18 @@ mod tests {
         ] {
             assert!(validate_read_only(q).is_ok(), "safe routine blocked: {q}");
         }
+    }
+
+    #[test]
+    fn export_label_names_attachments_after_the_queried_table() {
+        assert_eq!(export_label("SELECT * FROM orders WHERE id = 1"), "orders");
+        assert_eq!(export_label("SELECT * FROM sales.orders o"), "orders");
+        // Quoted identifiers are opaque after mask_sql (their content must not leak).
+        assert_eq!(export_label("SELECT * FROM \"Order Items\""), "result");
+        assert_eq!(export_label("SELECT * FROM `metrics`"), "result");
+        assert_eq!(export_label("SELECT * FROM (SELECT 1) x"), "result");
+        assert_eq!(export_label("SELECT 1"), "result");
+        assert_eq!(export_label("SELECT * FROM 'not a table'"), "result");
     }
 
     /// Reserved words preceding `(` are SQL syntax, not routine calls — subqueries,

@@ -199,6 +199,7 @@ pub struct StoredResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
     pub dialect: String,
+    pub label: String,
     pub created: Instant,
     estimated_bytes: usize,
     workspace: String,
@@ -226,6 +227,8 @@ pub struct ResultBinding {
     pub thread_ts: String,
     pub requester: String,
     pub dialect: String,
+    /// Sanitized filename stem for export attachments (first queried table, or "result").
+    pub label: String,
 }
 
 pub enum ResultAccess {
@@ -255,6 +258,7 @@ impl ResultStore {
             .saturating_add(binding.thread_ts.len())
             .saturating_add(binding.requester.len())
             .saturating_add(binding.dialect.len())
+            .saturating_add(binding.label.len())
             .saturating_add(
                 rows.len()
                     .saturating_mul(std::mem::size_of::<Vec<Option<String>>>()),
@@ -270,6 +274,7 @@ impl ResultStore {
             columns,
             rows,
             dialect: binding.dialect,
+            label: binding.label,
             created: Instant::now(),
             estimated_bytes,
             workspace: binding.workspace,
@@ -411,6 +416,7 @@ mod tests {
             thread_ts: "1.0".into(),
             requester: "U1".into(),
             dialect: "postgres".into(),
+            label: "orders".into(),
         };
         let (first, _) = s.insert(binding(), cols.clone(), row.clone()).unwrap();
         for _ in 0..10 {

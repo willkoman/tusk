@@ -43,6 +43,18 @@ export type AiConfig = {
   approvedOrigins: Partial<Record<AiProvider, string>>;
   /** Send a few sample rows of relevant tables to the model (real values leave your machine). */
   shareSamples: boolean;
+  /** Response-token ceiling per AI turn. One knob for every AI surface — the Slack pane
+   *  reuses the same normalization so desktop and bot can't drift apart. */
+  maxTokens: number;
+};
+
+/** Canonical max-tokens normalization for ALL AI surfaces (desktop panel + Slack bot):
+ *  positive finite numbers clamp to [256, 128000] and snap to 256-token steps;
+ *  anything else takes the fallback. */
+export const normalizeMaxTokens = (raw: string | number, fallback = 2048): number => {
+  const parsed = typeof raw === "number" ? raw : Number(raw);
+  const finite = Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  return Math.round(Math.max(256, Math.min(128000, finite)) / 256) * 256;
 };
 
 /** Canonical HTTP(S) origin, or null for invalid/credential-bearing URLs. */
@@ -119,6 +131,9 @@ export function normalizeAiConfig(raw: unknown): AiConfig {
     baseUrls,
     approvedOrigins,
     shareSamples: known && obj.shareSamples === true,
+    maxTokens: normalizeMaxTokens(
+      typeof obj.maxTokens === "number" || typeof obj.maxTokens === "string" ? obj.maxTokens : 2048,
+    ),
   };
 }
 
@@ -129,6 +144,7 @@ const fallbackConfig = (): AiConfig => ({
   baseUrls: {},
   approvedOrigins: {},
   shareSamples: false,
+  maxTokens: 2048,
 });
 
 const subscribers = new Set<(config: AiConfig) => void>();

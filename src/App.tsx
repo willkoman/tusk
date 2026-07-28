@@ -12,6 +12,7 @@ import { prefsStore, tabsStore, layoutStore, type PersistedTabs, type TabsPersis
 import { makeTab, basename, gridViewFor, pendingCount, snapshotTabs as recoverySnapshot, type Tab, type ResultSnapshot, type GridView, type SortKey, type Filter, type PendingEdits } from "./tabs";
 import { ResultGrid } from "./ResultGrid";
 import { UpdateBadge } from "./UpdateBadge";
+import { WhatsNew } from "./WhatsNew";
 import { wrapQuery, wrappableQuery, stripTrailingSemi, hasDuplicateColumns, hasViewRules } from "./grid/query";
 import { editTarget, editPlan, type EditPlan } from "./grid/editable";
 import { detectBoolCols, typeBoolCols } from "./grid/bool";
@@ -151,6 +152,7 @@ type Capabilities = {
   ddl: boolean;
   relationships: boolean;
   explainAnalyze: boolean;
+  cancelQuery: boolean;
   manualTransactions: boolean;
   transactionSavepoints: boolean;
   setTransaction: boolean;
@@ -588,7 +590,9 @@ function App() {
   const updatePrefs = (patch: Partial<EditorPrefs>) => {
     const next = { ...prefs(), ...patch };
     setPrefs(next);
-    prefsStore.save(next);
+    // Loud like the AI/Slack panes: a silently unsaved pref "works" until restart.
+    if (!prefsStore.save(next))
+      setPersistenceWarning("Editor settings could not be saved — they apply now but will reset on restart (storage unavailable or full).");
   };
 
   // Resolve the theme pref ("system" follows the OS) and flip the CSS-variable
@@ -641,11 +645,13 @@ function App() {
     // (vs null, which is persisted as "explicitly unbound").
     for (const k of Object.keys(next) as ActionId[]) if (next[k] === undefined) delete next[k];
     setKeys(next);
-    keymapStore.save(next);
+    if (!keymapStore.save(next))
+      setPersistenceWarning("Shortcut changes could not be saved — they apply now but will reset on restart (storage unavailable or full).");
   };
   const resetKeys = () => {
     setKeys({});
-    keymapStore.save({});
+    if (!keymapStore.save({}))
+      setPersistenceWarning("Shortcut reset could not be saved — defaults apply now but overrides may return on restart.");
   };
   const globalBindings = createMemo(() => {
     const m = new Map<string, ActionId>();
@@ -1016,7 +1022,10 @@ function App() {
     } else if (result.generation > 0 && result.transactionRevision !== tx.revision) {
       return { editable: false, reason: "transaction state changed; rerun before editing", plan: null };
     }
-    const tgt = editTarget(editBaseQ(), editIndexer(schema()));
+    // The tab's active schema pins the session search_path, so bare-name
+    // resolution inside editTarget may use the same active→public chain the
+    // server applies; without one, ambiguous names stay uneditable.
+    const tgt = editTarget(editBaseQ(), editIndexer(schema()), activeTab().searchSchema);
     if (!tgt.ok) return { editable: false, reason: tgt.reason, plan: null };
     // PG permission model: no write privilege at all → don't offer editing
     // (partial privileges still commit — the server enforces per statement).
@@ -1535,7 +1544,8 @@ function App() {
       document.querySelector("[data-blocking-dialog='true'], .modal-overlay")
     ) return;
     // On the connect screen only screen-independent actions fire (manual, settings).
-    if (!conn() && id !== "openHelp" && id !== "openSettings") return;
+    // Shortcuts is the same shared-tail dialog as Settings, so it works disconnected too.
+    if (!conn() && id !== "openHelp" && id !== "openSettings" && id !== "openShortcuts") return;
     // Chords without Mod/Alt (F5, plain Enter, Shift-X…) must not fire while
     // typing in an input/textarea or the editor.
     if (!/^Mod-|^Alt-/.test(k)) {
@@ -2437,6 +2447,10 @@ function App() {
   // run_query call then errors out and unwinds through executeQuery's finally.
   function cancelQuery() {
     if (!running() || cancelling()) return;
+    if (caps()?.cancelQuery === false) {
+      patchResult(runningTabId() ?? activeTabId(), { status: "This engine cannot cancel a running query — wait for it to finish" });
+      return;
+    }
     setCancelling(true);
     void cancelOperation(conn()?.id, runningTabId() ?? activeTabId());
   }
@@ -2644,11 +2658,28 @@ function App() {
       scope === "all"
         ? { connectionId: src.connectionId, sql: src.query, options: opts, path, searchPath: src.searchSchema }
         : { connectionId: src.connectionId, columns: src.columns, rows: src.rows, options: opts, path };
+    const t0 = performance.now();
+    // A scope=all export RE-RUNS the query server-side — that belongs in history
+    // like every other server execution (Slack runs and Explorer DDL are recorded).
+    const exportHistory = (status: "ok" | "error", rows: number | null, error: string | null) => {
+      if (scope !== "all") return;
+      const key = conn()?.key;
+      if (key && conn()?.id === src.connectionId) recordHistory({
+        sql: `-- [Export] ${opts.format} → ${path}\n${src.query}`,
+        durationMs: Math.round(performance.now() - t0),
+        status,
+        rows,
+        error,
+        schema: src.searchSchema ?? null,
+      }, key);
+    };
     try {
       const n = await invoke<number>("export_to_file", args);
+      exportHistory("ok", n, null);
       if (originCurrent(src.origin, true) && src.origin.tabId) patchResult(src.origin.tabId, { status: `exported ${n} rows → ${path}` });
       return true;
     } catch (e) {
+      exportHistory("error", null, errMsg(e).split("\n")[0]);
       if (originCurrent(src.origin, true) && src.origin.tabId)
         patchResult(src.origin.tabId, { status: `export rejected: ${errMsg(e)}` });
       throw e;
@@ -2663,9 +2694,12 @@ function App() {
       const status = await invoke<TransactionStatus>("cancel_operation", { connectionId, ownerId });
       applyAuthoritativeTransaction(status, c.generation);
     } catch (e) {
+      // A rejected cancel means no unwind will ever reset the Cancelling… state or
+      // report why — do both here (the error may still carry authoritative state).
       const embedded = transactionFromError(e);
       if (embedded) applyAuthoritativeTransaction(embedded, c.generation);
-      else console.error(e);
+      setCancelling(false);
+      patchResult(ownerId, { status: `cancel failed: ${errMsg(e)}` });
     }
   }
 
@@ -2881,23 +2915,41 @@ function App() {
 
   // Run a DDL statement built by a form/confirm dialog, then refresh the tree.
   // Returns ok/error so the dialog can stay open and show failures inline.
+  // Explorer DDL is a real database mutation: it lands in history like every other
+  // run path (audit trail — Slack SELECTs are recorded; a right-click DROP must be
+  // too), and its status/error surface reopens a collapsed results panel.
   async function runDDL(sqlText: string, origin = captureOrigin()): Promise<{ ok: boolean; error?: string }> {
     const c = conn();
     if (!c || !originCurrent(origin)) return { ok: false, error: "connection or tab changed" };
     if (metadataFrozen()) return { ok: false, error: "Explorer database actions are frozen during a manual transaction" };
     const before = transaction();
+    const t0 = performance.now();
+    const ddlHistory = (status: "ok" | "error", error: string | null) => recordHistory({
+      sql: `-- [Explorer]\n${sqlText}`,
+      durationMs: Math.round(performance.now() - t0),
+      status,
+      rows: null,
+      error,
+      schema: null,
+    }, c.key);
     if (origin.tabId) patchResult(origin.tabId, { runErr: "" });
     try {
       const out = await invoke<QueryResult>("run_query", { connectionId: c.id, ownerId: origin.tabId ?? activeTabId(), sql: sqlText, pageSize: PAGE, searchPath: null });
+      ddlHistory("ok", null);
       if (!applyAuthoritativeTransaction(out.transaction, c.generation, "statement", before)) return { ok: false, error: "stale transaction response" };
       if (!connectionCurrent(c) || !originCurrent(origin)) return { ok: false, error: "connection or tab changed" };
-      if (origin.tabId) patchResult(origin.tabId, { status: out.kind === "exec" ? out.message : `${out.rows.length}${out.done ? "" : "+"} rows` });
+      if (origin.tabId) {
+        if (!resultsOpen()) { setResultsOpen(true); persistLayout(); }
+        patchResult(origin.tabId, { status: out.kind === "exec" ? out.message : `${out.rows.length}${out.done ? "" : "+"} rows` });
+      }
       await loadSchema(c);
       return { ok: true };
     } catch (e) {
+      const message = errMsg(e);
+      ddlHistory("error", message.split("\n")[0]);
       const embedded = transactionFromError(e);
       if (embedded) applyAuthoritativeTransaction(embedded, c.generation, "statement", before);
-      return { ok: false, error: errMsg(e) };
+      return { ok: false, error: message };
     }
   }
 
@@ -2905,7 +2957,10 @@ function App() {
   function runDDLToast(sqlText: string) {
     const origin = captureOrigin();
     void runDDL(sqlText, origin).then((r) => {
-      if (!r.ok && origin.tabId && originCurrent(origin)) patchResult(origin.tabId, { runErr: r.error ?? "failed" });
+      if (!r.ok && origin.tabId && originCurrent(origin)) {
+        if (!resultsOpen()) { setResultsOpen(true); persistLayout(); }
+        patchResult(origin.tabId, { runErr: r.error ?? "failed" });
+      }
     });
   }
 
@@ -3174,7 +3229,9 @@ function App() {
         const cur = tree()?.database === n.name;
         items.push(
           { label: "Create schema…", icon: "plus", ...gate(canCreateSchema(), "Requires CREATE on the database"), onClick: () => setActiveDialog({ kind: "createSchema" }) },
-          { label: cur ? "Drop… (connected)" : "Drop…", icon: "trash", danger: true, disabled: cur || conn()?.readOnly || (pEnforced() && !isSuper()), title: cur ? "Can't drop the connected database" : (pEnforced() && !isSuper()) ? "Requires database ownership (or superuser)" : undefined, onClick: () => setActiveDialog({ kind: "confirm", title: `Drop database ${n.name}`, primaryLabel: "Drop database", build: () => ddl.dropDatabase(n.name) }) },
+          // Same gate() as every other Explorer DDL item (manual-transaction freeze,
+          // read-only, driver support) — DROP DATABASE least of all may skip the freeze.
+          { label: cur ? "Drop… (connected)" : "Drop…", icon: "trash", danger: true, ...gate(!pEnforced() || isSuper(), "Requires database ownership (or superuser)"), ...noDuck("DuckDB has no DROP DATABASE"), ...(cur ? { disabled: true, title: "Can't drop the connected database" } : {}), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop database ${n.name}`, primaryLabel: "Drop database", build: () => ddl.dropDatabase(n.name) }) },
           { sep: true },
           copyName,
         );
@@ -3279,8 +3336,10 @@ function App() {
     {
       label: "Explain Analyze (runs the query)",
       icon: "play",
-      disabled: caps()?.explainAnalyze === false || !activeDatabaseAllowed(),
-      title: caps()?.explainAnalyze === false ? "Not supported by this engine" : !activeDatabaseAllowed() ? "This tab does not own the transaction" : undefined,
+      disabled: caps()?.explainAnalyze === false || conn()?.readOnly || !activeDatabaseAllowed(),
+      title: caps()?.explainAnalyze === false ? "Not supported by this engine"
+        : conn()?.readOnly ? "Connection is read-only (EXPLAIN ANALYZE executes the statement)"
+        : !activeDatabaseAllowed() ? "This tab does not own the transaction" : undefined,
       onClick: () => runAction("explainAnalyze"),
     },
   ];
@@ -3761,11 +3820,15 @@ function App() {
                       if (owner) switchTab(owner);
                     } else doRun();
                   }}
-                  disabled={cancelling() || transaction().state === "lost"}
-                  title={running() ? "Cancel running query" : activeDatabaseAllowed() ? "Run selection or all" : "Switch to the transaction owner"}
+                  disabled={cancelling() || transaction().state === "lost" || (running() && caps()?.cancelQuery === false)}
+                  title={running()
+                    ? (caps()?.cancelQuery === false ? "This engine cannot cancel a running query" : "Cancel running query")
+                    : activeDatabaseAllowed() ? "Run selection or all" : "Switch to the transaction owner"}
                 >
                   {running()
-                    ? (cancelling() ? <><span class="spinner-sm" />Cancelling…</> : <>✕ Cancel {fmtDur(runMs())}</>)
+                    ? (cancelling() ? <><span class="spinner-sm" />Cancelling…</>
+                      : caps()?.cancelQuery === false ? <><span class="spinner-sm" />Running {fmtDur(runMs())}</>
+                      : <>✕ Cancel {fmtDur(runMs())}</>)
                     : transaction().state === "lost" ? "Reconnect required" : !activeDatabaseAllowed() ? "Go to transaction" : "Run ▶"}
                 </button>
                 <button class="ghost tb-text" onClick={openFileDialog}>Open</button>
@@ -4332,6 +4395,7 @@ function App() {
 
       {/* Update pill renders in both screens (connect + workspace). */}
       <UpdateBadge />
+      <WhatsNew />
 
       {/* Manual + Settings work on both screens (connect screen has its own buttons). */}
       <Show when={helpOpen()}>

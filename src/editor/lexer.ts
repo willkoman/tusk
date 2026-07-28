@@ -1,18 +1,26 @@
 // Byte-faithful TS port of the backend lexer in `src-tauri/src/script.rs`
-// (`split` / `dollar_tag_end`). One O(n) pass classifies every region of the doc
-// as code / string / quoted-identifier / comment / dollar-quoted body, and yields
-// semicolon-delimited statement spans. Everything downstream (auto-fold, the
-// heuristic + schema linters, the statement gutter) reads this — so SQL syntax
-// inside strings/comments/`$tag$…$tag$` bodies is never misinterpreted.
+// (`split_impl` / `dollar_tag_end`), including its per-engine branches: MySQL
+// `#` comments and whitespace-required `--`, MySQL backslash escapes inside
+// quotes, and MySQL/SQLite backtick identifiers. One O(n) pass classifies every
+// region of the doc as code / string / quoted-identifier / comment / dollar body
+// and yields semicolon-delimited statement spans. Everything downstream
+// (auto-fold, the heuristic + schema linters, the statement gutter, param
+// detection, grid wrapping) reads this — so SQL syntax inside strings, comments,
+// `$tag$…$tag$`, and backticks is never misinterpreted on any engine.
 //
 // Scope note: this drives editor *UI* only. The authoritative splitter for
-// execution and server-side validation stays `script::split` in Rust. We
-// deliberately skip the psql `\meta` and `COPY … FROM stdin` data-block handling
-// here — they don't affect folding/lint correctness and only matter when running.
+// execution and server-side validation stays `script::parse_for_engine` in Rust.
+// We deliberately skip the psql `\meta` and `COPY … FROM stdin` data-block
+// handling here — they don't affect folding/lint correctness and only matter
+// when running. Where Rust ERRORS (ambiguous `\'` / `\``), this lexer stays
+// lenient and consumes the pair; the execution boundary still rejects it.
 
 import { type EditorState } from "@codemirror/state";
+import { sqlDialect } from "../sql/ident";
 
-export type SpanKind = "code" | "string" | "dquote" | "line-comment" | "block-comment" | "dollar";
+export type SqlEngine = "postgres" | "duckdb" | "sqlite" | "mysql";
+
+export type SpanKind = "code" | "string" | "dquote" | "btick" | "line-comment" | "block-comment" | "dollar";
 
 export type Span = { from: number; to: number; kind: SpanKind };
 export type Stmt = { from: number; to: number; text: string };
@@ -57,10 +65,18 @@ export function dollarTagEnd(doc: string, i: number): number {
   return -1;
 }
 
-export function lex(doc: string): LexResult {
+const HASH = 35; // #
+const BACKSLASH = 92; // \
+const BTICK = 96; // `
+
+const isSpaceOrControl = (cc: number): boolean => cc <= 32 || cc === 127;
+
+export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine): LexResult {
   const n = doc.length;
   const spans: Span[] = [];
   const stmts: Stmt[] = [];
+  const mysql = engine === "mysql";
+  const bticks = mysql || engine === "sqlite";
   let i = 0;
   let codeStart = 0;
   let stmtStart = 0;
@@ -72,12 +88,49 @@ export function lex(doc: string): LexResult {
     const text = doc.slice(from, to);
     if (text.trim().length) stmts.push({ from, to, text });
   };
+  // Consume a quoted region ending at `quote`, honoring '' doubling and — on
+  // MySQL — backslash escape pairs (mirrors script.rs; `\'`/`\"` consumed
+  // leniently where Rust errors, since editor lexing cannot reject).
+  const quoted = (start: number, quote: number, kind: SpanKind) => {
+    pushCode(start);
+    i = start + 1;
+    while (i < n) {
+      const c = doc.charCodeAt(i);
+      if (mysql && c === BACKSLASH && i + 1 < n) {
+        i += 2;
+        continue;
+      }
+      if (c === quote) {
+        if (i + 1 < n && doc.charCodeAt(i + 1) === quote) {
+          i += 2;
+          continue;
+        }
+        i++;
+        break;
+      }
+      i++;
+    }
+    spans.push({ from: start, to: i, kind });
+    codeStart = i;
+  };
 
   while (i < n) {
     const cc = doc.charCodeAt(i);
 
-    // line comment  --…\n
-    if (cc === DASH && i + 1 < n && doc.charCodeAt(i + 1) === DASH) {
+    // line comment  --…\n  (MySQL requires whitespace/EOL after `--`: `1--2` is math)
+    if (
+      cc === DASH && i + 1 < n && doc.charCodeAt(i + 1) === DASH &&
+      (!mysql || i + 2 >= n || isSpaceOrControl(doc.charCodeAt(i + 2)))
+    ) {
+      pushCode(i);
+      const start = i;
+      while (i < n && doc.charCodeAt(i) !== NL) i++;
+      spans.push({ from: start, to: i, kind: "line-comment" });
+      codeStart = i;
+      continue;
+    }
+    // MySQL `#` comment runs to end-of-line (a `;` inside must not split statements)
+    if (mysql && cc === HASH) {
       pushCode(i);
       const start = i;
       while (i < n && doc.charCodeAt(i) !== NL) i++;
@@ -96,44 +149,19 @@ export function lex(doc: string): LexResult {
       codeStart = i;
       continue;
     }
-    // single-quoted string  '…'  ('' = escaped quote)
+    // single-quoted string  '…'  ('' = escaped quote; MySQL also \-escapes)
     if (cc === SQUOTE) {
-      pushCode(i);
-      const start = i;
-      i++;
-      while (i < n) {
-        if (doc.charCodeAt(i) === SQUOTE) {
-          if (i + 1 < n && doc.charCodeAt(i + 1) === SQUOTE) {
-            i += 2;
-            continue;
-          }
-          i++;
-          break;
-        }
-        i++;
-      }
-      spans.push({ from: start, to: i, kind: "string" });
-      codeStart = i;
+      quoted(i, SQUOTE, "string");
       continue;
     }
-    // double-quoted identifier  "…"  ("" = escaped quote)
+    // double-quoted identifier  "…"  ("" = escaped quote; MySQL also \-escapes)
     if (cc === DQUOTE) {
-      pushCode(i);
-      const start = i;
-      i++;
-      while (i < n) {
-        if (doc.charCodeAt(i) === DQUOTE) {
-          if (i + 1 < n && doc.charCodeAt(i + 1) === DQUOTE) {
-            i += 2;
-            continue;
-          }
-          i++;
-          break;
-        }
-        i++;
-      }
-      spans.push({ from: start, to: i, kind: "dquote" });
-      codeStart = i;
+      quoted(i, DQUOTE, "dquote");
+      continue;
+    }
+    // backtick identifier  `…`  (MySQL/SQLite; `` = escaped backtick)
+    if (bticks && cc === BTICK) {
+      quoted(i, BTICK, "btick");
       continue;
     }
     // dollar-quoted body  $tag$ … $tag$
@@ -179,16 +207,19 @@ export function lex(doc: string): LexResult {
 
 // Shared lex cache keyed on the immutable Text instance, so auto-fold, the fold
 // gutter, and the linters all reuse a single O(n) pass per document version.
-const lexCache = new WeakMap<object, LexResult>();
+// The engine participates in the key: connecting to a different driver with the
+// same document must re-lex (backticks/`#` mean different things).
+const lexCache = new WeakMap<object, { engine: SqlEngine; result: LexResult }>();
 
 export function lexState(state: EditorState): LexResult {
   const key = state.doc as unknown as object;
+  const engine = sqlDialect() as SqlEngine;
   let r = lexCache.get(key);
-  if (!r) {
-    r = lex(docString(state));
+  if (!r || r.engine !== engine) {
+    r = { engine, result: lex(docString(state), engine) };
     lexCache.set(key, r);
   }
-  return r;
+  return r.result;
 }
 
 // Full-document string, cached per immutable Text instance. CM's doc.toString()
@@ -236,9 +267,10 @@ export function maskNonCode(
   spans: Span[],
   from: number,
   to: number,
-  // Keep double-quoted identifiers (`"col"`) intact — they're names, not string
-  // literals. The schema linter needs them; the paren/heuristic linter does not (a `)`
-  // inside a quoted identifier would otherwise count as a real paren), so it stays false.
+  // Keep quoted identifiers (`"col"`, MySQL/SQLite `` `col` ``) intact — they're
+  // names, not string literals. The schema linter and grid editability need them;
+  // the paren/heuristic linter does not (a `)` inside a quoted identifier would
+  // otherwise count as a real paren), so it stays false.
   keepDquote = false,
 ): string {
   const arr = doc.slice(from, to).split("");
@@ -256,7 +288,7 @@ export function maskNonCode(
   for (let i = lo; i < spans.length; i++) {
     const s = spans[i];
     if (s.from >= to) break;
-    if (s.kind === "code" || (keepDquote && s.kind === "dquote")) continue;
+    if (s.kind === "code" || (keepDquote && (s.kind === "dquote" || s.kind === "btick"))) continue;
     const a = Math.max(s.from, from);
     const b = Math.min(s.to, to);
     for (let p = a; p < b; p++) {

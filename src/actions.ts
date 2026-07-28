@@ -64,7 +64,13 @@ export const ACTIONS: readonly ActionDef[] = [
   { id: "runStatement", title: "Run current statement", category: "Query", defaultKey: "Mod-Shift-Enter", scope: "editor", enabled: (c) => c.connected && c.canRunDatabase },
   { id: "explain", title: "Explain (plan)", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.connected && !c.running && c.canRunDatabase },
   { id: "explainAnalyze", title: "Explain Analyze (runs the statement)", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.connected && !c.running && c.canExplainAnalyze && c.canRunDatabase },
-  { id: "cancelQuery", title: "Cancel running query", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.running },
+  // Bound by default: this is the one action that must stay reachable while dialogs
+  // are up (see onWindowKey's allowlist) — shipping it mouse-only undercut that.
+  // Mod-based so it fires even while typing in the editor (bare chords are
+  // suppressed there) and inside dialogs (onWindowKey allowlists cancelQuery).
+  // NOT Mod-Escape: Ctrl+Esc is reserved by Windows (Start menu) and never
+  // reaches the app. Mod-F2 matches DataGrip's stop-query key.
+  { id: "cancelQuery", title: "Cancel running query", category: "Query", defaultKey: "Mod-F2", scope: "global", enabled: (c) => c.running },
   { id: "commitTransaction", title: "Commit current transaction unit", category: "Query", defaultKey: "Mod-Alt-c", scope: "global", enabled: (c) => c.canCommitTransaction },
   { id: "rollbackTransaction", title: "Rollback current transaction unit", category: "Query", defaultKey: "Mod-Alt-r", scope: "global", enabled: (c) => c.canRollbackTransaction },
   { id: "loadAllRows", title: "Load all rows", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.hasResult && c.canRunDatabase },
@@ -84,7 +90,9 @@ export const ACTIONS: readonly ActionDef[] = [
   { id: "openShortcuts", title: "Show keyboard shortcuts", category: "View", defaultKey: null, scope: "global" },
   { id: "openHelp", title: "Open manual", category: "View", defaultKey: "F1", scope: "global" },
   { id: "openHistory", title: "Toggle query history", category: "View", defaultKey: "Mod-Shift-h", scope: "global", enabled: (c) => c.connected },
-  { id: "openPalette", title: "Command palette", category: "View", defaultKey: "Mod-k", scope: "global" },
+  // The palette renders inside the connected workbench, so gate it honestly instead
+  // of letting Mod-k silently no-op on the connect screen.
+  { id: "openPalette", title: "Command palette", category: "View", defaultKey: "Mod-k", scope: "global", enabled: (c) => c.connected },
   { id: "toggleAi", title: "Toggle AI assistant", category: "View", defaultKey: null, scope: "global", enabled: (c) => c.connected },
 ];
 

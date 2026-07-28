@@ -683,6 +683,17 @@ select option { font-weight: 400; }
 
 /* --- built-in updater pill + panel (bottom-right, both screens) --- */
 .upd-root { position: fixed; right: 16px; bottom: 34px; z-index: 90; display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+/* What's-new sits in the same corner, stacked above the update pill so a
+   just-updated launch that also finds a newer release shows both. */
+.wn-root { position: fixed; right: 16px; bottom: 70px; z-index: 91; display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+.wn-panel { width: 380px; }
+.wn-body { max-height: 320px; overflow: auto; margin-bottom: 8px; }
+.wn-relhead { font-weight: 600; color: var(--accent); margin: 10px 0 2px; font-family: var(--mono); }
+.wn-grouphead { font-weight: 600; margin: 8px 0 2px; color: var(--text); }
+.wn-list { margin: 0 0 4px; padding-left: 18px; color: var(--muted); }
+.wn-list li { margin: 3px 0; }
+.wn-list strong { color: var(--text); }
+.wn-list code { font-family: var(--mono); background: rgba(var(--accent-rgb), 0.08); padding: 0 3px; border-radius: 3px; }
 .upd-pill {
   display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px;
   font-size: 12px; font-weight: 600; cursor: pointer;

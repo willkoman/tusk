@@ -53,7 +53,16 @@ describe("AI config normalization", () => {
       baseUrls: { openai: "https://example.test" },
       approvedOrigins: {},
       shareSamples: false,
+      maxTokens: 2048,
     });
+  });
+
+  it("normalizes maxTokens like the Slack pane (clamp + 256 snap, fallback on junk)", () => {
+    expect(normalizeAiConfig({ provider: "openai", maxTokens: 4096 }).maxTokens).toBe(4096);
+    expect(normalizeAiConfig({ provider: "openai", maxTokens: 300 }).maxTokens).toBe(256);
+    expect(normalizeAiConfig({ provider: "openai", maxTokens: 999999 }).maxTokens).toBe(128000);
+    expect(normalizeAiConfig({ provider: "openai", maxTokens: "junk" }).maxTokens).toBe(2048);
+    expect(normalizeAiConfig({ provider: "openai" }).maxTokens).toBe(2048);
   });
 
   it("never throws when storage is corrupt, unavailable, or full", () => {

@@ -254,15 +254,16 @@ pub fn ai_save_key(
         .map_err(|e| AppError::new(e.to_string()))
 }
 
-/// Whether a key is stored for a provider (the key itself is never returned).
+/// Whether a usable key is stored for a provider (the key itself is never returned).
+/// Always origin-bound: without an explicit base this checks the provider's shipped
+/// origin — a bare "does any key exist" answer would report Connected for a key that
+/// every actual request path (also origin-bound) refuses to send.
 #[tauri::command]
 pub fn ai_has_key(provider: String, base_url: Option<String>) -> bool {
-    match base_url.as_deref() {
-        Some(base) => get_key_for_origin(&provider, base).is_ok(),
-        None => key_entry(&provider)
-            .map(|e| e.get_password().is_ok())
-            .unwrap_or(false),
-    }
+    let endpoint = base_url.or_else(|| default_origin(&provider));
+    endpoint
+        .map(|base| get_key_for_origin(&provider, &base).is_ok())
+        .unwrap_or(false)
 }
 
 /// Remove a provider's stored key.
@@ -583,19 +584,23 @@ fn build_request(req: &AiRequest, key: &str) -> Result<WireRequest, AppError> {
                 .unwrap_or("https://api.anthropic.com");
             let url = endpoint_url(base, &["v1", "messages"], &[])?;
             let mut headers = vec![
-                ("x-api-key".to_string(), key.to_string()),
-                ("anthropic-version".into(), "2023-06-01".into()),
+                ("anthropic-version".to_string(), "2023-06-01".to_string()),
                 ("content-type".into(), "application/json".into()),
             ];
-            // Gateways that speak this shape authenticate PER ENDPOINT, not per gateway:
-            // OpenCode's `/v1/messages` reads `x-api-key` (like Anthropic proper) and
-            // ignores Bearer, while its `/v1/chat/completions` reads Bearer and ignores
-            // x-api-key — probed on both /zen and /zen/go. So x-api-key above already
-            // covers OpenCode. Other Anthropic-shaped proxies read Bearer instead; send
-            // it too when this isn't Anthropic proper. Unknown auth headers are ignored
-            // (they yield "Missing API key", not a 400), so the extra header is safe.
-            if req.provider != "anthropic" {
-                headers.push(("authorization".into(), format!("Bearer {key}")));
+            // Keyless local endpoints get NO auth headers — same rule as the OpenAI
+            // wires: some servers reject an empty credential outright.
+            if !key.is_empty() {
+                headers.push(("x-api-key".into(), key.to_string()));
+                // Gateways that speak this shape authenticate PER ENDPOINT, not per gateway:
+                // OpenCode's `/v1/messages` reads `x-api-key` (like Anthropic proper) and
+                // ignores Bearer, while its `/v1/chat/completions` reads Bearer and ignores
+                // x-api-key — probed on both /zen and /zen/go. So x-api-key above already
+                // covers OpenCode. Other Anthropic-shaped proxies read Bearer instead; send
+                // it too when this isn't Anthropic proper. Unknown auth headers are ignored
+                // (they yield "Missing API key", not a 400), so the extra header is safe.
+                if req.provider != "anthropic" {
+                    headers.push(("authorization".into(), format!("Bearer {key}")));
+                }
             }
             let msgs: Vec<_> = req
                 .messages
@@ -625,10 +630,10 @@ fn build_request(req: &AiRequest, key: &str) -> Result<WireRequest, AppError> {
             );
             let action = format!("{model}:streamGenerateContent");
             let url = endpoint_url(&base, &["models", &action], &[("alt", "sse")])?;
-            let headers = vec![
-                ("x-goog-api-key".to_string(), key.to_string()),
-                ("content-type".into(), "application/json".into()),
-            ];
+            let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
+            if !key.is_empty() {
+                headers.push(("x-goog-api-key".into(), key.to_string()));
+            }
             let contents: Vec<_> = req
                 .messages
                 .iter()
@@ -766,12 +771,18 @@ pub async fn ai_list_models(
         Err(_) if allow_no_key => String::new(),
         Err(e) => return Err(e),
     };
+    // Keyless endpoints get no empty credential header on ANY wire (same rule as
+    // `build_request` — some servers reject a blank credential outright).
     let headers: Vec<(String, String)> = match header_kind {
-        Wire::Anthropic => vec![
+        Wire::Anthropic if !key.is_empty() => vec![
             ("x-api-key".into(), key.clone()),
             ("anthropic-version".into(), "2023-06-01".into()),
         ],
-        Wire::Gemini => vec![("x-goog-api-key".to_string(), key.clone())],
+        Wire::Anthropic => vec![("anthropic-version".into(), "2023-06-01".into())],
+        Wire::Gemini if !key.is_empty() => {
+            vec![("x-goog-api-key".to_string(), key.clone())]
+        }
+        Wire::Gemini => Vec::new(),
         Wire::Openai | Wire::Responses if !key.is_empty() => {
             vec![("authorization".to_string(), format!("Bearer {key}"))]
         }

@@ -4,6 +4,22 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-28
+
+### Added
+- **"What's new" after every update.** The first launch on a new version pops a panel bottom-right listing everything that changed since the version you were on (all skipped releases included), fed by the bundled changelog — exact for the running build, works offline. Dismiss once and it stays gone until the next update; fresh installs see nothing. GitHub release notes are now published from the same changelog section, so the story is identical in-app and on the releases page.
+- **AI reply max tokens is configurable on the desktop, not just Slack.** Settings → AI gains the same "AI reply max tokens" control the Slack pane has (256–128,000, snapped to 256); the panel previously hardcoded 2,048. Both surfaces share one normalization.
+- **Cancel is honest per engine.** New `cancelQuery` capability: on engines with no out-of-band cancel (SQLite, MySQL, DuckDB on Windows) the Run button shows a running timer instead of a Cancel that can't work, and a rejected cancel now resets the button and reports why instead of wedging "Cancelling…" forever. Cancel also gets a default shortcut (Mod-F2 — Ctrl+Esc is reserved by Windows) that works while typing and while dialogs are open.
+
+### Changed
+- **The editor lexer is engine-aware, like execution.** On MySQL, `#` comments and `--` without trailing whitespace lex correctly, backslash escapes inside quotes are honored, and backtick identifiers (MySQL/SQLite) are first-class — so statement splitting, "Run current statement", auto-fold, linting, parameter detection, and grid sort/filter no longer mis-read MySQL/SQLite SQL. Bare-name ambiguity in autocomplete AND schema-lint now resolves through the tab's active schema then `public` (one shared resolver), so the linter can't flag a table completion just offered.
+- **Every server execution is in history.** Explorer right-click DDL records a `-- [Explorer]` entry (and surfaces its result/error even with the results panel collapsed); a full-query file export records `-- [Export]` with the destination; both match the existing `-- [Slack]` audit convention.
+- **Grid copy = export bytes.** "Copy as CSV/TSV/JSON/Markdown" now uses the same formatter as Export→Clipboard/file: empty strings stay quoted (`""`) and distinguishable from NULL, JSON matches the Rust-parity shape, and Markdown always includes its header row.
+- **Slack exports match the desktop.** TSV and SQL-insert buttons join CSV/Excel/JSON/Markdown (the stored result already carries its source dialect), and attachments are named after the queried table instead of a pile of identical `result.csv`s.
+- **Comma-for-AND typos get an instant squiggle.** `WHERE a = 1, b = 2` (invalid in every engine) is flagged as-you-type by the offline linter, with legit commas (IN lists, row constructors, function arguments, SET lists, nested subqueries) untouched. This closes a real gap: the server linter is deliberately paused while a result stream is open (validation would roll back the live cursor), and this class of error previously had no other detector.
+- **Settings failures are loud everywhere.** Editor/grid preference and keyboard-shortcut saves report storage failures like the AI/Slack panes do, instead of silently reverting on the next launch.
+- **Cross-surface consistency fixes.** Drop database now respects the same gate as every other Explorer DDL action (manual-transaction freeze, read-only, driver support) plus a DuckDB block; Explain Analyze is pre-gated on read-only connections like the rest of the mutating surfaces; the Slack bot samples up to 5 relevant tables matching the desktop panel (was 3); keyboard shortcuts for Shortcuts settings work on the connect screen and the command palette is honestly disabled there; `ai_has_key` is origin-bound in every arm; keyless AI endpoints no longer receive empty credential headers on any wire (chat and model-list alike).
+
 ## [0.9.0] - 2026-07-27
 
 ### Fixed

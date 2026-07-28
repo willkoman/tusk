@@ -8,9 +8,10 @@ import type { SortKey, Filter } from "../tabs";
 function queryShape(q: string): { inner: string; masked: string; safe: boolean } {
   const trimmed = q.trim();
   if (!trimmed) return { inner: "", masked: "", safe: false };
+  // The lexer is engine-aware (backticks/`#` comments mask as non-code on
+  // MySQL/SQLite), so no post-hoc backtick patching is needed here.
   const { spans } = lex(trimmed);
-  const masked = maskNonCode(trimmed, spans, 0, trimmed.length)
-    .replace(/`(?:[^`]|``)*`/g, (identifier) => " ".repeat(identifier.length));
+  const masked = maskNonCode(trimmed, spans, 0, trimmed.length);
   const semis = [...masked.matchAll(/;/g)].map((m) => m.index!);
   if (semis.length > 1) return { inner: trimmed, masked, safe: false };
   if (semis.length === 1 && masked.slice(semis[0] + 1).trim())

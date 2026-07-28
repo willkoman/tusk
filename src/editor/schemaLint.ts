@@ -71,6 +71,9 @@ export function schemaDiagnostics(
   stmts: Stmt[],
   idx: Index,
   funcs: ReadonlySet<string>,
+  // The tab's active schema: bare-name ambiguity resolves through it (then
+  // public), matching both completion and the server's search_path.
+  activeSchema: string | null = null,
 ): SchemaDiag[] {
   if (doc.length > LIVE_ANALYSIS_MAX_CHARS) return [];
   if (idx.tables.length > SCHEMA_LINT_TABLE_LIMIT || idx.schemas.length > SCHEMA_LINT_TABLE_LIMIT) return [];
@@ -119,7 +122,7 @@ export function schemaDiagnostics(
       while (after < masked.length && /\s/.test(masked[after])) after++;
       if (masked[after] === "(") continue;
       const ref = aliases.get(alias.toLowerCase()) ?? alias;
-      const t = tableByRef(idx, ref);
+      const t = tableByRef(idx, ref, activeSchema);
       if (!t || cte.has(alias.toLowerCase())) continue;
       const tableColumns = columnsOf(t);
       if (tableColumns.lower.has(col.toLowerCase())) continue;
@@ -140,7 +143,7 @@ export function schemaDiagnostics(
       const raw = m[1];
       const name = strip(raw);
       sawTable = true;
-      if (tableByRef(idx, name)) continue;
+      if (tableByRef(idx, name, activeSchema)) continue;
       const parts = name.split(".");
       const bare = parts[parts.length - 1].toLowerCase();
       if (cte.has(bare)) {
@@ -207,7 +210,7 @@ export function schemaDiagnostics(
     let scopeTooLarge = false;
     if (fullMode) {
       for (const ref of new Set(aliases.values())) {
-        const t = tableByRef(idx, ref);
+        const t = tableByRef(idx, ref, activeSchema);
         if (!t) continue;
         for (const c of t.columns) {
           const lc = c.name.toLowerCase();
@@ -296,7 +299,11 @@ function replaceAction(from: number, to: number, text: string) {
 }
 
 /** CodeMirror wrapper: live schema + function catalog in, Diagnostics out. */
-export function schemaLintSource(getSchema: () => Table[], getFuncs: () => ReadonlySet<string>) {
+export function schemaLintSource(
+  getSchema: () => Table[],
+  getFuncs: () => ReadonlySet<string>,
+  getActiveSchema: () => string | null = () => null,
+) {
   const indexOf = makeIndexer();
   return (view: EditorView): Diagnostic[] => {
     if (view.state.doc.length > LIVE_ANALYSIS_MAX_CHARS) return [];
@@ -311,7 +318,7 @@ export function schemaLintSource(getSchema: () => Table[], getFuncs: () => Reado
     const idx = indexOf(tables);
     const { spans, stmts } = lexState(view.state);
     const doc = docString(view.state);
-    return schemaDiagnostics(doc, spans, stmts, idx, getFuncs()).map((d) => ({
+    return schemaDiagnostics(doc, spans, stmts, idx, getFuncs(), getActiveSchema()).map((d) => ({
       from: d.from,
       to: d.to,
       severity: "warning" as const,

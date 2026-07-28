@@ -1891,7 +1891,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Every result carries **Export as… CSV / Excel / JSON / Markdown** buttons — results stay exportable for **15 minutes** (8 most recent kept), a click uploads the file in-thread. Export clicks aren't requester-gated (the data is already channel-visible), but channel/user allowlists still apply."
+        "md": "Every result carries **Export as… CSV / TSV / Excel / JSON / SQL / Markdown** buttons — results stay exportable for **15 minutes** (8 most recent kept), a click uploads the file in-thread named after the queried table. Export clicks are requester-only, and channel/user allowlists still apply."
       },
       {
         "k": "h",
@@ -2761,7 +2761,7 @@ export const TOPICS: Topic[] = [
           "DM or `@mention` the bot with a question → the AI proposes SQL with **Approve / Reject** buttons. Only the requester can click; proposals expire after 5 minutes.",
           "Approved queries are **read-only by construction**: one wrappable read, mutation/output/lock scans, executable-comment rejection, a conservative deterministic-function allowlist, a hard row cap, and a fresh engine-enforced read-only backend — layered guards, never prompt-only (see [[topic:safety|Safety]]).",
           "Results reply in-thread as an inline table, CSV/XLSX attachment, or a **chart rendered fully locally** (plotters → PNG, embedded font — nothing leaves your machine). Ask explicitly (\"as a bar chart, months on x\") and the AI's chart spec controls type, axes, and series; date+numeric results auto-chart too (Settings toggle, default on).",
-          "Every result carries **Export as… CSV / Excel / JSON / Markdown** buttons (results cached 15 minutes).",
+          "Every result carries **Export as… CSV / TSV / Excel / JSON / SQL / Markdown** buttons (results cached 15 minutes; requester-only).",
           "Every approved run lands in [[topic:history|query history]] with a `-- [Slack] asked by <user>` marker.",
           "Configure in **Settings → Slack** — tokens go to the OS keychain; the statusbar shows a live 🟢 Slack badge.",
           "Fixed: DuckDB `CAST(timestamptz_col AS DATE)` no longer fails with \"Unimplemented type for cast\" — the ICU extension now loads on every connection."

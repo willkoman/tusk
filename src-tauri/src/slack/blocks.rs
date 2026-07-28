@@ -103,10 +103,14 @@ pub fn error_card(message: &str) -> Value {
 }
 
 /// The export formats offered on every result: (button label, ExportOptions format id).
-pub const EXPORT_FORMATS: [(&str, &str); 4] = [
+/// Parity with the desktop export dialog (`src/export.ts`) minus none — the stored
+/// result carries its dialect, so SQL inserts are fully correct here too.
+pub const EXPORT_FORMATS: [(&str, &str); 6] = [
     ("CSV", "csv"),
+    ("TSV", "tsv"),
     ("Excel", "xlsx"),
     ("JSON", "json"),
+    ("SQL", "sql"),
     ("Markdown", "markdown"),
 ];
 
@@ -174,7 +178,8 @@ mod tests {
         let actions = v.as_array().unwrap().last().unwrap();
         assert_eq!(actions["type"], "actions");
         assert_eq!(actions["elements"][0]["value"], "export:csv:res-7");
-        assert_eq!(actions["elements"][1]["value"], "export:xlsx:res-7");
+        assert_eq!(actions["elements"][1]["value"], "export:tsv:res-7");
+        assert_eq!(actions["elements"][4]["value"], "export:sql:res-7");
         // Without a stored result there are no buttons.
         let bare = result_card("a", "1 row", None);
         assert_eq!(bare.as_array().unwrap().len(), 2);

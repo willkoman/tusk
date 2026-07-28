@@ -77,6 +77,18 @@ describe("editTarget", () => {
     expect(editTarget("SELECT * FROM public.users", ambiguous)).toMatchObject({ ok: false });
   });
 
+  it("an active schema resolves bare ambiguity the way the pinned search_path does", () => {
+    const dup = buildIndex([
+      { schema: "public", name: "orders", columns: [{ name: "id", data_type: "int" }] },
+      { schema: "sales", name: "orders", columns: [{ name: "id", data_type: "int" }] },
+    ]);
+    // No active schema → the server default search_path is unknowable → refuse.
+    expect(editTarget("SELECT * FROM orders", dup)).toMatchObject({ ok: false });
+    // Active schema set → search_path is `<schema>, public` → deterministic.
+    expect(editTarget("SELECT * FROM orders", dup, "sales")).toMatchObject({ ok: true, table: { schema: "sales" } });
+    expect(editTarget("SELECT * FROM orders", dup, "audit")).toMatchObject({ ok: true, table: { schema: "public" } });
+  });
+
   it("rejects expressions/aliases in the select list (wrong-row hazard)", () => {
     // `id*2 AS id` would make the commit WHERE clause target the wrong row.
     for (const q of [

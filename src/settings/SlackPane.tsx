@@ -6,7 +6,7 @@
 import { Show, createSignal, onCleanup, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { activeBaseUrl, aiStore, defaultModel, isKeyless, resolveBaseUrl, resolveWire, type AiConfig } from "../ai/store";
+import { activeBaseUrl, aiStore, defaultModel, isKeyless, normalizeMaxTokens, resolveBaseUrl, resolveWire, type AiConfig } from "../ai/store";
 
 export type SlackConfig = {
   enabled: boolean;
@@ -50,11 +50,8 @@ export const DEFAULT_CONFIG: SlackConfig = {
 
 const errMsg = (e: unknown): string => (e as { message?: string })?.message ?? String(e);
 
-export const normalizeSlackMaxTokens = (raw: string | number, fallback = 2048): number => {
-  const parsed = typeof raw === "number" ? raw : Number(raw);
-  const finite = Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-  return Math.round(Math.max(256, Math.min(128000, finite)) / 256) * 256;
-};
+/** One normalization for every AI surface — see `normalizeMaxTokens` in ai/store.ts. */
+export const normalizeSlackMaxTokens = normalizeMaxTokens;
 
 /** Normalize newly-added privacy/token fields when loading older config documents. */
 export const normalizeSlackConfig = (raw?: Partial<SlackConfig> | null): SlackConfig => ({
