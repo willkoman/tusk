@@ -1,0 +1,245 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0e1116; --panel: #161b22; --panel-2: #1b212b;
+    --border: #242c38; --border-hover: #36506e;
+    --text: #d7dde5; --muted: #8b97a6;
+    --accent: #3b82f6; --accent-2: #2dd4bf;
+    --danger: #f87171; --ok: #3fb950; --warn: #e6b450;
+    --accent-soft: rgba(59,130,246,0.16);
+    --zebra: rgba(148,163,184,0.055);
+    --tok-kw: #c792ea; --tok-type: #2dd4bf; --tok-fn: #82aaff;
+    --tok-str: #c3e88d; --tok-qid: #ffcb6b; --tok-num: #f78c6c; --tok-com: #6b7684;
+    --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  }
+  html, body { width: 1400px; height: 860px; overflow: hidden; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  /* title bar / tab strip */
+  .tabs {
+    display: flex; align-items: center; gap: 2px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    padding: 6px 8px 0; height: 36px;
+  }
+  .tab {
+    display: flex; align-items: center; gap: 7px;
+    padding: 6px 12px; border-radius: 6px 6px 0 0;
+    color: var(--muted); font-size: 12.5px; cursor: default;
+    border: 1px solid transparent; border-bottom: none;
+  }
+  .tab.active {
+    background: var(--bg); color: var(--text);
+    border-color: var(--border);
+  }
+  .tab .x { color: var(--muted); font-size: 11px; opacity: .6; }
+  .tab.active .x { opacity: 1; }
+  .conn-pill {
+    margin-left: auto; display: flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--muted); padding-bottom: 6px;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+
+  .main { flex: 1; display: flex; min-height: 0; }
+
+  /* sidebar */
+  .sidebar {
+    width: 240px; background: var(--panel); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; padding: 8px;
+  }
+  .side-title {
+    font-size: 11px; font-weight: 600; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--muted); padding: 4px 6px 8px;
+  }
+  .tree { font-size: 12.5px; line-height: 1.9; overflow: hidden; }
+  .node { display: flex; align-items: center; gap: 6px; padding: 1px 6px; border-radius: 4px; white-space: nowrap; }
+  .node.sel { background: var(--accent-soft); }
+  .caret { color: var(--muted); font-size: 9px; width: 10px; display: inline-block; }
+  .ico { width: 14px; text-align: center; font-size: 11px; }
+  .badge {
+    font-size: 9px; padding: 0 4px; border-radius: 3px; margin-left: 2px;
+    background: var(--accent-soft); color: var(--accent); font-family: var(--mono);
+  }
+  .badge.fk { background: rgba(45,212,191,.15); color: var(--accent-2); }
+  .child { padding-left: 22px; color: var(--muted); }
+  .child .col-type { margin-left: auto; font-family: var(--mono); font-size: 10.5px; opacity: .75; }
+
+  /* work area */
+  .work { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+  /* editor */
+  .editor {
+    height: 300px; border-bottom: 1px solid var(--border);
+    display: flex; font-family: var(--mono); font-size: 13px; line-height: 1.7;
+    background: var(--bg);
+  }
+  .gutter {
+    width: 44px; text-align: right; padding: 10px 10px 10px 0;
+    color: #4b5566; user-select: none; flex-shrink: 0; position: relative;
+  }
+  .gutter .ln { position: relative; }
+  .gutter .run {
+    position: absolute; left: 6px; color: var(--accent); font-size: 10px;
+    opacity: .9;
+  }
+  .code { padding: 10px 16px 10px 6px; white-space: pre; overflow: hidden; }
+  .kw { color: var(--tok-kw); } .fn { color: var(--tok-fn); }
+  .str { color: var(--tok-str); } .num { color: var(--tok-num); }
+  .com { color: var(--tok-com); font-style: italic; } .qid { color: var(--tok-qid); }
+  .cur-line { background: rgba(148,163,184,0.06); display: block; }
+  .caret-blink { display: inline-block; width: 2px; height: 15px; background: var(--accent); vertical-align: -2px; }
+
+  /* autocomplete popup */
+  .ac-wrap { position: relative; }
+  .ac {
+    position: absolute; top: 128px; left: 210px; width: 260px;
+    background: var(--panel-2); border: 1px solid var(--border-hover);
+    border-radius: 8px; box-shadow: 0 16px 48px rgba(0,0,0,.5);
+    padding: 4px; font-size: 12px; z-index: 5;
+  }
+  .ac .item { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 5px; }
+  .ac .item.sel { background: var(--accent-soft); }
+  .ac .kind { font-size: 9.5px; width: 14px; text-align: center; color: var(--tok-type); font-family: var(--mono); }
+  .ac .meta { margin-left: auto; color: var(--muted); font-size: 10.5px; font-family: var(--mono); }
+
+  /* toolbar between editor and grid */
+  .toolbar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 12px; background: var(--panel); border-bottom: 1px solid var(--border);
+    font-size: 12px; color: var(--muted);
+  }
+  .btn {
+    display: flex; align-items: center; gap: 5px;
+    padding: 4px 10px; border-radius: 5px; border: 1px solid var(--border);
+    background: var(--panel-2); color: var(--text); font-size: 12px;
+  }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .toolbar .spacer { flex: 1; }
+
+  /* grid */
+  .grid { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  th {
+    text-align: left; font-weight: 600; font-size: 11.5px;
+    padding: 7px 12px; background: var(--panel); color: var(--text);
+    border-bottom: 1px solid var(--border); position: sticky;
+  }
+  th .sort { color: var(--accent); font-size: 10px; margin-left: 4px; }
+  th .pk { color: var(--warn); font-size: 10px; margin-right: 4px; }
+  td {
+    padding: 5px 12px; border-bottom: 1px solid var(--border);
+    font-family: var(--mono); font-size: 12px; white-space: nowrap;
+  }
+  tr:nth-child(even) td { background: var(--zebra); }
+  td.num { text-align: right; color: var(--tok-num); }
+  td.null { color: var(--muted); font-style: italic; }
+  td.edit { background: rgba(230,180,80,.12); box-shadow: inset 0 0 0 1px rgba(230,180,80,.5); }
+  td .str-v { color: var(--text); }
+
+  /* status bar */
+  .status {
+    display: flex; align-items: center; gap: 16px;
+    background: var(--panel); border-top: 1px solid var(--border);
+    padding: 5px 14px; font-size: 11.5px; color: var(--muted);
+  }
+  .status .ok { color: var(--ok); }
+  .status .right { margin-left: auto; display: flex; gap: 16px; }
+</style>
+</head>
+<body>
+
+<div class="tabs">
+  <div class="tab active"><span>🐘</span> analytics.sql <span class="x">×</span></div>
+  <div class="tab"><span>📄</span> monthly-report.sql <span class="x">×</span></div>
+  <div class="tab"><span>📄</span> scratch <span class="x">×</span></div>
+  <div class="conn-pill"><span class="dot"></span> warehouse · postgres@db.internal:5432</div>
+</div>
+
+<div class="main">
+  <div class="sidebar">
+    <div class="side-title">warehouse</div>
+    <div class="tree">
+      <div class="node"><span class="caret">▾</span><span class="ico">🗂</span> public</div>
+      <div class="node" style="padding-left:22px"><span class="caret">▾</span><span class="ico">📋</span> orders</div>
+      <div class="node child"><span>id</span><span class="badge">PK</span><span class="col-type">bigint</span></div>
+      <div class="node child"><span>user_id</span><span class="badge fk">FK</span><span class="col-type">bigint</span></div>
+      <div class="node child"><span>status</span><span class="col-type">text</span></div>
+      <div class="node child"><span>total</span><span class="col-type">numeric</span></div>
+      <div class="node child"><span>created_at</span><span class="col-type">timestamptz</span></div>
+      <div class="node sel" style="padding-left:22px"><span class="caret">▸</span><span class="ico">📋</span> users</div>
+      <div class="node" style="padding-left:22px"><span class="caret">▸</span><span class="ico">📋</span> products</div>
+      <div class="node" style="padding-left:22px"><span class="caret">▸</span><span class="ico">📋</span> order_items</div>
+      <div class="node" style="padding-left:22px"><span class="caret">▸</span><span class="ico">👁</span> revenue_by_month</div>
+    </div>
+  </div>
+
+  <div class="work">
+    <div class="editor">
+      <div class="gutter">
+        <div class="ln"><span class="run">▶</span>1</div>
+        <div class="ln">2</div>
+        <div class="ln">3</div>
+        <div class="ln">4</div>
+        <div class="ln">5</div>
+        <div class="ln">6</div>
+        <div class="ln">7</div>
+        <div class="ln">8</div>
+      </div>
+      <div class="code"><span class="com">-- top customers by lifetime value</span>
+<span class="kw">SELECT</span> u.email,
+       <span class="fn">count</span>(o.id)  <span class="kw">AS</span> orders,
+       <span class="fn">sum</span>(o.total) <span class="kw">AS</span> lifetime_value
+<span class="kw">FROM</span> orders o
+<span class="kw">JOIN</span> users u <span class="kw">ON</span> o.user_id = u.id
+<span class="kw">WHERE</span> o.status = <span class="str">'paid'</span>
+<span class="kw">GROUP BY</span> <span class="num">1</span>
+<span class="kw">ORDER BY</span> lifetime_value <span class="kw">DESC</span>
+<span class="kw">LIMIT</span> <span class="num">10</span>;</div>
+    </div>
+
+    <div class="toolbar">
+      <div class="btn primary">▶ Run</div>
+      <div class="btn">⏹ Cancel</div>
+      <div class="btn">⇓ Load all</div>
+      <span style="color:var(--ok)">✓ 10 rows in 42 ms</span>
+      <div class="spacer"></div>
+      <span>🔒 read-write · txn idle</span>
+    </div>
+
+    <div class="grid">
+      <table>
+        <tr><th>#</th><th>email</th><th style="text-align:right">orders</th><th style="text-align:right">lifetime_value</th></tr>
+        <tr><td class="num">1</td><td class="str-v">priya.nair@acme.io</td><td class="num">47</td><td class="num">18,204.50</td></tr>
+        <tr><td class="num">2</td><td class="str-v">tom.okafor@brightline.com</td><td class="num">39</td><td class="num edit">15,987.25</td></tr>
+        <tr><td class="num">3</td><td class="str-v">lena.fischer@nordwind.de</td><td class="num">35</td><td class="num">12,440.00</td></tr>
+        <tr><td class="num">4</td><td class="str-v">marco.rossi@venetia.it</td><td class="num">31</td><td class="num">11,093.75</td></tr>
+        <tr><td class="num">5</td><td class="str-v">aisha.diallo@sahel.co</td><td class="num">28</td><td class="num">9,812.00</td></tr>
+        <tr><td class="num">6</td><td class="str-v">kenji.sato@tokyoworks.jp</td><td class="num">24</td><td class="num">8,455.20</td></tr>
+        <tr><td class="num">7</td><td class="str-v">sofia.reyes@andina.pe</td><td class="num">21</td><td class="num">7,299.90</td></tr>
+        <tr><td class="num">8</td><td class="str-v">j.lindqvist@fjaril.se</td><td class="num">19</td><td class="num">6,120.00</td></tr>
+        <tr><td class="num">9</td><td class="str-v">grace.mbeki@zambezi.zw</td><td class="num null">NULL</td><td class="num">5,874.30</td></tr>
+        <tr><td class="num">10</td><td class="str-v">ivan.petrov@volga.ru</td><td class="num">15</td><td class="num">4,510.00</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="status">
+  <span class="ok">● connected</span>
+  <span>PostgreSQL 16.3</span>
+  <span>statement 1 of 1</span>
+  <div class="right">
+    <span>⏱ 42 ms</span>
+    <span>10 rows · page 1</span>
+    <span>Ctrl+Enter to run</span>
+  </div>
+</div>
+
+</body>
+</html>

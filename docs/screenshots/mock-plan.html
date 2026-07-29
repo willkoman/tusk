@@ -1,0 +1,154 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0e1116; --panel: #161b22; --panel-2: #1b212b;
+    --border: #242c38; --border-hover: #36506e;
+    --text: #d7dde5; --muted: #8b97a6;
+    --accent: #3b82f6; --accent-2: #2dd4bf;
+    --ok: #3fb950; --warn: #e6b450;
+    --accent-soft: rgba(59,130,246,0.16);
+    --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  }
+  html, body { width: 1400px; height: 860px; overflow: hidden; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  .head {
+    display: flex; align-items: center; gap: 10px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    padding: 8px 14px;
+  }
+  .head h1 { font-size: 13px; font-weight: 600; }
+  .chip {
+    font-size: 11px; padding: 2px 8px; border-radius: 10px;
+    background: var(--accent-soft); color: var(--accent);
+  }
+  .legend { margin-left: auto; display: flex; gap: 12px; font-size: 11px; color: var(--muted); align-items: center; }
+  .grad { width: 90px; height: 8px; border-radius: 4px;
+    background: linear-gradient(90deg, #64748b, #eab308, #ef4444); }
+
+  .canvas { flex: 1; position: relative; overflow: hidden;
+    background-image: radial-gradient(rgba(148,163,184,.12) 1px, transparent 1px);
+    background-size: 22px 22px; }
+
+  svg.edges { position: absolute; inset: 0; width: 100%; height: 100%; }
+
+  .node {
+    position: absolute; width: 230px;
+    background: var(--panel-2); border: 1px solid var(--border-hover);
+    border-radius: 8px; overflow: hidden;
+    box-shadow: 0 10px 30px rgba(0,0,0,.35);
+  }
+  .node .bar { height: 4px; }
+  .node .body { padding: 8px 12px 9px; }
+  .node .name { font-family: var(--mono); font-size: 12.5px; font-weight: 600; }
+  .node .stats { display: flex; gap: 10px; margin-top: 5px; font-size: 10.5px; color: var(--muted); font-family: var(--mono); }
+  .node .self { margin-top: 6px; font-size: 10.5px; font-family: var(--mono); color: var(--text); }
+  .node .selfbar { height: 4px; border-radius: 2px; margin-top: 3px; background: var(--border); position: relative; overflow: hidden; }
+  .node .selfbar i { position: absolute; inset: 0; right: auto; border-radius: 2px; }
+  .node .filter { margin-top: 6px; font-size: 10px; color: var(--muted); font-family: var(--mono);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* side details panel */
+  .details {
+    position: absolute; right: 16px; top: 16px; width: 250px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px 14px; font-size: 12px;
+    box-shadow: 0 16px 48px rgba(0,0,0,.4);
+  }
+  .details h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 8px; }
+  .details .k { color: var(--muted); }
+  .details .row { display: flex; justify-content: space-between; padding: 3px 0; font-family: var(--mono); font-size: 11.5px; }
+  .hot { color: #ef4444; font-weight: 600; }
+
+  .hint { position: absolute; left: 16px; bottom: 14px; font-size: 11px; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<div class="head">
+  <h1>EXPLAIN ANALYZE</h1>
+  <span class="chip">PostgreSQL 16.3</span>
+  <span style="color:var(--muted);font-size:12px">SELECT … FROM orders JOIN users …</span>
+  <div class="legend">
+    <span>self time</span><span class="grad"></span><span>cold → hot</span>
+    <span style="margin-left:8px">color: <b>self time</b></span>
+  </div>
+</div>
+
+<div class="canvas">
+  <svg class="edges">
+    <path d="M 400 138 C 400 170, 250 180, 250 210" stroke="#3b82f6" stroke-width="2" fill="none" opacity=".55"/>
+    <path d="M 400 138 C 400 170, 560 180, 560 210" stroke="#3b82f6" stroke-width="2" fill="none" opacity=".55"/>
+    <path d="M 250 348 C 250 380, 250 390, 250 420" stroke="#3b82f6" stroke-width="2" fill="none" opacity=".55"/>
+  </svg>
+
+  <div class="node" style="left:285px; top:60px">
+    <div class="bar" style="background:#eab308"></div>
+    <div class="body">
+      <div class="name">Hash Join</div>
+      <div class="stats"><span>rows 1,204,411</span><span>loops 1</span></div>
+      <div class="self">self 312.4 ms · total 1,842.9 ms</div>
+      <div class="selfbar"><i style="width:38%;background:#eab308"></i></div>
+      <div class="filter">Hash Cond: (o.user_id = u.id)</div>
+    </div>
+  </div>
+
+  <div class="node" style="left:135px; top:210px">
+    <div class="bar" style="background:#ef4444"></div>
+    <div class="body">
+      <div class="name">Seq Scan on orders o</div>
+      <div class="stats"><span>rows 4,987,220</span><span>loops 1</span></div>
+      <div class="self hot">self 1,389.2 ms · total 1,402.7 ms</div>
+      <div class="selfbar"><i style="width:96%;background:#ef4444"></i></div>
+      <div class="filter">Filter: (status = 'paid'::text) — rows removed 2,113,804</div>
+    </div>
+  </div>
+
+  <div class="node" style="left:445px; top:210px">
+    <div class="bar" style="background:#64748b"></div>
+    <div class="body">
+      <div class="name">Hash</div>
+      <div class="stats"><span>rows 82,144</span><span>loops 1</span></div>
+      <div class="self">self 61.3 ms · total 128.0 ms</div>
+      <div class="selfbar"><i style="width:9%;background:#64748b"></i></div>
+      <div class="filter">Buckets 131072 · Batches 1 · Memory 5,108 kB</div>
+    </div>
+  </div>
+
+  <div class="node" style="left:135px; top:420px">
+    <div class="bar" style="background:#64748b"></div>
+    <div class="body">
+      <div class="name">Index Scan on users u</div>
+      <div class="stats"><span>rows 82,144</span><span>loops 1</span></div>
+      <div class="self">self 66.7 ms · total 66.7 ms</div>
+      <div class="selfbar"><i style="width:10%;background:#64748b"></i></div>
+      <div class="filter">Index: users_pkey</div>
+    </div>
+  </div>
+
+  <div class="details">
+    <h2>Node details</h2>
+    <div class="row"><span class="k">Node</span><span>Seq Scan</span></div>
+    <div class="row"><span class="k">Relation</span><span>orders</span></div>
+    <div class="row"><span class="k">Startup</span><span>0.00 ms</span></div>
+    <div class="row"><span class="k">Total</span><span class="hot">1,402.7 ms</span></div>
+    <div class="row"><span class="k">Rows</span><span>4,987,220</span></div>
+    <div class="row"><span class="k">Width</span><span>48 B</span></div>
+    <div class="row"><span class="k">% of query</span><span class="hot">76%</span></div>
+    <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border);color:var(--muted);font-size:11px">
+      💡 76% of query time — consider an index on <span style="font-family:var(--mono)">orders(status)</span>.
+    </div>
+  </div>
+
+  <div class="hint">scroll to zoom · drag to pan · click a node to collapse</div>
+</div>
+
+</body>
+</html>

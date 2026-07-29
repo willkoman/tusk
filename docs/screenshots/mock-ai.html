@@ -1,0 +1,167 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0e1116; --panel: #161b22; --panel-2: #1b212b;
+    --border: #242c38; --border-hover: #36506e;
+    --text: #d7dde5; --muted: #8b97a6;
+    --accent: #3b82f6; --accent-2: #2dd4bf;
+    --ok: #3fb950;
+    --accent-soft: rgba(59,130,246,0.16);
+    --tok-kw: #c792ea; --tok-fn: #82aaff; --tok-str: #c3e88d;
+    --tok-num: #f78c6c; --tok-com: #6b7684;
+    --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  }
+  html, body { width: 1400px; height: 860px; overflow: hidden; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    display: flex;
+  }
+
+  /* dimmed workbench behind the AI pane */
+  .behind {
+    flex: 1; filter: brightness(.55) saturate(.8);
+    display: flex; flex-direction: column; pointer-events: none;
+  }
+  .fake-editor {
+    height: 46%; border-bottom: 1px solid var(--border);
+    font-family: var(--mono); font-size: 13px; line-height: 1.7;
+    padding: 14px 20px; white-space: pre; color: var(--text);
+  }
+  .fake-grid { flex: 1; padding: 12px 20px; }
+  .fake-grid table { border-collapse: collapse; width: 100%; font-size: 12px; font-family: var(--mono); }
+  .fake-grid th { text-align: left; padding: 6px 12px; background: var(--panel); border-bottom: 1px solid var(--border); }
+  .fake-grid td { padding: 5px 12px; border-bottom: 1px solid var(--border); }
+
+  /* AI panel */
+  .ai {
+    width: 430px; background: var(--panel); border-left: 1px solid var(--border);
+    display: flex; flex-direction: column;
+  }
+  .ai-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 14px; border-bottom: 1px solid var(--border);
+  }
+  .ai-head b { font-size: 13px; }
+  .model {
+    font-size: 11px; color: var(--muted); border: 1px solid var(--border);
+    padding: 2px 8px; border-radius: 10px; display: flex; gap: 5px; align-items: center;
+  }
+  .ctx {
+    display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 14px;
+    border-bottom: 1px solid var(--border); font-size: 10.5px;
+  }
+  .ctx span {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px;
+    padding: 2px 7px; color: var(--muted); font-family: var(--mono);
+  }
+  .chat { flex: 1; padding: 14px; display: flex; flex-direction: column; gap: 12px; overflow: hidden; }
+
+  .msg-user {
+    align-self: flex-end; max-width: 88%;
+    background: var(--accent-soft); border: 1px solid rgba(59,130,246,.3);
+    border-radius: 10px 10px 3px 10px; padding: 8px 12px; font-size: 12.5px;
+  }
+  .msg-ai { align-self: flex-start; max-width: 96%; font-size: 12.5px; line-height: 1.55; }
+  .msg-ai p { margin-bottom: 8px; }
+  .sql {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    font-family: var(--mono); font-size: 12px; line-height: 1.65;
+    padding: 10px 12px; white-space: pre; overflow: hidden; margin-top: 4px;
+  }
+  .kw { color: var(--tok-kw); } .fn { color: var(--tok-fn); }
+  .str { color: var(--tok-str); } .num { color: var(--tok-num); } .com { color: var(--tok-com); }
+  .sql-actions { display: flex; gap: 8px; margin-top: 7px; }
+  .sql-actions button {
+    font-size: 11px; padding: 3px 10px; border-radius: 5px;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+  }
+  .sql-actions .open { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .propose-note {
+    display: flex; gap: 6px; align-items: center; margin-top: 8px;
+    font-size: 10.5px; color: var(--muted);
+  }
+
+  .composer {
+    border-top: 1px solid var(--border); padding: 10px 14px;
+  }
+  .composer .box {
+    border: 1px solid var(--border-hover); border-radius: 8px; background: var(--bg);
+    padding: 8px 12px; color: var(--muted); font-size: 12.5px;
+    display: flex; align-items: center;
+  }
+  .composer .send { margin-left: auto; color: var(--accent); }
+  .quick { display: flex; gap: 6px; margin-top: 8px; }
+  .quick span {
+    font-size: 10.5px; padding: 3px 9px; border-radius: 10px;
+    border: 1px solid var(--border); color: var(--muted);
+  }
+</style>
+</head>
+<body>
+
+<div class="behind">
+  <div class="fake-editor"><span class="com">-- top customers by lifetime value</span>
+<span class="kw">SELECT</span> u.email, <span class="fn">sum</span>(o.total) <span class="kw">AS</span> lifetime_value
+<span class="kw">FROM</span> orders o <span class="kw">JOIN</span> users u <span class="kw">ON</span> o.user_id = u.id
+<span class="kw">WHERE</span> o.status = <span class="str">'paid'</span>
+<span class="kw">GROUP BY</span> <span class="num">1</span> <span class="kw">ORDER BY</span> lifetime_value <span class="kw">DESC</span> <span class="kw">LIMIT</span> <span class="num">10</span>;</div>
+  <div class="fake-grid">
+    <table>
+      <tr><th>#</th><th>email</th><th>lifetime_value</th></tr>
+      <tr><td>1</td><td>priya.nair@acme.io</td><td>18,204.50</td></tr>
+      <tr><td>2</td><td>tom.okafor@brightline.com</td><td>15,987.25</td></tr>
+      <tr><td>3</td><td>lena.fischer@nordwind.de</td><td>12,440.00</td></tr>
+      <tr><td>4</td><td>marco.rossi@venetia.it</td><td>11,093.75</td></tr>
+      <tr><td>5</td><td>aisha.diallo@sahel.co</td><td>9,812.00</td></tr>
+    </table>
+  </div>
+</div>
+
+<div class="ai">
+  <div class="ai-head">
+    <b>✨ AI Assistant</b>
+    <div class="model">🟣 Claude Sonnet 4 ▾</div>
+    <span style="margin-left:auto;color:var(--muted);font-size:11px">BYOK · keychain</span>
+  </div>
+  <div class="ctx">
+    <span>postgres 16.3</span><span>schema: public</span>
+    <span>12 tables · 9 FKs</span><span>skills: revenue-rules.md</span>
+    <span style="color:var(--accent-2)">⛔ sample rows: off</span>
+  </div>
+
+  <div class="chat">
+    <div class="msg-user">
+      Which customers churned last quarter? Revenue excludes refunds per our skill.
+    </div>
+    <div class="msg-ai">
+      <p>Customers whose last <b>non-refunded</b> order is older than 90 days, joined on the declared FK <span style="font-family:var(--mono)">orders.user_id → users.id</span>:</p>
+      <div class="sql"><span class="kw">SELECT</span> u.email,
+       <span class="fn">max</span>(o.created_at) <span class="kw">AS</span> last_order
+<span class="kw">FROM</span> users u
+<span class="kw">JOIN</span> orders o <span class="kw">ON</span> o.user_id = u.id
+ <span class="kw">AND</span> o.status &lt;&gt; <span class="str">'refunded'</span>
+<span class="kw">GROUP BY</span> <span class="num">1</span>
+<span class="kw">HAVING</span> <span class="fn">max</span>(o.created_at)
+        &lt; <span class="fn">now</span>() - <span class="kw">interval</span> <span class="str">'90 days'</span>
+<span class="kw">ORDER BY</span> last_order;</div>
+      <div class="sql-actions">
+        <button>📋 Copy</button>
+        <button class="open">→ Open in editor</button>
+      </div>
+      <div class="propose-note">🛡 Propose-only — nothing runs until you execute it in the editor.</div>
+    </div>
+  </div>
+
+  <div class="composer">
+    <div class="box">Ask about your database… <span class="send">➤</span></div>
+    <div class="quick"><span>Explain this query</span><span>Fix error</span><span>Optimize</span></div>
+  </div>
+</div>
+
+</body>
+</html>
