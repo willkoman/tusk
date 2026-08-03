@@ -4,6 +4,8 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-08-03
+
 ### Fixed
 - **Slack settings no longer silently revert when you switch Settings tabs.** Every non-token Slack control (sample-row sharing, allowlists, row caps, timeout, charts, write policy, reply max tokens) now saves the moment you change it, matching the rest of the Settings dialog. Previously these edits only persisted after an explicit Save click; switching to another tab first discarded them and the pane quietly sprang back to the old values — most visibly the "Share sample rows with AI" toggle. The Save button remains for entering tokens. Saves are serialized so a rapid change and tab switch can never interleave a stale read.
 

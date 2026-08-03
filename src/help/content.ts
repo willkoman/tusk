@@ -2794,6 +2794,31 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
+        "text": "v0.9.3 — Slack settings save as you change them",
+        "id": "v0-9-3"
+      },
+      {
+        "k": "list",
+        "ordered": false,
+        "items": [
+          "Non-token [[topic:slack|Slack]] settings (sample-row sharing, allowlists, row caps, timeout, charts, write policy, reply max tokens) now **save the moment you change them** — switching Settings tabs no longer silently reverts an edit that hadn't been Saved. The Save button remains for tokens."
+        ]
+      },
+      {
+        "k": "h",
+        "text": "v0.9.2 — the manual caught up",
+        "id": "v0-9-2"
+      },
+      {
+        "k": "list",
+        "ordered": false,
+        "items": [
+          "The **What's-new panel** now appears on the first update that ships it, even for pre-0.9.1 installs, and is summonable from the command palette.",
+          "**Manual corrections** — twenty-seven fixes across twelve topics, including six factual errors."
+        ]
+      },
+      {
+        "k": "h",
         "text": "v0.9.1 — what's new after an update, honest cancel, engine-aware lexing",
         "id": "v0-9-1"
       },
