@@ -1859,7 +1859,7 @@ export const TOPICS: Topic[] = [
           "**Two tokens** — the Bot token (`xoxb-…`, from Install to Workspace) and an App-level token (`xapp-…`) with `connections:write`.",
           "**Paste both in Settings → Slack** — stored in the OS keychain (service `tusk-slack`), never written to disk, never echoed back (placeholder says *\"saved in keychain — type to replace\"*).",
           "**Test connection** validates both tokens and names the workspace; **Enable Slack bot** starts/stops it. Statusbar badge: `🟢 Slack` running, 🟡 connecting/reconnecting.",
-          "**AI provider/model** is mirrored from **Settings → AI** when you press Save here — the Rust bot can't read the web view's storage, so re-save after changing provider or model."
+          "**AI provider/model** is mirrored from **Settings → AI** whenever the Slack pane saves — the Rust bot can't read the web view's storage, so after changing provider or model, change any Slack setting or press Save here."
         ],
         "ordered": false
       },
@@ -1960,6 +1960,10 @@ export const TOPICS: Topic[] = [
         "k": "h",
         "text": "Access control & limits",
         "id": "settings"
+      },
+      {
+        "k": "p",
+        "md": "These settings **save as you change them**, like the rest of the Settings dialog — no Save click needed. The **Save** button stores newly typed tokens (and still saves everything else)."
       },
       {
         "k": "table",

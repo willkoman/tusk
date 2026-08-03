@@ -7,6 +7,7 @@ import { Show, createSignal, onCleanup, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { activeBaseUrl, aiStore, defaultModel, isKeyless, normalizeMaxTokens, resolveBaseUrl, resolveWire, type AiConfig } from "../ai/store";
+import { KeyedSerialQueue } from "../asyncQueue";
 
 export type SlackConfig = {
   enabled: boolean;
@@ -70,6 +71,11 @@ export const slackConfigMatches = (expected: SlackConfig, actual: SlackConfig): 
 
 type SaveResult = { tokensChanged: boolean };
 
+// Module-level so a save still in flight when the pane unmounts (settings tab switch
+// remounts panes) is ordered before the next mount's load — the fresh pane can never
+// read the pre-save file.
+const slackIo = new KeyedSerialQueue<"io">();
+
 export function SlackPane() {
   const [cfg, setCfg] = createSignal<SlackConfig>(DEFAULT_CONFIG);
   const [configLoaded, setConfigLoaded] = createSignal(false);
@@ -91,7 +97,7 @@ export function SlackPane() {
     unsubscribeAi = aiStore.subscribe(setAi);
     void (async () => {
       try {
-        const info = await invoke<SlackConfigInfo>("slack_load_config");
+        const info = await slackIo.run("io", () => invoke<SlackConfigInfo>("slack_load_config"));
         if (!mounted) return;
         const loaded = normalizeSlackConfig(info.config);
         setCfg(loaded);
@@ -137,13 +143,40 @@ export function SlackPane() {
   const csv = (list: string[]) => list.join(", ");
   const parseCsv = (s: string) => s.split(",").map((x) => x.trim()).filter(Boolean);
 
+  // Non-token controls apply live like every other Settings tab — a tab switch remounts
+  // this pane from disk, so an edit that waited for an explicit Save was silently lost.
+  // Success is quiet (save() read-back verifies); failure reloads the persisted config
+  // so a control never keeps showing a value that is not actually on disk.
+  const applyPatch = (p: Partial<SlackConfig>) => {
+    patch(p);
+    void save({}, false).then(async (saved) => {
+      if (saved) {
+        setNote("");
+        return;
+      }
+      try {
+        const info = await slackIo.run("io", () => invoke<SlackConfigInfo>("slack_load_config"));
+        if (!mounted) return;
+        const loaded = normalizeSlackConfig(info.config);
+        setCfg(loaded);
+        setMaxTokensInput(String(loaded.aiMaxTokens));
+      } catch {
+        /* keep current UI state; the failure note stands */
+      }
+    });
+  };
+
   // Persist config + any newly typed tokens; mirror the AI panel's provider/model.
   // `override` lets callers pin fields (notably `enabled`) independent of the signal.
-  const save = async (override: Partial<SlackConfig> = {}): Promise<SaveResult | null> => {
+  // All saves and the mount load serialize through `slackIo`, so writes never interleave.
+  const save = (override: Partial<SlackConfig> = {}, includeTokens = true): Promise<SaveResult | null> =>
+    slackIo.run("io", () => doSave(override, includeTokens));
+
+  const doSave = async (override: Partial<SlackConfig>, includeTokens: boolean): Promise<SaveResult | null> => {
     const currentAi = ai();
     const model = currentAi.model || defaultModel(currentAi.provider);
     const wire = resolveWire(currentAi.provider, model);
-    const tokensChanged = Boolean(botToken().trim() || appToken().trim());
+    const tokensChanged = includeTokens && Boolean(botToken().trim() || appToken().trim());
     const config: SlackConfig = {
       ...cfg(),
       ...override,
@@ -163,8 +196,8 @@ export function SlackPane() {
     try {
       await invoke("slack_save_config", {
         config,
-        botToken: botToken().trim() || null,
-        appToken: appToken().trim() || null,
+        botToken: (includeTokens && botToken().trim()) || null,
+        appToken: (includeTokens && appToken().trim()) || null,
       });
       // Read-after-write catches stale controlled-input values and serialization/
       // persistence failures before the UI claims success.
@@ -175,8 +208,10 @@ export function SlackPane() {
       }
       setHasBot(verified.hasBotToken);
       setHasApp(verified.hasAppToken);
-      setBotToken("");
-      setAppToken("");
+      if (includeTokens) {
+        setBotToken("");
+        setAppToken("");
+      }
       setCfg(persisted);
       setMaxTokensInput(String(persisted.aiMaxTokens));
       return { tokensChanged };
@@ -343,7 +378,7 @@ export function SlackPane() {
           min="1"
           max="100"
           value={cfg().maxRowsInline}
-          onChange={(e) => patch({ maxRowsInline: Math.trunc(Math.max(1, Math.min(100, Number(e.currentTarget.value) || 20))) })}
+          onChange={(e) => applyPatch({ maxRowsInline: Math.trunc(Math.max(1, Math.min(100, Number(e.currentTarget.value) || 20))) })}
         />
       </label>
       <label class="settings-row">
@@ -353,7 +388,7 @@ export function SlackPane() {
           min="100"
           max="100000"
           value={cfg().maxRowsFile}
-          onChange={(e) => patch({ maxRowsFile: Math.trunc(Math.max(100, Math.min(100000, Number(e.currentTarget.value) || 10000))) })}
+          onChange={(e) => applyPatch({ maxRowsFile: Math.trunc(Math.max(100, Math.min(100000, Number(e.currentTarget.value) || 10000))) })}
         />
       </label>
       <label class="settings-row">
@@ -363,7 +398,7 @@ export function SlackPane() {
           min="1"
           max="600"
           value={cfg().queryTimeoutSecs}
-          onChange={(e) => patch({ queryTimeoutSecs: Math.trunc(Math.max(1, Math.min(600, Number(e.currentTarget.value) || 30))) })}
+          onChange={(e) => applyPatch({ queryTimeoutSecs: Math.trunc(Math.max(1, Math.min(600, Number(e.currentTarget.value) || 30))) })}
         />
       </label>
       <label
@@ -383,8 +418,8 @@ export function SlackPane() {
           }}
           onBlur={() => {
             const normalized = normalizeSlackMaxTokens(maxTokensInput(), cfg().aiMaxTokens);
-            patch({ aiMaxTokens: normalized });
             setMaxTokensInput(String(normalized));
+            applyPatch({ aiMaxTokens: normalized });
           }}
         />
       </label>
@@ -395,7 +430,7 @@ export function SlackPane() {
           type="text"
           placeholder="empty = all"
           value={csv(cfg().allowlistChannels)}
-          onChange={(e) => patch({ allowlistChannels: parseCsv(e.currentTarget.value) })}
+          onChange={(e) => applyPatch({ allowlistChannels: parseCsv(e.currentTarget.value) })}
         />
       </label>
       <label class="settings-row" title="Slack user IDs (U…), comma-separated. Empty = anyone in an allowed channel.">
@@ -404,7 +439,7 @@ export function SlackPane() {
           type="text"
           placeholder="empty = all"
           value={csv(cfg().allowlistUsers)}
-          onChange={(e) => patch({ allowlistUsers: parseCsv(e.currentTarget.value) })}
+          onChange={(e) => applyPatch({ allowlistUsers: parseCsv(e.currentTarget.value) })}
         />
       </label>
 
@@ -415,7 +450,7 @@ export function SlackPane() {
         <span>When asked for writes/DDL</span>
         <select
           value={cfg().destructivePolicy}
-          onChange={(e) => patch({ destructivePolicy: e.currentTarget.value })}
+          onChange={(e) => applyPatch({ destructivePolicy: e.currentTarget.value })}
         >
           <option value="proposeReadonly">Propose read-only preview</option>
           <option value="refuse">Refuse & point to editor</option>
@@ -427,7 +462,7 @@ export function SlackPane() {
         title="Rendered locally in Tusk (no external service). When off, date+numeric results attach as files instead; a chart the user explicitly asks for is always honored."
       >
         <span>Auto-chart date/numeric results</span>
-        <input type="checkbox" checked={cfg().chartsEnabled} onChange={(e) => patch({ chartsEnabled: e.currentTarget.checked })} />
+        <input type="checkbox" checked={cfg().chartsEnabled} onChange={(e) => applyPatch({ chartsEnabled: e.currentTarget.checked })} />
       </label>
 
       <label
@@ -435,7 +470,7 @@ export function SlackPane() {
         title="When enabled, up to five real rows from relevant tables are sent to the configured AI provider with each Slack question. Off by default."
       >
         <span>Share sample rows with AI</span>
-        <input type="checkbox" checked={cfg().shareSamples} onChange={(e) => patch({ shareSamples: e.currentTarget.checked })} />
+        <input type="checkbox" checked={cfg().shareSamples} onChange={(e) => applyPatch({ shareSamples: e.currentTarget.checked })} />
       </label>
       </fieldset>
 
