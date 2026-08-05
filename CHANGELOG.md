@@ -4,6 +4,11 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-08-05
+
+### Added
+- **The editor now catches invisible paste artifacts before the server does.** SQL copied from web pages and chat apps often arrives with non-breaking spaces, zero-width characters, or curly quotes — invisible in the editor, but the database reads a non-breaking space as part of an *identifier*, producing baffling errors like `syntax error at or near "."` on a query that looks perfect. These now get an instant red squiggle naming the exact character (e.g. "non-breaking space (U+00A0)"), and one quick-fix (Tab / Alt+Enter on the squiggle) cleans every artifact in the document at once. Characters inside string literals are left alone — there they're data.
+
 ## [0.9.3] - 2026-08-03
 
 ### Fixed

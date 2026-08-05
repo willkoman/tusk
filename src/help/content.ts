@@ -544,7 +544,7 @@ export const TOPICS: Topic[] = [
         "rows": [
           [
             "Heuristic (offline)",
-            "Unmatched `)`; unclosed `(`; trailing comma; `DELETE`/`UPDATE` without `WHERE` (\"affects every row\"); unknown **leading** keyword (`SELCT` → \"did you mean SELECT?\"); a top-level comma between conditions in `WHERE`/`HAVING` (*',' is not valid between conditions — join them with AND or OR*)",
+            "Unmatched `)`; unclosed `(`; trailing comma; `DELETE`/`UPDATE` without `WHERE` (\"affects every row\"); unknown **leading** keyword (`SELCT` → \"did you mean SELECT?\"); a top-level comma between conditions in `WHERE`/`HAVING` (*',' is not valid between conditions — join them with AND or OR*); invisible paste artifacts in code — non-breaking/zero-width spaces and curly quotes from web pages, named with their code point, with a fix-all quick-fix (inside string literals they're data and stay untouched)",
             "error / warning"
           ],
           [
@@ -2791,6 +2791,18 @@ export const TOPICS: Topic[] = [
         "k": "tip",
         "kind": "tip",
         "md": "The updater shipped in v0.4.5 — earlier installs can't auto-update. Grab a fresh installer once; every version after keeps itself current."
+      },
+      {
+        "k": "h",
+        "text": "v0.9.4 — invisible paste artifacts get squiggles",
+        "id": "v0-9-4"
+      },
+      {
+        "k": "list",
+        "ordered": false,
+        "items": [
+          "SQL pasted from web pages often carries **non-breaking spaces, zero-width characters, or curly quotes** — invisible in the editor, but the server reads a non-breaking space as an *identifier* character (`syntax error at or near \".\"` on a query that looks perfect). The offline linter now squiggles each one with its code point, and one quick-fix ([[kbd:Tab]] / [[kbd:Alt-Enter]] on the squiggle) cleans the whole document. String literals are left alone — there they're data."
+        ]
       },
       {
         "k": "h",

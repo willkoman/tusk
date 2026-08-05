@@ -18,6 +18,50 @@ import { closest } from "./distance";
 import { docString, lexState, maskNonCode, spanAt } from "./lexer";
 import { LINT_DIAGNOSTIC_LIMIT, LINT_STATEMENT_LIMIT, LIVE_ANALYSIS_MAX_CHARS } from "./limits";
 
+// Paste artifacts from web pages and chat apps that are invisible (or near-invisible)
+// in the editor but are NOT whitespace to the server: PostgreSQL lexes any char >= 0x80
+// as an identifier character, so ` p.master_id` parses as an alias plus a stray
+// `.` -- a baffling "syntax error at or near \".\"" with nothing visibly wrong. Curly
+// quotes are the same failure class (never valid SQL punctuation). Each maps to its
+// replacement; zero-width characters map to removal.
+const UNICODE_ARTIFACTS = new Map<string, { fix: string; what: string }>([
+  ["\u00a0", { fix: " ", what: "non-breaking space" }],
+  ["\u1680", { fix: " ", what: "Unicode space" }],
+  ["\u202f", { fix: " ", what: "narrow no-break space" }],
+  ["\u205f", { fix: " ", what: "Unicode space" }],
+  ["\u3000", { fix: " ", what: "ideographic space" }],
+  ["\u200b", { fix: "", what: "zero-width space" }],
+  ["\ufeff", { fix: "", what: "zero-width BOM" }],
+  ["\u2018", { fix: "'", what: "curly quote" }],
+  ["\u2019", { fix: "'", what: "curly quote" }],
+  ["\u201c", { fix: '"', what: "curly quote" }],
+  ["\u201d", { fix: '"', what: "curly quote" }],
+]);
+for (let cp = 0x2000; cp <= 0x200a; cp++) UNICODE_ARTIFACTS.set(String.fromCharCode(cp), { fix: " ", what: "Unicode space" });
+const ARTIFACT_RE = /[\u00a0\u1680\u2000-\u200b\u202f\u205f\u3000\ufeff\u2018\u2019\u201c\u201d]/g;
+const uPlus = (ch: string) => `U+${ch.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}`;
+
+const artifactMessage = (ch: string, info: { fix: string; what: string }): string =>
+  info.fix === " "
+    ? `${info.what} (${uPlus(ch)}) \u2014 looks like a space, but the server reads it as an identifier character (usually a web-page paste)`
+    : info.fix === ""
+      ? `${info.what} (${uPlus(ch)}) \u2014 invisible, but the server still sees it`
+      : `${info.what} (${uPlus(ch)}) \u2014 SQL needs straight quotes`;
+
+/** Replace every paste artifact in the document's CODE regions (strings and comments
+ *  are left alone \u2014 a non-breaking space inside a string literal is data). */
+function fixAllArtifacts(view: EditorView): void {
+  const { spans } = lexState(view.state);
+  const doc = docString(view.state);
+  const masked = maskNonCode(doc, spans, 0, doc.length);
+  const changes: { from: number; to: number; insert: string }[] = [];
+  ARTIFACT_RE.lastIndex = 0;
+  for (let hit = ARTIFACT_RE.exec(masked); hit; hit = ARTIFACT_RE.exec(masked)) {
+    changes.push({ from: hit.index, to: hit.index + 1, insert: UNICODE_ARTIFACTS.get(hit[0])!.fix });
+  }
+  if (changes.length) view.dispatch({ changes });
+}
+
 // Fast, offline heuristics that run as-you-type. Deliberately limited to checks
 // that are reliably correct on real SQL (read off the masked, code-only view of
 // each statement) so they don't cry wolf:
@@ -52,6 +96,22 @@ export function heuristicLintSource() {
       const stmt = stmts[stmtIndex];
       const base = stmt.from;
       const m = maskNonCode(doc, spans, stmt.from, stmt.to);
+
+      // Paste artifacts (see UNICODE_ARTIFACTS): flagged only in code — inside a
+      // string literal they're data. The one action fixes the whole document, since
+      // these arrive dozens at a time from a single paste.
+      ARTIFACT_RE.lastIndex = 0;
+      for (let hit = ARTIFACT_RE.exec(m); hit; hit = ARTIFACT_RE.exec(m)) {
+        const info = UNICODE_ARTIFACTS.get(hit[0])!;
+        if (add({
+          from: base + hit.index,
+          to: base + hit.index + 1,
+          severity: "error",
+          message: artifactMessage(hit[0], info),
+          actions: [{ name: "fix all in document", apply: (v) => fixAllArtifacts(v) }],
+        })) return out;
+      }
+
       const stack: number[] = [];
 
       for (let p = 0; p < m.length; p++) {

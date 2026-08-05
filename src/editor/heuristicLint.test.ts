@@ -59,3 +59,43 @@ describe("WHERE-clause comma detection", () => {
     expect(messages("DELETE FROM t")).toEqual(expect.arrayContaining([expect.stringContaining("without WHERE")]));
   });
 });
+
+describe("paste-artifact detection", () => {
+  it("flags NBSP indentation (the web-paste syntax-error class) and points at each char", () => {
+    const doc = "SELECT DISTINCT" + String.fromCharCode(10) + " NBSP NBSPp.master_id FROM product p".split("NBSP").join(String.fromCharCode(0xa0));
+    const found = lint(doc).filter((d) => /non-breaking space/.test(d.message));
+    expect(found.length).toBe(2);
+    for (const d of found) expect(doc.charCodeAt(d.from)).toBe(0xa0);
+    expect(found[0].severity).toBe("error");
+    expect(found[0].actions?.[0]?.name).toBe("fix all in document");
+  });
+
+  it("flags zero-width and curly-quote artifacts with their code points", () => {
+    const zw = "SELECT id" + String.fromCharCode(0x200b) + " FROM t";
+    expect(messages(zw)).toEqual(expect.arrayContaining([expect.stringContaining("U+200B")]));
+    const cq = "SELECT " + String.fromCharCode(0x2018) + "x" + String.fromCharCode(0x2019) + " FROM t";
+    expect(messages(cq)).toEqual(expect.arrayContaining([expect.stringContaining("straight quotes")]));
+  });
+
+  it("ignores artifacts inside string literals and comments (they are data)", () => {
+    const doc = "SELECT 'a" + String.fromCharCode(0xa0) + "b' FROM t -- note" + String.fromCharCode(0xa0) + "here";
+    expect(lint(doc).filter((d) => /non-breaking space/.test(d.message))).toEqual([]);
+  });
+
+  it("fix-all replaces every code artifact and leaves string data untouched", () => {
+    const NB = String.fromCharCode(0xa0);
+    const doc = "SELECT" + NB + "a, 'x" + NB + "y'" + String.fromCharCode(0x200b) + " FROM t";
+    const state = EditorState.create({ doc });
+    let applied: string | null = null;
+    const view = {
+      state,
+      dispatch: (tr: { changes: { from: number; to: number; insert: string }[] }) => {
+        applied = state.update({ changes: tr.changes }).state.doc.toString();
+      },
+    } as unknown as EditorView;
+    const diag = heuristicLintSource()(view).find((d) => d.actions?.length);
+    expect(diag).toBeTruthy();
+    diag!.actions![0].apply(view, diag!.from, diag!.to);
+    expect(applied).toBe("SELECT a, 'x" + NB + "y' FROM t");
+  });
+});
