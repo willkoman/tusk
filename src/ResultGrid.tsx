@@ -49,6 +49,8 @@ export type ResultGridProps = {
   onViewValue: (col: string, val: string | null) => void;
   onStatus: (text: string, tabId: string, resultGeneration: number) => void;
   canSort: Accessor<boolean>;
+  /** Why sorting is unavailable right now (empty when `canSort`); surfaced as status on a header click. */
+  sortUnavailable: Accessor<string>;
   canFilter: Accessor<boolean>;
   /** Canonical loaded-row indices in visible order; null = identity. */
   rowOrder: Accessor<number[] | null>;
@@ -738,7 +740,12 @@ export function ResultGrid(props: ResultGridProps) {
     props.onSortFilter(next, props.view().filters, "sort");
   }
   function cycleSort(oi: number, additive: boolean) {
-    if (!props.canSort()) return;
+    if (!props.canSort()) {
+      // A silent no-op reads as a broken header; say why instead.
+      const why = props.sortUnavailable();
+      if (why) props.onStatus(why, props.activeTabId(), props.resultGeneration());
+      return;
+    }
     const cur = props.view().sorts;
     const existing = cur.find((s) => s.col === oi);
     const cycled = !existing ? "asc" : existing.dir === "asc" ? "desc" : null;

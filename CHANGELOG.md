@@ -4,6 +4,13 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-09-03
+
+### Fixed
+- **A result whose stream was closed underneath it is now marked incomplete instead of passing as the full set.** Expanding a table in the Explorer, refreshing the schema, sidebar DDL, an all-rows export, an import, the ERD/DDL viewer, or running a query in another tab all close the one server cursor a streaming result depends on. Previously the next scroll silently reported the rows loaded so far as the complete result (`1000 rows`, Load all gone). The affected tab now shows an **Incomplete result** badge with a status naming what closed the stream, the in-memory sort is disabled for it (a header click re-runs the query with `ORDER BY` instead), the Export dialog labels its loaded rows as incomplete, and the backend reports an interrupted stream explicitly so no path can present a partial result as done. Autocomplete's FK-hint lookup no longer touches the cursor while a result is streaming, and the table detail needed for in-grid editing is fetched before a query runs rather than after (which used to truncate every editable result at the first page as soon as you scrolled).
+- **A sort click that can't apply now says why.** Header clicks on an unsortable result (query running, transaction owned elsewhere, or a result that can't be re-run with `ORDER BY` and isn't fully loaded) used to do nothing; the status line now explains the reason.
+- **Sorting a numeric column in a loaded result now orders by value.** Clicking sort on a fully loaded result reorders rows in memory, and that path compared every value as text, so a number column came out as `911, 90, 9, 893, 89, 87`. When every loaded value in the column is a number it now compares numerically (integers exactly at any size, decimals and scientific notation as doubles, `NaN` last); a column with any non-numeric value keeps text ordering so mixed data never sorts inconsistently. Server-side `ORDER BY` (used while rows are still streaming or a filter is active) was never affected.
+
 ## [0.9.4] - 2026-08-05
 
 ### Added

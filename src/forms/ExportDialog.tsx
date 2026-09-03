@@ -15,6 +15,8 @@ type ColState = { idx: number; name: string; on: boolean };
 export function ExportDialog(props: {
   columns: string[];
   loadedRows: (string | null)[][];
+  /** Non-empty when the loaded rows are only part of the result (stream interrupted). */
+  loadedIncomplete?: string;
   defaultTable: string;
   /** Source backend kind; SQL preview must use the same quoting as file/clipboard export. */
   dialect: string;
@@ -216,7 +218,7 @@ export function ExportDialog(props: {
             <label>Rows
               <select value={scope()} onChange={(e) => setScope(e.currentTarget.value as ExportScope)} disabled={dest() === "clipboard"}>
                 <option value="all" disabled={props.allowAllRows === false}>All rows (re-run query)</option>
-                <option value="loaded">Loaded rows ({props.loadedRows.length})</option>
+                <option value="loaded">Loaded rows ({props.loadedRows.length}{props.loadedIncomplete ? ", incomplete" : ""})</option>
               </select>
             </label>
             <label>To

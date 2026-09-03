@@ -26,6 +26,13 @@ export type ResultSnapshot = {
   transactionRevision: number;
   /** Set when a transaction boundary makes edits against this snapshot unsafe. */
   transactionStale: string;
+  /**
+   * Non-empty when the loaded rows are NOT the full result: the stream was closed
+   * before it drained (another tab ran, a metadata/Explorer/export/import command
+   * rolled the cursor back, or the connection dropped). The reason is shown to the
+   * user; local sort and "loaded rows" export treat the snapshot as partial.
+   */
+  incomplete: string;
 };
 
 export const EMPTY_RESULT: ResultSnapshot = {
@@ -43,7 +50,24 @@ export const EMPTY_RESULT: ResultSnapshot = {
   transactionId: null,
   transactionRevision: 0,
   transactionStale: "",
+  incomplete: "",
 };
+
+/**
+ * Patch that freezes a still-streaming snapshot as an explicitly incomplete result.
+ * Returns null when the snapshot already finished (nothing was lost).
+ */
+export function interruptedResult(
+  result: Pick<ResultSnapshot, "rows" | "done">,
+  reason: string,
+): Pick<ResultSnapshot, "done" | "incomplete" | "status"> | null {
+  if (result.done) return null;
+  return {
+    done: true,
+    incomplete: reason,
+    status: `${result.rows.length} rows loaded · ${reason} — re-run the query for the full result`,
+  };
+}
 
 // --- result-grid display state (per tab, ephemeral — not persisted) ---
 export type SortKey = { col: number; dir: "asc" | "desc" }; // col = ORIGINAL column index

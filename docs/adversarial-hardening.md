@@ -35,7 +35,7 @@ This ledger records the guarantees and remaining limits of the input-hardening p
 
 ## Residual risks
 
-- Result values do not carry portable type/collation metadata. Local grid sort is deterministic text ordering with engine-specific NULL placement, not guaranteed native numeric, date, locale, or collation ordering. Use SQL `ORDER BY` for server semantics.
+- Result values do not carry portable type/collation metadata. Local grid sort infers a numeric column only when every loaded value is a numeric literal (exact integer comparison, otherwise double); anything else is deterministic text ordering with engine-specific NULL placement, not guaranteed native date, locale, or collation ordering. Use SQL `ORDER BY` for server semantics.
 - Tauri/WebView deserializes an IPC message before Rust command validators run. Normal UI paths reject oversized input before invoke, but a compromised renderer can still force one whole message allocation. Truly unbounded imports require a future file-streaming IPC design.
 - Database drivers must allocate an individual returned cell before Tusk can inspect its length. Slack pages rows and applies live aggregate budgets, but a server expression returning one enormous value can still allocate inside the driver first.
 - DuckDB/SQLite execution is synchronous. A pathological embedded query cannot be preempted by Tokio timeout; this is unchanged for UI and Slack. File-backed Slack reads are isolated read-only, while in-memory embedded Slack execution is refused because a second connection would target a different database.

@@ -19,6 +19,7 @@ import { detectBoolCols, typeBoolCols } from "./grid/bool";
 import { buildCommitScript } from "./grid/editSql";
 import { planPaste, mergePaste, type RowRef } from "./grid/paste";
 import { orderedRows, sortedRowOrder } from "./grid/sort";
+import { interruptedResult } from "./tabs";
 import { makeIndexer } from "./sql/aliases";
 import { type Dataset, IMPORT_LIMITS, parseCSV, parseJSON, formatWithOptions } from "./formats";
 import { FORMAT_EXT, type ExportOptions, type ExportScope } from "./export";
@@ -86,7 +87,7 @@ type QueryOutcome =
   | { kind: "rows"; columns: string[]; rows: (string | null)[][]; done: boolean; note?: string }
   | { kind: "exec"; message: string };
 type QueryResult = QueryOutcome & { transaction: TransactionStatus };
-type FetchResult = { rows: (string | null)[][]; done: boolean; transaction: TransactionStatus };
+type FetchResult = { rows: (string | null)[][]; done: boolean; interrupted?: boolean; transaction: TransactionStatus };
 type Connected = {
   id: string;
   version: string;
@@ -378,6 +379,22 @@ function App() {
 
   const patchTab = (id: string, patch: Partial<Tab>) =>
     setTabs((ts) => ts.map((t) => (t.id === id ? { ...t, ...patch } : t)));
+  /**
+   * Release the single server cursor because `reason` is about to (or did) close it
+   * underneath its owner tab. The owner's snapshot is frozen as an explicitly
+   * INCOMPLETE result — status, toolbar badge, local-sort/export gating — instead of
+   * being silently presented as the full set. No-op when nothing is streaming.
+   */
+  function interruptStream(reason: string) {
+    const owner = cursorOwner;
+    if (!owner) return;
+    cursorOwner = null;
+    cursorGeneration++;
+    const t = tabs().find((x) => x.id === owner.tabId);
+    if (!t || t.result.generation !== owner.resultGeneration) return;
+    const patch = interruptedResult(t.result, reason);
+    if (patch) patchResult(owner.tabId, patch);
+  }
   const patchResult = (id: string, patch: Partial<ResultSnapshot>) =>
     setTabs((ts) => ts.map((t) => (t.id === id ? { ...t, result: { ...t.result, ...patch } } : t)));
 
@@ -713,6 +730,8 @@ function App() {
       searchSchema: string | null;
       /** The grid's bool-column set (source indices) frozen with the snapshot — export shows what the grid shows. */
       boolCols: number[];
+      /** Non-empty when the loaded rows are a partial result (stream interrupted). */
+      incomplete: string;
       origin: UiOrigin;
       connectionId: string;
       dialect: string;
@@ -732,6 +751,7 @@ function App() {
     setExportSrc({
       columns: columns(),
       rows: orderedRows(rows(), order),
+      incomplete: tab.result.incomplete,
       query,
       table: tableNameFromSql(query),
       searchSchema: tab.searchSchema,
@@ -973,13 +993,27 @@ function App() {
     !(connectionKind() === "mysql" && hasDuplicateColumns(activeTab().result.columns));
   const localSortEligible = () => {
     const tab = activeTab();
-    return tab.result.done && tab.result.rowsAreBase && tab.gridView.filters.length === 0 && tab.result.rows.length <= MAX_LOCAL_SORT_ROWS;
+    // An interrupted stream holds only part of the result: sorting it in memory would
+    // order a subset while looking like the whole. Fall through to the server path.
+    return tab.result.done && !tab.result.incomplete && tab.result.rowsAreBase && tab.gridView.filters.length === 0 && tab.result.rows.length <= MAX_LOCAL_SORT_ROWS;
+  };
+  /** Why a header click can't sort right now (empty when it can). Shown as status feedback. */
+  const sortUnavailable = () => {
+    if (running()) return "sorting is unavailable while a query is running";
+    if (!activeDatabaseAllowed())
+      return transaction().state === "lost" ? "sorting is unavailable: the transaction session was lost — disconnect and reconnect" : "sorting is frozen while another tab owns the transaction";
+    if (!canServerSortFilter()) {
+      if (activeTab().result.incomplete) return "this result is incomplete and its query can't be re-run with ORDER BY — re-run it to sort";
+      if (!activeTab().result.done) return "this query can't be re-run with ORDER BY — load all rows first to sort in memory";
+      return "this result can't be sorted: the query isn't a single re-runnable SELECT and it exceeds the in-memory sort limit";
+    }
+    return "";
   };
   const canSort = () => !running() && (localSortEligible() || (activeDatabaseAllowed() && canServerSortFilter()));
   const canFilter = () => !running() && activeDatabaseAllowed() && canServerSortFilter();
   const localSortRows = createMemo(() => activeTab().result.rows);
   const localSorts = createMemo(() => activeTab().gridView.sorts);
-  const localSortDone = createMemo(() => activeTab().result.done);
+  const localSortDone = createMemo(() => activeTab().result.done && !activeTab().result.incomplete);
   const localSortBase = createMemo(() => activeTab().result.rowsAreBase);
   const localSortHasFilters = createMemo(() => activeTab().gridView.filters.length > 0);
   const localRowOrder = createMemo(() => {
@@ -1037,8 +1071,16 @@ function App() {
         return { editable: false, reason: `no write privilege on ${tgt.table.name}`, plan: null };
     }
     const det = details()[relKey(tgt.table.schema, tgt.table.name)];
-    if (!det)
+    if (!det) {
+      // The detail read rolls back the server cursor, so it must never run while
+      // this result is still streaming (executeQuery prefetches it before the run;
+      // this is the fallback when that missed, e.g. metadata was frozen).
+      if (metadataFrozen())
+        return { editable: false, reason: "table info can't load during a manual transaction — expand the table in the Explorer before BEGIN", plan: null };
+      if (!result.done)
+        return { editable: false, reason: "table info loads once the result finishes streaming (Load all)", plan: null };
       return { editable: false, reason: "loading table info…", plan: null, want: { schema: tgt.table.schema, name: tgt.table.name } };
+    }
     const p = editPlan(det, cols, tgt.table);
     if (!p.ok) return { editable: false, reason: p.reason, plan: null };
     return { editable: true, reason: "", plan: p };
@@ -1999,6 +2041,7 @@ function App() {
     fkFetched.clear();
     setFkEdges([]);
     setMenuState(null);
+    interruptStream("a schema refresh closed the result stream");
     setSchemaLoading(true);
     sampleCache.clear(); // schema (and likely data) may have changed — drop stale AI samples
     try {
@@ -2071,6 +2114,9 @@ function App() {
   async function fetchFkSchema(schemaName: string, target = conn()) {
     const c = target;
     if (!c || metadataFrozen() || caps()?.relationships === false || fkFetched.has(schemaName)) return;
+    // A best-effort completion hint must never roll back a live result stream; the
+    // next keystroke/tab switch retries once the stream has drained.
+    if (cursorOwner !== null) return;
     const generation = fkGeneration;
     const transactionRevision = transaction().revision;
     const inflightKey = `${c.id}:${generation}:${schemaName}`;
@@ -2106,6 +2152,7 @@ function App() {
     const inflightKey = `${c.id}:${generation}:${key}`;
     if (!force && (details()[key] || detailInflight.has(inflightKey))) return;
     detailInflight.add(inflightKey);
+    interruptStream("expanding a relation in the Explorer closed the result stream");
     try {
       const d = await invoke<RelationDetail>("table_detail", {
         connectionId: c.id,
@@ -2197,7 +2244,7 @@ function App() {
     // Running with the results panel collapsed would hide the output — reopen it.
     if (!resultsOpen()) { setResultsOpen(true); persistLayout(); }
     const runSchema = runTab.searchSchema;
-    if (cursorOwner && cursorOwner.tabId !== runTabId) patchResult(cursorOwner.tabId, { done: true });
+    if (cursorOwner && cursorOwner.tabId !== runTabId) interruptStream(`stream closed when "${runTab.title}" ran a query`);
     cursorOwner = null;
     cursorGeneration++;
     fetchGeneration++;
@@ -2227,6 +2274,18 @@ function App() {
     runTimers.add(timer);
     let completed = false;
     try {
+      // In-grid editing needs the target table's detail (PK/columns). Fetching it AFTER
+      // the run would roll back the result's cursor and truncate the stream, so resolve
+      // the target from the (pre-execution) base query and load it now, while no
+      // stream is open and `running` already excludes a concurrent run. Best-effort:
+      // a failure just leaves the grid read-only.
+      if (mode === "base" && base && !transactionOpen(transaction())) {
+        try {
+          const tgt = editTarget(base, editIndexer(schema()), runTab.searchSchema);
+          if (tgt.ok && !details()[relKey(tgt.table.schema, tgt.table.name)]) await loadDetail(tgt.table.schema, tgt.table.name);
+        } catch { /* read-only grid until the detail loads later */ }
+        if (!isCurrent()) return false;
+      }
       const out = await invoke<QueryResult>("run_query", { connectionId: c.id, ownerId: runTabId, sql: sqlToRun, pageSize: PAGE, searchPath: runSchema });
       expectedTransactionRevision = out.transaction.revision;
       const accepted = applyAuthoritativeTransaction(out.transaction, c.generation, event, before);
@@ -2238,6 +2297,7 @@ function App() {
         const prevCols = rt?.result.columns ?? [];
         patchResult(runTabId, {
           columns: out.columns, rows: out.rows, done: out.done, lastQuery: sqlToRun, baseQuery: base, epoch, generation: loadedGeneration,
+          incomplete: "",
           rowsAreBase: mode === "base" || sqlToRun === base,
           status: `${out.rows.length}${out.done ? "" : "+"} rows${out.note ? ` · ${out.note}` : ""}`,
           transactionId: transactionOpen(out.transaction) ? out.transaction.id : null,
@@ -2263,7 +2323,7 @@ function App() {
         }
       } else {
         patchResult(runTabId, {
-          columns: [], rows: [], done: true, lastQuery: sqlToRun, baseQuery: base, rowsAreBase: false, epoch, generation: loadedGeneration, status: out.message,
+          columns: [], rows: [], done: true, incomplete: "", lastQuery: sqlToRun, baseQuery: base, rowsAreBase: false, epoch, generation: loadedGeneration, status: out.message,
           transactionId: transactionOpen(out.transaction) ? out.transaction.id : null,
           transactionRevision: out.transaction.revision,
           transactionStale: "",
@@ -2296,6 +2356,7 @@ function App() {
         generation: ++resultGeneration,
         lastQuery: sqlToRun,
         baseQuery: base,
+        incomplete: "",
         transactionId: transactionOpen(transaction()) ? transaction().id : null,
         transactionRevision: transaction().revision,
         transactionStale: transaction().state === "lost" ? "transaction session lost; result provenance is no longer trustworthy" : "",
@@ -2594,7 +2655,14 @@ function App() {
       // Read the captured tab's rows (the user may have switched tabs during the fetch).
       const prev = tabs().find((t) => t.id === id)?.result.rows ?? [];
       const merged = r.rows.length ? [...prev, ...r.rows] : prev;
-      patchResult(id, { rows: merged, done: r.done, status: `${merged.length}${r.done ? "" : "+"} rows` });
+      if (r.interrupted) {
+        // The backend found our cursor already closed by an intervening command
+        // (metadata read, Explorer DDL, export, import) that the frontend didn't
+        // intercept. Never present the partial rows as the full result.
+        patchResult(id, { rows: merged, ...interruptedResult({ rows: merged, done: false }, "the result stream was closed by another database action") });
+      } else {
+        patchResult(id, { rows: merged, done: r.done, status: `${merged.length}${r.done ? "" : "+"} rows` });
+      }
       if (r.done) {
         cursorOwner = null;
         cursorGeneration++;
@@ -2610,7 +2678,7 @@ function App() {
       // silently marking the result complete — show the error banner over the rows
       // fetched so far, and stop paging so we don't hammer a dead cursor.
       const msg = errMsg(e);
-      patchResult(id, { runErr: msg, status: `streaming stopped — ${msg}`, done: true });
+      patchResult(id, { runErr: msg, status: `streaming stopped — ${msg}`, done: true, incomplete: `streaming stopped — ${msg}` });
       cursorOwner = null;
       cursorGeneration++;
     } finally {
@@ -2676,6 +2744,7 @@ function App() {
         schema: src.searchSchema ?? null,
       }, key);
     };
+    if (scope === "all") interruptStream("an all-rows export closed the result stream");
     try {
       const n = await invoke<number>("export_to_file", args);
       exportHistory("ok", n, null);
@@ -2832,6 +2901,7 @@ function App() {
     const operationCurrent = () => generation === importReadGeneration && importOrigin === binding;
     setImportBusy(true);
     setImportMsg("");
+    interruptStream("an import closed the result stream");
     try {
       const n = await invoke<number>("import_rows", {
         connectionId,
@@ -2936,6 +3006,7 @@ function App() {
       schema: null,
     }, c.key);
     if (origin.tabId) patchResult(origin.tabId, { runErr: "" });
+    interruptStream("an Explorer action closed the result stream");
     try {
       const out = await invoke<QueryResult>("run_query", { connectionId: c.id, ownerId: origin.tabId ?? activeTabId(), sql: sqlText, pageSize: PAGE, searchPath: null });
       ddlHistory("ok", null);
@@ -3005,6 +3076,7 @@ function App() {
     const c = conn();
     if (!c || rejectFrozenExplorer()) return;
     const origin = captureOrigin();
+    interruptStream("reading object DDL closed the result stream");
     try {
       const dd = await invoke<string>("object_ddl", {
         connectionId: c.id,
@@ -3930,6 +4002,9 @@ function App() {
                       Copy w/ column names
                     </label>
                   </Show>
+                  <Show when={activeTab().result.incomplete}>
+                    <span class="result-incomplete" title={`${activeTab().result.incomplete} — the rows below are only part of the result; re-run the query for the full set`}>Incomplete result</span>
+                  </Show>
                   <Show when={activeTab().result.transactionStale}>
                     <span class="transaction-result-stale" title={activeTab().result.transactionStale}>Stale transaction result</span>
                   </Show>
@@ -3964,6 +4039,7 @@ function App() {
                   resultGeneration={() => activeTab().result.generation}
                   onLoadMore={loadMore}
                   onSortFilter={onSortFilter}
+                  sortUnavailable={sortUnavailable}
                   onMenu={(x, y, items) => setMenu({ x, y, items })}
                   onViewValue={(col, val) => setCellView({ col, val, origin: captureOrigin() })}
                   onStatus={(text, tabId, generation) => {
@@ -4061,6 +4137,7 @@ function App() {
           {(g) => (
             <DdlGraphDialog
               connectionId={g().connectionId}
+              onBeforeMetadata={() => interruptStream("the ERD/DDL viewer closed the result stream")}
               schema={g().schema}
               name={g().name}
               kind={g().kind}
@@ -4208,6 +4285,7 @@ function App() {
             <ExportDialog
               columns={src().columns}
               loadedRows={src().rows}
+              loadedIncomplete={src().incomplete}
               defaultTable={src().table}
               dialect={src().dialect}
               boolCols={src().boolCols}

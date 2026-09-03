@@ -655,8 +655,8 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**While running** — Run becomes **✕ Cancel** with a live elapsed counter (updated every 200 ms); the final duration sits at the right of the result toolbar.",
-          "**One cursor per connection** (`tusk_cur`) — while idle, running in another tab or using the sidebar closes the previous stream; the old tab keeps its rows as a frozen snapshot marked done. During a manual transaction, other tabs/sidebar database actions are frozen and an owner run closes only its prior stream, not the outer transaction.",
-          "**Dropped mid-stream** — the grid keeps what it has, shows an error banner plus a `streaming stopped — …` status; re-run to resume."
+          "**One cursor per connection** (`tusk_cur`) — while idle, running in another tab, expanding a relation in the Explorer, refreshing the schema, sidebar DDL, an all-rows export, an import, or the ERD/DDL viewer closes the previous stream. The old tab keeps its rows but is marked **Incomplete result** (toolbar badge + a `N rows loaded · …` status naming what closed it); in-memory sort is off for it and Export lists its loaded rows as incomplete — re-run for the full set. During a manual transaction, other tabs/sidebar database actions are frozen and an owner run closes only its prior stream, not the outer transaction.",
+          "**Dropped mid-stream** — the grid keeps what it has, shows an error banner plus a `streaming stopped — …` status and the same Incomplete badge; re-run to resume."
         ]
       },
       {
@@ -680,7 +680,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Once a base result is **fully loaded**, sort gestures reorder rows in memory — no re-run. While rows are still streaming, or whenever a filter is active, the grid re-runs your query wrapped as `SELECT * FROM (<your query>) AS _tusk … ORDER BY <ordinal>` so ordering happens on the server across the whole result. Local ordering is display-text ordering with each engine's default NULL placement; use an explicit `ORDER BY` when native numeric/date/collation semantics matter."
+        "md": "Once a base result is **fully loaded**, sort gestures reorder rows in memory — no re-run. While rows are still streaming, or whenever a filter is active, the grid re-runs your query wrapped as `SELECT * FROM (<your query>) AS _tusk … ORDER BY <ordinal>` so ordering happens on the server across the whole result. Local ordering compares a column numerically when every loaded value is a number (integers compare exactly at any size), otherwise by display text, with each engine's default NULL placement; use an explicit `ORDER BY` when native date/collation semantics matter. A header click that can't sort (query running, transaction owned elsewhere, or a result that isn't re-runnable and isn't fully loaded) explains why in the status line."
       },
       {
         "k": "list",
@@ -1090,7 +1090,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "Sidebar DDL shares your query connection: while idle, a sidebar action rolls back an open streaming cursor — a tab still paging a big result stops where it is (loaded rows stay). Sidebar DDL is frozen while a manual transaction owns the session."
+        "md": "Sidebar DDL shares your query connection: while idle, a sidebar action rolls back an open streaming cursor — a tab still paging a big result stops where it is (loaded rows stay) and is marked **Incomplete result**. Sidebar DDL is frozen while a manual transaction owns the session."
       },
       {
         "k": "h",
@@ -2791,6 +2791,20 @@ export const TOPICS: Topic[] = [
         "k": "tip",
         "kind": "tip",
         "md": "The updater shipped in v0.4.5 — earlier installs can't auto-update. Grab a fresh installer once; every version after keeps itself current."
+      },
+      {
+        "k": "h",
+        "text": "v0.9.5 — incomplete results say so; numeric sort sorts numbers",
+        "id": "v0-9-5"
+      },
+      {
+        "k": "list",
+        "ordered": false,
+        "items": [
+          "**Incomplete results are marked.** Expanding a table in the Explorer, refreshing the schema, sidebar DDL, an all-rows export, an import, the ERD/DDL viewer, or running in another tab closes the one server cursor a streaming result depends on. The affected tab used to report the rows loaded so far as the full result on the next scroll; it now shows an **Incomplete result** badge and a `N rows loaded · …` status naming what closed the stream, in-memory sort is off for it (a header click re-runs with `ORDER BY`), and Export labels its loaded rows as incomplete. The table info needed for in-grid editing is fetched **before** a query runs — fetching it afterwards used to truncate every editable result at the first page.",
+          "**Numeric columns sort by value** in a fully loaded result (integers exactly at any size, decimals and scientific notation as numbers, `NaN` last); a column with any non-numeric value keeps text order. See [[topic:results|Results]].",
+          "**A sort click that can't apply says why** in the status line instead of doing nothing."
+        ]
       },
       {
         "k": "h",

@@ -86,6 +86,8 @@ export function DdlGraphDialog(props: {
   kind: string; // table | view | matview
   onOpenSql: (sql: string) => void;
   onCopy: (text: string, note: string) => void;
+  /** Called before each metadata read; the host uses it to release a live result stream the read will roll back. */
+  onBeforeMetadata?: () => void;
   onClose: () => void;
 }) {
   // Re-centerable focus (click a neighbor) — starts at the invoked relation,
@@ -111,6 +113,7 @@ export function DdlGraphDialog(props: {
   const centered = () => (center().name ? center() : null); // table-scoped resources skip schema-only mode
   const [ddl] = createResource(centered, async (c) => {
     try {
+      props.onBeforeMetadata?.();
       return { ok: await invoke<string>("object_ddl", { connectionId: props.connectionId, kind: c.kind, schema: c.schema, name: c.name }) };
     } catch (e) {
       return { err: errMsg(e) };
@@ -118,6 +121,7 @@ export function DdlGraphDialog(props: {
   });
   const [rels] = createResource(centered, async (c) => {
     try {
+      props.onBeforeMetadata?.();
       return readRelationships(await invoke<unknown>("table_relationships", { connectionId: props.connectionId, schema: c.schema, name: c.name }));
     } catch (e) {
       return { kind: "error", message: errMsg(e) } as ValueLoad<never>;

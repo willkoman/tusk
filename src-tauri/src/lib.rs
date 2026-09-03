@@ -834,9 +834,15 @@ async fn fetch_more(
         .with_transaction(c.transaction.clone()));
     }
     if !c.backend.cursor_open() {
+        // A stream that finished naturally already released its owner. An owner that is
+        // still registered means something else (a metadata command, sidebar DDL, an
+        // export or import) rolled the cursor back underneath it: report that
+        // explicitly so the UI never presents the partial rows as the full result.
+        let interrupted = c.stream_owner.take().is_some();
         return Ok(FetchResponse {
             rows: vec![],
             done: true,
+            interrupted,
             transaction: c.transaction.clone(),
         });
     }
@@ -880,6 +886,7 @@ async fn fetch_more(
             Ok(FetchResponse {
                 rows: page.rows,
                 done: page.done,
+                interrupted: false,
                 transaction: c.transaction.clone(),
             })
         }

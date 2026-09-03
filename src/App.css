@@ -600,6 +600,7 @@ select option { font-weight: 400; }
 .result-error { margin: 10px 12px; }
 .result-empty { padding: 16px; color: var(--muted); }
 .transaction-result-stale { color: var(--warn); font-size: 11px; font-weight: 600; white-space: nowrap; }
+.result-incomplete { color: var(--warn); font-size: 11px; font-weight: 600; white-space: nowrap; cursor: help; }
 /* Centered loading overlay shown while a query is pending, on top of the (possibly
    stale) output. pointer-events:none so it never traps clicks; faint backdrop dims
    the prior result. Solid colors only (no color-mix) for WKWebView reliability. */

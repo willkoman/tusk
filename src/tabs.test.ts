@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { makeTab, pendingCount } from "./tabs";
+import { interruptedResult, makeTab, pendingCount } from "./tabs";
 
 describe("tab identities", () => {
   it("starts editor and loaded-result generations independently", () => {
@@ -18,5 +18,20 @@ describe("tab identities", () => {
       deletes: [1],
       inserts: [{}, { 4: null }],
     })).toBe(4);
+  });
+});
+
+describe("interruptedResult", () => {
+  it("freezes a streaming snapshot as an explicitly incomplete result", () => {
+    const patch = interruptedResult({ rows: [["1"], ["2"]], done: false }, "an import closed the result stream");
+    expect(patch).toEqual({
+      done: true,
+      incomplete: "an import closed the result stream",
+      status: "2 rows loaded · an import closed the result stream — re-run the query for the full result",
+    });
+  });
+
+  it("leaves a finished snapshot untouched", () => {
+    expect(interruptedResult({ rows: [["1"]], done: true }, "anything")).toBeNull();
   });
 });

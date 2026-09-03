@@ -210,6 +210,11 @@ pub struct FetchResult {
 pub struct FetchResponse {
     pub rows: Vec<Vec<Option<String>>>,
     pub done: bool,
+    /// The stream still had an owner but its server-side cursor was already closed by an
+    /// intervening command (metadata read, sidebar DDL, export, import). The rows loaded
+    /// so far are all the UI will ever get from this result; it must be marked
+    /// incomplete rather than silently reported as complete.
+    pub interrupted: bool,
     pub transaction: TransactionStatus,
 }
 
