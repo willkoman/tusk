@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   AI_PROVIDERS,
   defaultModel,
-  groupByTier,
   modelSupported,
   providerInfo,
   resolveBaseUrl,
@@ -58,7 +57,7 @@ describe("provider registry", () => {
     // live catalog fetch fails. See providers.ts rules.
     const dead = ["deepseek-chat", "deepseek-reasoner", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"];
     for (const p of AI_PROVIDERS) {
-      for (const m of p.models) expect(dead).not.toContain(m.id);
+      for (const m of p.models) expect(dead).not.toContain(m);
     }
   });
 });
@@ -112,8 +111,8 @@ describe("OpenCode Go per-model wire dispatch", () => {
 
   it("every curated OpenCode model exists in the live catalog", () => {
     for (const m of providerInfo("opencode").models) {
-      expect(GO_CATALOG).toContain(m.id);
-      expect(modelSupported("opencode", m.id)).toBe(true);
+      expect(GO_CATALOG).toContain(m);
+      expect(modelSupported("opencode", m)).toBe(true);
     }
   });
 
@@ -209,26 +208,16 @@ describe("OpenCode Zen — all four wires, nothing hidden", () => {
   });
 
   it("every curated Zen model exists in the live catalog", () => {
-    for (const m of providerInfo("opencode-zen").models) expect(ZEN_CATALOG).toContain(m.id);
+    for (const m of providerInfo("opencode-zen").models) expect(ZEN_CATALOG).toContain(m);
   });
 });
 
-describe("model grouping", () => {
-  it("groups curated models into tier buckets in a fixed order", () => {
-    const groups = groupByTier("anthropic", ["claude-haiku-4-5", "claude-opus-4-8", "claude-sonnet-5"]);
-    expect(groups.map((g) => g.label)).toEqual(["Flagship", "Balanced", "Fast & cheap"]);
-    expect(groups[0].models).toEqual(["claude-opus-4-8"]);
-  });
-
-  it("puts live-catalog ids the registry doesn't know into a trailing group", () => {
-    const groups = groupByTier("anthropic", ["claude-opus-4-8", "claude-experimental-9"]);
-    expect(groups.map((g) => g.label)).toEqual(["Flagship", "Other"]);
-    expect(groups[1].models).toEqual(["claude-experimental-9"]);
-  });
-
-  it("renders a router/local provider as one flat group, preserving catalog order", () => {
-    const groups = groupByTier("openrouter", ["z/model", "a/model"]);
-    expect(groups).toEqual([{ label: "Models", models: ["z/model", "a/model"] }]);
+describe("fallback model lists", () => {
+  it("are flat id lists — no tiers, no ranking, no per-model commentary", () => {
+    for (const p of AI_PROVIDERS) {
+      for (const m of p.models) expect(typeof m).toBe("string");
+      expect(new Set(p.models).size).toBe(p.models.length);
+    }
   });
 
   it("defaultModel picks the first curated model; live-catalog-only providers have none", () => {

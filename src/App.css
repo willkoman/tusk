@@ -1180,6 +1180,38 @@ button.btn-danger { background: var(--danger); border-color: var(--danger); colo
 .mp-note { max-width: 42%; overflow: hidden; text-overflow: ellipsis; }
 .mp-empty { padding: 12px 8px; color: var(--muted); font-size: 12px; }
 
+/* Inline multi-select model curator (Settings → AI → Models shown). */
+.mmp { display: flex; flex-direction: column; gap: 6px; margin: 2px 0 6px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
+.mmp-bar { display: flex; align-items: center; gap: 6px; }
+.mmp-bar .mp-search { flex: 1; margin: 0; }
+.mmp-bar button { font-size: 11px; padding: 3px 8px; white-space: nowrap; }
+.mmp-meta { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--muted); flex-wrap: wrap; }
+.mmp-meta .spacer { flex: 1; }
+.mmp-list { max-height: 260px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; padding: 2px; }
+.mmp-meta code, .mmp-add code { font-family: var(--mono); font-size: 11px; color: var(--text); }
+.mmp-row { display: flex; align-items: center; gap: 8px; width: 100%; padding: 3px 6px 3px 8px; box-sizing: border-box; color: var(--text); font: inherit; text-align: left; cursor: pointer; border-radius: 4px; }
+.mmp-row:hover, .mmp-row.on { background: var(--accent-soft); }
+.mmp-row input[type="checkbox"] { margin: 0; flex-shrink: 0; }
+.mmp-row .mp-model { flex: 1; }
+.mmp-row.sel .mp-model { font-weight: 600; }
+/* ★ = the provider's default. Quiet until hovered so a long list doesn't sprout a column
+   of stars; the current default is always shown, in accent. */
+.mmp-star { flex-shrink: 0; border: 1px solid transparent; background: transparent; color: var(--muted); font: inherit; font-size: 11px; padding: 1px 6px; border-radius: 999px; cursor: pointer; opacity: 0; }
+.mmp-row:hover .mmp-star, .mmp-row.on .mmp-star, .mmp-star.on { opacity: 1; }
+.mmp-star:hover { color: var(--text); border-color: var(--border); }
+.mmp-star.on { color: var(--accent); border-color: var(--accent); }
+.mmp-add { color: var(--muted); }
+.mmp-add-icon { width: 13px; text-align: center; flex-shrink: 0; font-size: 12px; }
+.mmp-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.mmp-chip { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-family: var(--mono); padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border); background: var(--panel-2); color: var(--text); max-width: 100%; }
+.mmp-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+.mmp-chip button { border: none; background: transparent; color: var(--muted); cursor: pointer; padding: 0 2px; font-size: 12px; line-height: 1; }
+.mmp-chip button:hover { color: var(--text); }
+.mmp-chip.def { border-color: var(--accent); }
+.mmp-chip-star { color: var(--accent); }
+.mmp-chip.off { opacity: 0.55; }
+.mmp-chip.off span { text-decoration: line-through; }
+
 /* ---------- Settings → AI (src/settings/AiPane.tsx) ----------
    Reuses .settings-row / .settings-note / .run / .ghost / .error; the classes below only
    add the card + skill-row layout. Colours come from the theme vars, never literals. */
@@ -1209,6 +1241,13 @@ button.btn-danger { background: var(--danger); border-color: var(--danger); colo
 .ai-card-model { flex: 1; text-align: right; color: var(--muted); font-size: 11px; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ai-card-caret { color: var(--muted); font-size: 10px; }
 .ai-card-body { padding: 4px 10px 10px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; }
+/* Sub-group label inside a card (Connection / Models): small caps + an optional one-line
+   hint under it, so the card reads as two short forms rather than one long one. */
+.ai-card-group { display: flex; flex-direction: column; gap: 2px; margin: 8px 0 2px; font-size: 10px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.ai-card-group small { font-size: 11px; font-weight: 400; letter-spacing: normal; text-transform: none; line-height: 1.4; }
+.ai-card-body .settings-row input[type="password"], .ai-card-body .settings-row input:not([type]) { width: 260px; max-width: 55%; }
+.ai-card-body .settings-inline input[type="password"] { width: 200px; }
+.ai-card-actions button.danger:hover { color: var(--danger); border-color: var(--danger); }
 .ai-card-actions { display: flex; align-items: center; gap: 6px; padding: 6px 0 2px; }
 .ai-card-actions .spacer { flex: 1; }
 
@@ -1416,3 +1455,57 @@ button.btn-danger { background: var(--danger); border-color: var(--danger); colo
 @media (prefers-reduced-motion: reduce) {
   .kbd-frame, .kbd-frame * { animation: none !important; }
 }
+
+/* ---------- Settings → Slack (src/settings/SlackPane.tsx) ----------
+   Status card + four sections. Section chrome is the generic .settings-section* (same
+   treatment as .ai-section so the AI and Slack tabs read as siblings); rows reuse
+   .settings-row with a stacked label+hint (.settings-label) so no control depends on a
+   hover tooltip to be understood. */
+.slack-pane { display: flex; flex-direction: column; gap: 4px; max-height: 62vh; overflow-y: auto; padding-right: 6px; }
+.settings-section { display: flex; flex-direction: column; gap: 2px; }
+.settings-section + .settings-section { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
+.settings-section-head { display: flex; align-items: center; gap: 10px; min-height: 30px; flex-wrap: wrap; }
+.settings-section-title { margin: 0; font-size: 14px; font-weight: 600; color: var(--text); }
+.settings-section-sub { font-size: 11px; color: var(--muted); }
+.settings-section-actions { margin-left: auto; display: flex; gap: 6px; }
+.settings-section-actions button { font-size: 12px; padding: 4px 10px; }
+.settings-label { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.settings-label > span { display: inline-flex; align-items: center; gap: 6px; }
+.settings-label small { font-size: 11px; line-height: 1.4; color: var(--muted); }
+.settings-label code, .slack-model { font-family: var(--mono); font-size: 11px; color: var(--text); background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+.slack-model { padding: 3px 7px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.settings-actions { display: flex; align-items: center; gap: 6px; padding: 6px 0 2px; }
+.settings-actions .spacer { flex: 1; }
+.settings-hint { font-size: 11px; color: var(--muted); }
+.slack-pane .settings-row input[type="text"] { width: 240px; }
+.slack-pane .settings-row input[type="password"] { width: 240px; }
+.slack-pane .settings-row select { max-width: 240px; }
+.slack-pane .settings-note { padding: 2px 0 6px; line-height: 1.45; }
+.slack-pane .settings-note code { font-family: var(--mono); font-size: 11px; }
+
+.slack-status { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); margin-bottom: 6px; }
+.slack-status-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.slack-status-text b { font-size: 13px; }
+.slack-status-text small { font-size: 11px; color: var(--muted); line-height: 1.4; overflow-wrap: anywhere; }
+.slack-status.err .slack-status-text small { color: var(--danger); }
+.slack-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; background: var(--muted); box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0); }
+.slack-status.on { border-color: var(--ok); }
+.slack-status.on .slack-dot { background: var(--ok); box-shadow: 0 0 0 3px rgba(63, 185, 80, 0.18); }
+.slack-status.wait .slack-dot { background: #e6aa3c; animation: tusk-blink 1.2s infinite; }
+.slack-status.err .slack-dot { background: var(--danger); }
+.slack-switch { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); cursor: pointer; flex-shrink: 0; }
+.slack-switch input { width: 34px; height: 18px; margin: 0; appearance: none; -webkit-appearance: none; border-radius: 999px; background: var(--border); position: relative; cursor: pointer; transition: background 0.15s; }
+.slack-switch input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--text); transition: transform 0.15s; }
+.slack-switch input:checked { background: var(--ok); }
+.slack-switch input:checked::after { transform: translateX(16px); background: #fff; }
+.slack-switch input:disabled { opacity: 0.5; cursor: default; }
+.slack-note { font-size: 12px; color: var(--text); padding: 6px 10px; margin-bottom: 4px; border-radius: 6px; background: var(--panel-2); border: 1px solid var(--border); overflow-wrap: anywhere; }
+.slack-note.error { color: var(--danger); border-color: var(--danger); }
+
+/* The Explorer is a click/drag surface, not prose: a mouse drag that starts on a tree row
+   must never start a text selection (which used to paint the row labels — and, once the
+   pointer crossed into the editor or grid, everything on the way). Inputs stay selectable. */
+.sidebar { user-select: none; }
+.sidebar input { user-select: text; }
+/* Non-label rows (buttons / read-only values) get the same geometry as label.settings-row. */
+.slack-pane div.settings-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 0; font-size: 12px; color: var(--text); }

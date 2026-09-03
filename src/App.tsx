@@ -3806,7 +3806,17 @@ function App() {
                 <button class="icon" title="Clear" onClick={() => setTreeFilter("")}>✕</button>
               </Show>
             </div>
-            <div class="sidebar-body" onContextMenu={openSidebarMenu}>
+            <div
+              class="sidebar-body"
+              onContextMenu={openSidebarMenu}
+              // Tree rows are user-select:none, but Chromium still starts a selection
+              // on mousedown and paints it once the drag crosses selectable content
+              // (row labels in WebView2, the editor/grid beyond the pane). Cancel the
+              // default on a plain left press; clicks/dblclicks/context still fire.
+              onMouseDown={(e) => {
+                if (e.button === 0 && !(e.target instanceof HTMLInputElement)) e.preventDefault();
+              }}
+            >
               <Show when={tree()} fallback={<div class="empty-hint">no objects</div>}>
                 {(t) => (
                   <Tree

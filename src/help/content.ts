@@ -1632,7 +1632,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Keys are stored **per provider** in the **OS keychain** (service `tusk-ai`) and are used only by the Rust backend — never in localStorage, never echoed back to the UI. The panel only ever learns a boolean. Because each provider has its own keychain entry, you can set up several and switch between them mid-conversation without re-entering anything. Non-secret config (active provider, per-provider model and base URL, the sample-data toggle) lives in localStorage under `tusk.ai.config`."
+        "md": "Keys are stored **per provider** in the **OS keychain** (service `tusk-ai`) and are used only by the Rust backend — never in localStorage, never echoed back to the UI. The panel only ever learns a boolean. Because each provider has its own keychain entry, you can set up several and switch between them mid-conversation without re-entering anything. Non-secret config (active provider, per-provider model and base URL, per-provider model allowlists, the sample-data toggle) lives in localStorage under `tusk.ai.config`."
       },
       {
         "k": "p",
@@ -1651,6 +1651,10 @@ export const TOPICS: Topic[] = [
       {
         "k": "p",
         "md": "The picker in the panel header is a **searchable combobox**, not a dropdown — a router like OpenRouter serves several hundred models. Click it (or just start typing) to fuzzy-filter across every provider you've set up; ↑/↓ to move, Enter to pick, Esc to close. Matched characters are highlighted."
+      },
+      {
+        "k": "p",
+        "md": "**Choose models in Settings → AI.** Each provider card has one **Models** list, and it answers both questions: the **checkbox** on a row means the model is *offered* in the header picker and to the Slack bot; the **★** marks the provider's *default* — the model a chat starts on when you switch to that provider. Nothing ticked means every listed model is offered. The list is the provider's **live** catalog, fetched with your key when you open the card (**Refresh** re-fetches; until a key is saved and its origin approved you see the shipped fallback ids). Search it, **Select all** / **Select matches** to tick the visible rows, **Clear** to go back to offering everything, or ✕ a chip. Type an id the catalog doesn't list and an **Add … as a model id** row lets you use it anyway (for custom endpoints). Because the choice is re-filtered against the live catalog each time, a model the provider retires drops out on its own and the card names any stale pick; hiding the model you were using moves the default to your first tick, and starring a model that isn't ticked ticks it. Tusk imposes no ranking — no \"flagship\" or \"fast\" tiers — the list is exactly what the provider serves, in its order."
       },
       {
         "k": "table",
@@ -1679,7 +1683,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "With the search box empty you get the curated grouping instead: **Flagship / Balanced / Fast & cheap / Older, still widely used**, per provider. Model lists are fetched **live** from each provider using your saved key; the curated list is only a fallback for when that fetch fails. **Custom…** in Settings accepts any model id your endpoint takes."
+        "md": "With the search box empty the picker lists each provider's models under a provider heading, in catalog order — no tiers. Model lists are fetched **live** from each provider using your saved key; the shipped fallback ids appear only when that fetch fails. Any id your endpoint takes can be added from the Models list in Settings."
       },
       {
         "k": "h",
@@ -1857,9 +1861,10 @@ export const TOPICS: Topic[] = [
         "items": [
           "**Create your own app** from the YAML manifest in `docs/slack-setup.md` (scopes: `chat:write`, `files:write`, `app_mentions:read`, `im:history`, `im:write`, optional `channels:history`; Socket Mode + interactivity on).",
           "**Two tokens** — the Bot token (`xoxb-…`, from Install to Workspace) and an App-level token (`xapp-…`) with `connections:write`.",
-          "**Paste both in Settings → Slack** — stored in the OS keychain (service `tusk-slack`), never written to disk, never echoed back (placeholder says *\"saved in keychain — type to replace\"*).",
-          "**Test connection** validates both tokens and names the workspace; **Enable Slack bot** starts/stops it. Statusbar badge: `🟢 Slack` running, 🟡 connecting/reconnecting.",
-          "**AI provider/model** is mirrored from **Settings → AI** whenever the Slack pane saves — the Rust bot can't read the web view's storage, so after changing provider or model, change any Slack setting or press Save here."
+          "**Paste both under Slack app tokens in Settings → Slack** — stored in the OS keychain (service `tusk-slack`), never written to disk, never echoed back (a *saved* chip marks each stored token; the field says *type to replace*). **Save tokens** stores them; **Test connection** validates both and names the workspace.",
+          "**The status card at the top** shows the bot's state (Bot off / Connecting… / Bot running, with the last error) and its **On/Off switch**, which is disabled until both tokens are present. Statusbar badge: `🟢 Slack` running, 🟡 connecting/reconnecting.",
+          "**The rest is grouped**: *Who can ask* (channel and user allowlists), *Answers* (rows shown inline, row cap, query timeout, auto-chart, write/DDL reply policy), and *AI* (provider/model, reply max tokens, sample rows). Every one of these saves the moment you change it.",
+          "**AI provider/model** is mirrored from **Settings → AI** whenever the Slack pane saves — the Rust bot can't read the web view's storage. The AI section shows the pair the bot is using; when Settings → AI has since changed, it says so and offers **Update bot** (any other Slack change also re-mirrors it)."
         ],
         "ordered": false
       },
@@ -1913,7 +1918,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**Inline monospace table** — ≤ *Max rows (inline table)* (default **20**), ≤ **5** columns, and the text fits Slack's message block.",
+          "**Inline monospace table** — ≤ *Rows shown inline* (default **20**), ≤ **5** columns, and the text fits Slack's message block.",
           "**CSV attachment** — medium results; **XLSX** past **15** columns.",
           "**Auto-chart** — date+numeric results (2–4 columns, first column date-like, ≤ 50 rows) when *Auto-chart date/numeric results* is on (default). Rendering is fully local — nothing extra leaves the machine.",
           "**Explicit requests** (*\"chart monthly revenue as a bar chart\"*) — the type/axes/labels you name are honored over the heuristic.",
@@ -1940,7 +1945,7 @@ export const TOPICS: Topic[] = [
           "**Single statement only** — scripts are rejected outright.",
           "**Wrappable reads only**: `SELECT` / `WITH` / `TABLE` / `VALUES`. `EXPLAIN` and `SHOW` are read-only but can't be a subquery, so they're rejected too.",
           "**Masked mutation scan** — strings, comments, dollar-quotes, and quoted identifiers are blanked, then `insert` / `update` / `delete` / `merge` / `drop` / `alter` / `truncate` / `create` / `grant` / `revoke` are word-boundary matched **anywhere** — catching writable CTEs like `WITH d AS (DELETE …) SELECT`, smuggled DDL, and `FOR UPDATE` / `FOR SHARE` row locks.",
-          "**Hard row cap** — execution wraps the query as `SELECT * FROM (…) AS _tusk LIMIT cap+1` (*Max rows (file / hard cap)*, default **10,000**) with a \"(truncated at N rows)\" note.",
+          "**Hard row cap** — execution wraps the query as `SELECT * FROM (…) AS _tusk LIMIT cap+1` (*Row cap* under Answers, default **10,000**) with a \"(truncated at N rows)\" note.",
           "**Engine-aware timeout** — *Query timeout* (default **30 s**) uses a real server-side CancelRequest on Postgres; other engines report when a query may finish after Tusk stops waiting.",
           "**Fresh engine-enforced read-only connection** — plus a conservative allowlist of common deterministic functions; unknown, file/network, session, sleep, extension, and sequence routines are rejected.",
           "**Never the UI's streaming cursor** — Slack queries run buffered, never through the shared server cursor a grid stream owns."
@@ -2532,11 +2537,11 @@ export const TOPICS: Topic[] = [
           ],
           [
             "**AI**",
-            "Provider cards (key, default model, API base, origin approval, Test connection), **AI reply max tokens** (256–128,000), and Skills — see [[topic:ai|AI assistant]]"
+            "Provider cards — **Connection** (API key, API base, origin approval, Test connection) and **Models** (one list from the live catalog: tick to offer, ★ for the default) — then **Assistant** (Share sample rows, Reply max tokens 256–128,000) and Skills — see [[topic:ai|AI assistant]]"
           ],
           [
             "**Slack**",
-            "Bot tokens, enable toggle, Test connection, limits and allowlists — see [[topic:slack|Slack bot]]"
+            "Status card with On/Off switch, then Slack app tokens (Save/Test), Who can ask (allowlists), Answers (row limits, timeout, charts, write policy), and AI (mirrored provider/model, reply max tokens, sample rows) — see [[topic:slack|Slack bot]]"
           ],
           [
             "**Shortcuts**",
@@ -2791,6 +2796,21 @@ export const TOPICS: Topic[] = [
         "k": "tip",
         "kind": "tip",
         "md": "The updater shipped in v0.4.5 — earlier installs can't auto-update. Grab a fresh installer once; every version after keeps itself current."
+      },
+      {
+        "k": "h",
+        "text": "v0.9.6 — one model list per provider; Slack settings reorganized",
+        "id": "v0-9-6"
+      },
+      {
+        "k": "list",
+        "ordered": false,
+        "items": [
+          "**Settings → AI has one model list per provider, and no built-in tiers.** Each provider card is two groups: **Connection** (API key — Enter saves — API base, custom-origin approval, Test connection, Get a key / Remove key) and **Models**, a single searchable list fetched live from the provider when you open the card. A row's **checkbox** decides whether the chat header picker and the Slack bot offer that model; **★** marks the provider's default. The old Default-model dropdown and its \"flagship / balanced / older\" grouping are gone — the list is exactly what the provider serves, in its order. An id the catalog doesn't list can be typed and added. See [[topic:ai|AI assistant]].",
+          "**Sample-row sharing and Reply max tokens** moved into their own **Assistant** group with a one-line explanation each.",
+          "**Settings → Slack is reorganized:** a status card (state, last error, On/Off switch) then Slack app tokens, Who can ask, Answers, and AI, every field with an inline explanation; the AI group says when the bot is behind Settings → AI and offers **Update bot**. See [[topic:slack|Slack bot]].",
+          "**Dragging in the Schema Explorer no longer highlights text.**"
+        ]
       },
       {
         "k": "h",

@@ -40,19 +40,6 @@ export type AiProvider =
   | "lmstudio"
   | "custom";
 
-/** Conceptual buckets for the picker. Not a provider concept — purely how we group. */
-export type Tier = "flagship" | "balanced" | "fast" | "legacy";
-
-export const TIER_LABELS: Record<Tier, string> = {
-  flagship: "Flagship",
-  balanced: "Balanced",
-  fast: "Fast & cheap",
-  legacy: "Older, still widely used",
-};
-export const TIER_ORDER: Tier[] = ["flagship", "balanced", "fast", "legacy"];
-
-export type ModelSpec = { id: string; tier: Tier; note?: string };
-
 export type ProviderSpec = {
   id: AiProvider;
   label: string;
@@ -66,9 +53,12 @@ export type ProviderSpec = {
   keyUrl: string;
   /** Local servers authenticate nothing — the panel must not gate them behind a key. */
   needsKey: boolean;
-  /** Curated fallback list. EMPTY = this provider is live-catalog-only (its catalog is
-   *  too large, too namespaced, or too user-specific to hardcode meaningfully). */
-  models: ModelSpec[];
+  /** Curated fallback ids, in the order the picker lists them (the first is the initial
+   *  default). Deliberately NO ranking, tier, or commentary: which model is "best" is the
+   *  user's call, made in Settings → AI from the live catalog. EMPTY = this provider is
+   *  live-catalog-only (its catalog is too large, too namespaced, or too user-specific
+   *  to hardcode meaningfully). */
+  models: string[];
   /** Per-model wire override. `null` = this provider serves the model on a shape we
    *  don't speak, so hide it from the picker. Only the OpenCode gateways need this. */
   wireFor?: (model: string) => Wire | null;
@@ -93,12 +83,12 @@ export const AI_PROVIDERS: ProviderSpec[] = [
     keyUrl: "https://console.anthropic.com/settings/keys",
     needsKey: true,
     models: [
-      { id: "claude-opus-4-8", tier: "flagship", note: "Most capable Opus; long-horizon agentic work" },
-      { id: "claude-fable-5", tier: "flagship", note: "Most capable overall; premium pricing" },
-      { id: "claude-sonnet-5", tier: "balanced", note: "Near-Opus quality at Sonnet cost" },
-      { id: "claude-haiku-4-5", tier: "fast", note: "Fastest and cheapest" },
-      { id: "claude-opus-4-7", tier: "legacy" },
-      { id: "claude-sonnet-4-6", tier: "legacy" },
+      "claude-opus-4-8",
+      "claude-fable-5",
+      "claude-sonnet-5",
+      "claude-haiku-4-5",
+      "claude-opus-4-7",
+      "claude-sonnet-4-6",
     ],
   },
   {
@@ -113,14 +103,14 @@ export const AI_PROVIDERS: ProviderSpec[] = [
     // this provider's base (the only way, before the registry) keep working untouched —
     // same keychain account, same config. New setups should use "custom" instead.
     models: [
-      { id: "gpt-5.5", tier: "flagship", note: "Hardest coding + professional work" },
-      { id: "gpt-5.5-pro", tier: "flagship", note: "Max effort, price-insensitive" },
-      { id: "gpt-5.4", tier: "balanced", note: "Frontier work at half the price" },
-      { id: "gpt-5.3-codex", tier: "balanced", note: "Agentic coding" },
-      { id: "gpt-5.4-mini", tier: "fast" },
-      { id: "gpt-5.4-nano", tier: "fast", note: "Classification, extraction, ranking" },
-      { id: "gpt-4.1", tier: "legacy", note: "Smartest non-reasoning; 1M context" },
-      { id: "gpt-4o", tier: "legacy" },
+      "gpt-5.5",
+      "gpt-5.5-pro",
+      "gpt-5.4",
+      "gpt-5.3-codex",
+      "gpt-5.4-mini",
+      "gpt-5.4-nano",
+      "gpt-4.1", // Smartest non-reasoning; 1M context
+      "gpt-4o",
     ],
   },
   {
@@ -137,12 +127,12 @@ export const AI_PROVIDERS: ProviderSpec[] = [
     // wire is already implemented and streams identically — no reason to switch.
     // Auth is the `x-goog-api-key` header (Google accepts it; Zen requires it).
     models: [
-      { id: "gemini-3.5-flash", tier: "flagship", note: "Google's most intelligent listed model" },
-      { id: "gemini-3.1-pro-preview", tier: "flagship", note: "Advanced reasoning (preview)" },
-      { id: "gemini-3-flash-preview", tier: "balanced" },
-      { id: "gemini-3.1-flash-lite", tier: "fast", note: "Cheapest frontier-class" },
-      { id: "gemini-2.5-pro", tier: "legacy", note: "Retires 2026-10-16" },
-      { id: "gemini-2.5-flash", tier: "legacy", note: "Retires 2026-10-16" },
+      "gemini-3.5-flash",
+      "gemini-3.1-pro-preview",
+      "gemini-3-flash-preview",
+      "gemini-3.1-flash-lite",
+      "gemini-2.5-pro", // Retires 2026-10-16
+      "gemini-2.5-flash", // Retires 2026-10-16
     ],
   },
   {
@@ -162,17 +152,17 @@ export const AI_PROVIDERS: ProviderSpec[] = [
     // Ids verified against a live `GET /zen/go/v1/models` (2026-07). The live catalog wins
     // when the fetch succeeds; note it serves 20 ids while the docs page lists only 14.
     models: [
-      { id: "deepseek-v4-pro", tier: "flagship", note: "Hardest reasoning/agentic; 1M context" },
-      { id: "qwen3.7-max", tier: "flagship" },
-      { id: "minimax-m3", tier: "flagship" },
-      { id: "glm-5.2", tier: "balanced" },
-      { id: "kimi-k2.7-code", tier: "balanced", note: "Coding" },
-      { id: "qwen3.7-plus", tier: "balanced" },
-      { id: "mimo-v2.5-pro", tier: "balanced" },
-      { id: "deepseek-v4-flash", tier: "fast", note: "Cheap, high-volume" },
-      { id: "minimax-m2.5", tier: "fast" },
-      { id: "glm-5.1", tier: "legacy" },
-      { id: "kimi-k2.6", tier: "legacy" },
+      "deepseek-v4-pro", // Hardest reasoning/agentic; 1M context
+      "qwen3.7-max",
+      "minimax-m3",
+      "glm-5.2",
+      "kimi-k2.7-code",
+      "qwen3.7-plus",
+      "mimo-v2.5-pro",
+      "deepseek-v4-flash",
+      "minimax-m2.5",
+      "glm-5.1",
+      "kimi-k2.6",
     ],
     // Go routes each family to a different endpoint, and `/v1/models` is a bare OpenAI list
     // (`{id, object, created, owned_by:"opencode"}`) with NO endpoint or vendor field — so
@@ -205,19 +195,19 @@ export const AI_PROVIDERS: ProviderSpec[] = [
     needsKey: true,
     // A curated cross-section; the live 50-model catalog wins when the fetch succeeds.
     models: [
-      { id: "claude-opus-4-8", tier: "flagship" },
-      { id: "claude-fable-5", tier: "flagship", note: "Most capable; premium pricing" },
-      { id: "gpt-5.5", tier: "flagship", note: "Served on /responses" },
-      { id: "gemini-3.5-flash", tier: "flagship" },
-      { id: "deepseek-v4-pro", tier: "flagship", note: "1M context" },
-      { id: "claude-sonnet-5", tier: "balanced" },
-      { id: "gpt-5.4", tier: "balanced" },
-      { id: "glm-5.2", tier: "balanced" },
-      { id: "kimi-k2.7-code", tier: "balanced", note: "Coding" },
-      { id: "grok-build-0.1", tier: "balanced", note: "Agentic software engineering" },
-      { id: "claude-haiku-4-5", tier: "fast" },
-      { id: "gpt-5.4-nano", tier: "fast" },
-      { id: "deepseek-v4-flash", tier: "fast" },
+      "claude-opus-4-8",
+      "claude-fable-5",
+      "gpt-5.5", // Served on /responses
+      "gemini-3.5-flash",
+      "deepseek-v4-pro", // 1M context
+      "claude-sonnet-5",
+      "gpt-5.4",
+      "glm-5.2",
+      "kimi-k2.7-code",
+      "grok-build-0.1",
+      "claude-haiku-4-5",
+      "gpt-5.4-nano",
+      "deepseek-v4-flash",
     ],
     // Zen's `/v1/models` is a bare OpenAI list (`{id, object, created, owned_by}`) with no
     // endpoint or vendor field, so the id prefix is the only dispatch signal that exists.
@@ -256,9 +246,9 @@ export const AI_PROVIDERS: ProviderSpec[] = [
     keyUrl: "https://console.groq.com/keys",
     needsKey: true,
     models: [
-      { id: "openai/gpt-oss-120b", tier: "flagship", note: "Groq's de-facto default" },
-      { id: "openai/gpt-oss-20b", tier: "fast", note: "Cheap reasoning, high throughput" },
-      { id: "qwen/qwen3.6-27b", tier: "balanced", note: "Agentic coding (preview)" },
+      "openai/gpt-oss-120b",
+      "openai/gpt-oss-20b",
+      "qwen/qwen3.6-27b",
     ],
     // Groq's Llama line (llama-3.3-70b-versatile, llama-3.1-8b-instant) shuts down
     // 2026-08-16 — deliberately absent from this fallback. See the rules above.
@@ -327,40 +317,6 @@ export const resolveBaseUrl = (p: AiProvider, override: string, wire?: Wire): st
   return wire && spec.baseForWire ? spec.baseForWire(base, wire) : base;
 };
 
-export const providerModels = (p: AiProvider): string[] => providerInfo(p).models.map((m) => m.id);
+export const providerModels = (p: AiProvider): string[] => [...providerInfo(p).models];
 
 export const defaultModel = (p: AiProvider): string => providerModels(p)[0] ?? "";
-
-/** Tier of a known model; `undefined` for anything only the live catalog knows about. */
-export const tierOf = (p: AiProvider, model: string): Tier | undefined =>
-  providerInfo(p).models.find((m) => m.id === model)?.tier;
-
-export const modelNote = (p: AiProvider, model: string): string | undefined =>
-  providerInfo(p).models.find((m) => m.id === model)?.note;
-
-/** Group a model list into tier buckets for the picker. Models the registry doesn't
- *  know (live-catalog ids) fall into a trailing "Other" group, preserving input order. */
-export function groupByTier(
-  p: AiProvider,
-  models: string[],
-): { label: string; models: string[] }[] {
-  const buckets = new Map<string, string[]>();
-  const other: string[] = [];
-  for (const id of models) {
-    const t = tierOf(p, id);
-    if (!t) {
-      other.push(id);
-      continue;
-    }
-    const list = buckets.get(t) ?? [];
-    list.push(id);
-    buckets.set(t, list);
-  }
-  const out = TIER_ORDER.filter((t) => buckets.get(t)?.length).map((t) => ({
-    label: TIER_LABELS[t],
-    models: buckets.get(t)!,
-  }));
-  // A provider with no curated tiers (routers, local) renders as one flat group.
-  if (other.length) out.push({ label: out.length ? "Other" : "Models", models: other });
-  return out;
-}

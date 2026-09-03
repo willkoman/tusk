@@ -2,13 +2,14 @@
 // router catalog (OpenRouter serves several hundred ids), so this is a combobox: type to
 // fuzzy-filter across every configured provider, arrow keys to move, Enter to pick.
 //
-// With an empty query it renders the same curated grouping as before (provider · tier),
-// so the common case — a handful of Anthropic models — is unchanged. Typing flattens the
-// list into score order, because a global ranking is what you want when you know the name.
+// With an empty query it lists each provider's models in catalog order under a provider
+// heading — no tiers or editorial ranking, the order the provider (or your Settings → AI
+// curation) gives. Typing flattens the list into score order, because a global ranking
+// is what you want when you know the name.
 
 import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
 import { fuzzyRank, highlight } from "./fuzzy";
-import { groupByTier, modelNote, providerInfo, type AiProvider } from "./store";
+import { providerInfo, type AiProvider } from "./store";
 
 export type ModelChoice = { provider: AiProvider; model: string };
 
@@ -50,12 +51,12 @@ export function ModelPicker(props: {
     }));
   });
 
-  /** Grouped rows when not searching — the curated tier order. */
+  /** Grouped rows when not searching — one group per provider, catalog order. */
   const groups = createMemo(() =>
     props.providers.flatMap((p) => {
       const models = props.modelsFor(p);
       if (!models.length) return [];
-      return groupByTier(p, models).map((g) => ({ label: `${providerInfo(p).label} · ${g.label}`, provider: p, models: g.models }));
+      return [{ label: providerInfo(p).label, provider: p, models }];
     }),
   );
 
@@ -106,7 +107,7 @@ export function ModelPicker(props: {
     <div class="mp">
       <button
         class="mp-btn"
-        title={modelNote(props.current.provider, props.current.model) ?? "Model — click or type to search"}
+        title="Model — click or type to search"
         onClick={() => { setOpen((v) => !v); queueMicrotask(() => inputEl?.focus()); }}
       >
         <span class="mp-btn-model">{props.current.model || "Select a model"}</span>
@@ -138,12 +139,10 @@ export function ModelPicker(props: {
                           <button
                             class="mp-row"
                             classList={{ on: indexOf(c) === cursor(), cur: isCurrent(c) }}
-                            title={modelNote(g.provider, model)}
                             onMouseEnter={() => setCursor(indexOf(c))}
                             onClick={() => pick(c)}
                           >
                             <span class="mp-model">{model}</span>
-                            <Show when={modelNote(g.provider, model)}>{(n) => <span class="mp-note">{n()}</span>}</Show>
                           </button>
                         );
                       }}
@@ -158,7 +157,6 @@ export function ModelPicker(props: {
                     <button
                       class="mp-row"
                       classList={{ on: i() === cursor(), cur: isCurrent(r) }}
-                      title={modelNote(r.provider, r.model)}
                       onMouseEnter={() => setCursor(i())}
                       onClick={() => pick(r)}
                     >

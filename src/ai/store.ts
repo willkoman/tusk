@@ -13,7 +13,7 @@ import {
   type Wire,
 } from "./providers";
 
-export type { AiProvider, Wire, Tier, ModelSpec, ProviderSpec } from "./providers";
+export type { AiProvider, Wire, ProviderSpec } from "./providers";
 export {
   AI_PROVIDERS,
   providerInfo,
@@ -22,9 +22,6 @@ export {
   resolveWire,
   resolveBaseUrl,
   modelSupported,
-  groupByTier,
-  tierOf,
-  modelNote,
 } from "./providers";
 
 export type AiConfig = {
@@ -41,12 +38,19 @@ export type AiConfig = {
   /** Origins explicitly approved for provider overrides. The backend independently binds
    *  each key to its approved origin; this map keeps official providers pinned in the UI. */
   approvedOrigins: Partial<Record<AiProvider, string>>;
+  /** Per-provider allowlist of model ids to present in pickers, chosen in Settings → AI
+   *  from the provider's live catalog. Absent/empty = present every model the catalog
+   *  (or the curated fallback) offers. Bounded: `MAX_ENABLED_MODELS` ids of ≤500 chars. */
+  enabledModels: Partial<Record<AiProvider, string[]>>;
   /** Send a few sample rows of relevant tables to the model (real values leave your machine). */
   shareSamples: boolean;
   /** Response-token ceiling per AI turn. One knob for every AI surface — the Slack pane
    *  reuses the same normalization so desktop and bot can't drift apart. */
   maxTokens: number;
 };
+
+/** Upper bound on curated model ids per provider — a router catalog is a few hundred. */
+export const MAX_ENABLED_MODELS = 500;
 
 /** Canonical max-tokens normalization for ALL AI surfaces (desktop panel + Slack bot):
  *  positive finite numbers clamp to [256, 128000] and snap to 256-token steps;
@@ -120,6 +124,16 @@ export function normalizeAiConfig(raw: unknown): AiConfig {
   const models = stringMap(obj.models, 500);
   const baseUrls = stringMap(obj.baseUrls, 2_000);
   const approvedOrigins = stringMap(obj.approvedOrigins, 500);
+  // Allowlists: known providers only, string ids only, deduped, bounded. An empty list
+  // is dropped so "nothing curated" has exactly one representation.
+  const enabledModels: Partial<Record<AiProvider, string[]>> = {};
+  if (obj.enabledModels && typeof obj.enabledModels === "object" && !Array.isArray(obj.enabledModels)) {
+    for (const [k, v] of Object.entries(obj.enabledModels as Record<string, unknown>)) {
+      if (!AI_PROVIDERS.some((p) => p.id === k) || !Array.isArray(v)) continue;
+      const list = normalizeModelList(v);
+      if (list.length) enabledModels[k as AiProvider] = list;
+    }
+  }
   if (model && models[provider] === undefined) models[provider] = model;
   if (typeof obj.baseUrl === "string" && baseUrls[provider] === undefined) baseUrls[provider] = obj.baseUrl.slice(0, 2_000);
   // Real row values leave the machine. Missing, malformed, and pre-setting values all
@@ -130,11 +144,69 @@ export function normalizeAiConfig(raw: unknown): AiConfig {
     models,
     baseUrls,
     approvedOrigins,
+    enabledModels,
     shareSamples: known && obj.shareSamples === true,
     maxTokens: normalizeMaxTokens(
       typeof obj.maxTokens === "number" || typeof obj.maxTokens === "string" ? obj.maxTokens : 2048,
     ),
   };
+}
+
+/** Dedupe, trim, drop non-strings/blank/oversized ids, cap the count; input order kept. */
+export function normalizeModelList(raw: readonly unknown[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const v of raw) {
+    if (typeof v !== "string") continue;
+    const id = v.trim();
+    if (!id || id.length > 500 || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+    if (out.length >= MAX_ENABLED_MODELS) break;
+  }
+  return out;
+}
+
+/**
+ * The models a picker should present for `provider`.
+ *  - No allowlist → the live catalog when we have one, else the curated fallback.
+ *  - Allowlist + live catalog → the catalog filtered to the allowlist (an id the provider
+ *    no longer serves disappears, which is the whole point of curating from live data).
+ *  - Allowlist, no live catalog → the allowlist itself: it was chosen from live data and
+ *    is fresher than the hardcoded fallback.
+ * The provider's remembered model is always kept visible so the header never names a
+ * model the list can't show.
+ */
+export function visibleModels(
+  c: AiConfig,
+  provider: AiProvider,
+  live: readonly string[] | null | undefined,
+  fallback: readonly string[],
+): string[] {
+  const allow = c.enabledModels[provider];
+  let out: string[];
+  if (!allow?.length) out = [...(live ?? fallback)];
+  else if (live) {
+    const set = new Set(allow);
+    out = live.filter((m) => set.has(m));
+  } else out = [...allow];
+  const remembered = c.models[provider] ?? (c.provider === provider ? c.model : undefined);
+  if (remembered && !out.includes(remembered)) out.unshift(remembered);
+  return out;
+}
+
+/** Replace one provider's allowlist. A non-empty list re-homes the provider's remembered
+ *  model onto its first entry when the old choice is no longer allowed, so the active
+ *  model can never be one the user just hid. */
+export function withEnabledModels(c: AiConfig, provider: AiProvider, models: readonly string[]): AiConfig {
+  const list = normalizeModelList(models);
+  const enabledModels = { ...c.enabledModels };
+  if (list.length) enabledModels[provider] = list;
+  else delete enabledModels[provider];
+  const next: AiConfig = { ...c, enabledModels };
+  const remembered = c.models[provider] ?? (c.provider === provider ? c.model : "");
+  if (list.length && remembered && !list.includes(remembered)) return withProviderModel(next, provider, list[0]);
+  return next;
 }
 
 const fallbackConfig = (): AiConfig => ({
@@ -143,6 +215,7 @@ const fallbackConfig = (): AiConfig => ({
   models: {},
   baseUrls: {},
   approvedOrigins: {},
+  enabledModels: {},
   shareSamples: false,
   maxTokens: 2048,
 });
@@ -218,6 +291,17 @@ export const aiStore = {
     notify(normalizeAiConfig(c));
   },
 };
+
+/** Make `model` the provider's default (its remembered model, and the active model when
+ *  the provider is active). A curated allowlist gains the id if it lacks it, so the
+ *  default can never be a model the pickers hide. */
+export function withDefaultModel(c: AiConfig, provider: AiProvider, model: string): AiConfig {
+  const id = model.trim();
+  if (!id) return c;
+  const allow = c.enabledModels[provider];
+  const next = allow?.length && !allow.includes(id) ? withEnabledModels(c, provider, [...allow, id]) : c;
+  return withProviderModel(next, provider, id);
+}
 
 /** Update one provider's remembered model and its active model when applicable. */
 export function withProviderModel(c: AiConfig, provider: AiProvider, model: string): AiConfig {

@@ -2,7 +2,18 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
-## [Unreleased]
+## [0.9.6] - 2026-09-03
+
+### Changed
+- **Settings → Slack is reorganized so you can tell what each control does at a glance.** The pane now opens with one status card — the bot's state with its last error, and an On/Off switch that stays disabled until both tokens are present — followed by four titled groups: **Slack app tokens** (Save tokens / Test connection, a *saved* chip per stored token), **Who can ask** (channel and user allowlists), **Answers** (rows shown inline, row cap, query timeout, auto-chart, write/DDL reply policy), and **AI** (the provider/model the bot is using, reply max tokens, sample rows). Every field carries a one-line explanation under its label instead of a hover tooltip, and the AI group now says outright when Settings → AI has moved to a different provider or model than the bot is using, with an **Update bot** button rather than the old "change any setting or press Save" ritual.
+
+- **Settings → AI has one model list per provider, and no more built-in "flagship / balanced / older" tiers.** Each provider card is now two short groups. **Connection** holds the API key (Enter saves it), API base, custom-origin approval, and Test connection, with Get a key / Remove key alongside. **Models** is a single searchable list, fetched live from the provider the moment you open the card (Refresh re-fetches; until a key is saved you see the shipped ids): the **checkbox** on a row decides whether the chat header picker and the Slack bot offer that model, and **★** marks the provider's default. The old Default-model dropdown, which duplicated this list and grouped it into tiers Tusk had decided for you, is gone — the header picker now simply lists each provider's models in catalog order, and the fallback lists carry ids only. Starring a model that isn't ticked ticks it, hiding the default moves it to your first tick, Select all / Select matches / Clear and removable chips work as before, and an id the catalog doesn't list can be typed and added for custom endpoints. Sample-row sharing and Reply max tokens moved out of the provider list into their own **Assistant** group with a one-line explanation each.
+
+### Added
+- **Choose which AI models the pickers offer, from each provider's live catalog.** Once a provider is set up in Settings → AI (key saved and approved, or keyless), its card's **Models** list is the provider's live catalog (Refresh re-fetches), with Select all / Select matches, Clear, and a removable chip per pick. The chat header picker and the Slack mirror then present only the ticked ids, so a long or fast-moving catalog (OpenRouter, OpenAI, Gemini) stays as short as you want without editing a hardcoded list. The choice is re-filtered against the live catalog on every load, so a retired model disappears by itself and the card names any stale pick; hiding the model you were using moves the default to your first choice. Nothing ticked means every model, exactly as before.
+
+### Fixed
+- **Dragging in the Schema Explorer no longer highlights text.** A mouse drag that started on a tree row used to begin a text selection, painting row labels — and, once the pointer crossed into the editor or grid, everything on the way. The Explorer is now a pure click/drag surface; the filter box is still selectable.
 
 ## [0.9.5] - 2026-09-03
 

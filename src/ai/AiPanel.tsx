@@ -5,6 +5,7 @@ import {
   providerModels, providerInfo, AI_PROVIDERS, isKeyless, resolveWire, resolveBaseUrl,
   modelSupported, originApproved,
   type AiConfig, type AiProvider, type AiEvent,
+  visibleModels,
 } from "./store";
 import { buildSystemPrompt, relevantTables, type AiContext, type SampleTable } from "./context";
 import { Markdown } from "./markdown";
@@ -61,7 +62,7 @@ export function AiPanel(props: {
    *  model this provider serves on a wire we don't speak (`wireFor` → null). Both
    *  OpenCode gateways are fully covered today, so nothing is filtered in practice. */
   const modelsFor = (pid: AiProvider) =>
-    (liveModels()[pid] ?? providerModels(pid)).filter((m) => modelSupported(pid, m));
+    visibleModels(cfg(), pid, liveModels()[pid], providerModels(pid)).filter((m) => modelSupported(pid, m));
   const modelFetchGeneration = new Map<AiProvider, number>();
   let keyGeneration = 0;
   let keyedGeneration = 0;

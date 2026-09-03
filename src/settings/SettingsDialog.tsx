@@ -225,7 +225,7 @@ export function SettingsDialog(props: {
               <AiPane database={props.database} />
             </Match>
             <Match when={tab() === "slack"}>
-              <SlackPane />
+              <SlackPane onOpenAi={() => setTab("ai")} />
             </Match>
 
             <Match when={tab() === "shortcuts"}>

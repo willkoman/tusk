@@ -1,8 +1,12 @@
-// Settings → AI. Two sections, both self-contained (direct `invoke`s, like SlackPane):
+// Settings → AI. Three sections, all self-contained (direct `invoke`s, like SlackPane):
 //
-//   Providers — one card each. Key status, key entry (never echoed back), default model
-//   grouped by tier, base URL where it's editable, and a Test button that actually calls
-//   the provider's model catalog. Keys live in the OS keychain, one account per provider id.
+//   Providers — one card each, two groups inside: **Connection** (key entry — never echoed
+//   back — API base, origin approval, Test) and **Models** (the ONE model control:
+//   `ModelMultiPicker`, where a checkbox = offered in the pickers and ★ = the provider's
+//   default; fed by the live catalog once the provider is usable, else the shipped
+//   fallback ids). Keys live in the OS keychain, one account per provider id.
+//
+//   Assistant — settings shared by every provider: sample-row sharing, reply token cap.
 //
 //   Skills — user-authored instruction bundles fed to the assistant. Workspace-scoped
 //   (every connection) or database-scoped. Stored on disk as Markdown-with-frontmatter by
@@ -13,11 +17,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { save as saveDialog, open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
-  AI_PROVIDERS, aiStore, defaultModel, groupByTier, isKeyless, modelNote, normalizeMaxTokens,
+  AI_PROVIDERS, aiStore, defaultModel, isKeyless, normalizeMaxTokens,
   approvedBaseOverride, connectionTestProbe, endpointOrigin, normalizeAiConfig, originApproved,
-  originNeedsConsent, providerInfo, providerModels, resolveBaseUrl,
-  withProviderModel, type AiConfig, type AiProvider,
+  originNeedsConsent, providerInfo, providerModels, resolveBaseUrl, withDefaultModel, withEnabledModels,
+  type AiConfig, type AiProvider,
 } from "../ai/store";
+import { ModelMultiPicker } from "../ai/ModelMultiPicker";
 import { emptySkill, type Skill } from "../ai/skills";
 import { KeyedSerialQueue } from "../asyncQueue";
 
@@ -50,7 +55,47 @@ export function AiPane(props: { database: string }) {
   const [keyInput, setKeyInput] = createSignal<Record<string, string>>({});
   const [expanded, setExpanded] = createSignal<AiProvider | null>(null);
   const [liveModels, setLiveModels] = createSignal<Partial<Record<AiProvider, string[]>>>({});
-  const modelsFor = (pid: AiProvider) => liveModels()[pid] ?? providerModels(pid);
+  /** Everything the provider offers right now (live), else the shipped fallback ids. */
+  const catalogFor = (pid: AiProvider) => liveModels()[pid] ?? providerModels(pid);
+  const [catalogState, setCatalogState] = createSignal<Record<string, { loading: boolean; error: string; live: boolean }>>({});
+  const patchCatalog = (pid: AiProvider, p: Partial<{ loading: boolean; error: string; live: boolean }>) =>
+    setCatalogState((m) => ({ ...m, [pid]: { ...{ loading: false, error: "", live: false }, ...m[pid], ...p } }));
+  const catalogGeneration = new Map<AiProvider, number>();
+  /** Fetch the provider's live catalog for curation (no completion probe — Test does that). */
+  async function fetchCatalog(pid: AiProvider) {
+    const spec = providerInfo(pid);
+    if (!originApproved(cfg(), pid)) { patchCatalog(pid, { error: "Approve the custom API origin first." }); return; }
+    const base = resolveBaseUrl(pid, approvedBaseOverride(cfg(), pid));
+    if (!base) { patchCatalog(pid, { error: "Set an API base URL first." }); return; }
+    const generation = (catalogGeneration.get(pid) ?? 0) + 1;
+    catalogGeneration.set(pid, generation);
+    patchCatalog(pid, { loading: true, error: "" });
+    try {
+      const list = await invoke<string[]>("ai_list_models", {
+        provider: pid, wire: spec.wire, baseUrl: base, allowNoKey: !spec.needsKey,
+      });
+      if (!mounted || catalogGeneration.get(pid) !== generation) return;
+      if (list.length) setLiveModels((m) => ({ ...m, [pid]: list }));
+      patchCatalog(pid, { loading: false, live: list.length > 0, error: list.length ? "" : "The provider returned no models." });
+    } catch (e) {
+      if (mounted && catalogGeneration.get(pid) === generation) patchCatalog(pid, { loading: false, error: errMsg(e) });
+    }
+  }
+  /** Why the live catalog can't be fetched yet; empty once the provider is usable
+   *  (keyless, or a key that is saved and its origin approved). */
+  const refreshBlocked = (pid: AiProvider): string => {
+    if (!originApproved(cfg(), pid)) return "approve the custom origin first";
+    if (!isKeyless(pid) && !probe()[pid]?.hasKey) return "save a key first";
+    if (!resolveBaseUrl(pid, approvedBaseOverride(cfg(), pid))) return "set an API base first";
+    return "";
+  };
+  /** Opening a usable provider's card loads its live catalog once, so the model list is
+   *  real before the user reaches it. */
+  const toggleCard = (pid: AiProvider) => {
+    const opening = expanded() !== pid;
+    setExpanded(opening ? pid : null);
+    if (opening && !liveModels()[pid] && !refreshBlocked(pid)) void fetchCatalog(pid);
+  };
   const probeGeneration = new Map<AiProvider, number>();
   const keyMutations = new KeyedSerialQueue<AiProvider>();
   let mounted = true;
@@ -114,7 +159,7 @@ export function AiPane(props: { database: string }) {
         probe,
       });
       if (!probeCurrent(pid, generation)) return;
-      if (list.length) setLiveModels((m) => ({ ...m, [pid]: list }));
+      if (list.length) { setLiveModels((m) => ({ ...m, [pid]: list })); patchCatalog(pid, { live: true, error: "" }); }
       patchProbe(pid, {
         testing: false,
         ok: true,
@@ -161,6 +206,9 @@ export function AiPane(props: { database: string }) {
       await keyMutations.run(pid, () => invoke("ai_clear_key", { provider: pid }));
       if (!probeCurrent(pid, generation)) return;
       patchProbe(pid, { hasKey: false, note: "", ok: null });
+      // The catalog was fetched with the key just removed; fall back to the shipped ids.
+      setLiveModels((m) => { const { [pid]: _gone, ...rest } = m; return rest; });
+      patchCatalog(pid, { live: false, error: "", loading: false });
       aiStore.broadcast(cfg());
     } catch (e) {
       if (probeCurrent(pid, generation)) patchProbe(pid, { note: errMsg(e), ok: false });
@@ -239,8 +287,8 @@ export function AiPane(props: { database: string }) {
           <span class="ai-section-sub">{configured()} set up</span>
         </header>
         <div class="settings-note">
-          Each provider stores its key separately in your OS keychain — add several and switch
-          models from the chat header. Keys never reach the web view.
+          Open a provider to connect it and choose its models. Set up several and switch
+          between them from the chat header. Keys live in your OS keychain and never reach the web view.
         </div>
         <Show when={configError()}><div class="error">{configError()}</div></Show>
 
@@ -251,7 +299,7 @@ export function AiPane(props: { database: string }) {
             const open = () => expanded() === p.id;
             return (
               <div class="ai-card" classList={{ active: isActive(p.id), open: open() }}>
-                <button class="ai-card-head" onClick={() => setExpanded(open() ? null : p.id)}>
+                <button class="ai-card-head" onClick={() => toggleCard(p.id)}>
                   <span class="ai-card-name">
                     {p.label}
                     <Show when={isActive(p.id)}><span class="ai-chip accent">Active</span></Show>
@@ -265,49 +313,33 @@ export function AiPane(props: { database: string }) {
                   <div class="ai-card-body">
                     <Show when={p.note}><div class="ai-note">{p.note}</div></Show>
 
+                    {/* ---- Connection: everything needed to reach the provider ---- */}
+                    <div class="ai-card-group">Connection</div>
+
                     <Show when={p.needsKey}>
                       <label class="settings-row">
-                        <span>API key</span>
-                        <input
-                          type="password"
-                          placeholder={probe()[p.id]?.hasKey ? "saved in keychain — type to replace" : "paste key"}
-                          value={keyInput()[p.id] ?? ""}
-                          onInput={(e) => setKeyInput((m) => ({ ...m, [p.id]: e.currentTarget.value }))}
-                        />
+                        <span class="settings-label">
+                          <span>API key</span>
+                          <small>{probe()[p.id]?.hasKey ? "Saved in your OS keychain. Paste a new key to replace it." : "Stored in your OS keychain, never shown again."}</small>
+                        </span>
+                        <span class="settings-inline">
+                          <input
+                            type="password"
+                            placeholder={probe()[p.id]?.hasKey ? "type to replace" : "paste key"}
+                            value={keyInput()[p.id] ?? ""}
+                            onInput={(e) => setKeyInput((m) => ({ ...m, [p.id]: e.currentTarget.value }))}
+                            onKeyDown={(e) => { if (e.key === "Enter" && (keyInput()[p.id] ?? "").trim()) void saveKey(p.id); }}
+                          />
+                          <button class="run" disabled={!(keyInput()[p.id] ?? "").trim()} onClick={() => void saveKey(p.id)}>Save</button>
+                        </span>
                       </label>
-                      <div class="ai-card-actions">
-                        <Show when={p.keyUrl}>
-                          <button class="ghost" onClick={() => void openUrl(p.keyUrl)}>Get a key ↗</button>
-                        </Show>
-                        <span class="spacer" />
-                        <Show when={probe()[p.id]?.hasKey}>
-                          <button class="ghost" onClick={() => void clearKey(p.id)}>Remove key</button>
-                        </Show>
-                        <button class="run" disabled={!(keyInput()[p.id] ?? "").trim()} onClick={() => void saveKey(p.id)}>Save key</button>
-                      </div>
                     </Show>
 
                     <label class="settings-row">
-                      <span>Default model</span>
-                      <select
-                        value={cfg().models[p.id] ?? defaultModel(p.id)}
-                        onChange={(e) => {
-                          const next = withProviderModel(cfg(), p.id, e.currentTarget.value);
-                          setConfig(next);
-                        }}
-                      >
-                        <For each={groupByTier(p.id, modelsFor(p.id))}>
-                          {(g) => (
-                            <optgroup label={g.label}>
-                              <For each={g.models}>{(m) => <option value={m} title={modelNote(p.id, m)}>{m}</option>}</For>
-                            </optgroup>
-                          )}
-                        </For>
-                      </select>
-                    </label>
-
-                    <label class="settings-row">
-                      <span>API base {p.id === "custom" ? "(required)" : "(optional)"}</span>
+                      <span class="settings-label">
+                        <span>API base</span>
+                        <small>{p.id === "custom" ? "Required — the prefix before /v1." : "Optional — leave blank for the provider's own endpoint."}</small>
+                      </span>
                       <input
                         placeholder={p.baseHint}
                         value={cfg().baseUrls[p.id] ?? ""}
@@ -316,8 +348,13 @@ export function AiPane(props: { database: string }) {
                     </label>
 
                     <Show when={originNeedsConsent(p.id, cfg().baseUrls[p.id] ?? "")}>
-                      <label class="settings-row" title="A saved key, prompts, schema context, and enabled sample rows may be sent to this origin.">
-                        <span>Allow custom origin</span>
+                      <label class="settings-row">
+                        <span class="settings-label">
+                          <span>Allow custom origin</span>
+                          <small>
+                            <code>{endpointOrigin(cfg().baseUrls[p.id] ?? "") ?? "invalid URL"}</code> — your key, prompts, schema and any shared sample rows go here.
+                          </small>
+                        </span>
                         <input
                           type="checkbox"
                           checked={originApproved(cfg(), p.id)}
@@ -337,9 +374,6 @@ export function AiPane(props: { database: string }) {
                           }}
                         />
                       </label>
-                      <div class="ai-note">
-                        Custom origin: <code>{endpointOrigin(cfg().baseUrls[p.id] ?? "") ?? "invalid URL"}</code>. Approval is required before credentials or database context can be sent there.
-                      </div>
                     </Show>
                     <Show when={isKeyless(p.id)}>
                       <div class="ai-note">Keyless endpoints are accepted only on localhost or a loopback IP.</div>
@@ -349,10 +383,13 @@ export function AiPane(props: { database: string }) {
                       <button class="ghost" disabled={probe()[p.id]?.testing} onClick={() => void testProvider(p.id)}>
                         {probe()[p.id]?.testing ? "Testing…" : "Test connection"}
                       </button>
+                      <Show when={p.needsKey && p.keyUrl}>
+                        <button class="ghost" onClick={() => void openUrl(p.keyUrl)}>Get a key ↗</button>
+                      </Show>
                       <span class="spacer" />
-                      <button class="run" disabled={isActive(p.id)} onClick={() => setConfig({ provider: p.id, model: cfg().models[p.id] ?? defaultModel(p.id) })}>
-                        {isActive(p.id) ? "Active" : "Use this provider"}
-                      </button>
+                      <Show when={p.needsKey && probe()[p.id]?.hasKey}>
+                        <button class="ghost danger" onClick={() => void clearKey(p.id)}>Remove key</button>
+                      </Show>
                     </div>
                     <Show when={probe()[p.id]?.note}>
                       <div classList={{ "ai-note": probe()[p.id]?.ok !== false, error: probe()[p.id]?.ok === false }}>
@@ -360,6 +397,31 @@ export function AiPane(props: { database: string }) {
                         {probe()[p.id]?.note}
                       </div>
                     </Show>
+
+                    {/* ---- Models: the one place a model is chosen for this provider ---- */}
+                    <div class="ai-card-group">
+                      Models
+                      <small>Tick the models the chat picker and Slack should offer; ★ marks the default. Nothing ticked = every model listed.</small>
+                    </div>
+                    <ModelMultiPicker
+                      catalog={catalogFor(p.id)}
+                      live={!!catalogState()[p.id]?.live}
+                      loading={!!catalogState()[p.id]?.loading}
+                      error={catalogState()[p.id]?.error ?? ""}
+                      refreshBlocked={refreshBlocked(p.id)}
+                      selected={cfg().enabledModels[p.id] ?? []}
+                      defaultModel={cfg().models[p.id] ?? defaultModel(p.id)}
+                      onChange={(list) => setConfig(withEnabledModels(cfg(), p.id, list))}
+                      onDefault={(model) => setConfig(withDefaultModel(cfg(), p.id, model))}
+                      onRefresh={() => void fetchCatalog(p.id)}
+                    />
+
+                    <div class="ai-card-actions">
+                      <span class="spacer" />
+                      <button class="run" disabled={isActive(p.id)} onClick={() => setConfig({ provider: p.id, model: cfg().models[p.id] ?? defaultModel(p.id) })}>
+                        {isActive(p.id) ? "Active provider" : "Use this provider"}
+                      </button>
+                    </div>
                   </div>
                 </Show>
               </div>
@@ -368,8 +430,20 @@ export function AiPane(props: { database: string }) {
         </For>
       </div>
 
-        <label class="settings-row" title="Send a few sample rows of relevant tables so the model understands your real data. Real values leave your machine.">
-          <span>Share sample data with the model</span>
+      </section>
+
+      {/* ------------------------------------------------ assistant */}
+      <section class="ai-section">
+        <header class="ai-section-head">
+          <h3 class="ai-section-title">Assistant</h3>
+          <span class="ai-section-sub">applies to every provider</span>
+        </header>
+
+        <label class="settings-row">
+          <span class="settings-label">
+            <span>Share sample rows with the model</span>
+            <small>Sends a few rows from relevant tables so answers fit your real data. Real values leave your machine. Off by default.</small>
+          </span>
           <input
             type="checkbox"
             checked={cfg().shareSamples}
@@ -381,11 +455,11 @@ export function AiPane(props: { database: string }) {
           />
         </label>
 
-        <label
-          class="settings-row"
-          title="Upper bound on the AI's reply length, in tokens. Too low cuts replies (and their SQL) off mid-sentence; the provider may cap it lower than this."
-        >
-          <span>AI reply max tokens</span>
+        <label class="settings-row">
+          <span class="settings-label">
+            <span>Reply max tokens</span>
+            <small>Upper bound on a reply's length (256–128,000). Too low cuts replies and their SQL off mid-sentence; the provider may cap it lower.</small>
+          </span>
           <input
             type="number"
             min="256"
