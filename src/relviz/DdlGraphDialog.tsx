@@ -270,6 +270,7 @@ export function DdlGraphDialog(props: {
   const beginDrag = (e: PointerEvent, kind: "table" | "group" | "hood", id: string, gi: number, members: string[]) => {
     if (e.button !== 0) return;
     e.stopPropagation();
+    e.preventDefault(); // no native text selection under a card/group drag (see panzoom.ts)
     dragRef = { kind, id, gi, members, startX: e.clientX, startY: e.clientY, lastX: e.clientX, lastY: e.clientY, moved: false };
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
   };

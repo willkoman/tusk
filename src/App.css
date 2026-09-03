@@ -903,7 +903,9 @@ select option { font-weight: 400; }
 .confirm-note { font-size: 12.5px; line-height: 1.5; color: var(--text); }
 
 /* ---- pan/zoom canvas (plan tree + relationship graphs) ---- */
-.viz-viewport { position: relative; flex: 1; min-height: 0; min-width: 0; overflow: hidden; touch-action: none; cursor: grab; background: var(--bg); }
+/* A pan/drag surface, never prose: the pointer handlers cancel the compat mousedown,
+   and this is the belt for anything that reaches the viewport another way. */
+.viz-viewport { position: relative; flex: 1; min-height: 0; min-width: 0; overflow: hidden; touch-action: none; cursor: grab; background: var(--bg); user-select: none; }
 .viz-viewport.dragging { cursor: grabbing; }
 .viz-canvas { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
 .viz-edges { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }

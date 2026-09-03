@@ -2809,6 +2809,7 @@ export const TOPICS: Topic[] = [
           "**Settings → AI has one model list per provider, and no built-in tiers.** Each provider card is two groups: **Connection** (API key — Enter saves — API base, custom-origin approval, Test connection, Get a key / Remove key) and **Models**, a single searchable list fetched live from the provider when you open the card. A row's **checkbox** decides whether the chat header picker and the Slack bot offer that model; **★** marks the provider's default. The old Default-model dropdown and its \"flagship / balanced / older\" grouping are gone — the list is exactly what the provider serves, in its order. An id the catalog doesn't list can be typed and added. See [[topic:ai|AI assistant]].",
           "**Sample-row sharing and Reply max tokens** moved into their own **Assistant** group with a one-line explanation each.",
           "**Settings → Slack is reorganized:** a status card (state, last error, On/Off switch) then Slack app tokens, Who can ask, Answers, and AI, every field with an inline explanation; the AI group says when the bot is behind Settings → AI and offers **Update bot**. See [[topic:slack|Slack bot]].",
+          "**Panning the ERD or dragging a table card no longer selects text** — the schema graph and the EXPLAIN plan canvas are pure pan/drag surfaces now; the DDL pane beside the graph stays selectable.",
           "**Dragging in the Schema Explorer no longer highlights text.**"
         ]
       },

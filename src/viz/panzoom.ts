@@ -54,6 +54,10 @@ export function createPanZoom(): PanZoom {
     },
     onPointerDown: (e: PointerEvent) => {
       if (e.button !== 0 || !Number.isFinite(e.clientX) || !Number.isFinite(e.clientY)) return;
+      // Cancel the compatibility mousedown: without this Chromium starts a native text
+      // selection under the pan and extends it across every card label — and, once the
+      // captured pointer leaves the viewport, across the dialog and page behind it.
+      e.preventDefault();
       const t = transform();
       panStart = { px: e.clientX, py: e.clientY, x: t.x, y: t.y };
       setDragging(true);
