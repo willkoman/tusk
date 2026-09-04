@@ -489,5 +489,12 @@ describe("explainSql", () => {
     expect(analyzeExecutesWrite("-- c\nWITH x AS (SELECT 1) SELECT * FROM x")).toBe(false);
     expect(analyzeExecutesWrite("DELETE FROM t")).toBe(true);
     expect(analyzeExecutesWrite("UPDATE t SET a=1")).toBe(true);
+    // A WITH is a read only when the statement it feeds is one.
+    expect(analyzeExecutesWrite("WITH bnr AS (SELECT id FROM vendor) UPDATE pvl SET a = NULL FROM bnr WHERE 1=1")).toBe(true);
+    expect(analyzeExecutesWrite("WITH g AS (SELECT 1) INSERT INTO t SELECT * FROM g")).toBe(true);
+    expect(analyzeExecutesWrite("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d")).toBe(true);
+    expect(analyzeExecutesWrite("WITH update AS (SELECT 1) SELECT * FROM update")).toBe(false);
+    expect(analyzeExecutesWrite("WITH x AS (SELECT 'update' /* delete */) TABLE x")).toBe(false);
+    expect(analyzeExecutesWrite("WITH x AS (SELECT 1)")).toBe(true);
   });
 });

@@ -1147,6 +1147,73 @@ pub fn contains_code_word(sql: &str, needle: &str) -> bool {
     scan_code_words(sql, |word, _| word.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
+/// The shape of a `WITH`-led statement: `main` is the lowercased keyword of the statement
+/// its CTEs feed (`select`, `insert`, `update`, `delete`, `merge`, `table`, `values`, or
+/// DuckDB's `from`/`pivot`), `modifying_cte` says whether any CTE body is itself a write
+/// (`WITH d AS (DELETE … RETURNING *) SELECT …`). `None` when the text is not WITH-led
+/// or no main statement is found (a parenthesised main `SELECT` is still recognised).
+///
+/// A CTE *name* is a depth-0 word followed by `AS` (past its optional column list);
+/// PostgreSQL leaves `update`/`delete`/`insert` non-reserved, so `WITH update AS (…)`
+/// must not be mistaken for the main statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WithShape {
+    pub main: String,
+    pub modifying_cte: bool,
+}
+
+const WITH_MAIN_WORDS: &[&str] = &[
+    "select", "insert", "update", "delete", "merge", "table", "values", "from", "pivot",
+];
+
+pub fn with_shape(sql: &str) -> Option<WithShape> {
+    if first_word(sql) != "with" {
+        return None;
+    }
+    let mut top: Vec<String> = Vec::new();
+    let mut expect_body = false;
+    let mut modifying_cte = false;
+    let mut paren_main: Option<String> = None;
+    let mut prev_depth = 0usize;
+    scan_code_words(effective_start(sql), |word, depth| {
+        let w = String::from_utf8_lossy(word).to_ascii_lowercase();
+        if depth == 0 {
+            expect_body = matches!(w.as_str(), "as" | "materialized");
+            top.push(w);
+        } else if prev_depth == 0 {
+            // First word of a new top-level paren group.
+            if expect_body {
+                expect_body = false;
+                if matches!(w.as_str(), "insert" | "update" | "delete" | "merge") {
+                    modifying_cte = true;
+                }
+            } else if top.len() > 1
+                && paren_main.is_none()
+                && matches!(w.as_str(), "select" | "table" | "values")
+            {
+                // `WITH x AS (…) (SELECT …) UNION …` — main statement in parens.
+                paren_main = Some(w);
+            }
+        }
+        prev_depth = depth;
+        false
+    });
+    let main = top
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(i, w)| {
+            WITH_MAIN_WORDS.contains(&w.as_str())
+                && top.get(i + 1).map(String::as_str) != Some("as")
+        })
+        .map(|(_, w)| w.clone())
+        .or(paren_main)?;
+    Some(WithShape {
+        main,
+        modifying_cte,
+    })
+}
+
 fn is_copy_from_stdin(sql: &str) -> bool {
     if first_word(sql) != "copy" {
         return false;
@@ -1230,6 +1297,64 @@ pub async fn run(client: &Client, items: &[Item], read_only: bool) -> Result<Str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn with_shape_finds_the_statement_the_ctes_feed() {
+        use super::with_shape;
+        let shape = |s: &str| with_shape(s).map(|w| (w.main, w.modifying_cte));
+        assert_eq!(shape("SELECT 1"), None);
+        assert_eq!(
+            shape("WITH x AS (SELECT 1) SELECT * FROM x"),
+            Some(("select".into(), false))
+        );
+        assert_eq!(
+            shape("-- note\nWITH RECURSIVE t(n) AS (VALUES (1) UNION ALL SELECT n+1 FROM t WHERE n < 5) TABLE t"),
+            Some(("table".into(), false))
+        );
+        assert_eq!(
+            shape("WITH bnr AS (SELECT id FROM vendor), good AS (SELECT 1) UPDATE pvl SET a = NULL FROM good g WHERE 1=1"),
+            Some(("update".into(), false))
+        );
+        assert_eq!(
+            shape("WITH g AS (SELECT 1) INSERT INTO t SELECT * FROM g"),
+            Some(("insert".into(), false))
+        );
+        assert_eq!(
+            shape("WITH g AS (SELECT 1) DELETE FROM t USING g"),
+            Some(("delete".into(), false))
+        );
+        assert_eq!(
+            shape("WITH g AS (SELECT 1) MERGE INTO t USING g ON 1=1 WHEN MATCHED THEN DELETE"),
+            Some(("merge".into(), false))
+        );
+        // Non-reserved words as CTE names are names, not the main statement.
+        assert_eq!(
+            shape(
+                "WITH update AS (SELECT 1), delete(a) AS (SELECT 2) SELECT * FROM update, delete"
+            ),
+            Some(("select".into(), false))
+        );
+        // Data-modifying CTE bodies, including NOT MATERIALIZED, are flagged.
+        assert_eq!(
+            shape("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"),
+            Some(("select".into(), true))
+        );
+        assert_eq!(
+            shape("WITH d AS NOT MATERIALIZED (UPDATE t SET a=1 RETURNING *) SELECT * FROM d"),
+            Some(("select".into(), true))
+        );
+        // Keywords inside strings/comments/quoted identifiers are invisible.
+        assert_eq!(
+            shape("WITH x AS (SELECT 'update' /* delete */ AS \"insert\") SELECT * FROM x"),
+            Some(("select".into(), false))
+        );
+        // Parenthesised main statement.
+        assert_eq!(
+            shape("WITH x AS (SELECT 1) (SELECT * FROM x) UNION (SELECT 2)"),
+            Some(("select".into(), false))
+        );
+        assert_eq!(shape("WITH x AS (SELECT 1)"), None);
+    }
+
     use super::*;
 
     #[test]

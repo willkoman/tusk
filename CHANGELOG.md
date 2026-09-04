@@ -2,6 +2,11 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
+## [0.9.7] - 2026-09-04
+
+### Fixed
+- **`WITH … UPDATE` / `INSERT` / `DELETE` / `MERGE` now run as the writes they are.** A statement that opens with `WITH` was classified as a streamable read by its first word alone, so PostgreSQL received it wrapped in `DECLARE … CURSOR FOR WITH … UPDATE` and answered `syntax error at or near "UPDATE"` — the SQL itself was fine. Tusk now looks at the statement the CTEs feed: a `WITH` ending in `SELECT`/`TABLE`/`VALUES` still streams through the cursor, one ending in a write executes normally and reports rows affected, and a CTE that is itself a write (`WITH d AS (DELETE … RETURNING *) SELECT …`) takes the plain path too. CTE names that happen to be `update`/`delete` are not mistaken for the statement. The same test now gates **Explain Analyze**: a `WITH … UPDATE` gets the "this will execute" confirmation instead of running unasked.
+
 ## [0.9.6] - 2026-09-03
 
 ### Changed

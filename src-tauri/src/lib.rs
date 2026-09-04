@@ -300,10 +300,19 @@ pub(crate) async fn lock_conn(conn: &Conn) -> Result<ConnGuard<'_>, AppError> {
 /// subqueries fine (pinned by `duck_from_first_and_pivot_stream`), and classifying
 /// them non-cursorable buffered ENTIRE tables in RAM (`FROM events` on a big table
 /// was an allocation-abort waiting to happen).
-fn is_cursorable(sql: &str, duck: bool) -> bool {
+pub(crate) fn is_cursorable(sql: &str, duck: bool) -> bool {
+    let read_head = |w: &str| {
+        matches!(w, "select" | "table" | "values") || (duck && matches!(w, "from" | "pivot"))
+    };
     let w = first_sql_word(sql);
-    matches!(w.as_str(), "select" | "with" | "table" | "values")
-        || (duck && matches!(w.as_str(), "from" | "pivot"))
+    match w.as_str() {
+        // `WITH … UPDATE/INSERT/DELETE/MERGE` is a write wearing a read's first word:
+        // `DECLARE … CURSOR FOR` it is a syntax error, and a data-modifying CTE cannot
+        // sit under a cursor either. Only a WITH whose main statement is a read streams;
+        // anything else runs on the plain execute path.
+        "with" => script::with_shape(sql).is_some_and(|s| !s.modifying_cte && read_head(&s.main)),
+        _ => read_head(&w),
+    }
 }
 
 /// Statements allowed on a read-only connection.
@@ -1134,6 +1143,31 @@ mod bind_param_tests {
         ));
         assert!(!is_cursorable("selection FROM t", false));
         assert!(!is_read_only_stmt("showcase"));
+        // WITH streams only when the statement it feeds is a read.
+        assert!(is_cursorable("WITH x AS (SELECT 1) SELECT * FROM x", false));
+        assert!(is_cursorable("WITH x AS (SELECT 1) TABLE x", false));
+        assert!(!is_cursorable(
+            "WITH bnr AS (SELECT id FROM vendor) UPDATE pvl SET a = NULL FROM bnr WHERE 1=1",
+            false
+        ));
+        assert!(!is_cursorable(
+            "WITH g AS (SELECT 1) INSERT INTO t SELECT * FROM g",
+            false
+        ));
+        assert!(!is_cursorable(
+            "WITH g AS (SELECT 1) DELETE FROM t USING g",
+            false
+        ));
+        assert!(!is_cursorable(
+            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
+            false
+        ));
+        assert!(is_cursorable(
+            "WITH update AS (SELECT 1) SELECT * FROM update",
+            false
+        ));
+        assert!(is_cursorable("WITH x AS (SELECT 1) FROM x", true));
+        assert!(!is_cursorable("WITH x AS (SELECT 1) FROM x", false));
         // DuckDB-only forms stream (buffering FROM <big table> whole was an OOM-abort
         // class); other engines keep rejecting them as cursorable.
         assert!(is_cursorable("FROM events", true));

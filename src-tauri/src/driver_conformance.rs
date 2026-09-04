@@ -81,12 +81,9 @@ fn mysql_cfg() -> Option<ConnectionConfig> {
 
 // --- helpers ---
 
+/// The production classifier (non-DuckDB form): a `WITH`-led write must not stream.
 fn cursorable(sql: &str) -> bool {
-    let t = sql.trim_start().to_ascii_lowercase();
-    t.starts_with("select")
-        || t.starts_with("with")
-        || t.starts_with("table")
-        || t.starts_with("values")
+    crate::is_cursorable(sql, false)
 }
 
 async fn exec(b: &mut Backend, sql: &str) {
@@ -201,9 +198,63 @@ async fn syntax_error_recovery_battery(b: &mut Backend, eng: &Eng) {
     }
 }
 
+/// `WITH … UPDATE` is a write wearing a read's first word. It used to classify as
+/// cursorable, so PostgreSQL received `DECLARE … CURSOR FOR WITH … UPDATE` (a syntax
+/// error at UPDATE) and every engine routed the write through the read path.
+async fn with_dml_battery(b: &mut Backend, eng: &Eng) {
+    let q = eng.quote;
+    exec(b, &format!("DROP TABLE IF EXISTS {}", q("wdml"))).await;
+    exec(
+        b,
+        &format!("CREATE TABLE {} (id INTEGER, v INTEGER)", q("wdml")),
+    )
+    .await;
+    exec(
+        b,
+        &format!("INSERT INTO {} VALUES (1, 0), (2, 0)", q("wdml")),
+    )
+    .await;
+    let sql = format!(
+        "WITH g AS (SELECT 1 AS id) UPDATE {} SET v = 9 WHERE id IN (SELECT id FROM g)",
+        q("wdml")
+    );
+    assert!(
+        !cursorable(&sql),
+        "[{}] WITH-led UPDATE must not be cursorable",
+        eng.name
+    );
+    b.rollback_cursor().await;
+    // Outcome shape is engine-specific (DuckDB reports writes as a one-row `Count`
+    // result); what matters is that it is not a cursor error and the write lands.
+    if let Err(e) = b.run_single(&sql, 100, cursorable(&sql)).await {
+        panic!("[{}] WITH … UPDATE failed: {}", eng.name, e.message);
+    }
+    let r = all(b, &format!("SELECT v FROM {} WHERE id = 1", q("wdml"))).await;
+    assert_eq!(
+        cell(&r[0], 0).as_deref(),
+        Some("9"),
+        "[{}] WITH … UPDATE applied",
+        eng.name
+    );
+    // A read-headed WITH still streams through the cursor path.
+    let sql = format!(
+        "WITH g AS (SELECT id FROM {}) SELECT id FROM g ORDER BY id",
+        q("wdml")
+    );
+    assert!(cursorable(&sql), "[{}] WITH … SELECT streams", eng.name);
+    assert_eq!(
+        all(b, &sql).await.len(),
+        2,
+        "[{}] WITH … SELECT rows",
+        eng.name
+    );
+    exec(b, &format!("DROP TABLE {}", q("wdml"))).await;
+}
+
 async fn run_battery(b: &mut Backend, eng: &Eng) {
     database_name_battery(b, eng).await;
     syntax_error_recovery_battery(b, eng).await;
+    with_dml_battery(b, eng).await;
     let q = eng.quote;
 
     // clean slate (idempotent across re-runs on a persistent server)

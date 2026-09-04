@@ -1328,7 +1328,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "`EXPLAIN ANALYZE` **executes** the statement. If it isn't a read (`SELECT`/`WITH`/`TABLE`/`VALUES`), Tusk shows an *Explain Analyze* confirmation dialog — only the red **Run it** button proceeds."
+        "md": "`EXPLAIN ANALYZE` **executes** the statement. If it isn't a read (`SELECT`/`TABLE`/`VALUES`, or a `WITH` that feeds one — `WITH … UPDATE` counts as a write), Tusk shows an *Explain Analyze* confirmation dialog — only the red **Run it** button proceeds."
       },
       {
         "k": "h",
@@ -2796,6 +2796,19 @@ export const TOPICS: Topic[] = [
         "k": "tip",
         "kind": "tip",
         "md": "The updater shipped in v0.4.5 — earlier installs can't auto-update. Grab a fresh installer once; every version after keeps itself current."
+      },
+      {
+        "k": "h",
+        "text": "v0.9.7 — WITH-led writes run as writes",
+        "id": "v0-9-7"
+      },
+      {
+        "k": "list",
+        "ordered": false,
+        "items": [
+          "**`WITH … UPDATE` / `INSERT` / `DELETE` / `MERGE` now execute correctly.** A statement opening with `WITH` was treated as a streamable read by its first word, so PostgreSQL received it wrapped in a cursor and answered `syntax error at or near \"UPDATE\"`. Tusk now looks at the statement the CTEs feed: a `WITH` ending in `SELECT`/`TABLE`/`VALUES` still streams, one ending in a write runs normally and reports rows affected, and a CTE that is itself a write takes the plain path too.",
+          "**Explain Analyze on a `WITH … UPDATE` now asks first**, like any other write — see [[topic:plans|EXPLAIN plans]]."
+        ]
       },
       {
         "k": "h",
