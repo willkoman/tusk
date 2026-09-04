@@ -1149,69 +1149,383 @@ pub fn contains_code_word(sql: &str, needle: &str) -> bool {
 
 /// The shape of a `WITH`-led statement: `main` is the lowercased keyword of the statement
 /// its CTEs feed (`select`, `insert`, `update`, `delete`, `merge`, `table`, `values`, or
-/// DuckDB's `from`/`pivot`), `modifying_cte` says whether any CTE body is itself a write
-/// (`WITH d AS (DELETE … RETURNING *) SELECT …`). `None` when the text is not WITH-led
-/// or no main statement is found (a parenthesised main `SELECT` is still recognised).
-///
-/// A CTE *name* is a depth-0 word followed by `AS` (past its optional column list);
-/// PostgreSQL leaves `update`/`delete`/`insert` non-reserved, so `WITH update AS (…)`
-/// must not be mistaken for the main statement.
+/// DuckDB's `from`/`pivot`), `modifying_cte` says whether any CTE body is itself a write,
+/// and `main_select_into` identifies the mutating PostgreSQL/MySQL `SELECT … INTO` form.
+/// `None` means the shape is not understood, which callers deliberately treat as
+/// non-cursorable. A parenthesised main statement is still recognised.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WithShape {
     pub main: String,
     pub modifying_cte: bool,
+    pub main_select_into: bool,
 }
 
 const WITH_MAIN_WORDS: &[&str] = &[
     "select", "insert", "update", "delete", "merge", "table", "values", "from", "pivot",
 ];
 
-pub fn with_shape(sql: &str) -> Option<WithShape> {
-    if first_word(sql) != "with" {
-        return None;
+#[derive(Debug, Clone, Copy)]
+enum ShapeTokenKind<'a> {
+    Word(&'a [u8]),
+    Ident,
+    Open,
+    Close,
+    Comma,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ShapeToken<'a> {
+    kind: ShapeTokenKind<'a>,
+}
+
+const MAX_SHAPE_TOKENS: usize = 200_000;
+
+fn push_shape_token<'a>(out: &mut Vec<ShapeToken<'a>>, kind: ShapeTokenKind<'a>) -> bool {
+    if out.len() >= MAX_SHAPE_TOKENS {
+        return false;
     }
-    let mut top: Vec<String> = Vec::new();
-    let mut expect_body = false;
-    let mut modifying_cte = false;
-    let mut paren_main: Option<String> = None;
-    let mut prev_depth = 0usize;
-    scan_code_words(effective_start(sql), |word, depth| {
-        let w = String::from_utf8_lossy(word).to_ascii_lowercase();
-        if depth == 0 {
-            expect_body = matches!(w.as_str(), "as" | "materialized");
-            top.push(w);
-        } else if prev_depth == 0 {
-            // First word of a new top-level paren group.
-            if expect_body {
-                expect_body = false;
-                if matches!(w.as_str(), "insert" | "update" | "delete" | "merge") {
-                    modifying_cte = true;
+    out.push(ShapeToken { kind });
+    true
+}
+
+fn shape_tokens(sql: &str, engine: TransactionEngine) -> Option<Vec<ShapeToken<'_>>> {
+    let b = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        let dash_comment = b[i] == b'-'
+            && i + 1 < b.len()
+            && b[i + 1] == b'-'
+            && (engine != TransactionEngine::MySql
+                || b.get(i + 2)
+                    .is_none_or(|c| matches!(c, b' ' | b'\t' | b'\r' | b'\n')));
+        if dash_comment {
+            i += 2;
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if engine == TransactionEngine::MySql && b[i] == b'#' {
+            i += 1;
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+            continue;
+        }
+        if b[i] == b'\'' {
+            i += 1;
+            while i < b.len() {
+                if engine == TransactionEngine::MySql && b[i] == b'\\' && i + 1 < b.len() {
+                    i += 2;
+                    continue;
                 }
-            } else if top.len() > 1
-                && paren_main.is_none()
-                && matches!(w.as_str(), "select" | "table" | "values")
-            {
-                // `WITH x AS (…) (SELECT …) UNION …` — main statement in parens.
-                paren_main = Some(w);
+                if b[i] == b'\'' {
+                    i += 1;
+                    if i < b.len() && b[i] == b'\'' {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b[i] == b'$' {
+            if let Some(end) = dollar_tag_end(b, i) {
+                let delim = &b[i..=end];
+                i = end + 1;
+                while i + delim.len() <= b.len() && &b[i..i + delim.len()] != delim {
+                    i += 1;
+                }
+                i = (i + delim.len()).min(b.len());
+                continue;
             }
         }
-        prev_depth = depth;
-        false
-    });
-    let main = top
-        .iter()
-        .enumerate()
-        .skip(1)
-        .find(|(i, w)| {
-            WITH_MAIN_WORDS.contains(&w.as_str())
-                && top.get(i + 1).map(String::as_str) != Some("as")
-        })
-        .map(|(_, w)| w.clone())
-        .or(paren_main)?;
+        if b[i] == b'"'
+            || (b[i] == b'`'
+                && matches!(engine, TransactionEngine::MySql | TransactionEngine::Sqlite))
+        {
+            let quote = b[i];
+            i += 1;
+            while i < b.len() {
+                if engine == TransactionEngine::MySql && b[i] == b'\\' && i + 1 < b.len() {
+                    i += 2;
+                    continue;
+                }
+                if b[i] == quote {
+                    i += 1;
+                    if i < b.len() && b[i] == quote {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            if !push_shape_token(&mut out, ShapeTokenKind::Ident) {
+                return None;
+            }
+            continue;
+        }
+        if b[i].is_ascii_alphabetic() || b[i] == b'_' || b[i] >= 0x80 {
+            let start = i;
+            i += 1;
+            while i < b.len()
+                && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'_' | b'$') || b[i] >= 0x80)
+            {
+                i += 1;
+            }
+            let ident = &b[start..i];
+            let kind = if ident.iter().any(|c| *c == b'$' || *c >= 0x80) {
+                ShapeTokenKind::Ident
+            } else {
+                ShapeTokenKind::Word(ident)
+            };
+            if !push_shape_token(&mut out, kind) {
+                return None;
+            }
+            continue;
+        }
+        let kind = match b[i] {
+            b'(' => Some(ShapeTokenKind::Open),
+            b')' => Some(ShapeTokenKind::Close),
+            b',' => Some(ShapeTokenKind::Comma),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            if !push_shape_token(&mut out, kind) {
+                return None;
+            }
+        }
+        i += 1;
+    }
+    Some(out)
+}
+
+fn shape_word(token: Option<&ShapeToken<'_>>, expected: &str) -> bool {
+    matches!(token.map(|t| t.kind), Some(ShapeTokenKind::Word(word)) if word.eq_ignore_ascii_case(expected.as_bytes()))
+}
+
+fn shape_ident(token: Option<&ShapeToken<'_>>) -> bool {
+    matches!(
+        token.map(|t| t.kind),
+        Some(ShapeTokenKind::Word(_) | ShapeTokenKind::Ident)
+    )
+}
+
+fn close_group(tokens: &[ShapeToken<'_>], open: usize) -> Option<usize> {
+    if !matches!(tokens.get(open)?.kind, ShapeTokenKind::Open) {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (i, token) in tokens.iter().enumerate().skip(open) {
+        match token.kind {
+            ShapeTokenKind::Open => depth += 1,
+            ShapeTokenKind::Close => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn top_level_shape_word(tokens: &[ShapeToken<'_>], expected: &str) -> bool {
+    let mut depth = 0usize;
+    for token in tokens {
+        match token.kind {
+            ShapeTokenKind::Open => depth += 1,
+            ShapeTokenKind::Close => depth = depth.saturating_sub(1),
+            ShapeTokenKind::Word(word)
+                if depth == 0 && word.eq_ignore_ascii_case(expected.as_bytes()) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn skip_search_clause(tokens: &[ShapeToken<'_>], mut pos: usize) -> Option<usize> {
+    if !shape_word(tokens.get(pos), "search") {
+        return Some(pos);
+    }
+    pos += 1;
+    if !(shape_word(tokens.get(pos), "breadth") || shape_word(tokens.get(pos), "depth")) {
+        return None;
+    }
+    pos += 1;
+    if !shape_word(tokens.get(pos), "first") {
+        return None;
+    }
+    pos += 1;
+    if !shape_word(tokens.get(pos), "by") {
+        return None;
+    }
+    pos += 1;
+    while pos < tokens.len() && !shape_word(tokens.get(pos), "set") {
+        pos += 1;
+    }
+    if !shape_word(tokens.get(pos), "set") || !shape_ident(tokens.get(pos + 1)) {
+        return None;
+    }
+    Some(pos + 2)
+}
+
+fn skip_cycle_clause(tokens: &[ShapeToken<'_>], mut pos: usize) -> Option<usize> {
+    if !shape_word(tokens.get(pos), "cycle") {
+        return Some(pos);
+    }
+    pos += 1;
+    while pos < tokens.len() && !shape_word(tokens.get(pos), "set") {
+        pos += 1;
+    }
+    if !shape_word(tokens.get(pos), "set") || !shape_ident(tokens.get(pos + 1)) {
+        return None;
+    }
+    pos += 2;
+    while pos < tokens.len() && !shape_word(tokens.get(pos), "using") {
+        pos += 1;
+    }
+    if !shape_word(tokens.get(pos), "using") || !shape_ident(tokens.get(pos + 1)) {
+        return None;
+    }
+    Some(pos + 2)
+}
+
+fn body_modifies(tokens: &[ShapeToken<'_>], nesting: usize) -> bool {
+    if nesting > 64 {
+        return true;
+    }
+    if shape_word(tokens.first(), "with") {
+        return parse_with_tokens(tokens, nesting + 1).is_none_or(|shape| {
+            shape.modifying_cte
+                || shape.main_select_into
+                || matches!(
+                    shape.main.as_str(),
+                    "insert" | "update" | "delete" | "merge"
+                )
+        });
+    }
+    matches!(
+        tokens.first().map(|t| t.kind),
+        Some(ShapeTokenKind::Word(word))
+            if ["insert", "update", "delete", "merge"]
+                .iter()
+                .any(|candidate| word.eq_ignore_ascii_case(candidate.as_bytes()))
+    ) || (shape_word(tokens.first(), "select") && top_level_shape_word(&tokens[1..], "into"))
+}
+
+fn main_shape(
+    tokens: &[ShapeToken<'_>],
+    pos: usize,
+    modifying_cte: bool,
+    nesting: usize,
+) -> Option<WithShape> {
+    if nesting > 64 {
+        return None;
+    }
+    if matches!(tokens.get(pos)?.kind, ShapeTokenKind::Open) {
+        let close = close_group(tokens, pos)?;
+        if shape_word(tokens.get(pos + 1), "with") {
+            let mut shape = parse_with_tokens(&tokens[pos + 1..close], nesting + 1)?;
+            shape.modifying_cte |= modifying_cte;
+            return Some(shape);
+        }
+        return main_shape(&tokens[pos + 1..close], 0, modifying_cte, nesting + 1);
+    }
+    let ShapeTokenKind::Word(word) = tokens.get(pos)?.kind else {
+        return None;
+    };
+    let main = String::from_utf8_lossy(word).to_ascii_lowercase();
+    if !WITH_MAIN_WORDS.contains(&main.as_str()) {
+        return None;
+    }
+    let main_select_into = main == "select" && top_level_shape_word(&tokens[pos + 1..], "into");
     Some(WithShape {
         main,
         modifying_cte,
+        main_select_into,
     })
+}
+
+fn parse_with_tokens(tokens: &[ShapeToken<'_>], nesting: usize) -> Option<WithShape> {
+    if nesting > 64 || !shape_word(tokens.first(), "with") {
+        return None;
+    }
+    let mut pos = 1usize;
+    if shape_word(tokens.get(pos), "recursive") {
+        pos += 1;
+    }
+    let mut modifying_cte = false;
+    loop {
+        // cte_name [(columns)] [USING KEY (columns)] AS [NOT] MATERIALIZED (query)
+        if !shape_ident(tokens.get(pos)) {
+            return None;
+        }
+        pos += 1;
+        if matches!(tokens.get(pos).map(|t| t.kind), Some(ShapeTokenKind::Open)) {
+            pos = close_group(tokens, pos)? + 1;
+        }
+        if shape_word(tokens.get(pos), "using") {
+            pos += 1;
+            if !shape_word(tokens.get(pos), "key") {
+                return None;
+            }
+            pos += 1;
+            pos = close_group(tokens, pos)? + 1;
+        }
+        if !shape_word(tokens.get(pos), "as") {
+            return None;
+        }
+        pos += 1;
+        if shape_word(tokens.get(pos), "not") {
+            pos += 1;
+            if !shape_word(tokens.get(pos), "materialized") {
+                return None;
+            }
+            pos += 1;
+        } else if shape_word(tokens.get(pos), "materialized") {
+            pos += 1;
+        }
+        let close = close_group(tokens, pos)?;
+        modifying_cte |= body_modifies(&tokens[pos + 1..close], nesting);
+        pos = close + 1;
+
+        pos = skip_search_clause(tokens, pos)?;
+        pos = skip_cycle_clause(tokens, pos)?;
+        if matches!(tokens.get(pos).map(|t| t.kind), Some(ShapeTokenKind::Comma)) {
+            pos += 1;
+            continue;
+        }
+        return main_shape(tokens, pos, modifying_cte, nesting);
+    }
+}
+
+pub fn with_shape(sql: &str, engine: TransactionEngine) -> Option<WithShape> {
+    let tokens = shape_tokens(effective_start(sql), engine)?;
+    parse_with_tokens(&tokens, 0)
+}
+
+/// True when an unquoted `INTO` occurs at the statement's outer query level.
+/// Used to keep `SELECT … INTO` off both cursor and no-confirm execution paths.
+pub fn has_top_level_into(sql: &str, engine: TransactionEngine) -> bool {
+    shape_tokens(effective_start(sql), engine)
+        .is_none_or(|tokens| top_level_shape_word(&tokens, "into"))
 }
 
 fn is_copy_from_stdin(sql: &str) -> bool {
@@ -1300,7 +1614,8 @@ mod tests {
     #[test]
     fn with_shape_finds_the_statement_the_ctes_feed() {
         use super::with_shape;
-        let shape = |s: &str| with_shape(s).map(|w| (w.main, w.modifying_cte));
+        let shape =
+            |s: &str| with_shape(s, TransactionEngine::Postgres).map(|w| (w.main, w.modifying_cte));
         assert_eq!(shape("SELECT 1"), None);
         assert_eq!(
             shape("WITH x AS (SELECT 1) SELECT * FROM x"),
@@ -1353,6 +1668,45 @@ mod tests {
             Some(("select".into(), false))
         );
         assert_eq!(shape("WITH x AS (SELECT 1)"), None);
+        assert_eq!(
+            shape("WITH x AS (SELECT 1) SELECT 1 AS ordinal FROM x"),
+            Some(("select".into(), false))
+        );
+        assert_eq!(
+            shape(
+                "WITH RECURSIVE t(n) AS (VALUES (1) UNION ALL SELECT n+1 FROM t WHERE n<2) SEARCH DEPTH FIRST BY n SET \"select\" UPDATE \"target\" AS u SET n=2"
+            ),
+            Some(("update".into(), false))
+        );
+        assert_eq!(
+            shape(
+                "WITH RECURSIVE t(n) AS (VALUES (1) UNION ALL SELECT n+1 FROM t WHERE n<2) SEARCH DEPTH FIRST BY n SET update SELECT n FROM t"
+            ),
+            Some(("select".into(), false))
+        );
+        assert_eq!(
+            shape(
+                "WITH RECURSIVE t(n) AS (VALUES (1) UNION ALL SELECT n+1 FROM t WHERE n<2) CYCLE n SET is_cycle USING update SELECT n FROM t"
+            ),
+            Some(("select".into(), false))
+        );
+        assert_eq!(
+            shape("WITH RECURSIVE update(i) USING KEY(i) AS (VALUES (1)) SELECT * FROM update"),
+            Some(("select".into(), false))
+        );
+        assert_eq!(
+            shape("WITH 測試 AS (SELECT 1) SELECT * FROM 測試"),
+            Some(("select".into(), false))
+        );
+        assert_eq!(
+            shape("WITH cte$name AS (SELECT 1) SELECT * FROM cte$name"),
+            Some(("select".into(), false))
+        );
+        assert!(with_shape(
+            "WITH x AS (SELECT 1) SELECT * INTO archived FROM x",
+            TransactionEngine::Postgres,
+        )
+        .is_some_and(|shape| shape.main_select_into));
     }
 
     use super::*;

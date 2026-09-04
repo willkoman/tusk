@@ -38,7 +38,7 @@ import { type FkEdge } from "./sql/fk";
 import { type Skill } from "./ai/skills";
 import { ParamDialog } from "./forms/ParamDialog";
 import { detectPlan } from "./plan/detect";
-import { explainSql, analyzeExecutesWrite } from "./plan/explainSql";
+import { explainSql, analyzeExecutesWrite, isSingleExplainStatement } from "./plan/explainSql";
 import { Dialog, SqlPreview } from "./Dialog";
 import { Icon } from "./Icons";
 import { ident, qualify, qualifyIn, setSqlDialect } from "./sql/ident";
@@ -975,8 +975,12 @@ function App() {
     if (!api) return;
     const stmt = api.getSelection().trim() || api.getCurrentStatement();
     if (!stmt.trim()) return;
+    if (!isSingleExplainStatement(stmt, connectionKind())) {
+      setStatus("Explain requires exactly one statement — select a single statement and try again");
+      return;
+    }
     const wrapped = explainSql(connectionKind(), analyze, stmt, duckJsonExplain);
-    if (analyze && analyzeExecutesWrite(stmt)) {
+    if (analyze && analyzeExecutesWrite(stmt, connectionKind())) {
       setConfirmAnalyze({ sql: wrapped, origin: captureOrigin() });
       return;
     }
@@ -1537,7 +1541,7 @@ function App() {
     switch (id) {
       case "run": void doRun(); break;
       case "runStatement": {
-        const s = editorApi()?.getCurrentStatement();
+        const s = editorApi()?.getStatementRunText();
         if (s?.trim()) void doRun(s);
         break;
       }

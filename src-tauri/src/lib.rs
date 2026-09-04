@@ -300,7 +300,8 @@ pub(crate) async fn lock_conn(conn: &Conn) -> Result<ConnGuard<'_>, AppError> {
 /// subqueries fine (pinned by `duck_from_first_and_pivot_stream`), and classifying
 /// them non-cursorable buffered ENTIRE tables in RAM (`FROM events` on a big table
 /// was an allocation-abort waiting to happen).
-pub(crate) fn is_cursorable(sql: &str, duck: bool) -> bool {
+pub(crate) fn is_cursorable(sql: &str, engine: script::TransactionEngine) -> bool {
+    let duck = engine == script::TransactionEngine::DuckDb;
     let read_head = |w: &str| {
         matches!(w, "select" | "table" | "values") || (duck && matches!(w, "from" | "pivot"))
     };
@@ -310,7 +311,9 @@ pub(crate) fn is_cursorable(sql: &str, duck: bool) -> bool {
         // `DECLARE … CURSOR FOR` it is a syntax error, and a data-modifying CTE cannot
         // sit under a cursor either. Only a WITH whose main statement is a read streams;
         // anything else runs on the plain execute path.
-        "with" => script::with_shape(sql).is_some_and(|s| !s.modifying_cte && read_head(&s.main)),
+        "with" => script::with_shape(sql, engine)
+            .is_some_and(|s| !s.modifying_cte && !s.main_select_into && read_head(&s.main)),
+        "select" => !script::has_top_level_into(sql, engine),
         _ => read_head(&w),
     }
 }
@@ -719,7 +722,7 @@ async fn exec_items(
     }
 
     // A single plain statement runs interactively (streaming result grid).
-    let duck = matches!(c.backend, crate::driver::Backend::Duck(_));
+    let engine = c.transaction_engine();
     if items.len() == 1 {
         if let script::Item::Sql(stmt) = &items[0] {
             let trimmed = stmt.trim();
@@ -746,13 +749,13 @@ async fn exec_items(
                     .run_manual_single(
                         trimmed,
                         page,
-                        is_cursorable(trimmed, duck),
+                        is_cursorable(trimmed, engine),
                         c.transaction.mode,
                     )
                     .await?
             } else {
                 c.backend
-                    .run_single(trimmed, page, is_cursorable(trimmed, duck))
+                    .run_single(trimmed, page, is_cursorable(trimmed, engine))
                     .await?
             };
             if let QueryOutcome::Rows { columns, rows, .. } = &out {
@@ -1109,7 +1112,7 @@ mod bind_param_tests {
         validate_result_page, validate_sql_size, validate_tabular_payload, AppState, CancelHandle,
         ConnectionConfig, TransactionStatus, MAX_IPC_CELL_BYTES, MAX_SQL_BYTES,
     };
-    use crate::driver;
+    use crate::{driver, script};
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -1137,42 +1140,66 @@ mod bind_param_tests {
 
     #[test]
     fn query_classification_skips_comments_and_matches_whole_keywords() {
-        assert!(is_cursorable("-- heading\nSELECT 1", false));
+        let pg = script::TransactionEngine::Postgres;
+        let duck = script::TransactionEngine::DuckDb;
+        let mysql = script::TransactionEngine::MySql;
+        assert!(is_cursorable("-- heading\nSELECT 1", pg));
         assert!(is_read_only_stmt(
             "/* heading */ WITH x AS (SELECT 1) SELECT * FROM x"
         ));
-        assert!(!is_cursorable("selection FROM t", false));
+        assert!(!is_cursorable("selection FROM t", pg));
         assert!(!is_read_only_stmt("showcase"));
         // WITH streams only when the statement it feeds is a read.
-        assert!(is_cursorable("WITH x AS (SELECT 1) SELECT * FROM x", false));
-        assert!(is_cursorable("WITH x AS (SELECT 1) TABLE x", false));
+        assert!(is_cursorable("WITH x AS (SELECT 1) SELECT * FROM x", pg));
+        assert!(is_cursorable(
+            "WITH x AS (SELECT 1) SELECT 1 AS ordinal FROM x",
+            pg
+        ));
+        assert!(is_cursorable("WITH x AS (SELECT 1) TABLE x", pg));
         assert!(!is_cursorable(
             "WITH bnr AS (SELECT id FROM vendor) UPDATE pvl SET a = NULL FROM bnr WHERE 1=1",
-            false
+            pg
         ));
         assert!(!is_cursorable(
             "WITH g AS (SELECT 1) INSERT INTO t SELECT * FROM g",
-            false
+            pg
         ));
         assert!(!is_cursorable(
             "WITH g AS (SELECT 1) DELETE FROM t USING g",
-            false
+            pg
         ));
         assert!(!is_cursorable(
             "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
-            false
+            pg
+        ));
+        assert!(!is_cursorable(
+            "WITH RECURSIVE t(n) AS (VALUES (1) UNION ALL SELECT n+1 FROM t WHERE n<2) SEARCH DEPTH FIRST BY n SET \"select\" UPDATE \"target\" AS u SET n=2",
+            pg
         ));
         assert!(is_cursorable(
             "WITH update AS (SELECT 1) SELECT * FROM update",
-            false
+            pg
         ));
-        assert!(is_cursorable("WITH x AS (SELECT 1) FROM x", true));
-        assert!(!is_cursorable("WITH x AS (SELECT 1) FROM x", false));
+        assert!(is_cursorable(
+            "WITH RECURSIVE update(i) USING KEY(i) AS (VALUES (1)) SELECT * FROM update",
+            duck
+        ));
+        assert!(is_cursorable(
+            "WITH x AS (SELECT 1) # choose rows\nSELECT * FROM x",
+            mysql
+        ));
+        assert!(is_cursorable("WITH x AS (SELECT 1) FROM x", duck));
+        assert!(!is_cursorable("WITH x AS (SELECT 1) FROM x", pg));
         // DuckDB-only forms stream (buffering FROM <big table> whole was an OOM-abort
         // class); other engines keep rejecting them as cursorable.
-        assert!(is_cursorable("FROM events", true));
-        assert!(is_cursorable("PIVOT t ON k USING sum(v)", true));
-        assert!(!is_cursorable("FROM events", false));
+        assert!(is_cursorable("FROM events", duck));
+        assert!(is_cursorable("PIVOT t ON k USING sum(v)", duck));
+        assert!(!is_cursorable("FROM events", pg));
+        assert!(!is_cursorable("SELECT * INTO archived FROM events", pg));
+        assert!(!is_cursorable(
+            "WITH x AS (SELECT 1) SELECT * INTO archived FROM x",
+            pg
+        ));
         assert!(is_read_only_stmt("FROM events"));
         assert!(!is_read_only_stmt("frombulate"));
     }
@@ -1799,8 +1826,8 @@ async fn export_to_file(
                 ))
             }
         };
-        let duck = matches!(c.backend, driver::Backend::Duck(_));
-        if !is_read_only_stmt(&export_sql) || !is_cursorable(&export_sql, duck) {
+        let engine = c.transaction_engine();
+        if !is_read_only_stmt(&export_sql) || !is_cursorable(&export_sql, engine) {
             return Err(AppError::new(
                 "export can re-run exactly one read-only result query",
             ));

@@ -322,11 +322,11 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Statement splitting is **engine-aware**, matching execution. On MySQL, `#` comments and `--` without trailing whitespace lex correctly and backslash escapes inside quotes are honored; backtick identifiers are first-class on MySQL and SQLite. Everything built on the lexer — Run current statement, auto-fold, linting, parameter detection, and grid sort/filter — reads MySQL and SQLite SQL the way the server does."
+        "md": "Statement splitting is **engine-aware**, matching execution. On MySQL, `#` comments and `--` without trailing whitespace lex correctly and backslash escapes inside quotes are honored; backtick identifiers are first-class on MySQL and SQLite. Everything built on the lexer — Run selection or current statement, auto-fold, linting, parameter detection, and grid sort/filter — reads MySQL and SQLite SQL the way the server does."
       },
       {
         "k": "p",
-        "md": "Run with the cursor in a multi-statement buffer and nothing selected, and a **Run…** popover asks **Current block** or **Entire file** (↑↓ to choose, Enter to run, Esc to cancel); [[kbd:Mod-Shift-Enter]] skips the prompt and always runs the statement under the cursor. Every base run — success, error, or cancel — lands in [[topic:history|query history]] with its duration (row count on success)."
+        "md": "Run with the cursor in a multi-statement buffer and nothing selected, and a **Run…** popover asks **Current block** or **Entire file** (↑↓ to choose, Enter to run, Esc to cancel); [[kbd:Mod-Shift-Enter]] skips the prompt and runs the exact non-blank selection, or the statement under the cursor when nothing is selected. Every base run — success, error, or cancel — lands in [[topic:history|query history]] with its duration (row count on success)."
       },
       {
         "k": "keys",
@@ -337,7 +337,7 @@ export const TOPICS: Topic[] = [
           },
           {
             "action": "runStatement",
-            "does": "Run the statement under the cursor (no chooser)"
+            "does": "Run the selection, or the statement under the cursor (no chooser)"
           },
           {
             "action": "cancelQuery",
@@ -467,7 +467,7 @@ export const TOPICS: Topic[] = [
           "**Keyword auto-UPPERCASE** — live at word boundaries, skipping qualified names (`t.select`), quoted identifiers, and open strings.",
           "**Font size & wrap** — the small/large **A** buttons step the font between 9 and 24 px; the wrap icon toggles word wrap (also the `toggleWrap` action).",
           "**Right-click menu** — Cut / Copy / Paste / Select all / Toggle comment ([[kbd:Mod-/]]) / Run selection (or Run all).",
-          "**Explain ▾** — wraps the selection or the statement under the cursor for the [[topic:plans|plan visualizer]]; *Explain Analyze* is disabled on engines without it and warns before executing a write."
+          "**Explain ▾** — wraps one selected statement or the statement under the cursor for the [[topic:plans|plan visualizer]]; multi-statement selections are refused, and *Explain Analyze* is disabled on engines without it and warns before executing a write."
         ],
         "ordered": false
       },
@@ -1289,7 +1289,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**Explain ▾** in the [[topic:editor|editor toolbar]] offers **Explain** and **Explain Analyze (runs the query)** — registry actions (`explain` / `explainAnalyze`), unbound by default; bind them in [[topic:shortcuts|Settings → Shortcuts]] or fire them from the ⌘/Ctrl K command palette. Each takes your selection, or the statement under the cursor, and wraps it in the engine's best structured form:"
+        "md": "**Explain ▾** in the [[topic:editor|editor toolbar]] offers **Explain** and **Explain Analyze (runs the query)** — registry actions (`explain` / `explainAnalyze`), unbound by default; bind them in [[topic:shortcuts|Settings → Shortcuts]] or fire them from the ⌘/Ctrl K command palette. Each takes exactly one selected statement, or the statement under the cursor, and wraps it in the engine's best structured form; a multi-statement selection is refused so trailing SQL can never run outside the `EXPLAIN` prefix:"
       },
       {
         "k": "table",
@@ -2198,11 +2198,11 @@ export const TOPICS: Topic[] = [
           },
           {
             "action": "runStatement",
-            "does": "Run only the statement under the cursor"
+            "does": "Run the selection, or the statement under the cursor"
           },
           {
             "action": "explain",
-            "does": "EXPLAIN the current statement (plan view)"
+            "does": "EXPLAIN the selection or current statement (plan view)"
           },
           {
             "action": "explainAnalyze",
@@ -2349,7 +2349,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "[[kbd:Mod-k]] opens the palette: fuzzy subsequence matching over `category + title` (consecutive characters and word-starts score higher, so `rst` finds *Run current statement*). Navigate with ↑/↓, [[kbd:Enter]] runs, [[kbd:Escape]] closes; every row shows the action's **live** binding chip."
+        "md": "[[kbd:Mod-k]] opens the palette: fuzzy subsequence matching over `category + title` (consecutive characters and word-starts score higher, so `rcs` finds *Run selection or current statement*). Navigate with ↑/↓, [[kbd:Enter]] runs, [[kbd:Escape]] closes; every row shows the action's **live** binding chip."
       },
       {
         "k": "tip",
@@ -2363,7 +2363,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Editor-scoped actions (**Run**, **Run current statement**, **Format SQL**, **Toggle comment**, **Find & replace**) are also bound inside CodeMirror, so they win while you type; the window handler skips anything the editor consumed (`defaultPrevented`). Global actions (tabs, files, panels) dispatch at the window level regardless of focus — so [[kbd:Mod-w]] closes a Tusk tab, not the window."
+        "md": "Editor-scoped actions (**Run**, **Run selection or current statement**, **Format SQL**, **Toggle comment**, **Find & replace**) are also bound inside CodeMirror, so they win while you type; the window handler skips anything the editor consumed (`defaultPrevented`). Global actions (tabs, files, panels) dispatch at the window level regardless of focus — so [[kbd:Mod-w]] closes a Tusk tab, not the window."
       },
       {
         "k": "p",
@@ -2442,7 +2442,7 @@ export const TOPICS: Topic[] = [
           "[[kbd:Tab]] — layered: accepts an open completion, else applies a [[topic:editor-intel|lint quick-fix]] under the cursor, else indents",
           "[[kbd:Enter]] — accepts a completion when the popup is open, otherwise a normal newline",
           "Quick-fixes — also on [[kbd:Alt-Enter]] and [[kbd:Mod-.]]",
-          "Statement gutter ▶ — runs a statement by mouse; keyboard equivalents are the rebindable **Run** / **Run current statement**"
+          "Statement gutter ▶ — runs a statement by mouse; keyboard equivalents are the rebindable **Run** / **Run selection or current statement**"
         ]
       }
     ],
@@ -2796,6 +2796,19 @@ export const TOPICS: Topic[] = [
         "k": "tip",
         "kind": "tip",
         "md": "The updater shipped in v0.4.5 — earlier installs can't auto-update. Grab a fresh installer once; every version after keeps itself current."
+      },
+      {
+        "k": "h",
+        "text": "v0.9.8 — selected SQL stays selected",
+        "id": "v0-9-8"
+      },
+      {
+        "k": "list",
+        "ordered": false,
+        "items": [
+          "**Run selection or current statement now honors the exact selection.** [[kbd:Mod-Shift-Enter]] and the matching command-palette action used to ignore selected text and resolve the whole semicolon-delimited statement under the cursor. Selecting an inner `SELECT` inside `WITH … UPDATE` could therefore run the update; a non-blank selection now always wins, including when selected backwards.",
+          "**Explain and grid reruns fail closed on ambiguous SQL.** Explain refuses multi-statement selections so trailing SQL cannot execute outside its prefix, and the shared CTE classifier now understands complex engine-specific forms and treats `SELECT … INTO` as a write. Explain Analyze confirmation, backend streaming, and grid sort/filter wrapping use the same safety decision."
+        ]
       },
       {
         "k": "h",

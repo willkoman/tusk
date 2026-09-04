@@ -62,7 +62,7 @@ export type ActionDef = {
 
 export const ACTIONS: readonly ActionDef[] = [
   { id: "run", title: "Run (selection or all)", category: "Query", defaultKey: "Mod-Enter", scope: "editor", enabled: (c) => c.connected && c.canRunDatabase },
-  { id: "runStatement", title: "Run current statement", category: "Query", defaultKey: "Mod-Shift-Enter", scope: "editor", enabled: (c) => c.connected && c.canRunDatabase },
+  { id: "runStatement", title: "Run selection or current statement", category: "Query", defaultKey: "Mod-Shift-Enter", scope: "editor", enabled: (c) => c.connected && c.canRunDatabase },
   { id: "explain", title: "Explain (plan)", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.connected && !c.running && c.canRunDatabase },
   { id: "explainAnalyze", title: "Explain Analyze (runs the statement)", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.connected && !c.running && c.canExplainAnalyze && c.canRunDatabase },
   // Bound by default: this is the one action that must stay reachable while dialogs

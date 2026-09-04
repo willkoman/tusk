@@ -2,6 +2,12 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
+## [0.9.8] - 2026-09-04
+
+### Fixed
+- **Run selection or current statement can no longer expand a selection into a larger write.** The `Mod-Shift-Enter` action ignored an active selection and always resolved the semicolon-delimited statement under the cursor. Selecting only an inner `SELECT` inside `WITH … UPDATE` could therefore execute the entire update. A non-blank selection now wins byte-for-byte in the editor shortcut and command-palette path, including a selection made backwards; with nothing useful selected, the action still runs the current statement. Ordinary Run also falls back to the full buffer instead of silently doing nothing when the selection contains only whitespace.
+- **Explain and result-grid reruns now fail closed around tricky SQL shapes.** Explain accepts exactly one statement, so a selection such as `SELECT …; DELETE …` cannot leave trailing SQL outside the `EXPLAIN` prefix. The shared read/write classifier now structurally parses nested and parenthesized CTEs, quoted and Unicode names, PostgreSQL `SEARCH`/`CYCLE`, DuckDB `USING KEY` and FROM-first reads, and MySQL quoting/comments; PostgreSQL/MySQL `SELECT … INTO` is treated as a write. Explain Analyze confirmation, backend cursoring, and grid sort/filter wrapping consequently agree on whether a statement is safe to rerun as a read.
+
 ## [0.9.7] - 2026-09-04
 
 ### Fixed

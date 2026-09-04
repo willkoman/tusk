@@ -9,6 +9,7 @@
 
 use crate::db::{ConnectionConfig, QueryOutcome};
 use crate::driver::{connect, Backend};
+use crate::script::TransactionEngine;
 
 // --- engine descriptors ---
 
@@ -23,6 +24,7 @@ struct Eng {
     name: &'static str,
     schema: &'static str,      // schema arg for table_detail
     quote: fn(&str) -> String, // identifier quoting
+    engine: TransactionEngine,
 }
 
 fn base() -> ConnectionConfig {
@@ -83,7 +85,7 @@ fn mysql_cfg() -> Option<ConnectionConfig> {
 
 /// The production classifier (non-DuckDB form): a `WITH`-led write must not stream.
 fn cursorable(sql: &str) -> bool {
-    crate::is_cursorable(sql, false)
+    crate::is_cursorable(sql, TransactionEngine::Postgres)
 }
 
 async fn exec(b: &mut Backend, sql: &str) {
@@ -203,6 +205,7 @@ async fn syntax_error_recovery_battery(b: &mut Backend, eng: &Eng) {
 /// error at UPDATE) and every engine routed the write through the read path.
 async fn with_dml_battery(b: &mut Backend, eng: &Eng) {
     let q = eng.quote;
+    let cursorable = |sql: &str| crate::is_cursorable(sql, eng.engine);
     exec(b, &format!("DROP TABLE IF EXISTS {}", q("wdml"))).await;
     exec(
         b,
@@ -238,16 +241,66 @@ async fn with_dml_battery(b: &mut Backend, eng: &Eng) {
     );
     // A read-headed WITH still streams through the cursor path.
     let sql = format!(
-        "WITH g AS (SELECT id FROM {}) SELECT id FROM g ORDER BY id",
+        "WITH g AS (SELECT id FROM {}) SELECT 1 AS ordinal FROM g ORDER BY id",
         q("wdml")
     );
     assert!(cursorable(&sql), "[{}] WITH … SELECT streams", eng.name);
-    assert_eq!(
-        all(b, &sql).await.len(),
-        2,
-        "[{}] WITH … SELECT rows",
-        eng.name
-    );
+    b.rollback_cursor().await;
+    match b.run_single(&sql, 100, cursorable(&sql)).await.unwrap() {
+        QueryOutcome::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 2, "[{}] WITH … SELECT rows", eng.name)
+        }
+        QueryOutcome::Exec { message } => {
+            panic!("[{}] expected WITH … SELECT rows: {message}", eng.name)
+        }
+    }
+
+    if eng.name == "postgres" {
+        // SEARCH/CYCLE output-column names are still part of the CTE declaration.
+        // A quoted `select` there must not disguise the UPDATE that follows.
+        let sql = format!(
+            "WITH RECURSIVE t(n) AS (VALUES (1) UNION ALL SELECT n+1 FROM t WHERE n<2) \
+             SEARCH DEPTH FIRST BY n SET \"select\" \
+             UPDATE {} AS target SET v=7 WHERE id IN (SELECT n FROM t)",
+            q("wdml")
+        );
+        assert!(
+            !cursorable(&sql),
+            "[{}] SEARCH column named select must not hide UPDATE",
+            eng.name
+        );
+        b.rollback_cursor().await;
+        b.run_single(&sql, 100, cursorable(&sql)).await.unwrap();
+        let r = all(b, &format!("SELECT v FROM {} ORDER BY id", q("wdml"))).await;
+        assert!(
+            r.iter().all(|row| cell(row, 0).as_deref() == Some("7")),
+            "[{}] SEARCH-led UPDATE applied",
+            eng.name
+        );
+
+        // SELECT INTO creates a table and therefore belongs on the plain write path.
+        let archive = q("wdml_archive");
+        exec(b, &format!("DROP TABLE IF EXISTS {archive}")).await;
+        let sql = format!(
+            "WITH g AS (SELECT id FROM {}) SELECT * INTO TEMP TABLE {archive} FROM g",
+            q("wdml")
+        );
+        assert!(
+            !cursorable(&sql),
+            "[{}] WITH … SELECT INTO must not be cursorable",
+            eng.name
+        );
+        b.rollback_cursor().await;
+        b.run_single(&sql, 100, cursorable(&sql)).await.unwrap();
+        let r = all(b, &format!("SELECT count(*) FROM {archive}")).await;
+        assert_eq!(
+            r[0][0].as_deref(),
+            Some("2"),
+            "[{}] SELECT INTO applied",
+            eng.name
+        );
+        exec(b, &format!("DROP TABLE {archive}")).await;
+    }
     exec(b, &format!("DROP TABLE {}", q("wdml"))).await;
 }
 
@@ -1069,6 +1122,7 @@ async fn conformance_duckdb() {
         name: "duckdb",
         schema: "main",
         quote: dq,
+        engine: TransactionEngine::DuckDb,
     };
     run_battery(&mut b, &eng).await;
     relationship_battery(&mut b, &eng).await;
@@ -1087,6 +1141,7 @@ async fn conformance_sqlite() {
         name: "sqlite",
         schema: "main",
         quote: dq,
+        engine: TransactionEngine::Sqlite,
     };
     run_battery(&mut b, &eng).await;
     relationship_battery(&mut b, &eng).await;
@@ -1109,6 +1164,7 @@ async fn conformance_postgres() {
         name: "postgres",
         schema: "public",
         quote: dq,
+        engine: TransactionEngine::Postgres,
     };
     run_battery(&mut b, &eng).await;
     relationship_battery(&mut b, &eng).await;
@@ -1131,6 +1187,7 @@ async fn conformance_mysql() {
         name: "mysql",
         schema: "test",
         quote: bt,
+        engine: TransactionEngine::MySql,
     };
     run_battery(&mut b, &eng).await;
     relationship_battery(&mut b, &eng).await;

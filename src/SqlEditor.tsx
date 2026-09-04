@@ -28,7 +28,7 @@ import { makeSqlCompletion } from "./sql/completion";
 import { type FkEdge } from "./sql/fk";
 import { type Table } from "./sql/aliases";
 import { DEFAULT_PREFS, type CursorInfo, type EditorPrefs, type ValidateFn } from "./editor/types";
-import { lexState, statementAt } from "./editor/lexer";
+import { docString, lexState, selectionRunText, statementAt, statementRunText } from "./editor/lexer";
 import { effectiveKey, type ActionId, type KeyOverrides } from "./actions";
 import { keywordCase, keywordSet } from "./editor/keywordCase";
 import { themeFor } from "./editor/theme";
@@ -49,6 +49,8 @@ export type EditorApi = {
   getRunText: () => string;
   /** The statement under the cursor (whole doc if it can't be isolated). */
   getCurrentStatement: () => string;
+  /** The exact non-blank selection, otherwise the statement under the cursor. */
+  getStatementRunText: () => string;
   /** How many statements the buffer holds (drives the run whole-file vs block chooser). */
   getStatementCount: () => number;
   /** Insert text at the cursor (does not clobber the buffer) and focus the editor. */
@@ -137,13 +139,18 @@ export function SqlEditor(props: {
   const getRunText = () => {
     if (!view) return props.value;
     const sel = view.state.selection.main;
-    return sel.empty ? view.state.doc.toString() : view.state.sliceDoc(sel.from, sel.to);
+    return selectionRunText(docString(view.state), sel.anchor, sel.head);
   };
   const getCurrentStatement = () => {
     if (!view) return props.value;
     const { stmts } = lexState(view.state);
     const at = statementAt(stmts, view.state.selection.main.head);
     return at ? at.stmt.text : view.state.doc.toString();
+  };
+  const getStatementRunText = () => {
+    if (!view) return props.value;
+    const sel = view.state.selection.main;
+    return statementRunText(docString(view.state), lexState(view.state).stmts, sel.anchor, sel.head);
   };
   const getStatementCount = () => (view ? lexState(view.state).stmts.length : 0);
   const insertAtCursor = (text: string) => {
@@ -183,7 +190,7 @@ export function SqlEditor(props: {
     if (view) toggleComment(view);
   };
   const runCurrentStatement = () => {
-    const s = getCurrentStatement();
+    const s = getStatementRunText();
     if (s.trim()) props.onRunStatement?.(s);
   };
 
@@ -271,6 +278,7 @@ export function SqlEditor(props: {
     props.onReady?.({
       getRunText,
       getCurrentStatement,
+      getStatementRunText,
       getStatementCount,
       insertAtCursor,
       focus,

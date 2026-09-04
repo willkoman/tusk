@@ -5,7 +5,7 @@ import { parseMysql } from "./parseMysql";
 import { parseSqlite } from "./parseSqlite";
 import { parseDuck } from "./parseDuck";
 import { detectPlan, isExplainQuery } from "./detect";
-import { explainSql, analyzeExecutesWrite } from "./explainSql";
+import { explainSql, analyzeExecutesWrite, isSingleExplainStatement } from "./explainSql";
 import { MAX_PLAN_DEPTH, MAX_PLAN_LABEL_CHARS, MAX_PLAN_NODES, type PlanTree } from "./types";
 
 // ---------- Postgres JSON ----------
@@ -494,7 +494,33 @@ describe("explainSql", () => {
     expect(analyzeExecutesWrite("WITH g AS (SELECT 1) INSERT INTO t SELECT * FROM g")).toBe(true);
     expect(analyzeExecutesWrite("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d")).toBe(true);
     expect(analyzeExecutesWrite("WITH update AS (SELECT 1) SELECT * FROM update")).toBe(false);
+    expect(analyzeExecutesWrite("WITH x AS (SELECT 1) SELECT 1 AS ordinal FROM x")).toBe(false);
+    expect(analyzeExecutesWrite("WITH x AS (SELECT 1) SELECT \"a)\" AS b FROM x")).toBe(false);
+    expect(analyzeExecutesWrite("WITH 測試 AS (SELECT 1) SELECT * FROM 測試")).toBe(false);
+    expect(analyzeExecutesWrite("WITH cte$name AS (SELECT 1) SELECT * FROM cte$name")).toBe(false);
+    expect(analyzeExecutesWrite("WITH x AS (SELECT 1) UPDATE \"target\" AS u SET a=1 WHERE EXISTS (SELECT 1 FROM x)")).toBe(true);
+    expect(analyzeExecutesWrite(
+      "WITH RECURSIVE t(n) AS (VALUES (1) UNION ALL SELECT n+1 FROM t WHERE n<2) SEARCH DEPTH FIRST BY n SET \"select\" UPDATE \"target\" AS u SET n=2",
+    )).toBe(true);
+    expect(analyzeExecutesWrite(
+      "WITH RECURSIVE t(n) AS (VALUES (1) UNION ALL SELECT n+1 FROM t WHERE n<2) SEARCH DEPTH FIRST BY n SET update SELECT n FROM t",
+    )).toBe(false);
+    expect(analyzeExecutesWrite(
+      "WITH RECURSIVE update(i) USING KEY(i) AS (VALUES (1)) SELECT * FROM update",
+      "duckdb",
+    )).toBe(false);
     expect(analyzeExecutesWrite("WITH x AS (SELECT 'update' /* delete */) TABLE x")).toBe(false);
     expect(analyzeExecutesWrite("WITH x AS (SELECT 1)")).toBe(true);
+    expect(analyzeExecutesWrite("SELECT * INTO archived FROM source")).toBe(true);
+    expect(analyzeExecutesWrite("WITH x AS (SELECT 1) SELECT * INTO archived FROM x")).toBe(true);
+    expect(analyzeExecutesWrite("SELECT (SELECT 'into') FROM source")).toBe(false);
+    expect(analyzeExecutesWrite("FROM source", "duckdb")).toBe(false);
+    expect(analyzeExecutesWrite("PIVOT source ON k USING sum(v)", "duckdb")).toBe(false);
+    expect(analyzeExecutesWrite("WITH x AS (SELECT 1) FROM x", "duckdb")).toBe(false);
+    expect(analyzeExecutesWrite("FROM source", "postgres")).toBe(true);
+    expect(analyzeExecutesWrite("-- just a comment")).toBe(false);
+    expect(isSingleExplainStatement("SELECT ';'; -- trailing comment", "postgres")).toBe(true);
+    expect(isSingleExplainStatement("SELECT 1; DELETE FROM t", "postgres")).toBe(false);
+    expect(analyzeExecutesWrite("SELECT 1; DELETE FROM t", "postgres")).toBe(true);
   });
 });

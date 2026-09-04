@@ -313,3 +313,23 @@ export function statementAt(stmts: Stmt[], pos: number): { stmt: Stmt; index: nu
   if (stmts.length) return { stmt: stmts[stmts.length - 1], index: stmts.length - 1 };
   return null;
 }
+
+/**
+ * Text for the "run statement" action. A non-blank selection always wins: silently
+ * expanding an inner CTE selection to its enclosing statement can turn a selected
+ * read into an UPDATE/DELETE. With no useful selection, fall back to the statement
+ * under the cursor.
+ */
+export function statementRunText(doc: string, stmts: Stmt[], anchor: number, head: number): string {
+  const from = Math.min(anchor, head);
+  const to = Math.max(anchor, head);
+  const selected = doc.slice(from, to);
+  if (selected.trim()) return selected;
+  return statementAt(stmts, head)?.stmt.text ?? doc;
+}
+
+/** Text for the ordinary Run action: exact non-blank selection, otherwise all. */
+export function selectionRunText(doc: string, anchor: number, head: number): string {
+  const selected = doc.slice(Math.min(anchor, head), Math.max(anchor, head));
+  return selected.trim() ? selected : doc;
+}

@@ -1,5 +1,6 @@
-import { ident, lit } from "../sql/ident";
+import { ident, lit, sqlDialect } from "../sql/ident";
 import { lex, maskNonCode } from "../editor/lexer";
+import { isReadStatement } from "../plan/explainSql";
 import type { SortKey, Filter } from "../tabs";
 
 // Server-side sort/filter works by wrapping the user's base query as a subquery and
@@ -34,20 +35,9 @@ export function stripTrailingSemi(q: string): string {
 /** Whether the base query can be wrapped as `SELECT * FROM (<q>) t` (single row-producing statement). */
 export function wrappableQuery(q: string): boolean {
   const shape = queryShape(q);
-  if (!shape.safe || !/^\s*(select|with|table|values)\b/i.test(shape.masked)) return false;
-  // Wrapping re-runs the base query. Never let a data-modifying CTE become a grid
-  // sort/filter query merely because its final arm returns rows. A statement can
-  // only be executable at the start of the query or of a parenthesized body
-  // (`WITH x AS (DELETE …)`), so only flag mutation words there — scanning the
-  // whole text rejects harmless uses like `TRUNCATE(price, 2)` or a column named
-  // `copy`, silently killing sort/filter/editing.
-  for (const m of shape.masked.matchAll(
-    /\b(insert|update|delete|merge|create|alter|drop|truncate|grant|revoke|copy|call|do)\b/gi,
-  )) {
-    const before = shape.masked.slice(0, m.index).trimEnd();
-    if (before === "" || before.endsWith("(")) return false;
-  }
-  return true;
+  // The same structural WITH classifier protects Explain Analyze and backend
+  // cursoring, so sorting/filtering cannot re-run a WITH-led write either.
+  return shape.safe && isReadStatement(shape.inner, sqlDialect());
 }
 
 /** True when two result columns share a name (MySQL refuses to wrap those — error 1060). */

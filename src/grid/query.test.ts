@@ -68,6 +68,8 @@ describe("existing helpers", () => {
     expect(wrappableQuery("SELECT 1; SELECT 2")).toBe(false);
     expect(wrappableQuery("WITH changed AS (DELETE FROM t RETURNING *) SELECT * FROM changed")).toBe(false);
     expect(wrappableQuery("WITH x AS (\n  -- note\n  UPDATE t SET a=1 RETURNING *\n) SELECT * FROM x")).toBe(false);
+    expect(wrappableQuery("WITH x AS (SELECT 1) UPDATE t SET a=1 RETURNING *")).toBe(false);
+    expect(wrappableQuery("WITH x AS (SELECT 1) SELECT * INTO archived FROM x")).toBe(false);
     expect(wrapQuery("SELECT 1 -- tail", [], [], ["x"])).toContain("-- tail\n) AS _tusk");
   });
 
@@ -77,6 +79,12 @@ describe("existing helpers", () => {
     expect(wrappableQuery("SELECT * FROM t WHERE action = 'delete' AND kind = 'insert'")).toBe(true);
     expect(wrappableQuery("SELECT id AS insert_id, updated_at FROM t")).toBe(true);
     expect(wrappableQuery("WITH recent AS (SELECT * FROM orders) SELECT * FROM recent")).toBe(true);
+  });
+
+  it("wraps DuckDB FROM-first reads", () => {
+    setSqlDialect("duckdb");
+    expect(wrappableQuery("FROM events")).toBe(true);
+    expect(wrappableQuery("WITH recent AS (SELECT * FROM events) FROM recent")).toBe(true);
   });
 });
 
