@@ -68,7 +68,7 @@ duckdb = { version = "~1.4", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Embedded SQLite. `bundled` statically compiles SQLite (small, fast) + `column_decltype`
 # for declared column types in introspection.
-rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
+rusqlite = { version = "0.40", features = ["bundled", "column_decltype"] }
 # MySQL (network). Pure-Rust async driver; its `Pool` is Send+Sync (avoids the
 # !Sync-connection problem) and its `Value` enum makes all-text extraction easy.
 mysql_async = { version = "0.34", default-features = false, features = ["default-rustls"] }
