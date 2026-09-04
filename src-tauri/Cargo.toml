@@ -61,7 +61,7 @@ png = "0.18"
 # (DuckDB 1.5.x) that sort higher than 1.4.x, so a loose `version = "1"` resolved to a
 # broken preview (v1.5.3) where even `CURRENT_DATE - INTERVAL` failed to bind. `~1.4`
 # excludes the 1.5 preview line.
-duckdb = { version = "~1.4", features = ["bundled"] }
+duckdb = { version = "~1.10505", features = ["bundled"] }
 # Render DuckDB's temporal `Value` variants (Date32/Timestamp/Time64) to readable
 # text on the rare non-VARCHAR-cast paths (introspection / sample rows / non-cursorable
 # reads). Already in the tree transitively.
