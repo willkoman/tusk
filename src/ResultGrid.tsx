@@ -7,6 +7,9 @@ import { hiddenRuleCount, quickFilterOf, setQuickFilter, type FilterTree } from 
 import { boolWord } from "./grid/bool";
 import { parseClipboardTable, type RowRef } from "./grid/paste";
 
+/** A grid selection offered to Export, bound to the result it was taken from. */
+export type SelectionSource = Dataset & { tabId: string; generation: number };
+
 // Hand-rolled, two-axis-virtualized, read-only result grid. Uses a synchronized-pane
 // layout (header + gutter are transform-translated siblings of the body scroller, NOT
 // position:sticky) for reliable frozen header/gutter in WKWebView. Selection, keyboard
@@ -79,9 +82,12 @@ export type ResultGridProps = {
   onMarkDelete: (rows: RowRef[]) => void;
   onAddRow: () => void;
   /** Hands the workbench a getter for the current selection, so Export can offer it as
-   *  a scope. Returns null when nothing is selected or the selection exceeds the copy
-   *  ceiling (Export "All rows"/"Loaded rows" covers those). */
-  registerSelectionSource?: (get: () => Dataset | null) => void;
+   *  a scope. Returns null when nothing is selected, only uncommitted insert rows are
+   *  selected, or the selection exceeds the copy ceiling (Export "All rows"/"Loaded
+   *  rows" covers those). The snapshot carries the tab + result generation it belongs
+   *  to, and the grid clears the registration on unmount, so a replaced or disposed
+   *  result can never feed a later Export dialog. */
+  registerSelectionSource?: (get: (() => SelectionSource | null) | null) => void;
   /**
    * Paste a parsed clipboard grid. `anchor`/`anchorDisplayIdx`/`displayOrigCols`
    * describe where a positional paste starts; header-mapped pastes ignore them.
@@ -581,6 +587,10 @@ export function ResultGrid(props: ResultGridProps) {
   // The workbench reads the live selection through this getter (Export → Selection).
   // It returns the selected ROWS at full width in ORIGINAL column order, so the export
   // dialog's own column checkboxes and ordering still apply on top.
+  //
+  // Unlike clipboard copy, this reads the IMMUTABLE SNAPSHOT and skips pinned insert
+  // rows: an export writes a file, and a file must not contain values that are not in
+  // the database. That makes Selection and "Loaded rows" agree row for row.
   props.registerSelectionSource?.(() => {
     if (sel().mode === "none") return null;
     const b = selectionBounds();
@@ -588,9 +598,21 @@ export function ResultGrid(props: ResultGridProps) {
     if (b.r1 < b.r0 || !names.length) return null;
     if ((b.r1 - b.r0 + 1) * names.length > MAX_COPY_CELLS) return null;
     const out: (string | null)[][] = [];
-    for (let r = b.r0; r <= b.r1; r++) out.push(names.map((_, oi) => copyVal(r, oi)));
-    return { columns: names.slice(), rows: out };
+    for (let r = b.r0; r <= b.r1; r++) {
+      if (isInsRow(r)) continue;
+      const li = loadedAt(r);
+      out.push(names.map((_, oi) => props.rows()[li]?.[oi] ?? null));
+    }
+    if (!out.length) return null;
+    return {
+      tabId: props.activeTabId(),
+      generation: props.resultGeneration(),
+      columns: names.slice(),
+      rows: out,
+    };
   });
+  // A disposed grid must not keep feeding Export → Selection.
+  onCleanup(() => props.registerSelectionSource?.(null));
 
   async function copySelection(fmt: "tsv" | "csv" | "json" | "md") {
     const tabId = props.activeTabId();

@@ -1,5 +1,3 @@
-use bytes::Bytes;
-use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
 use tokio_postgres::config::SslMode;
 use tokio_postgres::{Client, SimpleQueryMessage};
@@ -555,81 +553,6 @@ pub fn pg_string_literal(value: &str) -> Result<String, AppError> {
     }
     out.push('\'');
     Ok(out)
-}
-
-fn csv_field(v: &Option<String>) -> String {
-    match v {
-        None => String::new(),
-        Some(s) => {
-            if s.is_empty()
-                || s.contains(',')
-                || s.contains('"')
-                || s.contains('\n')
-                || s.contains('\r')
-            {
-                format!("\"{}\"", s.replace('"', "\"\""))
-            } else {
-                s.clone()
-            }
-        }
-    }
-}
-
-/// Create a table whose columns are all `text` (for "create table on import").
-pub async fn create_table_text(
-    client: &Client,
-    schema: &str,
-    table: &str,
-    columns: &[String],
-) -> Result<(), AppError> {
-    let cols = columns
-        .iter()
-        .map(|c| format!("{} text", ident(c)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    client
-        .batch_execute(&format!(
-            "CREATE TABLE {}.{} ({cols})",
-            ident(schema),
-            ident(table)
-        ))
-        .await?;
-    Ok(())
-}
-
-/// Bulk-insert rows via COPY ... FROM STDIN (CSV). Returns rows written.
-pub async fn copy_rows(
-    client: &Client,
-    schema: &str,
-    table: &str,
-    columns: &[String],
-    rows: &[Vec<Option<String>>],
-) -> Result<u64, AppError> {
-    let cols = columns
-        .iter()
-        .map(|c| ident(c))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let copy = format!(
-        "COPY {}.{} ({cols}) FROM STDIN WITH (FORMAT csv)",
-        ident(schema),
-        ident(table)
-    );
-    let sink = client.copy_in(&copy).await?;
-    futures_util::pin_mut!(sink);
-    let mut buf = String::new();
-    for row in rows {
-        let line = row.iter().map(csv_field).collect::<Vec<_>>().join(",");
-        buf.push_str(&line);
-        buf.push('\n');
-        if buf.len() >= 64 * 1024 {
-            sink.send(Bytes::from(std::mem::take(&mut buf))).await?;
-        }
-    }
-    if !buf.is_empty() {
-        sink.send(Bytes::from(buf)).await?;
-    }
-    Ok(sink.finish().await?)
 }
 
 #[cfg(test)]

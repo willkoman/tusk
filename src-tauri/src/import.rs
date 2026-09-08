@@ -5,19 +5,22 @@
 //! `import_from_file` streams the same file in bounded batches straight from disk into
 //! the connected database — the file bytes never cross the Tauri IPC boundary.
 //!
-//! One import is one transaction, so a failure or a cancel leaves nothing behind. MySQL
-//! DDL implicitly commits, so a `create` import against MySQL can leave the empty table
-//! behind when the row load fails; that is the documented caveat.
+//! The row load is one transaction, so a failed or cancelled load leaves no rows behind.
+//! MySQL DDL implicitly commits *and ends* a transaction, so a `create` import against
+//! MySQL runs its `CREATE TABLE` BEFORE the transaction opens and reports it as a
+//! separately committed step: the rows still roll back, but the empty table remains.
 //!
-//! Acceptance rules for delimited text and JSON are kept in step with the frontend
-//! parser in `src/formats.ts` (quotes, embedded newlines, BOM, ragged rows, duplicate
-//! headers) — the fixtures in `tests` below are the shared parity set.
+//! Acceptance rules for delimited text, JSON and xlsx live here and are pinned by the
+//! fixtures in `tests` below. `src/formats.ts` is the clipboard/paste formatter, not a
+//! second import parser — it has no parity obligation to this file.
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use bytes::Bytes;
+use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
@@ -34,12 +37,21 @@ const MAX_TEXT_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_XLSX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_IMPORT_COLUMNS: usize = 10_000;
 const MAX_IMPORT_ROWS: u64 = 10_000_000;
-const MAX_FIELD_CHARS: usize = 1_000_000;
+const MAX_FIELD_BYTES: usize = 1_000_000;
+/// One source/target column NAME. Keeps `source_columns` (up to 10,000 entries) and a
+/// parsed header bounded per element, not only in count.
+const MAX_COLUMN_NAME_BYTES: usize = 512;
 /// One JSON array element / NDJSON line.
 const MAX_JSON_ELEMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_XLSX_CELLS: usize = 5_000_000;
 /// Rows sampled by `import_preview`.
 pub const PREVIEW_ROWS: usize = 50;
+/// Aggregate ceiling on the `ImportPreview` IPC payload. Sampling stops (and the
+/// preview reports itself truncated) rather than shipping an unbounded blob.
+const MAX_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
+/// One previewed cell. Longer values are elided for display/inference only — the load
+/// path re-reads the file and never sees the truncation.
+const MAX_PREVIEW_CELL_CHARS: usize = 2_000;
 /// Rows per parsed batch handed to the loader.
 const BATCH_ROWS: usize = 1_000;
 /// Byte ceiling for one generated statement — safely under MySQL's 16 MiB client
@@ -86,6 +98,8 @@ pub struct ImportOptions {
     pub delimiter: String,
     #[serde(default)]
     pub custom_delimiter: String,
+    /// One character, or empty to turn quoting off entirely (every delimiter and quote
+    /// byte is then literal field content).
     #[serde(default = "d_dquote")]
     pub quote_char: String,
     /// Empty = RFC 4180 doubled quotes only. One character additionally acts as a
@@ -128,7 +142,7 @@ impl ImportOptions {
             return Err(AppError::new("unsupported import encoding"));
         }
         let one_char = |s: &str| s.chars().count() == 1 && !s.contains(['\r', '\n']);
-        if !one_char(&self.quote_char)
+        if (!self.quote_char.is_empty() && !one_char(&self.quote_char))
             || (self.delimiter == "custom" && !one_char(&self.custom_delimiter))
             || (!self.escape_char.is_empty() && !one_char(&self.escape_char))
         {
@@ -136,15 +150,34 @@ impl ImportOptions {
                 "import delimiter, quote and escape characters must each be one non-newline character",
             ));
         }
-        if self.delim() == self.quote_c() {
+        // An escape equal to the quote breaks RFC-4180 doubling; an escape equal to the
+        // delimiter silently swallows separators. Both must be rejected, not guessed at.
+        let delim = self.delim();
+        if self.quote_c() == Some(delim) {
             return Err(AppError::new(
                 "import delimiter and quote character must differ",
             ));
+        }
+        if let Some(escape) = self.escape_c() {
+            if Some(escape) == self.quote_c() {
+                return Err(AppError::new(
+                    "import escape and quote character must differ — leave Escape empty for RFC 4180 doubled quotes",
+                ));
+            }
+            if escape == delim {
+                return Err(AppError::new(
+                    "import escape character and delimiter must differ",
+                ));
+            }
         }
         if self.null_text.len() > 1024
             || self.skip_rows > 1_000_000
             || self.sheet.len() > 200
             || self.source_columns.len() > MAX_IMPORT_COLUMNS
+            || self
+                .source_columns
+                .iter()
+                .any(|c| c.len() > MAX_COLUMN_NAME_BYTES)
         {
             return Err(AppError::new("import option exceeds its size limit"));
         }
@@ -160,8 +193,9 @@ impl ImportOptions {
             _ => ',',
         }
     }
-    fn quote_c(&self) -> char {
-        self.quote_char.chars().next().unwrap_or('"')
+    /// `None` when quoting is turned off.
+    fn quote_c(&self) -> Option<char> {
+        self.quote_char.chars().next()
     }
     fn escape_c(&self) -> Option<char> {
         self.escape_char.chars().next()
@@ -231,6 +265,10 @@ pub struct ImportSummary {
     pub rows_inserted: u64,
     pub rows_skipped: u64,
     pub warnings: Vec<String>,
+    /// MySQL DDL implicitly commits, so a create-and-load import runs its `CREATE TABLE`
+    /// before the transaction opens. True means the table itself is already committed
+    /// and would survive a failed or cancelled row load.
+    pub created_outside_transaction: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -466,9 +504,9 @@ impl RowBudget {
 }
 
 fn field_guard(len: usize) -> Result<(), AppError> {
-    if len > MAX_FIELD_CHARS {
+    if len > MAX_FIELD_BYTES {
         return Err(AppError::new(format!(
-            "import is too large: a field exceeds {MAX_FIELD_CHARS} characters"
+            "import is too large: a field exceeds {MAX_FIELD_BYTES} bytes"
         )));
     }
     Ok(())
@@ -483,25 +521,31 @@ fn columns_guard(n: usize) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Reject an empty or duplicated (case-insensitive) header, matching `src/formats.ts`.
-fn validate_header(columns: &[String]) -> Result<(), AppError> {
+/// Reject an empty, over-long or duplicated (case-insensitive) header. `noun` names the
+/// source in the error so an xlsx problem does not read as a delimited one.
+fn validate_header(columns: &[String], noun: &str) -> Result<(), AppError> {
     columns_guard(columns.len())?;
     if columns.iter().any(|c| c.is_empty()) {
-        return Err(AppError::new(
-            "delimited header contains an empty column name",
-        ));
+        return Err(AppError::new(format!(
+            "{noun} header contains an empty column name"
+        )));
+    }
+    if columns.iter().any(|c| c.len() > MAX_COLUMN_NAME_BYTES) {
+        return Err(AppError::new(format!(
+            "{noun} header contains a column name longer than {MAX_COLUMN_NAME_BYTES} bytes"
+        )));
     }
     let mut seen = std::collections::HashSet::with_capacity(columns.len());
     if columns.iter().any(|c| !seen.insert(c.to_lowercase())) {
-        return Err(AppError::new(
-            "delimited header contains duplicate column names",
-        ));
+        return Err(AppError::new(format!(
+            "{noun} header contains duplicate column names"
+        )));
     }
     Ok(())
 }
 
 /// Shape a raw parsed row against the resolved columns: pad short rows with NULL, reject
-/// wide ones (the `src/formats.ts` rule).
+/// wide ones.
 fn shape_row(
     raw: Vec<String>,
     width: usize,
@@ -598,12 +642,13 @@ impl Decoder {
     }
 }
 
-/// Streaming delimited-text parser. The state machine mirrors `parseCSV` in
-/// `src/formats.ts`: a quote may only open a field, characters after a closing quote are
-/// an error, an unterminated quoted field is an error.
+/// Streaming delimited-text parser and the sole definition of what Tusk accepts: a
+/// quote may only open a field, characters after a closing quote are an error, an
+/// unterminated quoted field is an error, and a wholly blank line is a separator.
 struct DelimitedParser {
     delim: char,
-    quote: char,
+    /// `None` when the user turned quoting off; every byte is then literal content.
+    quote: Option<char>,
     escape: Option<char>,
     in_quotes: bool,
     after_quote: bool,
@@ -664,12 +709,12 @@ impl DelimitedParser {
                     i += 1;
                     continue;
                 }
-                if ch == self.quote {
+                if Some(ch) == self.quote {
                     if i + 1 >= chars.len() && !last {
                         break; // the next character decides doubled vs. closing
                     }
-                    if chars.get(i + 1) == Some(&self.quote) {
-                        self.field.push(self.quote);
+                    if chars.get(i + 1) == self.quote.as_ref() {
+                        self.field.push(ch);
                         field_guard(self.field.len())?;
                         i += 2;
                         continue;
@@ -689,7 +734,7 @@ impl DelimitedParser {
                     "malformed delimited file: characters after a closing quote",
                 ));
             }
-            if ch == self.quote {
+            if Some(ch) == self.quote {
                 if self.field_started || !self.field.is_empty() {
                     return Err(AppError::new(
                         "malformed delimited file: quote inside an unquoted field",
@@ -826,9 +871,14 @@ fn parse_delimited(
                 skipped += 1;
                 continue;
             }
+            // A wholly blank line is a separator, not a one-empty-field row: importing it
+            // would write an all-NULL row for every trailing newline in the file.
+            if raw.len() == 1 && raw[0].is_empty() {
+                continue;
+            }
             let raw = if columns.is_none() {
                 if options.header {
-                    validate_header(&raw)?;
+                    validate_header(&raw, "delimited")?;
                     columns = Some(raw);
                     continue;
                 }
@@ -890,7 +940,7 @@ fn json_is_array(reader: &mut BufReader<std::fs::File>) -> Result<bool, AppError
 }
 
 /// Top-level fields of one JSON object, in document order, rejecting duplicate keys the
-/// way `assertUniqueJsonKeys` in `src/formats.ts` does.
+/// way the frontend clipboard JSON reader does.
 fn json_object_fields(text: &str) -> Result<Vec<(String, Option<String>)>, AppError> {
     let value: serde_json::Value = serde_json::from_str(text)
         .map_err(|e| AppError::new(format!("malformed JSON import: {e}")))?;
@@ -961,8 +1011,8 @@ fn json_object_fields(text: &str) -> Result<Vec<(String, Option<String>)>, AppEr
     Ok(fields)
 }
 
-/// Render a JSON value as import text. Objects/arrays stringify (the `src/formats.ts`
-/// rule); numbers keep the file's own spelling; null is NULL.
+/// Render a JSON value as import text. Objects/arrays stringify; numbers go through
+/// `serde_json`, which canonicalises them (`1.50` becomes `1.5`); null is NULL.
 fn json_scalar(value: &serde_json::Value) -> Result<Option<String>, AppError> {
     let rendered = match value {
         serde_json::Value::Null => return Ok(None),
@@ -975,11 +1025,43 @@ fn json_scalar(value: &serde_json::Value) -> Result<Option<String>, AppError> {
     Ok(Some(rendered))
 }
 
+/// JSON has no header row, so the column set is *discovered* from the objects. The
+/// preview discovers freely; the run path pins the preview's list (row values must land
+/// on the mapped indices) but KEEPS discovering, so a changed file and a key that only
+/// appears past the sampled window are both caught instead of silently dropped.
 struct JsonState {
-    columns: Vec<String>,
-    discovered: bool,
+    /// Every key seen so far, in first-seen order.
+    discovered: Vec<String>,
+    /// The preview's column list on the run path; `None` while previewing.
+    pinned: Option<Vec<String>>,
+    /// Keys reported as unimportable, so one warning is emitted per key.
+    warned: std::collections::HashSet<String>,
     row_number: u64,
     budget: RowBudget,
+}
+
+impl JsonState {
+    fn new(options: &ImportOptions) -> Self {
+        Self {
+            discovered: Vec::new(),
+            pinned: if options.source_columns.is_empty() {
+                None
+            } else {
+                Some(options.source_columns.clone())
+            },
+            warned: std::collections::HashSet::new(),
+            row_number: 0,
+            budget: RowBudget::new(),
+        }
+    }
+
+    /// The column list rows are projected onto.
+    fn columns(&self) -> &[String] {
+        match &self.pinned {
+            Some(pinned) => pinned,
+            None => &self.discovered,
+        }
+    }
 }
 
 /// Turn buffered JSON elements into rows. Returns false when the consumer stopped.
@@ -988,6 +1070,7 @@ fn drain_json(
     state: &mut JsonState,
     options: &ImportOptions,
     bytes_read: u64,
+    warnings: &mut Vec<String>,
     emit: RowSink<'_>,
 ) -> Result<bool, AppError> {
     for element in elements.drain(..) {
@@ -996,18 +1079,41 @@ fn drain_json(
             continue;
         }
         let fields = json_object_fields(trimmed)?;
-        if state.discovered {
+        let first = state.discovered.is_empty();
+        for (key, _) in &fields {
+            if !state.discovered.iter().any(|c| c == key) {
+                if key.len() > MAX_COLUMN_NAME_BYTES {
+                    return Err(AppError::new(format!(
+                        "JSON import contains an object key longer than {MAX_COLUMN_NAME_BYTES} bytes"
+                    )));
+                }
+                state.discovered.push(key.clone());
+                columns_guard(state.discovered.len())?;
+            }
+        }
+        if let Some(pinned) = &state.pinned {
+            // A file swapped between preview and run has no key in common with what the
+            // mapping was built from; every row would otherwise import as all-NULL.
+            if first && !fields.iter().any(|(k, _)| pinned.iter().any(|p| p == k)) {
+                return Err(AppError::new(
+                    "the file's columns changed since the preview — reopen the import dialog",
+                ));
+            }
             for (key, _) in &fields {
-                if !state.columns.iter().any(|c| c == key) {
-                    state.columns.push(key.clone());
-                    columns_guard(state.columns.len())?;
+                if !pinned.iter().any(|p| p == key)
+                    && state.warned.insert(key.clone())
+                    && warnings.len() < MAX_WARNINGS
+                {
+                    warnings.push(format!(
+                        "key {key} appears after the previewed sample and is not imported — reopen the import dialog to map it"
+                    ));
                 }
             }
         }
         state.row_number += 1;
         state.budget.count()?;
-        let row = state
-            .columns
+        let columns = state.columns();
+        let row = columns
             .iter()
             .map(|c| {
                 fields
@@ -1017,7 +1123,7 @@ fn drain_json(
                     .and_then(|v| options.null_of(v))
             })
             .collect::<Vec<_>>();
-        if !emit(&state.columns, row, bytes_read) {
+        if !emit(columns, row, bytes_read) {
             return Ok(false);
         }
     }
@@ -1031,12 +1137,7 @@ fn parse_json(
     emit: RowSink<'_>,
 ) -> Result<ParseOutcome, AppError> {
     let array = json_is_array(&mut reader)?;
-    let mut state = JsonState {
-        discovered: options.source_columns.is_empty(),
-        columns: options.source_columns.clone(),
-        row_number: 0,
-        budget: RowBudget::new(),
-    };
+    let mut state = JsonState::new(options);
     let mut bytes_read = 0u64;
     let mut elements: Vec<String> = Vec::new();
 
@@ -1118,7 +1219,14 @@ fn parse_json(
             }
             pending.clear();
             if (elements.len() >= 256 || read == 0)
-                && !drain_json(&mut elements, &mut state, options, bytes_read, emit)?
+                && !drain_json(
+                    &mut elements,
+                    &mut state,
+                    options,
+                    bytes_read,
+                    warnings,
+                    emit,
+                )?
             {
                 stopped = true;
             }
@@ -1133,7 +1241,12 @@ fn parse_json(
         let mut raw = Vec::new();
         loop {
             raw.clear();
-            let read = reader.read_until(b'\n', &mut raw).map_err(de)?;
+            // BOUND BEFORE ALLOCATING: an unbounded `read_until` would materialize a
+            // newline-free multi-gigabyte file in full before the cap could fire.
+            let read = (&mut reader)
+                .take(MAX_JSON_ELEMENT_BYTES as u64 + 1)
+                .read_until(b'\n', &mut raw)
+                .map_err(de)?;
             if read == 0 {
                 break;
             }
@@ -1154,16 +1267,23 @@ fn parse_json(
                 continue;
             }
             elements.push(line.trim().to_string());
-            if !drain_json(&mut elements, &mut state, options, bytes_read, emit)? {
+            if !drain_json(
+                &mut elements,
+                &mut state,
+                options,
+                bytes_read,
+                warnings,
+                emit,
+            )? {
                 break;
             }
         }
     }
-    if state.columns.is_empty() {
+    if state.columns().is_empty() {
         return Err(AppError::new("the import file contains no columns"));
     }
     Ok(ParseOutcome {
-        columns: state.columns,
+        columns: state.columns().to_vec(),
         warnings: std::mem::take(warnings),
         sheets: Vec::new(),
     })
@@ -1193,16 +1313,38 @@ fn parse_xlsx(
         }
         options.sheet.clone()
     };
+    // Check the declared sheet dimensions BEFORE `worksheet_range` materializes every
+    // cell. calamine only exposes a header-only cell reader for the `.xlsx` shape, so
+    // `.xls`/`.xlsb`/`.ods` still expand first (recorded as a residual risk in
+    // docs/adversarial-hardening.md).
+    if let calamine::Sheets::Xlsx(xl) = &mut workbook {
+        if let Ok(reader) = xl.worksheet_cells_reader(&name) {
+            let d = reader.dimensions();
+            let w = d.end.1.saturating_sub(d.start.1).saturating_add(1) as usize;
+            let h = d.end.0.saturating_sub(d.start.0).saturating_add(1) as usize;
+            columns_guard(w)?;
+            if w.saturating_mul(h) > MAX_XLSX_CELLS {
+                return Err(AppError::new(format!(
+                    "the sheet exceeds the {MAX_XLSX_CELLS}-cell import limit"
+                )));
+            }
+        }
+    }
     let range = workbook
         .worksheet_range(&name)
         .map_err(|e| AppError::new(format!("cannot read sheet {name}: {e}")))?;
     let width = range.width();
+    let height = range.height();
     columns_guard(width)?;
-    if width.saturating_mul(range.height()) > MAX_XLSX_CELLS {
+    if width.saturating_mul(height) > MAX_XLSX_CELLS {
         return Err(AppError::new(format!(
             "the sheet exceeds the {MAX_XLSX_CELLS}-cell import limit"
         )));
     }
+    // xlsx is read whole rather than streamed, so there are no bytes-consumed
+    // milestones; report progress as the row fraction of the file's size instead.
+    let total_bytes = file_size(path)?;
+    let data_rows = height.saturating_sub(options.skip_rows as usize + usize::from(options.header));
     let cell_text = |d: &Data| -> Result<String, AppError> {
         Ok(match d {
             Data::Empty => String::new(),
@@ -1241,11 +1383,17 @@ fn parse_xlsx(
         let head = rows
             .next()
             .ok_or_else(|| AppError::new("the sheet contains no header row"))?;
-        let names: Vec<String> = head
+        let mut names: Vec<String> = head
             .iter()
             .map(cell_text)
             .collect::<Result<Vec<_>, AppError>>()?;
-        validate_header(&names)?;
+        // A range's width is the sheet's, not the header's: one once-touched cell far to
+        // the right pads the header with blanks. Drop those the way the data rows do,
+        // instead of rejecting the whole sheet for an "empty column name".
+        while names.len() > 1 && names.last().is_some_and(|n| n.is_empty()) {
+            names.pop();
+        }
+        validate_header(&names, "sheet")?;
         names
     } else {
         (1..=width.max(1)).map(|k| format!("col{k}")).collect()
@@ -1266,7 +1414,12 @@ fn parse_xlsx(
             values.pop();
         }
         let shaped = shape_row(values, columns.len(), row_number, options, warnings)?;
-        if !emit(&columns, shaped, 0) {
+        let progressed = if data_rows == 0 {
+            total_bytes
+        } else {
+            total_bytes.saturating_mul(row_number.min(data_rows as u64)) / data_rows as u64
+        };
+        if !emit(&columns, shaped, progressed) {
             break;
         }
     }
@@ -1281,25 +1434,56 @@ fn parse_xlsx(
 // Preview
 // ---------------------------------------------------------------------------
 
+/// Elide one previewed cell. The preview is a display/inference sample, never the data
+/// the loader sees, so a truncated value cannot reach the database.
+fn preview_cell(value: String) -> String {
+    if value.chars().count() <= MAX_PREVIEW_CELL_CHARS {
+        return value;
+    }
+    let mut out: String = value.chars().take(MAX_PREVIEW_CELL_CHARS).collect();
+    out.push('…');
+    out
+}
+
 pub fn preview_file(path: &Path, options: &ImportOptions) -> Result<ImportPreview, AppError> {
     options.validate()?;
     let file_bytes = file_size(path)?;
     let mut rows: Vec<Vec<Option<String>>> = Vec::new();
     let mut seen = 0u64;
+    // The preview is the one IPC payload built from a file the user chose, so it carries
+    // its own aggregate budget: sampling stops early rather than shipping 50 rows of
+    // 10,000 megabyte-sized cells to the WebView.
+    let mut budget = 0usize;
+    let mut capped = false;
     // Read one row past the sample so `truncated` is accurate.
     let outcome = parse_file(path, options, &mut |_columns, row, _| {
         seen += 1;
-        if rows.len() < PREVIEW_ROWS {
-            rows.push(row);
+        if rows.len() < PREVIEW_ROWS && !capped {
+            let trimmed: Vec<Option<String>> =
+                row.into_iter().map(|v| v.map(preview_cell)).collect();
+            budget += trimmed
+                .iter()
+                .map(|v| v.as_ref().map_or(4, |s| s.len()))
+                .sum::<usize>();
+            rows.push(trimmed);
+            if budget > MAX_PREVIEW_BYTES {
+                capped = true;
+            }
         }
-        seen <= PREVIEW_ROWS as u64
+        seen <= PREVIEW_ROWS as u64 && !capped
     })?;
+    let mut warnings = outcome.warnings;
+    if capped && warnings.len() < MAX_WARNINGS {
+        warnings.push(format!(
+            "the sampled rows exceed the {MAX_PREVIEW_BYTES}-byte preview budget — fewer rows are shown"
+        ));
+    }
     Ok(ImportPreview {
         columns: outcome.columns,
         rows,
-        warnings: outcome.warnings,
+        warnings,
         sheets: outcome.sheets,
-        truncated: seen > PREVIEW_ROWS as u64,
+        truncated: capped || seen > PREVIEW_ROWS as u64,
         file_bytes,
     })
 }
@@ -1376,6 +1560,16 @@ impl Plan {
                 empty_as_null: column.empty_as_null,
                 source: column.source,
             });
+        }
+        if target.key_columns.len() > MAX_IMPORT_COLUMNS
+            || target
+                .key_columns
+                .iter()
+                .any(|k| k.len() > MAX_COLUMN_NAME_BYTES)
+        {
+            return Err(AppError::new(
+                "import conflict key list is invalid or too long",
+            ));
         }
         if target.conflict == "update" {
             if dialect == Dialect::Postgres && target.key_columns.is_empty() {
@@ -1488,17 +1682,161 @@ impl Plan {
         }
     }
 
+    /// `COPY <table> (cols) FROM STDIN` — the PostgreSQL fast path for a plain insert.
+    fn copy_sql(&self) -> String {
+        format!(
+            "COPY {} ({}) FROM STDIN",
+            self.qualified,
+            self.column_list()
+        )
+    }
+
+    /// COPY carries no conflict clause, so only a plain insert can take that path.
+    fn use_copy(&self) -> bool {
+        self.dialect == Dialect::Postgres && self.conflict == "error"
+    }
+
+    /// The value a source row contributes to one mapped column, with `empty → NULL`
+    /// applied. A whitespace-only cell counts as empty: the preview's type inference
+    /// skips blanks, so treating `" "` as data made a sampled `integer` column reject
+    /// mid-load.
+    fn cell<'r>(&self, column: &PlanColumn, row: &'r [Option<String>]) -> Option<&'r str> {
+        match row.get(column.source).and_then(|v| v.as_deref()) {
+            Some(v) if column.empty_as_null && v.trim().is_empty() => None,
+            other => other,
+        }
+    }
+
     /// Project one source row onto the mapped columns and render its value tuple.
     fn tuple(&self, row: &[Option<String>], row_number: u64) -> Result<String, AppError> {
         let mut parts = Vec::with_capacity(self.columns.len());
         for column in &self.columns {
-            let raw = match row.get(column.source).cloned().flatten() {
-                Some(v) if column.empty_as_null && v.is_empty() => None,
-                other => other,
-            };
-            parts.push(self.literal(column, raw.as_deref(), row_number)?);
+            let raw = self.cell(column, row);
+            parts.push(self.literal(column, raw, row_number)?);
         }
         Ok(format!("({})", parts.join(", ")))
+    }
+
+    /// Append one PostgreSQL text-format COPY line for `row`. Values are validated by
+    /// exactly the same rules as `literal`, so the COPY and INSERT paths accept and
+    /// reject the same files with the same messages.
+    fn copy_line(
+        &self,
+        row: &[Option<String>],
+        row_number: u64,
+        out: &mut String,
+    ) -> Result<(), AppError> {
+        for (k, column) in self.columns.iter().enumerate() {
+            if k > 0 {
+                out.push('\t');
+            }
+            let Some(value) = self.cell(column, row) else {
+                out.push_str("\\N");
+                continue;
+            };
+            let coerced = self.coerce(column, value, row_number)?;
+            let text = match coerced {
+                Coerced::Verbatim(v) => v,
+                Coerced::Text(v) => v,
+            };
+            if text.contains('\0') {
+                return Err(AppError::new(
+                    "PostgreSQL cannot store a text value containing a zero byte",
+                ));
+            }
+            for ch in text.chars() {
+                match ch {
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    other => out.push(other),
+                }
+            }
+        }
+        out.push('\n');
+        Ok(())
+    }
+
+    /// Validate + normalize one value by its declared token. `Verbatim` values are safe
+    /// as unquoted SQL (numbers, boolean keywords); `Text` values must be quoted.
+    fn coerce(
+        &self,
+        column: &PlanColumn,
+        value: &str,
+        row_number: u64,
+    ) -> Result<Coerced, AppError> {
+        let reject = |expected: &str| {
+            AppError::new(format!(
+                "row {row_number}, column {}: {} is not a valid {expected}",
+                column.target,
+                truncate_for_error(value)
+            ))
+        };
+        Ok(match column.kind {
+            ColumnType::Text => Coerced::Text(value.to_string()),
+            ColumnType::Date => {
+                let trimmed = value.trim();
+                if !valid_date(trimmed) {
+                    return Err(reject("date (YYYY-MM-DD)"));
+                }
+                Coerced::Text(trimmed.to_string())
+            }
+            ColumnType::Timestamp => {
+                let trimmed = value.trim();
+                match normalize_timestamp(trimmed, self.dialect) {
+                    Ok(normalized) => Coerced::Text(normalized),
+                    Err(why) => {
+                        return Err(AppError::new(format!(
+                            "row {row_number}, column {}: {} {why}",
+                            column.target,
+                            truncate_for_error(value)
+                        )))
+                    }
+                }
+            }
+            ColumnType::Integer | ColumnType::BigInt => {
+                let trimmed = value.trim();
+                if !is_integer_text(trimmed) {
+                    return Err(reject("integer"));
+                }
+                if trimmed.parse::<i64>().is_err() {
+                    return Err(reject("64-bit integer"));
+                }
+                Coerced::Verbatim(trimmed.trim_start_matches('+').to_string())
+            }
+            ColumnType::Numeric => {
+                let trimmed = value.trim();
+                if !is_numeric_text(trimmed) {
+                    return Err(reject("number"));
+                }
+                Coerced::Verbatim(trimmed.trim_start_matches('+').to_string())
+            }
+            ColumnType::Boolean => {
+                let Some(flag) = bool_text(value) else {
+                    return Err(reject("boolean"));
+                };
+                Coerced::Verbatim(
+                    match self.dialect {
+                        Dialect::Sqlite | Dialect::MySql => {
+                            if flag {
+                                "1"
+                            } else {
+                                "0"
+                            }
+                        }
+                        _ => {
+                            if flag {
+                                "TRUE"
+                            } else {
+                                "FALSE"
+                            }
+                        }
+                    }
+                    .to_string(),
+                )
+            }
+        })
     }
 
     fn literal(
@@ -1510,57 +1848,77 @@ impl Plan {
         let Some(value) = raw else {
             return Ok("NULL".to_string());
         };
-        let reject = |expected: &str| {
-            AppError::new(format!(
-                "row {row_number}, column {}: {} is not a valid {expected}",
-                column.target,
-                truncate_for_error(value)
-            ))
-        };
-        Ok(match column.kind {
-            ColumnType::Text | ColumnType::Date | ColumnType::Timestamp => {
-                self.dialect.string_literal(value)?
-            }
-            ColumnType::Integer | ColumnType::BigInt => {
-                let trimmed = value.trim();
-                if !is_integer_text(trimmed) {
-                    return Err(reject("integer"));
-                }
-                if trimmed.parse::<i64>().is_err() {
-                    return Err(reject("64-bit integer"));
-                }
-                trimmed.trim_start_matches('+').to_string()
-            }
-            ColumnType::Numeric => {
-                let trimmed = value.trim();
-                if !is_numeric_text(trimmed) {
-                    return Err(reject("number"));
-                }
-                trimmed.trim_start_matches('+').to_string()
-            }
-            ColumnType::Boolean => {
-                let Some(flag) = bool_text(value) else {
-                    return Err(reject("boolean"));
-                };
-                match self.dialect {
-                    Dialect::Sqlite | Dialect::MySql => {
-                        if flag {
-                            "1"
-                        } else {
-                            "0"
-                        }
-                    }
-                    _ => {
-                        if flag {
-                            "TRUE"
-                        } else {
-                            "FALSE"
-                        }
-                    }
-                }
-                .to_string()
-            }
+        Ok(match self.coerce(column, value, row_number)? {
+            Coerced::Verbatim(v) => v,
+            Coerced::Text(v) => self.dialect.string_literal(&v)?,
         })
+    }
+}
+
+enum Coerced {
+    /// Safe to emit unquoted (validated digits / boolean keyword).
+    Verbatim(String),
+    /// Must be rendered as a string literal by the dialect.
+    Text(String),
+}
+
+/// A `YYYY-MM-DD` value that is also a real calendar date. `2024-02-30` matches the
+/// shape the preview infers from but no engine accepts it, so it must fail here with a
+/// row number rather than half-way through the load.
+fn valid_date(v: &str) -> bool {
+    chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").is_ok()
+}
+
+/// Validate `YYYY-MM-DD` or `YYYY-MM-DD[ T]HH:MM[:SS[.fff]][Z|±HH[:]MM]` and normalize it
+/// for the target engine. MySQL's `DATETIME` has no zone: a trailing `Z` is dropped (the
+/// value is already UTC-naive) and a numeric offset is refused rather than mis-stored.
+fn normalize_timestamp(v: &str, dialect: Dialect) -> Result<String, &'static str> {
+    const SHAPE: &str = "is not a valid timestamp (YYYY-MM-DD[ HH:MM[:SS]])";
+    if v.len() < 10 || !v.is_char_boundary(10) {
+        return Err(SHAPE);
+    }
+    let (date, rest) = v.split_at(10);
+    if !valid_date(date) {
+        return Err(SHAPE);
+    }
+    if rest.is_empty() {
+        return Ok(v.to_string()); // a bare date is a valid timestamp everywhere
+    }
+    let Some(rest) = rest.strip_prefix(['T', 't', ' ']) else {
+        return Err(SHAPE);
+    };
+    // Split the time from an optional zone designator.
+    let (time, zone) = match rest.find(['Z', 'z', '+']) {
+        Some(i) => rest.split_at(i),
+        None => match rest.rfind('-') {
+            Some(i) => rest.split_at(i),
+            None => (rest, ""),
+        },
+    };
+    if chrono::NaiveTime::parse_from_str(time, "%H:%M:%S%.f").is_err()
+        && chrono::NaiveTime::parse_from_str(time, "%H:%M").is_err()
+    {
+        return Err(SHAPE);
+    }
+    let numeric_offset = match zone {
+        "" | "Z" | "z" => false,
+        other => {
+            let Some(body) = other.strip_prefix(['+', '-']) else {
+                return Err(SHAPE);
+            };
+            let digits: String = body.chars().filter(|c| *c != ':').collect();
+            if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(SHAPE);
+            }
+            true
+        }
+    };
+    match (dialect, numeric_offset) {
+        (Dialect::MySql, true) => {
+            Err("carries a time-zone offset, which MySQL DATETIME cannot store — convert it to UTC first")
+        }
+        (Dialect::MySql, false) => Ok(format!("{date} {time}")),
+        _ => Ok(v.to_string()),
     }
 }
 
@@ -1605,8 +1963,8 @@ impl Session<'_> {
         })
     }
 
-    async fn rollback(&mut self) {
-        let _ = self.batch("ROLLBACK").await;
+    async fn rollback(&mut self) -> Result<(), AppError> {
+        self.batch("ROLLBACK").await
     }
 
     /// Control / DDL statements: no row count needed, and DuckDB prefers `execute_batch`.
@@ -1665,10 +2023,12 @@ pub struct ImportRequest {
     pub target: ImportTarget,
 }
 
-/// One parsed batch handed from the blocking parser to the async loader.
+/// One parsed batch handed from the blocking parser to the async loader. The final chunk
+/// also carries the parser's accumulated warnings, which end up in the run summary.
 struct Chunk {
     rows: Vec<Vec<Option<String>>>,
     bytes_read: u64,
+    warnings: Vec<String>,
 }
 
 /// Load `request` into `backend`. The caller owns `require_idle`, read-only refusal,
@@ -1717,6 +2077,7 @@ pub async fn run_import(
                 let chunk = Chunk {
                     rows: std::mem::take(&mut batch),
                     bytes_read: bytes,
+                    warnings: Vec::new(),
                 };
                 if tx.blocking_send(Ok(chunk)).is_err() {
                     return false;
@@ -1737,13 +2098,14 @@ pub async fn run_import(
             Ok(outcome) if !checked && outcome.columns != parse_options.source_columns => {
                 let _ = tx.blocking_send(Err(changed));
             }
-            Ok(_) => {
-                if !batch.is_empty() {
-                    let _ = tx.blocking_send(Ok(Chunk {
-                        rows: batch,
-                        bytes_read: total_bytes,
-                    }));
-                }
+            Ok(outcome) => {
+                // Always send the tail chunk: it carries the parser's warnings (short
+                // rows, late JSON keys), which the run summary reports.
+                let _ = tx.blocking_send(Ok(Chunk {
+                    rows: batch,
+                    bytes_read: total_bytes,
+                    warnings: outcome.warnings,
+                }));
             }
         }
     });
@@ -1765,6 +2127,7 @@ pub async fn run_import(
         rows_inserted: 0,
         rows_skipped: 0,
         warnings: Vec::new(),
+        created_outside_transaction: false,
     };
     let result = load(
         &mut session,
@@ -1793,8 +2156,21 @@ pub async fn run_import(
             });
             Ok(summary)
         }
-        Err(error) => {
-            session.rollback().await;
+        Err(mut error) => {
+            // A ROLLBACK that itself fails leaves an open transaction the app does not
+            // track — say so instead of swallowing it.
+            if let Err(rollback) = session.rollback().await {
+                error.message = format!(
+                    "{}\n(rollback also failed: {} — verify the database state before retrying)",
+                    error.message, rollback.message
+                );
+            }
+            if summary.created_outside_transaction {
+                error.message = format!(
+                    "{}\n(MySQL commits DDL immediately, so the new table {} was created before the transaction and still exists — drop it before retrying)",
+                    error.message, plan.qualified
+                );
+            }
             let _ = parser.await;
             Err(error)
         }
@@ -1810,13 +2186,28 @@ async fn load(
     progress: &impl Fn(ImportProgressUpdate),
     summary: &mut ImportSummary,
 ) -> Result<(), AppError> {
+    // MySQL's CREATE TABLE implicitly COMMITs *and ends* the transaction, leaving the
+    // pooled connection back at autocommit=1 — every later INSERT would then commit
+    // itself and ROLLBACK would be a no-op. Create before the transaction opens instead,
+    // and report it as a separately committed step.
+    let mysql = matches!(session, Session::MySql(_));
+    if plan.create && mysql {
+        session.batch(&plan.create_sql()).await?;
+        summary.created_outside_transaction = true;
+    }
     session.begin().await?;
-    if plan.create {
+    if plan.create && !mysql {
         session.batch(&plan.create_sql()).await?;
     }
     if plan.truncate {
         session.batch(&plan.clear_sql()).await?;
     }
+    if plan.use_copy() {
+        return copy_load(session, plan, rx, cancel, total_bytes, progress, summary).await;
+    }
+    // MySQL reports 2 affected rows for every row an upsert UPDATES, so its own count
+    // cannot say how many rows were written; each tuple is written by definition.
+    let count_tuples = plan.dialect == Dialect::MySql && plan.conflict == "update";
     let head = plan.insert_head();
     let tail = plan.insert_tail();
     while let Some(chunk) = rx.recv().await {
@@ -1824,19 +2215,21 @@ async fn load(
             return Err(AppError::new("import cancelled — rolled back"));
         }
         let chunk = chunk?;
+        take_warnings(summary, chunk.warnings);
         let mut tuples: Vec<String> = Vec::new();
         let mut tuple_bytes = 0usize;
         for row in &chunk.rows {
             summary.rows_read += 1;
             let tuple = plan.tuple(row, summary.rows_read)?;
             if !tuples.is_empty() && tuple_bytes.saturating_add(tuple.len()) > BATCH_BYTES {
-                summary.rows_inserted += flush(session, &head, &tail, &mut tuples).await?;
+                summary.rows_inserted +=
+                    flush(session, &head, &tail, &mut tuples, count_tuples).await?;
                 tuple_bytes = 0;
             }
             tuple_bytes = tuple_bytes.saturating_add(tuple.len());
             tuples.push(tuple);
         }
-        summary.rows_inserted += flush(session, &head, &tail, &mut tuples).await?;
+        summary.rows_inserted += flush(session, &head, &tail, &mut tuples, count_tuples).await?;
         progress(ImportProgressUpdate {
             rows_read: summary.rows_read,
             rows_inserted: summary.rows_inserted,
@@ -1852,17 +2245,94 @@ async fn load(
     Ok(())
 }
 
+/// The PostgreSQL plain-insert path: one `COPY … FROM STDIN` for the whole load, inside
+/// the import transaction. COPY has no `ON CONFLICT`, so `ignore`/`update` keep the
+/// batched multi-row `INSERT`.
+async fn copy_load(
+    session: &mut Session<'_>,
+    plan: &Plan,
+    rx: &mut tokio::sync::mpsc::Receiver<Result<Chunk, AppError>>,
+    cancel: &Arc<AtomicBool>,
+    total_bytes: u64,
+    progress: &impl Fn(ImportProgressUpdate),
+    summary: &mut ImportSummary,
+) -> Result<(), AppError> {
+    let Session::Pg(client) = session else {
+        return Err(AppError::new("COPY import requires a PostgreSQL session"));
+    };
+    let mut sink = Box::pin(client.copy_in::<str, Bytes>(&plan.copy_sql()).await?);
+    let mut buf = String::new();
+    let outcome = async {
+        while let Some(chunk) = rx.recv().await {
+            if cancel.load(Ordering::Acquire) {
+                return Err(AppError::new("import cancelled — rolled back"));
+            }
+            let chunk = chunk?;
+            take_warnings(summary, chunk.warnings);
+            for row in &chunk.rows {
+                summary.rows_read += 1;
+                plan.copy_line(row, summary.rows_read, &mut buf)?;
+                if buf.len() >= BATCH_BYTES {
+                    sink.as_mut()
+                        .send(Bytes::from(std::mem::take(&mut buf)))
+                        .await?;
+                }
+            }
+            progress(ImportProgressUpdate {
+                rows_read: summary.rows_read,
+                rows_inserted: summary.rows_read,
+                bytes_read: chunk.bytes_read,
+                total_bytes,
+                done: false,
+                force: false,
+            });
+        }
+        if cancel.load(Ordering::Acquire) {
+            return Err(AppError::new("import cancelled — rolled back"));
+        }
+        if !buf.is_empty() {
+            sink.as_mut().send(Bytes::from(buf)).await?;
+        }
+        Ok(())
+    }
+    .await;
+    match outcome {
+        Ok(()) => {
+            summary.rows_inserted = sink.as_mut().finish().await?;
+            Ok(())
+        }
+        Err(error) => {
+            // Close the COPY either way so the protocol resyncs before ROLLBACK; the
+            // rows it accepted are inside the transaction that is about to roll back.
+            let _ = sink.as_mut().finish().await;
+            Err(error)
+        }
+    }
+}
+
+fn take_warnings(summary: &mut ImportSummary, warnings: Vec<String>) {
+    for warning in warnings {
+        if summary.warnings.len() >= MAX_WARNINGS {
+            break;
+        }
+        summary.warnings.push(warning);
+    }
+}
+
 async fn flush(
     session: &mut Session<'_>,
     head: &str,
     tail: &str,
     tuples: &mut Vec<String>,
+    count_tuples: bool,
 ) -> Result<u64, AppError> {
     if tuples.is_empty() {
         return Ok(0);
     }
+    let written = tuples.len() as u64;
     let sql = format!("{head}{}{tail}", std::mem::take(tuples).join(", "));
-    session.insert(&sql).await
+    let reported = session.insert(&sql).await?;
+    Ok(if count_tuples { written } else { reported })
 }
 
 // ---------------------------------------------------------------------------
@@ -2368,6 +2838,300 @@ mod tests {
             assert!(opts(json).validate().is_err(), "{json}");
         }
         assert!(opts(r#"{"format":"csv"}"#).validate().is_ok());
+    }
+
+    #[test]
+    fn blank_lines_are_separators_not_all_null_rows() {
+        let preview = parse(
+            "blank.csv",
+            b"id,name\n1,duck\n\n2,goose\n\n",
+            &opts(r#"{"format":"csv"}"#),
+        )
+        .unwrap();
+        assert_eq!(preview.rows.len(), 2, "blank lines must not become rows");
+        assert!(preview.warnings.is_empty(), "{:?}", preview.warnings);
+    }
+
+    #[test]
+    fn escape_must_differ_from_quote_and_delimiter() {
+        // escape == quote breaks ordinary RFC-4180 doubling.
+        let err = opts(r#"{"format":"csv","escapeChar":"\""}"#)
+            .validate()
+            .unwrap_err();
+        assert!(err.message.contains("escape and quote"), "{}", err.message);
+        // escape == delimiter silently swallows separators.
+        let err = opts(r#"{"format":"csv","escapeChar":","}"#)
+            .validate()
+            .unwrap_err();
+        assert!(
+            err.message.contains("escape character and delimiter"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn quoting_can_be_turned_off_entirely() {
+        let options = opts(r#"{"format":"csv","quoteChar":""}"#);
+        options.validate().unwrap();
+        let preview = parse("q.csv", b"size,note\n5\" pipe,a\"b\n", &options).unwrap();
+        assert_eq!(
+            preview.rows,
+            vec![vec![Some("5\" pipe".into()), Some("a\"b".into())]]
+        );
+        // The same file is a hard error with quoting on — that is the bug this escapes.
+        assert!(parse(
+            "q.csv",
+            b"size,note\n5\" pipe,a\n",
+            &opts(r#"{"format":"csv"}"#)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ndjson_bounds_a_newline_free_line_before_allocating() {
+        // A single line just over the element cap must be refused, not materialized.
+        let mut body = Vec::with_capacity(MAX_JSON_ELEMENT_BYTES + 64);
+        body.extend_from_slice(br#"{"a":""#);
+        body.resize(MAX_JSON_ELEMENT_BYTES + 8, b'x');
+        body.extend_from_slice(br#""}"#);
+        let err = parse("big.ndjson", &body, &opts(r#"{"format":"json"}"#)).unwrap_err();
+        assert!(err.message.contains("16 MiB limit"), "{}", err.message);
+    }
+
+    #[test]
+    fn json_run_path_detects_a_swapped_file_and_warns_about_late_keys() {
+        let mut pinned = opts(r#"{"format":"json"}"#);
+        pinned.source_columns = vec!["id".into(), "name".into()];
+        // Wholly different keys: every row would otherwise import as all-NULL.
+        let err = parse("swap.json", b"{\"other\":1}\n", &pinned).unwrap_err();
+        assert!(
+            err.message.contains("changed since the preview"),
+            "{}",
+            err.message
+        );
+        // A key that only shows up past the sampled window warns instead of vanishing.
+        let preview = parse(
+            "late.json",
+            b"{\"id\":1}\n{\"id\":2,\"email\":\"x\"}\n",
+            &pinned,
+        )
+        .unwrap();
+        assert_eq!(preview.columns, vec!["id", "name"]);
+        assert!(
+            preview.warnings.iter().any(|w| w.contains("email")),
+            "{:?}",
+            preview.warnings
+        );
+    }
+
+    #[test]
+    fn sheet_headers_drop_trailing_blanks_instead_of_erroring() {
+        use rust_xlsxwriter::Workbook;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide.xlsx");
+        let mut wb = Workbook::new();
+        let ws = wb.add_worksheet();
+        for (c, name) in ["id", "name"].iter().enumerate() {
+            ws.write_string(0, c as u16, *name).unwrap();
+        }
+        // One once-touched cell far to the right widens the sheet's range.
+        ws.write_string(0, 5, "").unwrap();
+        ws.write_number(1, 0, 1.0).unwrap();
+        ws.write_string(1, 1, "duck").unwrap();
+        wb.save(&path).unwrap();
+        let preview = preview_file(&path, &opts(r#"{"format":"xlsx"}"#)).unwrap();
+        assert_eq!(preview.columns, vec!["id", "name"]);
+        assert_eq!(
+            preview.rows,
+            vec![vec![Some("1".into()), Some("duck".into())]]
+        );
+    }
+
+    #[test]
+    fn preview_bounds_its_own_payload() {
+        // One megabyte-sized cell is elided rather than shipped over IPC.
+        let narrow = parse(
+            "fat.csv",
+            format!("id,blob\n1,{}\n", "x".repeat(900_000)).as_bytes(),
+            &opts(r#"{"format":"csv"}"#),
+        )
+        .unwrap();
+        let cell = narrow.rows[0][1].as_ref().unwrap();
+        assert!(cell.ends_with('…') && cell.chars().count() == MAX_PREVIEW_CELL_CHARS + 1);
+
+        // Many wide cells hit the aggregate budget, so sampling stops early and the
+        // preview reports itself truncated instead of returning an unbounded payload.
+        const COLS: usize = 100;
+        let header = (0..COLS)
+            .map(|k| format!("c{k}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let value = "y".repeat(2_100);
+        let row = vec![value.as_str(); COLS].join(",");
+        let mut body = String::with_capacity(45 * (row.len() + 1) + header.len() + 1);
+        body.push_str(&header);
+        body.push('\n');
+        for _ in 0..45 {
+            body.push_str(&row);
+            body.push('\n');
+        }
+        let preview = parse("wide.csv", body.as_bytes(), &opts(r#"{"format":"csv"}"#)).unwrap();
+        let bytes: usize = preview
+            .rows
+            .iter()
+            .flatten()
+            .map(|v| v.as_ref().map_or(0, |s| s.len()))
+            .sum();
+        assert!(
+            bytes <= MAX_PREVIEW_BYTES + COLS * (MAX_PREVIEW_CELL_CHARS + 3),
+            "preview payload {bytes} bytes"
+        );
+        assert!(preview.rows.len() < 45, "sampling stopped at the budget");
+        assert!(preview.truncated);
+    }
+
+    #[test]
+    fn whitespace_only_cells_count_as_empty() {
+        let p = plan(Dialect::Postgres, "error", &[]);
+        // `name` has emptyAsNull on; `id` does not, so a blank integer still errors.
+        assert_eq!(
+            p.tuple(&[Some("7".into()), Some("   ".into())], 1).unwrap(),
+            "(7, NULL)"
+        );
+        assert!(p.tuple(&[Some(" ".into()), Some("x".into())], 1).is_err());
+    }
+
+    #[test]
+    fn dates_and_timestamps_are_validated_and_trimmed() {
+        let column = |kind: ColumnType| PlanColumn {
+            target: "at".into(),
+            kind,
+            empty_as_null: false,
+            source: 0,
+        };
+        let plan_for = |dialect: Dialect, kind: ColumnType| Plan {
+            dialect,
+            qualified: dialect.qualify("", "t"),
+            columns: vec![column(kind)],
+            conflict: "error".into(),
+            key_columns: Vec::new(),
+            create: false,
+            truncate: false,
+        };
+        let pg_date = plan_for(Dialect::Postgres, ColumnType::Date);
+        assert_eq!(
+            pg_date.tuple(&[Some(" 2024-01-01 ".into())], 1).unwrap(),
+            "('2024-01-01')",
+            "leading/trailing space is trimmed, not sent"
+        );
+        assert!(
+            pg_date.tuple(&[Some("2024-02-30".into())], 1).is_err(),
+            "a shape-valid but impossible date must fail here, not at row N"
+        );
+        let pg_ts = plan_for(Dialect::Postgres, ColumnType::Timestamp);
+        assert_eq!(
+            pg_ts
+                .tuple(&[Some("2024-01-01T00:00:00Z".into())], 1)
+                .unwrap(),
+            "('2024-01-01T00:00:00Z')"
+        );
+        assert_eq!(
+            pg_ts.tuple(&[Some("2024-01-01".into())], 1).unwrap(),
+            "('2024-01-01')",
+            "a bare date is a valid timestamp"
+        );
+        assert!(pg_ts.tuple(&[Some("2024-01-01 25:00".into())], 1).is_err());
+        // MySQL DATETIME has no zone: Z is dropped, a numeric offset is refused.
+        let my_ts = plan_for(Dialect::MySql, ColumnType::Timestamp);
+        assert_eq!(
+            my_ts
+                .tuple(&[Some("2024-01-01T00:00:00Z".into())], 1)
+                .unwrap(),
+            "('2024-01-01 00:00:00')"
+        );
+        let err = my_ts
+            .tuple(&[Some("2024-01-01T00:00:00+05:00".into())], 1)
+            .unwrap_err();
+        assert!(err.message.contains("time-zone offset"), "{}", err.message);
+    }
+
+    #[test]
+    fn postgres_copy_lines_escape_and_validate_like_the_insert_path() {
+        let p = plan(Dialect::Postgres, "error", &[]);
+        assert!(p.use_copy(), "a plain PG insert takes the COPY path");
+        assert!(
+            !plan(Dialect::Postgres, "ignore", &[]).use_copy(),
+            "COPY has no ON CONFLICT"
+        );
+        assert!(!plan(Dialect::MySql, "error", &[]).use_copy());
+        assert_eq!(
+            p.copy_sql(),
+            "COPY \"public\".\"t\" (\"id\", \"name\") FROM STDIN"
+        );
+        let mut out = String::new();
+        p.copy_line(&[Some("7".into()), Some("a\tb\\c\nd".into())], 1, &mut out)
+            .unwrap();
+        p.copy_line(&[Some("+8".into()), Some(String::new())], 2, &mut out)
+            .unwrap();
+        assert_eq!(out, "7\ta\\tb\\\\c\\nd\n8\t\\N\n");
+        // The same rejections, with the same message, as the INSERT path.
+        let mut bad = String::new();
+        let err = p
+            .copy_line(&[Some("seven".into()), Some("x".into())], 4, &mut bad)
+            .unwrap_err();
+        assert!(err.message.contains("row 4, column id"), "{}", err.message);
+    }
+
+    /// PARITY FIXTURE — mirrored verbatim by "only infers a type the backend loader
+    /// accepts" in src/import.test.ts. The frontend infers these tokens from these
+    /// values; the loader must then accept every one of them on every engine.
+    #[test]
+    fn inference_and_coercion_agree() {
+        let fixture: &[(&[&str], ColumnType)] = &[
+            (&["1", "2", " ", "3"], ColumnType::Integer),
+            (&["4", "-3", "42"], ColumnType::Integer),
+            (&["0", "1", "1"], ColumnType::Integer),
+            (&["1", "2000000000"], ColumnType::BigInt),
+            (&["12345678901234567890"], ColumnType::Text),
+            (&["1.5", "-2", ".5"], ColumnType::Numeric),
+            (&["true", "no", "Y"], ColumnType::Boolean),
+            (&["2024-01-01", "2024-12-31"], ColumnType::Date),
+            (
+                &["2024-01-01T00:00:00Z", "2024-06-02 03:04"],
+                ColumnType::Timestamp,
+            ),
+        ];
+        for dialect in [
+            Dialect::Postgres,
+            Dialect::DuckDb,
+            Dialect::Sqlite,
+            Dialect::MySql,
+        ] {
+            for (values, kind) in fixture {
+                let p = Plan {
+                    dialect,
+                    qualified: dialect.qualify("", "t"),
+                    columns: vec![PlanColumn {
+                        target: "v".into(),
+                        kind: *kind,
+                        // The preview skips blanks, so the loader must too.
+                        empty_as_null: true,
+                        source: 0,
+                    }],
+                    conflict: "error".into(),
+                    key_columns: Vec::new(),
+                    create: false,
+                    truncate: false,
+                };
+                for value in *values {
+                    p.tuple(&[Some((*value).to_string())], 1)
+                        .unwrap_or_else(|e| {
+                            panic!("[{dialect:?}] {kind:?} rejected {value:?}: {}", e.message)
+                        });
+                }
+            }
+        }
     }
 
     #[test]

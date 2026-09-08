@@ -15,6 +15,7 @@ import {
   tableNameFromFile,
   tokenForDeclaredType,
   type ImportColumnMapping,
+  type ImportColumnType,
 } from "./import";
 
 describe("format detection", () => {
@@ -40,9 +41,24 @@ describe("type inference", () => {
   });
 
   it("widens to bigint past the 32-bit range", () => {
-    expect(inferType(["1", "2147483647"])).toBe("integer");
+    expect(inferType(["1", "1073741823"])).toBe("integer");
     expect(inferType(["1", "2147483648"])).toBe("bigint");
     expect(inferType(["-2147483649"])).toBe("bigint");
+  });
+
+  it("biases away from integer near the 32-bit edge", () => {
+    // The sample is at most 50 rows: a column already at ~1e9 is one row away from
+    // an int4 the engine would reject after a long load.
+    expect(inferType(["2147483647"])).toBe("bigint");
+    expect(inferType(["1", "2000000000"])).toBe("bigint");
+  });
+
+  it("falls back to text when a value would not fit the loader's i64 coercion", () => {
+    // PARITY: `literal`/`copy_line` in src-tauri/src/import.rs reject these outright,
+    // so inferring bigint would fail the whole import at row 1.
+    expect(inferType(["12345678901234567890"])).toBe("text");
+    expect(inferType(["1", "-99999999999999999999"])).toBe("text");
+    expect(inferType(["9223372036854775807"])).toBe("bigint");
   });
 
   it("detects decimals, dates and timestamps", () => {
@@ -56,6 +72,25 @@ describe("type inference", () => {
     expect(inferType([null, "", "  "])).toBe("text");
     expect(inferType([null, "7", ""])).toBe("integer");
     expect(inferType(["7", "seven"])).toBe("text");
+  });
+
+  // PARITY FIXTURE — mirrored verbatim by `inference_and_coercion_agree` in
+  // src-tauri/src/import.rs. Every column the preview types this way must be a column
+  // the loader can actually coerce those same values into; a disagreement is a load
+  // that dies half-way through with "row N is not a valid …".
+  it("only infers a type the backend loader accepts", () => {
+    const fixture: [string[], ImportColumnType][] = [
+      [["1", "2", " ", "3"], "integer"], // a whitespace-only cell is blank, not data
+      [["4", "-3", "42"], "integer"], // TINYINT values outside 0/1 are integers
+      [["0", "1", "1"], "integer"],
+      [["1", "2000000000"], "bigint"],
+      [["12345678901234567890"], "text"], // wider than i64
+      [["1.5", "-2", ".5"], "numeric"],
+      [["true", "no", "Y"], "boolean"],
+      [["2024-01-01", "2024-12-31"], "date"],
+      [["2024-01-01T00:00:00Z", "2024-06-02 03:04"], "timestamp"],
+    ];
+    for (const [values, token] of fixture) expect(inferType(values)).toBe(token);
   });
 
   it("infers a whole preview column-wise", () => {
@@ -75,7 +110,10 @@ describe("declared-type tokens and DDL parity", () => {
   it("maps engine types onto import tokens, defaulting to text", () => {
     expect(tokenForDeclaredType("character varying(20)")).toBe("text");
     expect(tokenForDeclaredType("BOOLEAN")).toBe("boolean");
-    expect(tokenForDeclaredType("tinyint(1)")).toBe("boolean");
+    // MySQL reports `tinyint` for every width and DuckDB's TINYINT is a 1-byte int:
+    // mapping it to boolean rejected any value outside 0/1.
+    expect(tokenForDeclaredType("tinyint(1)")).toBe("integer");
+    expect(tokenForDeclaredType("tinyint")).toBe("integer");
     expect(tokenForDeclaredType("int4")).toBe("integer");
     expect(tokenForDeclaredType("bigint")).toBe("bigint");
     expect(tokenForDeclaredType("numeric(10,2)")).toBe("numeric");

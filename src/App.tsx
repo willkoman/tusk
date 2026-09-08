@@ -13,7 +13,7 @@ import { makeTab, basename, gridViewFor, pendingCount, snapshotTabs as recoveryS
 import { FilterBar } from "./grid/FilterBar";
 import { classResolver, conditions, emptyFilter, hasConditions, removeNode, type FilterTree } from "./grid/filterModel";
 import { activeConditionCount } from "./grid/filterSql";
-import { ResultGrid } from "./ResultGrid";
+import { ResultGrid, type SelectionSource } from "./ResultGrid";
 import { UpdateBadge } from "./UpdateBadge";
 import { WhatsNew } from "./WhatsNew";
 import { wrapQuery, wrappableQuery, stripTrailingSemi, hasDuplicateColumns, hasViewRules } from "./grid/query";
@@ -24,7 +24,7 @@ import { planPaste, mergePaste, type RowRef } from "./grid/paste";
 import { orderedRows, sortedRowOrder } from "./grid/sort";
 import { interruptedResult } from "./tabs";
 import { makeIndexer } from "./sql/aliases";
-import { type Dataset, formatWithOptions } from "./formats";
+import { formatWithOptions } from "./formats";
 import { FORMAT_EXT, type ExportOptions, type ExportScope } from "./export";
 import { backupPayload, type BackupOptions, type BackupSummary, type RestoreOptions, type RestoreSummary } from "./backup";
 import { type BackupTarget } from "./forms/BackupDialog";
@@ -554,7 +554,7 @@ function App() {
         setImportOpen(null);
         importOrigin = null;
       }
-      if (exportTables()) setExportTables(null);
+      if (exportTables() && !exportTablesBusy()) setExportTables(null);
       if (next.state === "lost") {
         setTransactionWarning(`Transaction ${next.id ?? "session"} was lost. Its outcome may be unknown; disconnect and reconnect before continuing.`);
       }
@@ -789,8 +789,10 @@ function App() {
   let nativeCloseUnlisten: UnlistenFn | null = null;
   // Snapshot of the result being exported, frozen when the dialog opens so a tab
   // switch while it's open can't redirect the export to a different tab.
-  /** Live grid selection, registered by ResultGrid (Export → Selection scope). */
-  let gridSelection: (() => Dataset | null) | null = null;
+  /** Live grid selection, registered by ResultGrid (Export → Selection scope). Cleared
+   *  on grid unmount; the snapshot carries the tab + result generation it came from, so
+   *  a stale getter can never feed a different result of the same width. */
+  let gridSelection: (() => SelectionSource | null) | null = null;
   const [exportSrc, setExportSrc] = createSignal<
     {
       columns: string[];
@@ -823,6 +825,11 @@ function App() {
       query = wrapped;
     }
     const selection = gridSelection?.() ?? null;
+    const selectionCurrent =
+      !!selection &&
+      selection.tabId === activeTabId() &&
+      selection.generation === tab.result.generation &&
+      selection.columns.length === columns().length;
     // "Include CREATE TABLE" needs a plain source table; reuse the grid's own
     // single-table resolver rather than re-parsing the query here.
     const resolved = editTarget(tab.result.baseQuery, editIndexer(schema()), tab.searchSchema);
@@ -830,7 +837,7 @@ function App() {
     setExportSrc({
       columns: columns(),
       rows: orderedRows(rows(), order),
-      selectionRows: selection && selection.columns.length === columns().length ? selection.rows : [],
+      selectionRows: selectionCurrent ? selection!.rows : [],
       incomplete: tab.result.incomplete,
       ddl: ddlTarget && caps()?.ddl !== false
         ? { schema: ddlTarget.schema, name: ddlTarget.name, kind: "table" }
@@ -1028,6 +1035,7 @@ function App() {
   const [exportTables, setExportTables] = createSignal<
     { title: string; tables: { schema: string; name: string }[]; selection: { schema: string; name: string }[]; connectionId: string } | null
   >(null);
+  const [exportTablesBusy, setExportTablesBusy] = createSignal(false);
   const [exportTablesProgress, setExportTablesProgress] = createSignal<
     { index: number; total: number; table: string; rows: number; done: boolean } | null
   >(null);
@@ -3274,7 +3282,10 @@ function App() {
       origin,
       connectionId: c.id,
       dialect: connectionKind(),
-      ddl: caps()?.ddl !== false ? { schema: schemaName, name, kind } : undefined,
+      // Only a real table's reconstruction is a runnable CREATE ahead of INSERTs: a view
+      // would emit `CREATE VIEW v AS SELECT …` followed by `INSERT INTO v`. Views fall
+      // back to the synthetic all-`text` CREATE, with the dialog's note saying so.
+      ddl: caps()?.ddl !== false && kind === "table" ? { schema: schemaName, name, kind } : undefined,
     });
   }
 
@@ -3305,20 +3316,25 @@ function App() {
     if (!src || !c || c.id !== src.connectionId) throw new Error("connection changed");
     interruptStream("a table export closed the result stream");
     const t0 = performance.now();
-    const results = await invoke<{ schema: string; name: string; path: string; rows: number; error: string }[]>(
-      "export_tables",
-      { connectionId: src.connectionId, tables, options, directory },
-    );
-    const ok = results.filter((r) => !r.error).length;
-    recordHistory({
-      sql: `-- [Export] ${options.format} → ${directory} (${ok}/${results.length} tables)`,
-      durationMs: Math.round(performance.now() - t0),
-      status: ok === results.length ? "ok" : "error",
-      rows: results.reduce((n, r) => n + r.rows, 0),
-      error: results.find((r) => r.error)?.error ?? null,
-      schema: null,
-    }, c.key);
-    return results;
+    setExportTablesBusy(true);
+    try {
+      const results = await invoke<{ schema: string; name: string; path: string; rows: number; error: string }[]>(
+        "export_tables",
+        { connectionId: src.connectionId, tables, options, directory },
+      );
+      const ok = results.filter((r) => !r.error).length;
+      recordHistory({
+        sql: `-- [Export] ${options.format} → ${directory} (${ok}/${results.length} tables)`,
+        durationMs: Math.round(performance.now() - t0),
+        status: ok === results.length ? "ok" : "error",
+        rows: results.reduce((n, r) => n + r.rows, 0),
+        error: results.find((r) => r.error)?.error ?? null,
+        schema: null,
+      }, c.key);
+      return results;
+    } finally {
+      setExportTablesBusy(false);
+    }
   }
 
   function startResize(e: MouseEvent) {
@@ -3738,7 +3754,7 @@ function App() {
             ? [{ label: "Schema diagram…", icon: "link" as const, onClick: () => openDdlGraph(n.name, null, "table") }, { sep: true as const }]
             : []),
           { label: "Create table…", icon: "plus", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => setActiveDialog({ kind: "createTable", schema: n.name, tables: schema() }) },
-          { label: "Import file as new table…", icon: "download", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => openImport(null) },
+          { label: "Import file as new table…", icon: "download", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => openImport({ schema: n.name, name: "" }) },
           { label: "Export tables…", icon: "download", onClick: () => openTablesExport(n.name) },
           { label: "Rename…", icon: "edit", ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), ...engineCan(dcaps().renameSchema, "rename a schema"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename schema ${n.name}`, current: n.name, build: (nn) => ddl.renameSchema(n.name, nn) }) },
           { sep: true },
@@ -4260,9 +4276,7 @@ function App() {
               <span class="panel-title2">Explorer</span>
               <div class="head-actions">
                 <button class="icon" title="New… (based on selection)" disabled={metadataFrozen()} onClick={(e) => openPlusMenu(e)}><Icon name="plus" /></button>
-                <Show when={caps()?.bulkCopy !== false}>
-                  <button class="icon" title="Import data" disabled={metadataFrozen()} onClick={() => openImport(null)}><Icon name="download" /></button>
-                </Show>
+                <button class="icon" title="Import data" disabled={metadataFrozen()} onClick={() => openImport(null)}><Icon name="download" /></button>
                 <button class="icon" title={metadataFrozen() ? "Refresh deferred until transaction ends" : "Refresh"} disabled={schemaLoading() || metadataFrozen()} onClick={() => loadSchema()}>{schemaLoading() ? <span class="spinner-sm" /> : <Icon name="refresh" />}</button>
               </div>
             </div>
