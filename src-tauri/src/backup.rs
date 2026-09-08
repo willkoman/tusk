@@ -1031,6 +1031,24 @@ async fn backup_inner(
                 }
             }
         }
+        // Routine and trigger reconstruction is PostgreSQL-only (`ddl.rs` /
+        // `tree.rs`). Say so in the dump rather than letting a silently partial file
+        // look complete.
+        if !is_pg && !functions.is_empty() {
+            warnings.push(format!(
+                "{} functions/procedures are not reconstructed — {} routine(s) in this \
+                 selection are NOT in the dump; recreate them by hand",
+                caps.kind,
+                functions.len()
+            ));
+        }
+        if !is_pg {
+            warnings.push(format!(
+                "triggers are not reconstructed on {} — any trigger in this selection is \
+                 NOT in the dump",
+                caps.kind
+            ));
+        }
         if is_pg && !functions.is_empty() {
             out.put("-- functions\n").await?;
             for (schema, name) in &functions {

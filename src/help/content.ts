@@ -136,19 +136,21 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Tusk checks the SSH server's host key against your `~/.ssh/known_hosts` — plain, `[host]:port`, comma-list, and hashed (`ssh-keygen -H`) entries all match — and against its own trust store in the app config directory. `known_hosts` is only ever **read**; Tusk does not write to it."
+        "md": "Tusk checks the SSH server's host key against your `~/.ssh/known_hosts` — plain, `[host]:port`, comma-lists, `*`/`?` wildcards, `!` negations, hashed (`ssh-keygen -H`) names and the `@revoked` / `@cert-authority` markers are all understood — and against its own trust store in the app config directory. `known_hosts` is only ever **read**; Tusk does not write to it."
       },
       {
         "k": "list",
         "items": [
           "**Unknown host** — the connection stops and a dialog shows the key type and `SHA256:…` fingerprint. Compare it against the server (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` prints the same value), then **Trust and connect** records it and retries.",
-          "**Key changed** — refused outright, with no accept button. A host key that changed against a stored one is what a man-in-the-middle looks like; if the change really is legitimate, remove the old entry from `known_hosts` or from `ssh_known_hosts.json` in the app config directory."
+          "**Key changed** — refused outright, with no accept button. A host key that changed against a stored one is what a man-in-the-middle looks like; if the change really is legitimate, remove the old entry from `known_hosts` or from `ssh_known_hosts.json` in the app config directory.",
+          "**Key revoked** — a key listed under `@revoked` in `known_hosts` is refused, and is never offered for trust.",
+          "**Records unreadable** — if `known_hosts` or the trust store cannot be read, or holds an entry for this host that cannot be parsed, the connection is refused with that reason. Tusk will not offer to trust a key it could not compare against what you already have."
         ]
       },
       {
         "k": "tip",
-        "kind": "warn",
-        "md": "`verify-full` **SSL Mode** verifies the database certificate against `127.0.0.1` through a tunnel, because that is the address the driver dials. Use `require` over a tunnel unless the certificate is valid for the loopback address — the SSH layer already authenticates and encrypts the hop."
+        "kind": "tip",
+        "md": "`verify-full` works through a tunnel: TLS still runs end to end with the real database server, so the certificate is checked against the **Host** you entered rather than against the loopback address the tunnel listens on."
       },
       {
         "k": "h",
@@ -737,7 +739,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**Sort** — click a header to cycle **ascending → descending → none**; [[kbd:Shift]]-click adds to a multi-sort (priority numbers next to the arrows).",
-          "**Quick filter** — *Show filter row* in the header menu puts a box under each header. Each column does a case-insensitive contains match (`ILIKE '%text%'` on Postgres/DuckDB, `CAST … LIKE` on MySQL/SQLite), AND-combined, debounced 300 ms. It writes into the same filter the builder edits.",
+          "**Quick filter** — *Show filter row* in the header menu puts a box under each header. Each column does a case-insensitive contains match (`ILIKE` on Postgres/DuckDB, `LOWER(CAST(…)) LIKE LOWER(…)` elsewhere), AND-combined, debounced 300 ms. It writes into the same filter the builder edits: typing under an OR root re-roots the filter as an AND so the box can only ever narrow the result. A column carrying builder rules the one-line box cannot show is marked, since an empty box there would otherwise read as \"no filter\".",
           "**Filter builder** — the toolbar's **Filter** button, [[kbd:Mod-Shift-f]], *Filter by this column…* in the header menu, or the Explorer's *Filter rows…*. See below."
         ]
       },
@@ -781,13 +783,13 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**Operators** — `=` `≠` `<` `≤` `>` `≥`, `between` / `not between`, `in` / `not in` (comma-separated; quote a value that contains a comma), `like` / `not like` / `ilike` (raw patterns — you own the wildcards), `starts with` / `ends with` / `contains` (case-insensitive; `%` and `_` in your text are escaped, not wildcards), `is null` / `is not null`, `is true` / `is false`, `is empty` (`= ''`).",
-          "**Groups** — **AND** / **OR** per group, *+ Condition* and *+ Group* to extend, and per-row duplicate/remove. A nested group is added with the opposite join, which is the shape you usually want.",
+          "**Groups** — **AND** / **OR** per group, *+ Condition* and *+ Group* to extend, and per-row duplicate/remove. A nested group is added with the opposite join, which is the shape you usually want. *+ Group* is offered four levels deep, and a filter may not exceed eight levels or 200 conditions in all.",
           "**Buttons** — **Apply filter** re-streams the wrapped query, **Clear** empties the tree, **Copy WHERE** copies the clause, and **Open as query** puts the full wrapped `SELECT … WHERE …` into a new tab. [[kbd:Enter]] applies, [[kbd:Escape]] closes."
         ]
       },
       {
         "k": "p",
-        "md": "The generated SQL is per engine. Identifiers are always quoted and values are always literals — only strictly numeric text is emitted unquoted, and only against a numeric column. `ILIKE` is native on Postgres/DuckDB and becomes `LOWER(col) LIKE LOWER(pattern)` where it isn't; booleans emit `TRUE`/`FALSE` on Postgres/DuckDB and `1`/`0` on MySQL/SQLite; escaped LIKE patterns carry the `ESCAPE` clause each dialect reads correctly."
+        "md": "The generated SQL is per engine. Identifiers are always quoted and values are always literals — only strictly numeric text is emitted unquoted, and only against a numeric column. `ILIKE` is native on Postgres/DuckDB and becomes `LOWER(col) LIKE LOWER(pattern)` everywhere else, MySQL and SQLite included: their default collations usually ignore case, but a `_bin`/`_cs` column does not, and *contains* has to mean the same thing on every engine. Every LIKE-family comparison is made on the text form of the column, so a `char(n)` never matches on its blank padding. Booleans emit `TRUE`/`FALSE` on Postgres/DuckDB and `1`/`0` on MySQL/SQLite. `%` and `_` you type are escaped with `!` under an explicit `ESCAPE '!'` — never a backslash, which MySQL rejects under `sql_mode=ANSI`."
       },
       {
         "k": "tip",
@@ -796,7 +798,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "While a filter is active a bar above the grid shows one chip per condition, grouped as the filter is and joined by AND/OR, with an ✕ to drop just that rule, the row count the server reported, and **Edit…** / **Clear all**. A condition whose column left the result is dropped silently on the next run; a column name that appears twice in the result is refused outright (`filter rejected: …` in the status line) rather than matching the wrong one."
+        "md": "While a filter is active a bar above the grid shows one chip per condition, grouped as the filter is and joined by AND/OR, with an ✕ to drop just that rule, the row count the server reported, and **Edit…** / **Clear all**. A condition whose column left the result is dropped silently on the next run; a column name that appears twice in the result is refused outright (`filter rejected: …` / `sort/filter rejected: …` in the status line) rather than matching the wrong one. A filter is only recorded once the query it produces actually runs, so a rule that cannot be applied never leaves a chip behind."
       },
       {
         "k": "h",
@@ -1432,13 +1434,15 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "A header comment records the Tusk version, engine, database, UTC timestamp and the options used; the restore dialog reads it back. Then, in this order: drops, `CREATE SCHEMA IF NOT EXISTS`, sequences, tables (with their indexes and comments), **data**, views and materialized views, functions and triggers, **every foreign key**, and finally the PostgreSQL sequence positions."
+        "md": "A header comment records the Tusk version, engine, database, UTC timestamp and the options used; the restore dialog reads it back. Then, in this order: drops, `CREATE SCHEMA IF NOT EXISTS`, sequences, tables (with their indexes and comments), **data**, views and materialized views, functions and triggers (PostgreSQL only), the deferred foreign keys, and finally the PostgreSQL sequence positions."
       },
       {
         "k": "list",
         "ordered": false,
         "items": [
-          "**Foreign keys come last, always.** They are lifted out of PostgreSQL's reconstructed DDL and out of MySQL's `SHOW CREATE TABLE` into trailing `ALTER TABLE … ADD CONSTRAINT` statements, so a restore cannot break on table order — including a reference **cycle**, which no ordering can satisfy.",
+          "**Foreign keys come last on PostgreSQL and MySQL.** They are lifted out of PostgreSQL's reconstructed DDL and out of MySQL's `SHOW CREATE TABLE` into trailing `ALTER TABLE … ADD CONSTRAINT` statements, so a restore cannot break on table order — including a reference **cycle**, which no ordering can satisfy.",
+          "**SQLite and DuckDB keep foreign keys inline**, because neither engine can add one with `ALTER TABLE`. A SQLite dump writes `PRAGMA foreign_keys = OFF` ahead of everything else so the replay is not order-sensitive; DuckDB has no equivalent, and a cycle it cannot order around is reported as a warning instead of being written out as if it were fine.",
+          "**Functions, procedures and triggers are reconstructed on PostgreSQL only.** On the other engines the dump says so in a `-- warning:` line and in the result panel, naming what it could not carry, rather than looking complete.",
           "**PostgreSQL data streams through `COPY`.** The dump reads `COPY … TO STDOUT` and writes `COPY … FROM stdin;` blocks terminated by `\\.`, so no table is ever held in memory. A new block starts every 16 MiB.",
           "**Every other engine emits batched multi-row `INSERT`s**, built with the same dialect-aware quoting and literal rules as SQL export, and paged so memory stays flat. Binary columns are written as native blob literals (`X'…'`, `from_hex('…')`), not as text.",
           "**PostgreSQL dumps are snapshot-consistent**: the whole read runs inside one read-only repeatable-read transaction. The other engines page a table at a time, so a dump taken during concurrent writes is not a single point in time — the same caveat as grid paging.",
@@ -1452,7 +1456,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**Choose file…** picks the dump; Tusk reads its size and header first and shows what it is about to replay. A dump taken from a different engine is called out before you run it — its SQL is unlikely to replay cleanly. A file without a Tusk header is fine; it is simply replayed as plain SQL."
+        "md": "**Choose file…** picks the dump; Tusk reads its size and header first and shows what it is about to replay. A dump taken from a different engine is called out before you run it — its SQL is unlikely to replay cleanly. A file without a Tusk header is fine; it is simply replayed as plain SQL. If the header carries a `psql` directive such as `\restrict` (recent `pg_dump` output begins with one), the dialog says so before you start: Tusk replays SQL, not `psql` commands. A byte-order mark left by a Windows editor is ignored."
       },
       {
         "k": "list",
