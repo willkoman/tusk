@@ -9,6 +9,10 @@ export type Column = {
   is_fk: boolean;
   default: string | null;
   comment: string | null;
+  /** Auto-numbering column (PG identity/serial, MySQL AUTO_INCREMENT, SQLite
+   *  AUTOINCREMENT rowid, DuckDB `nextval(…)` default). Optional so test fixtures
+   *  and older cached payloads stay valid. */
+  identity?: boolean;
 };
 export type Idx = { name: string; unique: boolean; primary: boolean; def: string };
 export type Con = { name: string; kind: string; def: string };

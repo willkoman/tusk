@@ -11,9 +11,12 @@ import {
   type CompletionSource,
 } from "@codemirror/autocomplete";
 import { oneDark } from "@codemirror/theme-one-dark";
-import { getDialect } from "./sql/dialects";
+import { driverDialect, getDialect } from "./sql/dialects";
+import { sqlDialect } from "./sql/ident";
 
-const SPEC = getDialect("postgres");
+// The type/function/keyword lists follow the CONNECTED driver, so a MySQL column
+// editor offers MySQL types. Read per-mount: dialogs mount inside one connection.
+const spec = () => getDialect(driverDialect(sqlDialect()));
 
 /**
  * Single-line SQL input with Postgres syntax highlighting and context-appropriate
@@ -31,11 +34,12 @@ export function SqlField(props: {
   let view: EditorView | undefined;
 
   const options = (): Completion[] => {
-    const types: Completion[] = SPEC.types.map((label) => ({ label, type: "type" }));
+    const s = spec();
+    const types: Completion[] = s.types.map((label) => ({ label, type: "type" }));
     if (props.typesOnly) return types;
     return [
       ...types,
-      ...SPEC.functions.map((fn) => ({ label: `${fn}()`, apply: fn, type: "function" }) as Completion),
+      ...s.functions.map((fn) => ({ label: `${fn}()`, apply: fn, type: "function" }) as Completion),
       ...(props.columns ?? []).map((label) => ({ label, type: "property" }) as Completion),
     ];
   };
@@ -51,7 +55,7 @@ export function SqlField(props: {
       doc: props.value,
       extensions: [
         history(),
-        sql({ dialect: SPEC.cm, upperCaseKeywords: false }),
+        sql({ dialect: spec().cm, upperCaseKeywords: false }),
         autocompletion({ override: [source], defaultKeymap: false, icons: true }),
         keymap.of([
           { key: "Tab", run: acceptCompletion },

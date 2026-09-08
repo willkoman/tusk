@@ -16,6 +16,11 @@ pub struct Column {
     pub is_fk: bool,
     pub default: Option<String>,
     pub comment: Option<String>,
+    /// Auto-numbering column: PG identity/serial, MySQL AUTO_INCREMENT, SQLite
+    /// `INTEGER PRIMARY KEY AUTOINCREMENT`, DuckDB a `nextval(...)` default. The
+    /// Modify-table diff needs it because MySQL's `MODIFY COLUMN` restates the whole
+    /// definition and would otherwise drop AUTO_INCREMENT on any type change.
+    pub identity: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -344,14 +349,21 @@ pub async fn table_detail(
         .iter()
         .map(|r| {
             let nm = cell(r, 0);
+            let default = r.get(3).and_then(|v| v.clone());
+            // Identity columns, plus the older `serial` form (a nextval default).
+            let identity = !cell(r, 5).is_empty()
+                || default
+                    .as_deref()
+                    .is_some_and(|d| d.trim_start().to_ascii_lowercase().starts_with("nextval("));
             Column {
                 is_pk: pk.contains(&nm),
                 is_fk: fk.contains(&nm),
                 name: nm,
                 data_type: cell(r, 1),
                 nullable: cell(r, 2) == "t",
-                default: r.get(3).and_then(|v| v.clone()),
+                default,
                 comment: r.get(4).and_then(|v| v.clone()),
+                identity,
             }
         })
         .collect();

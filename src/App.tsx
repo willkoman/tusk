@@ -66,6 +66,7 @@ import { Dialog, SqlPreview } from "./Dialog";
 import { Icon } from "./Icons";
 import { ident, qualify, qualifyIn, setSqlDialect } from "./sql/ident";
 import * as ddl from "./sql/ddl";
+import { ddlCaps, ddlSupported } from "./sql/ddlCaps";
 import { clipWrite, clipRead } from "./clipboard";
 import { slackHistoryKey, type SlackExecuted } from "./slackEvents";
 import { KeyedSerialQueue } from "./asyncQueue";
@@ -322,26 +323,25 @@ function App() {
   const canCreateDatabase = () => !pEnforced() || !!perms()?.canCreateDb;
   const canTruncate = (s: string, t: string) => ownsTable(s, t) || !!tablePriv(s, t)?.truncate;
   const canInsert = (s: string, t: string) => ownsTable(s, t) || !!tablePriv(s, t)?.insert;
-  // Merge into a MenuItem: read-only wins, then driver support (the sidebar DDL
-  // builders in sql/ddl.ts emit Postgres syntax — offering them on MySQL/SQLite/
-  // DuckDB produced SQL errors at apply time), then the privilege. Every gate()
-  // call site is a mutating DDL item, so the driver check belongs here centrally.
-  // Drivers with sidebar DDL builders. Postgres is full; DuckDB covers everything its
-  // engine supports (the `sql/ddl.ts` builders emit DuckDB-compatible syntax) — the few
-  // operations DuckDB can't do via ALTER are gated per-action with `noDuck`. MySQL/SQLite
-  // still route to PG-syntax builders, so they stay off.
-  const ddlDriver = () => connectionKind() === "postgres" || connectionKind() === "duckdb";
+  // Per-engine DDL capabilities. ONE table (sql/ddlCaps.ts) answers "can this engine do
+  // X?" for both the SQL builders and this menu, so opening an engine up is a row there
+  // rather than a new check at every call site.
+  const dcaps = () => ddlCaps(connectionKind());
+  // Merge into a MenuItem: read-only wins, then the manual-transaction freeze, then the
+  // privilege. Every gate() call site is a mutating DDL item.
   const gate = (allowed: boolean, reason: string): { disabled?: boolean; title?: string } => {
     if (metadataFrozen()) return { disabled: true, title: "Explorer database actions are frozen during a manual transaction" };
     if (conn()?.readOnly) return { disabled: true, title: "Connection is read-only" };
-    if (conn() && !ddlDriver())
-      return { disabled: true, title: `DDL editing isn't supported for ${driverLabel(connectionKind())} yet` };
+    // An engine with no row in sql/ddlCaps.ts (SQL Server today) would otherwise fall
+    // back to the PostgreSQL builders and emit syntax the server rejects.
+    if (!ddlSupported(connectionKind())) return { disabled: true, title: `DDL editing isn't supported for ${driverLabel(connectionKind())} yet` };
     return allowed ? {} : { disabled: true, title: reason };
   };
-  // Disable an item that DuckDB's engine can't do (constraint ALTERs, rename index/
-  // sequence/constraint, ALTER SEQUENCE RESTART, CREATE DATABASE). Spread AFTER gate().
-  const noDuck = (reason: string): { disabled?: boolean; title?: string } =>
-    connectionKind() === "duckdb" ? { disabled: true, title: reason } : {};
+  // Disable an item this engine cannot express (constraint ALTERs on DuckDB, CREATE
+  // DATABASE on SQLite, renaming a constraint anywhere but Postgres, …). Spread AFTER
+  // gate(); `what` completes "<engine> can't <what>".
+  const engineCan = (supported: boolean, what: string): { disabled?: boolean; title?: string } =>
+    supported ? {} : { disabled: true, title: `${dcaps().label} can't ${what}` };
   const [host, setHost] = createSignal("localhost");
   const [port, setPort] = createSignal(5432);
   const [user, setUser] = createSignal("");
@@ -3455,6 +3455,33 @@ function App() {
     openGeneratedTab(text.trim() + ";", schema, n.name);
   }
 
+  /** The kind of one existing constraint, from the cached relation detail. MySQL drops
+   *  each kind with a different ALTER action, so the drop builder needs it. */
+  function constraintKindOf(schemaName: string, table: string, name: string): string | undefined {
+    return details()[relKey(schemaName, table)]?.constraints.find((c) => c.name === name)?.kind;
+  }
+
+  /** Lazy referenced-column detail for the foreign-key picker: key columns are marked
+   *  and sorted first. `list_schema` knows the names but not which columns are keys, so
+   *  this fetches `table_detail` for the ONE table the user picked. */
+  async function loadRefColumns(schemaName: string, table: string) {
+    const c = conn();
+    if (!c || metadataFrozen()) return null;
+    await loadDetail(schemaName, table, false, c);
+    if (!connectionCurrent(c)) return null;
+    const d = details()[relKey(schemaName, table)];
+    if (!d) return null;
+    const unique = new Set(
+      d.indexes.filter((ix) => ix.unique).flatMap((ix) => d.columns.filter((col) => ix.def.includes(col.name)).map((col) => col.name)),
+    );
+    return d.columns.map((col) => ({
+      name: col.name,
+      data_type: col.data_type,
+      isKey: col.is_pk || unique.has(col.name),
+      keyLabel: col.is_pk ? "pk" : unique.has(col.name) ? "unique" : undefined,
+    }));
+  }
+
   // Index/constraint dialogs need the relation's column list (and FK targets).
   async function openIndexDialog(n: NodeDescriptor) {
     const c = conn();
@@ -3476,6 +3503,7 @@ function App() {
       kind: "addConstraint",
       ctx: n,
       columns: d?.columns.map((c) => c.name) ?? [],
+      columnTypes: Object.fromEntries((d?.columns ?? []).map((c) => [c.name, c.data_type])),
       tables: schema(),
     }, origin);
   }
@@ -3486,7 +3514,11 @@ function App() {
     await loadDetail(n.schema!, n.name, false, c);
     if (!connectionCurrent(c) || !originCurrent(origin)) return;
     const d = details()[relKey(n.schema!, n.name)];
-    if (d) setActiveDialog({ kind: "modifyTable", ctx: n, detail: d }, origin);
+    if (d)
+      setActiveDialog(
+        { kind: "modifyTable", ctx: n, detail: d, schemas: tree()?.schemas.map((x) => x.name) ?? [], tables: schema() },
+        origin,
+      );
   }
 
   // Context-aware "+" menu — offers creates relevant to the sidebar selection.
@@ -3509,15 +3541,15 @@ function App() {
       items.push(
         { label: `New column in ${tableCtx.name}…`, icon: "plus", ...gate(ownsTable(tableCtx.schema!, tableCtx.name), `Requires ownership of ${tableCtx.name}`), onClick: () => setActiveDialog({ kind: "addColumn", ctx: tableCtx }) },
         { label: `New index on ${tableCtx.name}…`, icon: "index", ...gate(ownsTable(tableCtx.schema!, tableCtx.name), `Requires ownership of ${tableCtx.name}`), onClick: () => openIndexDialog(tableCtx) },
-        { label: `New constraint on ${tableCtx.name}…`, icon: "link", ...gate(ownsTable(tableCtx.schema!, tableCtx.name), `Requires ownership of ${tableCtx.name}`), ...noDuck("DuckDB can't add constraints via ALTER — define them in CREATE TABLE"), onClick: () => openConstraintDialog(tableCtx) },
+        { label: `New constraint on ${tableCtx.name}…`, icon: "link", ...gate(ownsTable(tableCtx.schema!, tableCtx.name), `Requires ownership of ${tableCtx.name}`), ...engineCan(dcaps().addConstraint, "add constraints with ALTER TABLE — define them in CREATE TABLE"), onClick: () => openConstraintDialog(tableCtx) },
         { sep: true },
       );
     }
     if (schemaName)
-      items.push({ label: `New table in ${schemaName}…`, icon: "copy", ...gate(canCreateInSchema(schemaName), `Requires CREATE on schema ${schemaName}`), onClick: () => setActiveDialog({ kind: "createTable", schema: schemaName }) });
+      items.push({ label: `New table in ${schemaName}…`, icon: "copy", ...gate(canCreateInSchema(schemaName), `Requires CREATE on schema ${schemaName}`), onClick: () => setActiveDialog({ kind: "createTable", schema: schemaName, tables: schema() }) });
     items.push(
-      { label: "New schema…", icon: "folder", ...gate(canCreateSchema(), "Requires CREATE on the database"), onClick: () => setActiveDialog({ kind: "createSchema" }) },
-      { label: "New database…", icon: "database", ...gate(canCreateDatabase(), "Requires the CREATEDB role attribute"), ...noDuck("DuckDB attaches database files rather than CREATE DATABASE"), onClick: () => setActiveDialog({ kind: "createDatabase" }) },
+      { label: "New schema…", icon: "folder", ...gate(canCreateSchema(), "Requires CREATE on the database"), ...engineCan(dcaps().createSchema, "create a schema"), onClick: () => setActiveDialog({ kind: "createSchema" }) },
+      { label: "New database…", icon: "database", ...gate(canCreateDatabase(), "Requires the CREATEDB role attribute"), ...engineCan(dcaps().createDatabase, "create a database from here"), onClick: () => setActiveDialog({ kind: "createDatabase" }) },
     );
     setMenu({ x: e.clientX, y: e.clientY, items });
   }
@@ -3570,13 +3602,13 @@ function App() {
           { label: "Modify table…", icon: "edit", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openModify(n) },
           { label: "Add column…", icon: "plus", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "addColumn", ctx: n }) },
           { label: "Add index…", icon: "index", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openIndexDialog(n) },
-          { label: "Add constraint…", icon: "link", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), ...noDuck("DuckDB can't add constraints via ALTER — define them in CREATE TABLE"), onClick: () => openConstraintDialog(n) },
+          { label: "Add constraint…", icon: "link", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), ...engineCan(dcaps().addConstraint, "add constraints with ALTER TABLE — define them in CREATE TABLE"), onClick: () => openConstraintDialog(n) },
           { sep: true },
           { label: "Rename…", icon: "edit", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename table ${n.name}`, current: n.name, build: (nn) => ddl.renameRelation("table", s!, n.name, nn) }) },
           { label: "Duplicate…", icon: "duplicate", ...gate(canCreateInSchema(s!), `Requires CREATE on schema ${s}`), onClick: () => setActiveDialog({ kind: "duplicate", title: `Duplicate ${n.name}`, defaultName: `${n.name}_copy`, build: (nn, wd) => ddl.duplicateTable(s!, n.name, nn, wd) }) },
-          { label: "Edit comment…", icon: "comment", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.comment(`TABLE ${qual}`, t) }) },
+          { label: "Edit comment…", icon: "comment", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), ...engineCan(dcaps().comments !== "none", "comment on a table"), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.commentOnTable(s!, n.name, t) }) },
           { sep: true },
-          { label: "Truncate…", icon: "eraser", danger: true, ...gate(canTruncate(s!, n.name), `Requires TRUNCATE or ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Truncate ${n.name}`, primaryLabel: "Truncate", showCascade: true, showRestartIdentity: true, build: (o) => ddl.truncate(s!, n.name, o) }) },
+          { label: dcaps().truncate ? "Truncate…" : "Delete all rows…", icon: "eraser", danger: true, ...gate(canTruncate(s!, n.name), `Requires TRUNCATE or ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: dcaps().truncate ? `Truncate ${n.name}` : `Delete all rows from ${n.name}`, primaryLabel: dcaps().truncate ? "Truncate" : "Delete all rows", showCascade: dcaps().truncateOptions, showRestartIdentity: dcaps().truncateOptions, build: (o) => ddl.truncate(s!, n.name, o) }) },
           { label: "Drop…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop table ${n.name}`, primaryLabel: "Drop table", showCascade: true, build: (o) => ddl.dropRelation("table", s!, n.name, o.cascade) }) },
           { sep: true },
           { label: "Backup table…", icon: "download", onClick: () => openBackup({ scope: "tables", schemas: [], tables: [{ schema: s!, name: n.name }], suggestedName: n.name }) },
@@ -3609,7 +3641,7 @@ function App() {
         items.push(
           { sep: true },
           { label: "Rename…", icon: "edit", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename ${n.name}`, current: n.name, build: (nn) => ddl.renameRelation(kw, s!, n.name, nn) }) },
-          { label: "Edit comment…", icon: "comment", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.comment(`${kw === "matview" ? "MATERIALIZED VIEW" : "VIEW"} ${qual}`, t) }) },
+          { label: "Edit comment…", icon: "comment", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), ...engineCan(dcaps().comments === "standard", "comment on a view"), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.comment(`${kw === "matview" ? "MATERIALIZED VIEW" : "VIEW"} ${qual}`, t) }) },
           { label: "Drop…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop ${n.name}`, primaryLabel: "Drop", showCascade: true, build: (o) => ddl.dropRelation(kw, s!, n.name, o.cascade) }) },
           { sep: true },
           ...(caps()?.ddl !== false || caps()?.relationships !== false
@@ -3626,7 +3658,9 @@ function App() {
         items.push(
           { label: "Edit column…", icon: "edit", ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "editColumn", ctx: n }) },
           { label: "Rename…", icon: "edit", ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename column ${n.name}`, current: n.name, build: (nn) => ddl.renameColumn(s!, n.table!, n.name, nn) }) },
-          { label: "Edit comment…", icon: "comment", ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: c.comment ?? "", build: (t) => ddl.comment(`COLUMN ${qualify(s!, n.table!)}.${ident(n.name)}`, t) }) },
+          // MySQL has no COMMENT ON: a column comment there restates the whole column
+          // definition, so the builder needs the column as the catalog reports it.
+          { label: "Edit comment…", icon: "comment", ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), ...engineCan(dcaps().comments !== "none", "comment on a column"), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: c.comment ?? "", build: (t) => ddl.commentOnColumn(s!, n.table!, { name: c.name, type: c.data_type, nullable: c.nullable, default: c.default ?? "", identity: c.identity }, t) }) },
           { sep: true },
           { label: "Drop column…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop column ${n.name}`, primaryLabel: "Drop column", showCascade: true, build: (o) => ddl.dropColumn(s!, n.table!, n.name, o.cascade) }) },
           { sep: true },
@@ -3639,12 +3673,12 @@ function App() {
           ...(caps()?.relationships !== false
             ? [{ label: "Schema diagram…", icon: "link" as const, onClick: () => openDdlGraph(n.name, null, "table") }, { sep: true as const }]
             : []),
-          { label: "Create table…", icon: "plus", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => setActiveDialog({ kind: "createTable", schema: n.name }) },
+          { label: "Create table…", icon: "plus", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => setActiveDialog({ kind: "createTable", schema: n.name, tables: schema() }) },
           { label: "Import file as new table…", icon: "download", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => openImport(null) },
           { label: "Export tables…", icon: "download", onClick: () => openTablesExport(n.name) },
-          { label: "Rename…", icon: "edit", ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename schema ${n.name}`, current: n.name, build: (nn) => ddl.renameSchema(n.name, nn) }) },
+          { label: "Rename…", icon: "edit", ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), ...engineCan(dcaps().renameSchema, "rename a schema"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename schema ${n.name}`, current: n.name, build: (nn) => ddl.renameSchema(n.name, nn) }) },
           { sep: true },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop schema ${n.name}`, primaryLabel: "Drop schema", showCascade: true, build: (o) => ddl.dropSchema(n.name, o.cascade) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), ...engineCan(dcaps().createSchema, "drop a schema"), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop schema ${n.name}`, primaryLabel: "Drop schema", showCascade: true, build: (o) => ddl.dropSchema(n.name, o.cascade) }) },
           { sep: true },
           { label: "Backup schema…", icon: "download", onClick: () => openBackup({ scope: "schemas", schemas: [n.name], tables: [], suggestedName: n.name }) },
           { sep: true },
@@ -3654,12 +3688,13 @@ function App() {
       case "database": {
         const cur = tree()?.database === n.name;
         items.push(
-          { label: "Create schema…", icon: "plus", ...gate(canCreateSchema(), "Requires CREATE on the database"), onClick: () => setActiveDialog({ kind: "createSchema" }) },
+          { label: "Create schema…", icon: "plus", ...gate(canCreateSchema(), "Requires CREATE on the database"), ...engineCan(dcaps().createSchema, "create a schema"), onClick: () => setActiveDialog({ kind: "createSchema" }) },
           { label: "Import file as new table…", icon: "download", ...gate(!pEnforced() || canCreateSchema() || schema().length > 0, "Requires CREATE somewhere in this database"), onClick: () => openImport(null) },
           { label: "Export tables…", icon: "download", onClick: () => openTablesExport(null) },
+
           // Same gate() as every other Explorer DDL item (manual-transaction freeze,
           // read-only, driver support) — DROP DATABASE least of all may skip the freeze.
-          { label: cur ? "Drop… (connected)" : "Drop…", icon: "trash", danger: true, ...gate(!pEnforced() || isSuper(), "Requires database ownership (or superuser)"), ...noDuck("DuckDB has no DROP DATABASE"), ...(cur ? { disabled: true, title: "Can't drop the connected database" } : {}), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop database ${n.name}`, primaryLabel: "Drop database", build: () => ddl.dropDatabase(n.name) }) },
+          { label: cur ? "Drop… (connected)" : "Drop…", icon: "trash", danger: true, ...gate(!pEnforced() || isSuper(), "Requires database ownership (or superuser)"), ...engineCan(dcaps().dropDatabase, "drop a database from here"), ...(cur ? { disabled: true, title: "Can't drop the connected database" } : {}), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop database ${n.name}`, primaryLabel: "Drop database", build: () => ddl.dropDatabase(n.name) }) },
           { sep: true },
           // Backup/restore run against the CONNECTED database — offer them only there.
           { label: "Backup database…", icon: "download", disabled: !cur, title: cur ? undefined : "Connect to this database to back it up", onClick: () => openBackup({ scope: "database", schemas: [], tables: [], suggestedName: n.name }) },
@@ -3671,24 +3706,24 @@ function App() {
       }
       case "index":
         items.push(
-          { label: "Rename…", icon: "edit", ...gate(true, ""), ...noDuck("DuckDB can't rename an index"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename index ${n.name}`, current: n.name, build: (nn) => ddl.renameIndex(s!, n.name, nn) }) },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop index ${n.name}`, primaryLabel: "Drop index", showCascade: true, build: (o) => ddl.dropIndex(s!, n.name, o.cascade) }) },
+          { label: "Rename…", icon: "edit", ...gate(true, ""), ...engineCan(dcaps().renameIndex, "rename an index"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename index ${n.name}`, current: n.name, build: (nn) => ddl.renameIndex(s!, n.name, nn, n.table) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop index ${n.name}`, primaryLabel: "Drop index", showCascade: true, build: (o) => ddl.dropIndex(s!, n.name, o.cascade, n.table) }) },
           { sep: true },
           copyName,
         );
         break;
       case "constraint":
         items.push(
-          { label: "Rename…", icon: "edit", ...gate(true, ""), ...noDuck("DuckDB can't rename a constraint"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename constraint ${n.name}`, current: n.name, build: (nn) => ddl.renameConstraint(s!, n.table!, n.name, nn) }) },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), ...noDuck("DuckDB can't drop a constraint via ALTER"), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop constraint ${n.name}`, primaryLabel: "Drop constraint", showCascade: true, build: (o) => ddl.dropConstraint(s!, n.table!, n.name, o.cascade) }) },
+          { label: "Rename…", icon: "edit", ...gate(true, ""), ...engineCan(dcaps().renameConstraint, "rename a constraint"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename constraint ${n.name}`, current: n.name, build: (nn) => ddl.renameConstraint(s!, n.table!, n.name, nn) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), ...engineCan(dcaps().dropConstraint !== "none", "drop a constraint with ALTER TABLE"), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop constraint ${n.name}`, primaryLabel: "Drop constraint", showCascade: true, build: (o) => ddl.dropConstraint(s!, n.table!, n.name, o.cascade, constraintKindOf(s!, n.table!, n.name)) }) },
           { sep: true },
           copyName,
         );
         break;
       case "sequence":
         items.push(
-          { label: "Restart… (edit value)", icon: "refresh", ...gate(true, ""), ...noDuck("DuckDB can't restart a sequence via ALTER"), onClick: () => editAsSql(ddl.alterSequenceRestart(s!, n.name, "1")) },
-          { label: "Rename…", icon: "edit", ...gate(true, ""), ...noDuck("DuckDB can't rename a sequence"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename sequence ${n.name}`, current: n.name, build: (nn) => ddl.renameSequence(s!, n.name, nn) }) },
+          { label: "Restart… (edit value)", icon: "refresh", ...gate(true, ""), ...engineCan(dcaps().alterSequence, "restart a sequence"), onClick: () => editAsSql(ddl.alterSequenceRestart(s!, n.name, "1")) },
+          { label: "Rename…", icon: "edit", ...gate(true, ""), ...engineCan(dcaps().renameSequence, "rename a sequence"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename sequence ${n.name}`, current: n.name, build: (nn) => ddl.renameSequence(s!, n.name, nn) }) },
           { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop sequence ${n.name}`, primaryLabel: "Drop sequence", showCascade: true, build: (o) => ddl.dropSequence(s!, n.name, o.cascade) }) },
           { sep: true },
           ...copyDdl,
@@ -4690,6 +4725,7 @@ function App() {
               const binding = dialogBinding();
               if (binding) editAsSql(sql, binding.origin);
             }}
+            onLoadColumns={loadRefColumns}
           />
         </Show>
         <Show when={exportSrc()}>
