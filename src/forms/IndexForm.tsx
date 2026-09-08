@@ -1,7 +1,8 @@
-import { createMemo, createSignal, For } from "solid-js";
+import { createMemo, createSignal, For, Show } from "solid-js";
 import { Dialog, DialogFooter } from "../Dialog";
 import { SqlField } from "../SqlField";
 import { createIndex } from "../sql/ddl";
+import { ddlCaps } from "../sql/ddlCaps";
 import type { NodeDescriptor } from "../Tree";
 
 export function IndexForm(props: {
@@ -11,6 +12,9 @@ export function IndexForm(props: {
   onRun: (sql: string) => Promise<{ ok: boolean; error?: string }>;
   onEditAsSql: (sql: string) => void;
 }) {
+  // Access method and partial WHERE are Postgres-only / engine-dependent — the caps
+  // table decides whether the control is even offered (the builder drops them anyway).
+  const caps = ddlCaps();
   const [selected, setSelected] = createSignal<string[]>([]);
   const [name, setName] = createSignal("");
   const [unique, setUnique] = createSignal(false);
@@ -66,20 +70,24 @@ export function IndexForm(props: {
           )}
         </For>
       </div>
-      <label>
-        Method
-        <select value={method()} onChange={(e) => setMethod(e.currentTarget.value)}>
-          <For each={["btree", "hash", "gin", "gist", "brin", "spgist"]}>{(m) => <option value={m}>{m}</option>}</For>
-        </select>
-      </label>
+      <Show when={caps.indexMethod}>
+        <label>
+          Method
+          <select value={method()} onChange={(e) => setMethod(e.currentTarget.value)}>
+            <For each={["btree", "hash", "gin", "gist", "brin", "spgist"]}>{(m) => <option value={m}>{m}</option>}</For>
+          </select>
+        </label>
+      </Show>
       <label class="checkbox">
         <input type="checkbox" checked={unique()} onChange={(e) => setUnique(e.currentTarget.checked)} />
         UNIQUE
       </label>
-      <label>
-        WHERE (partial index, optional)
-        <SqlField value={where()} columns={props.columns} onChange={setWhere} placeholder="e.g. active" />
-      </label>
+      <Show when={caps.partialIndex}>
+        <label>
+          WHERE (partial index, optional)
+          <SqlField value={where()} columns={props.columns} onChange={setWhere} placeholder="e.g. active" />
+        </label>
+      </Show>
       <DialogFooter
         sql={sql()}
         error={error()}
