@@ -28,7 +28,7 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["sync", "fs", "io-util", "time", "macros"] }
+tokio = { version = "1", features = ["sync", "fs", "io-util", "time", "macros", "net"] }
 tokio-postgres = "0.7"
 native-tls = "0.2"
 postgres-native-tls = "0.5"
@@ -41,7 +41,7 @@ tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 # Slack Socket Mode (desktop-hosted bot — outbound WebSocket only, no HTTP server).
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["compat", "rt"] }
 # Pin the process-wide rustls CryptoProvider to ring: reqwest's rustls-tls is
 # ring-flavored while tokio-tungstenite's rustls defaults to aws-lc-rs — with both
 # providers in the graph rustls has NO default and panics at TLS-config build time.
@@ -72,6 +72,16 @@ rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
 # MySQL (network). Pure-Rust async driver; its `Pool` is Send+Sync (avoids the
 # !Sync-connection problem) and its `Value` enum makes all-text extraction easy.
 mysql_async = { version = "0.34", default-features = false, features = ["default-rustls"] }
+# Microsoft SQL Server (network, TDS), driven over tokio-util's futures-io compat.
+# The maintained `-ng` fork, not `tiberius` 0.12: that one pins tokio-rustls 0.24 →
+# rustls-webpki 0.101, which carries unfixable certificate-name-constraint advisories
+# (RUSTSEC-2026-0098/0099) and cannot move to the patched 0.103 line. `native-tls`
+# rather than the fork's rustls feature: its rustls path hardcodes aws-lc-rs, whose
+# CMake+NASM toolchain this project avoids (see the rustls note above), while
+# native-tls is already the TLS backend of the PostgreSQL driver — SChannel on
+# Windows, SecureTransport on macOS, OpenSSL on Linux. `winauth` stays off because
+# Tusk offers SQL authentication only.
+tiberius-ng = { version = "0.13.1", default-features = false, features = ["native-tls", "tds73", "chrono"] }
 
 # Dev builds: full debuginfo for the bundled DuckDB/Arrow/SQLite tree costs
 # ~20 GB of target/ artifacts and regularly fills the disk. line-tables-only
