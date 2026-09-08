@@ -682,6 +682,29 @@ impl Backend {
         }
     }
 
+    /// Pin one physical session for a long single-threaded run (restore).
+    ///
+    /// Only MySQL needs it: every other backend already owns exactly one connection,
+    /// while MySQL checks one out of the pool per statement and the pool RESETS a
+    /// connection when it is returned. Session state a dump sets up for its own replay
+    /// — `SET FOREIGN_KEY_CHECKS = 0` most obviously — therefore applied to nothing at
+    /// all, and could equally have leaked into a later user query had the reset not
+    /// happened. Callers MUST pair this with `end_bulk_session`.
+    pub async fn begin_bulk_session(&mut self) -> Result<(), AppError> {
+        match self {
+            Backend::MySql(m) => m.begin_bulk().await,
+            _ => Ok(()),
+        }
+    }
+
+    /// Release the pinned session, returning the connection (and its session state) to
+    /// the pool. Infallible by design: it runs on every restore exit path.
+    pub async fn end_bulk_session(&mut self) {
+        if let Backend::MySql(m) = self {
+            m.end_bulk().await;
+        }
+    }
+
     /// Roll back + drop any open streaming cursor/transaction. PostgreSQL issues
     /// ROLLBACK only when cursor state is tracked — an idle autocommit session has
     /// nothing to roll back, and doing it anyway costs a round trip plus a server
@@ -2034,6 +2057,10 @@ pub struct MySqlConn {
     /// Owns the SSH session for this connection; dropping it closes the tunnel.
     tunnel: Option<crate::ssh::Tunnel>,
     pinned: Option<mysql_async::Conn>,
+    /// One connection held for the duration of a bulk run (restore), so the session
+    /// state a dump sets up survives from statement to statement. Distinct from
+    /// `pinned`, which belongs to the manual-transaction machinery.
+    bulk: Option<mysql_async::Conn>,
     manual_lost: bool,
     autocommit_off: bool,
 }
@@ -2102,11 +2129,26 @@ impl MySqlConn {
                 offset: 0,
                 tunnel,
                 pinned: None,
+                bulk: None,
                 manual_lost: false,
                 autocommit_off: false,
             }),
             format!("MySQL {version}"),
         ))
+    }
+
+    async fn begin_bulk(&mut self) -> Result<(), AppError> {
+        if self.bulk.is_none() {
+            self.bulk = Some(self.pool.get_conn().await.map_err(de)?);
+        }
+        Ok(())
+    }
+
+    /// Drop the bulk connection rather than returning it explicitly: mysql_async resets
+    /// a pooled connection on return, so whatever the dump set on it (FK checks off,
+    /// say) cannot survive into a later user query either way.
+    async fn end_bulk(&mut self) {
+        self.bulk.take();
     }
 
     async fn ensure_pinned(&mut self) -> Result<(), AppError> {
@@ -2407,8 +2449,15 @@ impl MySqlConn {
                 note: None,
             })
         } else {
-            let (columns, rows, affected) =
-                mysql_run_limited(&self.pool, trimmed, db::USER_TEXT_LIMITS).await?;
+            // A bulk run (restore) keeps ONE session so the dump's own `SET`s apply to
+            // the statements that follow them.
+            let (columns, rows, affected) = match self.bulk.as_mut() {
+                Some(conn) => {
+                    mysql_single_statement(trimmed)?;
+                    mysql_run_conn_limited(conn, trimmed, db::USER_TEXT_LIMITS).await?
+                }
+                None => mysql_run_limited(&self.pool, trimmed, db::USER_TEXT_LIMITS).await?,
+            };
             if !columns.is_empty() {
                 Ok(QueryOutcome::Rows {
                     columns,

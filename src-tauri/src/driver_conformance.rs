@@ -316,21 +316,17 @@ async fn filter_where_battery(b: &mut Backend, eng: &Eng) {
     let qty = q("qty");
     let flag = q("flag");
     let id = q("id");
-    // Mirrors filterSql.ts: ILIKE is native only on PG/DuckDB.
+    // Mirrors filterSql.ts: ILIKE is native only on PG/DuckDB; everywhere else both
+    // sides are folded explicitly rather than trusting the column's collation (a MySQL
+    // `_bin`/`_cs` column, or SQLite with `PRAGMA case_sensitive_like`, is not).
     let ci = |expr: &str, pat: &str, tail: &str| match eng.name {
         "postgres" | "duckdb" => format!("{expr} ILIKE {pat}{tail}"),
-        _ => format!("{expr} LIKE {pat}{tail}"),
+        _ => format!("LOWER({expr}) LIKE LOWER({pat}){tail}"),
     };
-    // A literal single backslash, written the way each dialect reads string literals.
-    let esc = match eng.name {
-        "mysql" => r" ESCAPE '\\'",
-        "postgres" => r" ESCAPE E'\\'",
-        _ => r" ESCAPE '\'",
-    };
-    // MySQL processes backslash escapes inside literals; the others do not.
-    let bs = if eng.name == "mysql" { r"\\" } else { r"\" };
-    // PG's `lit` switches to E'…' whenever the value carries a backslash.
-    let epfx = if eng.name == "postgres" { "E" } else { "" };
+    // `!`, never a backslash: MySQL under `sql_mode=ANSI` rejects `ESCAPE '\'` with
+    // error 1210, and a backslash literal reads differently per dialect. The clause is
+    // declared unconditionally for the patterns the builder constructs.
+    let esc = " ESCAPE '!'";
     let text_cast = |col: &str| match eng.name {
         "mysql" => format!("CAST({col} AS CHAR)"),
         "sqlite" => format!("CAST({col} AS TEXT)"),
@@ -355,39 +351,50 @@ async fn filter_where_battery(b: &mut Backend, eng: &Eng) {
         &format!(
             "INSERT INTO {} VALUES (1, 'Alpha', 10.00, TRUE), (2, 'beta', 20.50, FALSE), \
              (3, '50% off', 30.00, TRUE), (4, 'a_b', NULL, NULL), (5, 'o''brien', 5.00, FALSE), \
-             (6, '', 0.00, TRUE), (7, 'axb', 1.00, FALSE)",
+             (6, '', 0.00, TRUE), (7, 'axb', 1.00, FALSE), (8, 'b!c', 2.00, FALSE)",
             q("filt_t")
         ),
     )
     .await;
 
     let cases: Vec<(String, Vec<&str>)> = vec![
-        // contains — case-insensitive on every engine, no ESCAPE for plain text
-        (ci(&name, "'%alph%'", ""), vec!["1"]),
+        // contains — case-insensitive on every engine, ESCAPE always declared
+        (ci(&text_cast(&name), "'%alph%'", esc), vec!["1"]),
         // starts with, `%` in the user's text escaped (matches literally, not as a wildcard)
-        (ci(&name, &format!("{epfx}'50{bs}%%'"), esc), vec!["3"]),
+        (ci(&text_cast(&name), "'50!%%'", esc), vec!["3"]),
         // contains, `_` escaped: 'a_b' matches, 'axb' must not
-        (ci(&name, &format!("{epfx}'%a{bs}_b%'"), esc), vec!["4"]),
+        (ci(&text_cast(&name), "'%a!_b%'", esc), vec!["4"]),
+        // contains, an escape character in the user's own text is escaped with itself
+        (ci(&text_cast(&name), "'%b!!c%'", esc), vec!["8"]),
         // like — raw pattern, the wildcards are the user's
-        (format!("{name} LIKE '%b%'"), vec!["2", "4", "5", "7"]),
-        // non-text column cast for matching
-        (ci(&text_cast(&qty), "'%20%'", ""), vec!["2"]),
+        (
+            format!("{} LIKE '%b%'", text_cast(&name)),
+            vec!["2", "4", "5", "7", "8"],
+        ),
+        // every LIKE comparison is done on the text form of the column
+        (ci(&text_cast(&qty), "'%20%'", esc), vec!["2"]),
         // typed comparisons: unquoted numeric literal against a numeric column
         (format!("{qty} BETWEEN 5 AND 20.5"), vec!["1", "2", "5"]),
-        (format!("{qty} NOT BETWEEN 5 AND 20.5"), vec!["3", "6", "7"]),
+        (
+            format!("{qty} NOT BETWEEN 5 AND 20.5"),
+            vec!["3", "6", "7", "8"],
+        ),
         (format!("{id} IN (1, 2, 3)"), vec!["1", "2", "3"]),
-        (format!("{id} NOT IN (1, 2)"), vec!["3", "4", "5", "6", "7"]),
+        (
+            format!("{id} NOT IN (1, 2)"),
+            vec!["3", "4", "5", "6", "7", "8"],
+        ),
         // explicit NULL semantics
         (format!("{qty} IS NULL"), vec!["4"]),
         (
             format!("{qty} IS NOT NULL"),
-            vec!["1", "2", "3", "5", "6", "7"],
+            vec!["1", "2", "3", "5", "6", "7", "8"],
         ),
         // boolean literal form
         (bool_is(&flag, true), vec!["1", "3", "6"]),
-        (bool_is(&flag, false), vec!["2", "5", "7"]),
-        // is empty + a quote-carrying literal
-        (format!("{name} = ''"), vec!["6"]),
+        (bool_is(&flag, false), vec!["2", "5", "7", "8"]),
+        // is empty + a quote-carrying literal — both on the text form
+        (format!("{} = ''", text_cast(&name)), vec!["6"]),
         (format!("{name} = 'o''brien'"), vec!["5"]),
         // AND of an OR group — the shape the builder emits for nested groups
         (

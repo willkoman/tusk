@@ -63,6 +63,9 @@ export type RestoreSummary = {
   bytesRead: number;
   firstError: RestoreFailure | null;
   cancelled: boolean;
+  /** The restore ran inside one transaction, so `committed` is meaningful. */
+  singleTransaction: boolean;
+  /** The single-transaction wrapper committed. Always false when there was none. */
   committed: boolean;
 };
 
@@ -213,7 +216,9 @@ export function restoreResultLine(s: RestoreSummary): string {
   if (s.statementsFailed) parts.push(`${formatCount(s.statementsFailed)} failed`);
   if (s.rowsCopied) parts.push(`${formatCount(s.rowsCopied)} rows copied`);
   if (s.cancelled) parts.push("cancelled");
-  else if (!s.committed && !s.statementsFailed) parts.push("nothing applied");
-  else if (!s.committed) parts.push("rolled back");
+  // Outside a single transaction there is no unit to commit: every statement that ran
+  // is already durable, so only an empty run has "nothing applied" to report.
+  if (s.singleTransaction) parts.push(s.committed ? "committed" : "rolled back, nothing applied");
+  else if (!s.statementsOk) parts.push("nothing applied");
   return parts.join(", ");
 }
