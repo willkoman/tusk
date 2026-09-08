@@ -80,10 +80,10 @@ pub struct ConnectionConfig {
 impl ConnectionConfig {
     pub fn validate(&self) -> Result<(), AppError> {
         let driver = self.driver.as_deref().unwrap_or("postgres");
-        if !matches!(driver, "postgres" | "duckdb" | "sqlite" | "mysql") {
+        if !matches!(driver, "postgres" | "duckdb" | "sqlite" | "mysql" | "mssql") {
             return Err(AppError::new(format!("unknown driver: {driver}")));
         }
-        if matches!(driver, "postgres" | "mysql") {
+        if matches!(driver, "postgres" | "mysql" | "mssql") {
             if self.port == 0 {
                 return Err(AppError::new("port must be between 1 and 65535"));
             }
