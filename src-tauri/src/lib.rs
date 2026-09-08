@@ -1969,7 +1969,7 @@ async fn backup_to_file(
 /// Read the leading bytes of a dump so the restore dialog can show its header
 /// (engine / database / generated timestamp) before anything runs.
 #[tauri::command]
-async fn read_backup_header(path: String) -> Result<String, AppError> {
+async fn read_backup_header(path: String) -> Result<backup::BackupFileInfo, AppError> {
     backup::read_header(&path).await
 }
 

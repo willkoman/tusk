@@ -23,6 +23,9 @@ import { interruptedResult } from "./tabs";
 import { makeIndexer } from "./sql/aliases";
 import { type Dataset, IMPORT_LIMITS, parseCSV, parseJSON, formatWithOptions } from "./formats";
 import { FORMAT_EXT, type ExportOptions, type ExportScope } from "./export";
+import { backupPayload, type BackupOptions, type BackupSummary, type RestoreOptions, type RestoreSummary } from "./backup";
+import { type BackupTarget } from "./forms/BackupDialog";
+import { type BackupFileInfo } from "./forms/RestoreDialog";
 import { save, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Tree, type DbTree, type RelationDetail, type NodeDescriptor, nodeKey, relKey } from "./Tree";
 import { ContextMenu, type MenuItem, type MenuState } from "./ContextMenu";
@@ -118,6 +121,8 @@ const DDL_RE = /^\s*(create|alter|drop|truncate|comment|grant|revoke)\b/i;
 const SqlEditor = lazy(() => import("./SqlEditor").then((m) => ({ default: m.SqlEditor })));
 const AiPanel = lazy(() => import("./ai/AiPanel").then((m) => ({ default: m.AiPanel })));
 const ExportDialog = lazy(() => import("./forms/ExportDialog").then((m) => ({ default: m.ExportDialog })));
+const BackupDialog = lazy(() => import("./forms/BackupDialog").then((m) => ({ default: m.BackupDialog })));
+const RestoreDialog = lazy(() => import("./forms/RestoreDialog").then((m) => ({ default: m.RestoreDialog })));
 const WorkbenchDialogs = lazy(() => import("./WorkbenchDialogs").then((m) => ({ default: m.WorkbenchDialogs })));
 const SettingsDialog = lazy(() => import("./settings/SettingsDialog").then((m) => ({ default: m.SettingsDialog })));
 const ShortcutsPane = lazy(() => import("./settings/ShortcutsPane").then((m) => ({ default: m.ShortcutsPane })));
@@ -2762,6 +2767,94 @@ function App() {
     }
   }
 
+  // --- backup / restore ---
+  // Both are whole-connection operations: they need an idle session, so the single
+  // result stream is released first (the established `interruptStream` contract) and
+  // the run is recorded in history like every other server execution.
+  const [backupTarget, setBackupTarget] = createSignal<BackupTarget | null>(null);
+  const [restoreOpen, setRestoreOpen] = createSignal(false);
+
+  const backupCatalog = () =>
+    (tree()?.schemas ?? []).map((s) => ({ name: s.name, tables: s.tables.map((t) => t.name) }));
+
+  function openBackup(target: BackupTarget) {
+    if (rejectFrozenExplorer()) return;
+    setMenu(null);
+    setBackupTarget(target);
+  }
+
+  const pickBackupPath = (suggested: string) =>
+    save({
+      defaultPath: `${suggested || "backup"}.sql`,
+      filters: [{ name: "SQL", extensions: ["sql"] }],
+    });
+
+  async function runBackup(opts: BackupOptions, path: string): Promise<BackupSummary> {
+    const c = conn();
+    if (!c) throw new Error("not connected");
+    interruptStream("a backup closed the result stream");
+    const t0 = performance.now();
+    try {
+      const summary = await invoke<BackupSummary>("backup_to_file", backupPayload(c.id, path, opts));
+      recordHistory({
+        sql: `-- [Backup] ${opts.scope}/${opts.content} → ${path}`,
+        durationMs: Math.round(performance.now() - t0),
+        status: "ok",
+        rows: summary.rows,
+        error: null,
+        schema: null,
+      }, c.key);
+      return summary;
+    } catch (e) {
+      recordHistory({
+        sql: `-- [Backup] ${opts.scope}/${opts.content} → ${path}`,
+        durationMs: Math.round(performance.now() - t0),
+        status: /cancel/i.test(errMsg(e)) ? "cancelled" : "error",
+        rows: null,
+        error: errMsg(e).split("\n")[0],
+        schema: null,
+      }, c.key);
+      throw e;
+    }
+  }
+
+  async function pickRestoreFile(): Promise<BackupFileInfo | null> {
+    const path = await openDialog({ multiple: false, filters: [{ name: "SQL", extensions: ["sql"] }] });
+    if (typeof path !== "string") return null;
+    return invoke<BackupFileInfo>("read_backup_header", { path });
+  }
+
+  async function runRestore(path: string, opts: RestoreOptions): Promise<RestoreSummary> {
+    const c = conn();
+    if (!c) throw new Error("not connected");
+    interruptStream("a restore closed the result stream");
+    const t0 = performance.now();
+    const entry = (status: HistoryEntry["status"], rows: number | null, error: string | null) =>
+      recordHistory({
+        sql: `-- [Restore] ${path}`,
+        durationMs: Math.round(performance.now() - t0),
+        status,
+        rows,
+        error,
+        schema: null,
+      }, c.key);
+    try {
+      const summary = await invoke<RestoreSummary>("restore_from_file", { connectionId: c.id, path, options: opts });
+      entry(
+        summary.cancelled ? "cancelled" : summary.statementsFailed ? "error" : "ok",
+        summary.rowsCopied,
+        summary.firstError ? summary.firstError.message.split("\n")[0] : null,
+      );
+      // The database changed underneath the sidebar/autocomplete — refetch.
+      if (connectionCurrent(c)) await loadSchema();
+      return summary;
+    } catch (e) {
+      entry(/cancel/i.test(errMsg(e)) ? "cancelled" : "error", null, errMsg(e).split("\n")[0]);
+      if (connectionCurrent(c)) await loadSchema();
+      throw e;
+    }
+  }
+
   // Immediately cancel + roll back the in-flight export/import on this connection.
   async function cancelOperation(connectionId = conn()?.id, ownerId = activeTabId()) {
     const c = conn();
@@ -3239,6 +3332,8 @@ function App() {
           { label: "Truncate…", icon: "eraser", danger: true, ...gate(canTruncate(s!, n.name), `Requires TRUNCATE or ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Truncate ${n.name}`, primaryLabel: "Truncate", showCascade: true, showRestartIdentity: true, build: (o) => ddl.truncate(s!, n.name, o) }) },
           { label: "Drop…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop table ${n.name}`, primaryLabel: "Drop table", showCascade: true, build: (o) => ddl.dropRelation("table", s!, n.name, o.cascade) }) },
           { sep: true },
+          { label: "Backup table…", icon: "download", onClick: () => openBackup({ scope: "tables", schemas: [], tables: [{ schema: s!, name: n.name }], suggestedName: n.name }) },
+          { sep: true },
           { label: "Generate SELECT", icon: "code", onClick: () => generate(n, "select") },
           { label: "Generate INSERT", icon: "code", onClick: () => generate(n, "insert") },
           { label: "Generate UPDATE", icon: "code", onClick: () => generate(n, "update") },
@@ -3301,6 +3396,8 @@ function App() {
           { sep: true },
           { label: "Drop…", icon: "trash", danger: true, ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop schema ${n.name}`, primaryLabel: "Drop schema", showCascade: true, build: (o) => ddl.dropSchema(n.name, o.cascade) }) },
           { sep: true },
+          { label: "Backup schema…", icon: "download", onClick: () => openBackup({ scope: "schemas", schemas: [n.name], tables: [], suggestedName: n.name }) },
+          { sep: true },
           copyName,
         );
         break;
@@ -3311,6 +3408,10 @@ function App() {
           // Same gate() as every other Explorer DDL item (manual-transaction freeze,
           // read-only, driver support) — DROP DATABASE least of all may skip the freeze.
           { label: cur ? "Drop… (connected)" : "Drop…", icon: "trash", danger: true, ...gate(!pEnforced() || isSuper(), "Requires database ownership (or superuser)"), ...noDuck("DuckDB has no DROP DATABASE"), ...(cur ? { disabled: true, title: "Can't drop the connected database" } : {}), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop database ${n.name}`, primaryLabel: "Drop database", build: () => ddl.dropDatabase(n.name) }) },
+          { sep: true },
+          // Backup/restore run against the CONNECTED database — offer them only there.
+          { label: "Backup database…", icon: "download", disabled: !cur, title: cur ? undefined : "Connect to this database to back it up", onClick: () => openBackup({ scope: "database", schemas: [], tables: [], suggestedName: n.name }) },
+          { label: "Restore from file…", icon: "fileCode", disabled: !cur || !!conn()?.readOnly, title: !cur ? "Connect to this database to restore into it" : conn()?.readOnly ? "Connection is read-only" : undefined, onClick: () => { setMenu(null); if (!rejectFrozenExplorer()) setRestoreOpen(true); } },
           { sep: true },
           copyName,
         );
@@ -3435,6 +3536,9 @@ function App() {
         { sep: true },
         { label: "Format", icon: "edit", onClick: () => editorApi()?.format() },
         { label: "Find", icon: "search", onClick: () => editorApi()?.openSearch() },
+        { sep: true },
+        { label: "Backup…", icon: "download", onClick: () => openBackup({ scope: "database", schemas: [], tables: [], suggestedName: tree()?.database || "backup" }) },
+        { label: "Restore from file…", icon: "fileCode", disabled: !!conn()?.readOnly, title: conn()?.readOnly ? "Connection is read-only" : undefined, onClick: () => { setMenu(null); if (!rejectFrozenExplorer()) setRestoreOpen(true); } },
         { sep: true },
         ...explainMenuItems(),
       ],
@@ -4310,6 +4414,30 @@ function App() {
               onCancel={() => cancelOperation(src().connectionId, src().origin.tabId ?? activeTabId())}
             />
           )}
+        </Show>
+        <Show when={backupTarget()}>
+          {(target) => (
+            <BackupDialog
+              driverKind={caps()?.kind ?? "postgres"}
+              database={tree()?.database ?? ""}
+              catalog={backupCatalog()}
+              target={target()}
+              onClose={() => setBackupTarget(null)}
+              onPickPath={pickBackupPath}
+              onRun={runBackup}
+              onCancel={() => void cancelOperation()}
+            />
+          )}
+        </Show>
+        <Show when={restoreOpen()}>
+          <RestoreDialog
+            driverKind={caps()?.kind ?? "postgres"}
+            database={tree()?.database ?? ""}
+            onClose={() => setRestoreOpen(false)}
+            onPickFile={pickRestoreFile}
+            onRun={runRestore}
+            onCancel={() => void cancelOperation()}
+          />
         </Show>
         <Show when={commitView()}>
           {(cv) => (

@@ -2,6 +2,12 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
+## [Unreleased]
+
+### Added
+- **Backup and restore, built in — no `pg_dump`, no `mysqldump`, nothing to install.** Right-click a database, schema, or table in the Explorer (or use **Backup…** in the toolbar's ⋯ menu) to write a plain-SQL dump through the driver Tusk is already connected with. Pick the scope from a searchable checklist, choose schema+data / schema only / data only, optionally emit `DROP … IF EXISTS` ahead of the creates or wrap the whole file in one transaction, and watch the object, row, byte and elapsed counters while it runs — with a Cancel that works on every engine, including the ones with no server-side query cancel. The dump is written to a sibling temp file and atomically renamed, so a cancelled or failed backup leaves your previous file exactly as it was. PostgreSQL reads through `COPY … TO STDOUT` inside one repeatable-read snapshot and writes `COPY … FROM stdin` blocks, so no table is ever held in memory; DuckDB, SQLite and MySQL page into batched multi-row `INSERT`s with the same quoting and literal rules as SQL export, and binary columns keep their native blob literals. Every foreign key is emitted after all the data — lifted out of PostgreSQL's reconstruction and out of MySQL's `SHOW CREATE TABLE` — so a restore cannot fail on table ordering, cycles included, and PostgreSQL sequences come back at their real positions instead of restarting at 1.
+- **Restore from file replays a dump statement by statement, and says exactly where it stopped.** **Restore from file…** (Explorer database node, or the ⋯ menu) reads the dump's header first and shows the engine, database and timestamp it was taken from, warning up front when that engine is not the one you are connected to. Choose stop-at-first-error or keep going, optionally run everything in one transaction that rolls back on failure, and follow statements run / rows copied / bytes read live. The result names the first failure with its statement number and line, and the sidebar and autocomplete reload afterwards. The file is parsed as it streams, so a multi-gigabyte dump never has to fit in memory; restore is refused on read-only connections and while a manual transaction owns the session, and a statement is never replayed after the server may have seen it.
+
 ## [0.9.8] - 2026-09-04
 
 ### Fixed

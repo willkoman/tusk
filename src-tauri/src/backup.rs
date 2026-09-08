@@ -1327,8 +1327,25 @@ async fn flush_inserts(
 
 // --- restore ----------------------------------------------------------------
 
-/// Read the leading bytes of a dump so the UI can show its header before restoring.
-pub async fn read_header(path: &str) -> Result<String, AppError> {
+/// Pre-flight facts about a dump file: its size and its leading bytes, so the restore
+/// dialog can show the header (engine / database / timestamp) before anything runs.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupFileInfo {
+    pub path: String,
+    pub bytes: u64,
+    pub text: String,
+    /// The file is larger than `restore_from_file` will read.
+    pub too_large: bool,
+}
+
+pub async fn read_header(path: &str) -> Result<BackupFileInfo, AppError> {
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| AppError::new(format!("cannot read {path}: {e}")))?;
+    if !meta.is_file() {
+        return Err(AppError::new("the restore source is not a regular file"));
+    }
     let file = File::open(path)
         .await
         .map_err(|e| AppError::new(format!("cannot read {path}: {e}")))?;
@@ -1338,11 +1355,16 @@ pub async fn read_header(path: &str) -> Result<String, AppError> {
         .await
         .map_err(|e| AppError::new(format!("cannot read {path}: {e}")))?;
     // The cut may land mid-character; keep only the valid prefix.
-    let valid = match std::str::from_utf8(&bytes) {
+    let text = match std::str::from_utf8(&bytes) {
         Ok(s) => s.to_string(),
         Err(e) => String::from_utf8_lossy(&bytes[..e.valid_up_to()]).into_owned(),
     };
-    Ok(valid)
+    Ok(BackupFileInfo {
+        path: path.to_string(),
+        bytes: meta.len(),
+        text,
+        too_large: meta.len() > MAX_RESTORE_FILE_BYTES,
+    })
 }
 
 /// Replay a dump file onto the connected backend, streaming it statement by statement.
