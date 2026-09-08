@@ -326,8 +326,15 @@ async fn filter_where_battery(b: &mut Backend, eng: &Eng) {
         "postgres" => r" ESCAPE E'\\'",
         _ => r" ESCAPE '\'",
     };
-    // MySQL processes backslash escapes inside literals; the others do not.
-    let bs = if eng.name == "mysql" { r"\\" } else { r"\" };
+    // MySQL processes backslash escapes inside literals, and PostgreSQL's `lit`
+    // switches to an E'…' literal (which also processes them) as soon as the value
+    // carries a backslash — both therefore need the backslash doubled in the source
+    // text. DuckDB/SQLite read plain literals, where one backslash is one backslash.
+    let bs = if eng.name == "mysql" || eng.name == "postgres" {
+        r"\\"
+    } else {
+        r"\"
+    };
     // PG's `lit` switches to E'…' whenever the value carries a backslash.
     let epfx = if eng.name == "postgres" { "E" } else { "" };
     let text_cast = |col: &str| match eng.name {
@@ -1226,6 +1233,238 @@ async fn bool_export_battery(b: &mut Backend, eng: &Eng) {
     exec(b, &format!("DROP TABLE IF EXISTS {}", q("bool_t"))).await;
 }
 
+/// Bulk file import (src/import.rs) against every engine: create-and-load, per-engine
+/// conflict handling (PostgreSQL `ON CONFLICT`, MySQL `INSERT IGNORE` / `ON DUPLICATE
+/// KEY UPDATE`, SQLite/DuckDB `INSERT OR IGNORE` / `OR REPLACE`), truncate-and-reload,
+/// and rollback of a whole failed import.
+async fn import_battery(b: &mut Backend, eng: &Eng) {
+    use crate::import::{run_import, ImportColumn, ImportOptions, ImportRequest, ImportTarget};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let q = |n: &str| (eng.quote)(n);
+    let table = format!("{}.{}", q(eng.schema), q("imp_t"));
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, body: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        path.to_string_lossy().to_string()
+    };
+    let base = write(
+        "base.csv",
+        "id,name,flag,amount\n1,\"o'brien, jr\",true,12.5\n2,,no,\n3,ünïcode,1,-0.25\n",
+    );
+    let overlap = write(
+        "overlap.csv",
+        "id,name,flag,amount\n1,changed,false,1\n4,new,yes,2\n",
+    );
+    let broken = write(
+        "broken.csv",
+        "id,name,flag,amount\n5,ok,true,1\nnope,bad,true,1\n",
+    );
+
+    let options = |path: &str| {
+        let mut o: ImportOptions = serde_json::from_str(r#"{"format":"csv"}"#).unwrap();
+        o.source_columns = ["id", "name", "flag", "amount"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let _ = path;
+        o
+    };
+    let target = |create: bool, truncate: bool, conflict: &str| ImportTarget {
+        schema: eng.schema.to_string(),
+        table: "imp_t".to_string(),
+        create,
+        truncate,
+        conflict: conflict.to_string(),
+        key_columns: vec!["id".to_string()],
+        columns: vec![
+            ImportColumn {
+                source: 0,
+                target: "id".into(),
+                kind: "integer".into(),
+                empty_as_null: false,
+            },
+            ImportColumn {
+                source: 1,
+                target: "name".into(),
+                kind: "text".into(),
+                empty_as_null: true,
+            },
+            ImportColumn {
+                source: 2,
+                target: "flag".into(),
+                kind: "boolean".into(),
+                empty_as_null: true,
+            },
+            ImportColumn {
+                source: 3,
+                target: "amount".into(),
+                kind: "numeric".into(),
+                empty_as_null: true,
+            },
+        ],
+    };
+    let request = |path: &str, t: ImportTarget| ImportRequest {
+        path: path.to_string(),
+        options: options(path),
+        target: t,
+    };
+
+    let _ = b
+        .run_single(&format!("DROP TABLE IF EXISTS {table}"), 10, false)
+        .await;
+    b.rollback_cursor().await;
+
+    // 1. Create the table from the mapping and load it.
+    let summary = run_import(
+        b,
+        &request(&base, target(true, false, "error")),
+        &cancel,
+        |_| {},
+    )
+    .await
+    .unwrap_or_else(|e| panic!("[{}] create import: {}", eng.name, e.message));
+    assert_eq!(summary.rows_read, 3, "[{}] rows read", eng.name);
+
+    let rows = all(
+        b,
+        &format!("SELECT id, name, flag, amount FROM {table} ORDER BY id"),
+    )
+    .await;
+    assert_eq!(rows.len(), 3, "[{}] loaded rows", eng.name);
+    assert_eq!(
+        cell(&rows[0], 1).as_deref(),
+        Some("o'brien, jr"),
+        "[{}] quoted value",
+        eng.name
+    );
+    assert_eq!(
+        cell(&rows[1], 1),
+        None,
+        "[{}] empty string became NULL",
+        eng.name
+    );
+    assert_eq!(
+        cell(&rows[2], 1).as_deref(),
+        Some("ünïcode"),
+        "[{}] unicode",
+        eng.name
+    );
+    assert_eq!(
+        cell(&rows[1], 3),
+        None,
+        "[{}] empty numeric became NULL",
+        eng.name
+    );
+    let truthy = |v: Option<String>| matches!(v.as_deref(), Some("t" | "true" | "1" | "TRUE"));
+    assert!(truthy(cell(&rows[0], 2)), "[{}] boolean TRUE", eng.name);
+    assert!(!truthy(cell(&rows[1], 2)), "[{}] boolean FALSE", eng.name);
+    let amount: f64 = cell(&rows[0], 3).unwrap().parse().unwrap();
+    assert!((amount - 12.5).abs() < 1e-9, "[{}] numeric value", eng.name);
+
+    // A unique key so the conflict modes have something to collide with. (Created after
+    // the load so the engine-specific PK syntax stays out of the import path.)
+    // SQLite attaches the schema to the INDEX name, not the table; PostgreSQL forbids a
+    // schema-qualified index name. Only SQLite needs the divergent form here.
+    let unique_index = if eng.name == "sqlite" {
+        format!(
+            "CREATE UNIQUE INDEX {} ON {} ({})",
+            q("imp_t_ix"),
+            q("imp_t"),
+            q("id")
+        )
+    } else {
+        format!(
+            "CREATE UNIQUE INDEX {} ON {table} ({})",
+            q("imp_t_ix"),
+            q("id")
+        )
+    };
+    exec(b, &unique_index).await;
+
+    // 2. conflict = ignore — the colliding row keeps its original value.
+    run_import(
+        b,
+        &request(&overlap, target(false, false, "ignore")),
+        &cancel,
+        |_| {},
+    )
+    .await
+    .unwrap_or_else(|e| panic!("[{}] ignore import: {}", eng.name, e.message));
+    let rows = all(b, &format!("SELECT id, name FROM {table} ORDER BY id")).await;
+    assert_eq!(rows.len(), 4, "[{}] ignore added exactly one row", eng.name);
+    assert_eq!(
+        cell(&rows[0], 1).as_deref(),
+        Some("o'brien, jr"),
+        "[{}] ignore kept the original",
+        eng.name
+    );
+
+    // 3. conflict = update — the colliding row is replaced.
+    run_import(
+        b,
+        &request(&overlap, target(false, false, "update")),
+        &cancel,
+        |_| {},
+    )
+    .await
+    .unwrap_or_else(|e| panic!("[{}] upsert import: {}", eng.name, e.message));
+    let rows = all(b, &format!("SELECT id, name FROM {table} ORDER BY id")).await;
+    assert_eq!(rows.len(), 4, "[{}] upsert added no rows", eng.name);
+    assert_eq!(
+        cell(&rows[0], 1).as_deref(),
+        Some("changed"),
+        "[{}] upsert replaced the row",
+        eng.name
+    );
+
+    // 4. truncate + reload leaves exactly the file's rows.
+    run_import(
+        b,
+        &request(&base, target(false, true, "error")),
+        &cancel,
+        |_| {},
+    )
+    .await
+    .unwrap_or_else(|e| panic!("[{}] truncate import: {}", eng.name, e.message));
+    let rows = all(b, &format!("SELECT COUNT(*) FROM {table}")).await;
+    assert_eq!(
+        cell(&rows[0], 0).as_deref(),
+        Some("3"),
+        "[{}] truncate + reload",
+        eng.name
+    );
+
+    // 5. A bad value fails the whole import; nothing from it lands.
+    let err = run_import(
+        b,
+        &request(&broken, target(false, false, "error")),
+        &cancel,
+        |_| {},
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.message.contains("not a valid integer"),
+        "[{}] {}",
+        eng.name,
+        err.message
+    );
+    let rows = all(b, &format!("SELECT COUNT(*) FROM {table}")).await;
+    assert_eq!(
+        cell(&rows[0], 0).as_deref(),
+        Some("3"),
+        "[{}] failed import rolled back",
+        eng.name
+    );
+
+    exec(b, &format!("DROP TABLE {table}")).await;
+}
+
 // --- entry points ---
 
 #[tokio::test]
@@ -1242,6 +1481,7 @@ async fn conformance_duckdb() {
     sweep_battery(&mut b, &eng).await;
     export_battery(&mut b, &eng).await;
     bool_export_battery(&mut b, &eng).await;
+    import_battery(&mut b, &eng).await;
     binary_output_battery(&mut b, &eng).await;
     buffered_export_dialect_battery(&eng).await;
     transaction_battery(&duck_cfg(), &eng).await;
@@ -1261,6 +1501,7 @@ async fn conformance_sqlite() {
     sweep_battery(&mut b, &eng).await;
     export_battery(&mut b, &eng).await;
     bool_export_battery(&mut b, &eng).await;
+    import_battery(&mut b, &eng).await;
     binary_output_battery(&mut b, &eng).await;
     buffered_export_dialect_battery(&eng).await;
     transaction_battery(&sqlite_cfg(), &eng).await;
@@ -1284,6 +1525,7 @@ async fn conformance_postgres() {
     sweep_battery(&mut b, &eng).await;
     export_battery(&mut b, &eng).await;
     bool_export_battery(&mut b, &eng).await;
+    import_battery(&mut b, &eng).await;
     binary_output_battery(&mut b, &eng).await;
     buffered_export_dialect_battery(&eng).await;
     transaction_battery(&cfg, &eng).await;
@@ -1307,6 +1549,7 @@ async fn conformance_mysql() {
     sweep_battery(&mut b, &eng).await;
     export_battery(&mut b, &eng).await;
     bool_export_battery(&mut b, &eng).await;
+    import_battery(&mut b, &eng).await;
     binary_output_battery(&mut b, &eng).await;
     buffered_export_dialect_battery(&eng).await;
     transaction_battery(&cfg, &eng).await;
