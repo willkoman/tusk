@@ -1,11 +1,11 @@
 import { type SortKey } from "../tabs";
 
-export type DriverKind = "postgres" | "duckdb" | "sqlite" | "mysql" | string | undefined;
+export type DriverKind = "postgres" | "duckdb" | "sqlite" | "mysql" | "mssql" | string | undefined;
 
 function nullsFirst(kind: DriverKind, dir: SortKey["dir"]): boolean {
   if (kind === "postgres") return dir === "desc";
   if (kind === "duckdb") return false;
-  return dir === "asc"; // SQLite/MySQL defaults.
+  return dir === "asc"; // SQLite / MySQL / SQL Server defaults.
 }
 
 /** Plain decimal / scientific literal as every driver prints numbers over the text protocol. */

@@ -86,6 +86,9 @@ jobs:
       - name: Test backend
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
 
+      # The script starts its own pinned Postgres, MySQL and SQL Server containers.
+      # SQL Server needs ~2 GB of RAM and up to a minute before it accepts TDS
+      # connections; the script's readiness wait covers that.
       - name: Test all database drivers
         run: scripts/conformance.sh
 

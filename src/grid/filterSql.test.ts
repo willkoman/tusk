@@ -22,9 +22,11 @@ const COLUMNS = ["id", "name", "qty", "flag", "made_at"];
 const CLASS_OF = classResolver({ id: "int4", name: "text", qty: "numeric", flag: "boolean", made_at: "timestamp" });
 
 const hex = (s: string) => Array.from(new TextEncoder().encode(s), (b) => b.toString(16).padStart(2, "0")).join("");
-const id = (d: D, n: string) => (d === "mysql" ? `\`${n}\`` : `"${n}"`);
+const id = (d: D, n: string) =>
+  d === "mysql" ? `\`${n}\`` : d === "mssql" ? `[${n.replace(/]/g, "]]")}]` : `"${n}"`;
 const str = (d: D, s: string) => {
   if (d === "mysql") return s === "" ? "''" : `_utf8mb4 X'${hex(s)}'`;
+  if (d === "mssql") return `N'${s.replace(/'/g, "''")}'`;
   if (d === "postgres" && s.includes("\\")) return `E'${s.replace(/\\/g, "\\\\").replace(/'/g, "''")}'`;
   return `'${s.replace(/'/g, "''")}'`;
 };
@@ -114,7 +116,7 @@ describe("null / boolean / empty operators", () => {
   });
 
   it("is empty compares against the empty string", () => {
-    for (const d of DIALECTS) expect(render(d, "isEmpty", "name")).toBe(`${id(d, "name")} = ''`);
+    for (const d of DIALECTS) expect(render(d, "isEmpty", "name")).toBe(`${id(d, "name")} = ${str(d, "")}`);
   });
 });
 
@@ -153,7 +155,7 @@ describe("LIKE-family operators", () => {
     }
     setSqlDialect("postgres");
     expect(render("postgres", "ilike", "name", ["x"])).toContain("ILIKE");
-    expect(render("mssql", "ilike", "name", ["x"])).toBe(`LOWER("name") LIKE LOWER('x')`);
+    expect(render("mssql", "ilike", "name", ["x"])).toBe(`LOWER([name]) LIKE LOWER(N'x')`);
     expect(render("sqlite", "ilike", "name", ["x"])).toBe(`"name" LIKE 'x'`);
   });
 

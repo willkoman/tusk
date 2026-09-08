@@ -130,6 +130,7 @@ pub enum SqlDialect {
     DuckDb,
     Sqlite,
     MySql,
+    MsSql,
 }
 
 impl SqlDialect {
@@ -139,6 +140,7 @@ impl SqlDialect {
             "duckdb" => Ok(Self::DuckDb),
             "sqlite" => Ok(Self::Sqlite),
             "mysql" => Ok(Self::MySql),
+            "mssql" => Ok(Self::MsSql),
             _ => Err(AppError::new("unsupported SQL export dialect")),
         }
     }
@@ -381,6 +383,7 @@ fn hex_bytes(s: &str) -> String {
 fn sql_ident(name: &str, dialect: SqlDialect) -> String {
     match dialect {
         SqlDialect::MySql => format!("`{}`", name.replace('`', "``")),
+        SqlDialect::MsSql => format!("[{}]", name.replace(']', "]]")),
         _ => db::ident(name),
     }
 }
@@ -396,6 +399,27 @@ pub fn ident_for(name: &str, dialect: SqlDialect) -> String {
 /// emitted outside the export sinks. Same reuse rationale as `ident_for`.
 pub fn value_for(value: &Option<String>, dialect: SqlDialect) -> Result<String, AppError> {
     sql_val(value, dialect)
+}
+
+/// Column type a generated `CREATE TABLE` uses for exported text/boolean columns.
+fn sql_column_type(dialect: SqlDialect, boolean: bool) -> &'static str {
+    match (dialect, boolean) {
+        // T-SQL has neither a boolean type nor TRUE/FALSE literals; `bit` takes 1/0.
+        (SqlDialect::MsSql, true) => "bit",
+        (SqlDialect::MsSql, false) => "nvarchar(max)",
+        (_, true) => "boolean",
+        (_, false) => "text",
+    }
+}
+
+/// A recognized boolean as a literal the source dialect actually accepts.
+fn sql_bool_literal(word: &str, dialect: SqlDialect) -> &'static str {
+    match (dialect, word) {
+        (SqlDialect::MsSql, "TRUE") => "1",
+        (SqlDialect::MsSql, _) => "0",
+        (_, "TRUE") => "TRUE",
+        (_, _) => "FALSE",
+    }
 }
 
 fn sql_string(value: &str, dialect: SqlDialect) -> Result<String, AppError> {
@@ -415,6 +439,11 @@ fn sql_string(value: &str, dialect: SqlDialect) -> Result<String, AppError> {
         SqlDialect::DuckDb if value.chars().any(char::is_control) => {
             Ok(format!("decode(from_hex('{}'))", hex_bytes(value)))
         }
+        SqlDialect::MsSql if value.contains('\0') => Err(AppError::new(
+            "SQL Server SQL export cannot represent a text value containing a zero byte",
+        )),
+        // `N` keeps non-ASCII text intact regardless of the target column collation.
+        SqlDialect::MsSql => Ok(format!("N'{}'", value.replace('\'', "''"))),
         _ => Ok(format!("'{}'", value.replace('\'', "''"))),
     }
 }
@@ -459,11 +488,7 @@ fn header_text(
                     .iter()
                     .enumerate()
                     .map(|(k, c)| {
-                        let ty = if pbool.get(k).copied().unwrap_or(false) {
-                            "boolean"
-                        } else {
-                            "text"
-                        };
+                        let ty = sql_column_type(dialect, pbool.get(k).copied().unwrap_or(false));
                         format!("{} {ty}", sql_ident(c, dialect))
                     })
                     .collect::<Vec<_>>()
@@ -634,12 +659,13 @@ impl<'a> TextEmit<'a> {
                     .await?;
             }
             "sql" => {
-                // Recognized booleans emit as unquoted TRUE/FALSE literals (valid on
-                // PG / DuckDB / MySQL / SQLite); anything else stays a quoted string.
+                // Recognized booleans emit as unquoted literals the source dialect
+                // accepts (TRUE/FALSE on PG / DuckDB / MySQL / SQLite, 1/0 on SQL
+                // Server); anything else stays a quoted string.
                 let mut values = Vec::with_capacity(prow.len());
                 for (k, value) in prow.iter().enumerate() {
                     values.push(match self.word(k, value) {
-                        Some(word) => word.to_string(),
+                        Some(word) => sql_bool_literal(word, self.dialect).to_string(),
                         None => sql_val(value, self.dialect)?,
                     });
                 }

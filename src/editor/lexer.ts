@@ -18,9 +18,9 @@
 import { type EditorState } from "@codemirror/state";
 import { sqlDialect } from "../sql/ident";
 
-export type SqlEngine = "postgres" | "duckdb" | "sqlite" | "mysql";
+export type SqlEngine = "postgres" | "duckdb" | "sqlite" | "mysql" | "mssql";
 
-export type SpanKind = "code" | "string" | "dquote" | "btick" | "line-comment" | "block-comment" | "dollar";
+export type SpanKind = "code" | "string" | "dquote" | "btick" | "bracket" | "line-comment" | "block-comment" | "dollar";
 
 export type Span = { from: number; to: number; kind: SpanKind };
 export type Stmt = { from: number; to: number; text: string };
@@ -68,14 +68,46 @@ export function dollarTagEnd(doc: string, i: number): number {
 const HASH = 35; // #
 const BACKSLASH = 92; // \
 const BTICK = 96; // `
+const LBRACK = 91; // [
+const RBRACK = 93; // ]
+const SPACE = 32;
+const TAB = 9;
+const CR = 13;
 
 const isSpaceOrControl = (cc: number): boolean => cc <= 32 || cc === 127;
+
+/**
+ * A T-SQL `GO` batch separator occupying the rest of the line starting at `i`.
+ * Returns the index just past its newline, or -1. Mirrors `script.rs::mssql_go_line`;
+ * `GO` is a client directive, so it ends a statement and reaches no server. A repeat
+ * count is a boundary here too — the execution boundary is where it is refused.
+ */
+function goLineEnd(doc: string, start: number): number {
+  const n = doc.length;
+  let i = start;
+  const space = (cc: number) => cc === SPACE || cc === TAB;
+  while (i < n && space(doc.charCodeAt(i))) i++;
+  if (i + 2 > n) return -1;
+  if ((doc.charCodeAt(i) | 0x20) !== 103 || (doc.charCodeAt(i + 1) | 0x20) !== 111) return -1; // g, o
+  i += 2;
+  if (i < n && isWord(doc.charCodeAt(i))) return -1;
+  while (i < n && space(doc.charCodeAt(i))) i++;
+  while (i < n && doc.charCodeAt(i) >= 48 && doc.charCodeAt(i) <= 57) i++;
+  while (i < n && space(doc.charCodeAt(i))) i++;
+  if (i + 1 < n && doc.charCodeAt(i) === DASH && doc.charCodeAt(i + 1) === DASH) {
+    while (i < n && doc.charCodeAt(i) !== NL) i++;
+  }
+  if (i < n && doc.charCodeAt(i) === CR) i++;
+  if (i >= n) return n;
+  return doc.charCodeAt(i) === NL ? i + 1 : -1;
+}
 
 export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine): LexResult {
   const n = doc.length;
   const spans: Span[] = [];
   const stmts: Stmt[] = [];
   const mysql = engine === "mysql";
+  const mssql = engine === "mssql";
   const bticks = mysql || engine === "sqlite";
   let i = 0;
   let codeStart = 0;
@@ -117,6 +149,20 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
   while (i < n) {
     const cc = doc.charCodeAt(i);
 
+    // T-SQL `GO`: a client-side batch separator alone on its line. It ends the current
+    // statement and produces no code of its own.
+    if (mssql && (i === 0 || doc.charCodeAt(i - 1) === NL)) {
+      const end = goLineEnd(doc, i);
+      if (end >= 0) {
+        pushCode(i);
+        pushStmt(stmtStart, i);
+        spans.push({ from: i, to: end, kind: "line-comment" });
+        i = end;
+        codeStart = end;
+        stmtStart = end;
+        continue;
+      }
+    }
     // line comment  --…\n  (MySQL requires whitespace/EOL after `--`: `1--2` is math)
     if (
       cc === DASH && i + 1 < n && doc.charCodeAt(i + 1) === DASH &&
@@ -138,13 +184,25 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
       codeStart = i;
       continue;
     }
-    // block comment  /* … */
+    // block comment  /* … */  (T-SQL nests them; the other engines do not)
     if (cc === SLASH && i + 1 < n && doc.charCodeAt(i + 1) === STAR) {
       pushCode(i);
       const start = i;
       i += 2;
-      while (i < n && !(doc.charCodeAt(i) === STAR && i + 1 < n && doc.charCodeAt(i + 1) === SLASH)) i++;
-      if (i < n) i += 2;
+      let depth = 1;
+      while (i < n) {
+        if (doc.charCodeAt(i) === STAR && i + 1 < n && doc.charCodeAt(i + 1) === SLASH) {
+          i += 2;
+          if (--depth === 0) break;
+          continue;
+        }
+        if (mssql && doc.charCodeAt(i) === SLASH && i + 1 < n && doc.charCodeAt(i + 1) === STAR) {
+          i += 2;
+          depth++;
+          continue;
+        }
+        i++;
+      }
       spans.push({ from: start, to: i, kind: "block-comment" });
       codeStart = i;
       continue;
@@ -164,8 +222,29 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
       quoted(i, BTICK, "btick");
       continue;
     }
-    // dollar-quoted body  $tag$ … $tag$
-    if (cc === DOLLAR) {
+    // T-SQL `[bracket]` identifier (`]]` = escaped `]`)
+    if (mssql && cc === LBRACK) {
+      pushCode(i);
+      const start = i;
+      i++;
+      while (i < n) {
+        if (doc.charCodeAt(i) === RBRACK) {
+          i++;
+          if (i < n && doc.charCodeAt(i) === RBRACK) {
+            i++;
+            continue;
+          }
+          break;
+        }
+        i++;
+      }
+      spans.push({ from: start, to: i, kind: "bracket" });
+      codeStart = i;
+      continue;
+    }
+    // dollar-quoted body  $tag$ … $tag$  (not a T-SQL construct: `$` is an identifier
+    // and money-literal character there)
+    if (cc === DOLLAR && !mssql) {
       const end = dollarTagEnd(doc, i);
       if (end >= 0) {
         pushCode(i);
@@ -267,9 +346,9 @@ export function maskNonCode(
   spans: Span[],
   from: number,
   to: number,
-  // Keep quoted identifiers (`"col"`, MySQL/SQLite `` `col` ``) intact — they're
-  // names, not string literals. The schema linter and grid editability need them;
-  // the paren/heuristic linter does not (a `)` inside a quoted identifier would
+  // Keep quoted identifiers (`"col"`, MySQL/SQLite `` `col` ``, T-SQL `[col]`) intact —
+  // they're names, not string literals. The schema linter and grid editability need
+  // them; the paren/heuristic linter does not (a `)` inside a quoted identifier would
   // otherwise count as a real paren), so it stays false.
   keepDquote = false,
 ): string {
@@ -288,7 +367,10 @@ export function maskNonCode(
   for (let i = lo; i < spans.length; i++) {
     const s = spans[i];
     if (s.from >= to) break;
-    if (s.kind === "code" || (keepDquote && (s.kind === "dquote" || s.kind === "btick"))) continue;
+    if (
+      s.kind === "code" ||
+      (keepDquote && (s.kind === "dquote" || s.kind === "btick" || s.kind === "bracket"))
+    ) continue;
     const a = Math.max(s.from, from);
     const b = Math.min(s.to, to);
     for (let p = a; p < b; p++) {

@@ -1449,7 +1449,7 @@ async fn collect_with_deadline(
             let _ = cancel_handle.clone().cancel(cancel_cfg).await;
             Err(AppError::new(match kind {
                 "postgres" => "Slack session stopped; PostgreSQL cancellation was requested on the isolated query".to_string(),
-                "mysql" => "Slack session stopped; Tusk stopped waiting, but MySQL may still be finishing the isolated read-only query".to_string(),
+                "mysql" | "mssql" => format!("Slack session stopped; Tusk stopped waiting, but the {kind} server may still be finishing the isolated read-only query"),
                 "duckdb" | "sqlite" => format!("Slack session stopped; {kind} execution is synchronous and may run to completion"),
                 _ => "Slack session stopped during isolated query execution".to_string(),
             }))
@@ -1472,6 +1472,7 @@ async fn collect_with_deadline(
                 let detail = match kind {
                     "postgres" if cancel_result.is_ok() => "PostgreSQL server cancellation requested",
                     "mysql" => "Tusk stopped waiting; MySQL may still be finishing the isolated read-only query",
+                    "mssql" => "Tusk stopped waiting; SQL Server may still be finishing the isolated read-only query",
                     "duckdb" | "sqlite" => "embedded execution is synchronous; timeout cannot preempt work already inside the engine",
                     _ if cancel_result.is_ok() => "cancellation requested",
                     _ => "cancellation unavailable; the engine may still be finishing the isolated read-only query",

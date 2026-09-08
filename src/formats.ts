@@ -432,7 +432,22 @@ const hexText = (s: string): string =>
   Array.from(new TextEncoder().encode(s), (byte) => byte.toString(16).padStart(2, "0")).join("");
 
 function sqlExportIdent(s: string, dialect: string): string {
-  return dialect === "mysql" ? `\`${s.replace(/`/g, "``")}\`` : qIdent(s);
+  if (dialect === "mysql") return `\`${s.replace(/`/g, "``")}\``;
+  if (dialect === "mssql") return `[${s.replace(/]/g, "]]")}]`;
+  return qIdent(s);
+}
+
+/** Column type a generated `CREATE TABLE` uses. Mirrors Rust `export::sql_column_type`. */
+function sqlExportColumnType(dialect: string, boolean_: boolean): string {
+  // T-SQL has neither a boolean type nor TRUE/FALSE literals; `bit` takes 1/0.
+  if (dialect === "mssql") return boolean_ ? "bit" : "nvarchar(max)";
+  return boolean_ ? "boolean" : "text";
+}
+
+/** A recognized boolean as a literal the source dialect accepts. */
+function sqlExportBool(word: "TRUE" | "FALSE", dialect: string): string {
+  if (dialect === "mssql") return word === "TRUE" ? "1" : "0";
+  return word;
 }
 
 function sqlExportString(s: string, dialect: string): string {
@@ -448,6 +463,11 @@ function sqlExportString(s: string, dialect: string): string {
     return `CONVERT(X'${hexText(s)}' USING utf8mb4)`;
   if (dialect === "sqlite" && control) return `CAST(X'${hexText(s)}' AS TEXT)`;
   if (dialect === "duckdb" && control) return `decode(from_hex('${hexText(s)}'))`;
+  if (dialect === "mssql") {
+    if (s.includes("\0")) throw new Error("SQL Server SQL output cannot represent a zero byte");
+    // `N` keeps non-ASCII text intact regardless of the target column collation.
+    return `N'${s.replace(/'/g, "''")}'`;
+  }
   return `'${s.replace(/'/g, "''")}'`;
 }
 
@@ -456,7 +476,7 @@ export function formatWithOptions(d: Dataset, o: ExportOptions, sourceDialect = 
   if (!["csv", "tsv", "json", "sql", "markdown", "xlsx"].includes(o.format))
     throw new Error("unsupported export format");
   if (o.format === "xlsx") throw new Error("xlsx formatting is file-only");
-  if (!["postgres", "duckdb", "sqlite", "mysql"].includes(sourceDialect))
+  if (!["postgres", "duckdb", "sqlite", "mysql", "mssql"].includes(sourceDialect))
     throw new Error("unsupported SQL export dialect");
   if (
     !["comma", "tab", "semicolon", "pipe", "custom"].includes(o.delimiter) ||
@@ -527,14 +547,15 @@ export function formatWithOptions(d: Dataset, o: ExportOptions, sourceDialect = 
       if (table.includes("\0")) throw new Error("SQL output table name contains a zero byte");
       const sqlIdent = (s: string) => sqlExportIdent(s, dialect);
       const colList = cols.map(sqlIdent).join(", ");
-      // Recognized booleans emit as unquoted TRUE/FALSE literals (valid on PG /
-      // DuckDB / MySQL / SQLite); anything else stays a quoted string.
+      // Recognized booleans emit as unquoted literals the source dialect accepts
+      // (TRUE/FALSE on PG / DuckDB / MySQL / SQLite, 1/0 on SQL Server); anything else
+      // stays a quoted string.
       const tuple = (r: (string | null)[]) =>
         `(${r
           .map((v, k) => {
             if (v === null) return "NULL";
             const w = pbool[k] ? boolWord(v) : null;
-            return w ?? sqlExportString(v, dialect);
+            return w ? sqlExportBool(w, dialect) : sqlExportString(v, dialect);
           })
           .join(", ")})`;
       let out = "";
@@ -544,7 +565,7 @@ export function formatWithOptions(d: Dataset, o: ExportOptions, sourceDialect = 
         const ddl = o.sql.createSql.replace(/\s+$/, "").replace(/;$/, "");
         out += `${ddl};${nl}`;
       } else if (o.sql.includeCreate) {
-        out += `CREATE TABLE ${sqlIdent(table)} (${cols.map((c, k) => `${sqlIdent(c)} ${pbool[k] ? "boolean" : "text"}`).join(", ")});${nl}`;
+        out += `CREATE TABLE ${sqlIdent(table)} (${cols.map((c, k) => `${sqlIdent(c)} ${sqlExportColumnType(dialect, pbool[k])}`).join(", ")});${nl}`;
       }
       if (o.sql.multiRow) {
         let chunk: string[] = [];

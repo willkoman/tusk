@@ -19,13 +19,40 @@ fn dq(n: &str) -> String {
 fn bt(n: &str) -> String {
     format!("`{}`", n.replace('`', "``"))
 }
+fn br(n: &str) -> String {
+    format!("[{}]", n.replace(']', "]]"))
+}
 
 struct Eng {
     name: &'static str,
     schema: &'static str,      // schema arg for table_detail
     quote: fn(&str) -> String, // identifier quoting
     engine: TransactionEngine,
+    /// Type spellings the batteries need. T-SQL has no TEXT that stores Unicode, no
+    /// BOOLEAN, and `TIMESTAMP` there means `rowversion` — so these are per-engine.
+    text_type: &'static str,
+    timestamp_type: &'static str,
+    bool_type: &'static str,
+    /// Literals for the boolean column above.
+    bool_true: &'static str,
+    bool_false: &'static str,
+    /// The engine's own transaction-start statement.
+    begin: &'static str,
 }
+
+/// Every engine but SQL Server shares these spellings.
+const STANDARD_TYPES: Eng = Eng {
+    name: "",
+    schema: "",
+    quote: dq,
+    engine: TransactionEngine::Postgres,
+    text_type: "TEXT",
+    timestamp_type: "TIMESTAMP",
+    bool_type: "BOOLEAN",
+    bool_true: "TRUE",
+    bool_false: "FALSE",
+    begin: "BEGIN",
+};
 
 fn base() -> ConnectionConfig {
     ConnectionConfig {
@@ -65,6 +92,19 @@ fn pg_cfg() -> Option<ConnectionConfig> {
         password: "test".into(),
         dbname: "postgres".into(),
         sslmode: Some("disable".into()),
+        ..base()
+    })
+}
+fn mssql_cfg() -> Option<ConnectionConfig> {
+    let port: u16 = std::env::var("TUSK_TEST_MSSQL_PORT").ok()?.parse().ok()?;
+    Some(ConnectionConfig {
+        driver: Some("mssql".into()),
+        host: "127.0.0.1".into(),
+        port,
+        user: "sa".into(),
+        password: std::env::var("TUSK_TEST_MSSQL_PASSWORD").ok()?,
+        dbname: "tusk_test".into(),
+        sslmode: Some("prefer".into()),
         ..base()
     })
 }
@@ -440,7 +480,11 @@ async fn run_battery(b: &mut Backend, eng: &Eng) {
     //    default), newline.
     exec(
         b,
-        &format!("CREATE TABLE {} (id INTEGER, name TEXT)", q("conf")),
+        &format!(
+            "CREATE TABLE {} (id INTEGER, name {})",
+            q("conf"),
+            eng.text_type
+        ),
     )
     .await;
     exec(
@@ -518,7 +562,9 @@ async fn run_battery(b: &mut Backend, eng: &Eng) {
     //    forbids duplicate names there (1060) and falls back to appending LIMIT/OFFSET.
     let dup = all(
         b,
-        &format!("SELECT {0}, {0} FROM {1} ORDER BY id", q("id"), q("conf")),
+        // Ordinal ordering: with two columns named `id`, SQL Server rejects `ORDER BY id`
+        // as ambiguous, and every engine accepts the position.
+        &format!("SELECT {0}, {0} FROM {1} ORDER BY 1", q("id"), q("conf")),
     )
     .await;
     assert_eq!(
@@ -542,10 +588,11 @@ async fn run_battery(b: &mut Backend, eng: &Eng) {
     exec(
         b,
         &format!(
-            "CREATE TABLE {} ({} DATE, {} TIMESTAMP, {} DECIMAL(10,2))",
+            "CREATE TABLE {} ({} DATE, {} {}, {} DECIMAL(10,2))",
             q("typ"),
             q("d"),
             q("ts"),
+            eng.timestamp_type,
             q("dec")
         ),
     )
@@ -615,7 +662,14 @@ async fn run_battery(b: &mut Backend, eng: &Eng) {
         eng.name
     );
     // exact single-page boundary: 10 rows, page 10 → page1=10 (not done), page2=0 (done).
-    let (rows10, fetches10) = page_all(b, &format!("{sel_seq} LIMIT 10"), 10).await;
+    // Expressed with a predicate rather than LIMIT/TOP so every engine reads the same
+    // statement shape through its own pager.
+    let ten = format!(
+        "SELECT {0} FROM {1} WHERE {0} <= 10 ORDER BY {0}",
+        q("n"),
+        q("seq")
+    );
+    let (rows10, fetches10) = page_all(b, &ten, 10).await;
     assert_eq!(rows10.len(), 10, "[{}] single full page count", eng.name);
     assert_eq!(
         fetches10, 2,
@@ -787,8 +841,9 @@ async fn relationship_battery(b: &mut Backend, eng: &Eng) {
     exec(
         b,
         &format!(
-            "CREATE TABLE {} (id INTEGER PRIMARY KEY, label TEXT)",
-            q("rel_parent")
+            "CREATE TABLE {} (id INTEGER PRIMARY KEY, label {})",
+            q("rel_parent"),
+            eng.text_type
         ),
     )
     .await;
@@ -968,7 +1023,8 @@ async fn sweep_battery(b: &mut Backend, eng: &Eng) {
     // B0: the idle app-owned wrapper rejects transaction control. The command layer
     // routes manual scripts separately, without nesting this wrapper.
     let items2 = crate::script::split(&format!(
-        "BEGIN; INSERT INTO {0} VALUES (7); COMMIT;",
+        "{}; INSERT INTO {} VALUES (7); COMMIT;",
+        eng.begin,
         q("atomic_t")
     ));
     let tx_err = b.run_script(&items2, false).await.unwrap_err();
@@ -1024,12 +1080,23 @@ async fn export_battery(b: &mut Backend, eng: &Eng) {
     exec(b, &format!("CREATE TABLE {} (n INTEGER)", q("exp_t"))).await;
     // Bulk-fill 25k rows in one statement. A 125×200 cross join keeps recursion
     // depth ≤200 (MySQL's cte_max_recursion_depth defaults to 1000).
-    exec(b, &format!(
-        "INSERT INTO {} SELECT (a.n - 1) * 200 + b.n FROM \
-         (WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM g WHERE n < 125) SELECT n FROM g) AS a, \
-         (WITH RECURSIVE h(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM h WHERE n < 200) SELECT n FROM h) AS b",
-        q("exp_t")
-    )).await;
+    let fill = if eng.name == "mssql" {
+        // T-SQL rejects a CTE inside a derived table, so number the rows of a
+        // cross-joined catalog view instead.
+        format!(
+            "INSERT INTO {} (n) SELECT TOP 25000 CAST(ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS int) \
+             FROM sys.all_objects a CROSS JOIN sys.all_objects b",
+            q("exp_t")
+        )
+    } else {
+        format!(
+            "INSERT INTO {} SELECT (a.n - 1) * 200 + b.n FROM \
+             (WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM g WHERE n < 125) SELECT n FROM g) AS a, \
+             (WITH RECURSIVE h(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM h WHERE n < 200) SELECT n FROM h) AS b",
+            q("exp_t")
+        )
+    };
+    exec(b, &fill).await;
     let path = std::env::temp_dir().join(format!(
         "tusk_export_{}_{}.csv",
         eng.name,
@@ -1084,6 +1151,7 @@ async fn binary_output_battery(b: &mut Backend, eng: &Eng) {
         "duckdb" => "SELECT from_hex('00ff41')",
         "sqlite" => "SELECT X'00FF41'",
         "mysql" => "SELECT X'00FF41'",
+        "mssql" => "SELECT 0x00FF41",
         _ => unreachable!(),
     };
     let rows = all(b, sql).await;
@@ -1138,6 +1206,14 @@ async fn buffered_export_dialect_battery(eng: &Eng) {
                 "{text}"
             );
         }
+        "mssql" => {
+            assert!(
+                text.contains("CREATE TABLE [ta`ble] ([co`l] nvarchar(max));"),
+                "{text}"
+            );
+            // Backslashes are ordinary characters in T-SQL; only quotes double.
+            assert!(text.contains("N'path\\name\nline'"), "{text}");
+        }
         _ => unreachable!(),
     }
 }
@@ -1153,16 +1229,19 @@ async fn bool_export_battery(b: &mut Backend, eng: &Eng) {
     exec(
         b,
         &format!(
-            "CREATE TABLE {} (id INTEGER, flag BOOLEAN, note VARCHAR(10))",
-            q("bool_t")
+            "CREATE TABLE {} (id INTEGER, flag {}, note VARCHAR(10))",
+            q("bool_t"),
+            eng.bool_type
         ),
     )
     .await;
     exec(
         b,
         &format!(
-            "INSERT INTO {} VALUES (1, TRUE, 't'), (2, FALSE, 'f'), (3, NULL, 'x')",
-            q("bool_t")
+            "INSERT INTO {} VALUES (1, {}, 't'), (2, {}, 'f'), (3, NULL, 'x')",
+            q("bool_t"),
+            eng.bool_true,
+            eng.bool_false
         ),
     )
     .await;
@@ -1186,12 +1265,13 @@ async fn bool_export_battery(b: &mut Backend, eng: &Eng) {
 
     // Expression columns: typed by the binder on PG/DuckDB (prepare/DESCRIBE); SQLite
     // decltype is declared-columns-only, so an expression is (correctly) not detected.
-    let expr = b
-        .bool_columns(&format!(
-            "SELECT flag AND flag AS x, id FROM {}",
-            q("bool_t")
-        ))
-        .await;
+    // `bit` is not a boolean in T-SQL, so there is no equivalent expression there.
+    let expr_sql = if eng.name == "mssql" {
+        format!("SELECT flag | flag AS x, id FROM {}", q("bool_t"))
+    } else {
+        format!("SELECT flag AND flag AS x, id FROM {}", q("bool_t"))
+    };
+    let expr = b.bool_columns(&expr_sql).await;
     match eng.name {
         "postgres" | "duckdb" => {
             assert_eq!(expr, vec![0], "[{}] bool expression detected", eng.name)
@@ -1199,6 +1279,12 @@ async fn bool_export_battery(b: &mut Backend, eng: &Eng) {
         "sqlite" => assert!(
             expr.is_empty(),
             "[{}] expressions have no decltype",
+            eng.name
+        ),
+        "mssql" => assert_eq!(
+            expr,
+            vec![0],
+            "[{}] describe_first_result_set types the bit expression",
             eng.name
         ),
         _ => {}
@@ -1711,6 +1797,7 @@ async fn conformance_duckdb() {
         schema: "main",
         quote: dq,
         engine: TransactionEngine::DuckDb,
+        ..STANDARD_TYPES
     };
     run_battery(&mut b, &eng).await;
     relationship_battery(&mut b, &eng).await;
@@ -1731,6 +1818,7 @@ async fn conformance_sqlite() {
         schema: "main",
         quote: dq,
         engine: TransactionEngine::Sqlite,
+        ..STANDARD_TYPES
     };
     run_battery(&mut b, &eng).await;
     relationship_battery(&mut b, &eng).await;
@@ -1755,6 +1843,7 @@ async fn conformance_postgres() {
         schema: "public",
         quote: dq,
         engine: TransactionEngine::Postgres,
+        ..STANDARD_TYPES
     };
     run_battery(&mut b, &eng).await;
     relationship_battery(&mut b, &eng).await;
@@ -1780,6 +1869,36 @@ async fn conformance_mysql() {
         schema: "test",
         quote: bt,
         engine: TransactionEngine::MySql,
+        ..STANDARD_TYPES
+    };
+    run_battery(&mut b, &eng).await;
+    relationship_battery(&mut b, &eng).await;
+    sweep_battery(&mut b, &eng).await;
+    export_battery(&mut b, &eng).await;
+    bool_export_battery(&mut b, &eng).await;
+    binary_output_battery(&mut b, &eng).await;
+    buffered_export_dialect_battery(&eng).await;
+    transaction_battery(&cfg, &eng).await;
+}
+
+#[tokio::test]
+async fn conformance_mssql() {
+    let Some(cfg) = mssql_cfg() else {
+        eprintln!("SKIP conformance_mssql (set TUSK_TEST_MSSQL_PORT + TUSK_TEST_MSSQL_PASSWORD)");
+        return;
+    };
+    let (mut b, _v) = connect(&cfg).await.expect("connect mssql");
+    let eng = Eng {
+        name: "mssql",
+        schema: "dbo",
+        quote: br,
+        engine: TransactionEngine::MsSql,
+        text_type: "nvarchar(max)",
+        timestamp_type: "datetime2",
+        bool_type: "bit",
+        bool_true: "1",
+        bool_false: "0",
+        begin: "BEGIN TRANSACTION",
     };
     run_battery(&mut b, &eng).await;
     relationship_battery(&mut b, &eng).await;
@@ -1883,6 +2002,187 @@ async fn readonly_mysql_blocks_writes_after_pool_reuse() {
         res.is_err(),
         "read-only mysql must reject writes after pooled connection reset"
     );
+}
+
+/// The SQL Server catalog queries are hand-written `sys.*` SQL that the shared batteries
+/// never reach: sequences and routines in the tree, row/size estimates, triggers, view
+/// DDL, and the paging shapes that must fall back to one bounded read.
+#[tokio::test]
+async fn mssql_introspection_and_paging_fallbacks() {
+    let Some(cfg) = mssql_cfg() else {
+        eprintln!("SKIP mssql_introspection (set TUSK_TEST_MSSQL_PORT + TUSK_TEST_MSSQL_PASSWORD)");
+        return;
+    };
+    let (mut b, version) = connect(&cfg).await.expect("connect mssql");
+    assert!(version.starts_with("SQL Server "), "{version}");
+
+    for sql in [
+        "DROP TRIGGER IF EXISTS dbo.intro_trg",
+        "DROP VIEW IF EXISTS dbo.intro_v",
+        "DROP TABLE IF EXISTS dbo.intro_t",
+        "DROP SEQUENCE IF EXISTS dbo.intro_seq",
+        "DROP PROCEDURE IF EXISTS dbo.intro_p",
+        "CREATE TABLE dbo.intro_t (id int IDENTITY(1,1) PRIMARY KEY, label nvarchar(50) NOT NULL DEFAULT 'x', tag nvarchar(10) NULL, CONSTRAINT uq_intro UNIQUE (tag), CONSTRAINT ck_intro CHECK (LEN(label) > 0))",
+        "CREATE INDEX ix_intro_label ON dbo.intro_t (label)",
+        "CREATE SEQUENCE dbo.intro_seq AS int START WITH 1",
+        "CREATE VIEW dbo.intro_v AS SELECT id, label FROM dbo.intro_t",
+        "CREATE PROCEDURE dbo.intro_p AS SELECT 1",
+        "INSERT INTO dbo.intro_t (label, tag) VALUES ('a', 't1'), ('b', 't2'), ('c', NULL)",
+        "EXEC sp_addextendedproperty @name = N'MS_Description', @value = N'intro table', @level0type = N'SCHEMA', @level0name = N'dbo', @level1type = N'TABLE', @level1name = N'intro_t'",
+        "CREATE TRIGGER dbo.intro_trg ON dbo.intro_t AFTER INSERT AS SET NOCOUNT ON",
+    ] {
+        exec(&mut b, sql).await;
+    }
+    // Row estimates come from sys.dm_db_partition_stats, which lags DML slightly.
+    exec(&mut b, "UPDATE STATISTICS dbo.intro_t").await;
+
+    let tree = b.build_tree().await.expect("build_tree");
+    assert_eq!(tree.database, "tusk_test", "connected database name");
+    assert!(
+        tree.databases.iter().any(|d| d == "master"),
+        "sys.databases"
+    );
+    let dbo = tree
+        .schemas
+        .iter()
+        .find(|s| s.name == "dbo")
+        .expect("dbo schema");
+    assert!(
+        !tree
+            .schemas
+            .iter()
+            .any(|s| s.name == "sys" || s.name == "db_owner"),
+        "system and fixed-role schemas stay out of the sidebar"
+    );
+    let table = dbo
+        .tables
+        .iter()
+        .find(|t| t.name == "intro_t")
+        .expect("intro_t stub");
+    assert_eq!(table.comment.as_deref(), Some("intro table"));
+    assert_eq!(table.rows, Some(3), "row estimate");
+    assert!(table.size.is_some(), "table size estimate");
+    let view = dbo
+        .views
+        .iter()
+        .find(|v| v.name == "intro_v")
+        .expect("intro_v stub");
+    assert!(view.size.is_none(), "views report no size");
+    assert!(dbo.sequences.iter().any(|s| s == "intro_seq"));
+    assert!(dbo
+        .functions
+        .iter()
+        .any(|f| f.name == "intro_p" && f.returns == "procedure"));
+
+    let detail = b
+        .table_detail("dbo", "intro_t")
+        .await
+        .expect("table_detail");
+    let label = detail
+        .columns
+        .iter()
+        .find(|c| c.name == "label")
+        .expect("label column");
+    assert_eq!(label.data_type, "nvarchar(50)", "length-qualified type");
+    assert!(!label.nullable);
+    assert!(label.default.is_some(), "default constraint definition");
+    assert!(detail.columns.iter().any(|c| c.name == "id" && c.is_pk));
+    assert!(detail.indexes.iter().any(|i| i.name == "ix_intro_label"));
+    let kinds: Vec<&str> = detail.constraints.iter().map(|c| c.kind.as_str()).collect();
+    for kind in ["primary_key", "unique", "check"] {
+        assert!(kinds.contains(&kind), "constraint kinds {kinds:?}");
+    }
+    assert!(detail.triggers.iter().any(|t| t.name == "intro_trg"));
+
+    let view_ddl = b
+        .relation_ddl("view", "dbo", "intro_v")
+        .await
+        .expect("view ddl");
+    assert!(view_ddl.contains("CREATE VIEW"), "{view_ddl}");
+    let table_ddl = b
+        .relation_ddl("table", "dbo", "intro_t")
+        .await
+        .expect("table ddl");
+    for needle in [
+        "CREATE TABLE [dbo].[intro_t]",
+        "IDENTITY(1,1)",
+        "NOT NULL",
+        "CREATE INDEX",
+    ] {
+        assert!(
+            table_ddl.contains(needle),
+            "{needle} missing from:\n{table_ddl}"
+        );
+    }
+
+    // SQL Server has no catalog of built-in functions, so the unknown-function lint
+    // must stay off rather than fire on every builtin.
+    assert!(b.list_functions().await.unwrap().is_empty());
+    assert!(!b.permissions().await.unwrap().enforced);
+
+    // Paging: an ordered statement keeps its order, an unordered one is still paged,
+    // and a shape T-SQL cannot take an appended OFFSET/FETCH reads once with a note.
+    let (ordered, fetches) = page_all(
+        &mut b,
+        "SELECT label FROM dbo.intro_t ORDER BY label DESC",
+        2,
+    )
+    .await;
+    assert_eq!(fetches, 2);
+    assert_eq!(
+        ordered.iter().map(|r| cell(r, 0)).collect::<Vec<_>>(),
+        vec![Some("c".into()), Some("b".into()), Some("a".into())],
+    );
+    let (unordered, _) = page_all(&mut b, "SELECT label FROM dbo.intro_t", 2).await;
+    assert_eq!(unordered.len(), 3);
+    b.rollback_cursor().await;
+    match b
+        .run_single("SELECT TOP 2 label FROM dbo.intro_t", 1, true)
+        .await
+        .unwrap()
+    {
+        QueryOutcome::Rows {
+            rows, done, note, ..
+        } => {
+            assert_eq!(rows.len(), 2, "TOP is read whole, not paged");
+            assert!(done);
+            assert!(note.is_some_and(|n| n.contains("one page")), "explains why");
+        }
+        QueryOutcome::Exec { message } => panic!("expected rows: {message}"),
+    }
+
+    for sql in [
+        "DROP TRIGGER IF EXISTS dbo.intro_trg",
+        "DROP VIEW IF EXISTS dbo.intro_v",
+        "DROP PROCEDURE IF EXISTS dbo.intro_p",
+        "DROP TABLE IF EXISTS dbo.intro_t",
+        "DROP SEQUENCE IF EXISTS dbo.intro_seq",
+    ] {
+        exec(&mut b, sql).await;
+    }
+}
+
+/// SQL Server offers no session-level read-only flag, so the uniform client guard is
+/// the whole enforcement story there — pin that it actually blocks writes.
+#[tokio::test]
+async fn readonly_mssql_blocks_writes() {
+    let Some(mut cfg) = mssql_cfg() else {
+        eprintln!("SKIP readonly_mssql (set TUSK_TEST_MSSQL_PORT + TUSK_TEST_MSSQL_PASSWORD)");
+        return;
+    };
+    cfg.read_only = true;
+    let (mut b, _) = connect(&cfg).await.expect("connect mssql ro");
+    b.run_single("SELECT 1", 100, true).await.expect("read");
+    for write in [
+        "CREATE TABLE tusk_ro_probe (a int)",
+        "INSERT INTO tusk_ro_probe VALUES (1)",
+        "SELECT * INTO tusk_ro_probe2 FROM sys.objects",
+    ] {
+        assert!(
+            b.run_single(write, 100, false).await.is_err(),
+            "read-only mssql must reject: {write}"
+        );
+    }
 }
 
 // --- Postgres permission model (Epic 2): effective privileges of a limited role ---
@@ -2001,10 +2301,28 @@ async fn transaction_count(c: &mut ConnState, table: &str) -> usize {
 async fn transaction_battery(cfg: &ConnectionConfig, eng: &Eng) {
     use crate::db::{TransactionHealth, TransactionMode, TransactionState};
 
-    let table = if eng.name == "mysql" {
-        "`tusk_manual_tx`"
-    } else {
-        "\"tusk_manual_tx\""
+    let table = match eng.name {
+        "mysql" => "`tusk_manual_tx`",
+        "mssql" => "[tusk_manual_tx]",
+        _ => "\"tusk_manual_tx\"",
+    };
+    let mssql = eng.name == "mssql";
+    // T-SQL: bare BEGIN/END delimit a statement block, savepoints are SAVE TRANSACTION,
+    // and ROLLBACK TRANSACTION <name> targets a savepoint.
+    let begin = eng.begin;
+    let savepoint = |name: &str| {
+        if mssql {
+            format!("SAVE TRANSACTION {name}")
+        } else {
+            format!("SAVEPOINT {name}")
+        }
+    };
+    let rollback_to = |name: &str| {
+        if mssql {
+            format!("ROLLBACK TRANSACTION {name}")
+        } else {
+            format!("ROLLBACK TO SAVEPOINT {name}")
+        }
     };
     let mut c = state(cfg, false).await;
     command_exec(
@@ -2021,7 +2339,7 @@ async fn transaction_battery(cfg: &ConnectionConfig, eng: &Eng) {
     .unwrap();
 
     // Across-call rollback, owner isolation, and background-session guard.
-    command_exec(&mut c, &crate::script::parse("BEGIN").unwrap())
+    command_exec(&mut c, &crate::script::parse(begin).unwrap())
         .await
         .unwrap();
     assert_eq!(c.transaction.state, TransactionState::Active);
@@ -2042,12 +2360,12 @@ async fn transaction_battery(cfg: &ConnectionConfig, eng: &Eng) {
     assert_eq!(transaction_count(&mut c, table).await, 0);
 
     // Across-call commit and self-contained transaction script.
-    let begin = if matches!(eng.name, "postgres" | "mysql") {
+    let start = if matches!(eng.name, "postgres" | "mysql") {
         "START TRANSACTION"
     } else {
-        "BEGIN"
+        begin
     };
-    command_exec(&mut c, &crate::script::parse(begin).unwrap())
+    command_exec(&mut c, &crate::script::parse(start).unwrap())
         .await
         .unwrap();
     command_exec(
@@ -2066,7 +2384,8 @@ async fn transaction_battery(cfg: &ConnectionConfig, eng: &Eng) {
         .unwrap();
     command_exec(
         &mut c,
-        &crate::script::parse(&format!("BEGIN; INSERT INTO {table} VALUES (3); COMMIT;")).unwrap(),
+        &crate::script::parse(&format!("{begin}; INSERT INTO {table} VALUES (3); COMMIT;"))
+            .unwrap(),
     )
     .await
     .unwrap();
@@ -2074,7 +2393,7 @@ async fn transaction_battery(cfg: &ConnectionConfig, eng: &Eng) {
 
     // A statement error never silently commits or releases the owned session. PostgreSQL
     // requires recovery here; the other engines keep this constraint error recoverable.
-    command_exec(&mut c, &crate::script::parse("BEGIN").unwrap())
+    command_exec(&mut c, &crate::script::parse(begin).unwrap())
         .await
         .unwrap();
     command_exec(
@@ -2119,26 +2438,51 @@ async fn transaction_battery(cfg: &ConnectionConfig, eng: &Eng) {
         assert!(error.message.contains("savepoints"));
         assert_eq!(c.transaction.state, TransactionState::Idle);
     } else {
+        // SQL Server keeps a savepoint until the transaction ends; RELEASE has no T-SQL
+        // equivalent and preflight must say so instead of inventing one.
+        let release = if mssql {
+            String::new()
+        } else {
+            " RELEASE SAVEPOINT s;".to_string()
+        };
         command_exec(
             &mut c,
             &crate::script::parse(&format!(
-                "BEGIN; SAVEPOINT s; INSERT INTO {table} VALUES (4); ROLLBACK TO s; RELEASE SAVEPOINT s; COMMIT;"
+                "{begin}; {}; INSERT INTO {table} VALUES (4); {};{release} COMMIT;",
+                savepoint("s"),
+                rollback_to("s")
             ))
             .unwrap(),
         )
         .await
         .unwrap();
         assert_eq!(transaction_count(&mut c, table).await, 2);
+        if mssql {
+            let unsupported = crate::script::parse(&format!(
+                "{begin}; {}; RELEASE SAVEPOINT s; COMMIT;",
+                savepoint("s")
+            ))
+            .unwrap();
+            let error = command_exec(&mut c, &unsupported).await.unwrap_err();
+            assert!(
+                error.message.contains("RELEASE SAVEPOINT"),
+                "{}",
+                error.message
+            );
+            assert_eq!(c.transaction.state, TransactionState::Idle);
+        }
     }
 
     // SET TRANSACTION is native on PostgreSQL/MySQL and explicitly unsupported on
     // embedded engines that lack it.
     let set_script = if eng.name == "mysql" {
-        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; BEGIN; ROLLBACK;"
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; BEGIN; ROLLBACK;".to_string()
+    } else if mssql {
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string()
     } else {
-        "BEGIN; SET TRANSACTION READ ONLY; ROLLBACK;"
+        "BEGIN; SET TRANSACTION READ ONLY; ROLLBACK;".to_string()
     };
-    let set_result = command_exec(&mut c, &crate::script::parse(set_script).unwrap()).await;
+    let set_result = command_exec(&mut c, &crate::script::parse(&set_script).unwrap()).await;
     if matches!(eng.name, "postgres" | "mysql") {
         set_result.unwrap();
     } else {
@@ -2266,24 +2610,19 @@ async fn transaction_battery(cfg: &ConnectionConfig, eng: &Eng) {
     // App-layer read-only boundary permits lifecycle control but blocks writes before
     // engine access, leaving rollback available.
     c.read_only = true;
-    command_exec(&mut c, &crate::script::parse("BEGIN").unwrap())
+    command_exec(&mut c, &crate::script::parse(begin).unwrap())
         .await
         .unwrap();
     if eng.name != "duckdb" {
-        let savepoint = if eng.name == "mysql" {
-            "SAVEPOINT `write`"
-        } else {
-            "SAVEPOINT \"write\""
+        let named = match eng.name {
+            "mysql" => "`write`".to_string(),
+            "mssql" => "[write]".to_string(),
+            _ => "\"write\"".to_string(),
         };
-        let rollback_to = if eng.name == "mysql" {
-            "ROLLBACK TO SAVEPOINT `write`"
-        } else {
-            "ROLLBACK TO SAVEPOINT \"write\""
-        };
-        command_exec(&mut c, &crate::script::parse(savepoint).unwrap())
+        command_exec(&mut c, &crate::script::parse(&savepoint(&named)).unwrap())
             .await
             .unwrap();
-        command_exec(&mut c, &crate::script::parse(rollback_to).unwrap())
+        command_exec(&mut c, &crate::script::parse(&rollback_to(&named)).unwrap())
             .await
             .unwrap();
     }
@@ -2295,7 +2634,7 @@ async fn transaction_battery(cfg: &ConnectionConfig, eng: &Eng) {
     c.read_only = false;
 
     // Disconnect path uses this same-session rollback primitive.
-    command_exec(&mut c, &crate::script::parse("BEGIN").unwrap())
+    command_exec(&mut c, &crate::script::parse(begin).unwrap())
         .await
         .unwrap();
     command_exec(

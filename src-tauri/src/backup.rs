@@ -1145,6 +1145,8 @@ fn binary_literal(value: &Option<String>, dialect: SqlDialect) -> Result<Option<
         SqlDialect::Sqlite | SqlDialect::MySql => format!("X'{hex}'"),
         SqlDialect::DuckDb => format!("from_hex('{hex}')"),
         SqlDialect::Postgres => format!("'\\x{hex}'::bytea"),
+        // T-SQL binary literal: `0x…` (no quotes).
+        SqlDialect::MsSql => format!("0x{hex}"),
     }))
 }
 

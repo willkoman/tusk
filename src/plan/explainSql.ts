@@ -59,7 +59,22 @@ type ShapeToken =
 const MAX_SHAPE_TOKENS = 200_000;
 
 function shapeEngine(kind?: string | null): SqlEngine | null {
-  return kind === "postgres" || kind === "duckdb" || kind === "sqlite" || kind === "mysql" ? kind : null;
+  return kind === "postgres" || kind === "duckdb" || kind === "sqlite" || kind === "mysql" || kind === "mssql"
+    ? kind
+    : null;
+}
+
+/**
+ * T-SQL has no EXPLAIN. Plans come from `SET SHOWPLAN_XML ON`, whose XML Tusk has no
+ * renderer for, so the action is disabled rather than sending a statement SQL Server
+ * would reject (or, worse, executing the query under a name that promises it won't).
+ */
+export const EXPLAIN_UNSUPPORTED: Record<string, string> = {
+  mssql: "SQL Server has no EXPLAIN — Tusk can't render its SHOWPLAN output yet",
+};
+
+export function explainUnsupported(kind?: string | null): string | null {
+  return (kind && EXPLAIN_UNSUPPORTED[kind]) ?? null;
 }
 
 function lexForShape(stmt: string, kind?: string | null) {

@@ -1753,6 +1753,11 @@ pub async fn run_import(
         Backend::Duck(duck) => Session::Duck(duck),
         Backend::Sqlite(sqlite) => Session::Sqlite(sqlite),
         Backend::MySql(mysql) => Session::MySql(Box::new(mysql.pool.get_conn().await.map_err(de)?)),
+        Backend::MsSql(_) => {
+            return Err(AppError::new(
+                "file import isn't available on SQL Server yet — use the SQL editor or a CSV bulk-load tool",
+            ))
+        }
     };
 
     let mut summary = ImportSummary {

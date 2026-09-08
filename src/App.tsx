@@ -61,7 +61,7 @@ import {
 } from "./forms/SshSection";
 import { SshHostKeyDialog, type SshHostKeyPrompt } from "./forms/SshHostKeyDialog";
 import { detectPlan } from "./plan/detect";
-import { explainSql, analyzeExecutesWrite, isSingleExplainStatement } from "./plan/explainSql";
+import { explainSql, analyzeExecutesWrite, isSingleExplainStatement, explainUnsupported } from "./plan/explainSql";
 import { Dialog, SqlPreview } from "./Dialog";
 import { Icon } from "./Icons";
 import { ident, qualify, qualifyIn, setSqlDialect } from "./sql/ident";
@@ -165,6 +165,7 @@ const DRIVERS = [
   { id: "duckdb", label: "DuckDB", mascot: "🦆", ready: true },
   { id: "sqlite", label: "SQLite", mascot: "🪶", ready: true },
   { id: "mysql", label: "MySQL", mascot: "🐬", ready: true },
+  { id: "mssql", label: "SQL Server", mascot: "🧱", ready: true },
 ] as const;
 const driverMascot = (id?: string | null) => DRIVERS.find((d) => d.id === id)?.mascot ?? "🐘";
 const driverLabel = (id?: string | null) => DRIVERS.find((d) => d.id === id)?.label ?? "PostgreSQL";
@@ -1056,6 +1057,11 @@ function App() {
       setStatus(`Switch to ${ownerTab()?.title ?? "the transaction owner"} to run database actions`);
       return;
     }
+    const unsupported = explainUnsupported(connectionKind());
+    if (unsupported) {
+      setStatus(unsupported);
+      return;
+    }
     const api = editorApi();
     if (!api) return;
     const stmt = api.getSelection().trim() || api.getCurrentStatement();
@@ -1077,9 +1083,9 @@ function App() {
   const setGridView = (patch: Partial<GridView>) => patchTab(activeTabId(), { gridView: { ...activeTab().gridView, ...patch } });
   const canServerSortFilter = () =>
     wrappableQuery(activeTab().result.baseQuery) &&
-    // MySQL refuses duplicate column names inside a derived table (error 1060),
-    // so the sort/filter wrap can't work on such results there.
-    !(connectionKind() === "mysql" && hasDuplicateColumns(activeTab().result.columns));
+    // MySQL (error 1060) and SQL Server (error 8156) both refuse duplicate column
+    // names inside a derived table, so the sort/filter wrap can't work on such results.
+    !(["mysql", "mssql"].includes(connectionKind()) && hasDuplicateColumns(activeTab().result.columns));
   const localSortEligible = () => {
     const tab = activeTab();
     // An interrupted stream holds only part of the result: sorting it in memory would
@@ -2567,7 +2573,7 @@ function App() {
     if (running() || transactionOpen(transaction())) return;
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const items: MenuItem[] = [
-      { label: "Begin transaction", icon: "play", onClick: () => void runTransactionControl("BEGIN") },
+      { label: "Begin transaction", icon: "play", onClick: () => void runTransactionControl(connectionKind() === "mssql" ? "BEGIN TRANSACTION" : "BEGIN") },
     ];
     if (caps()?.setTransaction) {
       items.push({
@@ -3794,7 +3800,7 @@ function App() {
   // --- connect-screen profile menu ---
   function connString(p: Profile) {
     if (isEmbeddedDriver(p.driver)) return p.path || ":memory:";
-    const scheme = p.driver === "mysql" ? "mysql" : "postgresql";
+    const scheme = p.driver === "mysql" ? "mysql" : p.driver === "mssql" ? "sqlserver" : "postgresql";
     const base = `${scheme}://${p.user}@${p.host}:${p.port}/${p.dbname}`;
     return p.sslmode && p.sslmode !== "prefer" ? `${base}?sslmode=${p.sslmode}` : base;
   }
@@ -3992,10 +3998,12 @@ function App() {
                         disabled={!d.ready}
                         title={d.ready ? d.label : `${d.label} (soon)`}
                         onClick={() => {
+                          const previous = driver();
                           setDriver(d.id);
-                          if (d.id === "mysql" && port() === 5432) setPort(3306);
-                          if (d.id === "postgres" && port() === 3306) setPort(5432);
-                          if (d.id === "mysql" && dbname() === "postgres") setDbname("");
+                          // Only move the port when it still holds another driver's default.
+                          const defaults: Record<string, number> = { postgres: 5432, mysql: 3306, mssql: 1433 };
+                          if (defaults[d.id] && port() === defaults[previous]) setPort(defaults[d.id]);
+                          if (d.id !== "postgres" && dbname() === "postgres") setDbname("");
                           if (d.id === "postgres" && dbname() === "") setDbname("postgres");
                         }}
                       >
@@ -4014,10 +4022,10 @@ function App() {
                       <label>Host<input value={host()} onInput={(e) => setHost(e.currentTarget.value)} /></label>
                       <label>Port<input type="number" min="1" max="65535" step="1" value={port()} onInput={(e) => setPort(Number(e.currentTarget.value))} /></label>
                     </div>
-                    <label>User<input value={user()} onInput={(e) => setUser(e.currentTarget.value)} placeholder={driver() === "mysql" ? "root" : "postgres"} /></label>
+                    <label>User<input value={user()} onInput={(e) => setUser(e.currentTarget.value)} placeholder={driver() === "mysql" ? "root" : driver() === "mssql" ? "sa" : "postgres"} /></label>
                     <label>Password<input type="password" value={password()} onInput={(e) => setPassword(e.currentTarget.value)} placeholder={editingId() && savePassword() ? "•••••• (stored)" : ""} /></label>
                     <div class="field-row halves">
-                      <label>Database<input value={dbname()} onInput={(e) => setDbname(e.currentTarget.value)} placeholder={driver() === "mysql" ? "(optional)" : "postgres"} /></label>
+                      <label>Database<input value={dbname()} onInput={(e) => setDbname(e.currentTarget.value)} placeholder={driver() === "postgres" ? "postgres" : "(optional)"} /></label>
                       <label>SSL Mode
                         <select value={sslmode()} onChange={(e) => setSslmode(e.currentTarget.value)}>
                           <option value="disable">disable</option>

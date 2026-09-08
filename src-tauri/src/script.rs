@@ -56,9 +56,54 @@ pub fn parse(script: &str) -> Result<Vec<Item>, AppError> {
     split_impl(script, true, TransactionEngine::Postgres)
 }
 
+/// A T-SQL `GO` batch separator occupying the rest of the line. Returns the index
+/// just past the terminating newline plus whether a repeat count followed it.
+/// `GO` is a client directive (sqlcmd/SSMS), never sent to the server, so the
+/// splitter treats it as a statement boundary that produces no item of its own.
+fn mssql_go_line(b: &[u8], start: usize) -> Option<(usize, bool)> {
+    let n = b.len();
+    let mut i = start;
+    let space = |c: u8| matches!(c, b' ' | b'\t');
+    while i < n && space(b[i]) {
+        i += 1;
+    }
+    if i + 2 > n || (b[i] | 0x20) != b'g' || (b[i + 1] | 0x20) != b'o' {
+        return None;
+    }
+    i += 2;
+    if i < n && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+        return None;
+    }
+    while i < n && space(b[i]) {
+        i += 1;
+    }
+    let digits = i;
+    while i < n && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    let counted = i > digits;
+    while i < n && space(b[i]) {
+        i += 1;
+    }
+    if i + 1 < n && b[i] == b'-' && b[i + 1] == b'-' {
+        while i < n && b[i] != b'\n' {
+            i += 1;
+        }
+    }
+    if i < n && b[i] == b'\r' {
+        i += 1;
+    }
+    match b.get(i) {
+        None => Some((n, counted)),
+        Some(b'\n') => Some((i + 1, counted)),
+        Some(_) => None,
+    }
+}
+
 /// Checked execution splitter with the connected engine's string/comment rules.
 /// MySQL backslash escapes, `#` comments, and backtick identifiers must be handled
 /// before transaction preflight or text inside them can become a separate command.
+/// SQL Server adds `[bracket]` identifiers, nested block comments, and `GO`.
 pub fn parse_for_engine(script: &str, engine: TransactionEngine) -> Result<Vec<Item>, AppError> {
     split_impl(script, true, engine)
 }
@@ -115,6 +160,25 @@ fn split_core(
 
     while i < n {
         let c = b[i];
+
+        // T-SQL `GO`: a client-side batch separator on a line of its own. It ends the
+        // current statement and is never forwarded to the server. A repeat count would
+        // silently change how many times the batch runs, so execution rejects it.
+        if engine == TransactionEngine::MsSql && (i == 0 || b[i - 1] == b'\n') {
+            if let Some((next, counted)) = mssql_go_line(b, i) {
+                if checked && counted {
+                    return Err(AppError::new(
+                        "GO with a repeat count is not supported; run the batch explicitly",
+                    ));
+                }
+                let stmt = flush(std::mem::take(&mut cur)).trim().to_string();
+                if !stmt.is_empty() {
+                    items.push(Item::Sql(stmt));
+                }
+                i = next;
+                continue;
+            }
+        }
 
         // psql backslash meta-command at statement start (e.g. \connect). Tusk is
         // not psql: execution must fail visibly rather than silently omit the line.
@@ -173,19 +237,33 @@ fn split_core(
             }
             continue;
         }
-        // block comment
+        // block comment (T-SQL nests them; the other engines do not)
         if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
+            let nests = engine == TransactionEngine::MsSql;
             cur.push(b'/');
             cur.push(b'*');
             i += 2;
-            while i < n && !(b[i] == b'*' && i + 1 < n && b[i + 1] == b'/') {
+            let mut depth = 1usize;
+            while i < n {
+                if b[i] == b'*' && i + 1 < n && b[i + 1] == b'/' {
+                    cur.push(b'*');
+                    cur.push(b'/');
+                    i += 2;
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                if nests && b[i] == b'/' && i + 1 < n && b[i + 1] == b'*' {
+                    cur.push(b'/');
+                    cur.push(b'*');
+                    i += 2;
+                    depth += 1;
+                    continue;
+                }
                 cur.push(b[i]);
                 i += 1;
-            }
-            if i < n {
-                cur.push(b'*');
-                cur.push(b'/');
-                i += 2;
             }
             continue;
         }
@@ -297,23 +375,47 @@ fn split_core(
             }
             continue;
         }
-        // dollar-quoted body
-        if c == b'$' {
-            if let Some(end) = dollar_tag_end(b, i) {
-                let delim = &b[i..=end];
-                let dl = delim.len();
-                cur.extend_from_slice(delim);
-                i = end + 1;
-                while i < n {
-                    if b[i] == b'$' && i + dl <= n && &b[i..i + dl] == delim {
-                        cur.extend_from_slice(delim);
-                        i += dl;
-                        break;
-                    }
-                    cur.push(b[i]);
+        // SQL Server `[bracket]` identifiers (`]]` escapes a literal `]`). A `;` or
+        // quote inside one is part of the name, not a statement boundary.
+        if engine == TransactionEngine::MsSql && c == b'[' {
+            cur.push(b'[');
+            i += 1;
+            while i < n {
+                if b[i] == b']' {
+                    cur.push(b']');
                     i += 1;
+                    if i < n && b[i] == b']' {
+                        cur.push(b']');
+                        i += 1;
+                        continue;
+                    }
+                    break;
                 }
-                continue;
+                cur.push(b[i]);
+                i += 1;
+            }
+            continue;
+        }
+        // dollar-quoted body. T-SQL has no dollar quoting (`$` is an identifier and
+        // money-literal character), so it must stay an ordinary code byte there.
+        if c == b'$' {
+            if engine != TransactionEngine::MsSql {
+                if let Some(end) = dollar_tag_end(b, i) {
+                    let delim = &b[i..=end];
+                    let dl = delim.len();
+                    cur.extend_from_slice(delim);
+                    i = end + 1;
+                    while i < n {
+                        if b[i] == b'$' && i + dl <= n && &b[i..i + dl] == delim {
+                            cur.extend_from_slice(delim);
+                            i += dl;
+                            break;
+                        }
+                        cur.push(b[i]);
+                        i += 1;
+                    }
+                    continue;
+                }
             }
             cur.push(b'$');
             i += 1;
@@ -486,6 +588,7 @@ pub enum TransactionEngine {
     DuckDb,
     Sqlite,
     MySql,
+    MsSql,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -502,10 +605,38 @@ pub enum TransactionAction {
 }
 
 fn statement_words(sql: &str) -> Vec<String> {
+    statement_words_for(sql, TransactionEngine::Postgres)
+}
+
+/// Lowercased identifier-ish words of one statement, with the engine's quoting rules.
+/// `brackets` matters for SQL Server, where `SAVE TRANSACTION [a;b]` names a savepoint.
+fn statement_words_for(sql: &str, engine: TransactionEngine) -> Vec<String> {
+    let brackets = engine == TransactionEngine::MsSql;
     let b = effective_start(sql).as_bytes();
     let mut words = Vec::new();
     let mut i = 0usize;
     while i < b.len() {
+        if brackets && b[i] == b'[' {
+            i += 1;
+            let mut word = Vec::new();
+            while i < b.len() {
+                if b[i] == b']' {
+                    i += 1;
+                    if i < b.len() && b[i] == b']' {
+                        word.push(b']');
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                word.push(b[i]);
+                i += 1;
+            }
+            if !word.is_empty() {
+                words.push(String::from_utf8_lossy(&word).to_ascii_lowercase());
+            }
+            continue;
+        }
         if b[i] == b'-' && i + 1 < b.len() && b[i + 1] == b'-' {
             while i < b.len() && b[i] != b'\n' {
                 i += 1;
@@ -594,8 +725,88 @@ fn statement_words(sql: &str) -> Vec<String> {
 
 /// Classify one transaction-control statement. Malformed lifecycle forms fail here so
 /// a later bad command in a script cannot be discovered after earlier effects.
+#[cfg(test)]
 pub fn transaction_action(sql: &str) -> Result<Option<TransactionAction>, AppError> {
-    let words = statement_words(sql);
+    transaction_action_for(sql, TransactionEngine::Postgres)
+}
+
+/// SQL Server's lifecycle vocabulary differs enough that it needs its own classifier:
+/// bare `BEGIN`/`END` delimit a statement block (not a transaction), savepoints are
+/// `SAVE TRANSACTION name`, and `ROLLBACK TRANSACTION name` rolls back TO that
+/// savepoint rather than ending the unit.
+fn mssql_transaction_action(words: &[String]) -> Result<Option<TransactionAction>, AppError> {
+    let first = words.first().map(String::as_str).unwrap_or_default();
+    let second = words.get(1).map(String::as_str).unwrap_or_default();
+    let unit = matches!(second, "tran" | "transaction" | "work");
+    Ok(match first {
+        "begin" if matches!(second, "tran" | "transaction") => Some(TransactionAction::Begin),
+        // BEGIN/END without TRANSACTION open and close a T-SQL statement block.
+        "begin" | "end" => None,
+        "commit" => Some(TransactionAction::Commit),
+        "rollback" => {
+            // ROLLBACK [TRAN[SACTION]] ends the unit; a trailing name targets a savepoint.
+            let named = second == "to" || (unit && words.len() > 2);
+            match named.then_some(2usize) {
+                Some(index) => {
+                    let index = if words.get(index).is_some_and(|word| word == "savepoint") {
+                        index + 1
+                    } else {
+                        index
+                    };
+                    if words.len() <= index {
+                        return Err(AppError::new(
+                            "ROLLBACK TRANSACTION requires a savepoint name",
+                        ));
+                    }
+                    Some(TransactionAction::RollbackTo)
+                }
+                None => Some(TransactionAction::Rollback),
+            }
+        }
+        "save" if unit => {
+            if words.len() < 3 {
+                return Err(AppError::new("SAVE TRANSACTION requires a savepoint name"));
+            }
+            Some(TransactionAction::Savepoint)
+        }
+        // Recognized only so preflight can explain the gap: a ported PostgreSQL/MySQL
+        // script should get that message, not a bare SQL Server syntax error.
+        "release" => {
+            let name_index = if second == "savepoint" { 2 } else { 1 };
+            if words.len() <= name_index {
+                return Err(AppError::new("RELEASE requires a savepoint name"));
+            }
+            Some(TransactionAction::Release)
+        }
+        "set" => {
+            if words.iter().any(|word| word == "implicit_transactions") {
+                return Err(AppError::new(
+                    "SET IMPLICIT_TRANSACTIONS is not supported by Tusk; use BEGIN TRANSACTION",
+                ));
+            }
+            if second == "transaction" {
+                if words.len() < 3 {
+                    return Err(AppError::new(
+                        "SET TRANSACTION requires transaction characteristics",
+                    ));
+                }
+                Some(TransactionAction::SetTransaction)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    })
+}
+
+pub fn transaction_action_for(
+    sql: &str,
+    engine: TransactionEngine,
+) -> Result<Option<TransactionAction>, AppError> {
+    let words = statement_words_for(sql, engine);
+    if engine == TransactionEngine::MsSql {
+        return mssql_transaction_action(&words);
+    }
     let first = words.first().map(String::as_str).unwrap_or_default();
     let second = words.get(1).map(String::as_str).unwrap_or_default();
     let action = match first {
@@ -731,15 +942,20 @@ pub fn transaction_action(sql: &str) -> Result<Option<TransactionAction>, AppErr
 /// True when the script manages its own transaction, so the idle app-owned atomic
 /// wrapper must not be added.
 pub fn has_txn_control(items: &[Item]) -> bool {
+    has_txn_control_for(items, TransactionEngine::Postgres)
+}
+
+pub fn has_txn_control_for(items: &[Item], engine: TransactionEngine) -> bool {
     items.iter().any(|it| {
         let s = match it {
             Item::Sql(s) => s.as_str(),
             Item::Copy { stmt, .. } => stmt.as_str(),
         };
-        is_txn_control_stmt(s)
+        !matches!(transaction_action_for(s, engine), Ok(None))
     })
 }
 
+#[cfg(test)]
 pub fn is_txn_control_stmt(sql: &str) -> bool {
     !matches!(transaction_action(sql), Ok(None))
 }
@@ -819,7 +1035,7 @@ pub fn preflight_transactions(
             )));
         }
         let action = match item {
-            Item::Sql(sql) => transaction_action(sql)?,
+            Item::Sql(sql) => transaction_action_for(sql, engine)?,
             Item::Copy { .. } => None,
         };
         if state == TransactionState::Lost {
@@ -852,6 +1068,17 @@ pub fn preflight_transactions(
         {
             return Err(AppError::new(format!(
                 "statement {} can end or replace a MySQL transaction indirectly and is blocked inside a manual transaction",
+                index + 1
+            )));
+        }
+        // T-SQL's own DDL is transactional, but a procedure can COMMIT on Tusk's behalf
+        // and USE cannot run inside a transaction at all.
+        if engine == TransactionEngine::MsSql
+            && state != TransactionState::Idle
+            && matches!(item, Item::Sql(sql) if action.is_none() && matches!(first_word(sql).as_str(), "use" | "exec" | "execute"))
+        {
+            return Err(AppError::new(format!(
+                "statement {} can end or replace a SQL Server transaction indirectly and is blocked inside a manual transaction",
                 index + 1
             )));
         }
@@ -907,18 +1134,13 @@ pub fn preflight_transactions(
                 postgres_work_seen = Some(false);
             }
             Some(TransactionAction::RollbackTo) => {
-                if !matches!(
-                    engine,
-                    TransactionEngine::Postgres
-                        | TransactionEngine::Sqlite
-                        | TransactionEngine::MySql
-                ) {
+                if engine == TransactionEngine::DuckDb {
                     return Err(AppError::new("ROLLBACK TO is not supported by DuckDB"));
                 }
                 if !matches!(state, TransactionState::Active | TransactionState::Failed) {
                     return Err(AppError::new("ROLLBACK TO requires an active transaction"));
                 }
-                let name = transaction_savepoint_name(item, TransactionAction::RollbackTo)
+                let name = transaction_savepoint_name(item, TransactionAction::RollbackTo, engine)
                     .expect("transaction_action validated the name");
                 if let Some(position) = savepoints.iter().rposition(|saved| saved == &name) {
                     savepoints.truncate(position + 1);
@@ -930,21 +1152,21 @@ pub fn preflight_transactions(
                 state = TransactionState::Active;
             }
             Some(TransactionAction::Savepoint | TransactionAction::Release) => {
-                if !matches!(
-                    engine,
-                    TransactionEngine::Postgres
-                        | TransactionEngine::Sqlite
-                        | TransactionEngine::MySql
-                ) {
+                let action = action.expect("matched some above");
+                if engine == TransactionEngine::DuckDb {
                     return Err(AppError::new("savepoints are not supported by DuckDB"));
+                }
+                if engine == TransactionEngine::MsSql && action == TransactionAction::Release {
+                    return Err(AppError::new(
+                        "SQL Server has no RELEASE SAVEPOINT; a savepoint lives until the transaction ends",
+                    ));
                 }
                 if state != TransactionState::Active {
                     return Err(AppError::new(
                         "savepoint command requires a healthy active transaction",
                     ));
                 }
-                let action = action.expect("matched some above");
-                let name = transaction_savepoint_name(item, action)
+                let name = transaction_savepoint_name(item, action, engine)
                     .expect("transaction_action validated the name");
                 if action == TransactionAction::Savepoint {
                     savepoints.push(name);
@@ -962,6 +1184,13 @@ pub fn preflight_transactions(
                 }
                 TransactionEngine::Sqlite => {
                     return Err(AppError::new("SET TRANSACTION is not supported by SQLite"));
+                }
+                // T-SQL's SET TRANSACTION ISOLATION LEVEL changes the whole session, not
+                // one unit, so Tusk's per-transaction model cannot track it honestly.
+                TransactionEngine::MsSql => {
+                    return Err(AppError::new(
+                        "SET TRANSACTION ISOLATION LEVEL changes the SQL Server session, not one transaction, and is not supported by Tusk",
+                    ));
                 }
                 TransactionEngine::Postgres => {
                     if state != TransactionState::Active {
@@ -1033,11 +1262,29 @@ pub fn preflight_transactions(
     Ok(actions)
 }
 
-fn transaction_savepoint_name(item: &Item, action: TransactionAction) -> Option<String> {
+fn transaction_savepoint_name(
+    item: &Item,
+    action: TransactionAction,
+    engine: TransactionEngine,
+) -> Option<String> {
     let Item::Sql(sql) = item else {
         return None;
     };
-    let words = statement_words(sql);
+    let words = statement_words_for(sql, engine);
+    if engine == TransactionEngine::MsSql {
+        // SAVE TRAN[SACTION] <name> / ROLLBACK [TRAN[SACTION]|TO] [SAVEPOINT] <name>
+        return match action {
+            TransactionAction::Savepoint => words.get(2).cloned(),
+            TransactionAction::RollbackTo => words
+                .get(if words.get(2).is_some_and(|word| word == "savepoint") {
+                    3
+                } else {
+                    2
+                })
+                .cloned(),
+            _ => None,
+        };
+    }
     match action {
         TransactionAction::Savepoint => words.get(1).cloned(),
         TransactionAction::Release => words
@@ -1287,11 +1534,45 @@ fn shape_tokens(sql: &str, engine: TransactionEngine) -> Option<Vec<ShapeToken<'
             continue;
         }
         if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+            let nests = engine == TransactionEngine::MsSql;
             i += 2;
-            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+            let mut depth = 1usize;
+            while i + 1 < b.len() {
+                if b[i] == b'*' && b[i + 1] == b'/' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if nests && b[i] == b'/' && b[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                    continue;
+                }
                 i += 1;
             }
             i = (i + 2).min(b.len());
+            continue;
+        }
+        // SQL Server `[bracket]` identifier: one opaque token, `]]` escapes `]`.
+        if engine == TransactionEngine::MsSql && b[i] == b'[' {
+            i += 1;
+            while i < b.len() {
+                if b[i] == b']' {
+                    i += 1;
+                    if i < b.len() && b[i] == b']' {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            if !push_shape_token(&mut out, ShapeTokenKind::Ident) {
+                return None;
+            }
             continue;
         }
         if b[i] == b'\'' {
@@ -1313,7 +1594,7 @@ fn shape_tokens(sql: &str, engine: TransactionEngine) -> Option<Vec<ShapeToken<'
             }
             continue;
         }
-        if b[i] == b'$' {
+        if b[i] == b'$' && engine != TransactionEngine::MsSql {
             if let Some(end) = dollar_tag_end(b, i) {
                 let delim = &b[i..=end];
                 i = end + 1;
@@ -1586,6 +1867,72 @@ fn parse_with_tokens(tokens: &[ShapeToken<'_>], nesting: usize) -> Option<WithSh
             continue;
         }
         return main_shape(tokens, pos, modifying_cte, nesting);
+    }
+}
+
+/// Which T-SQL windowing form can page one read statement.
+///
+/// SQL Server has no `LIMIT` and no server-side cursor here: paging is
+/// `OFFSET n ROWS FETCH NEXT m ROWS ONLY`, which the grammar only accepts after an
+/// `ORDER BY`. Wrapping the statement as a derived table is not an option either —
+/// T-SQL rejects `WITH` and a bare `ORDER BY` inside one — so Tusk appends the clause
+/// to the statement itself and picks the form from its top-level shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsSqlPaging {
+    /// A top-level `ORDER BY` already exists: append `OFFSET/FETCH` and keep that order.
+    Append,
+    /// Nothing to order by: append `ORDER BY (SELECT NULL)` too. Row order is then
+    /// engine-defined across pages, exactly like MySQL's `LIMIT/OFFSET` without an order.
+    OrderNull,
+    /// Appending would be a syntax or semantic error — `TOP` conflicts with `OFFSET`,
+    /// the statement already has its own `OFFSET`/`FETCH`, `FOR XML|JSON`/`OPTION` must
+    /// stay last, and an unordered `UNION`/`EXCEPT`/`INTERSECT` rejects
+    /// `ORDER BY (SELECT NULL)`. The driver reads such a statement once, under the
+    /// ordinary result budget, instead of paging it wrongly.
+    Buffered,
+}
+
+pub fn mssql_paging(sql: &str) -> MsSqlPaging {
+    let Some(tokens) = shape_tokens(effective_start(sql), TransactionEngine::MsSql) else {
+        return MsSqlPaging::Buffered;
+    };
+    let mut depth = 0usize;
+    let mut order_by = false;
+    let mut set_operation = false;
+    let mut blocked = false;
+    let mut after_order = false;
+    for token in &tokens {
+        match token.kind {
+            ShapeTokenKind::Open => {
+                depth += 1;
+                after_order = false;
+            }
+            ShapeTokenKind::Close => {
+                depth = depth.saturating_sub(1);
+                after_order = false;
+            }
+            ShapeTokenKind::Word(word) if depth == 0 => {
+                let is = |candidate: &str| word.eq_ignore_ascii_case(candidate.as_bytes());
+                if after_order && is("by") {
+                    order_by = true;
+                }
+                after_order = is("order");
+                if is("top") || is("offset") || is("fetch") || is("for") || is("option") {
+                    blocked = true;
+                }
+                if is("union") || is("except") || is("intersect") {
+                    set_operation = true;
+                }
+            }
+            _ => after_order = false,
+        }
+    }
+    if blocked || (set_operation && !order_by) {
+        MsSqlPaging::Buffered
+    } else if order_by {
+        MsSqlPaging::Append
+    } else {
+        MsSqlPaging::OrderNull
     }
 }
 
@@ -1916,6 +2263,162 @@ mod tests {
         // PostgreSQL does not treat a backslash as a quote escape in a standard string.
         let pg = parse(r"BEGIN; SELECT '\'; COMMIT;").unwrap();
         assert_eq!(pg.len(), 3);
+    }
+
+    #[test]
+    fn engine_splitter_handles_tsql_brackets_nested_comments_and_go() {
+        let mssql = TransactionEngine::MsSql;
+        let sql_of = |items: &[Item]| {
+            items
+                .iter()
+                .map(|item| match item {
+                    Item::Sql(sql) => sql.clone(),
+                    Item::Copy { stmt, .. } => stmt.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // `;` and quotes inside a bracket identifier are part of the name.
+        let items = parse_for_engine("SELECT [a;COMMIT] FROM [t]; SELECT 2;", mssql).unwrap();
+        assert_eq!(
+            sql_of(&items),
+            vec!["SELECT [a;COMMIT] FROM [t]", "SELECT 2"]
+        );
+        // `]]` escapes a literal `]`.
+        let escaped = parse_for_engine("SELECT [we]]ird]; SELECT 2;", mssql).unwrap();
+        assert_eq!(sql_of(&escaped), vec!["SELECT [we]]ird]", "SELECT 2"]);
+
+        // T-SQL block comments nest, so the inner `*/` must not end the outer comment.
+        let nested =
+            parse_for_engine("SELECT 1 /* a /* b */ ; DROP TABLE t; */ + 2", mssql).unwrap();
+        assert_eq!(nested.len(), 1, "{:?}", sql_of(&nested));
+
+        // GO is a client batch separator: a boundary that reaches no server.
+        let batched = parse_for_engine("SELECT 1\nGO\nSELECT 2\ngo  -- trailing\n", mssql).unwrap();
+        assert_eq!(sql_of(&batched), vec!["SELECT 1", "SELECT 2"]);
+        assert_eq!(
+            sql_of(&parse_for_engine("SELECT 1\nGO", mssql).unwrap()).len(),
+            1
+        );
+        // `go` that is not alone on its line stays ordinary SQL.
+        let alias = parse_for_engine("SELECT 1 AS go, 2", mssql).unwrap();
+        assert_eq!(sql_of(&alias), vec!["SELECT 1 AS go, 2"]);
+        // A repeat count would run the batch N times; refuse rather than run it once.
+        assert!(parse_for_engine("SELECT 1\nGO 5\n", mssql)
+            .err()
+            .expect("GO with a repeat count is refused")
+            .message
+            .contains("repeat count"));
+
+        // `N'…'` is an ordinary string; `$` is not a dollar-quote opener in T-SQL.
+        let literals = parse_for_engine("SELECT N'a;b', $100; SELECT 2;", mssql).unwrap();
+        assert_eq!(sql_of(&literals), vec!["SELECT N'a;b', $100", "SELECT 2"]);
+    }
+
+    #[test]
+    fn tsql_transaction_vocabulary_is_recognized_and_bounded() {
+        let mssql = TransactionEngine::MsSql;
+        let action = |sql: &str| transaction_action_for(sql, mssql).unwrap();
+        assert_eq!(action("BEGIN TRANSACTION"), Some(TransactionAction::Begin));
+        assert_eq!(action("BEGIN TRAN"), Some(TransactionAction::Begin));
+        // A bare BEGIN/END opens and closes a statement block, not a transaction.
+        assert_eq!(action("BEGIN"), None);
+        assert_eq!(action("END"), None);
+        assert_eq!(action("COMMIT"), Some(TransactionAction::Commit));
+        assert_eq!(
+            action("COMMIT TRANSACTION"),
+            Some(TransactionAction::Commit)
+        );
+        assert_eq!(action("ROLLBACK"), Some(TransactionAction::Rollback));
+        assert_eq!(
+            action("ROLLBACK TRANSACTION"),
+            Some(TransactionAction::Rollback)
+        );
+        // A named ROLLBACK TRANSACTION targets a savepoint.
+        assert_eq!(
+            action("ROLLBACK TRANSACTION [s]"),
+            Some(TransactionAction::RollbackTo)
+        );
+        assert_eq!(
+            action("SAVE TRANSACTION [s]"),
+            Some(TransactionAction::Savepoint)
+        );
+        assert!(transaction_action_for("SAVE TRANSACTION", mssql).is_err());
+        assert!(
+            transaction_action_for("SET IMPLICIT_TRANSACTIONS ON", mssql)
+                .unwrap_err()
+                .message
+                .contains("IMPLICIT_TRANSACTIONS")
+        );
+
+        let idle = TransactionStatus::default();
+        let savepoints = parse_for_engine(
+            "BEGIN TRANSACTION; SAVE TRANSACTION [a;b]; ROLLBACK TRANSACTION [a;b]; COMMIT;",
+            mssql,
+        )
+        .unwrap();
+        assert_eq!(
+            preflight_transactions(&savepoints, mssql, &idle).unwrap(),
+            vec![
+                Some(TransactionAction::Begin),
+                Some(TransactionAction::Savepoint),
+                Some(TransactionAction::RollbackTo),
+                Some(TransactionAction::Commit),
+            ]
+        );
+        for (sql, needle) in [
+            (
+                "BEGIN TRANSACTION; SAVE TRANSACTION s; RELEASE SAVEPOINT s; COMMIT;",
+                "RELEASE SAVEPOINT",
+            ),
+            (
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                "SET TRANSACTION",
+            ),
+            ("BEGIN TRANSACTION; USE other; COMMIT;", "indirectly"),
+            ("BEGIN TRANSACTION; EXEC dbo.p; COMMIT;", "indirectly"),
+            ("BEGIN TRANSACTION; BEGIN TRANSACTION;", "nested"),
+        ] {
+            let items = parse_for_engine(sql, mssql).unwrap();
+            let error = preflight_transactions(&items, mssql, &idle).unwrap_err();
+            assert!(error.message.contains(needle), "{sql}: {}", error.message);
+        }
+    }
+
+    #[test]
+    fn tsql_paging_form_follows_the_statement_shape() {
+        use MsSqlPaging::*;
+        assert_eq!(mssql_paging("SELECT a FROM t"), OrderNull);
+        assert_eq!(mssql_paging("SELECT a FROM t ORDER BY a"), Append);
+        // Ordering inside a window function or subquery is not the statement's own.
+        assert_eq!(
+            mssql_paging("SELECT ROW_NUMBER() OVER (ORDER BY a) FROM t"),
+            OrderNull
+        );
+        assert_eq!(
+            mssql_paging("SELECT * FROM (SELECT a FROM t ORDER BY a OFFSET 0 ROWS) x"),
+            OrderNull
+        );
+        // Forms that cannot take an appended OFFSET/FETCH read in one page instead.
+        for sql in [
+            "SELECT TOP 5 a FROM t",
+            "SELECT a FROM t ORDER BY a OFFSET 5 ROWS FETCH NEXT 5 ROWS ONLY",
+            "SELECT a FROM t FOR JSON AUTO",
+            "SELECT a FROM t OPTION (RECOMPILE)",
+            "SELECT a FROM t UNION SELECT b FROM u",
+        ] {
+            assert_eq!(mssql_paging(sql), Buffered, "{sql}");
+        }
+        // A set operation that already carries an ORDER BY pages by appending.
+        assert_eq!(
+            mssql_paging("SELECT a FROM t UNION SELECT b FROM u ORDER BY 1"),
+            Append
+        );
+        // A CTE-led read pages like any other statement (T-SQL forbids wrapping it).
+        assert_eq!(
+            mssql_paging("WITH c AS (SELECT a FROM t) SELECT * FROM c"),
+            OrderNull
+        );
     }
 
     #[test]
