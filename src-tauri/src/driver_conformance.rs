@@ -38,6 +38,7 @@ fn base() -> ConnectionConfig {
         sslmode: None,
         read_only: false,
         path: None,
+        ssh: None,
     }
 }
 fn duck_cfg() -> ConnectionConfig {

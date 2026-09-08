@@ -72,6 +72,7 @@ rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
 # MySQL (network). Pure-Rust async driver; its `Pool` is Send+Sync (avoids the
 # !Sync-connection problem) and its `Value` enum makes all-text extraction easy.
 mysql_async = { version = "0.34", default-features = false, features = ["default-rustls"] }
+russh = { version = "0.63.2", default-features = false, features = ["ring", "rsa"] }
 
 # Dev builds: full debuginfo for the bundled DuckDB/Arrow/SQLite tree costs
 # ~20 GB of target/ artifacts and regularly fills the disk. line-tables-only
@@ -86,6 +87,10 @@ debug = false
 # Test-only: async test runtime (the app uses Tauri's runtime, so the main tokio dep
 # stays lean). Enables `#[tokio::test]` for the driver conformance suite.
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Test-only: generates the ephemeral host key for the in-process SSH server in
+# `ssh_tests.rs`. Version pinned to russh's own `rand` so `PrivateKey::random` accepts
+# the RNG (a mismatched rand_core makes the CryptoRng bound unsatisfiable).
+rand = { version = "0.10", features = ["thread_rng"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
