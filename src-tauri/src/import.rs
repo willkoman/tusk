@@ -545,7 +545,7 @@ fn validate_header(columns: &[String], noun: &str) -> Result<(), AppError> {
 }
 
 /// Shape a raw parsed row against the resolved columns: pad short rows with NULL, reject
-/// wide ones (the `src/formats.ts` rule).
+/// wide ones.
 fn shape_row(
     raw: Vec<String>,
     width: usize,
@@ -642,9 +642,9 @@ impl Decoder {
     }
 }
 
-/// Streaming delimited-text parser. The state machine mirrors `parseCSV` in
-/// `src/formats.ts`: a quote may only open a field, characters after a closing quote are
-/// an error, an unterminated quoted field is an error.
+/// Streaming delimited-text parser and the sole definition of what Tusk accepts: a
+/// quote may only open a field, characters after a closing quote are an error, an
+/// unterminated quoted field is an error, and a wholly blank line is a separator.
 struct DelimitedParser {
     delim: char,
     /// `None` when the user turned quoting off; every byte is then literal content.
@@ -940,7 +940,7 @@ fn json_is_array(reader: &mut BufReader<std::fs::File>) -> Result<bool, AppError
 }
 
 /// Top-level fields of one JSON object, in document order, rejecting duplicate keys the
-/// way `assertUniqueJsonKeys` in `src/formats.ts` does.
+/// way the frontend clipboard JSON reader does.
 fn json_object_fields(text: &str) -> Result<Vec<(String, Option<String>)>, AppError> {
     let value: serde_json::Value = serde_json::from_str(text)
         .map_err(|e| AppError::new(format!("malformed JSON import: {e}")))?;
@@ -1011,8 +1011,8 @@ fn json_object_fields(text: &str) -> Result<Vec<(String, Option<String>)>, AppEr
     Ok(fields)
 }
 
-/// Render a JSON value as import text. Objects/arrays stringify (the `src/formats.ts`
-/// rule); numbers keep the file's own spelling; null is NULL.
+/// Render a JSON value as import text. Objects/arrays stringify; numbers go through
+/// `serde_json`, which canonicalises them (`1.50` becomes `1.5`); null is NULL.
 fn json_scalar(value: &serde_json::Value) -> Result<Option<String>, AppError> {
     let rendered = match value {
         serde_json::Value::Null => return Ok(None),
