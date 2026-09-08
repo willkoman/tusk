@@ -193,6 +193,10 @@ impl Capabilities {
 pub enum CancelHandle {
     Pg(CancelToken),
     Duck(Arc<duckdb::InterruptHandle>),
+    /// A cooperative flag polled by a batched operation between units of work (bulk
+    /// import). Works on every engine, including the ones with no out-of-band cancel,
+    /// because each statement the operation issues is small and bounded.
+    Flag(Arc<std::sync::atomic::AtomicBool>),
     /// No out-of-band cancel (e.g. SQLite) — queries are local and short.
     None,
 }
@@ -200,6 +204,10 @@ pub enum CancelHandle {
 impl CancelHandle {
     pub async fn cancel(self, cfg: &ConnectionConfig) -> Result<(), AppError> {
         match self {
+            CancelHandle::Flag(flag) => {
+                flag.store(true, Ordering::Release);
+                Ok(())
+            }
             CancelHandle::Pg(token) => {
                 let tls = db::make_tls(cfg)?;
                 token.cancel_query(tls).await?;
@@ -269,7 +277,7 @@ const MAX_DUCK_GATE_POISON_LEAKS: usize = 16;
 /// Deref'able lock guard so every existing `d.lock()` call site is unchanged: it borrows
 /// the live `Connection` out of the `Option`. The connection is guaranteed present at any
 /// call site — `ensure_alive`/`connect` open it before backend methods run.
-struct DuckGuard<'a>(std::sync::MutexGuard<'a, Option<duckdb::Connection>>);
+pub(crate) struct DuckGuard<'a>(std::sync::MutexGuard<'a, Option<duckdb::Connection>>);
 impl std::ops::Deref for DuckGuard<'_> {
     type Target = duckdb::Connection;
     fn deref(&self) -> &duckdb::Connection {
@@ -282,7 +290,7 @@ impl std::ops::Deref for DuckGuard<'_> {
 impl DuckConn {
     /// Lock the connection, recovering the guard even if a prior holder panicked
     /// (poisoning) — a panic mid-query shouldn't permanently brick the connection.
-    fn lock(&self) -> DuckGuard<'_> {
+    pub(crate) fn lock(&self) -> DuckGuard<'_> {
         DuckGuard(self.conn.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
@@ -346,7 +354,7 @@ impl DuckConn {
     /// Wrap an operation error with the quarantine consequence when the error also
     /// poisoned the connection — otherwise "resource deadlock would occur" repeats
     /// on every later statement with no way out.
-    fn quarantine_if_poisoned(&self, err: AppError) -> AppError {
+    pub(crate) fn quarantine_if_poisoned(&self, err: AppError) -> AppError {
         match self.quarantine_poisoned() {
             Some(hint) => AppError::new(format!(
                 "{} — DuckDB left the connection unusable; {hint}",
@@ -394,7 +402,7 @@ impl DuckConn {
     ///   scratch (dropping it would abort the process). On platforms where parse
     ///   errors don't poison, the probe succeeds and the error surfaces from the
     ///   real connection — same behavior, no leak.
-    fn parse_check(&self, sql: &str) -> Result<(), AppError> {
+    pub(crate) fn parse_check(&self, sql: &str) -> Result<(), AppError> {
         if self.gate_poison_leaks.load(Ordering::Relaxed) >= MAX_DUCK_GATE_POISON_LEAKS {
             return Err(AppError::new(
                 "DuckDB parser safety budget exhausted after repeated parser failures — restart Tusk before running more SQL",
@@ -472,7 +480,7 @@ pub struct SqliteConn {
 }
 
 impl SqliteConn {
-    fn lock(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 }

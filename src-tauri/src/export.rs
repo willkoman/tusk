@@ -33,6 +33,11 @@ pub struct SqlOptions {
     pub multi_row: bool,
     #[serde(default)]
     pub include_create: bool,
+    /// Reconstructed engine DDL for the source table (`object_ddl`), used verbatim in
+    /// place of the synthetic all-`text` CREATE when `include_create` is on. Empty
+    /// keeps the synthetic form — the only option for an expression/join result.
+    #[serde(default)]
+    pub create_sql: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -166,6 +171,11 @@ impl ExportOptions {
         {
             return Err(AppError::new(
                 "export delimiter and quote character must each be one non-newline character",
+            ));
+        }
+        if self.sql.create_sql.len() > 1024 * 1024 {
+            return Err(AppError::new(
+                "the SQL export CREATE statement exceeds the 1 MiB limit",
             ));
         }
         if self.null_text.len() > 1024 * 1024
@@ -420,7 +430,13 @@ fn header_text(
             format!("| {} |{nl}| {} |{nl}", head.join(" | "), sep.join(" | "))
         }
         "sql" => {
-            if opts.sql.include_create {
+            if opts.sql.include_create && !opts.sql.create_sql.is_empty() {
+                // Engine-reconstructed DDL wins over the synthetic all-text CREATE: it
+                // carries the real types, keys and defaults.
+                let ddl = opts.sql.create_sql.trim_end();
+                let ddl = ddl.strip_suffix(';').unwrap_or(ddl);
+                format!("{ddl};{nl}")
+            } else if opts.sql.include_create {
                 let table = if opts.sql.table.is_empty() {
                     "exported".to_string()
                 } else {
@@ -1244,6 +1260,216 @@ fn validate_export_row(row: &[Option<String>], columns: usize) -> Result<(), App
         return Err(AppError::new("an export value exceeds the 1 MiB limit"));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Explorer multi-table export: one configured file per table in a chosen directory.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableRef {
+    #[serde(default)]
+    pub schema: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableExportResult {
+    pub schema: String,
+    pub name: String,
+    pub path: String,
+    pub rows: u64,
+    /// Empty on success. A failed table never removes files already written.
+    pub error: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TableExportProgress {
+    index: usize,
+    total: usize,
+    table: String,
+    rows: u64,
+    done: bool,
+}
+
+const MAX_EXPORT_TABLES: usize = 2_000;
+
+/// Filesystem-safe file stem for one exported table.
+fn table_file_stem(table: &TableRef) -> String {
+    let raw = if table.schema.is_empty() {
+        table.name.clone()
+    } else {
+        format!("{}_{}", table.schema, table.name)
+    };
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed: String = cleaned.chars().take(120).collect();
+    if trimmed.is_empty() {
+        "table".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn extension_for(format: &str) -> &'static str {
+    match format {
+        "tsv" => "tsv",
+        "json" => "json",
+        "sql" => "sql",
+        "markdown" => "md",
+        "xlsx" => "xlsx",
+        _ => "csv",
+    }
+}
+
+/// Export several tables to one directory, one file per table. Every file is written
+/// atomically; a table that fails is reported and the files already written stay.
+#[tauri::command]
+pub async fn export_tables(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::AppState>,
+    connection_id: String,
+    tables: Vec<TableRef>,
+    options: ExportOptions,
+    directory: String,
+) -> Result<Vec<TableExportResult>, AppError> {
+    use tauri::Emitter;
+    options.validate()?;
+    if tables.is_empty() {
+        return Err(AppError::new("select at least one table to export"));
+    }
+    if tables.len() > MAX_EXPORT_TABLES {
+        return Err(AppError::new(format!(
+            "select at most {MAX_EXPORT_TABLES} tables"
+        )));
+    }
+    for table in &tables {
+        if table.name.trim().is_empty()
+            || table.name.len() > 1_000
+            || table.schema.len() > 1_000
+            || table.name.contains('\0')
+            || table.schema.contains('\0')
+        {
+            return Err(AppError::new("an export table name is invalid or too long"));
+        }
+    }
+    let dir = PathBuf::from(&directory);
+    if !dir.is_dir() {
+        return Err(AppError::new("choose an existing destination directory"));
+    }
+    let conn = state.get(&connection_id)?;
+    let mut c = crate::lock_conn(&conn).await?;
+    crate::ensure_alive(&mut c).await?;
+    c.require_idle("table export")?;
+    let dialect_kind = c.backend.capabilities().kind;
+    let dialect = SqlDialect::parse(dialect_kind)?;
+    let cancel_registration = state.arm_cancel(
+        &connection_id,
+        c.backend.cancel_handle(),
+        c.backend.config().clone(),
+        None,
+        c.transaction.clone(),
+    )?;
+    c.backend.rollback_cursor().await;
+
+    let total = tables.len();
+    let mut results: Vec<TableExportResult> = Vec::with_capacity(total);
+    let mut used: HashSet<String> = HashSet::new();
+    for (index, table) in tables.iter().enumerate() {
+        let mut stem = table_file_stem(table);
+        // Two schemas can sanitize to the same stem; never let one silently clobber
+        // the other.
+        let mut suffix = 2;
+        while !used.insert(stem.clone()) {
+            stem = format!("{}_{suffix}", table_file_stem(table));
+            suffix += 1;
+        }
+        let path = dir.join(format!("{stem}.{}", extension_for(&options.format)));
+        let path_string = path.to_string_lossy().to_string();
+        let qualified = if table.schema.is_empty() {
+            sql_ident(&table.name, dialect)
+        } else {
+            format!(
+                "{}.{}",
+                sql_ident(&table.schema, dialect),
+                sql_ident(&table.name, dialect)
+            )
+        };
+        let sql = format!("SELECT * FROM {qualified}");
+        let mut table_options = options.clone();
+        table_options.sql.table = table.name.clone();
+        table_options.sql.create_sql = String::new();
+        table_options.xlsx.sheet_name = {
+            let name = sanitize_sheet(&table.name);
+            if name.is_empty() {
+                default_sheet()
+            } else {
+                name
+            }
+        };
+        table_options.bool_cols = c.backend.bool_columns(&sql).await;
+        let outcome = if matches!(c.backend, crate::driver::Backend::Pg(_)) {
+            run_export_query(c.backend.pg()?, &sql, &table_options, &path_string).await
+        } else {
+            run_export_paged(&mut c.backend, &sql, &table_options, &path_string).await
+        };
+        let failed = outcome.is_err();
+        let result = match outcome {
+            Ok(rows) => TableExportResult {
+                schema: table.schema.clone(),
+                name: table.name.clone(),
+                path: path_string,
+                rows,
+                error: String::new(),
+            },
+            Err(error) => TableExportResult {
+                schema: table.schema.clone(),
+                name: table.name.clone(),
+                path: String::new(),
+                rows: 0,
+                error: error.message,
+            },
+        };
+        let _ = app.emit(
+            "export-tables-progress",
+            TableExportProgress {
+                index: index + 1,
+                total,
+                table: table.name.clone(),
+                rows: result.rows,
+                done: index + 1 == total,
+            },
+        );
+        results.push(result);
+        if failed {
+            // A cancel surfaces as the current table's error; stop rather than
+            // hammering the connection with the rest.
+            for remaining in tables.iter().skip(index + 1) {
+                results.push(TableExportResult {
+                    schema: remaining.schema.clone(),
+                    name: remaining.name.clone(),
+                    path: String::new(),
+                    rows: 0,
+                    error: "skipped after an earlier table failed".to_string(),
+                });
+            }
+            break;
+        }
+    }
+    drop(c);
+    drop(cancel_registration);
+    Ok(results)
 }
 
 // ---------------------------------------------------------------------------

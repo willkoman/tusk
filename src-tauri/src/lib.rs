@@ -6,6 +6,7 @@ mod driver;
 #[cfg(test)]
 mod driver_conformance;
 mod export;
+mod import;
 mod perms;
 mod profiles;
 mod relgraph;
@@ -85,7 +86,7 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
-    fn get(&self, id: &str) -> Result<Conn, AppError> {
+    pub(crate) fn get(&self, id: &str) -> Result<Conn, AppError> {
         self.conns
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -96,7 +97,7 @@ impl AppState {
 
     /// Arm cancellation for an operation about to run on `id` (call after `ensure_alive`,
     /// with the current client's token). Generation-aware cleanup must run when it ends.
-    fn arm_cancel(
+    pub(crate) fn arm_cancel(
         &self,
         id: &str,
         handle: CancelHandle,
@@ -2364,6 +2365,9 @@ pub fn run() {
             permissions,
             cancel_operation,
             import_rows,
+            import::import_preview,
+            import::import_from_file,
+            export::export_tables,
             read_text_file,
             write_text_file,
             load_history,
