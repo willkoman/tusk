@@ -565,6 +565,10 @@ pub struct Tunnel {
     local_port: u16,
     session: Arc<client::Handle<TunnelHandler>>,
     accepting: Arc<AtomicBool>,
+    /// The last reason a forward failed. Without it the driver only ever sees a reset
+    /// loopback socket and reports it as a database error — a server with
+    /// `AllowTcpForwarding no` would look like an unreachable database.
+    forward_error: Arc<Mutex<Option<String>>>,
     task: tauri::async_runtime::JoinHandle<()>,
 }
 
@@ -595,6 +599,15 @@ impl Tunnel {
     /// reconnect so a dead tunnel is rebuilt rather than dialled into a closed port.
     pub fn is_alive(&self) -> bool {
         self.accepting.load(Ordering::Acquire) && !self.session.is_closed()
+    }
+
+    /// Consume the last forward failure, if the tunnel recorded one. Taken rather than
+    /// read so a stale reason cannot be blamed for a later, unrelated failure.
+    pub fn take_forward_error(&self) -> Option<String> {
+        self.forward_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     pub async fn open(
@@ -678,10 +691,12 @@ impl Tunnel {
 
         let session = Arc::new(session);
         let accepting = Arc::new(AtomicBool::new(true));
+        let forward_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let task = spawn_forwarder(
             listener,
             Arc::clone(&session),
             Arc::clone(&accepting),
+            Arc::clone(&forward_error),
             target_host.to_string(),
             target_port,
         );
@@ -690,6 +705,7 @@ impl Tunnel {
             local_port,
             session,
             accepting,
+            forward_error,
             task,
         })
     }
@@ -708,10 +724,12 @@ impl From<russh::Error> for BringUp {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_forwarder(
     listener: TcpListener,
     session: Arc<client::Handle<TunnelHandler>>,
     accepting: Arc<AtomicBool>,
+    forward_error: Arc<Mutex<Option<String>>>,
     target_host: String,
     target_port: u16,
 ) -> tauri::async_runtime::JoinHandle<()> {
@@ -724,11 +742,12 @@ fn spawn_forwarder(
                 break;
             };
             let session = Arc::clone(&session);
+            let forward_error = Arc::clone(&forward_error);
             let host = target_host.clone();
             tauri::async_runtime::spawn(async move {
                 let channel = session
                     .channel_open_direct_tcpip(
-                        host,
+                        host.clone(),
                         u32::from(target_port),
                         peer.ip().to_string(),
                         u32::from(peer.port()),
@@ -736,8 +755,18 @@ fn spawn_forwarder(
                     .await;
                 match channel {
                     // Dropping `socket` on failure resets the driver's connection
-                    // attempt — it never reaches an unintended destination.
-                    Err(e) => eprintln!("[tusk] ssh tunnel: direct-tcpip open failed: {e}"),
+                    // attempt — it never reaches an unintended destination. The reason
+                    // is recorded BEFORE the socket drops, so the driver's own error
+                    // can be annotated with it.
+                    Err(e) => {
+                        let reason = format!(
+                            "the SSH server refused to forward to {host}:{target_port} ({e}) \
+                             — check that it allows TCP forwarding (`AllowTcpForwarding yes`) \
+                             and can reach that address"
+                        );
+                        eprintln!("[tusk] ssh tunnel: {reason}");
+                        *forward_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+                    }
                     Ok(channel) => {
                         let mut stream = channel.into_stream();
                         if let Err(e) =
@@ -774,6 +803,19 @@ pub async fn ensure(
         }
     }
     Ok(Some(Tunnel::open(ssh, &cfg.host, cfg.port).await?))
+}
+
+/// Re-label a database connect failure that was really the tunnel's fault. Through a
+/// tunnel the driver only ever sees a reset loopback socket, so without this a refused
+/// forward reads as "the database is unreachable".
+pub fn explain_db_failure(tunnel: Option<&Tunnel>, error: AppError) -> AppError {
+    let Some(reason) = tunnel.and_then(Tunnel::take_forward_error) else {
+        return error;
+    };
+    AppError::new(format!(
+        "{reason}. The database reported: {}",
+        error.message
+    ))
 }
 
 /// The configuration the driver actually dials: loopback when tunnelled, unchanged

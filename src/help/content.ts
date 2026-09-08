@@ -6,7 +6,7 @@ import type { Topic } from "./types";
 
 export const TOPICS: Topic[] = [
   {
-    "blurb": "Connect screen, profiles, keychain passwords, SSL modes, read-only, per-driver capabilities.",
+    "blurb": "Connect screen, profiles, keychain passwords, SSL modes, SSH tunnels, read-only, per-driver capabilities.",
     "id": "getting-started",
     "title": "Connections & drivers",
     "blocks": [
@@ -51,7 +51,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**PostgreSQL / MySQL** — *Host / Port / User / Password / Database / SSL Mode*; picking MySQL flips the default port from 5432 to 3306 and makes *Database* optional.",
+          "**PostgreSQL / MySQL** — *Host / Port / User / Password / Database / SSL Mode*, plus an optional **SSH tunnel** section; picking MySQL flips the default port from 5432 to 3306 and makes *Database* optional.",
           "**DuckDB / SQLite** — a single **Database file** field with *Browse…*; **leave it blank for a scratch in-memory database**. No password or SSL — *Save password* disappears."
         ]
       },
@@ -98,6 +98,57 @@ export const TOPICS: Topic[] = [
             "Encrypts *and* verifies the certificate chain and hostname — libpq semantics."
           ]
         ]
+      },
+      {
+        "k": "h",
+        "text": "SSH tunnels",
+        "id": "ssh-tunnel"
+      },
+      {
+        "k": "p",
+        "md": "**PostgreSQL and MySQL** connections can go through an SSH tunnel. Tick **Connect through an SSH tunnel** in the form and fill in the SSH *host*, *port* (22 by default), and *user*. The SSH client is built into Tusk — nothing to install, and no `ssh -L` to leave running."
+      },
+      {
+        "k": "tip",
+        "kind": "tip",
+        "md": "The **Host** and **Port** at the top of the form are the database *as the SSH server sees it* — usually `localhost` and `5432`/`3306`. Tusk binds a private loopback port, forwards it over the SSH connection, and points the driver at that port."
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Password** — the SSH login password.",
+          "**Private key** — an OpenSSH or PEM key file (*Browse…* picks one); leave the passphrase blank for an unencrypted key.",
+          "**SSH agent** — uses the running agent: `$SSH_AUTH_SOCK` on macOS and Linux, the OpenSSH agent pipe on Windows. Tusk stores nothing."
+        ]
+      },
+      {
+        "k": "p",
+        "md": "**Save … in the OS keychain** stores the SSH password or key passphrase under its own keychain entry, separate from the database password, and it is read server-side at connect time — never sent to the frontend and never written to `connections.json`. The destination rule matches the database password: change the SSH host, port, user, or authentication method and Tusk asks you to enter the secret again rather than pointing the old one at a new machine."
+      },
+      {
+        "k": "p",
+        "md": "A tunnelled connection is marked **SSH** next to its name in the topbar and in the Connections list. If the link drops, the next command re-establishes the tunnel before reconnecting."
+      },
+      {
+        "k": "h",
+        "text": "Host key verification",
+        "id": "ssh-host-keys"
+      },
+      {
+        "k": "p",
+        "md": "Tusk checks the SSH server's host key against your `~/.ssh/known_hosts` — plain, `[host]:port`, comma-list, and hashed (`ssh-keygen -H`) entries all match — and against its own trust store in the app config directory. `known_hosts` is only ever **read**; Tusk does not write to it."
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Unknown host** — the connection stops and a dialog shows the key type and `SHA256:…` fingerprint. Compare it against the server (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` prints the same value), then **Trust and connect** records it and retries.",
+          "**Key changed** — refused outright, with no accept button. A host key that changed against a stored one is what a man-in-the-middle looks like; if the change really is legitimate, remove the old entry from `known_hosts` or from `ssh_known_hosts.json` in the app config directory."
+        ]
+      },
+      {
+        "k": "tip",
+        "kind": "warn",
+        "md": "`verify-full` **SSL Mode** verifies the database certificate against `127.0.0.1` through a tunnel, because that is the address the driver dials. Use `require` over a tunnel unless the certificate is valid for the loopback address — the SSH layer already authenticates and encrypts the hop."
       },
       {
         "k": "h",

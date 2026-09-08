@@ -499,8 +499,9 @@ pub async fn connect(config: &ConnectionConfig) -> Result<(Backend, String), App
         "postgres" => {
             // The tunnel comes up first so a failure names the SSH stage, not the DB.
             let tunnel = crate::ssh::ensure(None, config).await?;
-            let (client, version) =
-                db::open(&crate::ssh::dial_config(config, tunnel.as_ref())).await?;
+            let (client, version) = db::open(&crate::ssh::dial_config(config, tunnel.as_ref()))
+                .await
+                .map_err(|e| crate::ssh::explain_db_failure(tunnel.as_ref(), e))?;
             Ok((
                 Backend::Pg(PgConn {
                     client,
@@ -624,7 +625,9 @@ impl Backend {
             Backend::Pg(p) => {
                 p.tunnel = crate::ssh::ensure(p.tunnel.take(), &p.config).await?;
                 let (client, _version) =
-                    db::open(&crate::ssh::dial_config(&p.config, p.tunnel.as_ref())).await?;
+                    db::open(&crate::ssh::dial_config(&p.config, p.tunnel.as_ref()))
+                        .await
+                        .map_err(|e| crate::ssh::explain_db_failure(p.tunnel.as_ref(), e))?;
                 p.client = client;
                 p.cursor_name = None;
                 p.cursor_auto_transaction = false;
@@ -2070,7 +2073,9 @@ impl MySqlConn {
         }
         let pool = mysql_async::Pool::new(builder);
         // Fail fast + capture the server version.
-        let (_c, rows, _a) = mysql_run(&pool, "SELECT version()").await?;
+        let (_c, rows, _a) = mysql_run(&pool, "SELECT version()")
+            .await
+            .map_err(|e| crate::ssh::explain_db_failure(tunnel.as_ref(), e))?;
         let version = rows
             .first()
             .and_then(|r| r.first().cloned().flatten())

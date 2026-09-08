@@ -395,3 +395,192 @@ async fn ensure_reuses_a_live_tunnel_and_rebuilds_a_dead_one() {
         Ok(None) => panic!("a tunnelled config must always yield a tunnel"),
     }
 }
+
+// --- live end-to-end (opt-in) ---------------------------------------------
+
+/// The whole feature against real software: OpenSSH's `sshd` forwarding to a real
+/// PostgreSQL server, driven through `driver::connect` exactly as the app does it.
+///
+/// Skipped unless `scripts/conformance.sh` (or the reviewer) exports
+/// `TUSK_TEST_SSH_PORT`; `TUSK_TEST_SSH_DB_HOST`/`_PORT` name the database as the SSH
+/// container sees it, and `TUSK_TEST_SSH_USER`/`_PASSWORD` its login.
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_connects_through_a_real_sshd() {
+    use crate::db::ConnectionConfig;
+
+    let Some(ssh_port) = std::env::var("TUSK_TEST_SSH_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+    else {
+        return;
+    };
+    let _guard = trust_store_guard();
+    let dir = tempfile::tempdir().unwrap();
+    ssh::set_trust_dir(dir.path().to_path_buf());
+
+    let config = ConnectionConfig {
+        driver: Some("postgres".into()),
+        // Resolved inside the SSH container, not on this machine.
+        host: std::env::var("TUSK_TEST_SSH_DB_HOST").unwrap_or_else(|_| "tusk-it-pg".into()),
+        port: std::env::var("TUSK_TEST_SSH_DB_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5432),
+        user: "postgres".into(),
+        password: "test".into(),
+        dbname: "postgres".into(),
+        sslmode: Some("disable".into()),
+        read_only: false,
+        path: None,
+        ssh: Some(SshConfig {
+            host: "127.0.0.1".into(),
+            port: ssh_port,
+            user: std::env::var("TUSK_TEST_SSH_USER").unwrap_or_else(|_| "tusk".into()),
+            auth: "password".into(),
+            key_path: None,
+            ssh_password: std::env::var("TUSK_TEST_SSH_PASSWORD").unwrap_or_else(|_| "test".into()),
+            ssh_key_passphrase: String::new(),
+        }),
+    };
+
+    // A container's host key is new every run, so the first attempt must be the
+    // unknown-host refusal — the same path the connect screen takes.
+    let refused = crate::driver::connect(&config)
+        .await
+        .err()
+        .expect("a never-seen sshd host key must refuse the first connect");
+    let prompt = refused
+        .ssh_host_key
+        .expect("the refusal must carry a fingerprint to show the user");
+    assert!(prompt.fingerprint.starts_with("SHA256:"));
+    ssh::trust_host(&prompt.host, prompt.port, &prompt.fingerprint).unwrap();
+
+    let (mut backend, version) = crate::driver::connect(&config)
+        .await
+        .expect("PostgreSQL connects through the tunnel once the host key is trusted");
+    assert!(!version.is_empty());
+    assert_eq!(backend.database_name().await, "postgres");
+    match backend
+        .run_single("SELECT 42 AS answer", 100, false)
+        .await
+        .unwrap()
+    {
+        crate::db::QueryOutcome::Rows { columns, rows, .. } => {
+            assert_eq!(columns, vec!["answer".to_string()]);
+            assert_eq!(rows[0][0].as_deref(), Some("42"));
+        }
+        other => panic!("expected rows through the tunnel, got {other:?}"),
+    }
+
+    // Reconnect keeps working over the same tunnel.
+    backend
+        .reopen()
+        .await
+        .expect("reconnect through the tunnel");
+    assert_eq!(backend.database_name().await, "postgres");
+}
+
+/// A server that authenticates fine but refuses `direct-tcpip` — what
+/// `AllowTcpForwarding no` looks like on the wire. Without the annotation the driver
+/// only reports a reset loopback socket, which reads as an unreachable database.
+#[derive(Clone)]
+struct NoForwardingServer;
+
+impl server::Server for NoForwardingServer {
+    type Handler = Self;
+    fn new_client(&mut self, _peer: Option<std::net::SocketAddr>) -> Self {
+        self.clone()
+    }
+}
+
+impl server::Handler for NoForwardingServer {
+    type Error = russh::Error;
+
+    async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        if user == USER && password == PASSWORD {
+            Ok(Auth::Accept)
+        } else {
+            Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            })
+        }
+    }
+
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        _channel: Channel<Msg>,
+        _host_to_connect: &str,
+        _port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_forward_is_reported_as_an_ssh_problem() {
+    let _guard = trust_store_guard();
+    let dir = tempfile::tempdir().unwrap();
+
+    let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let public = host_key.public_key().clone();
+    let config = Arc::new(server::Config {
+        keys: vec![host_key],
+        auth_rejection_time: Duration::from_millis(1),
+        auth_rejection_time_initial: Some(Duration::ZERO),
+        nodelay: true,
+        ..Default::default()
+    });
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server_task = tokio::spawn(async move {
+        let mut server = NoForwardingServer;
+        let _ = server.run_on_socket(config, &listener).await;
+    });
+    trust(&dir, port, &public);
+
+    let tunnel = Tunnel::open(&ssh_config(port, PASSWORD), "db.internal", 5432)
+        .await
+        .expect("the tunnel itself opens — only forwarding is refused");
+
+    // Drive one connection through it, exactly as a driver would.
+    let mut client = TcpStream::connect(("127.0.0.1", tunnel.local_port()))
+        .await
+        .unwrap();
+    let _ = client.write_all(b"hello").await;
+    let mut sink = Vec::new();
+    let _ = client.read_to_end(&mut sink).await;
+
+    // The forwarder records the reason before the loopback socket drops, so by the time
+    // the driver's own error surfaces the annotation is available.
+    let mut reason = None;
+    for _ in 0..100 {
+        reason = tunnel.take_forward_error();
+        if reason.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let reason = reason.expect("a refused forward must be recorded");
+    assert!(reason.contains("db.internal:5432"), "{reason}");
+    assert!(reason.contains("AllowTcpForwarding"), "{reason}");
+
+    // …and it is taken, not cloned, so a later unrelated failure is not misattributed.
+    assert!(tunnel.take_forward_error().is_none());
+
+    let annotated =
+        crate::ssh::explain_db_failure(Some(&tunnel), crate::db::AppError::new("connection reset"));
+    assert_eq!(
+        annotated.message, "connection reset",
+        "nothing left to blame"
+    );
+
+    server_task.abort();
+}

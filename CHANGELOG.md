@@ -2,6 +2,12 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
+## [Unreleased]
+
+### Added
+- **Reach a database through an SSH tunnel.** The connect form has an **SSH tunnel** section for PostgreSQL and MySQL: tick it, give the SSH host, port, and user, and pick **Password**, **Private key** (with an optional passphrase and a file picker), or **SSH agent**. Tusk opens the tunnel first and then connects to the **Host** and **Port** in the form *as the SSH server sees them* — usually `localhost` — so no port has to be forwarded by hand and nothing extra has to be installed: the SSH client is built in. Saved connections remember the tunnel settings, and the SSH password or key passphrase goes into the OS keychain under its own entry, with the same rule as the database password — change the SSH host, port, user, or authentication method and you are asked to enter it again. Connections reached this way are marked **SSH** in the topbar and in the connections list, and the tunnel is re-established automatically if the link drops.
+- **First contact with an SSH host asks you to confirm its fingerprint.** Tusk checks the server's host key against your `~/.ssh/known_hosts` (plain and hashed entries alike, read-only — Tusk never writes to it) and its own trust store. A host you have not seen before stops the connection and shows the key type and its `SHA256:…` fingerprint, so you can compare it against the server before choosing **Trust and connect**. A host whose key has *changed* is refused outright with no accept button: that is what a man-in-the-middle looks like, and clearing it is a deliberate act outside the connect screen.
+
 ## [0.9.8] - 2026-09-04
 
 ### Fixed
