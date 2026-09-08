@@ -49,8 +49,31 @@ pub struct Profile {
 
 /// The keychain account holding this profile's SSH secret. Distinct from the DB
 /// password account (the bare id) so the two never overwrite each other.
+///
+/// The namespacing only holds while ids cannot contain `:` — see `check_id`, which
+/// `upsert` applies to every id that reaches the store. Without it, a profile with the
+/// id `p123:ssh` would share a keychain account with profile `p123`'s SSH secret, and
+/// saving either would overwrite the other's credential.
 fn ssh_account(id: &str) -> String {
     format!("{id}:ssh")
+}
+
+/// Ids address keychain accounts, so they are restricted to characters that cannot
+/// collide with the `:`-suffixed SSH account or be mistaken for a path. Generated ids
+/// (`p<nanos>` / `p<nanos>-<n>`) already satisfy this.
+fn check_id(id: &str) -> Result<(), AppError> {
+    if id.len() > 200 {
+        return Err(AppError::new("profile id is too long"));
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    {
+        return Err(AppError::new(
+            "profile id may only contain letters, digits, '-', '_' and '.'",
+        ));
+    }
+    Ok(())
 }
 
 /// Agent auth has nothing to store, and a profile without a tunnel obviously does not.
@@ -298,9 +321,10 @@ pub fn upsert(
     password: Option<String>,
     ssh_secret: Option<String>,
 ) -> Result<Profile, AppError> {
-    if p.id.len() > 200 || p.name.is_empty() || p.name.len() > 200 {
-        return Err(AppError::new("profile id/name is empty or too long"));
+    if p.name.is_empty() || p.name.len() > 200 {
+        return Err(AppError::new("profile name is empty or too long"));
     }
+    check_id(&p.id)?;
     if password.as_ref().is_some_and(|pw| pw.len() > 64 * 1024)
         || ssh_secret.as_ref().is_some_and(|s| s.len() > 64 * 1024)
     {
@@ -540,6 +564,23 @@ mod tests {
             save_ssh_secret: true,
             ..profile()
         }
+    }
+
+    #[test]
+    fn profile_ids_cannot_collide_with_the_ssh_keychain_account() {
+        // `ssh_account` namespaces by suffixing `:ssh`, so an id containing `:` could
+        // address another profile's SSH secret — `p1:ssh` would be exactly the account
+        // holding profile `p1`'s SSH passphrase.
+        assert_eq!(ssh_account("p1"), "p1:ssh");
+        assert!(check_id("p1:ssh").is_err());
+        assert!(check_id("p1/../p2").is_err());
+        assert!(check_id("p1 p2").is_err());
+        assert!(check_id(&"p".repeat(201)).is_err());
+        // Generated ids and the shapes users actually type stay valid.
+        assert!(check_id("").is_ok()); // assigned by upsert before use
+        assert!(check_id("p1759000000000000000").is_ok());
+        assert!(check_id("p1759000000000000000-1").is_ok());
+        assert!(check_id("my_profile.2").is_ok());
     }
 
     #[test]

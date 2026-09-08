@@ -73,6 +73,12 @@ rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
 # !Sync-connection problem) and its `Value` enum makes all-text extraction easy.
 mysql_async = { version = "0.34", default-features = false, features = ["default-rustls"] }
 russh = { version = "0.63.2", default-features = false, features = ["ring", "rsa"] }
+# Hashed `|1|salt|hash` host patterns in `~/.ssh/known_hosts` (HMAC-SHA1, per the
+# OpenSSH format). Tusk parses known_hosts itself: russh's parser aborts the whole
+# file on one line it cannot decode, which silently downgraded a CHANGED host key to
+# an unknown one. Versions match russh's own, so no extra copy is compiled.
+hmac = "0.13"
+sha1 = "0.11"
 
 # Dev builds: full debuginfo for the bundled DuckDB/Arrow/SQLite tree costs
 # ~20 GB of target/ artifacts and regularly fills the disk. line-tables-only

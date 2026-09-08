@@ -295,13 +295,37 @@ pub fn make_tls(cfg: &ConnectionConfig) -> Result<postgres_native_tls::MakeTlsCo
     Ok(postgres_native_tls::MakeTlsConnector::new(connector))
 }
 
-pub async fn open(cfg: &ConnectionConfig) -> Result<(Client, String), AppError> {
+/// Open a PostgreSQL connection, optionally validating TLS against a different name
+/// than the address dialled.
+///
+/// `tls_host` exists for the SSH tunnel: the socket goes to `127.0.0.1:<tunnel port>`
+/// while the TLS peer is still the real server, so `sslmode=verify-full` has to check
+/// the certificate against the configured hostname or it fails every time.
+/// tokio-postgres splits exactly this way — `host` is the name used for TLS
+/// validation, `hostaddr` is the address actually dialled.
+pub async fn open_with_tls_host(
+    cfg: &ConnectionConfig,
+    tls_host: Option<&str>,
+) -> Result<(Client, String), AppError> {
     let ssl_mode = ssl_mode_of(cfg)?;
     let tls = make_tls(cfg)?;
 
     let mut pgcfg = tokio_postgres::Config::new();
+    match tls_host.filter(|name| !name.is_empty()) {
+        Some(name) => {
+            let addr: std::net::IpAddr = cfg.host.parse().map_err(|_| {
+                AppError::new(format!(
+                    "the tunnelled dial address `{}` is not a numeric IP",
+                    cfg.host
+                ))
+            })?;
+            pgcfg.host(name).hostaddr(addr);
+        }
+        None => {
+            pgcfg.host(&cfg.host);
+        }
+    }
     pgcfg
-        .host(&cfg.host)
         .port(cfg.port)
         .user(&cfg.user)
         .password(&cfg.password)

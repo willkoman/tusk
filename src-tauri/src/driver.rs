@@ -499,9 +499,15 @@ pub async fn connect(config: &ConnectionConfig) -> Result<(Backend, String), App
         "postgres" => {
             // The tunnel comes up first so a failure names the SSH stage, not the DB.
             let tunnel = crate::ssh::ensure(None, config).await?;
-            let (client, version) = db::open(&crate::ssh::dial_config(config, tunnel.as_ref()))
-                .await
-                .map_err(|e| crate::ssh::explain_db_failure(tunnel.as_ref(), e))?;
+            // Through a tunnel the socket is loopback but the TLS peer is still the
+            // real server, so `verify-full` must check the configured hostname.
+            let tls_host = crate::ssh::tls_host(config, tunnel.as_ref());
+            let (client, version) = db::open_with_tls_host(
+                &crate::ssh::dial_config(config, tunnel.as_ref()),
+                tls_host.as_deref(),
+            )
+            .await
+            .map_err(|e| crate::ssh::explain_db_failure(tunnel.as_ref(), e))?;
             Ok((
                 Backend::Pg(PgConn {
                     client,
@@ -624,10 +630,13 @@ impl Backend {
         match self {
             Backend::Pg(p) => {
                 p.tunnel = crate::ssh::ensure(p.tunnel.take(), &p.config).await?;
-                let (client, _version) =
-                    db::open(&crate::ssh::dial_config(&p.config, p.tunnel.as_ref()))
-                        .await
-                        .map_err(|e| crate::ssh::explain_db_failure(p.tunnel.as_ref(), e))?;
+                let tls_host = crate::ssh::tls_host(&p.config, p.tunnel.as_ref());
+                let (client, _version) = db::open_with_tls_host(
+                    &crate::ssh::dial_config(&p.config, p.tunnel.as_ref()),
+                    tls_host.as_deref(),
+                )
+                .await
+                .map_err(|e| crate::ssh::explain_db_failure(p.tunnel.as_ref(), e))?;
                 p.client = client;
                 p.cursor_name = None;
                 p.cursor_auto_transaction = false;
@@ -2067,6 +2076,11 @@ impl MySqlConn {
                     ssl = ssl
                         .with_danger_accept_invalid_certs(true)
                         .with_danger_skip_domain_validation(true);
+                } else if let Some(name) = crate::ssh::tls_host(config, tunnel.as_ref()) {
+                    // Through a tunnel the socket is loopback while the TLS peer is
+                    // still the real server: verify the certificate against the
+                    // configured hostname, not against 127.0.0.1.
+                    ssl = ssl.with_danger_tls_hostname_override(Some(name));
                 }
                 builder = builder.ssl_opts(Some(ssl));
             }
