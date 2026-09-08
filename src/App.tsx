@@ -11,7 +11,8 @@ import { type CursorInfo, type EditorPrefs, type ServerDiag } from "./editor/typ
 import { prefsStore, tabsStore, layoutStore, type PersistedTabs, type TabsPersistenceFailure } from "./store";
 import { makeTab, basename, gridViewFor, pendingCount, snapshotTabs as recoverySnapshot, type Tab, type ResultSnapshot, type GridView, type SortKey, type PendingEdits } from "./tabs";
 import { FilterBar } from "./grid/FilterBar";
-import { classResolver, emptyFilter, hasConditions, removeNode, type FilterTree } from "./grid/filterModel";
+import { classResolver, conditions, emptyFilter, hasConditions, removeNode, type FilterTree } from "./grid/filterModel";
+import { activeConditionCount } from "./grid/filterSql";
 import { ResultGrid } from "./ResultGrid";
 import { UpdateBadge } from "./UpdateBadge";
 import { WhatsNew } from "./WhatsNew";
@@ -546,6 +547,9 @@ function App() {
       setMenuState(null);
       setDdlGraph(null);
       setActiveDialog(null);
+      // Backup/restore need an idle session; an opened transaction has taken it.
+      closeBackup();
+      closeRestore();
       if (importOpen() && !importBusy()) {
         setImportOpen(null);
         importOrigin = null;
@@ -1420,7 +1424,7 @@ function App() {
       if (t) {
         const v = t.gridView;
         const base = t.result.baseQuery;
-        const sqlToRun = hasViewRules(v.sorts, v.filters) ? tryWrapQuery(t, v.sorts, v.filters) : base;
+        const sqlToRun = hasViewRules(v.sorts, v.filters, t.result.columns) ? tryWrapQuery(t, v.sorts, v.filters) : base;
         if (sqlToRun === null) return;
         void executeQuery(sqlToRun, base, "wrapped");
       }
@@ -2125,6 +2129,8 @@ function App() {
     setExportSrc(null);
     setExportTables(null);
     setExportTablesProgress(null);
+    closeBackup();
+    closeRestore();
     setImportBusy(false);
     setImportProgress(null);
     setImportOpen(null);
@@ -2725,7 +2731,7 @@ function App() {
       base !== "" &&
       base === stripTrailingSemi(at.result.baseQuery) &&
       wrappableQuery(base) &&
-      hasViewRules(at.gridView.sorts, at.gridView.filters)
+      hasViewRules(at.gridView.sorts, at.gridView.filters, at.result.columns)
     ) {
       const gv = at.gridView;
       const wrapped = tryWrapQuery(at, gv.sorts, gv.filters);
@@ -2769,23 +2775,33 @@ function App() {
   }
 
   // Re-stream the active tab's result sorted/filtered (server ORDER BY / WHERE).
+  // The view is written ONLY once the run is committed to: persisting chips or a
+  // sort glyph for a rule that never reached the server would leave the grid
+  // claiming a filter the rows don't reflect — and the next plain Run would then
+  // silently wrap with it.
   function onSortFilter(sorts: SortKey[], filters: FilterTree, kind: "sort" | "filter") {
-    const prior = { sorts: activeTab().gridView.sorts, filters: activeTab().gridView.filters };
-    setGridView({ sorts, filters });
     const tab = activeTab();
+    if (running()) {
+      patchResult(tab.id, { status: `${kind} is unavailable while a query is running` });
+      return;
+    }
     if (kind === "sort" && localSortEligible() && !hasConditions(filters)) {
+      setGridView({ sorts, filters });
       patchResult(tab.id, { epoch: tab.result.epoch + 1 });
       return;
     }
     const base = tab.result.baseQuery;
-    if (!activeDatabaseAllowed() || !canServerSortFilter()) return;
-    const sqlToRun = hasViewRules(sorts, filters) ? tryWrapQuery(tab, sorts, filters) : base;
-    if (sqlToRun === null) {
-      // Wrap refused (unwrappable base, duplicate filter names) — no query will
-      // run, so don't leave a sort glyph/filter chip pretending it applied.
-      setGridView(prior);
+    if (!activeDatabaseAllowed() || !canServerSortFilter()) {
+      patchResult(tab.id, {
+        status: `${kind} rejected: ${sortUnavailable() || "this result cannot be re-run with a server-side sort or filter"}`,
+      });
       return;
     }
+    const sqlToRun = hasViewRules(sorts, filters, tab.result.columns) ? tryWrapQuery(tab, sorts, filters) : base;
+    // Wrap refused (unwrappable base, duplicate filter names) — tryWrapQuery has
+    // already reported why; leave the previous view in place.
+    if (sqlToRun === null) return;
+    setGridView({ sorts, filters });
     void executeQuery(sqlToRun, base, "wrapped");
   }
 
@@ -2811,8 +2827,24 @@ function App() {
       prefill,
       // Every callback re-checks the origin: the dialog outlives a tab switch or
       // a new result only as long as it still targets the tab it was opened on.
+      // The RESULT generation is deliberately NOT part of that check — the
+      // Explorer's "Filter rows…" opens the builder while its generated SELECT is
+      // still in flight, so the result the filter lands on is always a later one
+      // than the dialog was opened over. Instead of binding to a generation the
+      // flow cannot satisfy, every apply is re-validated against the LIVE result's
+      // columns and refused when a rule no longer resolves — a stale rule must
+      // never be silently dropped from the WHERE clause.
       onApply: (tree) => {
-        if (originCurrent(origin)) onSortFilter(activeTab().gridView.sorts, tree, "filter");
+        if (!originCurrent(origin)) return;
+        const tab = activeTab();
+        const live = tab.result.columns;
+        if (activeConditionCount(tree, live) !== conditions(tree).length) {
+          patchResult(tab.id, {
+            status: "filter rejected: the result changed and some conditions name columns it no longer has",
+          });
+          return;
+        }
+        onSortFilter(tab.gridView.sorts, tree, "filter");
       },
       onOpenQuery: (tree) => {
         if (!originCurrent(origin)) return;
@@ -2959,6 +2991,24 @@ function App() {
   // the run is recorded in history like every other server execution.
   const [backupTarget, setBackupTarget] = createSignal<BackupTarget | null>(null);
   const [restoreOpen, setRestoreOpen] = createSignal(false);
+  // Both dialogs target a whole CONNECTION, not a tab, so they are bound to the
+  // connection generation they were opened on (the way `exportSrc` is): a
+  // disconnect/reconnect underneath an open dialog must never let its Run button
+  // rewrite a different database.
+  let backupConnection: { id: string; generation: number } | null = null;
+  let restoreConnection: { id: string; generation: number } | null = null;
+  const boundToCurrentConnection = (b: { id: string; generation: number } | null) => {
+    const c = conn();
+    return !!c && !!b && c.id === b.id && c.generation === b.generation;
+  };
+  const closeBackup = () => { backupConnection = null; setBackupTarget(null); };
+  const closeRestore = () => { restoreConnection = null; setRestoreOpen(false); };
+  function openRestore() {
+    const c = conn();
+    if (!c) return;
+    restoreConnection = { id: c.id, generation: c.generation };
+    setRestoreOpen(true);
+  }
 
   const backupCatalog = () =>
     (tree()?.schemas ?? []).map((s) => ({ name: s.name, tables: s.tables.map((t) => t.name) }));
@@ -2966,6 +3016,9 @@ function App() {
   function openBackup(target: BackupTarget) {
     if (rejectFrozenExplorer()) return;
     setMenu(null);
+    const c = conn();
+    if (!c) return;
+    backupConnection = { id: c.id, generation: c.generation };
     setBackupTarget(target);
   }
 
@@ -2978,6 +3031,13 @@ function App() {
   async function runBackup(opts: BackupOptions, path: string): Promise<BackupSummary> {
     const c = conn();
     if (!c) throw new Error("not connected");
+    if (!boundToCurrentConnection(backupConnection))
+      throw new Error("the connection changed since this dialog was opened — close it and start the backup again");
+    // The backend refuses a backup while a manual transaction owns the session.
+    // Check that FIRST: `interruptStream` condemns a healthy cursor, and it must
+    // not be spent on a call that is going to be rejected anyway.
+    if (metadataFrozen())
+      throw new Error("backup is frozen while a manual transaction owns the session — commit or roll it back first");
     interruptStream("a backup closed the result stream");
     const t0 = performance.now();
     try {
@@ -3013,6 +3073,10 @@ function App() {
   async function runRestore(path: string, opts: RestoreOptions): Promise<RestoreSummary> {
     const c = conn();
     if (!c) throw new Error("not connected");
+    if (!boundToCurrentConnection(restoreConnection))
+      throw new Error("the connection changed since this dialog was opened — close it and start the restore again");
+    if (metadataFrozen())
+      throw new Error("restore is frozen while a manual transaction owns the session — commit or roll it back first");
     interruptStream("a restore closed the result stream");
     const t0 = performance.now();
     const entry = (status: HistoryEntry["status"], rows: number | null, error: string | null) =>
@@ -3698,7 +3762,7 @@ function App() {
           { sep: true },
           // Backup/restore run against the CONNECTED database — offer them only there.
           { label: "Backup database…", icon: "download", disabled: !cur, title: cur ? undefined : "Connect to this database to back it up", onClick: () => openBackup({ scope: "database", schemas: [], tables: [], suggestedName: n.name }) },
-          { label: "Restore from file…", icon: "fileCode", disabled: !cur || !!conn()?.readOnly, title: !cur ? "Connect to this database to restore into it" : conn()?.readOnly ? "Connection is read-only" : undefined, onClick: () => { setMenu(null); if (!rejectFrozenExplorer()) setRestoreOpen(true); } },
+          { label: "Restore from file…", icon: "fileCode", disabled: !cur || !!conn()?.readOnly, title: !cur ? "Connect to this database to restore into it" : conn()?.readOnly ? "Connection is read-only" : undefined, onClick: () => { setMenu(null); if (!rejectFrozenExplorer()) openRestore(); } },
           { sep: true },
           copyName,
         );
@@ -3825,7 +3889,7 @@ function App() {
         { label: "Find", icon: "search", onClick: () => editorApi()?.openSearch() },
         { sep: true },
         { label: "Backup…", icon: "download", onClick: () => openBackup({ scope: "database", schemas: [], tables: [], suggestedName: tree()?.database || "backup" }) },
-        { label: "Restore from file…", icon: "fileCode", disabled: !!conn()?.readOnly, title: conn()?.readOnly ? "Connection is read-only" : undefined, onClick: () => { setMenu(null); if (!rejectFrozenExplorer()) setRestoreOpen(true); } },
+        { label: "Restore from file…", icon: "fileCode", disabled: !!conn()?.readOnly, title: conn()?.readOnly ? "Connection is read-only" : undefined, onClick: () => { setMenu(null); if (!rejectFrozenExplorer()) openRestore(); } },
         { sep: true },
         ...explainMenuItems(),
       ],
@@ -4763,7 +4827,7 @@ function App() {
               database={tree()?.database ?? ""}
               catalog={backupCatalog()}
               target={target()}
-              onClose={() => setBackupTarget(null)}
+              onClose={closeBackup}
               onPickPath={pickBackupPath}
               onRun={runBackup}
               onCancel={() => void cancelOperation()}
@@ -4774,7 +4838,7 @@ function App() {
           <RestoreDialog
             driverKind={caps()?.kind ?? "postgres"}
             database={tree()?.database ?? ""}
-            onClose={() => setRestoreOpen(false)}
+            onClose={closeRestore}
             onPickFile={pickRestoreFile}
             onRun={runRestore}
             onCancel={() => void cancelOperation()}

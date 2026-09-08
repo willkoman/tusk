@@ -6,18 +6,28 @@
 //!
 //! ```text
 //! -- header comment (tusk version, engine, database, timestamp, options)
+//! PRAGMA foreign_keys = OFF;   -- SQLite only, before any BEGIN
 //! BEGIN;                       -- only where DDL is transactional and asked for
 //! DROP … IF EXISTS             -- include_drop, reverse dependency order
 //! CREATE SCHEMA IF NOT EXISTS
 //! CREATE SEQUENCE
-//! CREATE TABLE (+ indexes, comments)      -- FOREIGN KEYs held back
+//! CREATE TABLE (+ indexes, comments)      -- PG/MySQL: FOREIGN KEYs held back
 //! <data>                       -- PG: COPY … FROM stdin blocks; others: INSERTs
 //! CREATE VIEW / MATERIALIZED VIEW
-//! CREATE FUNCTION / CREATE TRIGGER        -- where the driver can reconstruct them
-//! ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY   -- after all data, so FK cycles restore
+//! CREATE FUNCTION / CREATE TRIGGER        -- PostgreSQL only
+//! ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY   -- PG/MySQL, after all data
 //! SELECT pg_catalog.setval(…)  -- PostgreSQL sequence positions
 //! COMMIT;
+//! PRAGMA foreign_keys = ON;    -- SQLite only
 //! ```
+//!
+//! **Foreign keys are only deferred on PostgreSQL and MySQL.** Those are the engines
+//! that can add a constraint with `ALTER TABLE`, so their FKs are lifted out of the
+//! table body and re-emitted after all the data — table order, cycles included, cannot
+//! break the restore. SQLite and DuckDB have no `ALTER TABLE … ADD CONSTRAINT`, so
+//! their FKs stay inline: SQLite's dump switches enforcement off instead, and a cycle
+//! that `topo_order` cannot resolve is recorded as a warning in the dump and the
+//! summary rather than silently written.
 //!
 //! Restore streams the file back through `script::parse_stream_chunk` so a
 //! multi-gigabyte dump never has to be resident, and executes statement by statement
@@ -238,6 +248,11 @@ pub struct RestoreSummary {
     pub bytes_read: u64,
     pub first_error: Option<RestoreFailure>,
     pub cancelled: bool,
+    /// The restore ran inside one transaction, so `committed` is meaningful.
+    pub single_transaction: bool,
+    /// The single-transaction wrapper committed. Only ever true when there WAS one:
+    /// without a wrapper there is no unit to commit and each successful statement is
+    /// already durable on its own, whatever happened after it.
     pub committed: bool,
 }
 
@@ -304,18 +319,14 @@ impl DumpFile {
         if let Ok(meta) = std::fs::metadata(&destination) {
             let _ = temp.as_file().set_permissions(meta.permissions());
         }
-        let temp = temp.into_temp_path();
-        let name = temp
-            .to_str()
-            .ok_or_else(|| AppError::new("backup temp path is not valid UTF-8"))?
-            .to_string();
-        let file = File::create(&name)
-            .await
-            .map_err(|e| AppError::new(format!("cannot open backup temp file: {e}")))?;
+        // Keep the handle tempfile already opened rather than closing it and
+        // re-opening the same path: there is then no window in which the name we are
+        // about to write through could be replaced by something else.
+        let (file, temp) = temp.into_parts();
         Ok(Self {
             destination,
             temp: Some(temp),
-            writer: BufWriter::new(file),
+            writer: BufWriter::new(File::from_std(file)),
             bytes: 0,
         })
     }
@@ -485,10 +496,18 @@ struct Rel {
     kind: String,
 }
 
-/// Order tables so a referenced table precedes the table referencing it. Best
-/// effort: an FK cycle (or an engine that cannot report edges) keeps catalog order,
-/// which is why PostgreSQL additionally defers every FK to a trailing ALTER.
-fn topo_order(tables: &[Rel], edges: &[(String, String, String, String)]) -> Vec<Rel> {
+/// Order tables so a referenced table precedes the table referencing it, and report
+/// whether a cycle stopped that from being possible.
+///
+/// Best effort: an FK cycle (or an engine that cannot report edges) keeps catalog order
+/// for the tables it could not place, which is why PostgreSQL and MySQL additionally
+/// defer every FK to a trailing ALTER. SQLite and DuckDB cannot add a foreign key with
+/// `ALTER TABLE` at all, so on those engines a cycle is reported to the caller and
+/// recorded in the dump as a warning.
+fn topo_order(
+    tables: &[Rel],
+    edges: &[(String, String, String, String)],
+) -> (Vec<Rel>, Vec<String>) {
     let index: HashMap<(String, String), usize> = tables
         .iter()
         .enumerate()
@@ -524,12 +543,14 @@ fn topo_order(tables: &[Rel], edges: &[(String, String, String, String)]) -> Vec
             break;
         }
     }
+    let mut unordered = Vec::new();
     for (i, table) in tables.iter().enumerate() {
         if !done[i] {
+            unordered.push(format!("{}.{}", table.schema, table.name));
             out.push(table.clone());
         }
     }
-    out
+    (out, unordered)
 }
 
 // --- backup -----------------------------------------------------------------
@@ -660,30 +681,63 @@ async fn backup_inner(
             }
         }
     }
-    let tables = topo_order(&tables, &edges);
+    let (tables, cyclic) = topo_order(&tables, &edges);
 
     // PostgreSQL sequences: identity-owned ones are created by their table's DDL, so
     // only the independent ones get a CREATE. All of them get a setval.
+    //
+    // A `tables` selection needs them too: `ddl.rs` reconstructs a `serial` column as
+    // `DEFAULT nextval('public.t_id_seq'::regclass)`, so a table-scope dump that
+    // skipped sequences produced a file that could not restore at all. The owning
+    // relation comes from `pg_depend` (`'a'` = auto, the serial case; `'i'` = internal,
+    // the identity case), which is also how the selection is filtered.
     let mut create_sequences: Vec<(String, String)> = Vec::new();
     let mut all_sequences: Vec<(String, String)> = Vec::new();
-    if is_pg && opts.scope != "tables" {
+    if is_pg && !schema_names.is_empty() {
+        // Scope the catalog scan to the schemas being dumped rather than listing every
+        // sequence in the database and discarding most of them.
+        let in_list = schema_names
+            .iter()
+            .map(|s| db::pg_string_literal(s))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", ");
         let rows = db::collect_rows(
             &backend
                 .pg()?
-                .simple_query(
-                    "SELECT n.nspname, c.relname, EXISTS (SELECT 1 FROM pg_depend d \
-                       WHERE d.objid = c.oid AND d.classid = 'pg_class'::regclass AND d.deptype = 'i') \
+                .simple_query(&format!(
+                    "SELECT n.nspname, c.relname, \
+                       EXISTS (SELECT 1 FROM pg_depend d \
+                         WHERE d.objid = c.oid AND d.classid = 'pg_class'::regclass \
+                           AND d.deptype = 'i'), \
+                       COALESCE((SELECT tn.nspname FROM pg_depend d \
+                           JOIN pg_class t ON t.oid = d.refobjid \
+                           JOIN pg_namespace tn ON tn.oid = t.relnamespace \
+                         WHERE d.objid = c.oid AND d.classid = 'pg_class'::regclass \
+                           AND d.refclassid = 'pg_class'::regclass \
+                           AND d.deptype IN ('a', 'i') LIMIT 1), ''), \
+                       COALESCE((SELECT t.relname FROM pg_depend d \
+                           JOIN pg_class t ON t.oid = d.refobjid \
+                         WHERE d.objid = c.oid AND d.classid = 'pg_class'::regclass \
+                           AND d.refclassid = 'pg_class'::regclass \
+                           AND d.deptype IN ('a', 'i') LIMIT 1), '') \
                      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-                     WHERE c.relkind = 'S' ORDER BY n.nspname, c.relname",
-                )
+                     WHERE c.relkind = 'S' AND n.nspname IN ({in_list}) \
+                     ORDER BY n.nspname, c.relname"
+                ))
                 .await?,
         )?
         .1;
         for r in &rows {
             let schema = cell(r, 0);
             let name = cell(r, 1);
-            if !wanted_schema(&schema) {
-                continue;
+            // A table selection carries only the sequences its tables own; anything
+            // else would create objects the user did not ask for.
+            if opts.scope == "tables" {
+                let owner_schema = cell(r, 3);
+                let owner_table = cell(r, 4);
+                if owner_table.is_empty() || !wanted_table(&owner_schema, &owner_table) {
+                    continue;
+                }
             }
             all_sequences.push((schema.clone(), name.clone()));
             if cell(r, 2) != "t" {
@@ -737,6 +791,28 @@ async fn backup_inner(
         ));
         out.put("-- note: this engine has no transactional DDL; the dump is not wrapped.\n\n")
             .await?;
+    }
+    // SQLite and DuckDB keep foreign keys INLINE in the table body: neither engine can
+    // add one with `ALTER TABLE`, so they cannot be deferred the way PostgreSQL's and
+    // MySQL's are. SQLite lets the dump switch enforcement off instead (this must come
+    // before any BEGIN — the pragma is a no-op inside a transaction); DuckDB has no
+    // equivalent, so a cycle it cannot order is reported rather than silently written.
+    if dialect == SqlDialect::Sqlite && opts.wants_schema() {
+        out.put(
+            "-- foreign keys stay inline on SQLite (no ALTER TABLE … ADD CONSTRAINT),\n\
+                 -- so enforcement is switched off for the replay.\n",
+        )
+        .await?;
+        out.stmt("PRAGMA foreign_keys = OFF").await?;
+    }
+    if !cyclic.is_empty() && !is_pg && !is_mysql {
+        warnings.push(format!(
+            "foreign key cycle among {} — {} cannot add a foreign key with ALTER TABLE, \
+             so these tables are emitted in catalog order and the dump may not restore \
+             into a database that enforces them",
+            cyclic.join(", "),
+            caps.kind
+        ));
     }
     if wrap {
         out.put("BEGIN;\n\n").await?;
@@ -955,6 +1031,24 @@ async fn backup_inner(
                 }
             }
         }
+        // Routine and trigger reconstruction is PostgreSQL-only (`ddl.rs` /
+        // `tree.rs`). Say so in the dump rather than letting a silently partial file
+        // look complete.
+        if !is_pg && !functions.is_empty() {
+            warnings.push(format!(
+                "{} functions/procedures are not reconstructed — {} routine(s) in this \
+                 selection are NOT in the dump; recreate them by hand",
+                caps.kind,
+                functions.len()
+            ));
+        }
+        if !is_pg {
+            warnings.push(format!(
+                "triggers are not reconstructed on {} — any trigger in this selection is \
+                 NOT in the dump",
+                caps.kind
+            ));
+        }
         if is_pg && !functions.is_empty() {
             out.put("-- functions\n").await?;
             for (schema, name) in &functions {
@@ -1002,8 +1096,57 @@ async fn backup_inner(
             cancelled(cancel)?;
             let relation = format!("{}.{}", db::ident(schema), db::ident(name));
             let read = format!("SELECT last_value, is_called FROM {relation}");
-            let Ok(rows) = db::collect_rows(&backend.pg()?.simple_query(&read).await?) else {
-                continue;
+            // One sequence the role cannot read (or that vanished) must not abort a
+            // dump that is otherwise complete — and the read runs inside the backup's
+            // repeatable-read transaction, so a failure would poison every statement
+            // after it. A savepoint keeps the unit usable and turns the failure into a
+            // warning the dump itself records.
+            let client = backend.pg()?;
+            if let Err(e) = client.batch_execute("SAVEPOINT tusk_backup_seq").await {
+                warnings.push(format!(
+                    "sequence positions: {}",
+                    comment_safe(&AppError::from(e).message)
+                ));
+                break;
+            }
+            let read_result = client.simple_query(&read).await;
+            let rows = match read_result {
+                Ok(messages) => {
+                    let _ = client
+                        .batch_execute("RELEASE SAVEPOINT tusk_backup_seq")
+                        .await;
+                    match db::collect_rows(&messages) {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            warnings.push(format!(
+                                "sequence {schema}.{name}: {}",
+                                comment_safe(&e.message)
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let message = AppError::from(e).message;
+                    if client
+                        .batch_execute("ROLLBACK TO SAVEPOINT tusk_backup_seq")
+                        .await
+                        .is_err()
+                    {
+                        // The transaction is unusable; stop reading positions rather
+                        // than emitting a cascade of identical failures.
+                        warnings.push(format!(
+                            "sequence {schema}.{name}: {}",
+                            comment_safe(&message)
+                        ));
+                        break;
+                    }
+                    warnings.push(format!(
+                        "sequence {schema}.{name}: {}",
+                        comment_safe(&message)
+                    ));
+                    continue;
+                }
             };
             let Some(row) = rows.1.first() else { continue };
             let last = cell(row, 0);
@@ -1025,6 +1168,9 @@ async fn backup_inner(
     }
     if wrap {
         out.put("COMMIT;\n\n").await?;
+    }
+    if dialect == SqlDialect::Sqlite && opts.wants_schema() {
+        out.stmt("PRAGMA foreign_keys = ON").await?;
     }
     for warning in &warnings {
         out.put(&format!("-- warning: {}\n", comment_safe(warning)))
@@ -1238,7 +1384,30 @@ async fn insert_table(
     tables_total: u64,
     object: &str,
 ) -> Result<u64, AppError> {
-    let select = format!("SELECT {column_list} FROM {relation}");
+    // SQLite is dynamically typed: a column declared TEXT can hold a BLOB, and the
+    // declared type is all `data_columns` can see. Ask for `typeof()` alongside every
+    // value so the literal follows what the cell ACTUALLY holds — without it a blob in
+    // an undeclared column came back as the driver's `\x…` rendering and was written
+    // out as that literal text, silently corrupting it on restore.
+    let per_cell_types = dialect == SqlDialect::Sqlite;
+    let select = if per_cell_types {
+        let projection = columns
+            .iter()
+            .map(|c| {
+                let quoted = ident_for(c, dialect);
+                format!("{quoted}, typeof({quoted})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("SELECT {projection} FROM {relation}")
+    } else {
+        format!("SELECT {column_list} FROM {relation}")
+    };
+    let expected_cells = if per_cell_types {
+        columns.len() * 2
+    } else {
+        columns.len()
+    };
     backend.rollback_cursor().await;
     let first = backend.run_single(&select, DATA_PAGE, true).await?;
     let (mut rows, mut done) = match first {
@@ -1257,14 +1426,21 @@ async fn insert_table(
         loop {
             cancelled(cancel)?;
             for row in &rows {
-                if row.len() != columns.len() {
+                if row.len() != expected_cells {
                     return Err(AppError::new(format!(
                         "unexpected column count while reading {object} for backup"
                     )));
                 }
-                let mut values = Vec::with_capacity(row.len());
-                for (k, value) in row.iter().enumerate() {
-                    let blob = if binary_cols.get(k).copied().unwrap_or(false) {
+                let mut values = Vec::with_capacity(columns.len());
+                for k in 0..columns.len() {
+                    let value = &row[if per_cell_types { k * 2 } else { k }];
+                    // With per-cell types the declared type is only a fallback: the
+                    // reported storage class decides.
+                    let is_binary = match per_cell_types {
+                        true => row[k * 2 + 1].as_deref() == Some("blob"),
+                        false => binary_cols.get(k).copied().unwrap_or(false),
+                    };
+                    let blob = if is_binary {
                         binary_literal(value, dialect)?
                     } else {
                         None
@@ -1339,6 +1515,37 @@ pub struct BackupFileInfo {
     pub text: String,
     /// The file is larger than `restore_from_file` will read.
     pub too_large: bool,
+    /// A psql meta-command (`\restrict`, `\connect`, …) found in the header. Tusk
+    /// executes SQL, not psql directives, so the restore would fail at that statement
+    /// — the dialog says so up front instead of only after the first failure.
+    pub meta_command: Option<String>,
+}
+
+/// The leading `\command` of a psql-style directive, if the header carries one on a
+/// line of its own. `pg_dump`'s plain output has begun with `\restrict <token>` since
+/// PostgreSQL 17.6/18, which is the shape this most often takes.
+fn meta_command_in(header: &str) -> Option<String> {
+    header
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('\\'))
+        .map(|line| {
+            line.split_whitespace()
+                .next()
+                .unwrap_or(line)
+                .chars()
+                .take(32)
+                .collect::<String>()
+        })
+        // `\.` terminates COPY data and is part of the dump format, not a directive.
+        .find(|command| command != "\\.")
+}
+
+/// Drop a UTF-8 byte-order mark. Several Windows editors add one when a dump is
+/// re-saved; without this it becomes part of the first statement and the engine
+/// reports an opaque syntax error on a line that looks perfectly fine.
+fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 
 pub async fn read_header(path: &str) -> Result<BackupFileInfo, AppError> {
@@ -1361,9 +1568,11 @@ pub async fn read_header(path: &str) -> Result<BackupFileInfo, AppError> {
         Ok(s) => s.to_string(),
         Err(e) => String::from_utf8_lossy(&bytes[..e.valid_up_to()]).into_owned(),
     };
+    let text = strip_bom(&text).to_string();
     Ok(BackupFileInfo {
         path: path.to_string(),
         bytes: meta.len(),
+        meta_command: meta_command_in(&text),
         text,
         too_large: meta.len() > MAX_RESTORE_FILE_BYTES,
     })
@@ -1399,17 +1608,37 @@ pub async fn run_restore(
     }
 
     backend.rollback_cursor().await;
+    // MySQL runs every statement on a connection checked out of the pool, and a pooled
+    // connection is reset when it goes back. Session state a dump sets up — the
+    // `SET FOREIGN_KEY_CHECKS = 0` at the top of our own MySQL dumps, most obviously —
+    // therefore applied to nothing at all, and could not be relied on for FK ordering.
+    // Pin ONE connection for the whole restore so the session the dump configures is
+    // the session its statements run on (and so nothing leaks back into the pool).
+    backend.begin_bulk_session().await?;
     let wrap = opts.single_transaction;
     if wrap {
-        backend.run_single("BEGIN", 1, false).await?;
+        if let Err(e) = backend.run_single("BEGIN", 1, false).await {
+            backend.end_bulk_session().await;
+            return Err(e);
+        }
     }
-    let outcome = restore_stream(backend, engine, path, opts, cancel, progress).await;
+    let outcome = restore_stream(
+        backend,
+        engine,
+        path,
+        opts,
+        MAX_RESTORE_UNIT_BYTES,
+        cancel,
+        progress,
+    )
+    .await;
     let mut summary = match outcome {
         Ok(summary) => summary,
         Err(e) => {
             if wrap {
                 let _ = backend.run_single("ROLLBACK", 1, false).await;
             }
+            backend.end_bulk_session().await;
             backend.rollback_cursor().await;
             return Err(e);
         }
@@ -1427,18 +1656,20 @@ pub async fn run_restore(
         } else {
             let _ = backend.run_single("ROLLBACK", 1, false).await;
         }
-    } else {
-        summary.committed = summary.statements_ok > 0;
     }
+    backend.end_bulk_session().await;
     backend.rollback_cursor().await;
     Ok(summary)
 }
 
+/// `max_unit` is `MAX_RESTORE_UNIT_BYTES` in production; it is a parameter only so the
+/// cap's enforcement can be tested without writing a 256 MiB fixture.
 async fn restore_stream(
     backend: &mut Backend,
     engine: script::TransactionEngine,
     path: &str,
     opts: &RestoreOptions,
+    max_unit: usize,
     cancel: &AtomicBool,
     progress: &mut (dyn FnMut(RestoreProgress) + Send),
 ) -> Result<RestoreSummary, AppError> {
@@ -1452,6 +1683,7 @@ async fn restore_stream(
         bytes_read: 0,
         first_error: None,
         cancelled: false,
+        single_transaction: opts.single_transaction,
         committed: false,
     };
     let mut throttle = Throttle::new();
@@ -1466,9 +1698,21 @@ async fn restore_stream(
 
     loop {
         if !eof {
+            // The per-unit cap is enforced BEFORE the next read, not after it: with the
+            // check at the bottom of the loop an EOF `continue` jumped straight past it,
+            // so a foreign dump whose single COPY block ran to the end of the file was
+            // buffered whole, however far past the documented limit that was.
+            if leftover.len() >= max_unit {
+                return Err(AppError::new(format!(
+                    "a single statement or COPY block in the dump exceeds the {max_unit}-byte restore limit"
+                )));
+            }
             // Read at least as much as we are already holding back, so a large COPY
-            // block is re-scanned a logarithmic number of times, not once per chunk.
-            let want = RESTORE_CHUNK_BYTES.max(leftover.len());
+            // block is re-scanned a logarithmic number of times, not once per chunk —
+            // clamped so the doubling cannot itself carry `leftover` past the cap.
+            let want = RESTORE_CHUNK_BYTES
+                .max(leftover.len())
+                .min(max_unit - leftover.len());
             let mut buf = vec![0u8; want];
             let mut filled = 0usize;
             while filled < want {
@@ -1501,7 +1745,12 @@ async fn restore_stream(
                     owned
                 }
             };
-            leftover.push_str(&text);
+            // A byte-order mark at the very start is not part of the first statement.
+            leftover.push_str(if summary.bytes_read == filled as u64 {
+                strip_bom(&text)
+            } else {
+                &text
+            });
         }
 
         let split = if final_pass {
@@ -1558,6 +1807,13 @@ async fn restore_stream(
                     summary.rows_copied = summary.rows_copied.saturating_add(copied);
                 }
                 Err(e) => {
+                    // A statement that failed BECAUSE the user cancelled (the server
+                    // cancel lands mid-statement) is a cancellation, not a defect in
+                    // the dump — report it as one instead of "restore failed".
+                    if cancel.load(Ordering::Relaxed) {
+                        summary.cancelled = true;
+                        return Ok(summary);
+                    }
                     summary.statements_failed += 1;
                     if summary.first_error.is_none() {
                         summary.first_error = Some(RestoreFailure {
@@ -1591,11 +1847,6 @@ async fn restore_stream(
         if eof {
             final_pass = true;
             continue;
-        }
-        if leftover.len() > MAX_RESTORE_UNIT_BYTES {
-            return Err(AppError::new(format!(
-                "a single statement or COPY block in the dump exceeds the {MAX_RESTORE_UNIT_BYTES}-byte restore limit"
-            )));
         }
     }
 
@@ -1718,11 +1969,10 @@ mod tests {
             "s".to_string(),
             "users".to_string(),
         )];
-        let order: Vec<String> = topo_order(&tables, &edges)
-            .into_iter()
-            .map(|t| t.name)
-            .collect();
+        let (ordered, cyclic) = topo_order(&tables, &edges);
+        let order: Vec<String> = ordered.into_iter().map(|t| t.name).collect();
         assert_eq!(order, vec!["users".to_string(), "orders".to_string()]);
+        assert!(cyclic.is_empty());
     }
 
     #[test]
@@ -1737,10 +1987,14 @@ mod tests {
             ("s".into(), "a".into(), "s".into(), "b".into()),
             ("s".into(), "b".into(), "s".into(), "a".into()),
         ];
-        let order = topo_order(&tables, &edges);
+        let (order, cyclic) = topo_order(&tables, &edges);
         assert_eq!(order.len(), 2);
         assert!(order.iter().any(|t| t.name == "a"));
         assert!(order.iter().any(|t| t.name == "b"));
+        // The cycle is REPORTED, so engines that cannot defer a foreign key into a
+        // trailing ALTER (SQLite, DuckDB) can warn instead of writing a dump that
+        // silently will not restore.
+        assert_eq!(cyclic, vec!["s.a".to_string(), "s.b".to_string()]);
     }
 
     #[test]
@@ -2189,5 +2443,191 @@ mod tests {
             script::Item::Sql(sql) => format!("SQL:{sql}"),
             script::Item::Copy { stmt, data } => format!("COPY:{stmt}|{data}"),
         }
+    }
+
+    // --- review regressions --------------------------------------------------
+
+    #[tokio::test]
+    async fn a_copy_block_running_to_end_of_file_still_hits_the_unit_cap() {
+        // The guard used to sit BELOW the `if eof { final_pass = true; continue; }`
+        // branch, so a dump whose one COPY block ran to the end of the file jumped
+        // straight past it and was buffered whole, however far past the cap.
+        let (_dir, path) = temp_dump("unit_cap");
+        let mut text = String::from("COPY t (a) FROM stdin;\n");
+        for i in 0..20_000 {
+            text.push_str(&format!("row-{i}\n"));
+        }
+        // Deliberately unterminated: the block runs to EOF, which is the case the
+        // misplaced guard let through.
+        std::fs::write(&path, &text).unwrap();
+        let (mut b, _v) = connect(&mem("sqlite")).await.unwrap();
+        let err = restore_stream(
+            &mut b,
+            script::TransactionEngine::Postgres,
+            &path,
+            &RestoreOptions {
+                stop_on_error: true,
+                single_transaction: false,
+            },
+            8 * 1024, // a small stand-in for MAX_RESTORE_UNIT_BYTES
+            &AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .await
+        .expect_err("an over-cap unit must be refused, not buffered");
+        assert!(err.message.contains("restore limit"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn a_leading_byte_order_mark_does_not_break_the_first_statement() {
+        let (_dir, path) = temp_dump("bom");
+        std::fs::write(
+            &path,
+            "\u{feff}CREATE TABLE bom_ok (a INTEGER);\nINSERT INTO bom_ok VALUES (1);\n",
+        )
+        .unwrap();
+        let (mut b, _v) = connect(&mem("sqlite")).await.unwrap();
+        let summary = replay(&mut b, "sqlite", &path).await;
+        assert_eq!(summary.statements_failed, 0, "{:?}", summary.first_error);
+        assert_eq!(read(&mut b, "SELECT a FROM bom_ok").await.len(), 1);
+
+        // The pre-flight strips it too, so the dialog's header preview is readable.
+        let info = read_header(&path).await.unwrap();
+        assert!(info.text.starts_with("CREATE TABLE"), "{}", info.text);
+        assert_eq!(info.meta_command, None);
+    }
+
+    #[tokio::test]
+    async fn the_header_preflight_names_a_psql_meta_command() {
+        // pg_dump's plain output has begun with `\restrict <token>` since PG 17.6/18.
+        let (_dir, path) = temp_dump("restrict");
+        std::fs::write(
+            &path,
+            "--\n-- PostgreSQL database dump\n--\n\n\\restrict abc123\n\nCREATE TABLE t (a int);\n",
+        )
+        .unwrap();
+        let info = read_header(&path).await.unwrap();
+        assert_eq!(info.meta_command.as_deref(), Some("\\restrict"));
+
+        // `\.` closes COPY data and is part of the format, not a directive.
+        let (_dir2, ok) = temp_dump("copy_terminator");
+        std::fs::write(&ok, "COPY t (a) FROM stdin;\n1\n\\.\n").unwrap();
+        assert_eq!(read_header(&ok).await.unwrap().meta_command, None);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_restore_is_reported_as_cancelled_not_failed() {
+        // The statement itself fails when the cancel lands mid-execution; the flag has
+        // to be consulted BEFORE the failure is recorded as a defect in the dump.
+        let (_dir, path) = temp_dump("cancel_report");
+        std::fs::write(
+            &path,
+            "CREATE TABLE cancel_ok (a INTEGER);\nNOT SQL AT ALL;\n",
+        )
+        .unwrap();
+        let (mut b, _v) = connect(&mem("sqlite")).await.unwrap();
+        let flag = AtomicBool::new(true); // already cancelled
+        let summary = run_restore(
+            &mut b,
+            script::TransactionEngine::Sqlite,
+            &path,
+            &RestoreOptions {
+                stop_on_error: true,
+                single_transaction: false,
+            },
+            &flag,
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(summary.cancelled);
+        assert_eq!(summary.statements_failed, 0);
+        assert!(summary.first_error.is_none());
+        // Without a wrapper there is nothing to commit; the summary says so instead of
+        // implying a transaction outcome it never had.
+        assert!(!summary.single_transaction);
+        assert!(!summary.committed);
+    }
+
+    #[tokio::test]
+    async fn a_sqlite_blob_in_an_undeclared_column_round_trips() {
+        // SQLite is dynamically typed: the declared type of a column says nothing about
+        // what a given cell holds. Classifying on the declared type alone wrote a blob
+        // out as the driver's `\x…` text and silently corrupted it.
+        let (_dir, path) = temp_dump("sqlite_typeof");
+        let (mut src, _v) = connect(&mem("sqlite")).await.unwrap();
+        run(
+            &mut src,
+            "CREATE TABLE mixed (id INTEGER PRIMARY KEY, payload TEXT)",
+        )
+        .await;
+        run(&mut src, "INSERT INTO mixed VALUES (1, X'00FF41')").await;
+        run(&mut src, "INSERT INTO mixed VALUES (2, 'plain text')").await;
+        // A text value that LOOKS like the driver's hex rendering must stay text.
+        run(&mut src, "INSERT INTO mixed VALUES (3, '\\x00ff41')").await;
+        run(&mut src, "INSERT INTO mixed VALUES (4, NULL)").await;
+        let before = read(
+            &mut src,
+            "SELECT id, typeof(payload), payload FROM mixed ORDER BY id",
+        )
+        .await;
+
+        dump(&mut src, &options("database", "all", true), &path)
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("X'00ff41'"),
+            "blob emitted as a blob:\n{text}"
+        );
+        // The dump switches enforcement off for the replay, since SQLite cannot add a
+        // foreign key with ALTER TABLE.
+        assert!(text.contains("PRAGMA foreign_keys = OFF;"), "{text}");
+
+        let (mut dst, _v) = connect(&mem("sqlite")).await.unwrap();
+        let restored = replay(&mut dst, "sqlite", &path).await;
+        assert_eq!(restored.statements_failed, 0, "{:?}", restored.first_error);
+        assert_eq!(
+            read(
+                &mut dst,
+                "SELECT id, typeof(payload), payload FROM mixed ORDER BY id"
+            )
+            .await,
+            before,
+            "storage classes and values both survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_foreign_key_cycle_is_warned_about_where_it_cannot_be_deferred() {
+        // SQLite keeps foreign keys inline (it cannot add one with ALTER TABLE), so a
+        // cycle cannot be ordered around the way PostgreSQL's and MySQL's are. The dump
+        // has to say so rather than look clean. (DuckDB cannot even express a cycle: it
+        // rejects a forward reference at CREATE and has no ADD CONSTRAINT.)
+        let (_dir, path) = temp_dump("sqlite_cycle");
+        let (mut src, _v) = connect(&mem("sqlite")).await.unwrap();
+        run(
+            &mut src,
+            "CREATE TABLE cyc_a (id INTEGER PRIMARY KEY, b_id INTEGER REFERENCES cyc_b(id))",
+        )
+        .await;
+        run(
+            &mut src,
+            "CREATE TABLE cyc_b (id INTEGER PRIMARY KEY, a_id INTEGER REFERENCES cyc_a(id))",
+        )
+        .await;
+        let summary = dump(&mut src, &options("database", "schema", false), &path)
+            .await
+            .unwrap();
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("foreign key cycle")),
+            "expected a cycle warning, got {:?}",
+            summary.warnings
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("-- warning: foreign key cycle"), "{text}");
     }
 }
