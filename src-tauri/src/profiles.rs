@@ -29,7 +29,7 @@ pub struct Profile {
     /// Auto-connect to this profile on app launch (at most one profile).
     #[serde(default)]
     pub default_connect: bool,
-    /// "postgres" (default for old profiles) | "duckdb" | "sqlite" | "mysql".
+    /// "postgres" (default for old profiles) | "duckdb" | "sqlite" | "mysql" | "mssql".
     #[serde(default)]
     pub driver: Option<String>,
     /// Database file path for embedded drivers (DuckDB/SQLite); empty = :memory:.

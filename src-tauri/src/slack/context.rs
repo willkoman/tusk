@@ -25,7 +25,7 @@ pub struct SampleTable {
 
 /// Connection facts the prompt needs (Slack has no editor SQL / selection).
 pub struct SlackAiCtx {
-    pub dialect: String, // "postgres" | "mysql" | "sqlite" | "duckdb"
+    pub dialect: String, // "postgres" | "mysql" | "sqlite" | "duckdb" | "mssql"
     pub user: String,
     pub is_superuser: bool,
     pub permissions_enforced: bool,
@@ -37,6 +37,7 @@ pub struct SlackAiCtx {
 fn quote_note(dialect: &str) -> &'static str {
     match dialect {
         "mysql" => "Quote identifiers with backticks (`col`).",
+        "mssql" => "Quote identifiers with brackets ([col]).",
         _ => "Quote identifiers with double quotes (\"col\").",
     }
 }

@@ -163,6 +163,29 @@ impl Capabilities {
             autocommit_mode: false,
         }
     }
+    pub fn mssql() -> Self {
+        Self {
+            kind: "mssql",
+            server_cursor: false, // paged via OFFSET/FETCH, not a server cursor
+            bulk_copy: false,
+            export: true, // paged export (not snapshot-consistent under writes)
+            schemas: true,
+            search_path: false, // T-SQL resolves through the login's default schema
+            transactional_ddl: true,
+            tls: true,
+            keychain: true,
+            permissions: false,
+            ddl: true,           // reconstructed from sys.* / sys.sql_modules
+            relationships: true, // sys.foreign_keys
+            // T-SQL has no EXPLAIN; plans come from SHOWPLAN, which Tusk cannot render.
+            explain_analyze: false,
+            cancel_query: false, // tiberius exposes no out-of-band attention signal
+            manual_transactions: true,
+            transaction_savepoints: true, // SAVE TRANSACTION (no RELEASE)
+            set_transaction: false,       // SET TRANSACTION ISOLATION LEVEL is session-wide
+            autocommit_mode: false,
+        }
+    }
     pub fn mysql() -> Self {
         Self {
             kind: "mysql",
@@ -483,6 +506,8 @@ pub enum Backend {
     Duck(DuckConn),
     Sqlite(SqliteConn),
     MySql(MySqlConn),
+    // Boxed: the tiberius client is far larger than the other connection structs.
+    MsSql(Box<MsSqlConn>),
 }
 
 /// Open a connection for the configured driver. PG = network (TLS); DuckDB = a local
@@ -505,6 +530,7 @@ pub async fn connect(config: &ConnectionConfig) -> Result<(Backend, String), App
         "duckdb" => DuckConn::open(config),
         "sqlite" => SqliteConn::open(config),
         "mysql" => MySqlConn::open(config).await,
+        "mssql" => MsSqlConn::open(config).await,
         other => Err(AppError::new(format!("unknown driver: {other}"))),
     }
 }
@@ -516,6 +542,7 @@ impl Backend {
             Backend::Duck(_) => Capabilities::duckdb(),
             Backend::Sqlite(_) => Capabilities::sqlite(),
             Backend::MySql(_) => Capabilities::mysql(),
+            Backend::MsSql(_) => Capabilities::mssql(),
         }
     }
 
@@ -525,6 +552,7 @@ impl Backend {
             Backend::Duck(d) => &d.config,
             Backend::Sqlite(s) => &s.config,
             Backend::MySql(m) => &m.config,
+            Backend::MsSql(m) => &m.config,
         }
     }
 
@@ -535,6 +563,8 @@ impl Backend {
             // re-opens it (and its file lock) lazily on the next command.
             Backend::Duck(d) => !d.is_open(),
             Backend::MySql(m) => m.manual_lost,
+            // tiberius exposes no liveness probe; the driver latches transport failures.
+            Backend::MsSql(m) => m.is_dead(),
             Backend::Sqlite(_) => false,
         }
     }
@@ -551,6 +581,7 @@ impl Backend {
                 .is_none(),
             Backend::Sqlite(sqlite) => sqlite.lock().is_autocommit(),
             Backend::MySql(mysql) => mysql.manual_lost,
+            Backend::MsSql(mssql) => mssql.manual_lost || mssql.is_dead(),
         }
     }
 
@@ -570,6 +601,7 @@ impl Backend {
             Backend::Duck(d) => d.stream_sql.is_some(),
             Backend::Sqlite(s) => s.stream_sql.is_some(),
             Backend::MySql(m) => m.stream_sql.is_some(),
+            Backend::MsSql(m) => m.stream_sql.is_some(),
         }
     }
 
@@ -582,7 +614,21 @@ impl Backend {
         match self {
             Backend::Pg(_) => true,
             Backend::Duck(duck) => duck.manual_transaction_aborted(),
+            // SQL Server dooms a transaction only for some errors; the driver records
+            // XACT_STATE() = -1 when it observes one (probing here would need async).
+            Backend::MsSql(mssql) => mssql.doomed,
             _ => false,
+        }
+    }
+
+    /// The script/transaction dialect of this backend.
+    pub fn engine(&self) -> script::TransactionEngine {
+        match self {
+            Backend::Pg(_) => script::TransactionEngine::Postgres,
+            Backend::Duck(_) => script::TransactionEngine::DuckDb,
+            Backend::Sqlite(_) => script::TransactionEngine::Sqlite,
+            Backend::MySql(_) => script::TransactionEngine::MySql,
+            Backend::MsSql(_) => script::TransactionEngine::MsSql,
         }
     }
 
@@ -633,6 +679,13 @@ impl Backend {
                 }
                 Ok(())
             }
+            Backend::MsSql(m) => {
+                let (backend, _v) = MsSqlConn::open(&m.config).await?;
+                if let Backend::MsSql(nm) = backend {
+                    *m = nm;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -677,6 +730,7 @@ impl Backend {
                 m.stream_sql = None;
                 m.offset = 0;
             }
+            Backend::MsSql(m) => m.reset_stream(),
         }
     }
 
@@ -713,6 +767,10 @@ impl Backend {
                 m.offset = 0;
                 Ok(())
             }
+            Backend::MsSql(m) => {
+                m.reset_stream();
+                Ok(())
+            }
         }
     }
 
@@ -738,6 +796,7 @@ impl Backend {
                 let _ = s.lock().execute_batch("ROLLBACK");
             }
             Backend::MySql(m) => m.rollback_pinned().await,
+            Backend::MsSql(m) => m.rollback_manual().await,
         }
     }
 
@@ -751,7 +810,7 @@ impl Backend {
         items: &[script::Item],
         read_only: bool,
     ) -> Result<String, AppError> {
-        if script::has_txn_control(items) {
+        if script::has_txn_control_for(items, self.engine()) {
             return Err(AppError::new(
                 "transaction-control statements are not supported; run the statements as one script without BEGIN/COMMIT",
             ));
@@ -809,6 +868,7 @@ impl Backend {
                 embedded_script(&s.lock(), items, |c, s| c.execute_batch(s).map_err(de))
             }
             Backend::MySql(m) => m.run_script(items).await,
+            Backend::MsSql(m) => m.run_script(items).await,
         }
     }
 
@@ -834,6 +894,7 @@ impl Backend {
                 .map_err(|e| d.quarantine_if_poisoned(e)),
             Backend::Sqlite(s) => s.run_single(trimmed, page, cursorable),
             Backend::MySql(m) => m.run_single(trimmed, page, cursorable).await,
+            Backend::MsSql(m) => m.run_single(trimmed, page, cursorable, false).await,
         }
     }
 
@@ -864,6 +925,7 @@ impl Backend {
                 .map_err(|e| d.quarantine_if_poisoned(e)),
             Backend::Sqlite(s) => s.run_single(trimmed, page, cursorable),
             Backend::MySql(m) => m.run_manual_single(trimmed, page, cursorable, mode).await,
+            Backend::MsSql(m) => m.run_single(trimmed, page, cursorable, true).await,
         }
     }
 
@@ -891,6 +953,7 @@ impl Backend {
                 })
             }
             Backend::MySql(m) => m.run_transaction_statement(sql, action, current_mode).await,
+            Backend::MsSql(m) => m.run_transaction_statement(sql, action).await,
         }
     }
 
@@ -929,6 +992,7 @@ impl Backend {
             Backend::Duck(d) => d.fetch_page(page).map_err(|e| d.quarantine_if_poisoned(e)),
             Backend::Sqlite(s) => s.fetch_page(page),
             Backend::MySql(m) => m.fetch_page(page).await,
+            Backend::MsSql(m) => m.fetch_page(page).await,
         }
     }
 
@@ -1011,6 +1075,8 @@ impl Backend {
                 found
             }
             Backend::MySql(_) => Vec::new(),
+            // sys.dm_exec_describe_first_result_set parses without executing.
+            Backend::MsSql(m) => m.bool_columns(sql).await,
         }
     }
 
@@ -1031,6 +1097,7 @@ impl Backend {
                 let (c, r, _a) = mysql_run_limited(&m.pool, sql, limits).await?;
                 Ok((c, r))
             }
+            Backend::MsSql(m) => m.query_text(sql, limits).await,
         }
     }
 
@@ -1048,6 +1115,7 @@ impl Backend {
             Backend::Duck(d) => duck_build_tree(&d.lock()),
             Backend::Sqlite(s) => sqlite_build_tree(&s.lock()),
             Backend::MySql(m) => mysql_build_tree(&m.pool).await,
+            Backend::MsSql(m) => m.build_tree().await,
         }
     }
 
@@ -1080,6 +1148,13 @@ impl Backend {
                 .and_then(|(_c, rows, _a)| rows.into_iter().next())
                 .and_then(|r| r.into_iter().next().flatten())
                 .unwrap_or_default(),
+            Backend::MsSql(m) => m
+                .query_text("SELECT DB_NAME()", db::CATALOG_TEXT_LIMITS)
+                .await
+                .ok()
+                .and_then(|(_c, rows)| rows.into_iter().next())
+                .and_then(|r| r.into_iter().next().flatten())
+                .unwrap_or_default(),
         }
     }
 
@@ -1094,6 +1169,7 @@ impl Backend {
             Backend::Duck(d) => duck_table_detail(&d.lock(), schema, name),
             Backend::Sqlite(s) => sqlite_table_detail(&s.lock(), name),
             Backend::MySql(m) => mysql_table_detail(&m.pool, schema, name).await,
+            Backend::MsSql(m) => m.table_detail(schema, name).await,
         }
     }
 
@@ -1141,6 +1217,10 @@ impl Backend {
                     name.into(),
                 ]);
                 let (_c, rows, _a) = mysql_run_params(&m.pool, sql, params).await?;
+                Ok(relgraph::mysql_split(&rows, schema, name))
+            }
+            Backend::MsSql(m) => {
+                let rows = m.fk_edge_rows(Some((schema, name))).await?;
                 Ok(relgraph::mysql_split(&rows, schema, name))
             }
         }
@@ -1228,6 +1308,15 @@ impl Backend {
                                ORDER BY table_name, ordinal_position";
                 let col_params = mysql_async::Params::Positional(vec![schema.into()]);
                 let (_c2, col_rows, _a2) = mysql_run_params(&m.pool, col_sql, col_params).await?;
+                Ok(relgraph::mysql_schema_graph(&col_rows, &edge_rows, schema))
+            }
+            Backend::MsSql(m) => {
+                let edge_rows = m.fk_edge_rows(None).await?;
+                let edge_rows: Vec<Vec<Option<String>>> = edge_rows
+                    .into_iter()
+                    .filter(|row| dcell(row, 1) == schema || dcell(row, 4) == schema)
+                    .collect();
+                let col_rows = m.erd_column_rows(schema).await?;
                 Ok(relgraph::mysql_schema_graph(&col_rows, &edge_rows, schema))
             }
         }
@@ -1320,6 +1409,7 @@ impl Backend {
                     })
                     .ok_or_else(|| AppError::new("no stored DDL for this object"))
             }
+            Backend::MsSql(m) => m.relation_ddl(kind, schema, name).await,
         }
     }
 
@@ -1365,6 +1455,9 @@ impl Backend {
             // is user routines only) — a partial list would false-positive on every
             // uncommon builtin, so report none and the lint stays off.
             Backend::MySql(_) => Ok(Vec::new()),
+            // SQL Server keeps no catalog of built-in functions either (sys.objects is
+            // user objects only), so linting against it would flag every builtin.
+            Backend::MsSql(_) => Ok(Vec::new()),
         }
     }
 
@@ -1387,6 +1480,7 @@ impl Backend {
         // exclusion differs.
         let exclude = match self {
             Backend::MySql(_) => "('mysql','information_schema','performance_schema','sys')",
+            Backend::MsSql(_) => "('sys','INFORMATION_SCHEMA')",
             _ => "('pg_catalog','information_schema')",
         };
         let sql = format!(
@@ -1421,9 +1515,12 @@ impl Backend {
 /// everyone else double quotes). Schema-qualified when a schema is given.
 fn sample_sql(b: &Backend, schema: &str, table: &str, limit: u32) -> String {
     let mysql = matches!(b, Backend::MySql(_));
+    let mssql = matches!(b, Backend::MsSql(_));
     let q = |s: &str| {
         if mysql {
             format!("`{}`", s.replace('`', "``"))
+        } else if mssql {
+            format!("[{}]", s.replace(']', "]]"))
         } else {
             format!("\"{}\"", s.replace('"', "\"\""))
         }
@@ -1433,6 +1530,10 @@ fn sample_sql(b: &Backend, schema: &str, table: &str, limit: u32) -> String {
     } else {
         format!("{}.{}", q(schema), q(table))
     };
+    if mssql {
+        // T-SQL has no LIMIT; TOP is the row-count form that needs no ORDER BY.
+        return format!("SELECT TOP {limit} * FROM {rel}");
+    }
     format!("SELECT * FROM {rel} LIMIT {limit}")
 }
 
@@ -2724,6 +2825,1078 @@ async fn mysql_table_detail(
     })
 }
 
+// --- SQL Server (tiberius / TDS) ---
+
+type MsSqlStream = tokio_util::compat::Compat<tokio::net::TcpStream>;
+type MsSqlClient = tiberius::Client<MsSqlStream>;
+
+/// A live SQL Server connection. tiberius owns one TDS session and is neither a pool
+/// nor `Sync`, so the client sits behind an async mutex: `Backend` methods that only
+/// take `&self` (introspection, script runs, export feeds) still need exclusive access
+/// to the socket. The per-connection `AsyncMutex` in the registry already serializes
+/// commands, so this lock is effectively uncontended.
+///
+/// Paging has no server cursor: `stream_sql` plus `offset` re-derive each page with
+/// `OFFSET … ROWS FETCH NEXT … ROWS ONLY`, and `paging` records which of the three
+/// T-SQL forms is safe for that statement (see `script::mssql_paging`).
+pub struct MsSqlConn {
+    client: tokio::sync::Mutex<MsSqlClient>,
+    pub config: ConnectionConfig,
+    pub stream_sql: Option<String>,
+    pub offset: usize,
+    paging: script::MsSqlPaging,
+    /// Latched transport failure — tiberius has no `is_closed`, so a lost socket is
+    /// remembered here and `ensure_alive` re-dials before the next explicit command.
+    dead: std::sync::atomic::AtomicBool,
+    /// The tracked manual transaction no longer exists on the server.
+    manual_lost: bool,
+    /// SQL Server reported `XACT_STATE() = -1`: the transaction can only be rolled back.
+    doomed: bool,
+}
+
+fn mssql_err(error: tiberius::error::Error) -> AppError {
+    // tiberius' Display for a server token is already the SQL Server message text.
+    AppError::new(error.to_string())
+}
+
+/// `[bracket]` identifier quoting (`]` doubles), the T-SQL form Tusk emits everywhere.
+fn mssql_ident(name: &str) -> String {
+    format!("[{}]", name.replace(']', "]]"))
+}
+
+fn mssql_lit(value: &str) -> String {
+    format!("N'{}'", value.replace('\'', "''"))
+}
+
+/// Render a `numeric`/`decimal` from its unscaled integer and scale. tiberius' own
+/// `Display` composes `int_part` and `dec_part` separately, which prints `-1.-50`
+/// for negative values.
+fn mssql_numeric(value: tiberius::numeric::Numeric) -> String {
+    let scale = value.scale() as usize;
+    let raw = value.value();
+    let sign = if raw < 0 { "-" } else { "" };
+    let digits = raw.unsigned_abs().to_string();
+    if scale == 0 {
+        return format!("{sign}{digits}");
+    }
+    let padded = if digits.len() <= scale {
+        format!("{}{digits}", "0".repeat(scale + 1 - digits.len()))
+    } else {
+        digits
+    };
+    let split = padded.len() - scale;
+    format!("{sign}{}.{}", &padded[..split], &padded[split..])
+}
+
+/// One TDS value as the text-or-NULL cell that crosses IPC. Binary columns use the
+/// same reversible lowercase `\x…` hex as every other driver; `bit` renders
+/// `true`/`false` so the grid's boolean heuristic and export share one vocabulary.
+fn mssql_value(data: &tiberius::ColumnData<'static>) -> Result<Option<String>, AppError> {
+    use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
+    use tiberius::ColumnData as C;
+    use tiberius::FromSql;
+
+    fn temporal<'a, T: FromSql<'a>>(
+        data: &'a tiberius::ColumnData<'static>,
+    ) -> Result<Option<T>, AppError> {
+        T::from_sql(data).map_err(mssql_err)
+    }
+
+    Ok(match data {
+        C::U8(v) => v.map(|n| n.to_string()),
+        C::I16(v) => v.map(|n| n.to_string()),
+        C::I32(v) => v.map(|n| n.to_string()),
+        C::I64(v) => v.map(|n| n.to_string()),
+        C::F32(v) => v.map(|n| n.to_string()),
+        C::F64(v) => v.map(|n| n.to_string()),
+        C::Bit(v) => v.map(|b| if b { "true" } else { "false" }.to_string()),
+        C::String(v) => v.as_ref().map(|s| s.to_string()),
+        C::Guid(v) => v.map(|g| g.to_string()),
+        C::Binary(v) => v.as_ref().map(|b| binary_text(b)),
+        C::Numeric(v) => v.map(mssql_numeric),
+        C::Xml(v) => v.as_ref().map(|x| x.as_ref().to_string()),
+        C::DateTime(_) | C::SmallDateTime(_) | C::DateTime2(_) => {
+            temporal::<NaiveDateTime>(data)?.map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+        }
+        C::Date(_) => temporal::<NaiveDate>(data)?.map(|d| d.format("%Y-%m-%d").to_string()),
+        C::Time(_) => temporal::<NaiveTime>(data)?.map(|t| t.format("%H:%M:%S%.f").to_string()),
+        C::DateTimeOffset(_) => temporal::<DateTime<FixedOffset>>(data)?
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f %:z").to_string()),
+    })
+}
+
+/// Drain one `QueryStream` into bounded text rows. A second result set is rejected —
+/// the app's contract is one result per statement, and silently keeping the first
+/// would hide half the output.
+async fn mssql_collect(
+    mut stream: tiberius::QueryStream<'_>,
+    limits: db::TextLimits,
+) -> Result<TextRows, AppError> {
+    use futures_util::TryStreamExt;
+
+    let columns: Vec<String> = match stream.columns().await.map_err(mssql_err)? {
+        Some(columns) => columns.iter().map(|c| c.name().to_string()).collect(),
+        None => Vec::new(),
+    };
+    let mut budget = db::TextBudget::new(&columns, limits)?;
+    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+    while let Some(item) = stream.try_next().await.map_err(mssql_err)? {
+        if item
+            .as_metadata()
+            .is_some_and(|meta| meta.result_index() > 0)
+        {
+            return Err(AppError::new(
+                "database returned multiple result sets where one was expected",
+            ));
+        }
+        let Some(row) = item.into_row() else { continue };
+        if row.result_index() > 0 {
+            return Err(AppError::new(
+                "database returned multiple result sets where one was expected",
+            ));
+        }
+        let mut out = Vec::with_capacity(columns.len());
+        for (_column, data) in row.cells() {
+            out.push(mssql_value(data)?);
+        }
+        budget.add_row(&out)?;
+        rows.push(out);
+    }
+    Ok((columns, rows))
+}
+
+/// Reject anything but one plain statement before it reaches the session. The command
+/// layer already splits, but the driver must not be the one path with a single check.
+fn mssql_single_statement(sql: &str) -> Result<(), AppError> {
+    match script::parse_for_engine(sql, script::TransactionEngine::MsSql)?.as_slice() {
+        [script::Item::Sql(_)] => Ok(()),
+        _ => Err(AppError::new(
+            "SQL Server driver refused a multi-statement or COPY query",
+        )),
+    }
+}
+
+impl MsSqlConn {
+    async fn open(config: &ConnectionConfig) -> Result<(Backend, String), AppError> {
+        if config.user.trim().is_empty() {
+            return Err(AppError::new(
+                "SQL Server integrated (Windows) authentication isn't supported yet — enter a SQL login and password",
+            ));
+        }
+        let client = Self::open_client(config).await?;
+        let conn = MsSqlConn {
+            client: tokio::sync::Mutex::new(client),
+            config: config.clone(),
+            stream_sql: None,
+            offset: 0,
+            paging: script::MsSqlPaging::Buffered,
+            dead: std::sync::atomic::AtomicBool::new(false),
+            manual_lost: false,
+            doomed: false,
+        };
+        let version = conn
+            .query_text(
+                "SELECT CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128))",
+                db::CATALOG_TEXT_LIMITS,
+            )
+            .await
+            .ok()
+            .and_then(|(_c, rows)| rows.into_iter().next())
+            .and_then(|row| row.into_iter().next().flatten())
+            .unwrap_or_else(|| "unknown".to_string());
+        Ok((
+            Backend::MsSql(Box::new(conn)),
+            format!("SQL Server {version}"),
+        ))
+    }
+
+    async fn open_client(config: &ConnectionConfig) -> Result<MsSqlClient, AppError> {
+        use tokio_util::compat::TokioAsyncWriteCompatExt;
+
+        let mut cfg = tiberius::Config::new();
+        cfg.host(&config.host);
+        cfg.port(if config.port == 0 { 1433 } else { config.port });
+        if !config.dbname.is_empty() {
+            cfg.database(&config.dbname);
+        }
+        cfg.application_name("Tusk");
+        cfg.authentication(tiberius::AuthMethod::sql_server(
+            &config.user,
+            &config.password,
+        ));
+        // libpq-shaped sslmode: `disable` turns TDS encryption off entirely, `prefer`
+        // and `require` encrypt without verifying the certificate, and the `verify-*`
+        // modes encrypt and validate against the system trust store.
+        match config.sslmode.as_deref().unwrap_or("prefer") {
+            "disable" => cfg.encryption(tiberius::EncryptionLevel::NotSupported),
+            "verify-ca" | "verify-full" => cfg.encryption(tiberius::EncryptionLevel::Required),
+            _ => {
+                cfg.encryption(tiberius::EncryptionLevel::Required);
+                cfg.trust_cert();
+            }
+        }
+        let addr = cfg.get_addr();
+        let tcp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        .map_err(|_| AppError::new(format!("timed out connecting to {addr}")))?
+        .map_err(de)?;
+        tcp.set_nodelay(true).map_err(de)?;
+        tiberius::Client::connect(cfg, tcp.compat_write())
+            .await
+            .map_err(mssql_err)
+    }
+
+    fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+    }
+
+    fn reset_stream(&mut self) {
+        self.stream_sql = None;
+        self.offset = 0;
+        self.paging = script::MsSqlPaging::Buffered;
+    }
+
+    /// Latch transport-level failures so `ensure_alive` re-dials instead of replaying
+    /// commands over a dead socket. Server-reported SQL errors leave the session usable.
+    fn note_error(&self, error: &AppError) -> AppError {
+        // Only tiberius' I/O and protocol errors qualify: a server-reported SQL error
+        // ("Token error: …") leaves the session perfectly usable, and treating one as a
+        // lost connection would wrongly declare an owned manual transaction lost.
+        // Matching is on the two `Display` prefixes because either can surface from
+        // inside `mssql_collect` as well as from the initial request.
+        const TRANSPORT_PREFIXES: [&str; 2] = [
+            "An error occurred during the attempt of performing I/O",
+            "Protocol error",
+        ];
+        if TRANSPORT_PREFIXES
+            .iter()
+            .any(|prefix| error.message.starts_with(prefix))
+        {
+            self.dead.store(true, Ordering::Release);
+        }
+        AppError::new(error.message.clone())
+    }
+
+    async fn run_text(&self, sql: &str, limits: db::TextLimits) -> Result<TextRows, AppError> {
+        let mut client = self.client.lock().await;
+        let result = async {
+            let stream = client.simple_query(sql).await.map_err(mssql_err)?;
+            mssql_collect(stream, limits).await
+        }
+        .await;
+        result.map_err(|error| self.note_error(&error))
+    }
+
+    async fn query_text(&self, sql: &str, limits: db::TextLimits) -> Result<TextRows, AppError> {
+        self.run_text(sql, limits).await
+    }
+
+    /// Catalog read with `@P1…` parameters. Runs through `sp_executesql`, which is safe
+    /// for reads: it never changes the outer session's transaction or database.
+    async fn query_params(
+        &self,
+        sql: &str,
+        params: &[&str],
+        limits: db::TextLimits,
+    ) -> Result<TextRows, AppError> {
+        let mut client = self.client.lock().await;
+        let result = async {
+            let bound: Vec<&dyn tiberius::ToSql> =
+                params.iter().map(|p| p as &dyn tiberius::ToSql).collect();
+            let stream = client.query(sql, &bound).await.map_err(mssql_err)?;
+            mssql_collect(stream, limits).await
+        }
+        .await;
+        result.map_err(|error| self.note_error(&error))
+    }
+
+    /// Rows touched by the previous statement on this session. `@@ROWCOUNT` is session
+    /// state that survives the batch boundary, so a follow-up batch reads the count the
+    /// user's statement produced. Best-effort: a failure just omits the count.
+    async fn last_rowcount(&self) -> Option<u64> {
+        self.run_text("SELECT @@ROWCOUNT", db::CATALOG_TEXT_LIMITS)
+            .await
+            .ok()
+            .and_then(|(_c, rows)| rows.into_iter().next())
+            .and_then(|row| row.into_iter().next().flatten())
+            .and_then(|value| value.parse::<u64>().ok())
+    }
+
+    fn page_sql(base: &str, paging: script::MsSqlPaging, limit: u32, offset: usize) -> String {
+        // The newline matters: a statement ending in a `--` comment would otherwise
+        // swallow the appended clause.
+        match paging {
+            script::MsSqlPaging::Append => {
+                format!("{base}\nOFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY")
+            }
+            // T-SQL requires an ORDER BY before OFFSET/FETCH; `(SELECT NULL)` is the
+            // documented no-op sort. Row order is then engine-defined across pages,
+            // exactly like MySQL's LIMIT/OFFSET without ORDER BY.
+            _ => format!(
+                "{base}\nORDER BY (SELECT NULL)\nOFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
+            ),
+        }
+    }
+
+    async fn run_single(
+        &mut self,
+        trimmed: &str,
+        page: u32,
+        cursorable: bool,
+        manual: bool,
+    ) -> Result<QueryOutcome, AppError> {
+        mssql_single_statement(trimmed)?;
+        let paging = script::mssql_paging(trimmed);
+        let outcome = self
+            .run_single_inner(trimmed, page, cursorable, paging)
+            .await;
+        if manual {
+            // Probe even when the statement failed: that is exactly when SQL Server may
+            // have doomed (XACT_STATE = -1) or already unwound the transaction.
+            self.verify_manual(true).await?;
+        }
+        outcome
+    }
+
+    async fn run_single_inner(
+        &mut self,
+        trimmed: &str,
+        page: u32,
+        cursorable: bool,
+        paging: script::MsSqlPaging,
+    ) -> Result<QueryOutcome, AppError> {
+        if cursorable && paging != script::MsSqlPaging::Buffered {
+            let sql = Self::page_sql(trimmed, paging, page, 0);
+            let (columns, rows) = self.run_text(&sql, db::USER_TEXT_LIMITS).await?;
+            let done = (rows.len() as u32) < page;
+            if done {
+                self.reset_stream();
+            } else {
+                self.stream_sql = Some(trimmed.to_string());
+                self.offset = page as usize;
+                self.paging = paging;
+            }
+            return Ok(QueryOutcome::Rows {
+                columns,
+                rows,
+                done,
+                note: None,
+            });
+        }
+        let (columns, rows) = self.run_text(trimmed, db::USER_TEXT_LIMITS).await?;
+        if columns.is_empty() {
+            let message = if script::is_ddl(trimmed) {
+                "OK".to_string()
+            } else {
+                match self.last_rowcount().await {
+                    Some(n) => format!("OK ({n} rows affected)"),
+                    None => "OK".to_string(),
+                }
+            };
+            return Ok(QueryOutcome::Exec { message });
+        }
+        Ok(QueryOutcome::Rows {
+            columns,
+            rows,
+            done: true,
+            // A statement Tusk cannot page safely (TOP, its own OFFSET/FETCH,
+            // FOR XML/JSON, OPTION, or an unordered set operation) is read once
+            // under the result budget instead of being silently truncated.
+            note: (cursorable && paging == script::MsSqlPaging::Buffered).then(|| {
+                "read in one page — SQL Server can't page this statement shape".to_string()
+            }),
+        })
+    }
+
+    async fn fetch_page(&mut self, page: u32) -> Result<FetchResult, AppError> {
+        let (base, paging) = match &self.stream_sql {
+            Some(base) => (base.clone(), self.paging),
+            None => {
+                return Ok(FetchResult {
+                    rows: vec![],
+                    done: true,
+                })
+            }
+        };
+        let sql = Self::page_sql(&base, paging, page, self.offset);
+        let (_columns, rows) = self.run_text(&sql, db::USER_TEXT_LIMITS).await?;
+        let done = (rows.len() as u32) < page;
+        self.offset += rows.len();
+        if done {
+            self.stream_sql = None;
+        }
+        Ok(FetchResult { rows, done })
+    }
+
+    /// `@@TRANCOUNT` plus `XACT_STATE()` for the tracked manual transaction. The server
+    /// is authoritative: a transaction that ended underneath Tusk must become `Lost`
+    /// rather than silently accepting further work.
+    async fn verify_manual(&mut self, expect_active: bool) -> Result<(), AppError> {
+        let probe = self
+            .run_text(
+                "SELECT @@TRANCOUNT, CAST(XACT_STATE() AS int)",
+                db::CATALOG_TEXT_LIMITS,
+            )
+            .await;
+        let row = match probe {
+            Ok((_c, rows)) => rows.into_iter().next(),
+            Err(error) => {
+                self.manual_lost = true;
+                return Err(AppError::new(format!(
+                    "SQL Server manual transaction status is unavailable: {}",
+                    error.message
+                )));
+            }
+        };
+        let read = |row: &Vec<Option<String>>, index: usize| -> i64 {
+            row.get(index)
+                .and_then(|v| v.as_deref())
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0)
+        };
+        let Some(row) = row else {
+            self.manual_lost = true;
+            return Err(AppError::new(
+                "SQL Server returned no transaction status row",
+            ));
+        };
+        let trancount = read(&row, 0);
+        let xact_state = read(&row, 1);
+        self.doomed = xact_state == -1;
+        if expect_active && trancount == 0 {
+            self.manual_lost = true;
+            return Err(AppError::new(
+                "SQL Server ended the manual transaction unexpectedly; reconnect required",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn run_transaction_statement(
+        &mut self,
+        sql: &str,
+        action: script::TransactionAction,
+    ) -> Result<QueryOutcome, AppError> {
+        mssql_single_statement(sql)?;
+        let result = self.run_text(sql, db::USER_TEXT_LIMITS).await;
+        let ends_unit = matches!(
+            action,
+            script::TransactionAction::Commit | script::TransactionAction::Rollback
+        );
+        // A failed COMMIT/ROLLBACK may leave the unit open; verify against the server
+        // either way rather than trusting the statement's own success.
+        self.verify_manual(!ends_unit && result.is_ok()).await?;
+        let (columns, rows) = result?;
+        if matches!(
+            action,
+            script::TransactionAction::Rollback | script::TransactionAction::RollbackTo
+        ) {
+            self.doomed = false;
+        }
+        Ok(if columns.is_empty() {
+            QueryOutcome::Exec {
+                message: "OK".to_string(),
+            }
+        } else {
+            QueryOutcome::Rows {
+                columns,
+                rows,
+                done: true,
+                note: None,
+            }
+        })
+    }
+
+    async fn rollback_manual(&mut self) {
+        let _ = self
+            .run_text(
+                "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
+                db::CATALOG_TEXT_LIMITS,
+            )
+            .await;
+        self.manual_lost = false;
+        self.doomed = false;
+    }
+
+    /// One app-owned transaction around an ordinary multi-statement script. Each item
+    /// runs as its own TDS batch, so batch-leading DDL (`CREATE VIEW`, `CREATE PROCEDURE`)
+    /// still works. `XACT_ABORT ON` makes any runtime error abort the whole unit instead
+    /// of leaving earlier statements committed, and is restored afterwards because it is
+    /// session state the user's own SQL would otherwise inherit.
+    async fn run_script(&self, items: &[script::Item]) -> Result<String, AppError> {
+        self.run_text("SET XACT_ABORT ON", db::CATALOG_TEXT_LIMITS)
+            .await?;
+        let outcome = self.run_script_inner(items).await;
+        let _ = self
+            .run_text("SET XACT_ABORT OFF", db::CATALOG_TEXT_LIMITS)
+            .await;
+        outcome
+    }
+
+    async fn run_script_inner(&self, items: &[script::Item]) -> Result<String, AppError> {
+        self.run_text("BEGIN TRANSACTION", db::CATALOG_TEXT_LIMITS)
+            .await?;
+        let mut stmts = 0u64;
+        for item in items {
+            let script::Item::Sql(sql) = item else {
+                continue;
+            };
+            if let Err(error) = self.run_text(sql.trim(), db::USER_TEXT_LIMITS).await {
+                let _ = self
+                    .run_text(
+                        "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
+                        db::CATALOG_TEXT_LIMITS,
+                    )
+                    .await;
+                return Err(AppError::new(format!(
+                    "{} — at statement {} ({})",
+                    error.message,
+                    stmts + 1,
+                    sql.lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(70)
+                        .collect::<String>()
+                )));
+            }
+            stmts += 1;
+        }
+        self.run_text("COMMIT TRANSACTION", db::CATALOG_TEXT_LIMITS)
+            .await
+            .map_err(|error| {
+                AppError::new(format!(
+                    "commit acknowledgement failed; transaction outcome is unknown — verify database state before retrying ({})",
+                    error.message
+                ))
+            })?;
+        Ok(format!("OK — {stmts} statements run, 0 rows copied"))
+    }
+
+    /// Result-column types without executing anything: `sys.dm_exec_describe_first_result_set`
+    /// parses and binds the batch only. Best-effort — any failure means no boolean mapping.
+    async fn bool_columns(&self, sql: &str) -> Vec<usize> {
+        let query = format!(
+            "SELECT column_ordinal, system_type_name FROM sys.dm_exec_describe_first_result_set({}, NULL, 0)",
+            mssql_lit(sql)
+        );
+        let Ok((_columns, rows)) = self.query_text(&query, db::CATALOG_TEXT_LIMITS).await else {
+            return Vec::new();
+        };
+        rows.iter()
+            .filter(|row| dcell(row, 1).eq_ignore_ascii_case("bit"))
+            .filter_map(|row| dcell(row, 0).parse::<usize>().ok())
+            .filter_map(|ordinal| ordinal.checked_sub(1))
+            .collect()
+    }
+
+    async fn object_id(&self, schema: &str, name: &str) -> Result<i64, AppError> {
+        let (_columns, rows) = self
+            .query_params(
+                "SELECT o.object_id FROM sys.objects o \
+                 JOIN sys.schemas s ON s.schema_id = o.schema_id \
+                 WHERE s.name = @P1 AND o.name = @P2",
+                &[schema, name],
+                db::CATALOG_TEXT_LIMITS,
+            )
+            .await?;
+        rows.first()
+            .and_then(|row| dcell(row, 0).parse::<i64>().ok())
+            .ok_or_else(|| AppError::new(format!("no such relation: {schema}.{name}")))
+    }
+
+    async fn build_tree(&self) -> Result<tree::DbTree, AppError> {
+        let (_c, schema_rows) = self
+            .query_text(MSSQL_SCHEMAS, db::CATALOG_TEXT_LIMITS)
+            .await?;
+        let (_c2, rel_rows) = self.query_text(MSSQL_RELS, db::CATALOG_TEXT_LIMITS).await?;
+        let (_c3, seq_rows) = self.query_text(MSSQL_SEQS, db::CATALOG_TEXT_LIMITS).await?;
+        let (_c4, func_rows) = self
+            .query_text(MSSQL_ROUTINES, db::CATALOG_TEXT_LIMITS)
+            .await?;
+        let database = self
+            .query_text("SELECT DB_NAME()", db::CATALOG_TEXT_LIMITS)
+            .await
+            .ok()
+            .and_then(|(_c, rows)| rows.into_iter().next())
+            .and_then(|row| row.into_iter().next().flatten())
+            .unwrap_or_default();
+        let databases = self
+            .query_text(
+                "SELECT name FROM sys.databases ORDER BY name",
+                db::CATALOG_TEXT_LIMITS,
+            )
+            .await
+            .map(|(_c, rows)| rows.iter().map(|row| dcell(row, 0)).collect())
+            .unwrap_or_else(|_| vec![database.clone()]);
+
+        let mut schemas: Vec<tree::Schema> = schema_rows
+            .iter()
+            .map(|row| tree::Schema {
+                name: dcell(row, 0),
+                tables: vec![],
+                views: vec![],
+                sequences: vec![],
+                functions: vec![],
+            })
+            .collect();
+        let index: std::collections::HashMap<String, usize> = schemas
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.name.clone(), i))
+            .collect();
+        for row in &rel_rows {
+            let Some(&i) = index.get(&dcell(row, 0)) else {
+                continue;
+            };
+            let is_view = dcell(row, 2).eq_ignore_ascii_case("VIEW");
+            let stub = tree::RelStub {
+                name: dcell(row, 1),
+                kind: if is_view { "view" } else { "table" }.to_string(),
+                comment: row.get(5).cloned().flatten(),
+                rows: row
+                    .get(3)
+                    .and_then(|v| v.as_deref())
+                    .and_then(|v| v.parse().ok()),
+                size: row
+                    .get(4)
+                    .and_then(|v| v.as_deref())
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .map(mssql_pretty_kb),
+            };
+            if is_view {
+                schemas[i].views.push(stub);
+            } else {
+                schemas[i].tables.push(stub);
+            }
+        }
+        for row in &seq_rows {
+            if let Some(&i) = index.get(&dcell(row, 0)) {
+                schemas[i].sequences.push(dcell(row, 1));
+            }
+        }
+        for row in &func_rows {
+            if let Some(&i) = index.get(&dcell(row, 0)) {
+                schemas[i].functions.push(tree::Func {
+                    name: dcell(row, 1),
+                    args: String::new(),
+                    returns: dcell(row, 2),
+                });
+            }
+        }
+        Ok(tree::DbTree {
+            database,
+            databases,
+            schemas,
+        })
+    }
+
+    async fn table_detail(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> Result<tree::RelationDetail, AppError> {
+        let oid = self.object_id(schema, name).await?;
+        let (_c, column_rows) = self
+            .query_text(&mssql_columns_sql(oid), db::CATALOG_TEXT_LIMITS)
+            .await?;
+        let columns = column_rows
+            .iter()
+            .map(|row| tree::Column {
+                name: dcell(row, 0),
+                data_type: dcell(row, 1),
+                nullable: dcell(row, 2) == "1",
+                is_pk: dcell(row, 4) == "1",
+                is_fk: dcell(row, 5) == "1",
+                default: row.get(3).cloned().flatten(),
+                comment: row.get(6).cloned().flatten(),
+            })
+            .collect();
+        let (_c2, index_rows) = self
+            .query_text(&mssql_indexes_sql(oid), db::CATALOG_TEXT_LIMITS)
+            .await
+            .unwrap_or_default();
+        let qualified = format!("{}.{}", mssql_ident(schema), mssql_ident(name));
+        let indexes = index_rows
+            .iter()
+            .map(|row| {
+                let unique = dcell(row, 1) == "1";
+                let primary = dcell(row, 2) == "1";
+                tree::Index {
+                    def: format!(
+                        "CREATE {}INDEX {} ON {qualified} ({})",
+                        if unique { "UNIQUE " } else { "" },
+                        mssql_ident(&dcell(row, 0)),
+                        dcell(row, 3)
+                    ),
+                    name: dcell(row, 0),
+                    unique,
+                    primary,
+                }
+            })
+            .collect();
+        let (_c3, constraint_rows) = self
+            .query_text(&mssql_constraints_sql(oid), db::CATALOG_TEXT_LIMITS)
+            .await
+            .unwrap_or_default();
+        let constraints = constraint_rows
+            .iter()
+            .map(|row| tree::Constraint {
+                name: dcell(row, 0),
+                kind: dcell(row, 1),
+                def: dcell(row, 2),
+            })
+            .collect();
+        let (_c4, trigger_rows) = self
+            .query_text(&mssql_triggers_sql(oid), db::CATALOG_TEXT_LIMITS)
+            .await
+            .unwrap_or_default();
+        let triggers = trigger_rows
+            .iter()
+            .map(|row| tree::Trigger {
+                name: dcell(row, 0),
+                def: dcell(row, 1),
+            })
+            .collect();
+        let (_c5, kind_rows) = self
+            .query_text(
+                &format!("SELECT type FROM sys.objects WHERE object_id = {oid}"),
+                db::CATALOG_TEXT_LIMITS,
+            )
+            .await
+            .unwrap_or_default();
+        let kind = match kind_rows.first().map(|row| dcell(row, 0)).as_deref() {
+            Some(t) if t.trim() == "V" => "view",
+            _ => "table",
+        };
+        Ok(tree::RelationDetail {
+            name: name.to_string(),
+            kind: kind.to_string(),
+            comment: None,
+            columns,
+            indexes,
+            constraints,
+            triggers,
+        })
+    }
+
+    /// `(constraint, src_schema, src_table, src_col, dst_schema, dst_table, dst_col)`
+    /// rows ordered by constraint then key position — the shape `relgraph`'s grouping
+    /// helpers expect.
+    async fn fk_edge_rows(
+        &self,
+        scope: Option<(&str, &str)>,
+    ) -> Result<Vec<Vec<Option<String>>>, AppError> {
+        let sql = mssql_fk_sql(scope.is_some());
+        let params: Vec<&str> = match scope {
+            Some((schema, name)) => vec![schema, name, schema, name],
+            None => vec![],
+        };
+        let (_columns, rows) = self
+            .query_params(&sql, &params, db::CATALOG_TEXT_LIMITS)
+            .await?;
+        Ok(rows)
+    }
+
+    /// `(table, column, data_type, key)` rows for the ERD, with `PRI` marking primary-key
+    /// columns (the marker `relgraph::mysql_schema_graph` reads).
+    async fn erd_column_rows(&self, schema: &str) -> Result<Vec<Vec<Option<String>>>, AppError> {
+        let (_columns, rows) = self
+            .query_params(MSSQL_ERD_COLUMNS, &[schema], db::CATALOG_TEXT_LIMITS)
+            .await?;
+        Ok(rows)
+    }
+
+    async fn relation_ddl(&self, kind: &str, schema: &str, name: &str) -> Result<String, AppError> {
+        let oid = self.object_id(schema, name).await?;
+        if kind != "table" {
+            // Views, procedures, functions and triggers keep their original text.
+            let (_c, rows) = self
+                .query_text(
+                    &format!("SELECT definition FROM sys.sql_modules WHERE object_id = {oid}"),
+                    db::DDL_TEXT_LIMITS,
+                )
+                .await?;
+            if let Some(definition) = rows.first().and_then(|row| row.first().cloned().flatten()) {
+                return Ok(format!(
+                    "{};\n",
+                    definition.trim_end().trim_end_matches(';')
+                ));
+            }
+            return Err(AppError::new("no stored DDL for this object"));
+        }
+        let qualified = format!("{}.{}", mssql_ident(schema), mssql_ident(name));
+        let (_c, column_rows) = self
+            .query_text(&mssql_ddl_columns_sql(oid), db::DDL_TEXT_LIMITS)
+            .await?;
+        if column_rows.is_empty() {
+            return Err(AppError::new("no columns found for this table"));
+        }
+        let mut parts: Vec<String> = column_rows
+            .iter()
+            .map(|row| {
+                let mut line = format!("    {} {}", mssql_ident(&dcell(row, 0)), dcell(row, 1));
+                if dcell(row, 4) == "1" {
+                    line.push_str(&format!(" IDENTITY({},{})", dcell(row, 5), dcell(row, 6)));
+                }
+                if dcell(row, 2) == "1" {
+                    line.push_str(" NULL");
+                } else {
+                    line.push_str(" NOT NULL");
+                }
+                if let Some(default) = row.get(3).cloned().flatten() {
+                    line.push_str(&format!(" DEFAULT {default}"));
+                }
+                line
+            })
+            .collect();
+        let (_c2, constraint_rows) = self
+            .query_text(&mssql_constraints_sql(oid), db::DDL_TEXT_LIMITS)
+            .await
+            .unwrap_or_default();
+        for row in &constraint_rows {
+            // Foreign keys are deferred to trailing ALTERs so replaying the script in
+            // dependency order cannot fail on a table that does not exist yet.
+            if dcell(row, 1) == "foreign_key" {
+                continue;
+            }
+            parts.push(format!(
+                "    CONSTRAINT {} {}",
+                mssql_ident(&dcell(row, 0)),
+                dcell(row, 2)
+            ));
+        }
+        let mut out = format!("CREATE TABLE {qualified} (\n{}\n);\n", parts.join(",\n"));
+        let (_c3, index_rows) = self
+            .query_text(&mssql_ddl_indexes_sql(oid), db::DDL_TEXT_LIMITS)
+            .await
+            .unwrap_or_default();
+        for row in &index_rows {
+            out.push_str(&format!(
+                "\nCREATE {}INDEX {} ON {qualified} ({});\n",
+                if dcell(row, 1) == "1" { "UNIQUE " } else { "" },
+                mssql_ident(&dcell(row, 0)),
+                dcell(row, 3)
+            ));
+        }
+        for row in &constraint_rows {
+            if dcell(row, 1) == "foreign_key" {
+                out.push_str(&format!(
+                    "\nALTER TABLE {qualified} ADD CONSTRAINT {} {};\n",
+                    mssql_ident(&dcell(row, 0)),
+                    dcell(row, 2)
+                ));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Pretty-print a size given in KiB, mirroring `pg_size_pretty`'s shape.
+fn mssql_pretty_kb(kb: i64) -> String {
+    let kb = kb.max(0) as f64;
+    const UNITS: [&str; 4] = ["kB", "MB", "GB", "TB"];
+    let mut value = kb;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", value.round() as i64, UNITS[unit])
+    } else {
+        format!("{value:.0} {}", UNITS[unit])
+    }
+}
+
+// Schemas the server owns or creates for the fixed database roles are noise in the
+// sidebar; user schemas always have `schema_id < 16384`.
+const MSSQL_SCHEMAS: &str = "SELECT s.name FROM sys.schemas s \
+     WHERE s.schema_id < 16384 AND s.name NOT IN ('sys','INFORMATION_SCHEMA','guest') \
+     ORDER BY s.name";
+
+const MSSQL_RELS: &str = "SELECT sch.name, o.name, \
+       CASE WHEN o.type = 'V' THEN 'VIEW' ELSE 'BASE TABLE' END, \
+       CAST(ps.row_count AS varchar(32)), \
+       CASE WHEN o.type = 'V' THEN NULL ELSE CAST(ps.total_kb AS varchar(32)) END, \
+       CAST(ep.value AS nvarchar(max)) \
+     FROM sys.objects o \
+     JOIN sys.schemas sch ON sch.schema_id = o.schema_id \
+     LEFT JOIN (SELECT object_id, \
+                       SUM(CASE WHEN index_id IN (0,1) THEN row_count ELSE 0 END) AS row_count, \
+                       SUM(used_page_count) * 8 AS total_kb \
+                FROM sys.dm_db_partition_stats GROUP BY object_id) ps \
+            ON ps.object_id = o.object_id \
+     LEFT JOIN sys.extended_properties ep \
+            ON ep.class = 1 AND ep.major_id = o.object_id AND ep.minor_id = 0 \
+           AND ep.name = 'MS_Description' \
+     WHERE o.type IN ('U','V') AND o.is_ms_shipped = 0 AND sch.schema_id < 16384 \
+     ORDER BY sch.name, o.name";
+
+const MSSQL_SEQS: &str = "SELECT sch.name, sq.name FROM sys.sequences sq \
+     JOIN sys.schemas sch ON sch.schema_id = sq.schema_id ORDER BY sch.name, sq.name";
+
+const MSSQL_ROUTINES: &str = "SELECT sch.name, o.name, \
+       CASE o.type WHEN 'P' THEN 'procedure' WHEN 'PC' THEN 'procedure' \
+                   WHEN 'IF' THEN 'table function' WHEN 'TF' THEN 'table function' \
+                   WHEN 'FT' THEN 'table function' WHEN 'AF' THEN 'aggregate' \
+                   ELSE 'function' END \
+     FROM sys.objects o JOIN sys.schemas sch ON sch.schema_id = o.schema_id \
+     WHERE o.type IN ('FN','IF','TF','P','AF','FS','FT','PC') AND o.is_ms_shipped = 0 \
+     ORDER BY sch.name, o.name";
+
+/// Rendered column type with its length/precision, matching how SSMS shows it.
+const MSSQL_TYPE_EXPR: &str = "t.name + CASE \
+       WHEN t.name IN ('varchar','char','varbinary','binary') \
+         THEN '(' + CASE WHEN c.max_length = -1 THEN 'max' ELSE CAST(c.max_length AS varchar(11)) END + ')' \
+       WHEN t.name IN ('nvarchar','nchar') \
+         THEN '(' + CASE WHEN c.max_length = -1 THEN 'max' ELSE CAST(c.max_length / 2 AS varchar(11)) END + ')' \
+       WHEN t.name IN ('decimal','numeric') \
+         THEN '(' + CAST(c.precision AS varchar(11)) + ',' + CAST(c.scale AS varchar(11)) + ')' \
+       WHEN t.name IN ('datetime2','datetimeoffset','time') \
+         THEN '(' + CAST(c.scale AS varchar(11)) + ')' \
+       ELSE '' END";
+
+fn mssql_columns_sql(oid: i64) -> String {
+    format!(
+        "SELECT c.name, {MSSQL_TYPE_EXPR}, CAST(c.is_nullable AS int), dc.definition, \
+                CAST(CASE WHEN pk.column_id IS NULL THEN 0 ELSE 1 END AS int), \
+                CAST(CASE WHEN fk.parent_column_id IS NULL THEN 0 ELSE 1 END AS int), \
+                CAST(ep.value AS nvarchar(max)) \
+         FROM sys.columns c \
+         JOIN sys.types t ON t.user_type_id = c.user_type_id \
+         LEFT JOIN sys.default_constraints dc ON dc.object_id = c.default_object_id \
+         LEFT JOIN (SELECT ic.object_id, ic.column_id FROM sys.index_columns ic \
+                    JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id \
+                    WHERE i.is_primary_key = 1) pk \
+                ON pk.object_id = c.object_id AND pk.column_id = c.column_id \
+         LEFT JOIN (SELECT DISTINCT parent_object_id, parent_column_id FROM sys.foreign_key_columns) fk \
+                ON fk.parent_object_id = c.object_id AND fk.parent_column_id = c.column_id \
+         LEFT JOIN sys.extended_properties ep ON ep.class = 1 AND ep.major_id = c.object_id \
+               AND ep.minor_id = c.column_id AND ep.name = 'MS_Description' \
+         WHERE c.object_id = {oid} ORDER BY c.column_id"
+    )
+}
+
+fn mssql_ddl_columns_sql(oid: i64) -> String {
+    format!(
+        "SELECT c.name, {MSSQL_TYPE_EXPR}, CAST(c.is_nullable AS int), dc.definition, \
+                CAST(c.is_identity AS int), \
+                CAST(ISNULL(ic.seed_value, 1) AS varchar(32)), \
+                CAST(ISNULL(ic.increment_value, 1) AS varchar(32)) \
+         FROM sys.columns c \
+         JOIN sys.types t ON t.user_type_id = c.user_type_id \
+         LEFT JOIN sys.default_constraints dc ON dc.object_id = c.default_object_id \
+         LEFT JOIN sys.identity_columns ic ON ic.object_id = c.object_id AND ic.column_id = c.column_id \
+         WHERE c.object_id = {oid} ORDER BY c.column_id"
+    )
+}
+
+/// Key columns of one index, in key order. `STRING_AGG` needs SQL Server 2017+.
+const MSSQL_INDEX_COLUMNS: &str =
+    "STRING_AGG(QUOTENAME(c.name), ', ') WITHIN GROUP (ORDER BY ic.key_ordinal)";
+
+fn mssql_indexes_sql(oid: i64) -> String {
+    format!(
+        "SELECT i.name, CAST(i.is_unique AS int), CAST(i.is_primary_key AS int), {MSSQL_INDEX_COLUMNS} \
+         FROM sys.indexes i \
+         JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
+         JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+         WHERE i.object_id = {oid} AND i.name IS NOT NULL AND ic.is_included_column = 0 \
+         GROUP BY i.name, i.is_unique, i.is_primary_key ORDER BY i.name"
+    )
+}
+
+/// Plain indexes only — constraint-backed ones are already emitted inline, exactly like
+/// the PostgreSQL reconstruction.
+fn mssql_ddl_indexes_sql(oid: i64) -> String {
+    format!(
+        "SELECT i.name, CAST(i.is_unique AS int), CAST(i.is_primary_key AS int), {MSSQL_INDEX_COLUMNS} \
+         FROM sys.indexes i \
+         JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
+         JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+         WHERE i.object_id = {oid} AND i.name IS NOT NULL AND ic.is_included_column = 0 \
+           AND i.is_primary_key = 0 AND i.is_unique_constraint = 0 \
+         GROUP BY i.name, i.is_unique, i.is_primary_key ORDER BY i.name"
+    )
+}
+
+fn mssql_constraints_sql(oid: i64) -> String {
+    format!(
+        "SELECT kc.name, CASE kc.type WHEN 'PK' THEN 'primary_key' ELSE 'unique' END, \
+                CASE kc.type WHEN 'PK' THEN 'PRIMARY KEY (' ELSE 'UNIQUE (' END + \
+                (SELECT STRING_AGG(QUOTENAME(c.name), ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) \
+                 FROM sys.index_columns ic JOIN sys.columns c \
+                   ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+                 WHERE ic.object_id = kc.parent_object_id AND ic.index_id = kc.unique_index_id \
+                   AND ic.is_included_column = 0) + ')' \
+         FROM sys.key_constraints kc WHERE kc.parent_object_id = {oid} \
+         UNION ALL \
+         SELECT fk.name, 'foreign_key', \
+                'FOREIGN KEY (' + \
+                (SELECT STRING_AGG(QUOTENAME(pc.name), ', ') WITHIN GROUP (ORDER BY fkc.constraint_column_id) \
+                 FROM sys.foreign_key_columns fkc JOIN sys.columns pc \
+                   ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id \
+                 WHERE fkc.constraint_object_id = fk.object_id) + \
+                ') REFERENCES ' + QUOTENAME(rs.name) + '.' + QUOTENAME(rt.name) + ' (' + \
+                (SELECT STRING_AGG(QUOTENAME(rc.name), ', ') WITHIN GROUP (ORDER BY fkc.constraint_column_id) \
+                 FROM sys.foreign_key_columns fkc JOIN sys.columns rc \
+                   ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id \
+                 WHERE fkc.constraint_object_id = fk.object_id) + ')' \
+         FROM sys.foreign_keys fk \
+         JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id \
+         JOIN sys.schemas rs ON rs.schema_id = rt.schema_id \
+         WHERE fk.parent_object_id = {oid} \
+         UNION ALL \
+         SELECT cc.name, 'check', 'CHECK ' + cc.definition \
+         FROM sys.check_constraints cc WHERE cc.parent_object_id = {oid}"
+    )
+}
+
+fn mssql_triggers_sql(oid: i64) -> String {
+    format!(
+        "SELECT tr.name, ISNULL(m.definition, '') FROM sys.triggers tr \
+         LEFT JOIN sys.sql_modules m ON m.object_id = tr.object_id \
+         WHERE tr.parent_id = {oid} AND tr.is_ms_shipped = 0 ORDER BY tr.name"
+    )
+}
+
+const MSSQL_FK_SELECT: &str = "SELECT fk.name, ps.name, pt.name, pc.name, rs.name, rt.name, rc.name \
+     FROM sys.foreign_keys fk \
+     JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id \
+     JOIN sys.tables pt ON pt.object_id = fk.parent_object_id \
+     JOIN sys.schemas ps ON ps.schema_id = pt.schema_id \
+     JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id \
+     JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id \
+     JOIN sys.schemas rs ON rs.schema_id = rt.schema_id \
+     JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id";
+
+const MSSQL_FK_ORDER: &str = " ORDER BY fk.name, ps.name, pt.name, fkc.constraint_column_id";
+
+fn mssql_fk_sql(scoped: bool) -> String {
+    let filter = if scoped {
+        " WHERE (ps.name = @P1 AND pt.name = @P2) OR (rs.name = @P3 AND rt.name = @P4)"
+    } else {
+        ""
+    };
+    format!("{MSSQL_FK_SELECT}{filter}{MSSQL_FK_ORDER}")
+}
+
+const MSSQL_ERD_COLUMNS: &str = "SELECT t.name, c.name, ty.name, \
+       CASE WHEN pk.column_id IS NULL THEN '' ELSE 'PRI' END \
+     FROM sys.tables t \
+     JOIN sys.schemas s ON s.schema_id = t.schema_id \
+     JOIN sys.columns c ON c.object_id = t.object_id \
+     JOIN sys.types ty ON ty.user_type_id = c.user_type_id \
+     LEFT JOIN (SELECT ic.object_id, ic.column_id FROM sys.index_columns ic \
+                JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id \
+                WHERE i.is_primary_key = 1) pk \
+            ON pk.object_id = c.object_id AND pk.column_id = c.column_id \
+     WHERE s.name = @P1 ORDER BY t.name, c.column_id";
+
 /// One connected database in the app registry.
 pub struct ConnState {
     pub backend: Backend,
@@ -2750,6 +3923,7 @@ impl ConnState {
             Backend::Duck(_) => script::TransactionEngine::DuckDb,
             Backend::Sqlite(_) => script::TransactionEngine::Sqlite,
             Backend::MySql(_) => script::TransactionEngine::MySql,
+            Backend::MsSql(_) => script::TransactionEngine::MsSql,
         }
     }
 
