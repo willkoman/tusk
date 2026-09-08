@@ -4,7 +4,7 @@
 export const GROUPS: { label: string; ids: string[] }[] = [
   { label: "Start here", ids: ["getting-started", "workspace", "whats-new"] },
   { label: "Writing SQL", ids: ["editor", "editor-intel", "shortcuts"] },
-  { label: "Results & data", ids: ["results", "grid-editing", "import-export"] },
+  { label: "Results & data", ids: ["results", "grid-editing", "import-export", "backup"] },
   { label: "Schema tools", ids: ["sidebar", "erd", "plans"] },
   { label: "Assistants", ids: ["ai", "slack"] },
   { label: "Trust & history", ids: ["history", "safety"] },

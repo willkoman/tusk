@@ -1230,7 +1230,7 @@ export const TOPICS: Topic[] = [
     "blocks": [
       {
         "k": "p",
-        "md": "Data moves through three doors: **Export…** on the result toolbar (file or clipboard, six formats, streaming), the sidebar's **Import data** icon (CSV/JSON file → table via `COPY`), and the grid's copy commands ([[kbd:Mod-C]] + right-click — see [[topic:results|Results]]). Export works on every engine; import is Postgres-only (the button appears only when the driver reports `bulkCopy`)."
+        "md": "Data moves through three doors: **Export…** on the result toolbar (file or clipboard, six formats, streaming), the sidebar's **Import data** icon (CSV/JSON file → table via `COPY`), and the grid's copy commands ([[kbd:Mod-C]] + right-click — see [[topic:results|Results]]). Export works on every engine; import is Postgres-only (the button appears only when the driver reports `bulkCopy`). Moving a whole database rather than one result is a different job — see [[topic:backup|Backup & restore]]."
       },
       {
         "k": "h",
@@ -1363,6 +1363,131 @@ export const TOPICS: Topic[] = [
       }
     ],
     "icon": "download"
+  },
+  {
+    "id": "backup",
+    "title": "Backup & restore",
+    "blurb": "Native plain-SQL dumps and replays through the driver — no pg_dump, no mysqldump.",
+    "blocks": [
+      {
+        "k": "p",
+        "md": "Tusk writes and replays backups itself, through the same driver it queries with — there is **no external binary** to install or keep version-matched, and nothing shells out. A dump is plain SQL: Tusk restores it, and so does the engine's own CLI client (`psql`, `mysql`, `sqlite3`, `duckdb`)."
+      },
+      {
+        "k": "h",
+        "text": "Starting one",
+        "id": "starting"
+      },
+      {
+        "k": "list",
+        "ordered": false,
+        "items": [
+          "**Explorer right-click** — a database node offers **Backup database…** and **Restore from file…**, a schema node **Backup schema…**, a table node **Backup table…**. Each pre-fills the dialog's scope.",
+          "**Toolbar ⋯ overflow** — **Backup…** (whole database) and **Restore from file…**.",
+          "Both need an idle session: they are blocked while a manual transaction owns the connection, and starting one releases the single result stream (the owning tab's result is marked incomplete, as with any other whole-connection command)."
+        ]
+      },
+      {
+        "k": "h",
+        "text": "The Backup dialog",
+        "id": "backup-dialog"
+      },
+      {
+        "k": "table",
+        "head": [
+          "Option",
+          "What it does"
+        ],
+        "rows": [
+          [
+            "**Scope**",
+            "**Whole database**, **Selected schemas**, or **Selected tables** — the last two show a searchable checklist built from the loaded tree. A table selection covers those tables and their rows only; views, sequences and routines need a schema or database backup."
+          ],
+          [
+            "**Contents**",
+            "**Schema + data**, **Schema only**, or **Data only**. Data-only carries no `CREATE`, so restore it onto a database that already has the tables."
+          ],
+          [
+            "**Emit DROP … IF EXISTS**",
+            "Adds a drop block ahead of the creates, in reverse dependency order, so the dump can replace what is already there instead of colliding with it. Disabled for a data-only dump."
+          ],
+          [
+            "**Wrap in one transaction**",
+            "`BEGIN` … `COMMIT` around the dump. Offered on PostgreSQL, DuckDB and SQLite; **disabled on MySQL**, which commits DDL implicitly."
+          ],
+          [
+            "**Destination**",
+            "**Choose file…** opens the native save dialog. Nothing runs until a path is set."
+          ]
+        ]
+      },
+      {
+        "k": "p",
+        "md": "While it runs, the dialog shows the current object, tables done, rows and bytes written, and elapsed time, with a **Cancel backup** button. The finished view reports the totals plus any warnings (objects whose DDL the driver could not reconstruct — those are also written into the file as `-- warning:` lines)."
+      },
+      {
+        "k": "h",
+        "text": "What a dump contains",
+        "id": "dump-layout"
+      },
+      {
+        "k": "p",
+        "md": "A header comment records the Tusk version, engine, database, UTC timestamp and the options used; the restore dialog reads it back. Then, in this order: drops, `CREATE SCHEMA IF NOT EXISTS`, sequences, tables (with their indexes and comments), **data**, views and materialized views, functions and triggers, **every foreign key**, and finally the PostgreSQL sequence positions."
+      },
+      {
+        "k": "list",
+        "ordered": false,
+        "items": [
+          "**Foreign keys come last, always.** They are lifted out of PostgreSQL's reconstructed DDL and out of MySQL's `SHOW CREATE TABLE` into trailing `ALTER TABLE … ADD CONSTRAINT` statements, so a restore cannot break on table order — including a reference **cycle**, which no ordering can satisfy.",
+          "**PostgreSQL data streams through `COPY`.** The dump reads `COPY … TO STDOUT` and writes `COPY … FROM stdin;` blocks terminated by `\\.`, so no table is ever held in memory. A new block starts every 16 MiB.",
+          "**Every other engine emits batched multi-row `INSERT`s**, built with the same dialect-aware quoting and literal rules as SQL export, and paged so memory stays flat. Binary columns are written as native blob literals (`X'…'`, `from_hex('…')`), not as text.",
+          "**PostgreSQL dumps are snapshot-consistent**: the whole read runs inside one read-only repeatable-read transaction. The other engines page a table at a time, so a dump taken during concurrent writes is not a single point in time — the same caveat as grid paging.",
+          "**Generated columns are skipped** on PostgreSQL, which would otherwise reject the restore."
+        ]
+      },
+      {
+        "k": "h",
+        "text": "The Restore dialog",
+        "id": "restore-dialog"
+      },
+      {
+        "k": "p",
+        "md": "**Choose file…** picks the dump; Tusk reads its size and header first and shows what it is about to replay. A dump taken from a different engine is called out before you run it — its SQL is unlikely to replay cleanly. A file without a Tusk header is fine; it is simply replayed as plain SQL."
+      },
+      {
+        "k": "list",
+        "ordered": false,
+        "items": [
+          "**Stop at the first error** (default) halts and reports; unchecking it keeps going and still records the first failure.",
+          "**Run everything in one transaction** rolls the whole restore back on any failure. Same engine rule as backup — not available on MySQL — and it requires stop-on-error, since the first failure aborts the unit anyway.",
+          "Progress shows statements run, rows copied and bytes read; the total is unknown until the file ends, because the file is parsed as it streams.",
+          "The result panel reports statements run, failures, rows copied, and the **first error with its statement number and line**.",
+          "When it finishes, the sidebar and autocomplete reload — the database changed underneath them."
+        ]
+      },
+      {
+        "k": "h",
+        "text": "Safety and limits",
+        "id": "safety"
+      },
+      {
+        "k": "list",
+        "ordered": false,
+        "items": [
+          "**A read-only connection can back up but never restore.** A backup is a read; a restore is blocked outright.",
+          "**A failed or cancelled backup never touches the previous file.** The dump is written to a sibling temp file, fsynced, then atomically renamed — the same guarantee as export.",
+          "**A restore statement is never replayed.** If the connection drops mid-restore the outcome is ambiguous, so Tusk stops and tells you to verify state rather than running it again.",
+          "**Cancel works on every driver.** Backup and restore check for cancellation between units, so they stop even where the engine has no out-of-band query cancel (SQLite, MySQL, DuckDB on Windows).",
+          "**Limits** — a restore reads at most **2 GiB**, and one statement (or one `COPY` data block) at most **256 MiB**. Tusk's own dumps stay well inside the second limit because it reopens `COPY` blocks as it writes."
+        ]
+      },
+      {
+        "k": "tip",
+        "kind": "warn",
+        "md": "DDL reconstruction is as complete as [[topic:sidebar|Copy DDL]] is, and no more: partitioning, inheritance, row-level security, grants, storage parameters and tablespaces are out of scope, DuckDB dumps carry no `CREATE INDEX` (its catalog stores only the table definition), and MySQL's `CREATE TABLE` is unqualified, so it restores into the connected database. Verify a restore before relying on a dump as your only copy."
+      }
+    ],
+    "icon": "duplicate"
   },
   {
     "id": "plans",

@@ -120,7 +120,7 @@ fn d_true() -> bool {
     true
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SqlDialect {
+pub enum SqlDialect {
     Postgres,
     DuckDb,
     Sqlite,
@@ -128,7 +128,7 @@ enum SqlDialect {
 }
 
 impl SqlDialect {
-    fn parse(value: &str) -> Result<Self, AppError> {
+    pub fn parse(value: &str) -> Result<Self, AppError> {
         match value {
             "" | "postgres" => Ok(Self::Postgres),
             "duckdb" => Ok(Self::DuckDb),
@@ -373,6 +373,19 @@ fn sql_ident(name: &str, dialect: SqlDialect) -> String {
         SqlDialect::MySql => format!("`{}`", name.replace('`', "``")),
         _ => db::ident(name),
     }
+}
+
+/// Dialect-aware identifier quoting for SQL emitted outside the export sinks
+/// (`backup.rs`). Re-exported rather than duplicated so backup dumps and SQL
+/// exports can never disagree about quoting.
+pub fn ident_for(name: &str, dialect: SqlDialect) -> String {
+    sql_ident(name, dialect)
+}
+
+/// Dialect-aware literal rendering (NULL, control bytes, backslashes) for SQL
+/// emitted outside the export sinks. Same reuse rationale as `ident_for`.
+pub fn value_for(value: &Option<String>, dialect: SqlDialect) -> Result<String, AppError> {
+    sql_val(value, dialect)
 }
 
 fn sql_string(value: &str, dialect: SqlDialect) -> Result<String, AppError> {
