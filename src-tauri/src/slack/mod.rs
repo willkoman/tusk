@@ -32,6 +32,11 @@ pub struct SlackRuntime {
     /// so an old session finishing an in-flight query after a restart can't wipe the new
     /// session's proposals/results or stomp its status.
     generation: AtomicU64,
+    /// The ONE Tusk connection this bot answers against. Several connections are open
+    /// at once, so "the active connection" is not a stable answer: the binding is
+    /// chosen when the bot starts (default: whatever the workbench had focused) and can
+    /// be repointed from Settings → Slack. Cleared when the bot stops.
+    connection: Mutex<Option<String>>,
     pub approvals: ApprovalStore,
     /// Finished results kept for their "Export as…" buttons (TTL'd + capped).
     pub results: ResultStore,
@@ -44,6 +49,8 @@ pub struct StatusInfo {
     /// "disconnected" | "connecting" | "connected"
     pub state: String,
     pub error: Option<String>,
+    /// Tusk connection id the bot is bound to (None when it is not running).
+    pub connection_id: Option<String>,
 }
 
 impl Default for StatusInfo {
@@ -52,20 +59,42 @@ impl Default for StatusInfo {
             running: false,
             state: "disconnected".into(),
             error: None,
+            connection_id: None,
         }
     }
 }
 
 impl SlackRuntime {
     pub fn set_status(&self, state: &str, error: Option<String>) {
+        let running = state != "disconnected";
+        // A stopped bot is bound to nothing. Keeping a stale id would make
+        // `on_connection_closed` claim a dead bot for the next disconnect, and would
+        // let `bind_connection` repoint something that is not running.
+        if !running {
+            self.set_connection(None);
+        }
+        let connection_id = crate::lock_sync(&self.connection).clone();
         let mut s = crate::lock_sync(&self.status);
         s.state = state.to_string();
         s.error = error;
-        s.running = state != "disconnected";
+        s.running = running;
+        s.connection_id = connection_id;
     }
 
     pub fn status_info(&self) -> StatusInfo {
-        crate::lock_sync(&self.status).clone()
+        let connection_id = crate::lock_sync(&self.connection).clone();
+        let mut s = crate::lock_sync(&self.status).clone();
+        s.connection_id = connection_id;
+        s
+    }
+
+    /// The connection id this bot is bound to, when it is running.
+    pub fn bound_connection(&self) -> Option<String> {
+        crate::lock_sync(&self.connection).clone()
+    }
+
+    fn set_connection(&self, id: Option<String>) {
+        *crate::lock_sync(&self.connection) = id;
     }
 
     fn take_cancel(&self) -> Option<CancellationToken> {
@@ -103,14 +132,81 @@ impl SlackRuntime {
     }
 }
 
+/// Check that an explicitly requested connection is really open.
+fn require_open(app: &AppHandle, id: &str) -> Result<String, AppError> {
+    app.state::<crate::AppState>()
+        .get(id)
+        .map(|_| id.to_string())
+        .map_err(|_| {
+            AppError::new(
+                "the connection chosen for the Slack bot is no longer open — pick another in Settings → Slack",
+            )
+        })
+}
+
+/// Repoint a running bot at another open connection. Takes effect on the next
+/// question; proposals already pending stay pinned to the connection that made them
+/// and fail closed on approval, which is the intended conservative outcome.
+pub fn bind_connection(app: &AppHandle, connection_id: &str) -> Result<(), AppError> {
+    let runtime = app.state::<SlackRuntime>();
+    if !runtime.status_info().running {
+        return Err(AppError::new("the Slack bot is not running"));
+    }
+    let id = require_open(app, connection_id)?;
+    runtime.set_connection(Some(id));
+    let _ = app.emit("slack:status", runtime.status_info());
+    Ok(())
+}
+
+/// Stop a bot whose bound connection just went away, and say why. Called from
+/// `disconnect`; a no-op for every other connection, so closing one session never
+/// disturbs a bot bound to a different one.
+pub fn on_connection_closed(app: &AppHandle, connection_id: &str) {
+    let runtime = app.state::<SlackRuntime>();
+    if runtime.bound_connection().as_deref() != Some(connection_id) {
+        return;
+    }
+    stop(app);
+    runtime.set_status(
+        "disconnected",
+        Some(
+            "Slack bot stopped: the Tusk connection it was answering against was disconnected."
+                .to_string(),
+        ),
+    );
+    let _ = app.emit("slack:status", runtime.status_info());
+}
+
 /// Start the bot: validate tokens, spawn the socket loop + event consumer.
-/// Idempotent — a running bot is stopped first.
-pub async fn start(app: AppHandle) -> Result<(), AppError> {
+/// Idempotent — a running bot is stopped first. `connection_id` pins the ONE Tusk
+/// connection it answers against (None = whichever the workbench has focused).
+pub async fn start(app: AppHandle, connection_id: Option<String>) -> Result<(), AppError> {
     stop(&app); // drop any previous session
 
     let runtime = app.state::<SlackRuntime>();
+    // Resolve the binding BEFORE any status is published: an explicit pick that is not
+    // open is a hard error, while "no pick and nothing connected yet" is the ordinary
+    // autostart case — the bot starts UNBOUND and the workbench binds it as soon as it
+    // opens a connection. Questions asked before that are refused with a clear reason
+    // rather than silently answered from whichever session happens to exist.
+    let bound = match connection_id {
+        Some(requested) => match require_open(&app, &requested) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                runtime.set_status("disconnected", Some(e.message.clone()));
+                let _ = app.emit("slack:status", runtime.status_info());
+                return Err(e);
+            }
+        },
+        None => app
+            .state::<crate::AppState>()
+            .active()
+            .ok()
+            .map(|(id, _)| id),
+    };
     let cancel = CancellationToken::new();
     let my_gen = runtime.next_generation();
+    runtime.set_connection(bound);
     runtime.set_cancel(cancel.clone());
     runtime.approvals.clear();
     runtime.results.clear();

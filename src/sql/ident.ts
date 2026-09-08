@@ -1,9 +1,18 @@
 // Identifier + literal quoting. One source of truth for building SQL strings on the
 // frontend. Identifier quoting is dialect-aware: MySQL uses backticks (`x`), SQL Server
-// brackets ([x]), everyone else standard double-quotes ("x"). The active dialect is set once per connection
-// (`setSqlDialect`) — the app is single-connection, so this avoids threading a dialect
-// arg through every call site (scaffolds, grid filters, DDL builders). For Postgres it
-// matches Rust `db::ident`, which is only used on PG-only backend paths (import/DDL).
+// brackets ([x]), everyone else standard double-quotes ("x"). For Postgres it matches
+// Rust `db::ident`, which is only used on PG-only backend paths (import/DDL).
+//
+// MULTI-CONNECTION RULE. Several connections are open at once, so this module var is
+// only ever the ACTIVE connection's dialect (App re-applies `setSqlDialect` on every
+// active-connection switch). Any SQL built for a SPECIFIC tab, dialog, or frozen
+// snapshot must pin its own dialect instead of trusting the global:
+//   * builders that already take a dialect/kind argument (wrapQuery, buildCommitScript,
+//     formatWithOptions, explainSql, the filter SQL) — pass the owning connection's kind;
+//   * everything that reaches `ident`/`lit`/`sqlDialect()` implicitly (sql/ddl.ts, the
+//     Explorer scaffolds, export previews) — wrap the call in `withDialect(kind, …)`.
+// `withDialect` is synchronous only: never `await` inside it, or another builder would
+// observe the borrowed dialect.
 
 let backtick = false; // true = MySQL identifier quoting
 let bracket = false; // true = SQL Server identifier quoting
@@ -19,6 +28,26 @@ export function setSqlDialect(d: string): void {
 /** The active dialect ("postgres" | "duckdb" | "mysql" | "sqlite" | "mssql"). */
 export function sqlDialect(): string {
   return dialect;
+}
+
+/**
+ * Run `build` with `d` as the identifier/literal dialect, then restore the previous
+ * one. This is how SQL for a NON-active connection is generated: the module-level
+ * dialect belongs to the active connection, and a query must never be built with
+ * another connection's quoting. Synchronous only — `build` must not await.
+ */
+export function withDialect<T>(d: string, build: () => T): T {
+  const previousDialect = dialect;
+  const previousBacktick = backtick;
+  const previousBracket = bracket;
+  setSqlDialect(d);
+  try {
+    return build();
+  } finally {
+    dialect = previousDialect;
+    backtick = previousBacktick;
+    bracket = previousBracket;
+  }
 }
 
 /** Quote an identifier: `users` → `"users"` (`` `users` `` on MySQL, `[users]` on SQL Server). */

@@ -24,7 +24,18 @@ export type LayoutSizes = {
   editorH: number;
   sidebarOpen?: boolean;
   resultsOpen?: boolean;
+  /**
+   * Saved-profile ids that were open when the workspace was last used, in open
+   * order. Offered by the connect screen as "Reopen last session" — never
+   * reconnected automatically, and ad-hoc sessions are deliberately absent
+   * because their credentials were typed, not stored.
+   */
+  openConnections?: string[];
 };
+
+/** Hard bound on the remembered-session list (mirrors connections.MAX_CONNECTIONS). */
+const MAX_REMEMBERED_CONNECTIONS = 16;
+const MAX_REMEMBERED_ID_CHARS = 200;
 
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 const finite = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
@@ -41,6 +52,18 @@ export const layoutStore = {
           if (finite(parsed[k]) && parsed[k] > 0) out[k] = parsed[k];
         for (const k of ["sidebarOpen", "resultsOpen"] as const)
           if (typeof parsed[k] === "boolean") out[k] = parsed[k];
+        // Untrusted on read like every other persisted value: bound the count, the
+        // element type and each id's length before it can reach a connect call.
+        const remembered = parsed.openConnections;
+        if (Array.isArray(remembered)) {
+          const ids: string[] = [];
+          for (const v of remembered) {
+            if (typeof v !== "string" || !v || v.length > MAX_REMEMBERED_ID_CHARS) continue;
+            if (!ids.includes(v)) ids.push(v);
+            if (ids.length >= MAX_REMEMBERED_CONNECTIONS) break;
+          }
+          out.openConnections = ids;
+        }
         return out;
       }
     } catch {

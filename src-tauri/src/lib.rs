@@ -92,11 +92,19 @@ pub(crate) fn lock_sync<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Ceiling on simultaneously registered connections. Each one holds a live server
+/// session (and, for the embedded engines, an OS file lock), so an unbounded registry
+/// is a resource leak a stuck reconnect loop could drive. Mirrored in the frontend by
+/// `MAX_CONNECTIONS` in `src/connections.ts`.
+pub(crate) const MAX_OPEN_CONNECTIONS: usize = 16;
+
 #[derive(Default)]
 pub(crate) struct AppState {
     conns: Mutex<HashMap<String, Conn>>,
-    /// The connection the UI most recently opened — what the Slack bot runs against.
-    /// Maintained by register()/disconnect (the app is single-connection).
+    /// The connection the workbench currently has focused. Several are open at once,
+    /// so this is set explicitly by the frontend (`set_active_connection`) on every
+    /// switch, and by `register` for a freshly opened one. It is only a *default*:
+    /// the Slack bot binds to a connection id of its own (see `slack::SlackRuntime`).
     active_conn_id: Mutex<Option<String>>,
     // Cancel handles for the *currently running* cancellable operation (export/import)
     // on a connection, keyed by connection id. Kept OUTSIDE the per-connection async
@@ -227,19 +235,55 @@ impl AppState {
     fn cancel_entry(&self, id: &str) -> Option<CancelEntry> {
         lock_sync(&self.cancels).get(id).cloned()
     }
-    fn register(&self, backend: Backend, read_only: bool) -> String {
+    /// Refuse a new session before anything is dialled, so a rejected connect never
+    /// costs a TCP/TLS handshake or an embedded file lock. `register` re-checks under
+    /// the registry lock, which is what actually makes the cap race-free.
+    pub(crate) fn check_capacity(&self) -> Result<(), AppError> {
+        if lock_sync(&self.conns).len() >= MAX_OPEN_CONNECTIONS {
+            return Err(Self::too_many());
+        }
+        Ok(())
+    }
+
+    fn too_many() -> AppError {
+        AppError::new(format!(
+            "too many open connections ({MAX_OPEN_CONNECTIONS}) — disconnect one before opening another"
+        ))
+    }
+
+    fn register(&self, backend: Backend, read_only: bool) -> Result<String, AppError> {
         let id = format!("conn-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let conn = Arc::new(RegisteredConn {
             inner: AsyncMutex::new(ConnState::new(backend, read_only)),
             closed: AtomicBool::new(false),
         });
-        lock_sync(&self.conns).insert(id.clone(), conn);
+        {
+            let mut conns = lock_sync(&self.conns);
+            // Checked again under the lock: two connects racing past `check_capacity`
+            // must not both land. The loser's backend drops here, closing its session.
+            if conns.len() >= MAX_OPEN_CONNECTIONS {
+                return Err(Self::too_many());
+            }
+            conns.insert(id.clone(), conn);
+        }
         *lock_sync(&self.active_conn_id) = Some(id.clone());
-        id
+        Ok(id)
     }
 
-    /// The connection the Slack bot should use: the UI's active one, falling back to
-    /// the sole registered connection.
+    /// Point `active()` at the connection the workbench has focused. Unknown ids are
+    /// rejected rather than clearing the binding, so a stale switch cannot silently
+    /// make "the active connection" mean something else.
+    pub(crate) fn set_active(&self, id: &str) -> Result<(), AppError> {
+        if !lock_sync(&self.conns).contains_key(id) {
+            return Err(AppError::new("no such connection"));
+        }
+        *lock_sync(&self.active_conn_id) = Some(id.to_string());
+        Ok(())
+    }
+
+    /// The connection the workbench has focused, falling back to the sole registered
+    /// one. This is a *default* for newly bound work (a Slack bot start), never the
+    /// resolution used to run an already-bound job — those carry their own id.
     pub(crate) fn active(&self) -> Result<(String, Conn), AppError> {
         let active = lock_sync(&self.active_conn_id).clone();
         let conns = lock_sync(&self.conns);
@@ -512,11 +556,12 @@ async fn connect(
     state: tauri::State<'_, AppState>,
     config: ConnectionConfig,
 ) -> Result<ConnectResult, AppError> {
+    state.check_capacity()?;
     let read_only = config.read_only;
     let via_ssh = config.tunnelled();
     let (backend, server_version) = driver::connect(&config).await?;
     Ok(ConnectResult {
-        connection_id: state.register(backend, read_only),
+        connection_id: state.register(backend, read_only)?,
         server_version,
         read_only,
         via_ssh,
@@ -529,6 +574,7 @@ async fn connect_profile(
     app: tauri::AppHandle,
     id: String,
 ) -> Result<ConnectResult, AppError> {
+    state.check_capacity()?;
     let p = profiles::load_all(&app)?
         .into_iter()
         .find(|x| x.id == id)
@@ -575,11 +621,22 @@ async fn connect_profile(
     let via_ssh = config.tunnelled();
     let (backend, server_version) = driver::connect(&config).await?;
     Ok(ConnectResult {
-        connection_id: state.register(backend, read_only),
+        connection_id: state.register(backend, read_only)?,
         server_version,
         read_only,
         via_ssh,
     })
+}
+
+/// Point the backend's "active connection" at the one the workbench has focused.
+/// Called on every connection switch; it only supplies the default binding for work
+/// that is not already pinned to an id (a Slack bot start).
+#[tauri::command]
+async fn set_active_connection(
+    state: tauri::State<'_, AppState>,
+    connection_id: String,
+) -> Result<(), AppError> {
+    state.set_active(&connection_id)
 }
 
 /// Record an SSH host key the user explicitly accepted after seeing its fingerprint.
@@ -591,10 +648,16 @@ async fn ssh_trust_host(host: String, port: u16, fingerprint: String) -> Result<
 
 #[tauri::command]
 async fn disconnect(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     connection_id: String,
 ) -> Result<(), AppError> {
-    disconnect_registered(&state, &connection_id).await
+    let result = disconnect_registered(&state, &connection_id).await;
+    // Closing one connection must not disturb the others, but the Slack bot runs
+    // against exactly one — if that is the one going away, stop it loudly instead of
+    // leaving a "connected" badge over a bot that can only answer with errors.
+    slack::on_connection_closed(&app, &connection_id);
+    result
 }
 
 async fn disconnect_registered(state: &AppState, connection_id: &str) -> Result<(), AppError> {
@@ -1166,9 +1229,10 @@ fn dollar_tag_end(b: &[u8], i: usize) -> Option<usize> {
 mod bind_param_tests {
     use super::{
         checked_page_size, disconnect_registered, exec_items, has_bind_params, is_cursorable,
-        is_read_only_stmt, lock_conn, persist_export_temp, validate_fetch_page,
-        validate_result_page, validate_sql_size, validate_tabular_payload, AppState, CancelHandle,
-        ConnectionConfig, TransactionStatus, MAX_IPC_CELL_BYTES, MAX_SQL_BYTES,
+        is_read_only_stmt, lock_conn, lock_sync, persist_export_temp, validate_fetch_page,
+        validate_result_page, validate_sql_size, validate_tabular_payload, AppError, AppState,
+        CancelHandle, ConnState, ConnectionConfig, TransactionStatus, MAX_IPC_CELL_BYTES,
+        MAX_OPEN_CONNECTIONS, MAX_SQL_BYTES,
     };
     use crate::{driver, script};
     use std::sync::atomic::Ordering;
@@ -1361,7 +1425,7 @@ mod bind_param_tests {
         let state = AppState::default();
         let cfg = sqlite_cancel_config();
         let (backend, _) = driver::connect(&cfg).await.unwrap();
-        let id = state.register(backend, false);
+        let id = state.register(backend, false).unwrap();
         let old = state
             .arm_cancel(
                 &id,
@@ -1392,7 +1456,7 @@ mod bind_param_tests {
         let state = AppState::default();
         let cfg = sqlite_cancel_config();
         let (backend, _) = driver::connect(&cfg).await.unwrap();
-        let id = state.register(backend, false);
+        let id = state.register(backend, false).unwrap();
         let registration = state
             .arm_cancel(
                 &id,
@@ -1441,7 +1505,7 @@ mod bind_param_tests {
             .await
             .unwrap();
         let state = AppState::default();
-        let id = state.register(backend, false);
+        let id = state.register(backend, false).unwrap();
         let conn = state.get(&id).unwrap();
         {
             let mut c = lock_conn(&conn).await.unwrap();
@@ -1466,6 +1530,130 @@ mod bind_param_tests {
             .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn registry_refuses_more_than_the_open_connection_cap() {
+        let state = AppState::default();
+        let cfg = sqlite_cancel_config();
+        let mut ids = Vec::new();
+        for _ in 0..MAX_OPEN_CONNECTIONS {
+            state.check_capacity().unwrap();
+            let (backend, _) = driver::connect(&cfg).await.unwrap();
+            ids.push(state.register(backend, false).unwrap());
+        }
+        // Pre-flight refuses before anything is dialled …
+        let refused = state.check_capacity().unwrap_err();
+        assert!(
+            refused.message.contains(&MAX_OPEN_CONNECTIONS.to_string()),
+            "cap error should name the limit: {}",
+            refused.message
+        );
+        // … and register refuses too, which is what makes the cap race-free.
+        let (backend, _) = driver::connect(&cfg).await.unwrap();
+        assert!(state.register(backend, false).is_err());
+        assert_eq!(lock_sync(&state.conns).len(), MAX_OPEN_CONNECTIONS);
+
+        // Freeing one slot lets exactly one more in.
+        disconnect_registered(&state, &ids[0]).await.unwrap();
+        state.check_capacity().unwrap();
+        let (backend, _) = driver::connect(&cfg).await.unwrap();
+        let extra = state.register(backend, false).unwrap();
+        assert_eq!(lock_sync(&state.conns).len(), MAX_OPEN_CONNECTIONS);
+        for id in ids.iter().skip(1).chain(std::iter::once(&extra)) {
+            disconnect_registered(&state, id).await.unwrap();
+        }
+        assert!(lock_sync(&state.conns).is_empty());
+    }
+
+    /// Two simultaneously open connections each own their own manual transaction:
+    /// independent status/revision/owner, no cross-talk on commit, and disconnecting
+    /// one leaves the other's transaction untouched.
+    #[tokio::test]
+    async fn two_connections_own_independent_transactions() {
+        async fn run(c: &mut ConnState, sql: &str, owner: &str) -> Result<(), AppError> {
+            let items = crate::script::parse(sql)?;
+            let actions = crate::script::preflight_transactions(
+                &items,
+                c.transaction_engine(),
+                &c.transaction,
+            )?;
+            exec_items(c, &items, &actions, 100, &None, owner)
+                .await
+                .map(|_| ())
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut configs = Vec::new();
+        for name in ["a.sqlite", "b.sqlite"] {
+            let mut cfg = sqlite_cancel_config();
+            cfg.path = Some(dir.path().join(name).to_string_lossy().into_owned());
+            let (mut backend, _) = driver::connect(&cfg).await.unwrap();
+            backend
+                .run_single("CREATE TABLE t(a INTEGER)", 100, false)
+                .await
+                .unwrap();
+            configs.push((cfg, backend));
+        }
+        let state = AppState::default();
+        let mut ids = Vec::new();
+        for (_, backend) in configs.drain(..) {
+            ids.push(state.register(backend, false).unwrap());
+        }
+        let (a, b) = (ids[0].clone(), ids[1].clone());
+        let (conn_a, conn_b) = (state.get(&a).unwrap(), state.get(&b).unwrap());
+
+        {
+            let mut ca = lock_conn(&conn_a).await.unwrap();
+            run(&mut ca, "BEGIN", "tab-a").await.unwrap();
+            run(&mut ca, "INSERT INTO t VALUES (1)", "tab-a")
+                .await
+                .unwrap();
+        }
+        {
+            let mut cb = lock_conn(&conn_b).await.unwrap();
+            run(&mut cb, "BEGIN", "tab-b").await.unwrap();
+            run(&mut cb, "INSERT INTO t VALUES (2)", "tab-b")
+                .await
+                .unwrap();
+        }
+
+        {
+            let ca = lock_conn(&conn_a).await.unwrap();
+            let cb = lock_conn(&conn_b).await.unwrap();
+            assert!(ca.transaction.owns_session() && cb.transaction.owns_session());
+            assert_eq!(ca.transaction.owner.as_deref(), Some("tab-a"));
+            assert_eq!(cb.transaction.owner.as_deref(), Some("tab-b"));
+            // Per-connection transaction ids restart at 1, so identity is the PAIR
+            // (connection id, transaction id) — never the transaction id alone.
+            assert_eq!(ca.transaction.id, cb.transaction.id);
+            // Each connection refuses the other's owner tab.
+            assert!(ca.require_transaction_owner("tab-b").is_err());
+            assert!(cb.require_transaction_owner("tab-a").is_err());
+            assert!(ca.require_transaction_owner("tab-a").is_ok());
+        }
+
+        // Committing A must not move B's transaction on at all.
+        let b_revision = lock_conn(&conn_b).await.unwrap().transaction.revision;
+        {
+            let mut ca = lock_conn(&conn_a).await.unwrap();
+            run(&mut ca, "COMMIT", "tab-a").await.unwrap();
+            assert!(!ca.transaction.owns_session());
+        }
+        {
+            let cb = lock_conn(&conn_b).await.unwrap();
+            assert!(cb.transaction.owns_session());
+            assert_eq!(cb.transaction.revision, b_revision);
+        }
+
+        // Disconnecting A rolls back nothing of B's, and B still owns its unit.
+        disconnect_registered(&state, &a).await.unwrap();
+        {
+            let cb = lock_conn(&conn_b).await.unwrap();
+            assert!(cb.transaction.owns_session());
+            assert_eq!(cb.transaction.owner.as_deref(), Some("tab-b"));
+        }
+        disconnect_registered(&state, &b).await.unwrap();
     }
 }
 
@@ -2429,9 +2617,20 @@ async fn slack_clear_tokens(app: tauri::AppHandle) -> Result<(), AppError> {
     slack::config::clear_tokens()
 }
 
+/// Start the bot bound to ONE Tusk connection. `connectionId` is the workbench's
+/// current pick; omitted, the bot binds to whichever connection is active.
 #[tauri::command]
-async fn slack_start(app: tauri::AppHandle) -> Result<(), AppError> {
-    slack::start(app).await
+async fn slack_start(app: tauri::AppHandle, connection_id: Option<String>) -> Result<(), AppError> {
+    slack::start(app, connection_id).await
+}
+
+/// Repoint a running bot at another open connection (Settings → Slack).
+#[tauri::command]
+async fn slack_set_connection(
+    app: tauri::AppHandle,
+    connection_id: String,
+) -> Result<(), AppError> {
+    slack::bind_connection(&app, &connection_id)
 }
 
 #[tauri::command]
@@ -2507,7 +2706,7 @@ pub fn run() {
                 .unwrap_or(false)
             {
                 tauri::async_runtime::spawn(async move {
-                    if let Err(e) = slack::start(handle).await {
+                    if let Err(e) = slack::start(handle, None).await {
                         eprintln!("[tusk-slack] autostart failed: {}", e.message);
                     }
                 });
@@ -2518,6 +2717,7 @@ pub fn run() {
             connect,
             connect_profile,
             disconnect,
+            set_active_connection,
             list_profiles,
             save_profile,
             delete_profile,
@@ -2565,6 +2765,7 @@ pub fn run() {
             slack_save_config,
             slack_clear_tokens,
             slack_start,
+            slack_set_connection,
             slack_stop,
             slack_status,
             slack_test,

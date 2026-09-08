@@ -24,6 +24,24 @@ struct SlackQueryResult {
     dialect: String,
 }
 
+/// The ONE connection this bot answers against. Tusk keeps several connections open,
+/// so the bot must never resolve "whatever is active right now" — that would let a
+/// question asked against one database be answered from another simply because the
+/// user switched tabs. The binding is fixed when the bot starts and only changes on
+/// an explicit pick in Settings → Slack.
+fn bound_connection(app: &AppHandle) -> Result<(String, crate::Conn), AppError> {
+    let id = app
+        .state::<SlackRuntime>()
+        .bound_connection()
+        .ok_or_else(|| AppError::new("the Slack bot is not answering against any Tusk connection yet — connect a database in Tusk, or pick one in Settings → Slack"))?;
+    let conn = app.state::<crate::AppState>().get(&id).map_err(|_| {
+        AppError::new(
+            "the Tusk connection this Slack bot answers against is no longer open — reconnect it, or pick another in Settings → Slack",
+        )
+    })?;
+    Ok((id, conn))
+}
+
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SlackConnectionIdentity<'a> {
@@ -385,8 +403,7 @@ async fn generate_proposal(
     // Snapshot schema/permissions/samples under the connection lock, then RELEASE it
     // before the (slow) AI call so the UI is never blocked on a Slack question.
     let (system, connection_id, database, dialect) = {
-        let state = app.state::<crate::AppState>();
-        let (connection_id, conn) = state.active()?;
+        let (connection_id, conn) = bound_connection(app)?;
         let mut c = crate::lock_conn(&conn).await?;
         crate::ensure_alive(&mut c).await?;
         c.require_idle("Slack metadata")?;
@@ -1332,11 +1349,10 @@ async fn run_proposal(
     // swallow the closing paren / LIMIT. `sql` is already `;`-trimmed by the caller.
     let wrapped = format!("SELECT * FROM (\n{sql}\n) AS _tusk LIMIT {}", cap + 1);
 
-    let state = app.state::<crate::AppState>();
-    let (conn_id, conn) = state.active()?;
+    let (conn_id, conn) = bound_connection(app)?;
     if conn_id != expected_connection_id {
         return Err(AppError::new(
-            "the active Tusk connection changed after this proposal was created — ask the question again before approving",
+            "the Tusk connection the bot answers against changed after this proposal was created — ask the question again before approving",
         ));
     }
     let (isolated_cfg, kind) = {
