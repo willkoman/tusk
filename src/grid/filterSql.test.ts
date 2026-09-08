@@ -37,9 +37,11 @@ const cast = (d: D, n: string) => {
 };
 const ci = (d: D, expr: string, pattern: string, tail = "") => {
   if (d === "postgres" || d === "duckdb") return `${expr} ILIKE ${pattern}${tail}`;
-  if (d === "mysql" || d === "sqlite") return `${expr} LIKE ${pattern}${tail}`;
+  // MySQL/SQLite/MSSQL all make case sensitivity a collation property.
   return `LOWER(${expr}) LIKE LOWER(${pattern})${tail}`;
 };
+/** The dialect-independent LIKE escape clause — never a backslash (MySQL ANSI mode). */
+const ESC = " ESCAPE '!'";
 
 function render(d: D, op: FilterOperator, column: string, values: string[] = [], columns = COLUMNS): string {
   setSqlDialect(d);
@@ -113,54 +115,63 @@ describe("null / boolean / empty operators", () => {
     }
   });
 
-  it("is empty compares against the empty string", () => {
-    for (const d of DIALECTS) expect(render(d, "isEmpty", "name")).toBe(`${id(d, "name")} = ''`);
+  it("is empty compares the text form against the empty string", () => {
+    for (const d of DIALECTS) expect(render(d, "isEmpty", "name")).toBe(`${cast(d, "name")} = ''`);
   });
 });
 
 describe("LIKE-family operators", () => {
-  it("contains / starts with / ends with stay case-insensitive per engine", () => {
+  it("contains / starts with / ends with stay case-insensitive on every engine", () => {
     for (const d of DIALECTS) {
-      expect(render(d, "contains", "name", ["ab"])).toBe(ci(d, id(d, "name"), str(d, "%ab%")));
-      expect(render(d, "startsWith", "name", ["ab"])).toBe(ci(d, id(d, "name"), str(d, "ab%")));
-      expect(render(d, "endsWith", "name", ["ab"])).toBe(ci(d, id(d, "name"), str(d, "%ab")));
+      expect(render(d, "contains", "name", ["ab"])).toBe(ci(d, cast(d, "name"), str(d, "%ab%"), ESC));
+      expect(render(d, "startsWith", "name", ["ab"])).toBe(ci(d, cast(d, "name"), str(d, "ab%"), ESC));
+      expect(render(d, "endsWith", "name", ["ab"])).toBe(ci(d, cast(d, "name"), str(d, "%ab"), ESC));
     }
   });
 
-  it("non-text columns are cast to text before matching", () => {
+  it("every LIKE comparison is done on the text form of the column", () => {
     for (const d of DIALECTS) {
-      expect(render(d, "contains", "id", ["7"])).toBe(ci(d, cast(d, "id"), str(d, "%7%")));
-      expect(render(d, "contains", "made_at", ["2024"])).toBe(ci(d, cast(d, "made_at"), str(d, "%2024%")));
+      expect(render(d, "contains", "id", ["7"])).toBe(ci(d, cast(d, "id"), str(d, "%7%"), ESC));
+      expect(render(d, "contains", "made_at", ["2024"])).toBe(ci(d, cast(d, "made_at"), str(d, "%2024%"), ESC));
+      // Text columns are cast too: a bare `char(n)` would otherwise match padded.
+      expect(render(d, "contains", "name", ["x"])).toContain(cast(d, "name"));
     }
   });
 
-  it("wildcards inside user text are escaped, with a dialect-correct ESCAPE clause", () => {
-    const clause = (d: D) => (d === "mysql" ? " ESCAPE '\\\\'" : d === "postgres" ? " ESCAPE E'\\\\'" : " ESCAPE '\\'");
+  it("wildcards are escaped with `!`, never a backslash, on every dialect", () => {
     for (const d of DIALECTS) {
-      expect(render(d, "contains", "name", ["50%"])).toBe(ci(d, id(d, "name"), str(d, "%50\\%%"), clause(d)));
-      expect(render(d, "startsWith", "name", ["a_b"])).toBe(ci(d, id(d, "name"), str(d, "a\\_b%"), clause(d)));
-      expect(render(d, "endsWith", "name", ["c\\d"])).toBe(ci(d, id(d, "name"), str(d, "%c\\\\d"), clause(d)));
-      // No special characters ⇒ no ESCAPE clause (keeps the common case clean).
-      expect(render(d, "contains", "name", ["plain"])).not.toContain("ESCAPE");
+      expect(render(d, "contains", "name", ["50%"])).toBe(ci(d, cast(d, "name"), str(d, "%50!%%"), ESC));
+      expect(render(d, "startsWith", "name", ["a_b"])).toBe(ci(d, cast(d, "name"), str(d, "a!_b%"), ESC));
+      // The escape character itself is escaped; a backslash is now ordinary text.
+      expect(render(d, "endsWith", "name", ["c!d"])).toBe(ci(d, cast(d, "name"), str(d, "%c!!d"), ESC));
+      expect(render(d, "contains", "name", ["c\\d"])).toBe(ci(d, cast(d, "name"), str(d, "%c\\d%"), ESC));
+      // The clause is unconditional and backslash-free, so MySQL `sql_mode=ANSI`
+      // (error 1210 on `ESCAPE '\'`) and standard_conforming_strings cannot
+      // change what the pattern means.
+      const plain = render(d, "contains", "name", ["plain"]);
+      expect(plain.endsWith("ESCAPE '!'")).toBe(true);
     }
   });
 
-  it("like / not like pass the pattern through; ilike maps to LOWER where unsupported", () => {
+  it("like / not like pass the pattern through; ilike folds case where it is not native", () => {
     for (const d of DIALECTS) {
-      expect(render(d, "like", "name", ["a%b"])).toBe(`${id(d, "name")} LIKE ${str(d, "a%b")}`);
-      expect(render(d, "notLike", "name", ["a%b"])).toBe(`${id(d, "name")} NOT LIKE ${str(d, "a%b")}`);
-      expect(render(d, "ilike", "name", ["a%b"])).toBe(ci(d, id(d, "name"), str(d, "a%b")));
+      expect(render(d, "like", "name", ["a%b"])).toBe(`${cast(d, "name")} LIKE ${str(d, "a%b")}`);
+      expect(render(d, "notLike", "name", ["a%b"])).toBe(`${cast(d, "name")} NOT LIKE ${str(d, "a%b")}`);
+      expect(render(d, "ilike", "name", ["a%b"])).toBe(ci(d, cast(d, "name"), str(d, "a%b")));
     }
     setSqlDialect("postgres");
     expect(render("postgres", "ilike", "name", ["x"])).toContain("ILIKE");
-    expect(render("mssql", "ilike", "name", ["x"])).toBe(`LOWER("name") LIKE LOWER('x')`);
-    expect(render("sqlite", "ilike", "name", ["x"])).toBe(`"name" LIKE 'x'`);
+    expect(render("mssql", "ilike", "name", ["x"])).toBe(`LOWER(CAST("name" AS VARCHAR(MAX))) LIKE LOWER('x')`);
+    expect(render("sqlite", "ilike", "name", ["x"])).toBe(`LOWER(CAST("name" AS TEXT)) LIKE LOWER('x')`);
+    // MySQL's default collation is case-insensitive, but a `_bin`/`_cs` column is
+    // not — the mapping must not depend on it.
+    expect(render("mysql", "ilike", "name", ["x"])).toBe("LOWER(CAST(`name` AS CHAR)) LIKE LOWER(_utf8mb4 X'78')");
   });
 
   it("quotes in user text are escaped, never able to close the literal", () => {
     expect(render("postgres", "eq", "name", ["o'brien"])).toBe(`"name" = 'o''brien'`);
     expect(render("postgres", "contains", "name", ["'; DROP TABLE t --"])).toBe(
-      `"name" ILIKE '%''; DROP TABLE t --%'`,
+      `"name"::text ILIKE '%''; DROP TABLE t --%' ESCAPE '!'`,
     );
     setSqlDialect("mysql");
     expect(renderCondition(makeCondition("name", "eq", ["a\\'b"]), { columns: COLUMNS, dialect: "mysql", classOf: CLASS_OF }))

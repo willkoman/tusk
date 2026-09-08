@@ -12,18 +12,20 @@ import {
   duplicateNode,
   emptyFilter,
   hasConditions,
+  hiddenRuleCount,
   isComplete,
+  isGroup,
   makeCondition,
   makeGroup,
-  normalizeFilters,
   operatorsFor,
   parseList,
   quickFilterOf,
   removeNode,
   setGroupOp,
   setQuickFilter,
-  treeFromFlat,
   updateCondition,
+  type Condition,
+  type FilterGroup,
   type FilterTree,
   MAX_CONDITIONS,
   MAX_VALUE_CHARS,
@@ -192,29 +194,7 @@ describe("bounds", () => {
   });
 });
 
-describe("migration + quick filters", () => {
-  it("migrates the legacy flat filter shape without losing rules", () => {
-    const t = treeFromFlat([{ col: 1, text: "abc" }, { col: 0, text: "  " }, { col: 9, text: "gone" }], ["id", "name"]);
-    expect(t.op).toBe("and");
-    expect(conditions(t).map((c) => [c.column, c.operator, c.values[0]])).toEqual([["name", "contains", "abc"]]);
-  });
-
-  it("normalizeFilters accepts flat arrays, trees, and junk", () => {
-    expect(conditions(normalizeFilters([{ col: 0, text: "x" }], ["id"]))[0].column).toBe("id");
-    const tree = normalizeFilters({ kind: "group", op: "or", items: [{ column: "a", operator: "gt", values: ["1"] }] });
-    expect(tree.op).toBe("or");
-    expect(conditions(tree)[0].operator).toBe("gt");
-    expect(normalizeFilters(null).items).toEqual([]);
-    expect(normalizeFilters("nope").items).toEqual([]);
-    expect(normalizeFilters([{ nonsense: true }]).items).toEqual([]);
-    // A bare condition object is promoted into a root AND.
-    const promoted = normalizeFilters({ column: "a", operator: "eq", values: ["1"] });
-    expect(promoted.op).toBe("and");
-    expect(conditions(promoted).length).toBe(1);
-    // An unknown operator degrades to the quick-filter contains rather than dropping.
-    expect(conditions(normalizeFilters({ column: "a", operator: "hack", values: ["1"] }))[0].operator).toBe("contains");
-  });
-
+describe("quick filters", () => {
   it("quick filters read and write top-level contains conditions only", () => {
     let t = emptyFilter();
     t = setQuickFilter(t, "name", "abc");
@@ -238,6 +218,68 @@ describe("migration + quick filters", () => {
   it("a nested contains condition is not a quick filter", () => {
     const t: FilterTree = { ...emptyFilter(), items: [makeGroup("or", [makeCondition("name", "contains", ["x"])])] };
     expect(quickFilterOf(t, "name")).toBe("");
+  });
+
+  it("typing under an OR root re-roots as AND instead of widening the result", () => {
+    // The header row means "AND this too". Appending into an OR root would make
+    // every row matching the new text match the whole filter.
+    const or: FilterTree = {
+      ...emptyFilter(),
+      op: "or",
+      items: [makeCondition("qty", "gt", ["10"]), makeCondition("qty", "lt", ["2"])],
+    };
+    const t = setQuickFilter(or, "name", "abc");
+    expect(t.op).toBe("and");
+    expect(t.items.length).toBe(2);
+    expect(isGroup(t.items[0])).toBe(true);
+    expect((t.items[0] as FilterGroup).op).toBe("or");
+    expect((t.items[0] as FilterGroup).items.length).toBe(2);
+    expect(quickFilterOf(t, "name")).toBe("abc");
+    // Nothing was lost: both original rules still render.
+    expect(conditions(t).length).toBe(3);
+    // A second quick filter simply joins the (now AND) root.
+    const t2 = setQuickFilter(t, "qty", "9");
+    expect(t2.op).toBe("and");
+    expect(t2.items.length).toBe(3);
+  });
+
+  it("an empty OR root becomes AND rather than nesting an empty group", () => {
+    const or: FilterTree = { ...emptyFilter(), op: "or" };
+    const t = setQuickFilter(or, "name", "x");
+    expect(t.op).toBe("and");
+    expect(t.items.length).toBe(1);
+  });
+
+  it("hiddenRuleCount reports rules the one-line box cannot show", () => {
+    const t: FilterTree = {
+      ...emptyFilter(),
+      items: [
+        makeCondition("name", "contains", ["abc"]), // the quick filter itself
+        makeCondition("name", "startsWith", ["z"]), // top level, other operator
+        makeGroup("or", [makeCondition("name", "eq", ["q"]), makeCondition("qty", "gt", ["1"])]),
+        makeCondition("qty", "eq", []), // incomplete — contributes no SQL
+      ],
+    };
+    expect(hiddenRuleCount(t, "name")).toBe(2);
+    expect(hiddenRuleCount(t, "qty")).toBe(1);
+    expect(hiddenRuleCount(t, "absent")).toBe(0);
+    expect(hiddenRuleCount(emptyFilter(), "name")).toBe(0);
+  });
+});
+
+describe("tree edits are pure rebuilds", () => {
+  // The FilterBuilder must therefore render its rows with `<Index>`: `<For>`
+  // reconciles by reference, so it would dispose and recreate the input being
+  // typed into on every keystroke.
+  it("an edit replaces the condition AND every enclosing group object", () => {
+    const inner = makeGroup("or", [makeCondition("name", "eq", ["a"])]);
+    const root: FilterTree = { ...emptyFilter(), items: [inner] };
+    const target = (inner.items[0] as Condition).id;
+    const next = updateCondition(root, target, { values: ["ab"] });
+    expect(next).not.toBe(root);
+    expect(next.items[0]).not.toBe(inner);
+    expect((next.items[0] as FilterGroup).items[0]).not.toBe(inner.items[0]);
+    expect(((next.items[0] as FilterGroup).items[0] as Condition).id).toBe(target);
   });
 });
 

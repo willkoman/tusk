@@ -7,12 +7,18 @@
 //  - A column referenced by a condition must resolve to exactly ONE result
 //    column; duplicates throw (the old flat filter did the same — an ambiguous
 //    reference inside `SELECT * FROM (…) AS _tusk` is a server error at best).
-//  - `ilike` is native only on Postgres/DuckDB; MySQL/SQLite/MSSQL get the
-//    LOWER(col) LIKE LOWER(pat) mapping. `contains`/`starts with`/`ends with`
-//    keep the OLD quick-filter semantics (case-insensitive) on every engine, so
-//    the header filter row generates byte-identical SQL to before.
-//  - LIKE patterns built from user text escape `%`, `_` and `\`, and only then
-//    is an ESCAPE clause emitted (written the way each dialect reads literals).
+//  - `ilike` is native only on Postgres/DuckDB; every other dialect gets the
+//    LOWER(col) LIKE LOWER(pat) mapping, MySQL and SQLite included — their
+//    default collations are usually case-insensitive but a `_bin`/`_cs` column
+//    (or `PRAGMA case_sensitive_like`) is not, and "case-insensitive" has to mean
+//    the same thing on every engine. `contains`/`starts with`/`ends with` use
+//    that same mapping.
+//  - Every LIKE-family comparison casts the column to text first, whatever its
+//    class, so `char(n)` padding and non-text types behave identically.
+//  - LIKE patterns built from user text escape `%`, `_` and the escape character
+//    itself with `!` — never a backslash, whose meaning inside a string literal
+//    depends on MySQL's `NO_BACKSLASH_ESCAPES`/`sql_mode=ANSI` (error 1210). The
+//    `ESCAPE '!'` clause is always emitted for those operators.
 
 import { ident, lit } from "../sql/ident";
 import {
@@ -88,29 +94,27 @@ function valueLiteral(value: string, cls: ColumnClass, dialect: string): string 
   return lit(value);
 }
 
-/** A literal single backslash, written the way each dialect reads string literals. */
-function escapeClause(dialect: string): string {
-  switch (dialect) {
-    case "mysql":
-      return " ESCAPE '\\\\'"; // MySQL processes backslash escapes inside literals
-    case "postgres":
-      return " ESCAPE E'\\\\'"; // deterministic regardless of standard_conforming_strings
-    default: // duckdb, sqlite, mssql — standard literals, no backslash processing
-      return " ESCAPE '\\'";
-  }
-}
+/**
+ * A dialect-independent LIKE escape character. `!` is a plain character in every
+ * engine's string literals, so unlike a backslash it never depends on MySQL's
+ * `NO_BACKSLASH_ESCAPES` (`sql_mode=ANSI` rejects `ESCAPE '\\'` with error 1210)
+ * or PostgreSQL's `standard_conforming_strings`.
+ */
+const LIKE_ESCAPE = "!";
+const ESCAPE_CLAUSE = ` ESCAPE '${LIKE_ESCAPE}'`;
 
-const LIKE_SPECIAL = /[\\%_]/;
-const escapeLikeText = (s: string) => s.replace(/([\\%_])/g, "\\$1");
+const escapeLikeText = (s: string) => s.replace(/([!%_])/g, `${LIKE_ESCAPE}$1`);
 
-/** Case-insensitive LIKE, per engine. `tail` carries an ESCAPE clause when needed. */
+/**
+ * Case-insensitive LIKE, per engine. `tail` carries the ESCAPE clause for the
+ * patterns this module builds (raw `ilike` patterns are the user's own).
+ */
 function ciLike(expr: string, pattern: string, dialect: string, negate: boolean, tail: string): string {
   const op = negate ? "NOT LIKE" : "LIKE";
   if (dialect === "postgres" || dialect === "duckdb")
     return `${expr} ${negate ? "NOT ILIKE" : "ILIKE"} ${pattern}${tail}`;
-  // MySQL and SQLite match case-insensitively under their default collations.
-  if (dialect === "mysql" || dialect === "sqlite") return `${expr} ${op} ${pattern}${tail}`;
-  // MSSQL case sensitivity is a collation property — fold both sides explicitly.
+  // MySQL, SQLite and MSSQL all make case sensitivity a collation property, so
+  // fold both sides explicitly rather than trusting the column's collation.
   return `LOWER(${expr}) ${op} LOWER(${pattern})${tail}`;
 }
 
@@ -134,8 +138,10 @@ export function renderCondition(cond: Condition, ctx: FilterSqlCtx): string {
   const cls = ctx.classOf?.(resolved) ?? "other";
   const quoted = ident(resolved);
   const dialect = ctx.dialect;
-  // LIKE-family matching needs text; a text column already is.
-  const textExpr = cls === "text" ? quoted : textCast(quoted, dialect);
+  // LIKE-family matching is always done on text: a bare `char(n)` column would
+  // otherwise match with its blank padding, and an unknown class must not decide
+  // whether the comparison is textual.
+  const textExpr = textCast(quoted, dialect);
   const v0 = cond.values[0] ?? "";
   const v1 = cond.values[1] ?? "";
 
@@ -189,8 +195,10 @@ export function renderCondition(cond: Condition, ctx: FilterSqlCtx): string {
       const esc = escapeLikeText(v0);
       const pattern =
         cond.operator === "contains" ? `%${esc}%` : cond.operator === "startsWith" ? `${esc}%` : `%${esc}`;
-      const tail = LIKE_SPECIAL.test(v0) ? escapeClause(dialect) : "";
-      return ciLike(textExpr, lit(pattern), dialect, false, tail);
+      // Always declared: the clause is what makes the escaping above meaningful,
+      // and emitting it unconditionally keeps the SQL identical whether or not
+      // the typed text happened to contain a wildcard.
+      return ciLike(textExpr, lit(pattern), dialect, false, ESCAPE_CLAUSE);
     }
   }
   return "";

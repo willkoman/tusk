@@ -3,7 +3,7 @@ import { type Dataset, formatForCopy } from "./formats";
 import { clipWrite, clipRead } from "./clipboard";
 import { type MenuItem } from "./ContextMenu";
 import { type GridView, type SortKey, type PendingEdits } from "./tabs";
-import { quickFilterOf, setQuickFilter, type FilterTree } from "./grid/filterModel";
+import { hiddenRuleCount, quickFilterOf, setQuickFilter, type FilterTree } from "./grid/filterModel";
 import { boolWord } from "./grid/bool";
 import { parseClipboardTable, type RowRef } from "./grid/paste";
 
@@ -783,6 +783,10 @@ export function ResultGrid(props: ResultGridProps) {
     }, 300);
   }
   const filterFor = (oi: number) => quickFilterOf(props.view().filters, props.columns()[oi] ?? "");
+  // Builder rules this one-line box cannot represent (another operator, or a rule
+  // nested in a group). Without the marker an empty box reads as "no filter on
+  // this column" while the result is in fact filtered by it.
+  const hiddenRulesFor = (oi: number) => hiddenRuleCount(props.view().filters, props.columns()[oi] ?? "");
 
   onCleanup(() => {
     clearTimeout(filterTimer);
@@ -929,11 +933,16 @@ export function ResultGrid(props: ResultGridProps) {
               <For each={range(visCols().start, visCols().end)}>
                 {(k) => {
                   const oi = () => displayCols()[k];
+                  const hidden = () => hiddenRulesFor(oi());
                   return (
                     <input
                       class="rg-filter-input"
+                      classList={{ "has-rules": hidden() > 0 }}
                       style={{ left: `${offsets()[k]}px`, width: `${colWidth(oi()) - 6}px` }}
-                      placeholder="filter…"
+                      placeholder={hidden() > 0 ? `${hidden()} rule${hidden() === 1 ? "" : "s"} · Edit…` : "filter…"}
+                      title={hidden() > 0
+                        ? `${hidden()} filter rule${hidden() === 1 ? "" : "s"} on this column come from the filter builder — open it to see or change them`
+                        : undefined}
                       value={filterFor(oi())}
                       disabled={!props.canFilter()}
                       onInput={(e) => onFilterInput(oi(), e.currentTarget.value)}
