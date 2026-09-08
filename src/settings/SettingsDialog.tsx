@@ -3,7 +3,7 @@ import { Dialog } from "../Dialog";
 import { type EditorPrefs } from "../editor/types";
 import { type DialectId } from "../sql/dialects";
 import { THEMES } from "../themes";
-import { SlackPane } from "./SlackPane";
+import { SlackPane, type SlackConnectionOption } from "./SlackPane";
 import { AiPane } from "./AiPane";
 import { crashConsent, setCrashConsent } from "../store";
 
@@ -39,6 +39,10 @@ export function SettingsDialog(props: {
   database: string;
   /** Rendered inside the Shortcuts tab (lands with the keymap feature). */
   shortcutsPane?: () => any;
+  /** Open connections, so Settings → Slack can point the bot at one of them. */
+  connections?: () => SlackConnectionOption[];
+  /** The connection the workbench has focused (the default a fresh bot start binds to). */
+  activeConnectionId?: () => string | null;
 }) {
   const [tab, setTab] = createSignal<SettingsTab>(props.initialTab ?? "editor");
   const p = props.prefs;
@@ -225,7 +229,7 @@ export function SettingsDialog(props: {
               <AiPane database={props.database} />
             </Match>
             <Match when={tab() === "slack"}>
-              <SlackPane onOpenAi={() => setTab("ai")} />
+              <SlackPane onOpenAi={() => setTab("ai")} connections={props.connections} activeConnectionId={props.activeConnectionId} />
             </Match>
 
             <Match when={tab() === "shortcuts"}>

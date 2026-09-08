@@ -139,6 +139,12 @@ export function pendingCount(p: PendingEdits | undefined): number {
 
 export type Tab = {
   id: string;
+  /**
+   * The connection this tab runs against. Several connections are open at once and
+   * one strip shows every tab, so the tab — not a global "current connection" — is
+   * what decides where a query runs and which dialect its SQL is built with.
+   */
+  connectionId: string;
   title: string;
   sql: string;
   filePath: string | null;
@@ -173,6 +179,7 @@ export function makeTab(init?: Partial<Tab>): Tab {
   counter += 1;
   return {
     id: `tab-${counter}`,
+    connectionId: init?.connectionId ?? "",
     title: init?.title ?? `Untitled ${counter}`,
     sql: init?.sql ?? "",
     filePath: init?.filePath ?? null,

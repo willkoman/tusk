@@ -45,13 +45,19 @@ function mssqlWrappable(inner: string): boolean {
   return !/(^|\W)with\s/i.test(masked) && !/(^|\W)order\s+by(\W|$)/i.test(masked);
 }
 
-/** Whether the base query can be wrapped as `SELECT * FROM (<q>) t` (single row-producing statement). */
-export function wrappableQuery(q: string): boolean {
+/**
+ * Whether the base query can be wrapped as `SELECT * FROM (<q>) t` (single
+ * row-producing statement). `dialect` must be the OWNING connection's kind — with
+ * several connections open the module-level dialect belongs to the active one, and
+ * a wrap decided under the wrong dialect would emit SQL the server rejects (or,
+ * worse, accept a shape T-SQL cannot nest).
+ */
+export function wrappableQuery(q: string, dialect: string = sqlDialect()): boolean {
   const shape = queryShape(q);
   // The same structural WITH classifier protects Explain Analyze and backend
   // cursoring, so sorting/filtering cannot re-run a WITH-led write either.
-  if (!shape.safe || !isReadStatement(shape.inner, sqlDialect())) return false;
-  return sqlDialect() !== "mssql" || mssqlWrappable(shape.inner);
+  if (!shape.safe || !isReadStatement(shape.inner, dialect)) return false;
+  return dialect !== "mssql" || mssqlWrappable(shape.inner);
 }
 
 /** True when two result columns share a name (MySQL refuses to wrap those — error 1060). */
@@ -86,7 +92,7 @@ export function wrapQuery(
   dialect: string = "postgres",
   classOf?: (column: string) => ColumnClass,
 ): string {
-  if (!wrappableQuery(base)) throw new Error("query cannot be safely wrapped for grid sorting or filtering");
+  if (!wrappableQuery(base, dialect)) throw new Error("query cannot be safely wrapped for grid sorting or filtering");
   const inner = stripTrailingSemi(base);
   const where = renderWhere(toFilterTree(filters, columns), { columns, dialect, classOf });
   const order = sorts

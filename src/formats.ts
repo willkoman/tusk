@@ -310,12 +310,17 @@ function markdownCell(v: string | null): string {
  *  toCSV/toTSV/toJSON/toMarkdown helpers below survive only for paste round-trip
  *  tests. Markdown always emits its header (a headerless markdown table isn't
  *  valid markdown). */
-export function formatForCopy(d: Dataset, fmt: "tsv" | "csv" | "json" | "md", header: boolean): string {
+export function formatForCopy(
+  d: Dataset,
+  fmt: "tsv" | "csv" | "json" | "md",
+  header: boolean,
+  sourceDialect = activeSqlDialect(),
+): string {
   const opts = defaultExportOptions("");
   opts.format = fmt === "md" ? "markdown" : fmt;
   opts.delimiter = fmt === "tsv" ? "tab" : "comma";
   opts.header = fmt === "md" ? true : header;
-  return formatWithOptions(d, opts);
+  return formatWithOptions(d, opts, sourceDialect);
 }
 
 export function toCSV(d: Dataset, header = true): string {

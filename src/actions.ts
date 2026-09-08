@@ -29,6 +29,9 @@ export type ActionId =
   | "toggleWrap"
   | "toggleSidebar"
   | "toggleResults"
+  | "nextConnection"
+  | "prevConnection"
+  | "newConnection"
   | "loadAllRows"
   | "exportResult"
   | "openFilterBuilder";
@@ -46,6 +49,8 @@ export type ActionCtx = {
   canRollbackTransaction: boolean;
   /** The active result can be re-streamed with a server-side WHERE. */
   canFilter: boolean;
+  /** How many database connections are open (0 = the connect screen). */
+  connectionCount: number;
 };
 
 export type ActionDef = {
@@ -100,6 +105,14 @@ export const ACTIONS: readonly ActionDef[] = [
   // of letting Mod-k silently no-op on the connect screen.
   { id: "openPalette", title: "Command palette", category: "View", defaultKey: "Mod-k", scope: "global", enabled: (c) => c.connected },
   { id: "toggleAi", title: "Toggle AI assistant", category: "View", defaultKey: null, scope: "global", enabled: (c) => c.connected },
+  // Connection switching. Arrow chords, NOT `Mod-Shift-]`/`[`: the browser reports
+  // `e.key` after the shift transform, so a shifted bracket arrives as `}`/`{` and a
+  // bracket binding could never match. Arrow names are layout-independent. Enabled
+  // only past one open connection, so the chords stay silent in a single-connection
+  // workspace.
+  { id: "nextConnection", title: "Next connection", category: "View", defaultKey: "Mod-Alt-ArrowRight", scope: "global", enabled: (c) => c.connectionCount > 1 },
+  { id: "prevConnection", title: "Previous connection", category: "View", defaultKey: "Mod-Alt-ArrowLeft", scope: "global", enabled: (c) => c.connectionCount > 1 },
+  { id: "newConnection", title: "Open another connection…", category: "View", defaultKey: "Mod-Shift-n", scope: "global", enabled: (c) => c.connected },
 ];
 
 /** Saved overrides: absent = default binding, null = explicitly unbound. */
@@ -154,12 +167,20 @@ export function findConflict(key: string, exceptId: ActionId | null, overrides: 
   return null;
 }
 
+/** Arrow keys render as glyphs — "Ctrl+Alt+ArrowRight" is unreadable in a chip. */
+const KEY_GLYPHS: Record<string, string> = {
+  ArrowLeft: "←",
+  ArrowRight: "→",
+  ArrowUp: "↑",
+  ArrowDown: "↓",
+};
+
 /** Human-readable chord for chips/palette (⌘⇧K on mac, Ctrl+Shift+K elsewhere). */
 export function displayKey(key: string | null): string {
   if (!key) return "";
   const parts = canonicalKey(key).split("-");
   const k = parts.pop() ?? "";
-  const label = k.length === 1 ? k.toUpperCase() : k;
+  const label = KEY_GLYPHS[k] ?? (k.length === 1 ? k.toUpperCase() : k);
   if (isMac) {
     return (parts.includes("Mod") ? "⌘" : "") + (parts.includes("Alt") ? "⌥" : "") + (parts.includes("Shift") ? "⇧" : "") + label;
   }

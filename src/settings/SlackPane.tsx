@@ -7,7 +7,7 @@
 // tokens, Who can ask, Answers, AI — each a header plus label/hint/control rows. Every
 // non-token control saves as it changes; the token section keeps explicit Save/Test.
 
-import { Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { activeBaseUrl, aiStore, defaultModel, isKeyless, normalizeMaxTokens, resolveBaseUrl, resolveWire, type AiConfig, type AiProvider } from "../ai/store";
@@ -33,7 +33,16 @@ export type SlackConfig = {
 };
 
 type SlackConfigInfo = { config: SlackConfig; hasBotToken: boolean; hasAppToken: boolean };
-export type SlackStatus = { running: boolean; state: string; error: string | null };
+export type SlackStatus = {
+  running: boolean;
+  state: string;
+  error: string | null;
+  /** The ONE Tusk connection the bot answers against (null when not running/bound). */
+  connectionId?: string | null;
+};
+
+/** One open Tusk connection, as offered in the bot's connection picker. */
+export type SlackConnectionOption = { id: string; label: string; mascot: string };
 
 export const DEFAULT_CONFIG: SlackConfig = {
   enabled: false,
@@ -98,7 +107,13 @@ const slackIo = new KeyedSerialQueue<"io">();
 const clampInt = (v: string, min: number, max: number, fallback: number) =>
   Math.trunc(Math.max(min, Math.min(max, Number(v) || fallback)));
 
-export function SlackPane(props: { onOpenAi?: () => void }) {
+export function SlackPane(props: {
+  onOpenAi?: () => void;
+  /** Open connections, so the bot can be pointed at one of them. */
+  connections?: () => SlackConnectionOption[];
+  /** The connection the workbench has focused — the default a fresh start binds to. */
+  activeConnectionId?: () => string | null;
+}) {
   const [cfg, setCfg] = createSignal<SlackConfig>(DEFAULT_CONFIG);
   const [configLoaded, setConfigLoaded] = createSignal(false);
   const [ai, setAi] = createSignal<AiConfig>(aiStore.load());
@@ -106,7 +121,9 @@ export function SlackPane(props: { onOpenAi?: () => void }) {
   const [hasApp, setHasApp] = createSignal(false);
   const [botToken, setBotToken] = createSignal("");
   const [appToken, setAppToken] = createSignal("");
-  const [status, setStatus] = createSignal<SlackStatus>({ running: false, state: "disconnected", error: null });
+  const [status, setStatus] = createSignal<SlackStatus>({ running: false, state: "disconnected", error: null, connectionId: null });
+  const openConnections = () => props.connections?.() ?? [];
+  const boundConnection = () => openConnections().find((c) => c.id === status().connectionId) ?? null;
   const [note, setNote] = createSignal("");
   const [busy, setBusy] = createSignal(false);
   const [maxTokensInput, setMaxTokensInput] = createSignal(String(DEFAULT_CONFIG.aiMaxTokens));
@@ -266,7 +283,10 @@ export function SlackPane(props: { onOpenAi?: () => void }) {
           return;
         }
         await invoke("slack_test");
-        await invoke("slack_start");
+        // Bind the bot to the connection the workbench has focused. The backend
+        // treats this as the ONE connection it answers against until it is
+        // repointed here; switching tabs later never redirects it.
+        await invoke("slack_start", { connectionId: props.activeConnectionId?.() ?? null });
         if (!(await save({ enabled: true }))) {
           await disableAfterRestartFailure("Bot started, but enabling could not be persisted. Bot stopped and remains disabled.");
           return;
@@ -301,7 +321,7 @@ export function SlackPane(props: { onOpenAi?: () => void }) {
       const team = await invoke<string>("slack_test");
       tokensValidated = true;
       if (wasRunning && saved.tokensChanged) {
-        await invoke("slack_start");
+        await invoke("slack_start", { connectionId: status().connectionId ?? props.activeConnectionId?.() ?? null });
         setNote(`✅ Tokens valid — workspace “${team}”. Bot restarted with the replacement tokens.`);
       } else {
         setNote(`✅ Tokens valid — workspace “${team}”.`);
@@ -328,7 +348,7 @@ export function SlackPane(props: { onOpenAi?: () => void }) {
       if (wasRunning && saved.tokensChanged) {
         try {
           await invoke("slack_test");
-          await invoke("slack_start");
+          await invoke("slack_start", { connectionId: status().connectionId ?? props.activeConnectionId?.() ?? null });
           setNote("Saved and validated. Bot restarted with the replacement tokens.");
         } catch (e) {
           await disableAfterRestartFailure(`Saved, but token restart failed: ${errMsg(e)} Bot stopped and was disabled.`);
@@ -350,7 +370,16 @@ export function SlackPane(props: { onOpenAi?: () => void }) {
     const s = status();
     const error = s.error ?? "";
     if (s.state === "connected") {
-      return { cls: "on", title: "Bot running", sub: error || "Answering questions in Slack against the active connection." };
+      const bound = boundConnection();
+      return {
+        cls: "on",
+        title: "Bot running",
+        sub: error || (bound
+          ? `Answering questions in Slack against ${bound.label}.`
+          : s.connectionId
+            ? "Answering questions in Slack. Its Tusk connection is no longer open — pick another below."
+            : "Waiting for a Tusk connection to answer against."),
+      };
     }
     if (s.state === "connecting") {
       return { cls: "wait", title: error ? "Reconnecting…" : "Connecting…", sub: error || "Opening the Socket Mode connection." };
@@ -393,6 +422,46 @@ export function SlackPane(props: { onOpenAi?: () => void }) {
         </div>
         <Show when={note()}>
           <div class="slack-note" classList={{ error: noteIsError() }}>{note()}</div>
+        </Show>
+
+        {/* Which Tusk connection the bot answers against. Several can be open, so this
+            is an explicit binding rather than "whichever tab you happen to be on":
+            a question asked in Slack must not change database because you switched
+            tabs in the app. Shown only when there is a choice to make. */}
+        <Show when={status().running && (openConnections().length > 1 || (!!status().connectionId && !boundConnection()))}>
+          <div class="settings-label slack-conn-row">
+            <div>
+              <label for="slack-conn">Answers against</label>
+              <small>
+                {boundConnection()
+                  ? "Proposals are pinned to this connection; approving one after a change fails closed."
+                  : "This bot's connection is no longer open. Pick one it should answer against."}
+              </small>
+            </div>
+            <select
+              id="slack-conn"
+              value={status().connectionId ?? ""}
+              disabled={busy()}
+              onChange={(e) => {
+                const id = e.currentTarget.value;
+                if (!id) return;
+                setBusy(true);
+                setNote("");
+                void slackIo
+                  .run("io", () => invoke("slack_set_connection", { connectionId: id }))
+                  .then(() => setNote("Bot repointed — it applies from the next question."))
+                  .catch((err) => setNote(`❌ ${errMsg(err)}`))
+                  .finally(() => setBusy(false));
+              }}
+            >
+              <Show when={!boundConnection()}>
+                <option value="">(connection closed)</option>
+              </Show>
+              <For each={openConnections()}>
+                {(c) => <option value={c.id}>{c.mascot} {c.label}</option>}
+              </For>
+            </select>
+          </div>
         </Show>
 
         <fieldset class="slack-fieldset" disabled={busy()}>

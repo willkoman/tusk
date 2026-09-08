@@ -64,7 +64,29 @@ import { detectPlan } from "./plan/detect";
 import { explainSql, analyzeExecutesWrite, isSingleExplainStatement, explainUnsupported } from "./plan/explainSql";
 import { Dialog, SqlPreview } from "./Dialog";
 import { Icon } from "./Icons";
-import { ident, qualify, qualifyIn, setSqlDialect } from "./sql/ident";
+import { ident, qualify, qualifyIn, setSqlDialect, withDialect } from "./sql/ident";
+import {
+  DRIVERS,
+  MAX_CONNECTIONS,
+  connectionColor,
+  connectionDot,
+  connectionDotTitle,
+  connectionKindOf,
+  connectionLabels,
+  connectionLimitError,
+  driverLabel,
+  driverMascot,
+  findConnection,
+  makeConnectionState,
+  nextColorIndex,
+  rememberedProfileIds,
+  stepConnection,
+  type Capabilities,
+  type ConnectionState,
+  type Connected,
+  type Permissions,
+  type TableInfo,
+} from "./connections";
 import * as ddl from "./sql/ddl";
 import { ddlCaps, ddlSupported } from "./sql/ddlCaps";
 import { clipWrite, clipRead } from "./clipboard";
@@ -91,8 +113,6 @@ import {
   type TransactionStatus,
 } from "./transaction";
 
-type ColumnInfo = { name: string; data_type: string };
-type TableInfo = { schema: string; name: string; columns: ColumnInfo[] };
 type Profile = {
   id: string;
   name: string;
@@ -115,17 +135,6 @@ type QueryOutcome =
 type QueryResult = QueryOutcome & { transaction: TransactionStatus };
 type FetchResult = { rows: (string | null)[][]; done: boolean; interrupted?: boolean; transaction: TransactionStatus };
 type ConnectReply = { connection_id: string; server_version: string; read_only: boolean; viaSsh?: boolean };
-type Connected = {
-  id: string;
-  version: string;
-  readOnly: boolean;
-  driver: string;
-  generation: number;
-  key: string;
-  target: string;
-  /** The session reaches the database through an SSH tunnel (drives the "via SSH" badge). */
-  viaSsh: boolean;
-};
 type UiOrigin = {
   connectionId: string | null;
   connectionGeneration: number;
@@ -134,8 +143,9 @@ type UiOrigin = {
   resultEpoch: number;
   transactionRevision: number;
 };
-// Slack bot status mirrors slack::StatusInfo in Rust.
-type SlackStatus = { running: boolean; state: string; error: string | null };
+// Slack bot status mirrors slack::StatusInfo in Rust. `connectionId` is the ONE Tusk
+// connection the bot answers against (null when it is not running / not yet bound).
+type SlackStatus = { running: boolean; state: string; error: string | null; connectionId?: string | null };
 
 const PAGE = 1000;
 const MAX_LOCAL_SORT_ROWS = 250_000;
@@ -159,57 +169,6 @@ const CommandPalette = lazy(() => import("./CommandPalette").then((m) => ({ defa
 const PlanView = lazy(() => import("./plan/PlanView").then((m) => ({ default: m.PlanView })));
 const DdlGraphDialog = lazy(() => import("./relviz/DdlGraphDialog").then((m) => ({ default: m.DdlGraphDialog })));
 
-// Supported drivers + their mascot (the brand icon adapts to the connected DB).
-// `ready` drivers are connectable now; others are staged in the picker.
-const DRIVERS = [
-  { id: "postgres", label: "PostgreSQL", mascot: "🐘", ready: true },
-  { id: "duckdb", label: "DuckDB", mascot: "🦆", ready: true },
-  { id: "sqlite", label: "SQLite", mascot: "🪶", ready: true },
-  { id: "mysql", label: "MySQL", mascot: "🐬", ready: true },
-  { id: "mssql", label: "SQL Server", mascot: "🧱", ready: true },
-] as const;
-const driverMascot = (id?: string | null) => DRIVERS.find((d) => d.id === id)?.mascot ?? "🐘";
-const driverLabel = (id?: string | null) => DRIVERS.find((d) => d.id === id)?.label ?? "PostgreSQL";
-
-// Per-driver feature flags from the backend `capabilities` command. The UI gates
-// features (search-path, import, export) on these.
-type Capabilities = {
-  kind: string;
-  serverCursor: boolean;
-  bulkCopy: boolean;
-  export: boolean;
-  schemas: boolean;
-  searchPath: boolean;
-  transactionalDdl: boolean;
-  tls: boolean;
-  keychain: boolean;
-  permissions: boolean;
-  ddl: boolean;
-  relationships: boolean;
-  explainAnalyze: boolean;
-  cancelQuery: boolean;
-  manualTransactions: boolean;
-  transactionSavepoints: boolean;
-  setTransaction: boolean;
-  autocommitMode: boolean;
-};
-
-// The connected role's effective privileges (from the `permissions` command). `enforced`
-// is false for drivers without a permission model (embedded / MySQL) — the UI then gates
-// nothing extra. Mirrors src-tauri/src/perms.rs.
-type TablePriv = { schema: string; name: string; select: boolean; insert: boolean; update: boolean; delete: boolean; truncate: boolean; references: boolean; trigger: boolean; isOwner: boolean };
-type SchemaPriv = { name: string; create: boolean; usage: boolean; isOwner: boolean };
-type Permissions = {
-  enforced: boolean;
-  currentUser: string;
-  isSuperuser: boolean;
-  canCreateDb: boolean;
-  canCreateRole: boolean;
-  createInCurrentDb: boolean;
-  schemas: SchemaPriv[];
-  tables: TablePriv[];
-};
-
 function errMsg(e: unknown): string {
   if (e && typeof e === "object" && "message" in e) return String((e as any).message);
   return String(e);
@@ -225,20 +184,127 @@ function fmtDur(ms: number): string {
   return h > 0 ? `${h}:${p(m)}:${p(sec)}` : `${m}:${p(sec)}`;
 }
 
+/**
+ * Per-connection bookkeeping that must NOT be reactive: monotone generation
+ * counters that invalidate stale async write-backs, the single cursor owner, and
+ * the metadata caches. Every one of these used to be a module-scope `let`/`Set` in
+ * App — shared, they made a run on one connection cancel an in-flight fetch on
+ * another and let one connection's schema refresh drop another's reply.
+ *
+ * A holder captures its runtime ONCE (`runtimes.get(id)`) and keeps using that
+ * reference: after a disconnect the entry is dropped from the map, and the orphan's
+ * mutations are inert because every write-back also checks `connectionOpen`.
+ */
+type ConnRuntime = {
+  queryGeneration: number;
+  fetchGeneration: number;
+  schemaGeneration: number;
+  fkGeneration: number;
+  cursorGeneration: number;
+  /** The one tab streaming from this connection's single server cursor. */
+  cursorOwner: { tabId: string; connectionGeneration: number; resultGeneration: number; cursorGeneration: number } | null;
+  activeQuery: { generation: number; connectionGeneration: number; tabId: string; transactionRevision: number } | null;
+  deferredSchemaRefresh: boolean;
+  transactionHistoryKey: string | null;
+  /** Schemas whose FK edges were fetched SUCCESSFULLY (cleared per introspection). */
+  fkFetched: Set<string>;
+  fkInFlight: Set<string>;
+  loadedRels: Map<string, { schema: string; name: string }>;
+  detailInflight: Set<string>;
+  sampleCache: Map<string, SampleTable>;
+  cancelAll: boolean;
+  /** False once this connection's stored recovery snapshot proved unwritable. */
+  recoveryWritable: boolean;
+  runTimers: Set<ReturnType<typeof setInterval>>;
+};
+
+const makeRuntime = (): ConnRuntime => ({
+  queryGeneration: 0,
+  fetchGeneration: 0,
+  schemaGeneration: 0,
+  fkGeneration: 0,
+  cursorGeneration: 0,
+  cursorOwner: null,
+  activeQuery: null,
+  deferredSchemaRefresh: false,
+  transactionHistoryKey: null,
+  fkFetched: new Set<string>(),
+  fkInFlight: new Set<string>(),
+  loadedRels: new Map<string, { schema: string; name: string }>(),
+  detailInflight: new Set<string>(),
+  sampleCache: new Map<string, SampleTable>(),
+  cancelAll: false,
+  recoveryWritable: true,
+  runTimers: new Set<ReturnType<typeof setInterval>>(),
+});
+
+/**
+ * One open connection in the workbench: its immutable identity, one signal holding
+ * the whole reactive per-connection state, and the non-reactive runtime.
+ *
+ * ONE signal per connection (rather than ~20) keeps the bookkeeping honest; the
+ * granularity comes back through the memoized active-connection accessors in App,
+ * which dedupe by value, so the 5 Hz run timer cannot re-run consumers of `schema`.
+ */
+type ConnEntry = {
+  conn: Connected;
+  colorIndex: number;
+  state: () => ConnectionState;
+  patch: (patch: Partial<ConnectionState>) => void;
+  runtime: ConnRuntime;
+};
+
+/** Placeholder returned by `activeTab()` when no connection is open. Never in `tabs()`. */
+const NO_TAB: Tab = makeTab({ title: "—" });
+
+// Shared empty values for the active-connection memos. Stable identities matter: a
+// fresh `[]` each read would make every downstream memo recompute on every notify.
+const EMPTY_TABLES: TableInfo[] = [];
+const EMPTY_FUNCS: ReadonlySet<string> = new Set<string>();
+const EMPTY_FK_EDGES: FkEdge[] = [];
+const EMPTY_DETAILS: Record<string, RelationDetail> = {};
+const EMPTY_HISTORY: HistoryEntry[] = [];
+
 function App() {
-  const [conn, setConn] = createSignal<Connected | null>(null);
-  const [transaction, setTransaction] = createSignal<TransactionStatus>({ ...IDLE_TRANSACTION });
-  const [transactionStartedAt, setTransactionStartedAt] = createSignal<number | null>(null);
+  // --- open connections -----------------------------------------------------
+  const [connections, setConnections] = createSignal<ConnEntry[]>([]);
+  const [activeConnectionId, setActiveConnectionId] = createSignal<string | null>(null);
+  const runtimes = new Map<string, ConnRuntime>();
+  /** Last tab focused on each connection, so switching back lands where you left. */
+  const lastTabByConn = new Map<string, string>();
   const [transactionNow, setTransactionNow] = createSignal(Date.now());
-  const [transactionWarning, setTransactionWarning] = createSignal("");
-  let transactionHistoryKey: string | null = null;
-  let deferredSchemaRefresh = false;
   let connectionGeneration = 0;
   let resultGeneration = 0;
-  let queryGeneration = 0;
-  let fetchGeneration = 0;
-  let schemaGeneration = 0;
-  let fkGeneration = 0;
+
+  const activeEntry = createMemo(() => findConnection(connections(), activeConnectionId()));
+  const activeState = createMemo(() => activeEntry()?.state() ?? null);
+  const entryOf = (id: string | null | undefined) => findConnection(connections(), id ?? null);
+  const stateOf = (id: string | null | undefined) => entryOf(id)?.state() ?? null;
+  /** Patch one connection's reactive state BY ID — never "whatever is active now". */
+  const patchConn = (id: string, patch: Partial<ConnectionState>) => entryOf(id)?.patch(patch);
+  /** True while `c` is still the same live session (same id AND same generation). */
+  const connectionOpen = (c: Pick<Connected, "id" | "generation">) =>
+    entryOf(c.id)?.conn.generation === c.generation;
+
+  // Active-connection accessors. These are MEMOS, not plain functions: `activeState`
+  // notifies on every field of the active connection (including the run timer), and
+  // memoizing dedupes each field by value so downstream memos keep today's
+  // granularity. Every existing read site (`caps()`, `schema()`, …) is unchanged and
+  // now means "the active connection's".
+  const conn = createMemo(() => activeEntry()?.conn ?? null);
+  const caps = createMemo(() => activeState()?.caps ?? null);
+  const connectionKind = createMemo(() => connectionKindOf(activeState()));
+  const perms = createMemo(() => activeState()?.perms ?? null);
+  const transaction = createMemo<TransactionStatus>(() => activeState()?.transaction ?? IDLE_TRANSACTION);
+  const transactionStartedAt = createMemo(() => activeState()?.transactionStartedAt ?? null);
+  const transactionWarning = createMemo(() => activeState()?.transactionWarning ?? "");
+  const running = createMemo(() => activeState()?.running ?? false);
+  const runningTabId = createMemo(() => activeState()?.runningTabId ?? null);
+  const runMs = createMemo(() => activeState()?.runMs ?? 0);
+  const cancelling = createMemo(() => activeState()?.cancelling ?? false);
+  const fetchingMore = createMemo(() => activeState()?.fetchingMore ?? false);
+  const loadingAll = createMemo(() => activeState()?.loadingAll ?? false);
+  const schemaLoading = createMemo(() => activeState()?.schemaLoading ?? false);
 
   // saved profiles + connection form
   const [profiles, setProfiles] = createSignal<Profile[]>([]);
@@ -246,13 +312,17 @@ function App() {
   const [name, setName] = createSignal("");
   const [driver, setDriver] = createSignal("postgres");
   const [path, setPath] = createSignal(""); // DuckDB/SQLite file (empty = :memory:)
-  const [caps, setCaps] = createSignal<Capabilities | null>(null);
-  const connectionKind = () => caps()?.kind ?? conn()?.driver ?? "postgres";
-  const [perms, setPerms] = createSignal<Permissions | null>(null);
+  /** True = the connect screen is raised as a modal over an open workspace. */
+  const [connectOpen, setConnectOpen] = createSignal(false);
+  /**
+   * Saved-profile ids that were open when the workspace was last used. Offered as
+   * "Reopen last session" and never reconnected on its own: passwords come from the
+   * keychain and a silent multi-connect on launch is a surprise, not a convenience.
+   */
+  const [reopenable, setReopenable] = createSignal<string[]>([]);
   const [aiOpen, setAiOpen] = createSignal(false);
   const [settingsOpen, setSettingsOpen] = createSignal<SettingsTab | null>(null); // non-null = open on that tab
   const [historyOpen, setHistoryOpen] = createSignal(false);
-  const [history, setHistory] = createSignal<HistoryEntry[]>([]);
   const [paletteOpen, setPaletteOpen] = createSignal(false);
   // Incremented to summon the What's-new panel on demand (command palette).
   const [whatsNewRequest, setWhatsNewRequest] = createSignal(0);
@@ -276,7 +346,8 @@ function App() {
     fks: fkEdges(),
     // True only when every schema this prompt relies on (active + public) fetched
     // successfully; one successful schema must not mask another failed lookup.
-    fksKnown: caps()?.relationships !== false && [...aiFkSchemas()].every((schemaName) => fkFetched.has(schemaName)),
+    fksKnown: caps()?.relationships !== false
+      && [...aiFkSchemas()].every((schemaName) => !!activeRuntime()?.fkFetched.has(schemaName)),
     currentSql: editorApi()?.getDoc() ?? activeTab().sql,
     selection: editorApi()?.getSelection() ?? "",
     lastError: activeTab().result.runErr,
@@ -284,25 +355,25 @@ function App() {
   // Sample-data fetcher for the AI assistant: a few read-only rows per relevant table,
   // cached for the session (cleared on schema reload) and run without disturbing any
   // in-flight stream. Best-effort — a table that can't be sampled is just skipped.
-  const sampleCache = new Map<string, SampleTable>();
   // relKey now lives in Tree.tsx — the tree reads the same cache, and a key drift
   // between writer and reader showed every expanded table as "loading…" forever.
   async function aiSampleRows(targets: { schema: string; name: string }[]): Promise<SampleTable[]> {
     const c = conn();
-    if (!c || metadataFrozen()) return [];
+    const rt = c ? runtimes.get(c.id) : null;
+    if (!c || !rt || metadataFrozen()) return [];
     const transactionRevision = transaction().revision;
     const results = await Promise.all(
       targets.map(async (t): Promise<SampleTable | null> => {
         const key = relKey(t.schema, t.name);
-        const hit = sampleCache.get(key);
+        const hit = rt.sampleCache.get(key);
         if (hit) return hit;
         try {
           const r = await invoke<{ columns: string[]; rows: (string | null)[][] }>("sample_rows", {
             connectionId: c.id, schema: t.schema, name: t.name, limit: 5,
           });
-          if (!connectionCurrent(c) || transaction().revision !== transactionRevision || metadataFrozen()) return null;
+          if (!connectionOpen(c) || transaction().revision !== transactionRevision || metadataFrozen()) return null;
           const s: SampleTable = { schema: t.schema, name: t.name, columns: r.columns, rows: r.rows };
-          sampleCache.set(key, s);
+          rt.sampleCache.set(key, s);
           return s;
         } catch {
           return null;
@@ -384,7 +455,6 @@ function App() {
   }
 
   // workspace
-  const [tree, setTree] = createSignal<DbTree | null>(null);
   // Docked-panel sizes — restored from localStorage, persisted on resize-end.
   const savedLayout = layoutStore.load();
   const [sidebarW, setSidebarW] = createSignal(savedLayout.sidebarW ?? 270);
@@ -394,13 +464,19 @@ function App() {
   // toggle restores the previous width/height instead of a default.
   const [sidebarOpen, setSidebarOpen] = createSignal(savedLayout.sidebarOpen ?? true);
   const [resultsOpen, setResultsOpen] = createSignal(savedLayout.resultsOpen ?? true);
-  // Autocomplete table/column list — sourced from `list_schema` (one query, all
-  // tables+columns), decoupled from the lazy object tree which no longer carries columns.
-  const [schema, setSchema] = createSignal<TableInfo[]>([]);
-  // Lowercase function/procedure catalog for the unknown-function lint.
-  const [funcs, setFuncs] = createSignal<ReadonlySet<string>>(new Set<string>());
-  // Live FK edges for the JOIN…ON completion (active schema + public, merged).
-  const [fkEdges, setFkEdges] = createSignal<FkEdge[]>([]);
+  // Per-connection metadata, read off the ACTIVE connection. Autocomplete's
+  // table/column list comes from `list_schema` (one query, all tables+columns),
+  // decoupled from the lazy object tree which no longer carries columns; `funcs` is
+  // the lowercase function/procedure catalog for the unknown-function lint;
+  // `fkEdges` the live JOIN…ON edges (active schema + public, merged); `details` the
+  // lazily expanded per-relation detail.
+  const tree = createMemo(() => activeState()?.tree ?? null);
+  const schema = createMemo<TableInfo[]>(() => activeState()?.schema ?? EMPTY_TABLES);
+  const funcs = createMemo<ReadonlySet<string>>(() => activeState()?.funcs ?? EMPTY_FUNCS);
+  const fkEdges = createMemo<FkEdge[]>(() => activeState()?.fkEdges ?? EMPTY_FK_EDGES);
+  const details = createMemo<Record<string, RelationDetail>>(() => activeState()?.details ?? EMPTY_DETAILS);
+  const history = createMemo<HistoryEntry[]>(() => activeState()?.history ?? EMPTY_HISTORY);
+  const activeRuntime = () => (activeConnectionId() ? runtimes.get(activeConnectionId()!) ?? null : null);
   // User-authored AI skills (stored on disk by Rust). Reloaded whenever Settings closes,
   // since that's the only place they're created/edited/imported/removed.
   const [skills, setSkills] = createSignal<Skill[]>([]);
@@ -414,12 +490,6 @@ function App() {
       if (skillsGeneration === generation) setSkills([]);
     }
   };
-  const fkFetched = new Set<string>(); // schemas fetched SUCCESSFULLY (cleared per introspection)
-  const fkInFlight = new Set<string>(); // dedupe concurrent fetches of the same schema
-  // Per-table detail (columns/indexes/constraints), fetched lazily on expand and cached.
-  const [details, setDetails] = createSignal<Record<string, RelationDetail>>({});
-  const loadedRels = new Map<string, { schema: string; name: string }>();
-  const detailInflight = new Set<string>();
   // Sidebar context menu + active workbench dialog.
   const [menuState, setMenuState] = createSignal<MenuState>(null);
   const menu = menuState;
@@ -430,29 +500,36 @@ function App() {
   const [selected, setSelected] = createSignal<NodeDescriptor | null>(null);
   // "View value" modal for a result-grid cell.
   const [cellView, setCellView] = createSignal<{ col: string; val: string | null; origin: UiOrigin } | null>(null);
-  // Editor tabs — each owns a SQL buffer + a snapshot of its last result grid.
-  const [tabs, setTabs] = createSignal<Tab[]>([makeTab({ sql: "SELECT * FROM information_schema.tables;" })]);
-  const [activeTabId, setActiveTabId] = createSignal(tabs()[0].id);
-  const activeTab = createMemo(() => tabs().find((t) => t.id === activeTabId()) ?? tabs()[0]);
+  // Editor tabs — each owns a SQL buffer, a snapshot of its last result grid, and the
+  // id of the connection it runs against. The strip shows every open connection's
+  // tabs; focusing one focuses its connection.
+  const [tabs, setTabs] = createSignal<Tab[]>([]);
+  const [activeTabId, setActiveTabId] = createSignal("");
+  const activeTab = createMemo(() => tabs().find((t) => t.id === activeTabId()) ?? NO_TAB);
+  const tabsOf = (connectionId: string) => tabs().filter((t) => t.connectionId === connectionId);
   const aiFkSchemas = () => new Set([activeTab().searchSchema ?? "public", "public"]);
   const [persistenceWarning, setPersistenceWarning] = createSignal("");
-  let cursorOwner: { tabId: string; connectionGeneration: number; resultGeneration: number; cursorGeneration: number } | null = null;
-  let cursorGeneration = 0;
-  let activeQuery: { generation: number; connectionGeneration: number; tabId: string; transactionRevision: number } | null = null;
 
   const patchTab = (id: string, patch: Partial<Tab>) =>
     setTabs((ts) => ts.map((t) => (t.id === id ? { ...t, ...patch } : t)));
   /**
-   * Release the single server cursor because `reason` is about to (or did) close it
-   * underneath its owner tab. The owner's snapshot is frozen as an explicitly
-   * INCOMPLETE result — status, toolbar badge, local-sort/export gating — instead of
-   * being silently presented as the full set. No-op when nothing is streaming.
+   * Release ONE connection's server cursor because `reason` is about to (or did)
+   * close it underneath its owner tab. The owner's snapshot is frozen as an
+   * explicitly INCOMPLETE result — status, toolbar badge, local-sort/export gating —
+   * instead of being silently presented as the full set. No-op when that connection
+   * is not streaming.
+   *
+   * The cursor is per connection, so the reason must be scoped to one too: a run or a
+   * metadata read on connection A must never mark connection B's live stream
+   * interrupted. Callers that act on a specific connection pass its id; the default
+   * is the active one.
    */
-  function interruptStream(reason: string) {
-    const owner = cursorOwner;
-    if (!owner) return;
-    cursorOwner = null;
-    cursorGeneration++;
+  function interruptStream(reason: string, connectionId = activeConnectionId()) {
+    const rt = connectionId ? runtimes.get(connectionId) : null;
+    const owner = rt?.cursorOwner;
+    if (!rt || !owner) return;
+    rt.cursorOwner = null;
+    rt.cursorGeneration++;
     const t = tabs().find((x) => x.id === owner.tabId);
     if (!t || t.result.generation !== owner.resultGeneration) return;
     const patch = interruptedResult(t.result, reason);
@@ -460,6 +537,39 @@ function App() {
   }
   const patchResult = (id: string, patch: Partial<ResultSnapshot>) =>
     setTabs((ts) => ts.map((t) => (t.id === id ? { ...t, result: { ...t.result, ...patch } } : t)));
+
+  // --- focus + strip -------------------------------------------------------
+  /** Persistence key each connection's tabs live under (may differ from conn.key
+   *  when a legacy snapshot could not be migrated). */
+  const recoveryKeys = new Map<string, string>();
+
+  /**
+   * Focus one connection, and one of its tabs. The active tab ALWAYS belongs to the
+   * active connection — that single invariant is what lets every "active X" accessor
+   * (caps, schema, transaction, permissions, dialect) keep meaning one connection.
+   */
+  function focusConnection(connectionId: string, tabId?: string) {
+    const owned = tabsOf(connectionId);
+    const target = tabId && owned.some((t) => t.id === tabId)
+      ? tabId
+      : (owned.some((t) => t.id === lastTabByConn.get(connectionId)) ? lastTabByConn.get(connectionId) : undefined) ?? owned[0]?.id;
+    setActiveConnectionId(connectionId);
+    if (target) {
+      setActiveTabId(target);
+      lastTabByConn.set(connectionId, target);
+    }
+  }
+
+  /** Chip labels, disambiguated when two sessions report the same database name. */
+  const connectionLabelMap = createMemo(() => connectionLabels(connections().map((e) => e.state())));
+  const labelOf = (connectionId: string) =>
+    connectionLabelMap().get(connectionId) ?? entryOf(connectionId)?.conn.target ?? "";
+  const kindOf = (connectionId: string) => connectionKindOf(stateOf(connectionId));
+  /** The first connection holding an open manual transaction (window close scans all). */
+  const anyTransactionOpen = () => connections().find((e) => transactionOpen(e.state().transaction)) ?? null;
+
+  /** Remember which saved profiles were open, for the connect screen's "Reopen last session". */
+  const rememberOpenConnections = () => persistLayout();
 
   const ownerTab = () => tabs().find((t) => t.id === transaction().owner);
   const ownerPendingCount = () => pendingCount(ownerTab()?.pending);
@@ -476,10 +586,8 @@ function App() {
     }
   }
 
-  function persistInterruptedMarker(status: TransactionStatus) {
-    const c = conn();
-    const startedAt = transactionStartedAt();
-    if (!c || startedAt === null) return;
+  function persistInterruptedMarker(c: Connected, status: TransactionStatus, startedAt: number | null) {
+    if (startedAt === null) return;
     const raw = encodeInterruptedTransaction(c.key, c.target, status, startedAt);
     if (!raw) return;
     try {
@@ -489,26 +597,33 @@ function App() {
     }
   }
 
-  /** Apply transaction state before result-origin checks; stale UI payloads cannot suppress it. */
+  /**
+   * Apply transaction state before result-origin checks; stale UI payloads cannot
+   * suppress it. `target` names the connection this status belongs to — never "the
+   * active one": a command finishing on a background connection must land on its own
+   * transaction bar, and must not touch another connection's tabs or results.
+   */
   function applyAuthoritativeTransaction(
+    target: Connected,
     incoming: unknown,
-    sourceGeneration: number,
     event: TransactionEvent = "statement",
     eventBaseline?: TransactionStatus,
   ): boolean {
-    const c = conn();
-    if (!c) return false;
-    const accepted = acceptTransactionStatus(transaction(), incoming, sourceGeneration, c.generation);
+    const entry = entryOf(target.id);
+    const rt = runtimes.get(target.id);
+    if (!entry || !rt || entry.conn.generation !== target.generation) return false;
+    const previous = entry.state().transaction;
+    const accepted = acceptTransactionStatus(previous, incoming, target.generation, entry.conn.generation);
     if (!accepted.accepted) return false;
-    const previous = transaction();
     const next = accepted.status;
     const opening = !transactionOpen(previous) && transactionOpen(next);
     const newIdentity = transactionOpen(next) && previous.id !== next.id;
+    let startedAt = entry.state().transactionStartedAt;
     if (opening || newIdentity) {
-      const startedAt = Date.now();
-      setTransactionStartedAt(startedAt);
+      startedAt = Date.now();
+      entry.patch({ transactionStartedAt: startedAt });
       setTransactionNow(startedAt);
-      transactionHistoryKey = next.id ? `${next.id}@${startedAt.toString(36)}` : null;
+      rt.transactionHistoryKey = next.id ? `${next.id}@${startedAt.toString(36)}` : null;
     }
 
     // A status poll can observe a new revision before the command response arrives.
@@ -520,6 +635,9 @@ function App() {
     const stale = transactionBoundaryStaleReason(boundaryPrevious, next, event);
     if (stale) {
       setTabs((all) => all.map((tab) => {
+        // Only this connection's tabs: another connection's results were never
+        // produced inside this transaction and must not be marked stale by it.
+        if (tab.connectionId !== target.id) return tab;
         const resultMatches = tab.result.generation > 0 && transactionProvenanceNeedsRefresh(
           tab.result.transactionId,
           tab.result.transactionRevision,
@@ -540,28 +658,32 @@ function App() {
       }));
     }
 
-    setTransaction(next);
+    entry.patch({ transaction: next });
     if (transactionOpen(next)) {
-      persistInterruptedMarker(next);
-      setMenuState(null);
-      setDdlGraph(null);
-      setActiveDialog(null);
-      if (importOpen() && !importBusy()) {
-        setImportOpen(null);
-        importOrigin = null;
+      persistInterruptedMarker(target, next, startedAt);
+      // Surfaces that could act on the wrong state close only when the transaction
+      // belongs to the connection the user is looking at.
+      if (activeConnectionId() === target.id) {
+        setMenuState(null);
+        setDdlGraph(null);
+        setActiveDialog(null);
+        if (importOpen() && !importBusy()) {
+          setImportOpen(null);
+          importOrigin = null;
+        }
+        if (exportTables()) setExportTables(null);
       }
-      if (exportTables()) setExportTables(null);
       if (next.state === "lost") {
-        setTransactionWarning(`Transaction ${next.id ?? "session"} was lost. Its outcome may be unknown; disconnect and reconnect before continuing.`);
+        entry.patch({ transactionWarning: `Transaction ${next.id ?? "session"} was lost. Its outcome may be unknown; disconnect and reconnect before continuing.` });
       }
     } else {
-      setTransactionStartedAt(null);
-      transactionHistoryKey = null;
-      removeInterruptedMarker(c.key);
+      entry.patch({ transactionStartedAt: null });
+      rt.transactionHistoryKey = null;
+      removeInterruptedMarker(target.key);
       queueMicrotask(() => {
-        if (deferredSchemaRefresh && conn()?.generation === sourceGeneration && !transactionOpen(transaction())) {
-          deferredSchemaRefresh = false;
-          void loadSchema(c);
+        if (rt.deferredSchemaRefresh && connectionOpen(target) && !transactionOpen(stateOf(target.id)?.transaction ?? IDLE_TRANSACTION)) {
+          rt.deferredSchemaRefresh = false;
+          void loadSchema(target);
         }
       });
     }
@@ -590,7 +712,6 @@ function App() {
   };
   const originCurrent = (o: UiOrigin, includeResult = false) => o.tabId === activeTabId() && originAlive(o, includeResult);
   const originKey = (o: UiOrigin) => JSON.stringify([o.connectionId, o.connectionGeneration, o.tabId, o.resultGeneration, o.resultEpoch, o.transactionRevision]);
-  const connectionCurrent = (c: Connected) => conn()?.id === c.id && conn()?.generation === c.generation;
   const setMenu = (next: MenuState) => {
     if (!next) {
       setMenuState(null);
@@ -613,6 +734,21 @@ function App() {
 
   const menuScope = createMemo(() => originKey(captureOrigin()));
   createEffect(on(menuScope, () => setMenuState(null), { defer: true }));
+  // Connection-scoped surfaces close when the focus moves to another connection:
+  // their live SQL preview is rendered with the ACTIVE dialect, and their Run is
+  // pinned to the origin connection, so leaving one up would only show a lie.
+  createEffect(on(activeConnectionId, (id, previous) => {
+    if (previous === undefined || id === previous) return;
+    setMenuState(null);
+    setActiveDialog(null);
+    setDdlGraph(null);
+    setCellView(null);
+    setRunChoice(null);
+    setSelected(null);
+    setBackupTarget(null);
+    setRestoreOpen(false);
+    if (!importBusy()) { setImportOpen(null); importOrigin = null; }
+  }, { defer: true }));
 
   // Active-tab accessors so the existing editor + result-grid JSX stays unchanged.
   const sql = () => activeTab().sql;
@@ -631,7 +767,11 @@ function App() {
     action = "sort/filter",
   ): string | null => {
     try {
-      return wrapQuery(tab.result.baseQuery, sorts, filters, tab.result.columns, connectionKind(), filterClassOf());
+      // The wrap is quoted for the TAB's connection. `withDialect` also covers the
+      // identifier quoting inside the filter renderer, which reads the module dialect.
+      const dialect = kindOf(tab.connectionId);
+      return withDialect(dialect, () =>
+        wrapQuery(tab.result.baseQuery, sorts, filters, tab.result.columns, dialect, filterClassOf()));
     } catch (e) {
       patchResult(tab.id, { status: `${action} rejected: ${errMsg(e)}` });
       return null;
@@ -640,10 +780,6 @@ function App() {
   // Distinct schema names for the active-schema (search_path) selector.
   const schemaNames = createMemo(() => [...new Set(schema().map((t) => t.schema))].sort());
 
-  const [running, setRunning] = createSignal(false);
-  const [runningTabId, setRunningTabId] = createSignal<string | null>(null); // tab whose query is in flight
-  const [runMs, setRunMs] = createSignal(0); // live elapsed while a query runs
-  const [cancelling, setCancelling] = createSignal(false); // cancel request sent, awaiting unwind
   const [editorApi, setEditorApi] = createSignal<EditorApi | null>(null);
   // Persisted editor↔results split height, clamped to the current window (a value saved
   // on a taller window must not push the results pane off a shorter one).
@@ -662,12 +798,13 @@ function App() {
   // DuckDB→postgres for highlighting). Quoting is identical for pg/duckdb/sqlite (double
   // quotes; only MySQL backticks), but the DDL builders branch on the true driver so they
   // can emit DuckDB-compatible syntax. Falls back to the editor dialect when disconnected.
+  // Re-applied on EVERY active-connection switch (the memo changes with it), so the
+  // module-level dialect always belongs to the connection on screen. SQL built for a
+  // tab/dialog on another connection must pin its own dialect - see `withDialect`.
   createEffect(() => setSqlDialect(conn() ? connectionKind() : activeDialect()));
   const [cursorInfo, setCursorInfo] = createSignal<CursorInfo | null>(null);
-  let tabsConnKey: string | null = null;
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   let restoring = false;
-  let tabsRecoveryWritable = true;
 
   const updatePrefs = (patch: Partial<EditorPrefs>) => {
     const next = { ...prefs(), ...patch };
@@ -753,6 +890,7 @@ function App() {
     canCommitTransaction: transactionControls().commit,
     canRollbackTransaction: transactionControls().rollback,
     canFilter: canFilter(),
+    connectionCount: connections().length,
   });
 
   // Validate the buffer against Postgres for parser-grade diagnostics (PREPARE-only,
@@ -765,10 +903,10 @@ function App() {
     // cursor is open: validate_sql rolls back the open cursor to PREPARE in autocommit,
     // which would truncate a live stream. (Double-clicking a table sets the editor doc,
     // which fires this lint ~600ms later — it must not kill the stream it just opened.)
-    if (!c || running() || cursorOwner !== null || metadataFrozen() || !prefs().serverLint) return [];
+    if (!c || running() || activeRuntime()?.cursorOwner != null || metadataFrozen() || !prefs().serverLint) return [];
     try {
       const diagnostics = await invoke<ServerDiag[]>("validate_sql", { connectionId: c.id, sql: sqlText, searchPath: activeTab().searchSchema });
-      return connectionCurrent(c) && originCurrent(origin) ? diagnostics : [];
+      return connectionOpen(c) && originCurrent(origin) ? diagnostics : [];
     } catch {
       return [];
     }
@@ -776,9 +914,14 @@ function App() {
 
   // --- tab management + file flow ---
   const [confirmClose, setConfirmClose] = createSignal<{ tabId: string; dirty: boolean; pending: number } | null>(null);
-  const [confirmDisconnect, setConfirmDisconnect] = createSignal<number | null>(null);
+  const [confirmDisconnect, setConfirmDisconnect] = createSignal<{ connectionId: string; count: number } | null>(null);
   const [confirmWindowClose, setConfirmWindowClose] = createSignal<number | null>(null);
-  type TransactionResolution = { kind: "close-tab"; tabId: string } | { kind: "disconnect" } | { kind: "window-close" };
+  // A resolution intent names the connection whose transaction must end first: with
+  // several open, "the transaction" is not a global fact.
+  type TransactionResolution =
+    | { kind: "close-tab"; tabId: string; connectionId: string }
+    | { kind: "disconnect"; connectionId: string }
+    | { kind: "window-close"; connectionId: string };
   const [transactionResolution, setTransactionResolution] = createSignal<TransactionResolution | null>(null);
   const [transactionResolutionBusy, setTransactionResolutionBusy] = createSignal(false);
   let allowNativeClose = false;
@@ -841,13 +984,20 @@ function App() {
     });
   };
 
+  /** Focus a tab — and, with it, the connection that tab belongs to. */
   function switchTab(id: string) {
-    if (id === activeTabId()) return;
+    const t = tabs().find((x) => x.id === id);
+    if (!t || id === activeTabId()) return;
     setActiveTabId(id); // ResultGrid restores its own scroll/selection on the tab change
+    lastTabByConn.set(t.connectionId, id);
+    if (t.connectionId !== activeConnectionId()) setActiveConnectionId(t.connectionId);
   }
 
+  /** New tabs always open on the connection currently in focus. */
   function openNewTab() {
-    const t = makeTab();
+    const id = activeConnectionId();
+    if (!id) return;
+    const t = makeTab({ connectionId: id });
     setTabs((ts) => [...ts, t]);
     switchTab(t.id);
   }
@@ -856,7 +1006,9 @@ function App() {
   // console's active schema set so the generated unqualified names resolve. Not
   // marked dirty — it's regenerable and becomes dirty once the user edits it.
   function openGeneratedTab(sqlText: string, schema: string | null, title?: string) {
-    const t = makeTab({ sql: sqlText, searchSchema: schema, title });
+    const id = activeConnectionId();
+    if (!id) return;
+    const t = makeTab({ connectionId: id, sql: sqlText, searchSchema: schema, title });
     setTabs((ts) => [...ts, t]);
     switchTab(t.id);
   }
@@ -894,29 +1046,37 @@ function App() {
       patchResult(id, { status: "Cancel or wait for this query before closing its owner tab" });
       return;
     }
-    if (transactionOwnedBy(transaction(), id)) {
-      switchTab(id);
-      setTransactionResolution({ kind: "close-tab", tabId: id });
+    const owningEntry = entryOf(tabs().find((t) => t.id === id)?.connectionId);
+    if (owningEntry && transactionOwnedBy(owningEntry.state().transaction, id)) {
+      raiseTransactionResolution(owningEntry, { kind: "close-tab", tabId: id });
       return;
     }
-    if (cursorOwner?.tabId === id) {
-      cursorOwner = null;
-      cursorGeneration++;
+    const closing = tabs().find((t) => t.id === id);
+    const owningConnection = closing?.connectionId ?? "";
+    const rt = runtimes.get(owningConnection);
+    if (rt?.cursorOwner?.tabId === id) {
+      rt.cursorOwner = null;
+      rt.cursorGeneration++;
     }
     saveOperations.delete(id);
     editorApi()?.dropTab(id);
-    const idx = tabs().findIndex((t) => t.id === id);
+    const siblings = tabsOf(owningConnection);
+    const idx = siblings.findIndex((t) => t.id === id);
     const next = tabs().filter((t) => t.id !== id);
-    if (next.length === 0) {
-      const fresh = makeTab();
-      setTabs([fresh]);
-      setActiveTabId(fresh.id);
+    // A connection always keeps at least one tab: closing its last one opens a fresh
+    // tab ON THAT CONNECTION rather than leaving it unreachable in the strip.
+    if (owningConnection && siblings.length === 1 && entryOf(owningConnection)) {
+      const fresh = makeTab({ connectionId: owningConnection });
+      setTabs([...next, fresh]);
+      if (activeTabId() === id) focusConnection(owningConnection, fresh.id);
+      else lastTabByConn.set(owningConnection, fresh.id);
       return;
     }
     setTabs(next);
     if (activeTabId() === id) {
-      const neighbor = next[Math.min(idx, next.length - 1)];
-      switchTab(neighbor.id);
+      const remaining = next.filter((t) => t.connectionId === owningConnection);
+      const neighbor = remaining[Math.min(idx, remaining.length - 1)] ?? next[0];
+      if (neighbor) switchTab(neighbor.id);
     }
   }
 
@@ -927,9 +1087,9 @@ function App() {
       patchResult(id, { status: "Cancel or wait for this query before closing its owner tab" });
       return;
     }
-    if (transactionOwnedBy(transaction(), id)) {
-      switchTab(id);
-      setTransactionResolution({ kind: "close-tab", tabId: id });
+    const owner = entryOf(t.connectionId);
+    if (owner && transactionOwnedBy(owner.state().transaction, id)) {
+      raiseTransactionResolution(owner, { kind: "close-tab", tabId: id });
       return;
     }
     const pending = pendingCount(t.pending);
@@ -1082,7 +1242,7 @@ function App() {
   const gridView = () => activeTab().gridView;
   const setGridView = (patch: Partial<GridView>) => patchTab(activeTabId(), { gridView: { ...activeTab().gridView, ...patch } });
   const canServerSortFilter = () =>
-    wrappableQuery(activeTab().result.baseQuery) &&
+    wrappableQuery(activeTab().result.baseQuery, connectionKind()) &&
     // MySQL (error 1060) and SQL Server (error 8156) both refuse duplicate column
     // names inside a derived table, so the sort/filter wrap can't work on such results.
     !(["mysql", "mssql"].includes(connectionKind()) && hasDuplicateColumns(activeTab().result.columns));
@@ -1342,7 +1502,7 @@ function App() {
       pkIdx: ec.plan.pkIdx,
       rows: t.result.rows,
       pending: t.pending,
-      dialect: connectionKind(),
+      dialect: kindOf(t.connectionId),
     });
     if (!script.length) {
       // Shouldn't happen (non-table cells can't be edited) — but never open a dialog
@@ -1387,15 +1547,15 @@ function App() {
     setCommitErr("");
     const t0 = performance.now();
     const before = transaction();
-    const beforeHistoryKey = transactionHistoryKey;
+    const beforeHistoryKey = runtimes.get(c.id)?.transactionHistoryKey ?? null;
     try {
       // Fully-qualified statements — no search_path dependence. Multi-statement
       // scripts run in one transaction (rolled back wholesale on failure).
       const sqlText = cv.script.map((s) => s + ";").join("\n");
       const out = await invoke<QueryResult>("run_query", { connectionId: c.id, ownerId: tabId, sql: sqlText, pageSize: PAGE, searchPath: null });
-      const accepted = applyAuthoritativeTransaction(out.transaction, c.generation, "grid_apply", before);
+      const accepted = applyAuthoritativeTransaction(c, out.transaction, "grid_apply", before);
       const source = tabs().find((tab) => tab.id === tabId);
-      if (!accepted || transaction().revision !== out.transaction.revision || !connectionCurrent(c) ||
+      if (!accepted || transaction().revision !== out.transaction.revision || !connectionOpen(c) ||
           source?.result.generation !== cv.origin.resultGeneration || source.result.epoch !== cv.origin.resultEpoch) return;
       setPendingFor(tabId, undefined);
       setCommitView(null);
@@ -1403,7 +1563,7 @@ function App() {
         ? `${cv.script.length} change${cv.script.length === 1 ? "" : "s"} applied inside transaction; commit the outer transaction separately`
         : `${cv.script.length} change${cv.script.length === 1 ? "" : "s"} applied` });
       recordHistory({
-        sql: historySqlForTransaction(sqlText, before, out.transaction, "grid_apply", beforeHistoryKey),
+        sql: historySqlForTransaction(c.id, sqlText, before, out.transaction, "grid_apply", beforeHistoryKey),
         durationMs: Math.round(performance.now() - t0),
         status: "ok",
         rows: null,
@@ -1426,13 +1586,13 @@ function App() {
       }
     } catch (e) {
       const embedded = transactionFromError(e);
-      if (embedded) applyAuthoritativeTransaction(embedded, c.generation, "grid_apply", before);
+      if (embedded) applyAuthoritativeTransaction(c, embedded, "grid_apply", before);
       const source = tabs().find((tab) => tab.id === tabId);
-      if (connectionCurrent(c) && source?.result.generation === cv.origin.resultGeneration && source.result.epoch === cv.origin.resultEpoch) {
+      if (connectionOpen(c) && source?.result.generation === cv.origin.resultGeneration && source.result.epoch === cv.origin.resultEpoch) {
         const message = errMsg(e);
         setCommitErr(message);
         recordHistory({
-          sql: historySqlForTransaction(cv.script.map((s) => s + ";").join("\n"), before, embedded ?? transaction(), "grid_apply", beforeHistoryKey),
+          sql: historySqlForTransaction(c.id, cv.script.map((s) => s + ";").join("\n"), before, embedded ?? transaction(), "grid_apply", beforeHistoryKey),
           durationMs: Math.round(performance.now() - t0),
           status: "error",
           rows: null,
@@ -1456,13 +1616,6 @@ function App() {
     });
   }
 
-  const [loadingAll, setLoadingAll] = createSignal(false);
-  const [schemaLoading, setSchemaLoading] = createSignal(false);
-  let cancelAll = false;
-  // Reactive so the "streaming…" spinner spins only during an actual in-flight fetch
-  // (not merely while more rows remain, i.e. !done()).
-  const [fetchingMore, setFetchingMore] = createSignal(false);
-  const runTimers = new Set<ReturnType<typeof setInterval>>();
   let transactionTimer: ReturnType<typeof setInterval> | undefined;
   const interactionCleanups = new Set<() => void>();
 
@@ -1486,6 +1639,20 @@ function App() {
   const slackUnlisten: UnlistenFn[] = [];
   const slackHistoryKeys = new Map<string, string>();
   let slackStatusRevision = 0;
+  /**
+   * The bot answers against exactly ONE connection. It can be running before any
+   * connection exists (autostart), in which case it is bound to the first one the
+   * workspace opens; after that the binding only changes on an explicit pick in
+   * Settings → Slack, so switching tabs never redirects Slack at another database.
+   */
+  const bindSlackIfUnbound = (connectionId: string) => {
+    const status = slackStatus();
+    if (!status.running || status.connectionId) return;
+    void invoke("slack_set_connection", { connectionId }).catch(() => {});
+  };
+  /** Connections offered as the Slack bot's target (Settings → Slack picker). */
+  const slackConnectionOptions = () =>
+    connections().map((e) => ({ id: e.conn.id, label: labelOf(e.conn.id), mascot: driverMascot(kindOf(e.conn.id)) }));
 
   const preventNativeContextMenu = (e: Event) => e.preventDefault();
   const showPersistenceFailure = (failure: TabsPersistenceFailure) => {
@@ -1494,8 +1661,8 @@ function App() {
       : "Unsaved tabs may not survive closing.";
     setPersistenceWarning(`Editor recovery ${failure.operation} failed (${failure.message}). ${consequence}`);
   };
-  const persistRecovery = (key: string, data: PersistedTabs, forClose = false) => {
-    if (!tabsRecoveryWritable && key === tabsConnKey) {
+  const persistRecoveryTo = (rt: ConnRuntime, key: string, data: PersistedTabs, forClose = false) => {
+    if (!rt.recoveryWritable) {
       const error: TabsPersistenceFailure = {
         operation: "save",
         code: "invalid-data",
@@ -1509,22 +1676,39 @@ function App() {
     else showPersistenceFailure(result.error);
     return result;
   };
+  /**
+   * Persist EVERY open connection's tabs and report whether any dirty buffer failed
+   * to save. Closing the window must not lose an unsaved buffer just because it
+   * belonged to a connection that was not focused.
+   */
+  const persistAllRecovery = (forClose = false): { unsafeDirty: boolean } => {
+    let unsafeDirty = false;
+    for (const entry of connections()) {
+      const snapshot = snapshotConnection(entry);
+      const saved = persistRecoveryTo(entry.runtime, recoveryKeys.get(entry.conn.id) ?? entry.conn.key, snapshot, forClose);
+      if (!saved.ok && snapshot.tabs.some((tab) => tab.dirty)) unsafeDirty = true;
+    }
+    return { unsafeDirty };
+  };
   const onBeforeUnload = (e: BeforeUnloadEvent) => {
-    const snapshot = snapshotTabs();
-    const saved = tabsConnKey ? persistRecovery(tabsConnKey, snapshot, true) : null;
-    const unsafeDirty = saved?.ok === false && snapshot.tabs.some((tab) => tab.dirty);
-    if (allowNativeClose || (!transactionOpen(transaction()) && !unsafeDirty && totalPendingCount() === 0)) return;
+    const { unsafeDirty } = persistAllRecovery(true);
+    if (allowNativeClose || (!anyTransactionOpen() && !unsafeDirty && totalPendingCount() === 0)) return;
     e.preventDefault();
     e.returnValue = "";
   };
+  /** Re-poll every open connection: a session can end underneath any of them. */
   const refreshTransactionStatus = async () => {
-    const c = conn();
-    if (!c || running() || fetchingMore() || importBusy() || commitBusy()) return;
-    try {
-      const status = await invoke<TransactionStatus>("transaction_status", { connectionId: c.id });
-      if (connectionCurrent(c)) applyAuthoritativeTransaction(status, c.generation);
-    } catch {
-      /* The next transaction-aware command will surface a connection failure. */
+    if (importBusy() || commitBusy()) return;
+    for (const entry of connections()) {
+      const c = entry.conn;
+      const s = entry.state();
+      if (s.running || s.fetchingMore) continue;
+      try {
+        const status = await invoke<TransactionStatus>("transaction_status", { connectionId: c.id });
+        if (connectionOpen(c)) applyAuthoritativeTransaction(c, status);
+      } catch {
+        /* The next transaction-aware command will surface a connection failure. */
+      }
     }
   };
   const onWindowFocus = () => void refreshTransactionStatus();
@@ -1542,16 +1726,13 @@ function App() {
           patchResult(tabId, { status: "Cancel or wait for the database operation before closing Tusk" });
           return;
         }
-        if (transactionOpen(transaction())) {
+        const open = anyTransactionOpen();
+        if (open) {
           event.preventDefault();
-          const owner = transaction().owner;
-          if (owner && tabs().some((tab) => tab.id === owner)) switchTab(owner);
-          setTransactionResolution({ kind: "window-close" });
+          raiseTransactionResolution(open, { kind: "window-close" });
           return;
         }
-        const snapshot = snapshotTabs();
-        const saved = tabsConnKey ? persistRecovery(tabsConnKey, snapshot, true) : null;
-        if (saved?.ok === false && snapshot.tabs.some((tab) => tab.dirty)) {
+        if (persistAllRecovery(true).unsafeDirty) {
           event.preventDefault();
           return;
         }
@@ -1596,7 +1777,10 @@ function App() {
     // the Slack event bridge (a rejected listen() would otherwise abort onMount and
     // leave the connect screen empty).
     await loadProfiles();
+    // Offer (never perform) a session restore; a default-connect profile still wins.
+    const remembered = (savedLayout.openConnections ?? []).filter((id) => profiles().some((p) => p.id === id));
     const def = profiles().find((p) => p.default_connect);
+    setReopenable(remembered.filter((id) => id !== def?.id));
     if (def) connectProfile(def.id);
     // Slack bot status (statusbar badge) + audit trail: every Slack-approved query
     // lands in the normal per-connection history with a [Slack] marker comment.
@@ -1647,8 +1831,10 @@ function App() {
     clearTimeout(saveTimer);
     if (transactionTimer) clearInterval(transactionTimer);
     nativeCloseUnlisten?.();
-    for (const timer of runTimers) clearInterval(timer);
-    runTimers.clear();
+    for (const rt of runtimes.values()) {
+      for (const timer of rt.runTimers) clearInterval(timer);
+      rt.runTimers.clear();
+    }
     for (const cleanup of [...interactionCleanups]) cleanup();
   });
 
@@ -1688,6 +1874,12 @@ function App() {
       case "loadAllRows": if (!done()) void loadAll(); break;
       case "exportResult": openExport(); break;
       case "openFilterBuilder": openFilterBuilder(); break;
+      case "nextConnection": case "prevConnection": {
+        const next = stepConnection(connections(), activeConnectionId(), id === "nextConnection" ? 1 : -1);
+        if (next) focusConnection(next);
+        break;
+      }
+      case "newConnection": openConnectScreen(); break;
     }
   }
 
@@ -1773,6 +1965,43 @@ function App() {
     setConnErr("");
   }
 
+  /** Raise the connect screen. Refuses past the open-connection cap with the reason. */
+  function openConnectScreen() {
+    const limit = connectionLimitError(connections());
+    if (limit) {
+      setStatus(limit);
+      return;
+    }
+    newProfile();
+    setConnectOpen(true);
+  }
+
+  /**
+   * Reconnect the saved profiles that were open last time, in their original order.
+   * Profiles that no longer exist, or whose password is not in the keychain, are
+   * reported rather than silently skipped — an incomplete restore that looks complete
+   * is worse than none.
+   */
+  async function reopenLastSession() {
+    const wanted = reopenable();
+    setReopenable([]);
+    const missing: string[] = [];
+    for (const id of wanted) {
+      if (connections().length >= MAX_CONNECTIONS) {
+        missing.push("(connection limit reached)");
+        break;
+      }
+      const profile = profiles().find((x) => x.id === id);
+      if (!profile) {
+        missing.push(id);
+        continue;
+      }
+      await connectProfile(id);
+    }
+    if (missing.length) setConnErr(`could not reopen: ${missing.join(", ")}`);
+    persistLayout();
+  }
+
   const isEmbeddedDriver = (d?: string | null) => d === "duckdb" || d === "sqlite";
 
   /** A tunnel that authenticates with a password or key passphrase can only connect
@@ -1787,9 +2016,14 @@ function App() {
     else editProfile(p);
   }
 
+  /**
+   * Register a freshly opened session as a new connection entry, restore its tab set
+   * and history, and focus it. Existing connections are untouched: their tabs stay in
+   * the strip, their streams keep streaming, their transaction bars keep running.
+   */
   async function afterConnect(
     r: ConnectReply,
-    meta: { key: string; legacyKey: string | null; target: string; driver: string },
+    meta: { key: string; legacyKey: string | null; target: string; driver: string; profileId: string | null },
   ) {
     const connected: Connected = {
       id: r.connection_id,
@@ -1800,59 +2034,37 @@ function App() {
       generation: ++connectionGeneration,
       key: meta.key,
       target: meta.target,
+      profileId: meta.profileId,
     };
-    tabsConnKey = meta.key;
-    tabsRecoveryWritable = true;
+    const runtime = makeRuntime();
+    runtimes.set(connected.id, runtime);
+    const [state, setState] = createSignal<ConnectionState>(
+      makeConnectionState(connected, nextColorIndex(connections())),
+    );
+    const entry: ConnEntry = {
+      conn: connected,
+      colorIndex: state().colorIndex,
+      state,
+      patch: (patch) => setState((s) => ({ ...s, ...patch })),
+      runtime,
+    };
     setPersistenceWarning("");
     slackHistoryKeys.set(connected.id, connected.key);
     if (slackHistoryKeys.size > 100) slackHistoryKeys.delete(slackHistoryKeys.keys().next().value!);
-    setTransaction({ ...IDLE_TRANSACTION });
-    setTransactionStartedAt(null);
-    transactionHistoryKey = null;
-    deferredSchemaRefresh = false;
-    setTransactionWarning("");
     try {
       const interrupted = decodeInterruptedTransaction(localStorage.getItem(INTERRUPTED_TRANSACTION_KEY));
       if (interrupted?.connectionKey === meta.key.slice(0, 2048)) {
-        setTransactionWarning(`Previous ${interrupted.mode === "autocommit_off" ? "autocommit-off unit" : "manual transaction"} ${interrupted.transactionId} was interrupted. No active state was restored; verify its outcome.`);
+        entry.patch({ transactionWarning: `Previous ${interrupted.mode === "autocommit_off" ? "autocommit-off unit" : "manual transaction"} ${interrupted.transactionId} was interrupted. No active state was restored; verify its outcome.` });
       }
     } catch {
       /* Advisory recovery warning only. */
     }
-    setConn(connected);
-    sampleCache.clear();
-    try {
-      const status = await invoke<TransactionStatus>("transaction_status", { connectionId: r.connection_id });
-      if (!connectionCurrent(connected)) return;
-      applyAuthoritativeTransaction(status, connected.generation);
-    } catch {
-      if (!connectionCurrent(connected)) return;
-    }
-    try {
-      const next = await invoke<Capabilities>("capabilities", { connectionId: r.connection_id });
-      if (!connectionCurrent(connected)) return;
-      setCaps(next);
-    } catch {
-      if (!connectionCurrent(connected)) return;
-      setCaps(null);
-    }
-    // DuckDB: probe PG-style EXPLAIN options once, at connect (safe — nothing
-    // is streaming yet). Drives the Explain action's wrapping.
-    duckJsonExplain = false;
-    if (connectionKind() === "duckdb") {
-      try {
-        const probe = await invoke<QueryResult>("run_query", { connectionId: r.connection_id, ownerId: activeTabId(), sql: "EXPLAIN (FORMAT json) SELECT 1", pageSize: PAGE, searchPath: null });
-        applyAuthoritativeTransaction(probe.transaction, connected.generation);
-        if (!connectionCurrent(connected)) return;
-        duckJsonExplain = true;
-      } catch (e) {
-        const embedded = transactionFromError(e);
-        if (embedded) applyAuthoritativeTransaction(embedded, connected.generation);
-        if (!connectionCurrent(connected)) return;
-        duckJsonExplain = false;
-      }
-    }
-    // Restore this connection's tab set (buffers/paths only — results are ephemeral).
+
+    // Restore this connection's tabs BEFORE it becomes active, so the workbench never
+    // renders a connection with no tab of its own.
+    let restoredTabs: Tab[] = [];
+    let restoredActive = 0;
+    let recoveryKey = meta.key;
     if (meta.key) {
       const current = tabsStore.loadResult(meta.key);
       let saved = current.ok ? current.value : null;
@@ -1863,7 +2075,7 @@ function App() {
         // blocked forever). Only when even the backup fails do writes stay off.
         const parked = tabsStore.quarantineResult(meta.key);
         if (!parked.ok) {
-          tabsRecoveryWritable = false;
+          runtime.recoveryWritable = false;
           showPersistenceFailure(parked.error);
         }
       }
@@ -1874,34 +2086,74 @@ function App() {
         if (!legacy.ok) showPersistenceFailure(legacy.error);
         else if (legacy.value) {
           saved = legacy.value;
-          const migrated = persistRecovery(meta.key, legacy.value);
+          const migrated = persistRecoveryTo(runtime, meta.key, legacy.value);
           if (migrated.ok) {
             const removed = tabsStore.removeResult(meta.legacyKey);
             if (!removed.ok) showPersistenceFailure(removed.error);
           } else {
-            tabsConnKey = meta.legacyKey;
+            recoveryKey = meta.legacyKey;
           }
         }
       }
-      restoring = true;
       if (saved && saved.tabs.length) {
-        const restored = saved.tabs.map((pt) =>
-          makeTab({ sql: pt.sql, filePath: pt.filePath, title: pt.title, searchSchema: pt.searchSchema ?? null, dirty: pt.dirty }),
+        restoredTabs = saved.tabs.map((pt) =>
+          makeTab({ connectionId: connected.id, sql: pt.sql, filePath: pt.filePath, title: pt.title, searchSchema: pt.searchSchema ?? null, dirty: pt.dirty }),
         );
-        setTabs(restored);
-        setActiveTabId(restored[Math.min(saved.activeIndex, restored.length - 1)].id);
+        restoredActive = Math.min(saved.activeIndex, restoredTabs.length - 1);
       } else {
-        const fresh = makeTab();
-        setTabs([fresh]);
-        setActiveTabId(fresh.id);
+        restoredTabs = [makeTab({ connectionId: connected.id })];
       }
-      restoring = false;
+    } else {
+      restoredTabs = [makeTab({ connectionId: connected.id })];
     }
-    const history = meta.legacyKey
+    recoveryKeys.set(connected.id, recoveryKey);
+
+    restoring = true;
+    setConnections((cs) => [...cs, entry]);
+    setTabs((ts) => [...ts, ...restoredTabs]);
+    focusConnection(connected.id, restoredTabs[restoredActive]?.id);
+    restoring = false;
+    // The backend's "active connection" is what a Slack bot binds to by default.
+    void invoke("set_active_connection", { connectionId: connected.id }).catch(() => {});
+    bindSlackIfUnbound(connected.id);
+
+    try {
+      const status = await invoke<TransactionStatus>("transaction_status", { connectionId: r.connection_id });
+      if (!connectionOpen(connected)) return;
+      applyAuthoritativeTransaction(connected, status);
+    } catch {
+      if (!connectionOpen(connected)) return;
+    }
+    try {
+      const next = await invoke<Capabilities>("capabilities", { connectionId: r.connection_id });
+      if (!connectionOpen(connected)) return;
+      patchConn(connected.id, { caps: next });
+    } catch {
+      if (!connectionOpen(connected)) return;
+      patchConn(connected.id, { caps: null });
+    }
+    // DuckDB: probe PG-style EXPLAIN options once, at connect (safe — nothing
+    // is streaming yet). Drives the Explain action's wrapping.
+    if (connectionKindOf(stateOf(connected.id)) === "duckdb") {
+      try {
+        const probe = await invoke<QueryResult>("run_query", { connectionId: r.connection_id, ownerId: restoredTabs[restoredActive]?.id ?? restoredTabs[0].id, sql: "EXPLAIN (FORMAT json) SELECT 1", pageSize: PAGE, searchPath: null });
+        applyAuthoritativeTransaction(connected, probe.transaction);
+        if (!connectionOpen(connected)) return;
+        patchConn(connected.id, { duckJsonExplain: true });
+      } catch (e) {
+        const embedded = transactionFromError(e);
+        if (embedded) applyAuthoritativeTransaction(connected, embedded);
+        if (!connectionOpen(connected)) return;
+        patchConn(connected.id, { duckJsonExplain: false });
+      }
+    }
+    const loaded = meta.legacyKey
       ? await historyStore.migrate(meta.legacyKey, meta.key)
       : await historyStore.load(meta.key);
-    if (!connectionCurrent(connected)) return;
-    setHistory(history);
+    if (!connectionOpen(connected)) return;
+    patchConn(connected.id, { history: loaded });
+    rememberOpenConnections();
+    setConnectOpen(false);
     await loadSchema(connected);
   }
 
@@ -1958,7 +2210,7 @@ function App() {
         : submittedDatabase || submittedHost;
       await connectWithHostKeyPrompt(async () => {
         const r = await invoke<ConnectReply>("connect", { config });
-        await afterConnect(r, { key: submittedKey, legacyKey: submittedLegacyKey, target: submittedTarget, driver: submittedDriver });
+        await afterConnect(r, { key: submittedKey, legacyKey: submittedLegacyKey, target: submittedTarget, driver: submittedDriver, profileId: null });
       });
     } catch (e) {
       setConnErr(errMsg(e));
@@ -1991,7 +2243,7 @@ function App() {
         : id;
       await connectWithHostKeyPrompt(async () => {
         const r = await invoke<ConnectReply>("connect_profile", { id });
-        await afterConnect(r, { key: `profile:${id}`, legacyKey: null, target, driver: profile?.driver ?? "postgres" });
+        await afterConnect(r, { key: `profile:${id}`, legacyKey: null, target, driver: profile?.driver ?? "postgres", profileId: id });
       });
     } catch (e) {
       setConnErr(errMsg(e));
@@ -2053,195 +2305,248 @@ function App() {
     }
   }
 
-  // Snapshot the tab set for persistence — capture the active tab's live editor doc
-  // (the editor, not tab.sql, is the source of truth while a tab is active).
-  function snapshotTabs(): PersistedTabs {
-    return recoverySnapshot(tabs(), activeTabId(), editorApi()?.getDoc());
+  /**
+   * Snapshot ONE connection's tab set for persistence. The live CodeMirror document
+   * is the source of truth only for the globally-active tab, so it is handed over
+   * only when that tab belongs to this connection — otherwise a background
+   * connection's snapshot would inherit the focused connection's buffer.
+   */
+  function snapshotConnection(entry: ConnEntry): PersistedTabs {
+    const owned = tabsOf(entry.conn.id);
+    const focused = owned.some((t) => t.id === activeTabId());
+    const active = focused
+      ? activeTabId()
+      : (owned.some((t) => t.id === lastTabByConn.get(entry.conn.id)) ? lastTabByConn.get(entry.conn.id)! : owned[0]?.id ?? "");
+    return recoverySnapshot(owned, active, focused ? editorApi()?.getDoc() : undefined);
   }
 
-  async function disconnect(force = false, transactionResolved = false): Promise<boolean> {
-    if (transactionOpen(transaction()) && !transactionResolved) {
-      const owner = transaction().owner;
-      if (owner && tabs().some((tab) => tab.id === owner)) switchTab(owner);
-      setTransactionResolution({ kind: "disconnect" });
+  /**
+   * Close ONE connection. Everything torn down here is scoped to that connection:
+   * its runtime generations, its tabs, its caches, its transaction. The other open
+   * connections keep streaming, keep their transaction bars, and keep their tabs.
+   */
+  async function disconnectConnection(
+    connectionId: string,
+    force = false,
+    transactionResolved = false,
+  ): Promise<boolean> {
+    const entry = entryOf(connectionId);
+    if (!entry) return true;
+    const c = entry.conn;
+    const rt = entry.runtime;
+    const status = entry.state().transaction;
+    if (transactionOpen(status) && !transactionResolved) {
+      raiseTransactionResolution(entry, { kind: "disconnect" });
       return false;
     }
-    const pending = totalPendingCount();
+    const pending = tabsOf(connectionId).reduce((total, tab) => total + pendingCount(tab.pending), 0);
     if (pending && !force) {
-      setConfirmDisconnect(pending);
+      setConfirmDisconnect({ connectionId, count: pending });
       return false;
     }
     setConfirmDisconnect(null);
-    const c = conn();
-    clearTimeout(saveTimer);
-    if (tabsConnKey) {
-      const snapshot = snapshotTabs();
-      const saved = persistRecovery(tabsConnKey, snapshot, true);
-      // Dirty buffers are recoverable only after a verified write. Keep the workspace
-      // open on failure; users can save files or retry once storage is available.
-      if (!saved.ok && snapshot.tabs.some((tab) => tab.dirty)) return false;
+    const snapshot = snapshotConnection(entry);
+    const saved = persistRecoveryTo(rt, recoveryKeys.get(connectionId) ?? c.key, snapshot, true);
+    // Dirty buffers are recoverable only after a verified write. Keep the connection
+    // open on failure; users can save files or retry once storage is available.
+    if (!saved.ok && snapshot.tabs.some((tab) => tab.dirty)) return false;
+    try {
+      await invoke("disconnect", { connectionId });
+    } catch (e) {
+      const embedded = transactionFromError(e);
+      if (embedded) applyAuthoritativeTransaction(c, embedded);
+      patchConn(connectionId, { transactionWarning: `Disconnect failed: ${errMsg(e)}` });
+      return false;
     }
-    if (c) {
-      try {
-        await invoke("disconnect", { connectionId: c.id });
-      } catch (e) {
-        const embedded = transactionFromError(e);
-        if (embedded) applyAuthoritativeTransaction(embedded, c.generation);
-        setTransactionWarning(`Disconnect failed: ${errMsg(e)}`);
-        return false;
+    if (status.state !== "lost") removeInterruptedMarker(c.key);
+    // Invalidate every in-flight async write-back for THIS connection only.
+    rt.queryGeneration++;
+    rt.fetchGeneration++;
+    rt.schemaGeneration++;
+    rt.fkGeneration++;
+    rt.cursorGeneration++;
+    rt.activeQuery = null;
+    rt.cursorOwner = null;
+    rt.deferredSchemaRefresh = false;
+    rt.transactionHistoryKey = null;
+    rt.sampleCache.clear();
+    rt.loadedRels.clear();
+    rt.detailInflight.clear();
+    rt.fkInFlight.clear();
+    rt.fkFetched.clear();
+    for (const timer of rt.runTimers) clearInterval(timer);
+    rt.runTimers.clear();
+    runtimes.delete(connectionId);
+    recoveryKeys.delete(connectionId);
+    lastTabByConn.delete(connectionId);
+    slackHistoryKeys.delete(connectionId);
+
+    const remaining = connections().filter((e) => e.conn.id !== connectionId);
+    setConnections(remaining);
+    for (const t of tabsOf(connectionId)) editorApi()?.dropTab(t.id);
+    for (const t of tabsOf(connectionId)) saveOperations.delete(t.id);
+    setTabs((ts) => ts.filter((t) => t.connectionId !== connectionId));
+    // Surfaces bound to the closing connection must go; ones belonging to another
+    // connection stay exactly as they were.
+    closeSurfacesFor(connectionId);
+    if (activeConnectionId() === connectionId) {
+      const next = remaining[0];
+      if (next) focusConnection(next.conn.id);
+      else {
+        setActiveConnectionId(null);
+        setActiveTabId("");
       }
     }
-    if (c && transaction().state !== "lost") removeInterruptedMarker(c.key);
-    connectionGeneration++;
-    queryGeneration++;
-    fetchGeneration++;
-    schemaGeneration++;
-    fkGeneration++;
-    activeQuery = null;
-    setRunning(false);
-    setRunningTabId(null);
-    setFetchingMore(false);
-    setLoadingAll(false);
-    setCancelling(false);
-    for (const timer of runTimers) clearInterval(timer);
-    runTimers.clear();
-    tabsConnKey = null;
-    tabsRecoveryWritable = true;
-    setConn(null);
-    setTransaction({ ...IDLE_TRANSACTION });
-    setTransactionStartedAt(null);
-    transactionHistoryKey = null;
-    setCaps(null);
-    setHistory([]);
-    setHistoryOpen(false);
+    if (!remaining.length) {
+      setHistoryOpen(false);
+      setSelected(null);
+      setPersistenceWarning("");
+    }
+    rememberOpenConnections();
+    return true;
+  }
+
+  /** Dismiss every modal/menu/dialog that was scoped to `connectionId`. */
+  function closeSurfacesFor(connectionId: string) {
     setMenu(null);
-    setActiveDialog(null);
     setCellView(null);
     setConfirmClose(null);
     setConfirmDisconnect(null);
     setConfirmWindowClose(null);
     setTransactionResolution(null);
     setTransactionResolutionBusy(false);
-    setExportSrc(null);
-    setExportTables(null);
-    setExportTablesProgress(null);
-    setImportBusy(false);
-    setImportProgress(null);
-    setImportOpen(null);
-    importOrigin = null;
     setConfirmAnalyze(null);
-    setCommitView(null);
-    transactionResolutionAfterApply = null;
     setConfirmDiscard(null);
     setRunChoice(null);
     setParamPrompt(null);
-    setDdlGraph(null);
     setRenameTab(null);
-    setPerms(null);
-    setTree(null);
-    setSelected(null);
-    setSchemaLoading(false);
-    setSchema([]);
-    sampleCache.clear();
-    setFuncs(new Set<string>());
-    setDetails({});
-    loadedRels.clear();
-    detailInflight.clear();
-    fkInFlight.clear();
-    fkFetched.clear();
-    setFkEdges([]);
-    cursorOwner = null;
-    cursorGeneration++;
-    const fresh = makeTab();
-    setTabs([fresh]);
-    setActiveTabId(fresh.id);
-    return true;
+    setCommitView(null);
+    transactionResolutionAfterApply = null;
+    if (dialogBinding()?.origin.connectionId === connectionId) setActiveDialog(null);
+    if (ddlGraph()?.connectionId === connectionId) setDdlGraph(null);
+    if (exportSrc()?.connectionId === connectionId) setExportSrc(null);
+    if (exportTables()?.connectionId === connectionId) {
+      setExportTables(null);
+      setExportTablesProgress(null);
+    }
+    if (importOrigin?.connection.id === connectionId) {
+      setImportBusy(false);
+      setImportProgress(null);
+      setImportOpen(null);
+      importOrigin = null;
+    }
+    if (backupTarget() && activeConnectionId() === connectionId) setBackupTarget(null);
+    if (restoreOpen() && activeConnectionId() === connectionId) setRestoreOpen(false);
   }
 
-  // Reflect the connected database in the OS window title (mascot + driver).
+  /** Close the connection the workbench is focused on (topbar Disconnect). */
+  const disconnect = (force = false, transactionResolved = false) => {
+    const id = activeConnectionId();
+    return id ? disconnectConnection(id, force, transactionResolved) : Promise.resolve(true);
+  };
+
+  // Reflect the focused database in the OS window title (mascot + driver), naming the
+  // connection itself once more than one is open.
   createEffect(() => {
     const c = conn();
     const kind = connectionKind();
-    const title = c ? `${driverMascot(kind)} Tusk — ${driverLabel(kind)}` : "Tusk";
+    const many = connections().length > 1;
+    const title = c
+      ? `${driverMascot(kind)} Tusk — ${many ? labelOf(c.id) : driverLabel(kind)}`
+      : "Tusk";
     void getCurrentWindow().setTitle(title).catch(() => {
       /* not in a Tauri window (e.g. preview) */
     });
   });
 
-  // Label for the connected target shown in the topbar chip: the database name for
-  // server drivers, or the file basename (":memory:" when blank) for embedded ones.
-  const connTarget = () => conn()?.target ?? "";
-
-  // Debounced per-connection tab-set save as buffers/structure change.
+  // Tell the backend which connection the workbench has focused: it is the default a
+  // Slack bot binds to, and the fallback for anything not already pinned to an id.
   createEffect(() => {
-    const data: PersistedTabs = {
-      tabs: tabs().map((t) => ({ sql: t.sql, filePath: t.filePath, title: t.title, searchSchema: t.searchSchema, dirty: t.dirty })),
-      activeIndex: Math.max(0, tabs().findIndex((t) => t.id === activeTabId())),
-    };
-    if (restoring || !tabsConnKey) return;
-    const key = tabsConnKey;
-    if (saveTimer) clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => persistRecovery(key, data), 800);
+    const id = activeConnectionId();
+    if (id) void invoke("set_active_connection", { connectionId: id }).catch(() => {});
   });
+
+
+  // Debounced tab-set save as buffers/structure change. EVERY open connection is
+  // persisted, not just the focused one: a background connection's unsaved buffer is
+  // no less recoverable than the one on screen.
+  createEffect(() => {
+    void tabs();
+    void activeTabId();
+    if (restoring || !connections().length) return;
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => persistAllRecovery(), 800);
+  });
+
+  // --- per-connection introspection ----------------------------------------
+  // Every loader below takes the connection it belongs to and captures that
+  // connection's runtime ONCE. Generations, the cursor owner and the metadata caches
+  // are per connection, so a refresh on one connection can neither invalidate an
+  // in-flight reply on another nor mark another connection's live stream interrupted.
+  /** Whether THAT connection is inside a manual transaction (not the focused one). */
+  const frozenFor = (id: string) => transactionOpen(stateOf(id)?.transaction ?? IDLE_TRANSACTION);
 
   async function loadSchema(target = conn()) {
     const c = target;
-    if (!c) return;
-    if (!connectionCurrent(c)) return;
-    if (metadataFrozen()) {
-      deferredSchemaRefresh = true;
+    const rt = c ? runtimes.get(c.id) : null;
+    if (!c || !rt || !connectionOpen(c)) return;
+    if (frozenFor(c.id)) {
+      rt.deferredSchemaRefresh = true;
       return;
     }
-    deferredSchemaRefresh = false;
-    const transactionRevision = transaction().revision;
-    const operation = ++schemaGeneration;
-    const isCurrent = () => connectionCurrent(c) && schemaGeneration === operation && transaction().revision === transactionRevision && !metadataFrozen();
-    fkGeneration++;
-    fkFetched.clear();
-    setFkEdges([]);
-    setMenuState(null);
-    interruptStream("a schema refresh closed the result stream");
-    setSchemaLoading(true);
-    sampleCache.clear(); // schema (and likely data) may have changed — drop stale AI samples
+    rt.deferredSchemaRefresh = false;
+    const transactionRevision = stateOf(c.id)!.transaction.revision;
+    const operation = ++rt.schemaGeneration;
+    const isCurrent = () => connectionOpen(c) && rt.schemaGeneration === operation
+      && (stateOf(c.id)?.transaction.revision ?? -1) === transactionRevision && !frozenFor(c.id);
+    rt.fkGeneration++;
+    rt.fkFetched.clear();
+    patchConn(c.id, { fkEdges: [] });
+    if (activeConnectionId() === c.id) setMenuState(null);
+    interruptStream("a schema refresh closed the result stream", c.id);
+    patchConn(c.id, { schemaLoading: true });
+    rt.sampleCache.clear(); // schema (and likely data) may have changed - drop stale AI samples
     try {
       const t = await invoke<DbTree>("db_tree", { connectionId: c.id });
       if (!isCurrent()) return;
-      setTree(t);
+      patchConn(c.id, { tree: t });
       // Prune cached detail for relations that no longer exist (dropped / renamed),
       // so refreshLoadedDetails doesn't keep re-fetching dead keys.
       const live = new Set<string>();
       for (const s of t.schemas) for (const r of [...s.tables, ...s.views]) live.add(relKey(s.name, r.name));
-      for (const k of [...loadedRels.keys()]) if (!live.has(k)) loadedRels.delete(k);
-      setDetails((prev) => {
-        const next: Record<string, RelationDetail> = {};
-        for (const k of Object.keys(prev)) if (live.has(k)) next[k] = prev[k];
-        return next;
-      });
+      for (const k of [...rt.loadedRels.keys()]) if (!live.has(k)) rt.loadedRels.delete(k);
+      const prev = stateOf(c.id)?.details ?? {};
+      const kept: Record<string, RelationDetail> = {};
+      for (const k of Object.keys(prev)) if (live.has(k)) kept[k] = prev[k];
+      patchConn(c.id, { details: kept });
       void loadTables(c, operation);
       void refreshLoadedDetails(c, operation);
       // Refresh effective privileges alongside the tree (grants/ownership can change).
       invoke<Permissions>("permissions", { connectionId: c.id })
-        .then((p) => { if (isCurrent()) setPerms(p); })
-        .catch(() => { if (isCurrent()) setPerms(null); });
+        .then((p) => { if (isCurrent()) patchConn(c.id, { perms: p }); })
+        .catch(() => { if (isCurrent()) patchConn(c.id, { perms: null }); });
     } catch (e) {
       console.error(e);
     } finally {
-      if (isCurrent()) setSchemaLoading(false);
+      if (isCurrent()) patchConn(c.id, { schemaLoading: false });
     }
   }
 
   // Full table+column list for autocomplete (decoupled from the lazy tree),
   // plus the live function catalog feeding the unknown-function lint (empty
-  // set = engine can't enumerate → that lint stays off).
-  async function loadTables(target = conn(), schemaOperation = schemaGeneration) {
+  // set = engine can't enumerate -> that lint stays off).
+  async function loadTables(target: Connected | null, schemaOperation?: number) {
     const c = target;
-    if (!c || metadataFrozen()) return;
-    const transactionRevision = transaction().revision;
-    const isCurrent = () => connectionCurrent(c) && schemaGeneration === schemaOperation && transaction().revision === transactionRevision && !metadataFrozen();
+    const rt = c ? runtimes.get(c.id) : null;
+    if (!c || !rt || frozenFor(c.id)) return;
+    const operation = schemaOperation ?? rt.schemaGeneration;
+    const transactionRevision = stateOf(c.id)!.transaction.revision;
+    const isCurrent = () => connectionOpen(c) && rt.schemaGeneration === operation
+      && (stateOf(c.id)?.transaction.revision ?? -1) === transactionRevision && !frozenFor(c.id);
     try {
       const tables = await invoke<TableInfo[]>("list_schema", { connectionId: c.id });
       if (!isCurrent()) return;
-      setSchema(tables);
+      patchConn(c.id, { schema: tables });
     } catch (e) {
       if (!isCurrent()) return;
       console.error(e);
@@ -2249,13 +2554,15 @@ function App() {
     try {
       const names = await invoke<string[]>("list_functions", { connectionId: c.id });
       if (!isCurrent()) return;
-      setFuncs(new Set(names.map((n) => n.toLowerCase())));
+      patchConn(c.id, { funcs: new Set(names.map((n) => n.toLowerCase())) });
     } catch {
       if (!isCurrent()) return;
-      setFuncs(new Set<string>());
+      patchConn(c.id, { funcs: new Set<string>() });
     }
-    // FK catalog for JOIN completion: active schema + public, merged.
-    const activeSchema = activeTab().searchSchema ?? "public";
+    // FK catalog for JOIN completion. Which schema matters is decided by THIS
+    // connection's focused tab, not by whichever tab happens to be on screen.
+    const focused = tabsOf(c.id).find((t) => t.id === lastTabByConn.get(c.id)) ?? tabsOf(c.id)[0];
+    const activeSchema = focused?.searchSchema ?? "public";
     await fetchFkSchema(activeSchema, c);
     if (activeSchema !== "public") await fetchFkSchema("public", c);
   }
@@ -2269,74 +2576,81 @@ function App() {
     await Promise.all([...aiFkSchemas()].map((n) => fetchFkSchema(n, c)));
   }
 
-  /** Fetch one schema's FK edges into fkEdges (deduped; best-effort). */
+  /** Fetch one schema's FK edges into that connection's fkEdges (deduped; best-effort). */
   async function fetchFkSchema(schemaName: string, target = conn()) {
     const c = target;
-    if (!c || metadataFrozen() || caps()?.relationships === false || fkFetched.has(schemaName)) return;
+    const rt = c ? runtimes.get(c.id) : null;
+    if (!c || !rt || frozenFor(c.id) || stateOf(c.id)?.caps?.relationships === false || rt.fkFetched.has(schemaName)) return;
     // A best-effort completion hint must never roll back a live result stream; the
-    // next keystroke/tab switch retries once the stream has drained.
-    if (cursorOwner !== null) return;
-    const generation = fkGeneration;
-    const transactionRevision = transaction().revision;
+    // next keystroke/tab switch retries once THIS connection's stream has drained.
+    if (rt.cursorOwner !== null) return;
+    const generation = rt.fkGeneration;
+    const transactionRevision = stateOf(c.id)!.transaction.revision;
     const inflightKey = `${c.id}:${generation}:${schemaName}`;
-    if (fkInFlight.has(inflightKey)) return;
-    fkInFlight.add(inflightKey);
+    if (rt.fkInFlight.has(inflightKey)) return;
+    rt.fkInFlight.add(inflightKey);
     try {
       const g = await invoke<{ tables: unknown[]; edges: FkEdge[] }>("schema_relationships", { connectionId: c.id, schema: schemaName });
-      if (!connectionCurrent(c) || fkGeneration !== generation || transaction().revision !== transactionRevision || metadataFrozen()) return;
+      if (!connectionOpen(c) || rt.fkGeneration !== generation
+        || (stateOf(c.id)?.transaction.revision ?? -1) !== transactionRevision || frozenFor(c.id)) return;
       // Mark fetched ONLY on success. `fksKnown` (which gates the AI prompt's "this schema
-      // declares no foreign keys" claim) is derived from this set — marking before the
+      // declares no foreign keys" claim) is derived from this set - marking before the
       // await meant a FAILED fetch asserted the schema had no FKs, the exact lie the
       // tri-state exists to prevent. A failure stays unmarked so the next send retries.
-      fkFetched.add(schemaName);
-      setFkEdges((prev) => {
-        const key = (e: FkEdge) => JSON.stringify([e.constraint, e.srcSchema, e.srcTable]);
-        const seen = new Set(prev.map(key));
-        return [...prev, ...g.edges.filter((e) => !seen.has(key(e)))];
-      });
+      rt.fkFetched.add(schemaName);
+      const prev = stateOf(c.id)?.fkEdges ?? [];
+      const key = (e: FkEdge) => JSON.stringify([e.constraint, e.srcSchema, e.srcTable]);
+      const seen = new Set(prev.map(key));
+      patchConn(c.id, { fkEdges: [...prev, ...g.edges.filter((e) => !seen.has(key(e)))] });
     } catch {
-      /* best-effort — completion just has fewer hints, and the prompt stays silent on FKs */
+      /* best-effort - completion just has fewer hints, and the prompt stays silent on FKs */
     } finally {
-      fkInFlight.delete(inflightKey);
+      rt.fkInFlight.delete(inflightKey);
     }
   }
 
   // Lazy-load one relation's detail on expand; cached unless `force`.
   async function loadDetail(schemaName: string, name: string, force = false, target = conn()) {
     const c = target;
-    if (!c || metadataFrozen()) return;
-    const generation = schemaGeneration;
-    const transactionRevision = transaction().revision;
+    const rt = c ? runtimes.get(c.id) : null;
+    if (!c || !rt || frozenFor(c.id)) return;
+    const generation = rt.schemaGeneration;
+    const transactionRevision = stateOf(c.id)!.transaction.revision;
     const key = relKey(schemaName, name);
     const inflightKey = `${c.id}:${generation}:${key}`;
-    if (!force && (details()[key] || detailInflight.has(inflightKey))) return;
-    detailInflight.add(inflightKey);
-    interruptStream("expanding a relation in the Explorer closed the result stream");
+    const detailsOf = () => stateOf(c.id)?.details ?? {};
+    if (!force && (detailsOf()[key] || rt.detailInflight.has(inflightKey))) return;
+    rt.detailInflight.add(inflightKey);
+    interruptStream("expanding a relation in the Explorer closed the result stream", c.id);
     try {
       const d = await invoke<RelationDetail>("table_detail", {
         connectionId: c.id,
         schema: schemaName,
         name,
       });
-      if (!connectionCurrent(c) || schemaGeneration !== generation || transaction().revision !== transactionRevision || metadataFrozen()) return;
-      loadedRels.set(key, { schema: schemaName, name });
-      setDetails((prev) => ({ ...prev, [key]: d }));
+      if (!connectionOpen(c) || rt.schemaGeneration !== generation
+        || (stateOf(c.id)?.transaction.revision ?? -1) !== transactionRevision || frozenFor(c.id)) return;
+      rt.loadedRels.set(key, { schema: schemaName, name });
+      patchConn(c.id, { details: { ...detailsOf(), [key]: d } });
     } catch (e) {
       console.error(e);
     } finally {
-      detailInflight.delete(inflightKey);
+      rt.detailInflight.delete(inflightKey);
       // A schema refresh can supersede the first detail request before it ever
       // reaches the cache. Retry under the new generation so an expanded row or
       // editability probe cannot remain stuck on "loading table info...".
-      if (connectionCurrent(c) && !metadataFrozen() && schemaGeneration !== generation && !details()[key])
+      if (connectionOpen(c) && !frozenFor(c.id) && rt.schemaGeneration !== generation && !detailsOf()[key])
         void loadDetail(schemaName, name, force, c);
     }
   }
 
   // Re-fetch detail for every already-expanded relation (after refresh / DDL).
-  async function refreshLoadedDetails(target = conn(), schemaOperation = schemaGeneration) {
-    for (const { schema, name } of loadedRels.values()) {
-      if (schemaGeneration !== schemaOperation) return;
+  async function refreshLoadedDetails(target: Connected | null, schemaOperation?: number) {
+    const rt = target ? runtimes.get(target.id) : null;
+    if (!target || !rt) return;
+    const operation = schemaOperation ?? rt.schemaGeneration;
+    for (const { schema, name } of [...rt.loadedRels.values()]) {
+      if (rt.schemaGeneration !== operation) return;
       await loadDetail(schema, name, true, target);
     }
   }
@@ -2345,20 +2659,24 @@ function App() {
 
   // Record a finished user-issued run into the per-connection history (never a
   // grid sort/filter re-run, never blocks the query path on storage failures).
+  // History is keyed by DESTINATION, so an entry lands on the connection that ran it
+  // even when the user has since switched to another one.
   const recordHistory = (e: Omit<HistoryEntry, "id" | "ts">, key: string) => {
     const ts = Date.now();
     const next = historyStore.append(key, { id: makeEntryId(ts), ts, ...e });
-    if (conn()?.key === key) setHistory(next);
+    for (const entry of connections()) if (entry.conn.key === key) entry.patch({ history: next });
   };
 
   const historySqlForTransaction = (
+    connectionId: string,
     sqlText: string,
     before: TransactionStatus,
     after: TransactionStatus,
     event: TransactionEvent,
-    priorHistoryKey: string | null = transactionHistoryKey,
+    priorHistoryKey?: string | null,
   ) => {
-    const key = transactionHistoryScope(before, after, event, transactionHistoryKey, priorHistoryKey);
+    const current = runtimes.get(connectionId)?.transactionHistoryKey ?? null;
+    const key = transactionHistoryScope(before, after, event, current, priorHistoryKey ?? current);
     return transactionHistorySql(sqlText, key, after.revision, event);
   };
 
@@ -2372,11 +2690,15 @@ function App() {
     force = false,
     historySql = sqlToRun,
   ): Promise<boolean> {
-    const c = conn();
-    if (!c || running() || !sqlToRun.trim()) return false;
     const runTabId = activeTabId();
     const runTab = tabs().find((t) => t.id === runTabId);
     if (!runTab) return false;
+    // The RUN TAB decides the connection, not "whichever is active": a run must
+    // execute (and be quoted) against the connection its tab belongs to.
+    const entry = entryOf(runTab.connectionId);
+    const c = entry?.conn ?? null;
+    const rt = entry?.runtime ?? null;
+    if (!c || !rt || entry!.state().running || !sqlToRun.trim()) return false;
     const event = transactionEvent(sqlToRun);
     if (!transactionDatabaseAllowed(transaction(), runTabId)) {
       patchResult(runTabId, { status: transaction().state === "lost"
@@ -2403,34 +2725,36 @@ function App() {
     // Running with the results panel collapsed would hide the output — reopen it.
     if (!resultsOpen()) { setResultsOpen(true); persistLayout(); }
     const runSchema = runTab.searchSchema;
-    if (cursorOwner && cursorOwner.tabId !== runTabId) interruptStream(`stream closed when "${runTab.title}" ran a query`);
-    cursorOwner = null;
-    cursorGeneration++;
-    fetchGeneration++;
-    setFetchingMore(false);
+    // Only THIS connection's cursor is freed: a run here must never interrupt a live
+    // stream on another connection, which has a server cursor of its own.
+    if (rt.cursorOwner && rt.cursorOwner.tabId !== runTabId)
+      interruptStream(`stream closed when "${runTab.title}" ran a query`, c.id);
+    rt.cursorOwner = null;
+    rt.cursorGeneration++;
+    rt.fetchGeneration++;
+    patchConn(c.id, { fetchingMore: false });
     setMenuState(null);
     patchResult(runTabId, { runErr: "", status: "" });
     patchTab(runTabId, { resultView: undefined }); // a new run resets the Plan/Grid choice
-    const runGeneration = ++queryGeneration;
-    const before = transaction();
-    const beforeHistoryKey = transactionHistoryKey;
+    const runGeneration = ++rt.queryGeneration;
+    const txOf = () => stateOf(c.id)?.transaction ?? IDLE_TRANSACTION;
+    const before = txOf();
+    const beforeHistoryKey = rt.transactionHistoryKey;
     let expectedTransactionRevision = before.revision;
-    activeQuery = { generation: runGeneration, connectionGeneration: c.generation, tabId: runTabId, transactionRevision: before.revision };
+    rt.activeQuery = { generation: runGeneration, connectionGeneration: c.generation, tabId: runTabId, transactionRevision: before.revision };
     const originCurrentForRun = () =>
-      activeQuery?.generation === runGeneration &&
-      activeQuery.connectionGeneration === c.generation &&
-      activeQuery.tabId === runTabId &&
-      connectionCurrent(c) &&
+      rt.activeQuery?.generation === runGeneration &&
+      rt.activeQuery.connectionGeneration === c.generation &&
+      rt.activeQuery.tabId === runTabId &&
+      connectionOpen(c) &&
       tabs().some((t) => t.id === runTabId);
-    const isCurrent = () => originCurrentForRun() && transaction().revision === expectedTransactionRevision;
-    setRunning(true);
-    setRunningTabId(runTabId);
+    const isCurrent = () => originCurrentForRun() && txOf().revision === expectedTransactionRevision;
+    patchConn(c.id, { running: true, runningTabId: runTabId, runMs: 0 });
     const t0 = performance.now();
-    setRunMs(0);
     const timer = setInterval(() => {
-      if (isCurrent()) setRunMs(performance.now() - t0);
+      if (isCurrent()) patchConn(c.id, { runMs: performance.now() - t0 });
     }, 200);
-    runTimers.add(timer);
+    rt.runTimers.add(timer);
     let completed = false;
     try {
       // In-grid editing needs the target table's detail (PK/columns). Fetching it AFTER
@@ -2438,22 +2762,23 @@ function App() {
       // the target from the (pre-execution) base query and load it now, while no
       // stream is open and `running` already excludes a concurrent run. Best-effort:
       // a failure just leaves the grid read-only.
-      if (mode === "base" && base && !transactionOpen(transaction())) {
+      if (mode === "base" && base && !transactionOpen(txOf())) {
         try {
-          const tgt = editTarget(base, editIndexer(schema()), runTab.searchSchema);
-          if (tgt.ok && !details()[relKey(tgt.table.schema, tgt.table.name)]) await loadDetail(tgt.table.schema, tgt.table.name);
+          const tgt = editTarget(base, editIndexer(stateOf(c.id)?.schema ?? []), runTab.searchSchema);
+          if (tgt.ok && !(stateOf(c.id)?.details ?? {})[relKey(tgt.table.schema, tgt.table.name)])
+            await loadDetail(tgt.table.schema, tgt.table.name, false, c);
         } catch { /* read-only grid until the detail loads later */ }
         if (!isCurrent()) return false;
       }
       const out = await invoke<QueryResult>("run_query", { connectionId: c.id, ownerId: runTabId, sql: sqlToRun, pageSize: PAGE, searchPath: runSchema });
       expectedTransactionRevision = out.transaction.revision;
-      const accepted = applyAuthoritativeTransaction(out.transaction, c.generation, event, before);
+      const accepted = applyAuthoritativeTransaction(c, out.transaction, event, before);
       if (!accepted || !isCurrent()) return false;
-      const rt = tabs().find((t) => t.id === runTabId);
-      const epoch = (rt?.result.epoch ?? 0) + 1;
+      const runTabNow = tabs().find((t) => t.id === runTabId);
+      const epoch = (runTabNow?.result.epoch ?? 0) + 1;
       const loadedGeneration = ++resultGeneration;
       if (out.kind === "rows") {
-        const prevCols = rt?.result.columns ?? [];
+        const prevCols = runTabNow?.result.columns ?? [];
         patchResult(runTabId, {
           columns: out.columns, rows: out.rows, done: out.done, lastQuery: sqlToRun, baseQuery: base, epoch, generation: loadedGeneration,
           incomplete: "",
@@ -2468,16 +2793,16 @@ function App() {
           // preference (e.g. "Filter rows…" from the sidebar) — keep it across the reset.
           patchTab(runTabId, {
             gridView: sameColumns(prevCols, out.columns)
-              ? { ...(rt?.gridView ?? gridViewFor(out.columns.length)), sorts: [], filters: emptyFilter() }
-              : { ...gridViewFor(out.columns.length), filterRowOpen: rt?.gridView.filterRowOpen ?? false },
+              ? { ...(runTabNow?.gridView ?? gridViewFor(out.columns.length)), sorts: [], filters: emptyFilter() }
+              : { ...gridViewFor(out.columns.length), filterRowOpen: runTabNow?.gridView.filterRowOpen ?? false },
           });
         }
         if (!out.done) {
-          cursorOwner = {
+          rt.cursorOwner = {
             tabId: runTabId,
             connectionGeneration: c.generation,
             resultGeneration: loadedGeneration,
-            cursorGeneration: ++cursorGeneration,
+            cursorGeneration: ++rt.cursorGeneration,
           };
         }
       } else {
@@ -2492,7 +2817,7 @@ function App() {
       if (out.kind === "exec" || DDL_RE.test(sqlToRun)) void loadSchema(c);
       if (mode === "base") {
         recordHistory({
-          sql: historySqlForTransaction(historySql, before, out.transaction, event, beforeHistoryKey),
+          sql: historySqlForTransaction(c.id, historySql, before, out.transaction, event, beforeHistoryKey),
           durationMs: Math.round(performance.now() - t0),
           status: "ok",
           rows: out.kind === "rows" ? out.rows.length : null,
@@ -2505,7 +2830,7 @@ function App() {
       const embedded = transactionFromError(e);
       if (embedded) {
         expectedTransactionRevision = embedded.revision;
-        if (!applyAuthoritativeTransaction(embedded, c.generation, event, before)) return false;
+        if (!applyAuthoritativeTransaction(c, embedded, event, before)) return false;
       }
       if (!isCurrent()) return false;
       const msg = errMsg(e);
@@ -2516,9 +2841,9 @@ function App() {
         lastQuery: sqlToRun,
         baseQuery: base,
         incomplete: "",
-        transactionId: transactionOpen(transaction()) ? transaction().id : null,
-        transactionRevision: transaction().revision,
-        transactionStale: transaction().state === "lost" ? "transaction session lost; result provenance is no longer trustworthy" : "",
+        transactionId: transactionOpen(txOf()) ? txOf().id : null,
+        transactionRevision: txOf().revision,
+        transactionStale: txOf().state === "lost" ? "transaction session lost; result provenance is no longer trustworthy" : "",
       };
       // A user cancel surfaces as Postgres' "canceling statement due to user request" —
       // present it as a calm status, not a red error banner.
@@ -2526,7 +2851,7 @@ function App() {
       else patchResult(runTabId, { ...failedResult, runErr: msg, columns: [], rows: [], done: true });
       if (mode === "base") {
         recordHistory({
-          sql: historySqlForTransaction(historySql, before, embedded ?? transaction(), event, beforeHistoryKey),
+          sql: historySqlForTransaction(c.id, historySql, before, embedded ?? txOf(), event, beforeHistoryKey),
           durationMs: Math.round(performance.now() - t0),
           status: /cancel/i.test(msg) ? "cancelled" : "error",
           rows: null,
@@ -2536,13 +2861,11 @@ function App() {
       }
     } finally {
       clearInterval(timer);
-      runTimers.delete(timer);
-      if (activeQuery?.generation === runGeneration) {
-        activeQuery = null;
-        setRunning(false);
-        setRunningTabId(null);
-        setCancelling(false);
-        if (connectionCurrent(c) && tabs().some((t) => t.id === runTabId))
+      rt.runTimers.delete(timer);
+      if (rt.activeQuery?.generation === runGeneration) {
+        rt.activeQuery = null;
+        patchConn(c.id, { running: false, runningTabId: null, cancelling: false });
+        if (connectionOpen(c) && tabs().some((t) => t.id === runTabId))
           patchResult(runTabId, { elapsed: Math.round(performance.now() - t0) });
       }
     }
@@ -2593,17 +2916,12 @@ function App() {
       patchResult(runningTabId() ?? activeTabId(), { status: "Cancel or wait for the database operation before closing Tusk" });
       return false;
     }
-    if (transactionOpen(transaction())) {
-      const owner = transaction().owner;
-      if (owner && tabs().some((tab) => tab.id === owner)) switchTab(owner);
-      setTransactionResolution({ kind: "window-close" });
+    const open = anyTransactionOpen();
+    if (open) {
+      raiseTransactionResolution(open, { kind: "window-close" });
       return false;
     }
-    if (tabsConnKey) {
-      const snapshot = snapshotTabs();
-      const saved = persistRecovery(tabsConnKey, snapshot, true);
-      if (!saved.ok && snapshot.tabs.some((tab) => tab.dirty)) return false;
-    }
+    if (persistAllRecovery(true).unsafeDirty) return false;
     const pending = totalPendingCount();
     if (pending > 0 && !forcePending) {
       setConfirmWindowClose(pending);
@@ -2620,16 +2938,34 @@ function App() {
     }
   }
 
+  /**
+   * Raise the "resolve this transaction first" dialog for ONE connection, focusing it
+   * and its owner tab. Window close walks every open connection this way, one at a
+   * time, so a transaction on a background connection cannot be closed past silently.
+   */
+  function raiseTransactionResolution(entry: ConnEntry, intent: { kind: "close-tab"; tabId: string } | { kind: "disconnect" } | { kind: "window-close" }) {
+    const owner = entry.state().transaction.owner;
+    focusConnection(entry.conn.id, owner ?? undefined);
+    setTransactionResolution({ ...intent, connectionId: entry.conn.id } as TransactionResolution);
+  }
+
   function continueAfterTransactionResolution(intent: TransactionResolution) {
     if (intent.kind === "close-tab") closeTab(intent.tabId);
-    else if (intent.kind === "disconnect") void disconnect();
+    else if (intent.kind === "disconnect") void disconnectConnection(intent.connectionId);
     else void closeNativeWindow();
   }
 
   async function resolveTransaction(action: "commit" | "rollback") {
     const intent = transactionResolution();
-    const tx = transaction();
-    if (!intent || transactionResolutionBusy() || transactionControlBusy() || tx.state === "lost" || ownerPendingCount()) return;
+    if (!intent) return;
+    const entry = entryOf(intent.connectionId);
+    if (!entry) {
+      setTransactionResolution(null);
+      return;
+    }
+    if (activeConnectionId() !== intent.connectionId) focusConnection(intent.connectionId);
+    const tx = entry.state().transaction;
+    if (transactionResolutionBusy() || transactionControlBusy() || tx.state === "lost" || ownerPendingCount()) return;
     const owner = tx.owner;
     if (!owner || !tabs().some((tab) => tab.id === owner)) return;
     if (tx.state === "configured" && action === "commit") return;
@@ -2654,28 +2990,35 @@ function App() {
   async function disconnectLostTransaction() {
     const intent = transactionResolution();
     if (!intent || transactionResolutionBusy()) return;
+    const entry = entryOf(intent.connectionId);
+    if (!entry) {
+      setTransactionResolution(null);
+      return;
+    }
     setTransactionResolutionBusy(true);
-    const warning = transactionWarning() || "Transaction session was lost; reconnect and verify its outcome.";
+    const warning = entry.state().transactionWarning || "Transaction session was lost; reconnect and verify its outcome.";
     try {
-      const disconnected = await disconnect(true, true);
+      const disconnected = await disconnectConnection(intent.connectionId, true, true);
       if (!disconnected) return;
       setConnErr(warning);
+      setPersistenceWarning(warning);
       if (intent.kind === "window-close") await closeNativeWindow(true);
     } finally {
-      if (conn()) setTransactionResolutionBusy(false);
+      if (entryOf(intent.connectionId)) setTransactionResolutionBusy(false);
     }
   }
 
   // Cancel the in-flight query (re-clicking Run): fire a Postgres CancelRequest; the
   // run_query call then errors out and unwinds through executeQuery's finally.
   function cancelQuery() {
-    if (!running() || cancelling()) return;
+    const c = conn();
+    if (!c || !running() || cancelling()) return;
     if (caps()?.cancelQuery === false) {
       patchResult(runningTabId() ?? activeTabId(), { status: "This engine cannot cancel a running query — wait for it to finish" });
       return;
     }
-    setCancelling(true);
-    void cancelOperation(conn()?.id, runningTabId() ?? activeTabId());
+    patchConn(c.id, { cancelling: true });
+    void cancelOperation(c.id, runningTabId() ?? activeTabId());
   }
 
   // Run-target chooser: when Run is hit with the cursor inside one of several statements
@@ -2824,28 +3167,34 @@ function App() {
     }, origin);
   }
 
+  // Page the ACTIVE tab's stream. Everything is resolved from that tab's connection:
+  // its cursor owner, its fetch generation, its transaction.
   async function loadMore() {
-    const c = conn();
     const id = activeTabId();
-    if (!c || done() || fetchingMore() || !transactionDatabaseAllowed(transaction(), id)) return;
-    const owner = cursorOwner;
     const tab = tabs().find((t) => t.id === id);
-    if (!owner || owner.tabId !== id || owner.connectionGeneration !== c.generation || tab?.result.generation !== owner.resultGeneration) return;
-    const operation = ++fetchGeneration;
-    const before = transaction();
+    const entry = entryOf(tab?.connectionId);
+    const c = entry?.conn ?? null;
+    const rt = entry?.runtime ?? null;
+    if (!c || !rt || !tab) return;
+    const txOf = () => stateOf(c.id)?.transaction ?? IDLE_TRANSACTION;
+    if (tab.result.done || entry!.state().fetchingMore || !transactionDatabaseAllowed(txOf(), id)) return;
+    const owner = rt.cursorOwner;
+    if (!owner || owner.tabId !== id || owner.connectionGeneration !== c.generation || tab.result.generation !== owner.resultGeneration) return;
+    const operation = ++rt.fetchGeneration;
+    const before = txOf();
     let expectedTransactionRevision = before.revision;
     const isCurrent = () =>
-      fetchGeneration === operation &&
-      connectionCurrent(c) &&
-      cursorOwner?.cursorGeneration === owner.cursorGeneration &&
-      cursorOwner.resultGeneration === owner.resultGeneration &&
+      rt.fetchGeneration === operation &&
+      connectionOpen(c) &&
+      rt.cursorOwner?.cursorGeneration === owner.cursorGeneration &&
+      rt.cursorOwner.resultGeneration === owner.resultGeneration &&
       tabs().find((t) => t.id === id)?.result.generation === owner.resultGeneration &&
-      transaction().revision === expectedTransactionRevision;
-    setFetchingMore(true);
+      txOf().revision === expectedTransactionRevision;
+    patchConn(c.id, { fetchingMore: true });
     try {
       const r = await invoke<FetchResult>("fetch_more", { connectionId: c.id, ownerId: id, pageSize: PAGE });
       expectedTransactionRevision = r.transaction.revision;
-      if (!applyAuthoritativeTransaction(r.transaction, c.generation, "statement", before) || !isCurrent()) return;
+      if (!applyAuthoritativeTransaction(c, r.transaction, "statement", before) || !isCurrent()) return;
       // Read the captured tab's rows (the user may have switched tabs during the fetch).
       const prev = tabs().find((t) => t.id === id)?.result.rows ?? [];
       const merged = r.rows.length ? [...prev, ...r.rows] : prev;
@@ -2858,14 +3207,14 @@ function App() {
         patchResult(id, { rows: merged, done: r.done, status: `${merged.length}${r.done ? "" : "+"} rows` });
       }
       if (r.done) {
-        cursorOwner = null;
-        cursorGeneration++;
+        rt.cursorOwner = null;
+        rt.cursorGeneration++;
       }
     } catch (e) {
       const embedded = transactionFromError(e);
       if (embedded) {
         expectedTransactionRevision = embedded.revision;
-        if (!applyAuthoritativeTransaction(embedded, c.generation, "statement", before)) return;
+        if (!applyAuthoritativeTransaction(c, embedded, "statement", before)) return;
       }
       if (!isCurrent()) return;
       // Streaming broke (e.g. connection dropped mid-fetch). Surface it instead of
@@ -2873,31 +3222,37 @@ function App() {
       // fetched so far, and stop paging so we don't hammer a dead cursor.
       const msg = errMsg(e);
       patchResult(id, { runErr: msg, status: `streaming stopped — ${msg}`, done: true, incomplete: `streaming stopped — ${msg}` });
-      cursorOwner = null;
-      cursorGeneration++;
+      rt.cursorOwner = null;
+      rt.cursorGeneration++;
     } finally {
-      if (fetchGeneration === operation) setFetchingMore(false);
+      if (rt.fetchGeneration === operation) patchConn(c.id, { fetchingMore: false });
     }
   }
 
-  // Drain the cursor to completion (or cancel). Yields between pages to stay responsive.
+  // Drain the active tab's cursor to completion (or cancel). Yields between pages to
+  // stay responsive. The loop is bound to one connection's runtime, so another
+  // connection's paging is neither cancelled by nor waits on this one.
   async function loadAll() {
-    if (loadingAll()) { cancelAll = true; return; }
     const id = activeTabId();
-    const ownerGeneration = cursorOwner?.cursorGeneration;
-    setLoadingAll(true);
-    cancelAll = false;
+    const entry = entryOf(tabs().find((t) => t.id === id)?.connectionId);
+    const c = entry?.conn ?? null;
+    const rt = entry?.runtime ?? null;
+    if (!c || !rt) return;
+    if (entry!.state().loadingAll) { rt.cancelAll = true; return; }
+    const ownerGeneration = rt.cursorOwner?.cursorGeneration;
+    patchConn(c.id, { loadingAll: true });
+    rt.cancelAll = false;
     while (
-      !cancelAll &&
+      !rt.cancelAll &&
       !tabs().find((t) => t.id === id)?.result.done &&
-      cursorOwner?.tabId === id &&
-      cursorOwner.cursorGeneration === ownerGeneration &&
+      rt.cursorOwner?.tabId === id &&
+      rt.cursorOwner.cursorGeneration === ownerGeneration &&
       activeTabId() === id
     ) {
       await loadMore();
       await new Promise((r) => setTimeout(r));
     }
-    setLoadingAll(false);
+    patchConn(c.id, { loadingAll: false });
   }
 
   function tableNameFromSql(s: string): string {
@@ -3032,28 +3387,31 @@ function App() {
         summary.firstError ? summary.firstError.message.split("\n")[0] : null,
       );
       // The database changed underneath the sidebar/autocomplete — refetch.
-      if (connectionCurrent(c)) await loadSchema();
+      if (connectionOpen(c)) await loadSchema();
       return summary;
     } catch (e) {
       entry(/cancel/i.test(errMsg(e)) ? "cancelled" : "error", null, errMsg(e).split("\n")[0]);
-      if (connectionCurrent(c)) await loadSchema();
+      if (connectionOpen(c)) await loadSchema();
       throw e;
     }
   }
 
-  // Immediately cancel + roll back the in-flight export/import on this connection.
-  async function cancelOperation(connectionId = conn()?.id, ownerId = activeTabId()) {
-    const c = conn();
-    if (!connectionId || !c || c.id !== connectionId) return;
+  // Immediately cancel + roll back the in-flight query/export/import on ONE
+  // connection. The id is required (never "the active one"): a cancel must reach the
+  // connection that armed the operation even after the user switched away.
+  async function cancelOperation(connectionId = activeConnectionId(), ownerId = activeTabId()) {
+    const entry = entryOf(connectionId);
+    if (!connectionId || !entry) return;
+    const c = entry.conn;
     try {
       const status = await invoke<TransactionStatus>("cancel_operation", { connectionId, ownerId });
-      applyAuthoritativeTransaction(status, c.generation);
+      applyAuthoritativeTransaction(c, status);
     } catch (e) {
       // A rejected cancel means no unwind will ever reset the Cancelling… state or
       // report why — do both here (the error may still carry authoritative state).
       const embedded = transactionFromError(e);
-      if (embedded) applyAuthoritativeTransaction(embedded, c.generation);
-      setCancelling(false);
+      if (embedded) applyAuthoritativeTransaction(c, embedded);
+      patchConn(c.id, { cancelling: false });
       patchResult(ownerId, { status: `cancel failed: ${errMsg(e)}` });
     }
   }
@@ -3136,7 +3494,7 @@ function App() {
   ): Promise<ImportSummary> {
     const binding = importOrigin;
     const c = binding?.connection;
-    if (!binding || !c || !connectionCurrent(c) || metadataFrozen()) {
+    if (!binding || !c || !connectionOpen(c) || metadataFrozen()) {
       throw new Error("connection changed — reopen the import dialog");
     }
     const label = `${target.schema ? `${target.schema}.` : ""}${target.table}`;
@@ -3159,7 +3517,7 @@ function App() {
         error: null,
         schema: target.schema || null,
       }, c.key);
-      if (connectionCurrent(c) && !metadataFrozen()) await loadSchema(c);
+      if (connectionOpen(c) && !metadataFrozen()) await loadSchema(c);
       return summary;
     } catch (e) {
       const message = errMsg(e);
@@ -3195,9 +3553,9 @@ function App() {
     // export opens, never while a stream is live (it rolls the shared cursor back).
     interruptStream("reading table columns closed the result stream");
     await loadDetail(schemaName, name, false, c);
-    if (!connectionCurrent(c) || !originCurrent(origin)) return;
+    if (!connectionOpen(c) || !originCurrent(origin)) return;
     const detail = details()[relKey(schemaName, name)];
-    const query = `SELECT * FROM ${qualifyIn(schemaName, name, schemaName)}`;
+    const query = withDialect(connectionKindOf(stateOf(c.id)), () => `SELECT * FROM ${qualifyIn(schemaName, name, schemaName)}`);
     setExportSrc({
       columns: detail?.columns.map((col) => col.name) ?? [],
       rows: [],
@@ -3287,14 +3645,14 @@ function App() {
 
   function runTable(schemaName: string, name: string) {
     if (rejectFrozenExplorer()) return;
-    const q = `SELECT * FROM ${qualifyIn(schemaName, name, schemaName)}`;
+    const q = withDialect(connectionKind(), () => `SELECT * FROM ${qualifyIn(schemaName, name, schemaName)}`);
     openGeneratedTab(q, schemaName, name);
     doRun(q);
   }
 
   function runTableLimit(schemaName: string, name: string, limit: number) {
     if (rejectFrozenExplorer()) return;
-    const q = `SELECT * FROM ${qualifyIn(schemaName, name, schemaName)} LIMIT ${limit}`;
+    const q = withDialect(connectionKind(), () => `SELECT * FROM ${qualifyIn(schemaName, name, schemaName)} LIMIT ${limit}`);
     openGeneratedTab(q, schemaName, name);
     doRun(q);
   }
@@ -3307,9 +3665,10 @@ function App() {
    * the lighter surface.
    */
   async function filterTable(schemaName: string, name: string) {
-    if (rejectFrozenExplorer()) return;
-    const q = `SELECT * FROM ${qualifyIn(schemaName, name, schemaName)}`;
-    const t = makeTab({ sql: q, searchSchema: schemaName, title: name });
+    const owner = activeConnectionId();
+    if (!owner || rejectFrozenExplorer()) return;
+    const q = withDialect(connectionKind(), () => `SELECT * FROM ${qualifyIn(schemaName, name, schemaName)}`);
+    const t = makeTab({ connectionId: owner, sql: q, searchSchema: schemaName, title: name });
     t.gridView = { ...t.gridView, filterRowOpen: true };
     setTabs((ts) => [...ts, t]);
     switchTab(t.id);
@@ -3351,8 +3710,8 @@ function App() {
     try {
       const out = await invoke<QueryResult>("run_query", { connectionId: c.id, ownerId: origin.tabId ?? activeTabId(), sql: sqlText, pageSize: PAGE, searchPath: null });
       ddlHistory("ok", null);
-      if (!applyAuthoritativeTransaction(out.transaction, c.generation, "statement", before)) return { ok: false, error: "stale transaction response" };
-      if (!connectionCurrent(c) || !originCurrent(origin)) return { ok: false, error: "connection or tab changed" };
+      if (!applyAuthoritativeTransaction(c, out.transaction, "statement", before)) return { ok: false, error: "stale transaction response" };
+      if (!connectionOpen(c) || !originCurrent(origin)) return { ok: false, error: "connection or tab changed" };
       if (origin.tabId) {
         if (!resultsOpen()) { setResultsOpen(true); persistLayout(); }
         patchResult(origin.tabId, { status: out.kind === "exec" ? out.message : `${out.rows.length}${out.done ? "" : "+"} rows` });
@@ -3363,7 +3722,7 @@ function App() {
       const message = errMsg(e);
       ddlHistory("error", message.split("\n")[0]);
       const embedded = transactionFromError(e);
-      if (embedded) applyAuthoritativeTransaction(embedded, c.generation, "statement", before);
+      if (embedded) applyAuthoritativeTransaction(c, embedded, "statement", before);
       return { ok: false, error: message };
     }
   }
@@ -3425,7 +3784,7 @@ function App() {
         schema: n.schema ?? "",
         name: n.name,
       });
-      if (!connectionCurrent(c) || !originAlive(origin) || !origin.tabId) return;
+      if (!connectionOpen(c) || !originAlive(origin) || !origin.tabId) return;
       if (toEditor) scaffoldEditor(dd, origin.tabId);
       else copyText(dd, "copied DDL", origin);
     } catch (e) {
@@ -3441,17 +3800,17 @@ function App() {
     if (!c || rejectFrozenExplorer()) return;
     const origin = captureOrigin();
     await loadDetail(n.schema!, n.name, false, c);
-    if (!connectionCurrent(c) || !originCurrent(origin)) return;
+    if (!connectionOpen(c) || !originCurrent(origin)) return;
     const d = details()[relKey(n.schema!, n.name)];
     const cols = d?.columns.map((c) => c.name) ?? [];
     const pks = d?.columns.filter((c) => c.is_pk).map((c) => c.name) ?? [];
     const schema = n.schema!;
-    const text =
+    const text = withDialect(connectionKindOf(stateOf(c.id)), () =>
       kind === "select"
         ? ddl.genSelect(schema, n.name, cols, schema)
         : kind === "insert"
           ? ddl.genInsert(schema, n.name, cols, schema)
-          : ddl.genUpdate(schema, n.name, cols, pks, schema);
+          : ddl.genUpdate(schema, n.name, cols, pks, schema));
     openGeneratedTab(text.trim() + ";", schema, n.name);
   }
 
@@ -3468,7 +3827,7 @@ function App() {
     const c = conn();
     if (!c || metadataFrozen()) return null;
     await loadDetail(schemaName, table, false, c);
-    if (!connectionCurrent(c)) return null;
+    if (!connectionOpen(c)) return null;
     const d = details()[relKey(schemaName, table)];
     if (!d) return null;
     const unique = new Set(
@@ -3488,7 +3847,7 @@ function App() {
     if (!c || rejectFrozenExplorer()) return;
     const origin = captureOrigin();
     await loadDetail(n.schema!, n.name, false, c);
-    if (!connectionCurrent(c) || !originCurrent(origin)) return;
+    if (!connectionOpen(c) || !originCurrent(origin)) return;
     const d = details()[relKey(n.schema!, n.name)];
     setActiveDialog({ kind: "addIndex", ctx: n, columns: d?.columns.map((c) => c.name) ?? [] }, origin);
   }
@@ -3497,7 +3856,7 @@ function App() {
     if (!c || rejectFrozenExplorer()) return;
     const origin = captureOrigin();
     await loadDetail(n.schema!, n.name, false, c);
-    if (!connectionCurrent(c) || !originCurrent(origin)) return;
+    if (!connectionOpen(c) || !originCurrent(origin)) return;
     const d = details()[relKey(n.schema!, n.name)];
     setActiveDialog({
       kind: "addConstraint",
@@ -3512,7 +3871,7 @@ function App() {
     if (!c || rejectFrozenExplorer()) return;
     const origin = captureOrigin();
     await loadDetail(n.schema!, n.name, false, c);
-    if (!connectionCurrent(c) || !originCurrent(origin)) return;
+    if (!connectionOpen(c) || !originCurrent(origin)) return;
     const d = details()[relKey(n.schema!, n.name)];
     if (d)
       setActiveDialog(
@@ -3901,6 +4260,11 @@ function App() {
     layoutStore.save({
       sidebarW: sidebarW(), aiW: aiW(), historyW: historyW(), editorH: editorH(),
       sidebarOpen: sidebarOpen(), resultsOpen: resultsOpen(),
+      // Profile ids only: an ad-hoc session's credentials were typed, never stored,
+      // so offering to reopen one could only fail or prompt.
+      openConnections: connections().length
+        ? rememberedProfileIds(connections())
+        : reopenable(),
     });
 
   // Hard safety bounds: no side panel may grow past the point where the editor/main
@@ -3961,160 +4325,214 @@ function App() {
   const startResizeAi = (e: MouseEvent) => startResizeH(e, aiW, setAiW, -1, 280, maxSideDockW(760));
   const startResizeHistory = (e: MouseEvent) => startResizeH(e, historyW, setHistoryW, -1, 240, maxSideDockW(700));
 
+  /**
+   * The connect screen. It is the whole window when nothing is open, and a modal over
+   * the workbench when an existing session opens another connection ("+" in the
+   * strip), so connecting never costs you the workspace you are already in.
+   */
+  const connectPanel = () => (
+            <div class="connect-layout">
+              <div class="profiles-panel">
+                <div class="panel-title">Connections</div>
+                <div class="profiles-list">
+                  <For each={profiles()}>
+                    {(p) => (
+                      <div class="profile-row" classList={{ active: editingId() === p.id }} onContextMenu={(e) => openProfileMenu(e, p)}>
+                        <div class="profile-main" onClick={() => useProfile(p)}>
+                          <span class="profile-avatar">{driverMascot(p.driver)}</span>
+                          <div class="profile-text">
+                            <div class="profile-name">
+                              <span class="profile-name-text">{p.name || (isEmbeddedDriver(p.driver) ? basename(p.path || ":memory:") : p.host)}</span>
+                              <Show when={p.default_connect}><span class="profile-star" title="Connects on startup"><Icon name="star" /></span></Show>
+                              <Show when={p.read_only}><span class="chip-ro" title="Read-only connection">RO</span></Show>
+                            </div>
+                            <div class="profile-sub">
+                              <span>{isEmbeddedDriver(p.driver) ? (p.path || ":memory:") : `${p.user}@${p.host}:${p.port}/${p.dbname}`}</span>
+                              <Show when={p.ssh}>{(t) => <span class="chip-ssh" title={`Tunnelled through ${t().user}@${t().host}:${t().port}`}>SSH</span>}</Show>
+                              <Show when={p.save_password}><Icon name="lock" /></Show>
+                            </div>
+                          </div>
+                          <span class="profile-go"><Icon name="play" /></span>
+                        </div>
+                        <button class="icon" title="Edit" onClick={() => editProfile(p)}><Icon name="edit" /></button>
+                        <button class="icon" title="Delete" onClick={() => deleteProfile(p.id)}><Icon name="trash" /></button>
+                      </div>
+                    )}
+                  </For>
+                  <Show when={profiles().length === 0}>
+                    <div class="profiles-empty">
+                      <span class="profiles-empty-mark">🐘</span>
+                      <div>No saved connections yet.</div>
+                      <div class="profiles-empty-sub">Fill the form and hit <b>Save</b> — or just <b>Connect</b> without saving.</div>
+                    </div>
+                  </Show>
+                </div>
+                <button class="ghost full" onClick={newProfile}>＋ New connection</button>
+                <div class="connect-foot">Right-click a connection for more · <kbd class="kb-kbd">F1</kbd> manual</div>
+              </div>
+  
+              <form class="connect-card" onSubmit={doConnect}>
+                <div class="brand-row">
+                  <span class="brand-mark">{driverMascot(driver())}</span>
+                  <div>
+                    <div class="brand">Tusk</div>
+                    <div class="subtitle">{editingId() ? "Edit connection" : "New connection"}</div>
+                  </div>
+                </div>
+                <label>Name<input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="My database" /></label>
+                <label>Driver
+                  <div class="driver-tiles" role="radiogroup" aria-label="Driver">
+                    <For each={DRIVERS}>
+                      {(d) => (
+                        <button
+                          type="button"
+                          class="driver-tile"
+                          role="radio"
+                          aria-checked={driver() === d.id}
+                          classList={{ active: driver() === d.id }}
+                          disabled={!d.ready}
+                          title={d.ready ? d.label : `${d.label} (soon)`}
+                          onClick={() => {
+                            const previous = driver();
+                            setDriver(d.id);
+                            // Only move the port when it still holds another driver's default.
+                            const defaults: Record<string, number> = { postgres: 5432, mysql: 3306, mssql: 1433 };
+                            if (defaults[d.id] && port() === defaults[previous]) setPort(defaults[d.id]);
+                            if (d.id !== "postgres" && dbname() === "postgres") setDbname("");
+                            if (d.id === "postgres" && dbname() === "") setDbname("postgres");
+                          }}
+                        >
+                          <span class="dt-mascot">{d.mascot}</span>
+                          <span class="dt-label">{d.label}</span>
+                        </button>
+                      )}
+                    </For>
+                  </div>
+                </label>
+                <Show
+                  when={driver() === "duckdb" || driver() === "sqlite"}
+                  fallback={
+                    <>
+                      <div class="field-row host-port">
+                        <label>Host<input value={host()} onInput={(e) => setHost(e.currentTarget.value)} /></label>
+                        <label>Port<input type="number" min="1" max="65535" step="1" value={port()} onInput={(e) => setPort(Number(e.currentTarget.value))} /></label>
+                      </div>
+                      <label>User<input value={user()} onInput={(e) => setUser(e.currentTarget.value)} placeholder={driver() === "mysql" ? "root" : driver() === "mssql" ? "sa" : "postgres"} /></label>
+                      <label>Password<input type="password" value={password()} onInput={(e) => setPassword(e.currentTarget.value)} placeholder={editingId() && savePassword() ? "•••••• (stored)" : ""} /></label>
+                      <div class="field-row halves">
+                        <label>Database<input value={dbname()} onInput={(e) => setDbname(e.currentTarget.value)} placeholder={driver() === "postgres" ? "postgres" : "(optional)"} /></label>
+                        <label>SSL Mode
+                          <select value={sslmode()} onChange={(e) => setSslmode(e.currentTarget.value)}>
+                            <option value="disable">disable</option>
+                            <option value="prefer">prefer</option>
+                            <option value="require">require</option>
+                            <option value="verify-full">verify-full</option>
+                          </select>
+                        </label>
+                      </div>
+                    </>
+                  }
+                >
+                  <label>Database file
+                    <div class="file-row">
+                      <input value={path()} onInput={(e) => setPath(e.currentTarget.value)} placeholder={`/path/to/db.${driver() === "sqlite" ? "sqlite" : "duckdb"} — blank = in-memory`} />
+                      <button type="button" class="ghost" onClick={browseDbFile}>Browse…</button>
+                    </div>
+                  </label>
+                  <div class="empty-hint">Leave blank for a scratch in-memory database.</div>
+                </Show>
+                <Show when={!isEmbeddedDriver(driver())}>
+                  <SshSection
+                    state={ssh()}
+                    onChange={patchSsh}
+                    hasStoredSecret={sshSecretStored()}
+                    onError={setConnErr}
+                  />
+                </Show>
+                <label class="checkbox"><input type="checkbox" checked={readOnly()} onChange={(e) => setReadOnly(e.currentTarget.checked)} />Read-only (block writes &amp; DDL)</label>
+                <Show when={!isEmbeddedDriver(driver())}>
+                  <label class="checkbox"><input type="checkbox" checked={savePassword()} onChange={(e) => setSavePassword(e.currentTarget.checked)} />Save password</label>
+                </Show>
+                <label class="checkbox"><input type="checkbox" checked={defaultConnect()} onChange={(e) => setDefaultConnect(e.currentTarget.checked)} />Connect on startup</label>
+                <div class="form-actions">
+                  <button type="button" class="ghost" onClick={saveProfile}>Save</button>
+                  <button type="submit" disabled={connecting()}>{connecting() ? <><span class="spinner-sm" />Connecting…</> : "Connect"}</button>
+                </div>
+                <Show when={connErr()}><div class="error">{connErr()}</div></Show>
+              </form>
+            </div>
+  );
+
   return (
     <>
     <Show
-      when={conn()}
+      when={connections().length > 0}
       fallback={
         <div class="connect-screen">
           <div class="connect-utils">
             <button class="icon" title="Manual (F1)" onClick={() => setHelpOpen(true)}><Icon name="help" /></button>
             <button class="icon" title="Settings" onClick={() => setSettingsOpen("editor")}><Icon name="gear" /></button>
           </div>
-          <div class="connect-layout">
-            <div class="profiles-panel">
-              <div class="panel-title">Connections</div>
-              <div class="profiles-list">
-                <For each={profiles()}>
-                  {(p) => (
-                    <div class="profile-row" classList={{ active: editingId() === p.id }} onContextMenu={(e) => openProfileMenu(e, p)}>
-                      <div class="profile-main" onClick={() => useProfile(p)}>
-                        <span class="profile-avatar">{driverMascot(p.driver)}</span>
-                        <div class="profile-text">
-                          <div class="profile-name">
-                            <span class="profile-name-text">{p.name || (isEmbeddedDriver(p.driver) ? basename(p.path || ":memory:") : p.host)}</span>
-                            <Show when={p.default_connect}><span class="profile-star" title="Connects on startup"><Icon name="star" /></span></Show>
-                            <Show when={p.read_only}><span class="chip-ro" title="Read-only connection">RO</span></Show>
-                          </div>
-                          <div class="profile-sub">
-                            <span>{isEmbeddedDriver(p.driver) ? (p.path || ":memory:") : `${p.user}@${p.host}:${p.port}/${p.dbname}`}</span>
-                            <Show when={p.ssh}>{(t) => <span class="chip-ssh" title={`Tunnelled through ${t().user}@${t().host}:${t().port}`}>SSH</span>}</Show>
-                            <Show when={p.save_password}><Icon name="lock" /></Show>
-                          </div>
-                        </div>
-                        <span class="profile-go"><Icon name="play" /></span>
-                      </div>
-                      <button class="icon" title="Edit" onClick={() => editProfile(p)}><Icon name="edit" /></button>
-                      <button class="icon" title="Delete" onClick={() => deleteProfile(p.id)}><Icon name="trash" /></button>
-                    </div>
-                  )}
-                </For>
-                <Show when={profiles().length === 0}>
-                  <div class="profiles-empty">
-                    <span class="profiles-empty-mark">🐘</span>
-                    <div>No saved connections yet.</div>
-                    <div class="profiles-empty-sub">Fill the form and hit <b>Save</b> — or just <b>Connect</b> without saving.</div>
-                  </div>
-                </Show>
-              </div>
-              <button class="ghost full" onClick={newProfile}>＋ New connection</button>
-              <div class="connect-foot">Right-click a connection for more · <kbd class="kb-kbd">F1</kbd> manual</div>
+          <Show when={reopenable().length > 0}>
+            <div class="reopen-bar">
+              <span>Last session had {reopenable().length} connection{reopenable().length === 1 ? "" : "s"} open.</span>
+              <button class="ghost" disabled={connecting()} onClick={() => void reopenLastSession()}>Reopen last session</button>
+              <button class="icon" title="Forget" onClick={() => { setReopenable([]); persistLayout(); }}>&#10005;</button>
             </div>
-
-            <form class="connect-card" onSubmit={doConnect}>
-              <div class="brand-row">
-                <span class="brand-mark">{driverMascot(driver())}</span>
-                <div>
-                  <div class="brand">Tusk</div>
-                  <div class="subtitle">{editingId() ? "Edit connection" : "New connection"}</div>
-                </div>
-              </div>
-              <label>Name<input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="My database" /></label>
-              <label>Driver
-                <div class="driver-tiles" role="radiogroup" aria-label="Driver">
-                  <For each={DRIVERS}>
-                    {(d) => (
-                      <button
-                        type="button"
-                        class="driver-tile"
-                        role="radio"
-                        aria-checked={driver() === d.id}
-                        classList={{ active: driver() === d.id }}
-                        disabled={!d.ready}
-                        title={d.ready ? d.label : `${d.label} (soon)`}
-                        onClick={() => {
-                          const previous = driver();
-                          setDriver(d.id);
-                          // Only move the port when it still holds another driver's default.
-                          const defaults: Record<string, number> = { postgres: 5432, mysql: 3306, mssql: 1433 };
-                          if (defaults[d.id] && port() === defaults[previous]) setPort(defaults[d.id]);
-                          if (d.id !== "postgres" && dbname() === "postgres") setDbname("");
-                          if (d.id === "postgres" && dbname() === "") setDbname("postgres");
-                        }}
-                      >
-                        <span class="dt-mascot">{d.mascot}</span>
-                        <span class="dt-label">{d.label}</span>
-                      </button>
-                    )}
-                  </For>
-                </div>
-              </label>
-              <Show
-                when={driver() === "duckdb" || driver() === "sqlite"}
-                fallback={
-                  <>
-                    <div class="field-row host-port">
-                      <label>Host<input value={host()} onInput={(e) => setHost(e.currentTarget.value)} /></label>
-                      <label>Port<input type="number" min="1" max="65535" step="1" value={port()} onInput={(e) => setPort(Number(e.currentTarget.value))} /></label>
-                    </div>
-                    <label>User<input value={user()} onInput={(e) => setUser(e.currentTarget.value)} placeholder={driver() === "mysql" ? "root" : driver() === "mssql" ? "sa" : "postgres"} /></label>
-                    <label>Password<input type="password" value={password()} onInput={(e) => setPassword(e.currentTarget.value)} placeholder={editingId() && savePassword() ? "•••••• (stored)" : ""} /></label>
-                    <div class="field-row halves">
-                      <label>Database<input value={dbname()} onInput={(e) => setDbname(e.currentTarget.value)} placeholder={driver() === "postgres" ? "postgres" : "(optional)"} /></label>
-                      <label>SSL Mode
-                        <select value={sslmode()} onChange={(e) => setSslmode(e.currentTarget.value)}>
-                          <option value="disable">disable</option>
-                          <option value="prefer">prefer</option>
-                          <option value="require">require</option>
-                          <option value="verify-full">verify-full</option>
-                        </select>
-                      </label>
-                    </div>
-                  </>
-                }
-              >
-                <label>Database file
-                  <div class="file-row">
-                    <input value={path()} onInput={(e) => setPath(e.currentTarget.value)} placeholder={`/path/to/db.${driver() === "sqlite" ? "sqlite" : "duckdb"} — blank = in-memory`} />
-                    <button type="button" class="ghost" onClick={browseDbFile}>Browse…</button>
-                  </div>
-                </label>
-                <div class="empty-hint">Leave blank for a scratch in-memory database.</div>
-              </Show>
-              <Show when={!isEmbeddedDriver(driver())}>
-                <SshSection
-                  state={ssh()}
-                  onChange={patchSsh}
-                  hasStoredSecret={sshSecretStored()}
-                  onError={setConnErr}
-                />
-              </Show>
-              <label class="checkbox"><input type="checkbox" checked={readOnly()} onChange={(e) => setReadOnly(e.currentTarget.checked)} />Read-only (block writes &amp; DDL)</label>
-              <Show when={!isEmbeddedDriver(driver())}>
-                <label class="checkbox"><input type="checkbox" checked={savePassword()} onChange={(e) => setSavePassword(e.currentTarget.checked)} />Save password</label>
-              </Show>
-              <label class="checkbox"><input type="checkbox" checked={defaultConnect()} onChange={(e) => setDefaultConnect(e.currentTarget.checked)} />Connect on startup</label>
-              <div class="form-actions">
-                <button type="button" class="ghost" onClick={saveProfile}>Save</button>
-                <button type="submit" disabled={connecting()}>{connecting() ? <><span class="spinner-sm" />Connecting…</> : "Connect"}</button>
-              </div>
-              <Show when={connErr()}><div class="error">{connErr()}</div></Show>
-            </form>
-          </div>
+          </Show>
+          {connectPanel()}
         </div>
       }
     >
       <div class="workspace">
         <header class="topbar">
           <span class="brand-sm">{driverMascot(connectionKind())} Tusk</span>
-          <span class="conn-chip" title={conn()?.viaSsh ? `${connTarget()} — reached through an SSH tunnel` : connTarget()}>
-            <span class="conn-dot" />
-            <span class="conn-name">{connTarget()}</span>
-            <Show when={conn()?.viaSsh}>
-              <span class="conn-ssh" title="Reached through an SSH tunnel">SSH</span>
-            </Show>
-          </span>
-          <span class="meta">{driverLabel(connectionKind())} {conn()!.version}</span>
+          {/* Connection strip: one chip per open session. With a single connection it
+              renders exactly the old topbar chip, so nothing changes visually until a
+              second connection actually exists. */}
+          <div class="conn-strip" role="tablist" aria-label="Open connections">
+            <For each={connections()}>
+              {(entry) => {
+                const id = entry.conn.id;
+                const active = () => activeConnectionId() === id;
+                const dot = () => connectionDot(entry.state());
+                return (
+                  <span
+                    class="conn-chip"
+                    role="tab"
+                    aria-selected={active()}
+                    classList={{ active: active(), multi: connections().length > 1 }}
+                    style={connections().length > 1 ? { "--conn-color": connectionColor(entry.colorIndex) } : undefined}
+                    title={`${labelOf(id)} — ${driverLabel(kindOf(id))}${entry.conn.viaSsh ? " (through an SSH tunnel)" : ""} · ${connectionDotTitle(dot())}`}
+                    onClick={() => focusConnection(id)}
+                  >
+                    <Show when={connections().length > 1}>
+                      <span class="conn-mascot">{driverMascot(kindOf(id))}</span>
+                    </Show>
+                    <span class="conn-dot" classList={{ [dot()]: true }} />
+                    <span class="conn-name">{labelOf(id)}</span>
+                    <Show when={entry.conn.viaSsh}>
+                      <span class="conn-ssh" title="Reached through an SSH tunnel">SSH</span>
+                    </Show>
+                    <Show when={connections().length > 1}>
+                      <button
+                        class="conn-close"
+                        title={`Disconnect ${labelOf(id)}`}
+                        onClick={(e) => { e.stopPropagation(); void disconnectConnection(id); }}
+                      >&#215;</button>
+                    </Show>
+                  </span>
+                );
+              }}
+            </For>
+            <button
+              class="conn-add"
+              title={connectionLimitError(connections()) || `Open another connection (${displayKey(effectiveKey("newConnection", keys()))})`}
+              disabled={!!connectionLimitError(connections())}
+              onClick={() => openConnectScreen()}
+            >&#65291;</button>
+          </div>
+          <span class="meta">{driverLabel(connectionKind())} {conn()?.version ?? ""}</span>
           <Show when={conn()!.readOnly}>
             <span class="badge badge-ro" title="Writes & DDL are blocked"><Icon name="lock" /> Read-only</span>
           </Show>
@@ -4129,7 +4547,7 @@ function App() {
           <button class="icon" classList={{ active: historyOpen() }} title="Query history" onClick={() => setHistoryOpen((v) => !v)}><Icon name="clock" /></button>
           <button class="icon" classList={{ active: helpOpen() }} title="Manual" onClick={() => setHelpOpen(true)}><Icon name="help" /></button>
           <button class="icon" title="Settings" onClick={() => setSettingsOpen("editor")}><Icon name="gear" /></button>
-          <button class="ghost" onClick={() => void disconnect()}>Disconnect</button>
+          <button class="ghost" title={connections().length > 1 ? `Disconnect ${labelOf(activeConnectionId() ?? "")}` : undefined} onClick={() => void disconnect()}>Disconnect</button>
         </header>
 
         <Show when={transactionOpen(transaction())}>
@@ -4184,7 +4602,7 @@ function App() {
               </Show>
             </Show>
             <Show when={transaction().state === "lost"}>
-              <button class="btn-danger" onClick={() => { setTransactionResolution({ kind: "disconnect" }); }}>Disconnect / reconnect</button>
+              <button class="btn-danger" onClick={() => { const e = activeEntry(); if (e) raiseTransactionResolution(e, { kind: "disconnect" }); }}>Disconnect / reconnect</button>
             </Show>
           </div>
         </Show>
@@ -4264,8 +4682,14 @@ function App() {
                   {(t) => (
                     <div
                       class="tab"
-                      classList={{ active: t.id === activeTabId(), "tx-owner": transaction().owner === t.id, frozen: transactionOpen(transaction()) && transaction().owner !== t.id }}
-                      title={t.filePath ?? t.title}
+                      classList={{
+                        active: t.id === activeTabId(),
+                        "tx-owner": stateOf(t.connectionId)?.transaction.owner === t.id,
+                        frozen: transactionOpen(stateOf(t.connectionId)?.transaction ?? IDLE_TRANSACTION) && stateOf(t.connectionId)?.transaction.owner !== t.id,
+                        "other-conn": connections().length > 1 && t.connectionId !== activeConnectionId(),
+                      }}
+                      style={connections().length > 1 ? { "--conn-color": connectionColor(entryOf(t.connectionId)?.colorIndex ?? 0) } : undefined}
+                      title={`${t.filePath ?? t.title}${connections().length > 1 ? ` — ${labelOf(t.connectionId)}` : ""}`}
                       draggable={true}
                       onDragStart={() => (dragTabId = t.id)}
                       onDragOver={(e) => {
@@ -4293,9 +4717,12 @@ function App() {
                         });
                       }}
                     >
+                      <Show when={connections().length > 1}>
+                        <span class="tab-conn" title={labelOf(t.connectionId)}>{driverMascot(kindOf(t.connectionId))}</span>
+                      </Show>
                       <span class="tab-title">{t.title}</span>
-                      <Show when={running() && runningTabId() === t.id}><span class="spinner-sm tab-spin" title="Query running" /></Show>
-                      <Show when={transaction().owner === t.id}><span class="tab-tx" title={`Owns ${transaction().id ?? "manual transaction"}`}>TX</span></Show>
+                      <Show when={stateOf(t.connectionId)?.running && stateOf(t.connectionId)?.runningTabId === t.id}><span class="spinner-sm tab-spin" title="Query running" /></Show>
+                      <Show when={stateOf(t.connectionId)?.transaction.owner === t.id}><span class="tab-tx" title={`Owns ${stateOf(t.connectionId)?.transaction.id ?? "manual transaction"}`}>TX</span></Show>
                       <Show when={t.dirty}><span class="tab-dot" title="Unsaved changes">●</span></Show>
                       <button class="tab-close" title="Close (⌘/Ctrl+W)" onClick={(e) => { e.stopPropagation(); closeTab(t.id); }}>×</button>
                     </div>
@@ -4565,8 +4992,10 @@ function App() {
                 runText(sql);
               }}
               onClear={() => {
-                const key = conn()?.key;
-                if (key) { historyStore.clear(key); if (conn()?.key === key) setHistory([]); }
+                const c = conn();
+                if (!c) return;
+                historyStore.clear(c.key);
+                for (const entry of connections()) if (entry.conn.key === c.key) entry.patch({ history: [] });
               }}
               onClose={() => setHistoryOpen(false)}
             />
@@ -4850,14 +5279,14 @@ function App() {
           )}
         </Show>
         <Show when={confirmDisconnect()}>
-          {(count) => (
+          {(target) => (
             <Dialog title="Disconnect with pending changes?" onClose={() => setConfirmDisconnect(null)} width={460}>
               <p class="confirm-text">
-                Disconnecting discards {count()} uncommitted grid change{count() === 1 ? "" : "s"}. Editor buffers remain saved in this workspace.
+                Disconnecting <b>{labelOf(target().connectionId)}</b> discards {target().count} uncommitted grid change{target().count === 1 ? "" : "s"} on it. Editor buffers remain saved in this workspace.
               </p>
               <div class="form-actions">
                 <button class="ghost" onClick={() => setConfirmDisconnect(null)}>Stay connected</button>
-                <button class="btn-danger" onClick={() => void disconnect(true)}>Discard &amp; disconnect</button>
+                <button class="btn-danger" onClick={() => void disconnectConnection(target().connectionId, true)}>Discard &amp; disconnect</button>
               </div>
             </Dialog>
           )}
@@ -4957,6 +5386,14 @@ function App() {
       </div>
     </Show>
 
+      {/* The connect screen as a modal, so opening another connection never costs you
+          the workspace you are already in. */}
+      <Show when={connectOpen() && connections().length > 0}>
+        <Dialog title="Open another connection" width={980} onClose={() => setConnectOpen(false)}>
+          {connectPanel()}
+        </Dialog>
+      </Show>
+
       {/* Update pill renders in both screens (connect + workspace). */}
       <UpdateBadge />
       <WhatsNew requestShow={whatsNewRequest} />
@@ -5016,6 +5453,8 @@ function App() {
           initialTab={settingsOpen()!}
           connected={!!conn()}
           database={tree()?.database ?? ""}
+          connections={slackConnectionOptions}
+          activeConnectionId={activeConnectionId}
           shortcutsPane={() => <ShortcutsPane keys={keys} update={updateKeys} resetAll={resetKeys} />}
         />
       </Show>

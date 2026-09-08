@@ -1,4 +1,4 @@
-import { ident, lit, qualify } from "../sql/ident";
+import { ident, lit, qualify, sqlDialect, withDialect } from "../sql/ident";
 import type { PendingEdits } from "../tabs";
 
 // Commit-script builder for in-grid edits. Pure + vitest-covered.
@@ -7,6 +7,10 @@ import type { PendingEdits } from "../tabs";
 // use the ORIGINAL snapshot values (the PK itself may have been edited);
 // composite PKs are AND-ed; a NULL original compares with IS NULL. All values
 // are text (simple protocol) — quoted via `lit`, which is dialect-aware.
+//
+// The whole script is built under `input.dialect` (see `withDialect`): the grid may
+// belong to a tab on a connection that is not the active one, and a MySQL row must
+// never be updated with PostgreSQL quoting because a Postgres tab had focus.
 
 export type CommitInput = {
   schema: string;
@@ -20,7 +24,8 @@ export type CommitInput = {
   /** ORIGINAL loaded rows (snapshot — never mutated by editing). */
   rows: (string | null)[][];
   pending: PendingEdits;
-  /** Drives the empty-INSERT form only (quoting follows the module-level dialect). */
+  /** The owning connection's driver kind: drives identifier/literal quoting AND the
+   *  empty-INSERT form. Defaults to the active connection's dialect. */
   dialect?: string;
 };
 
@@ -39,6 +44,10 @@ function pkWhere(input: CommitInput, row: (string | null)[]): string {
 
 /** The commit script as ordered single statements (joined by the caller). */
 export function buildCommitScript(input: CommitInput): string[] {
+  return withDialect(input.dialect ?? sqlDialect(), () => buildCommitScriptIn(input));
+}
+
+function buildCommitScriptIn(input: CommitInput): string[] {
   const { columns, isTableCol, rows, pending } = input;
   const target = qualify(input.schema, input.table);
   const deletes = new Set(pending.deletes);

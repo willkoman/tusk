@@ -166,7 +166,7 @@ export function makeConnectionState(conn: Connected, colorIndex: number): Connec
 }
 
 /** The lowest colour index not already taken (so a close+open reuses the free slot). */
-export function nextColorIndex(list: readonly ConnectionState[]): number {
+export function nextColorIndex(list: readonly { colorIndex: number }[]): number {
   const taken = new Set(list.map((c) => c.colorIndex));
   for (let i = 0; i < CONNECTION_COLORS.length * 4; i++) if (!taken.has(i)) return i;
   return list.length;
@@ -290,7 +290,7 @@ export function connectionLabels(list: readonly ConnectionState[]): Map<string, 
 
 /** Id of the connection `dir` steps from the active one, wrapping. Null when <2 open. */
 export function stepConnection(
-  list: readonly ConnectionState[],
+  list: readonly { conn: Pick<Connected, "id"> }[],
   activeId: string | null,
   dir: 1 | -1,
 ): string | null {
@@ -302,7 +302,7 @@ export function stepConnection(
 }
 
 /** Why a new connection cannot be opened right now (empty string = it can). */
-export function connectionLimitError(list: readonly ConnectionState[]): string {
+export function connectionLimitError(list: readonly unknown[]): string {
   return list.length >= MAX_CONNECTIONS
     ? `Too many open connections (${MAX_CONNECTIONS}). Disconnect one before opening another.`
     : "";
@@ -315,7 +315,7 @@ export function connectionLimitError(list: readonly ConnectionState[]): string {
  * deliberately excluded: their credentials were typed, never stored, so offering to
  * reopen one would either fail or prompt — neither is a session restore.
  */
-export function rememberedProfileIds(list: readonly ConnectionState[]): string[] {
+export function rememberedProfileIds(list: readonly { conn: Pick<Connected, "profileId"> }[]): string[] {
   const out: string[] = [];
   for (const c of list) {
     const id = c.conn.profileId;
