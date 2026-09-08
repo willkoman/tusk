@@ -686,7 +686,8 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**Sort** — click a header to cycle **ascending → descending → none**; [[kbd:Shift]]-click adds to a multi-sort (priority numbers next to the arrows).",
-          "**Filter** — *Filter…* in the header menu, or the sidebar's *Filter rows…* (opens the table with the row visible). Each column does a case-insensitive contains match (`ILIKE '%text%'` on Postgres/DuckDB, `CAST … LIKE` on MySQL/SQLite), AND-combined, debounced 300 ms."
+          "**Quick filter** — *Show filter row* in the header menu puts a box under each header. Each column does a case-insensitive contains match (`ILIKE '%text%'` on Postgres/DuckDB, `CAST … LIKE` on MySQL/SQLite), AND-combined, debounced 300 ms. It writes into the same filter the builder edits.",
+          "**Filter builder** — the toolbar's **Filter** button, [[kbd:Mod-Shift-f]], *Filter by this column…* in the header menu, or the Explorer's *Filter rows…*. See below."
         ]
       },
       {
@@ -706,6 +707,45 @@ export const TOPICS: Topic[] = [
           "Re-running the *same unedited* query text keeps active rules; edit the text first for a clean result.",
           "A sort/filter re-run resets scroll and selection — the rows underneath changed."
         ]
+      },
+      {
+        "k": "h",
+        "text": "The filter builder",
+        "id": "filter-builder"
+      },
+      {
+        "k": "p",
+        "md": "A filter is a **tree**, not a list: one root group joined by AND or OR, holding conditions and nested groups, so \"A and (B or C)\" and \"(A and B) or C\" are both expressible. A condition is a column, an operator, and its values; the operator menu offers only what the column's class supports, and a badge next to the name says which class Tusk inferred (`text`, `num`, `bool`, `date`, `any`). Types come from the relation's detail when it's loaded — without it every column is `any`, which still offers the conservative set and casts to text for matching."
+      },
+      {
+        "k": "keys",
+        "rows": [
+          {
+            "action": "openFilterBuilder",
+            "does": "Open the filter builder for the active result"
+          }
+        ]
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Operators** — `=` `≠` `<` `≤` `>` `≥`, `between` / `not between`, `in` / `not in` (comma-separated; quote a value that contains a comma), `like` / `not like` / `ilike` (raw patterns — you own the wildcards), `starts with` / `ends with` / `contains` (case-insensitive; `%` and `_` in your text are escaped, not wildcards), `is null` / `is not null`, `is true` / `is false`, `is empty` (`= ''`).",
+          "**Groups** — **AND** / **OR** per group, *+ Condition* and *+ Group* to extend, and per-row duplicate/remove. A nested group is added with the opposite join, which is the shape you usually want.",
+          "**Buttons** — **Apply filter** re-streams the wrapped query, **Clear** empties the tree, **Copy WHERE** copies the clause, and **Open as query** puts the full wrapped `SELECT … WHERE …` into a new tab. [[kbd:Enter]] applies, [[kbd:Escape]] closes."
+        ]
+      },
+      {
+        "k": "p",
+        "md": "The generated SQL is per engine. Identifiers are always quoted and values are always literals — only strictly numeric text is emitted unquoted, and only against a numeric column. `ILIKE` is native on Postgres/DuckDB and becomes `LOWER(col) LIKE LOWER(pattern)` where it isn't; booleans emit `TRUE`/`FALSE` on Postgres/DuckDB and `1`/`0` on MySQL/SQLite; escaped LIKE patterns carry the `ESCAPE` clause each dialect reads correctly."
+      },
+      {
+        "k": "tip",
+        "kind": "tip",
+        "md": "`≠` and `not in` exclude NULL rows, exactly as SQL does. To keep them, add an `is null` condition on the same column inside an OR group."
+      },
+      {
+        "k": "p",
+        "md": "While a filter is active a bar above the grid shows one chip per condition, grouped as the filter is and joined by AND/OR, with an ✕ to drop just that rule, the row count the server reported, and **Edit…** / **Clear all**. A condition whose column left the result is dropped silently on the next run; a column name that appears twice in the result is refused outright (`filter rejected: …` in the status line) rather than matching the wrong one."
       },
       {
         "k": "h",
@@ -1002,7 +1042,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**Double-click** a table or view to stream all rows in a new tab (see [[topic:results|Results grid]]). The context menu adds **Select 100 rows** (tables only), **Select all rows**, and **Filter rows…** (opens with the grid's per-column filter row visible) — all open a *new* tab with active schema preset to the relation's, so the generated query stays unqualified and still resolves."
+        "md": "**Double-click** a table or view to stream all rows in a new tab (see [[topic:results|Results grid]]). The context menu adds **Select 100 rows** (tables only), **Select all rows**, and **Filter rows…** (runs the table and opens the [[topic:results|filter builder]] over it, pre-loaded with the relation's columns and types) — all open a *new* tab with active schema preset to the relation's, so the generated query stays unqualified and still resolves."
       },
       {
         "k": "p",
@@ -2235,6 +2275,10 @@ export const TOPICS: Topic[] = [
           {
             "action": "exportResult",
             "does": "Open the Export dialog for the current result"
+          },
+          {
+            "action": "openFilterBuilder",
+            "does": "Open the filter builder for the current result"
           },
           {
             "action": "format",

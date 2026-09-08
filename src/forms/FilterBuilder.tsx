@@ -80,22 +80,21 @@ export function FilterBuilder(props: {
   };
 
   const [tree, setTree] = createSignal<FilterTree>(seeded());
-  const [error, setError] = createSignal("");
   let firstField: HTMLSelectElement | undefined;
 
   onMount(() => queueMicrotask(() => firstField?.focus()));
 
-  const where = createMemo(() => {
+  // One memo carries both outcomes — the generator throws on an ambiguous column
+  // name or an over-budget tree, and that message is what the footer shows.
+  const rendered = createMemo<{ sql: string; error: string }>(() => {
     try {
-      const sql = renderWhere(tree(), { columns: props.columns, dialect: props.dialect, classOf: classOf() });
-      setError("");
-      return sql;
+      return { sql: renderWhere(tree(), { columns: props.columns, dialect: props.dialect, classOf: classOf() }), error: "" };
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      return "";
+      return { sql: "", error: e instanceof Error ? e.message : String(e) };
     }
   });
-
+  const where = () => rendered().sql;
+  const error = () => rendered().error;
   const preview = () => (where() ? `WHERE ${where()}` : "");
 
   const apply = () => {

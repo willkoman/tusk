@@ -304,10 +304,123 @@ async fn with_dml_battery(b: &mut Backend, eng: &Eng) {
     exec(b, &format!("DROP TABLE {}", q("wdml"))).await;
 }
 
+/// The WHERE clauses the visual filter builder generates must be VALID and mean the
+/// same thing on every engine. `src/grid/filterSql.ts` decides the shapes (its vitest
+/// suite pins the exact strings); this executes those shapes so a dialect mistake —
+/// `IS TRUE` where booleans are 0/1, an `ESCAPE` clause the parser rejects, a cast
+/// target that doesn't exist — fails here instead of in a user's grid.
+async fn filter_where_battery(b: &mut Backend, eng: &Eng) {
+    let q = eng.quote;
+    let name = q("name");
+    let qty = q("qty");
+    let flag = q("flag");
+    let id = q("id");
+    // Mirrors filterSql.ts: ILIKE is native only on PG/DuckDB.
+    let ci = |expr: &str, pat: &str, tail: &str| match eng.name {
+        "postgres" | "duckdb" => format!("{expr} ILIKE {pat}{tail}"),
+        _ => format!("{expr} LIKE {pat}{tail}"),
+    };
+    // A literal single backslash, written the way each dialect reads string literals.
+    let esc = match eng.name {
+        "mysql" => r" ESCAPE '\\'",
+        "postgres" => r" ESCAPE E'\\'",
+        _ => r" ESCAPE '\'",
+    };
+    // MySQL processes backslash escapes inside literals; the others do not.
+    let bs = if eng.name == "mysql" { r"\\" } else { r"\" };
+    // PG's `lit` switches to E'…' whenever the value carries a backslash.
+    let epfx = if eng.name == "postgres" { "E" } else { "" };
+    let text_cast = |col: &str| match eng.name {
+        "mysql" => format!("CAST({col} AS CHAR)"),
+        "sqlite" => format!("CAST({col} AS TEXT)"),
+        _ => format!("{col}::text"),
+    };
+    let bool_is = |col: &str, want: bool| match eng.name {
+        "postgres" | "duckdb" => format!("{col} IS {}", if want { "TRUE" } else { "FALSE" }),
+        _ => format!("{col} = {}", if want { "1" } else { "0" }),
+    };
+
+    exec(b, &format!("DROP TABLE IF EXISTS {}", q("filt_t"))).await;
+    exec(
+        b,
+        &format!(
+            "CREATE TABLE {} (id INTEGER, name VARCHAR(40), qty DECIMAL(10,2), flag BOOLEAN)",
+            q("filt_t")
+        ),
+    )
+    .await;
+    exec(
+        b,
+        &format!(
+            "INSERT INTO {} VALUES (1, 'Alpha', 10.00, TRUE), (2, 'beta', 20.50, FALSE), \
+             (3, '50% off', 30.00, TRUE), (4, 'a_b', NULL, NULL), (5, 'o''brien', 5.00, FALSE), \
+             (6, '', 0.00, TRUE), (7, 'axb', 1.00, FALSE)",
+            q("filt_t")
+        ),
+    )
+    .await;
+
+    let cases: Vec<(String, Vec<&str>)> = vec![
+        // contains — case-insensitive on every engine, no ESCAPE for plain text
+        (ci(&name, "'%alph%'", ""), vec!["1"]),
+        // starts with, `%` in the user's text escaped (matches literally, not as a wildcard)
+        (ci(&name, &format!("{epfx}'50{bs}%%'"), esc), vec!["3"]),
+        // contains, `_` escaped: 'a_b' matches, 'axb' must not
+        (ci(&name, &format!("{epfx}'%a{bs}_b%'"), esc), vec!["4"]),
+        // like — raw pattern, the wildcards are the user's
+        (format!("{name} LIKE '%b%'"), vec!["2", "4", "5", "7"]),
+        // non-text column cast for matching
+        (ci(&text_cast(&qty), "'%20%'", ""), vec!["2"]),
+        // typed comparisons: unquoted numeric literal against a numeric column
+        (format!("{qty} BETWEEN 5 AND 20.5"), vec!["1", "2", "5"]),
+        (format!("{qty} NOT BETWEEN 5 AND 20.5"), vec!["3", "6", "7"]),
+        (format!("{id} IN (1, 2, 3)"), vec!["1", "2", "3"]),
+        (format!("{id} NOT IN (1, 2)"), vec!["3", "4", "5", "6", "7"]),
+        // explicit NULL semantics
+        (format!("{qty} IS NULL"), vec!["4"]),
+        (
+            format!("{qty} IS NOT NULL"),
+            vec!["1", "2", "3", "5", "6", "7"],
+        ),
+        // boolean literal form
+        (bool_is(&flag, true), vec!["1", "3", "6"]),
+        (bool_is(&flag, false), vec!["2", "5", "7"]),
+        // is empty + a quote-carrying literal
+        (format!("{name} = ''"), vec!["6"]),
+        (format!("{name} = 'o''brien'"), vec!["5"]),
+        // AND of an OR group — the shape the builder emits for nested groups
+        (
+            format!("({id} = 1 OR {id} = 2) AND {}", bool_is(&flag, true)),
+            vec!["1"],
+        ),
+        // OR of an AND group
+        (
+            format!("({qty} > 25 AND {}) OR {id} = 5", bool_is(&flag, true)),
+            vec!["3", "5"],
+        ),
+    ];
+
+    for (where_sql, want) in cases {
+        let sql = format!(
+            "SELECT {id} FROM {} WHERE {where_sql} ORDER BY {id}",
+            q("filt_t")
+        );
+        let rows = all(b, &sql).await;
+        let got: Vec<String> = rows.iter().filter_map(|r| cell(r, 0)).collect();
+        assert_eq!(
+            got, want,
+            "[{}] generated filter WHERE mismatched: {sql}",
+            eng.name
+        );
+    }
+    exec(b, &format!("DROP TABLE {}", q("filt_t"))).await;
+}
+
 async fn run_battery(b: &mut Backend, eng: &Eng) {
     database_name_battery(b, eng).await;
     syntax_error_recovery_battery(b, eng).await;
     with_dml_battery(b, eng).await;
+    filter_where_battery(b, eng).await;
     let q = eng.quote;
 
     // clean slate (idempotent across re-runs on a persistent server)

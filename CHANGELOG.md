@@ -2,6 +2,15 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
+## [Unreleased]
+
+### Added
+- **Build result filters visually, with AND/OR groups instead of one contains box per column.** The results toolbar has a **Filter** button (`Ctrl/⌘+Shift+F`), the column header menu offers *Filter by this column…*, and the Explorer's *Filter rows…* opens a table with the builder already up. A condition is a column, an operator, and its values — `=`, `≠`, `<`, `≤`, `>`, `≥`, `between`, `in`, `like`, `ilike`, `starts with`, `ends with`, `contains`, `is null`, `is true`, `is empty` and their negations — and the operator menu only offers what the column's type supports, with a type badge next to the name. Conditions group into ANDs of ORs (or ORs of ANDs) to whatever depth you need, each row can be duplicated or removed, and the dialog shows the exact `WHERE` clause it will run as you build it. **Apply** re-streams the result through the server as before, **Copy WHERE** puts the clause on the clipboard, and **Open as query** drops the full wrapped `SELECT` into a new tab so you can keep editing it as SQL.
+- **Active filters are now visible above the grid.** A slim bar lists one chip per condition — grouped exactly as the filter is, joined by AND/OR — with an ✕ on each to drop just that rule, the row count as the server reports it, and **Edit…** / **Clear all**. The per-column filter row still works and now feeds the same filter, so a quick contains match and a built condition are the same thing.
+
+### Changed
+- **Filter SQL is generated per engine.** Identifiers are always quoted and values are always literals; `ILIKE` is used on PostgreSQL and DuckDB and mapped to a `LOWER(…) LIKE LOWER(…)` comparison where it doesn't exist; booleans emit `TRUE`/`FALSE` or `1`/`0` to match how each engine stores them; `%` and `_` typed into *contains* / *starts with* / *ends with* are escaped with a dialect-correct `ESCAPE` clause instead of acting as wildcards; and only strictly numeric text is emitted unquoted against a numeric column. `≠` and `not in` exclude NULL rows the way SQL does — add an `is null` condition in an OR group when you want them back.
+
 ## [0.9.8] - 2026-09-04
 
 ### Fixed
