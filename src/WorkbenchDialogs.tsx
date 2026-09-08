@@ -12,6 +12,8 @@ import { RenameDialog } from "./forms/RenameDialog";
 import { DuplicateDialog } from "./forms/DuplicateDialog";
 import { CommentDialog } from "./forms/CommentDialog";
 import { ConfirmDialog } from "./forms/ConfirmDialog";
+import { FilterBuilder } from "./forms/FilterBuilder";
+import type { FilterTree } from "./grid/filterModel";
 
 type RefTable = { schema: string; name: string; columns: { name: string }[] };
 
@@ -28,6 +30,19 @@ export type DialogState =
   | { kind: "rename"; title: string; current: string; build: (newName: string) => string }
   | { kind: "duplicate"; title: string; defaultName: string; build: (newName: string, withData: boolean) => string }
   | { kind: "comment"; title: string; current: string; build: (text: string | null) => string }
+  | {
+      /** Visual result-grid filter builder. Runs nothing itself — it hands the
+       *  tree back to App, which re-streams the wrapped query. */
+      kind: "filter";
+      columns: string[];
+      types?: Record<string, string>;
+      dialect: string;
+      initial: FilterTree;
+      prefill?: string;
+      onApply: (tree: FilterTree) => void;
+      onOpenQuery: (tree: FilterTree) => void;
+      onCopyWhere: (where: string) => void;
+    }
   | {
       kind: "confirm";
       title: string;
@@ -106,6 +121,24 @@ export function WorkbenchDialogs(props: { state: DialogState | null } & Handlers
         {(() => {
           const st = s() as Extract<DialogState, { kind: "comment" }>;
           return <CommentDialog title={st.title} current={st.current} build={st.build} {...h} />;
+        })()}
+      </Match>
+      <Match when={props.state?.kind === "filter"}>
+        {(() => {
+          const st = s() as Extract<DialogState, { kind: "filter" }>;
+          return (
+            <FilterBuilder
+              columns={st.columns}
+              types={st.types}
+              dialect={st.dialect}
+              initial={st.initial}
+              prefill={st.prefill}
+              onApply={st.onApply}
+              onOpenQuery={st.onOpenQuery}
+              onCopyWhere={st.onCopyWhere}
+              onClose={props.onClose}
+            />
+          );
         })()}
       </Match>
       <Match when={props.state?.kind === "confirm"}>

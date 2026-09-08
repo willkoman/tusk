@@ -2,7 +2,8 @@ import { createSignal, createMemo, createEffect, on, onCleanup, For, Show, type 
 import { type Dataset, formatForCopy } from "./formats";
 import { clipWrite, clipRead } from "./clipboard";
 import { type MenuItem } from "./ContextMenu";
-import { type GridView, type SortKey, type Filter, type PendingEdits } from "./tabs";
+import { type GridView, type SortKey, type PendingEdits } from "./tabs";
+import { quickFilterOf, setQuickFilter, type FilterTree } from "./grid/filterModel";
 import { boolWord } from "./grid/bool";
 import { parseClipboardTable, type RowRef } from "./grid/paste";
 
@@ -44,7 +45,9 @@ export type ResultGridProps = {
   /** Identity of the backend result loaded into this tab. */
   resultGeneration: Accessor<number>;
   onLoadMore: () => void;
-  onSortFilter: (sorts: SortKey[], filters: Filter[], kind: "sort" | "filter") => void;
+  onSortFilter: (sorts: SortKey[], filters: FilterTree, kind: "sort" | "filter") => void;
+  /** Open the visual filter builder, optionally pre-filled for one column. */
+  onOpenFilter: (column?: string) => void;
   onMenu: (x: number, y: number, items: MenuItem[]) => void;
   onViewValue: (col: string, val: string | null) => void;
   onStatus: (text: string, tabId: string, resultGeneration: number) => void;
@@ -711,7 +714,8 @@ export function ResultGrid(props: ResultGridProps) {
     }
     if (props.canFilter()) {
       items.push(
-        { label: props.view().filterRowOpen ? "Hide filter row" : "Filter…", icon: "search", onClick: () => props.setView({ filterRowOpen: !props.view().filterRowOpen }) },
+        { label: "Filter by this column…", icon: "search", onClick: () => props.onOpenFilter(props.columns()[oi]) },
+        { label: props.view().filterRowOpen ? "Hide filter row" : "Show filter row", icon: "search", onClick: () => props.setView({ filterRowOpen: !props.view().filterRowOpen }) },
       );
     }
     if (props.canSort() || props.canFilter()) items.push({ sep: true });
@@ -763,9 +767,12 @@ export function ResultGrid(props: ResultGridProps) {
 
   let filterTimer: ReturnType<typeof setTimeout> | undefined;
   let resizeCleanup: (() => void) | null = null;
+  // The quick-filter row writes top-level `contains` conditions into the same
+  // structured tree the builder edits, so both surfaces share one model.
   function onFilterInput(oi: number, text: string) {
-    const filters = props.view().filters.filter((f) => f.col !== oi);
-    if (text.trim() !== "") filters.push({ col: oi, text });
+    const name = props.columns()[oi];
+    if (name == null) return;
+    const filters = setQuickFilter(props.view().filters, name, text);
     props.setView({ filters });
     clearTimeout(filterTimer);
     const key = resultKey();
@@ -775,7 +782,7 @@ export function ResultGrid(props: ResultGridProps) {
       if (props.activeTabId() === tabId && resultKey() === key) props.onSortFilter(sorts, filters, "filter");
     }, 300);
   }
-  const filterFor = (oi: number) => props.view().filters.find((f) => f.col === oi)?.text ?? "";
+  const filterFor = (oi: number) => quickFilterOf(props.view().filters, props.columns()[oi] ?? "");
 
   onCleanup(() => {
     clearTimeout(filterTimer);

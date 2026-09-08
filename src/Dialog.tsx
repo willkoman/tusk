@@ -96,6 +96,10 @@ export function DialogFooter(props: {
   primaryDanger?: boolean;
   onPrimary: () => void;
   onEditAsSql?: () => void;
+  /** Override the secondary button's label (defaults to "Edit as SQL"). */
+  editAsSqlLabel?: string;
+  /** Extra ghost buttons rendered before Cancel (e.g. Clear / Copy). */
+  extra?: JSX.Element;
   onCancel: () => void;
 }) {
   return (
@@ -105,10 +109,11 @@ export function DialogFooter(props: {
         <div class="error">{props.error}</div>
       </Show>
       <div class="form-actions">
+        {props.extra}
         <button class="ghost" onClick={props.onCancel}>Cancel</button>
         <Show when={props.onEditAsSql}>
           <button class="ghost" disabled={props.disabled} onClick={() => props.onEditAsSql!()}>
-            Edit as SQL
+            {props.editAsSqlLabel ?? "Edit as SQL"}
           </button>
         </Show>
         <button

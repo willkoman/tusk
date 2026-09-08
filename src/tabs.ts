@@ -1,4 +1,5 @@
 import type { PersistedTabs } from "./store";
+import { EMPTY_FILTER, type FilterTree } from "./grid/filterModel";
 
 // Editor tab model. Each tab carries its own SQL buffer, file binding, and a
 // snapshot of its last result grid. Only the tab that last ran a cursorable query
@@ -71,6 +72,11 @@ export function interruptedResult(
 
 // --- result-grid display state (per tab, ephemeral — not persisted) ---
 export type SortKey = { col: number; dir: "asc" | "desc" }; // col = ORIGINAL column index
+/**
+ * LEGACY flat filter (one case-insensitive contains match per column index).
+ * Superseded by the structured `FilterTree`; kept as the degenerate input shape
+ * that `grid/filterModel.normalizeFilters` migrates forward.
+ */
 export type Filter = { col: number; text: string };
 
 export type GridView = {
@@ -82,8 +88,12 @@ export type GridView = {
   hidden: number[];
   /** multi-sort keys, in priority order (server ORDER BY). */
   sorts: SortKey[];
-  /** per-column filters (server WHERE ILIKE). */
-  filters: Filter[];
+  /**
+   * Structured filter tree (server WHERE) — the single source of truth for both
+   * the visual filter builder and the per-column quick-filter row, which reads
+   * and writes top-level `contains` conditions in it.
+   */
+  filters: FilterTree;
   filterRowOpen: boolean;
 };
 
@@ -92,7 +102,7 @@ export const EMPTY_GRID_VIEW: GridView = {
   order: [],
   hidden: [],
   sorts: [],
-  filters: [],
+  filters: EMPTY_FILTER,
   filterRowOpen: false,
 };
 

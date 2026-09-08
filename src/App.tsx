@@ -9,7 +9,9 @@ import { driverDialect, type DialectId } from "./sql/dialects";
 import { type AiContext, type SampleTable } from "./ai/context";
 import { type CursorInfo, type EditorPrefs, type ServerDiag } from "./editor/types";
 import { prefsStore, tabsStore, layoutStore, type PersistedTabs, type TabsPersistenceFailure } from "./store";
-import { makeTab, basename, gridViewFor, pendingCount, snapshotTabs as recoverySnapshot, type Tab, type ResultSnapshot, type GridView, type SortKey, type Filter, type PendingEdits } from "./tabs";
+import { makeTab, basename, gridViewFor, pendingCount, snapshotTabs as recoverySnapshot, type Tab, type ResultSnapshot, type GridView, type SortKey, type PendingEdits } from "./tabs";
+import { FilterBar } from "./grid/FilterBar";
+import { classResolver, emptyFilter, hasConditions, removeNode, type FilterTree } from "./grid/filterModel";
 import { ResultGrid } from "./ResultGrid";
 import { UpdateBadge } from "./UpdateBadge";
 import { WhatsNew } from "./WhatsNew";
@@ -564,11 +566,11 @@ function App() {
   const tryWrapQuery = (
     tab: Tab,
     sorts: SortKey[],
-    filters: Filter[],
+    filters: FilterTree,
     action = "sort/filter",
   ): string | null => {
     try {
-      return wrapQuery(tab.result.baseQuery, sorts, filters, tab.result.columns, connectionKind());
+      return wrapQuery(tab.result.baseQuery, sorts, filters, tab.result.columns, connectionKind(), filterClassOf());
     } catch (e) {
       patchResult(tab.id, { status: `${action} rejected: ${errMsg(e)}` });
       return null;
@@ -689,6 +691,7 @@ function App() {
     canExplainAnalyze: caps()?.explainAnalyze !== false,
     canCommitTransaction: transactionControls().commit,
     canRollbackTransaction: transactionControls().rollback,
+    canFilter: canFilter(),
   });
 
   // Validate the buffer against Postgres for parser-grade diagnostics (PREPARE-only,
@@ -744,7 +747,7 @@ function App() {
     const order = localRowOrder();
     let query = lastQuery();
     if (order && tab.gridView.sorts.length && canServerSortFilter()) {
-      const wrapped = tryWrapQuery(tab, tab.gridView.sorts, [], "export query");
+      const wrapped = tryWrapQuery(tab, tab.gridView.sorts, emptyFilter(), "export query");
       if (wrapped === null) return;
       query = wrapped;
     }
@@ -999,7 +1002,7 @@ function App() {
     const tab = activeTab();
     // An interrupted stream holds only part of the result: sorting it in memory would
     // order a subset while looking like the whole. Fall through to the server path.
-    return tab.result.done && !tab.result.incomplete && tab.result.rowsAreBase && tab.gridView.filters.length === 0 && tab.result.rows.length <= MAX_LOCAL_SORT_ROWS;
+    return tab.result.done && !tab.result.incomplete && tab.result.rowsAreBase && !hasConditions(tab.gridView.filters) && tab.result.rows.length <= MAX_LOCAL_SORT_ROWS;
   };
   /** Why a header click can't sort right now (empty when it can). Shown as status feedback. */
   const sortUnavailable = () => {
@@ -1019,7 +1022,7 @@ function App() {
   const localSorts = createMemo(() => activeTab().gridView.sorts);
   const localSortDone = createMemo(() => activeTab().result.done && !activeTab().result.incomplete);
   const localSortBase = createMemo(() => activeTab().result.rowsAreBase);
-  const localSortHasFilters = createMemo(() => activeTab().gridView.filters.length > 0);
+  const localSortHasFilters = createMemo(() => hasConditions(activeTab().gridView.filters));
   const localRowOrder = createMemo(() => {
     const sorts = localSorts();
     return localSortDone() && localSortBase() && !localSortHasFilters() && localSortRows().length <= MAX_LOCAL_SORT_ROWS && sorts.length
@@ -1109,6 +1112,19 @@ function App() {
     if (det) return typeBoolCols(editCols(), det.columns);
     return detectBoolCols(editCols(), editRows());
   });
+  /**
+   * Column name → driver type for the active result, when its source relation's
+   * detail happens to be loaded (the editability path already fetches it). Drives
+   * the filter builder's type badges/operator menus and the numeric/boolean
+   * literal choice in the generated WHERE; absent metadata is not an error —
+   * every column then behaves as the conservative "other" class.
+   */
+  const filterColumnTypes = (): Record<string, string> | undefined => {
+    const det = editDetail();
+    if (!det) return undefined;
+    return Object.fromEntries(det.columns.map((c) => [c.name, c.data_type]));
+  };
+  const filterClassOf = () => classResolver(filterColumnTypes());
   /** Dropdown editor info for a bool column; tokens match the driver's textual booleans. */
   const boolEditInfo = (oi: number): { trueVal: string; falseVal: string; nullable: boolean } | null => {
     const det = editDetail();
@@ -1316,7 +1332,7 @@ function App() {
       if (t) {
         const v = t.gridView;
         const base = t.result.baseQuery;
-        const sqlToRun = v.sorts.length || v.filters.length ? tryWrapQuery(t, v.sorts, v.filters) : base;
+        const sqlToRun = hasViewRules(v.sorts, v.filters) ? tryWrapQuery(t, v.sorts, v.filters) : base;
         if (sqlToRun === null) return;
         void executeQuery(sqlToRun, base, "wrapped");
       }
@@ -1570,6 +1586,7 @@ function App() {
       case "toggleAi": setAiOpen((v) => !v); break;
       case "loadAllRows": if (!done()) void loadAll(); break;
       case "exportResult": openExport(); break;
+      case "openFilterBuilder": openFilterBuilder(); break;
     }
   }
 
@@ -2313,7 +2330,7 @@ function App() {
           // preference (e.g. "Filter rows…" from the sidebar) — keep it across the reset.
           patchTab(runTabId, {
             gridView: sameColumns(prevCols, out.columns)
-              ? { ...(rt?.gridView ?? gridViewFor(out.columns.length)), sorts: [], filters: [] }
+              ? { ...(rt?.gridView ?? gridViewFor(out.columns.length)), sorts: [], filters: emptyFilter() }
               : { ...gridViewFor(out.columns.length), filterRowOpen: rt?.gridView.filterRowOpen ?? false },
           });
         }
@@ -2614,11 +2631,11 @@ function App() {
   }
 
   // Re-stream the active tab's result sorted/filtered (server ORDER BY / WHERE).
-  function onSortFilter(sorts: SortKey[], filters: Filter[], kind: "sort" | "filter") {
+  function onSortFilter(sorts: SortKey[], filters: FilterTree, kind: "sort" | "filter") {
     const prior = { sorts: activeTab().gridView.sorts, filters: activeTab().gridView.filters };
     setGridView({ sorts, filters });
     const tab = activeTab();
-    if (kind === "sort" && localSortEligible() && filters.length === 0) {
+    if (kind === "sort" && localSortEligible() && !hasConditions(filters)) {
       patchResult(tab.id, { epoch: tab.result.epoch + 1 });
       return;
     }
@@ -2632,6 +2649,41 @@ function App() {
       return;
     }
     void executeQuery(sqlToRun, base, "wrapped");
+  }
+
+  /**
+   * Open the visual filter builder over the active result. `columns`/`types` may
+   * be supplied by the Explorer, which knows the relation before its generated
+   * `SELECT *` has finished streaming; otherwise the loaded result's own columns
+   * (and whatever table detail the editability path already fetched) are used.
+   */
+  function openFilterBuilder(prefill?: string, columns?: string[], types?: Record<string, string>) {
+    const origin = captureOrigin();
+    const cols = columns ?? activeTab().result.columns;
+    if (!cols.length) {
+      setStatus("run a query first — the filter builder works on a loaded result");
+      return;
+    }
+    setActiveDialog({
+      kind: "filter",
+      columns: cols,
+      types: types ?? filterColumnTypes(),
+      dialect: connectionKind(),
+      initial: activeTab().gridView.filters,
+      prefill,
+      // Every callback re-checks the origin: the dialog outlives a tab switch or
+      // a new result only as long as it still targets the tab it was opened on.
+      onApply: (tree) => {
+        if (originCurrent(origin)) onSortFilter(activeTab().gridView.sorts, tree, "filter");
+      },
+      onOpenQuery: (tree) => {
+        if (!originCurrent(origin)) return;
+        const tab = activeTab();
+        const sqlText = tryWrapQuery(tab, tab.gridView.sorts, tree, "filter query");
+        if (sqlText !== null) openGeneratedTab(sqlText, tab.searchSchema, "Filtered");
+      },
+      onCopyWhere: (where) => copyText(where ? `WHERE ${where}` : "", "copied WHERE clause", origin),
+    }, origin);
   }
 
   async function loadMore() {
@@ -2979,15 +3031,32 @@ function App() {
     doRun(q);
   }
 
-  /** Open a table in a new tab and run it with the per-column filter row already showing. */
-  function filterTable(schemaName: string, name: string) {
+  /**
+   * Open a table in a new tab, run it, and raise the visual filter builder over
+   * it. The relation's detail supplies the builder's columns and type badges
+   * before the generated `SELECT *` has finished streaming; the per-column quick
+   * filter row is left showing as well, so dismissing the builder still lands on
+   * the lighter surface.
+   */
+  async function filterTable(schemaName: string, name: string) {
     if (rejectFrozenExplorer()) return;
     const q = `SELECT * FROM ${qualifyIn(schemaName, name, schemaName)}`;
     const t = makeTab({ sql: q, searchSchema: schemaName, title: name });
     t.gridView = { ...t.gridView, filterRowOpen: true };
     setTabs((ts) => [...ts, t]);
     switchTab(t.id);
+    // Detail rolls the shared cursor back, so fetch it BEFORE the run, never after.
+    const key = relKey(schemaName, name);
+    if (!details()[key] && !metadataFrozen()) await loadDetail(schemaName, name);
+    const det = details()[key];
+    if (activeTabId() !== t.id) return;
     doRun(q);
+    if (det)
+      openFilterBuilder(
+        undefined,
+        det.columns.map((c) => c.name),
+        Object.fromEntries(det.columns.map((c) => [c.name, c.data_type])),
+      );
   }
 
   // Run a DDL statement built by a form/confirm dialog, then refresh the tree.
@@ -3225,7 +3294,7 @@ function App() {
         items.push(
           { label: "Select 100 rows", icon: "play", onClick: () => runTableLimit(s!, n.name, 100) },
           { label: "Select all rows", icon: "play", onClick: () => runTable(s!, n.name) },
-          { label: "Filter rows…", icon: "search", onClick: () => filterTable(s!, n.name) },
+          { label: "Filter rows…", icon: "search", onClick: () => void filterTable(s!, n.name) },
           { sep: true },
           { label: "Modify table…", icon: "edit", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openModify(n) },
           { label: "Add column…", icon: "plus", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "addColumn", ctx: n }) },
@@ -3256,7 +3325,7 @@ function App() {
         const kw = n.kind;
         items.push(
           { label: "Select all rows", icon: "play", onClick: () => runTable(s!, n.name) },
-          { label: "Filter rows…", icon: "search", onClick: () => filterTable(s!, n.name) },
+          { label: "Filter rows…", icon: "search", onClick: () => void filterTable(s!, n.name) },
         );
         if (kw === "matview")
           items.push(
@@ -4022,6 +4091,18 @@ function App() {
                   <Show when={activeTab().result.transactionStale}>
                     <span class="transaction-result-stale" title={activeTab().result.transactionStale}>Stale transaction result</span>
                   </Show>
+                  <Show when={columns().length > 0}>
+                    <span class="sb-sep" />
+                    <button
+                      class="ghost export-btn"
+                      classList={{ "filter-active": hasConditions(gridView().filters) }}
+                      disabled={!canFilter()}
+                      title={canFilter() ? "Build a result filter" : sortUnavailable() || "this result can't be filtered"}
+                      onClick={() => openFilterBuilder()}
+                    >
+                      <Icon name="search" /> Filter
+                    </button>
+                  </Show>
                   <Show when={(lastQuery() || columns().length > 0) && caps()?.export !== false}>
                     <span class="sb-sep" />
                     <button class="ghost export-btn" onClick={openExport}>Export…</button>
@@ -4036,6 +4117,16 @@ function App() {
                   plan={() => planMemo()!}
                   prefs={prefs}
                   fitKey={() => `${activeTabId()}:${activeTab().result.epoch}`}
+                />
+              </Show>
+              <Show when={!(planMemo() && resultView() === "plan") && columns().length > 0}>
+                <FilterBar
+                  tree={() => gridView().filters}
+                  rowText={() => `${rows().length.toLocaleString()}${done() ? "" : "+"} row${rows().length === 1 && done() ? "" : "s"}`}
+                  disabled={() => !canFilter()}
+                  onEdit={() => openFilterBuilder()}
+                  onRemove={(id) => onSortFilter(gridView().sorts, removeNode(gridView().filters, id), "filter")}
+                  onClear={() => onSortFilter(gridView().sorts, emptyFilter(), "filter")}
                 />
               </Show>
               <Show when={!(planMemo() && resultView() === "plan") && columns().length > 0} fallback={
@@ -4053,6 +4144,7 @@ function App() {
                   resultGeneration={() => activeTab().result.generation}
                   onLoadMore={loadMore}
                   onSortFilter={onSortFilter}
+                  onOpenFilter={(column) => openFilterBuilder(column)}
                   sortUnavailable={sortUnavailable}
                   onMenu={(x, y, items) => setMenu({ x, y, items })}
                   onViewValue={(col, val) => setCellView({ col, val, origin: captureOrigin() })}

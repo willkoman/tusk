@@ -30,7 +30,8 @@ export type ActionId =
   | "toggleSidebar"
   | "toggleResults"
   | "loadAllRows"
-  | "exportResult";
+  | "exportResult"
+  | "openFilterBuilder";
 
 /** What an `enabled` predicate can see (kept tiny on purpose). */
 export type ActionCtx = {
@@ -43,6 +44,8 @@ export type ActionCtx = {
   canExplainAnalyze: boolean;
   canCommitTransaction: boolean;
   canRollbackTransaction: boolean;
+  /** The active result can be re-streamed with a server-side WHERE. */
+  canFilter: boolean;
 };
 
 export type ActionDef = {
@@ -76,6 +79,7 @@ export const ACTIONS: readonly ActionDef[] = [
   { id: "rollbackTransaction", title: "Rollback current transaction unit", category: "Query", defaultKey: "Mod-Alt-r", scope: "global", enabled: (c) => c.canRollbackTransaction },
   { id: "loadAllRows", title: "Load all rows", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.hasResult && c.canRunDatabase },
   { id: "exportResult", title: "Export result…", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.hasResult && c.canExport },
+  { id: "openFilterBuilder", title: "Filter rows…", category: "Query", defaultKey: "Mod-Shift-f", scope: "global", enabled: (c) => c.hasResult && c.canFilter },
   { id: "format", title: "Format SQL", category: "Editor", defaultKey: "Shift-Alt-f", scope: "editor" },
   { id: "find", title: "Find & replace", category: "Editor", defaultKey: null, scope: "editor" },
   { id: "toggleComment", title: "Toggle comment", category: "Editor", defaultKey: "Mod-/", scope: "editor" },

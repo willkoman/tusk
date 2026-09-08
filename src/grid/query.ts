@@ -1,7 +1,9 @@
-import { ident, lit, sqlDialect } from "../sql/ident";
+import { sqlDialect } from "../sql/ident";
 import { lex, maskNonCode } from "../editor/lexer";
 import { isReadStatement } from "../plan/explainSql";
-import type { SortKey, Filter } from "../tabs";
+import { hasConditions, toFilterTree, type ColumnClass, type FilterInput } from "./filterModel";
+import { renderWhere } from "./filterSql";
+import type { SortKey } from "../tabs";
 
 // Server-side sort/filter works by wrapping the user's base query as a subquery and
 // re-streaming it. Pure + unit-testable.
@@ -45,51 +47,36 @@ export function hasDuplicateColumns(cols: string[]): boolean {
   return new Set(cols.map((c) => c.toLowerCase())).size !== cols.length;
 }
 
-/** A grid view carries active ordering or a non-empty filter (so a re-run should re-apply it). */
-export function hasViewRules(sorts: SortKey[], filters: Filter[]): boolean {
-  return sorts.length > 0 || filters.some((f) => f.text.trim() !== "");
-}
-
-/** Per-dialect "stringify column and case-insensitively LIKE-match" expression. */
-function filterExpr(col: string, text: string, dialect: string): string {
-  const pat = lit("%" + text + "%");
-  switch (dialect) {
-    case "mysql":
-      return `CAST(${ident(col)} AS CHAR) LIKE ${pat}`; // CI by default collation
-    case "sqlite":
-      return `CAST(${ident(col)} AS TEXT) LIKE ${pat}`; // LIKE is CI (ASCII) by default
-    default: // postgres, duckdb
-      return `${ident(col)}::text ILIKE ${pat}`;
-  }
+/**
+ * A grid view carries active ordering or a non-empty filter (so a re-run should
+ * re-apply it). Accepts the structured filter tree or the legacy flat array.
+ */
+export function hasViewRules(sorts: SortKey[], filters: FilterInput): boolean {
+  if (sorts.length > 0) return true;
+  // The legacy flat shape carries its own text, so it needs no column list.
+  if (Array.isArray(filters)) return filters.some((f) => f.text.trim() !== "");
+  return hasConditions(filters);
 }
 
 /**
  * Wrap `base` with optional WHERE (filters) and ORDER BY (sorts).
  * - ORDER BY uses **ordinal position** (`col+1`) to avoid duplicate-name ambiguity in `SELECT *`.
- * - Filters cast each column to text and case-insensitively match — per DIALECT
- *   (`ILIKE` is PG/DuckDB-only; MySQL/SQLite use CAST + LIKE), AND-combined.
+ * - The WHERE body is rendered by `grid/filterSql.ts` from the structured filter
+ *   tree (a legacy flat `Filter[]` is migrated to a root AND of `contains`
+ *   conditions first, so its SQL is unchanged).
  * Returns a single statement with no trailing `;` (streams via the server cursor).
  */
 export function wrapQuery(
   base: string,
   sorts: SortKey[],
-  filters: Filter[],
+  filters: FilterInput,
   columns: string[],
   dialect: string = "postgres",
+  classOf?: (column: string) => ColumnClass,
 ): string {
   if (!wrappableQuery(base)) throw new Error("query cannot be safely wrapped for grid sorting or filtering");
   const inner = stripTrailingSemi(base);
-  const activeFilters = filters.filter((f) => f.text.trim() !== "" && columns[f.col] != null);
-  const duplicateNames = new Set(
-    columns
-      .map((name) => dialect === "postgres" ? name : name.toLowerCase())
-      .filter((name, i, all) => all.indexOf(name) !== i),
-  );
-  if (activeFilters.some((f) => duplicateNames.has(dialect === "postgres" ? columns[f.col] : columns[f.col].toLowerCase())))
-    throw new Error("cannot safely filter a result with duplicate target column names");
-  const where = activeFilters
-    .map((f) => filterExpr(columns[f.col], f.text, dialect))
-    .join(" AND ");
+  const where = renderWhere(toFilterTree(filters, columns), { columns, dialect, classOf });
   const order = sorts
     .filter((s) => s.col >= 0 && s.col < columns.length)
     .map((s) => `${s.col + 1} ${s.dir === "desc" ? "DESC" : "ASC"}`)
