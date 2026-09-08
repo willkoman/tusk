@@ -86,6 +86,20 @@ describe("existing helpers", () => {
     expect(wrappableQuery("FROM events")).toBe(true);
     expect(wrappableQuery("WITH recent AS (SELECT * FROM events) FROM recent")).toBe(true);
   });
+
+  it("mssql casts to nvarchar and refuses shapes a derived table cannot hold", () => {
+    setSqlDialect("mssql");
+    expect(wrapQuery("SELECT * FROM t", SORTS, FILTERS, COLS, "mssql")).toBe(
+      "SELECT * FROM (SELECT * FROM t\n) AS _tusk WHERE CAST([id] AS nvarchar(max)) LIKE N'%abc%' ORDER BY 2 DESC",
+    );
+    expect(wrappableQuery("SELECT * FROM t")).toBe(true);
+    // T-SQL rejects WITH and a bare ORDER BY inside a derived table.
+    expect(wrappableQuery("WITH recent AS (SELECT * FROM t) SELECT * FROM recent")).toBe(false);
+    expect(wrappableQuery("SELECT * FROM t ORDER BY id")).toBe(false);
+    // Those words only matter as real code.
+    expect(wrappableQuery("SELECT 'order by' AS x FROM t")).toBe(true);
+    expect(wrappableQuery("SELECT [order by] FROM t")).toBe(true);
+  });
 });
 
 describe("hasViewRules", () => {

@@ -51,6 +51,38 @@ describe("engine-aware lexing (parity with script.rs split_impl)", () => {
     expect(maskNonCode(doc, spans, 0, doc.length)).toBe("SELECT         FROM t");
     expect(maskNonCode(doc, spans, 0, doc.length, true)).toBe(doc);
   });
+
+  it("mssql: [bracket] identifiers hold ; and quotes inertly", () => {
+    expect(stmtTexts("SELECT [a;COMMIT] FROM [t]; SELECT 2", "mssql")).toEqual([
+      "SELECT [a;COMMIT] FROM [t];",
+      "SELECT 2",
+    ]);
+    expect(stmtTexts("SELECT [we]]ird]; SELECT 2", "mssql")).toEqual(["SELECT [we]]ird];", "SELECT 2"]);
+    expect(kinds("SELECT [x]", "mssql")).toEqual(["code", "bracket"]);
+    // Brackets stay ordinary code elsewhere (PostgreSQL array subscripts).
+    expect(kinds("SELECT a[1]", "postgres")).toEqual(["code"]);
+    const doc = "SELECT [col;x] FROM t";
+    const { spans } = lex(doc, "mssql");
+    expect(maskNonCode(doc, spans, 0, doc.length)).toBe("SELECT         FROM t");
+    expect(maskNonCode(doc, spans, 0, doc.length, true)).toBe(doc);
+  });
+
+  it("mssql: block comments nest and $ is not a dollar quote", () => {
+    expect(kinds("SELECT 1 /* a /* b */ ; */ + 2", "mssql")).toEqual(["code", "block-comment", "code"]);
+    // Everywhere else the inner `*/` ends the comment, so the `;` splits.
+    expect(stmtTexts("SELECT 1 /* a /* b */ ; */ + 2", "postgres")).toHaveLength(2);
+    expect(kinds("SELECT $100, $x$ not a body $x$", "mssql")).toEqual(["code"]);
+    expect(kinds("SELECT $x$ body $x$", "postgres")).toContain("dollar");
+  });
+
+  it("mssql: a lone GO line ends the batch and is never sent", () => {
+    expect(stmtTexts("SELECT 1\nGO\nSELECT 2\ngo -- done\n", "mssql")).toEqual(["SELECT 1", "SELECT 2"]);
+    // `go` as an alias or column name is ordinary code.
+    expect(stmtTexts("SELECT 1 AS go, 2", "mssql")).toEqual(["SELECT 1 AS go, 2"]);
+    expect(stmtTexts("SELECT go\nFROM t", "mssql")).toEqual(["SELECT go\nFROM t"]);
+    // GO means nothing on the other engines.
+    expect(stmtTexts("SELECT 1\nGO\nSELECT 2", "postgres")).toEqual(["SELECT 1\nGO\nSELECT 2"]);
+  });
 });
 
 describe("statement run target", () => {

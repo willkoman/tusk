@@ -1,27 +1,31 @@
 // Identifier + literal quoting. One source of truth for building SQL strings on the
-// frontend. Identifier quoting is dialect-aware: MySQL uses backticks (`x`), everyone
-// else standard double-quotes ("x"). The active dialect is set once per connection
+// frontend. Identifier quoting is dialect-aware: MySQL uses backticks (`x`), SQL Server
+// brackets ([x]), everyone else standard double-quotes ("x"). The active dialect is set once per connection
 // (`setSqlDialect`) — the app is single-connection, so this avoids threading a dialect
 // arg through every call site (scaffolds, grid filters, DDL builders). For Postgres it
 // matches Rust `db::ident`, which is only used on PG-only backend paths (import/DDL).
 
 let backtick = false; // true = MySQL identifier quoting
+let bracket = false; // true = SQL Server identifier quoting
 let dialect = "postgres"; // active driver dialect (drives DDL emission quirks)
 
 /** Set identifier quoting + dialect for the connected driver. Call on connect / dialect change. */
 export function setSqlDialect(d: string): void {
   dialect = d;
   backtick = d === "mysql";
+  bracket = d === "mssql";
 }
 
-/** The active dialect ("postgres" | "duckdb" | "mysql" | "sqlite"). */
+/** The active dialect ("postgres" | "duckdb" | "mysql" | "sqlite" | "mssql"). */
 export function sqlDialect(): string {
   return dialect;
 }
 
-/** Quote an identifier: `users` → `"users"` (or `` `users` `` on MySQL). */
+/** Quote an identifier: `users` → `"users"` (`` `users` `` on MySQL, `[users]` on SQL Server). */
 export function ident(name: string): string {
-  return backtick ? `\`${name.replace(/`/g, "``")}\`` : `"${name.replace(/"/g, '""')}"`;
+  if (backtick) return `\`${name.replace(/`/g, "``")}\``;
+  if (bracket) return `[${name.replace(/]/g, "]]")}]`;
+  return `"${name.replace(/"/g, '""')}"`;
 }
 
 /** Schema-qualified identifier: `("public","users")` → `"public"."users"`. */
@@ -60,5 +64,11 @@ export function lit(s: string): string {
   }
   if (dialect === "sqlite" && hasControl(s)) return `CAST(X'${hexText(s)}' AS TEXT)`;
   if (dialect === "duckdb" && hasControl(s)) return `decode(from_hex('${hexText(s)}'))`;
+  // T-SQL has no escape character inside a string, so doubling quotes is complete; the
+  // `N` prefix keeps non-ASCII text intact regardless of the column's collation.
+  if (dialect === "mssql") {
+    if (s.includes("\0")) throw new Error("SQL Server text literals cannot contain a zero byte");
+    return `N'${s.replace(/'/g, "''")}'`;
+  }
   return `'${s.replace(/'/g, "''")}'`;
 }

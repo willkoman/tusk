@@ -55,6 +55,9 @@ export const STATEMENT_STARTERS: Set<string> = new Set([
   // SQLite / DuckDB
   "PRAGMA", "ATTACH", "DETACH", "INSTALL", "LOAD", "EXPORT", "SUMMARIZE", "PIVOT",
   "UNPIVOT", "FROM", "FORCE",
+  // T-SQL
+  "GO", "PRINT", "THROW", "RAISERROR", "SAVE", "WAITFOR", "BACKUP", "RESTORE", "DBCC",
+  "WHILE", "IF", "TRY", "CATCH", "OPEN", "DEALLOCATE",
 ]);
 
 const POSTGRES_FUNCTIONS = [
@@ -109,16 +112,32 @@ const SQLITE_FUNCTIONS = [
 const SQLITE_TYPES = ["integer", "real", "text", "blob", "numeric", "boolean", "date", "datetime"];
 
 const MSSQL_FUNCTIONS = [
-  "abs", "avg", "cast", "ceiling", "charindex", "coalesce", "concat", "convert", "count",
-  "current_timestamp", "dateadd", "datediff", "datepart", "day", "floor", "getdate", "getutcdate",
-  "isnull", "left", "len", "lower", "ltrim", "max", "min", "month", "newid", "nullif", "patindex",
-  "replace", "right", "round", "row_number", "rtrim", "stuff", "substring", "sum", "trim", "upper",
-  "year",
+  "abs", "avg", "cast", "ceiling", "charindex", "choose", "coalesce", "concat", "concat_ws",
+  "convert", "count", "count_big", "current_timestamp", "current_user", "datalength", "dateadd",
+  "datediff", "datefromparts", "datename", "datepart", "datetimefromparts", "day", "db_name",
+  "dense_rank", "difference", "eomonth", "exp", "floor", "format", "getdate", "getutcdate",
+  "iif", "isdate", "isjson", "isnull", "isnumeric", "json_modify", "json_query", "json_value",
+  "lag", "lead", "left", "len", "log", "lower", "ltrim", "max", "min", "month", "newid",
+  "newsequentialid", "ntile", "nullif", "object_id", "object_name", "parsename", "patindex",
+  "percentile_cont", "power", "quotename", "rand", "rank", "replace", "replicate", "reverse",
+  "right", "round", "row_number", "rtrim", "schema_name", "scope_identity", "sign", "soundex",
+  "space", "sqrt", "square", "str", "string_agg", "string_escape", "string_split", "stuff",
+  "substring", "sum", "suser_sname", "switchoffset", "sysdatetime", "sysdatetimeoffset",
+  "sysutcdatetime", "todatetimeoffset", "trim", "try_cast", "try_convert", "try_parse",
+  "unicode", "upper", "user_name", "year",
 ];
 const MSSQL_TYPES = [
-  "bigint", "binary", "bit", "char", "date", "datetime", "datetime2", "decimal", "float", "int",
-  "money", "nchar", "ntext", "numeric", "nvarchar", "real", "smallint", "text", "time", "tinyint",
-  "uniqueidentifier", "varbinary", "varchar", "xml",
+  "bigint", "binary", "bit", "char", "date", "datetime", "datetime2", "datetimeoffset", "decimal",
+  "float", "geography", "geometry", "hierarchyid", "image", "int", "money", "nchar", "ntext",
+  "numeric", "nvarchar", "real", "rowversion", "smalldatetime", "smallint", "smallmoney",
+  "sql_variant", "sysname", "text", "time", "timestamp", "tinyint", "uniqueidentifier",
+  "varbinary", "varchar", "xml",
+];
+const MSSQL_KEYWORDS = [
+  "TOP", "OUTPUT", "MERGE", "OFFSET", "FETCH", "NEXT", "ROWS", "ONLY", "PERCENT", "IDENTITY",
+  "NOLOCK", "APPLY", "CROSS APPLY", "OUTER APPLY", "PIVOT", "UNPIVOT", "OVER", "PARTITION BY",
+  "TRY_CAST", "TRY_CONVERT", "GO", "DECLARE", "EXEC", "PROCEDURE", "BEGIN TRANSACTION",
+  "SAVE TRANSACTION", "SCHEMA", "CLUSTERED", "NONCLUSTERED", "INCLUDE", "WITH TIES",
 ];
 
 const DIALECTS: Record<DialectId, DialectSpec> = {
@@ -136,8 +155,9 @@ const DIALECTS: Record<DialectId, DialectSpec> = {
     statementKeywords: [...STATEMENT_KEYWORDS, "PRAGMA", "VACUUM"], functions: SQLITE_FUNCTIONS, types: SQLITE_TYPES,
   },
   mssql: {
-    id: "mssql", cm: MSSQL, keywords: [...SHARED_KEYWORDS, "TOP", "OUTPUT", "MERGE"],
-    statementKeywords: [...STATEMENT_KEYWORDS, "MERGE"], functions: MSSQL_FUNCTIONS, types: MSSQL_TYPES,
+    id: "mssql", cm: MSSQL, keywords: [...SHARED_KEYWORDS, ...MSSQL_KEYWORDS],
+    statementKeywords: [...STATEMENT_KEYWORDS, "MERGE", "EXEC", "GO", "PRINT", "THROW"],
+    functions: MSSQL_FUNCTIONS, types: MSSQL_TYPES,
   },
 };
 

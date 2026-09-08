@@ -196,5 +196,15 @@ describe("formatWithOptions boolean mapping", () => {
     const mysql = formatWithOptions(d, opts({ format: "sql", boolCols: [], sql: { table: "ta`ble", multiRow: false, includeCreate: true } }));
     expect(mysql).toContain("CREATE TABLE `ta``ble` (`co``l` text);");
     expect(mysql).toContain("CONVERT(X'706174685c6e616d652773' USING utf8mb4)");
+
+    setSqlDialect("mssql");
+    const mssql = formatWithOptions(
+      { columns: ["co]l", "flag"], rows: [["path\\name's", "true"], [null, "false"]] },
+      opts({ format: "sql", boolCols: [1], sql: { table: "ta]ble", multiRow: false, includeCreate: true } }),
+    );
+    // T-SQL has no boolean type or TRUE/FALSE literal — `bit` takes 1/0.
+    expect(mssql).toContain("CREATE TABLE [ta]]ble] ([co]]l] nvarchar(max), [flag] bit);");
+    expect(mssql).toContain("VALUES (N'path\\name''s', 1);");
+    expect(mssql).toContain("VALUES (NULL, 0);");
   });
 });

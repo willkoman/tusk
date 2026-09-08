@@ -32,12 +32,24 @@ export function stripTrailingSemi(q: string): string {
   return shape.safe ? shape.inner : q.trim();
 }
 
+/**
+ * T-SQL forbids both `WITH` and a bare `ORDER BY` inside a derived table, so a CTE-led
+ * or already-ordered statement cannot be wrapped for grid sort/filter there. Reported
+ * as "not wrappable" rather than emitted and left for SQL Server to reject.
+ */
+function mssqlWrappable(inner: string): boolean {
+  const { spans } = lex(inner, "mssql");
+  const masked = maskNonCode(inner, spans, 0, inner.length);
+  return !/(^|\W)with\s/i.test(masked) && !/(^|\W)order\s+by(\W|$)/i.test(masked);
+}
+
 /** Whether the base query can be wrapped as `SELECT * FROM (<q>) t` (single row-producing statement). */
 export function wrappableQuery(q: string): boolean {
   const shape = queryShape(q);
   // The same structural WITH classifier protects Explain Analyze and backend
   // cursoring, so sorting/filtering cannot re-run a WITH-led write either.
-  return shape.safe && isReadStatement(shape.inner, sqlDialect());
+  if (!shape.safe || !isReadStatement(shape.inner, sqlDialect())) return false;
+  return sqlDialect() !== "mssql" || mssqlWrappable(shape.inner);
 }
 
 /** True when two result columns share a name (MySQL refuses to wrap those — error 1060). */
@@ -58,6 +70,9 @@ function filterExpr(col: string, text: string, dialect: string): string {
       return `CAST(${ident(col)} AS CHAR) LIKE ${pat}`; // CI by default collation
     case "sqlite":
       return `CAST(${ident(col)} AS TEXT) LIKE ${pat}`; // LIKE is CI (ASCII) by default
+    case "mssql":
+      // Case sensitivity follows the column/database collation, which is CI by default.
+      return `CAST(${ident(col)} AS nvarchar(max)) LIKE ${pat}`;
     default: // postgres, duckdb
       return `${ident(col)}::text ILIKE ${pat}`;
   }

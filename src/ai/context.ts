@@ -11,7 +11,7 @@ export type AiCtxTable = { schema: string; name: string; columns: { name: string
 export type SampleTable = { schema: string; name: string; columns: string[]; rows: (string | null)[][] };
 
 export type AiContext = {
-  dialect: string; // "postgres" | "mysql" | "sqlite" | "duckdb"
+  dialect: string; // "postgres" | "mysql" | "sqlite" | "duckdb" | "mssql"
   driverLabel: string;
   version: string;
   user: string;
@@ -44,6 +44,7 @@ const QUOTE_NOTE: Record<string, string> = {
   postgres: 'Quote identifiers with double quotes ("col").',
   duckdb: 'Quote identifiers with double quotes ("col").',
   sqlite: 'Quote identifiers with double quotes ("col").',
+  mssql: "Quote identifiers with brackets ([col]).",
 };
 
 /**

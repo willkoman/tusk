@@ -30,4 +30,12 @@ describe("SQL quoting", () => {
     setSqlDialect("duckdb");
     expect(lit("a\0b\n")).toBe("decode(from_hex('6100620a'))");
   });
+
+  it("uses SQL Server brackets and N-prefixed literals", () => {
+    setSqlDialect("mssql");
+    expect(ident("we]ird")).toBe("[we]]ird]");
+    // Backslashes are ordinary characters in T-SQL; only the quote doubles.
+    expect(lit("path\\name's")).toBe("N'path\\name''s'");
+    expect(() => lit("zero\0byte")).toThrow(/zero byte/i);
+  });
 });
