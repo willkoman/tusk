@@ -14,19 +14,20 @@ import { CommentDialog } from "./forms/CommentDialog";
 import { ConfirmDialog } from "./forms/ConfirmDialog";
 import { FilterBuilder } from "./forms/FilterBuilder";
 import type { FilterTree } from "./grid/filterModel";
+import type { RefColumn, RefTable } from "./forms/FkEditor";
 
-type RefTable = { schema: string; name: string; columns: { name: string }[] };
+export type { RefColumn, RefTable };
 
 /** All dialog variants. In-memory only (closures are fine). */
 export type DialogState =
   | { kind: "addColumn"; ctx: NodeDescriptor }
   | { kind: "editColumn"; ctx: NodeDescriptor }
-  | { kind: "modifyTable"; ctx: NodeDescriptor; detail: RelationDetail }
-  | { kind: "createTable"; schema: string }
+  | { kind: "modifyTable"; ctx: NodeDescriptor; detail: RelationDetail; schemas?: string[]; tables?: RefTable[] }
+  | { kind: "createTable"; schema: string; tables?: RefTable[] }
   | { kind: "createSchema" }
   | { kind: "createDatabase" }
   | { kind: "addIndex"; ctx: NodeDescriptor; columns: string[] }
-  | { kind: "addConstraint"; ctx: NodeDescriptor; columns: string[]; tables: RefTable[] }
+  | { kind: "addConstraint"; ctx: NodeDescriptor; columns: string[]; columnTypes?: Record<string, string>; tables: RefTable[] }
   | { kind: "rename"; title: string; current: string; build: (newName: string) => string }
   | { kind: "duplicate"; title: string; defaultName: string; build: (newName: string, withData: boolean) => string }
   | { kind: "comment"; title: string; current: string; build: (text: string | null) => string }
@@ -58,6 +59,9 @@ type Handlers = {
   onClose: () => void;
   onRun: (sql: string) => Promise<{ ok: boolean; error?: string }>;
   onEditAsSql: (sql: string) => void;
+  /** Lazy per-table column detail for the foreign-key picker (PK/unique marked).
+   *  One handler for every dialog that embeds `FkEditor`. */
+  onLoadColumns?: (schema: string, table: string) => Promise<RefColumn[] | null>;
 };
 
 /** Single dispatcher — renders the form matching `state`. Each form owns its
@@ -78,11 +82,23 @@ export function WorkbenchDialogs(props: { state: DialogState | null } & Handlers
       <Match when={props.state?.kind === "modifyTable"}>
         {(() => {
           const st = s() as Extract<DialogState, { kind: "modifyTable" }>;
-          return <ModifyTableForm ctx={st.ctx} detail={st.detail} {...h} />;
+          return (
+            <ModifyTableForm
+              ctx={st.ctx}
+              detail={st.detail}
+              schemas={st.schemas}
+              tables={st.tables}
+              loadColumns={props.onLoadColumns}
+              {...h}
+            />
+          );
         })()}
       </Match>
       <Match when={props.state?.kind === "createTable"}>
-        <CreateTableForm schema={(s() as Extract<DialogState, { kind: "createTable" }>).schema} {...h} />
+        {(() => {
+          const st = s() as Extract<DialogState, { kind: "createTable" }>;
+          return <CreateTableForm schema={st.schema} tables={st.tables} loadColumns={props.onLoadColumns} {...h} />;
+        })()}
       </Match>
       <Match when={props.state?.kind === "createSchema"}>
         <SchemaForm {...h} />
@@ -98,12 +114,19 @@ export function WorkbenchDialogs(props: { state: DialogState | null } & Handlers
         />
       </Match>
       <Match when={props.state?.kind === "addConstraint"}>
-        <ConstraintForm
-          ctx={(s() as Extract<DialogState, { kind: "addConstraint" }>).ctx}
-          columns={(s() as Extract<DialogState, { kind: "addConstraint" }>).columns}
-          tables={(s() as Extract<DialogState, { kind: "addConstraint" }>).tables}
-          {...h}
-        />
+        {(() => {
+          const st = s() as Extract<DialogState, { kind: "addConstraint" }>;
+          return (
+            <ConstraintForm
+              ctx={st.ctx}
+              columns={st.columns}
+              columnTypes={st.columnTypes}
+              tables={st.tables}
+              loadColumns={props.onLoadColumns}
+              {...h}
+            />
+          );
+        })()}
       </Match>
       <Match when={props.state?.kind === "rename"}>
         {(() => {
