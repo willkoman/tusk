@@ -69,15 +69,48 @@ pub fn split(script: &str) -> Vec<Item> {
     split_impl(script, false, TransactionEngine::Postgres).unwrap_or_default()
 }
 
+/// One streaming parse step over a chunk of a larger script.
+pub struct StreamSplit {
+    /// Statements that are definitely complete within the fed chunk.
+    pub items: Vec<Item>,
+    /// Byte offset in the fed chunk where each item's statement text began
+    /// (same length/order as `items`) — lets a caller report line numbers.
+    pub starts: Vec<usize>,
+    /// Byte offset of the unparsed tail; feed `chunk[tail_start..]` back with the
+    /// next chunk. Always an ASCII boundary (0, or just past a `;` / newline).
+    pub tail_start: usize,
+}
+
+/// Parse the complete statements of one chunk of a larger script, reporting where
+/// the (possibly incomplete) trailing statement begins. Restore streams a dump
+/// file through this so a multi-gigabyte file never has to be resident *and* the
+/// checked lexer below stays the ONE authority on SQL statement boundaries — an
+/// independent streaming splitter would be a second lexer to keep in sync.
+pub fn parse_stream_chunk(chunk: &str, engine: TransactionEngine) -> Result<StreamSplit, AppError> {
+    split_core(chunk, true, engine, true)
+}
+
 fn split_impl(
     script: &str,
     checked: bool,
     engine: TransactionEngine,
 ) -> Result<Vec<Item>, AppError> {
+    split_core(script, checked, engine, false).map(|out| out.items)
+}
+
+fn split_core(
+    script: &str,
+    checked: bool,
+    engine: TransactionEngine,
+    stream: bool,
+) -> Result<StreamSplit, AppError> {
     let b = script.as_bytes();
     let n = b.len();
     let mut i = 0usize;
     let mut items: Vec<Item> = Vec::new();
+    let mut starts: Vec<usize> = Vec::new();
+    // Byte offset where the statement currently accumulating in `cur` began.
+    let mut stmt_start = 0usize;
     let mut cur: Vec<u8> = Vec::new();
 
     while i < n {
@@ -93,6 +126,15 @@ fn split_impl(
             let start = i;
             while i < n && b[i] != b'\n' {
                 i += 1;
+            }
+            // Streaming: a chunk may have cut the line in half — hand the whole
+            // statement back as the tail rather than judging a partial line.
+            if stream && i >= n {
+                return Ok(StreamSplit {
+                    items,
+                    starts,
+                    tail_start: stmt_start,
+                });
             }
             if checked {
                 let command = String::from_utf8_lossy(&b[start..i]);
@@ -280,6 +322,8 @@ fn split_impl(
         // statement terminator
         if c == b';' {
             i += 1;
+            let this_start = stmt_start;
+            stmt_start = i;
             let stmt = flush(std::mem::take(&mut cur)).trim().to_string();
             if stmt.is_empty() {
                 continue;
@@ -315,17 +359,35 @@ fn split_impl(
                     data.extend_from_slice(line);
                     data.push(b'\n');
                 }
-                if checked && !terminated {
-                    return Err(AppError::new(
-                        "COPY FROM stdin data is missing the terminating `\\.` line",
-                    ));
+                if !terminated {
+                    // Streaming: the data block continues past this chunk — replay the
+                    // whole COPY statement (header + data so far) as the tail.
+                    if stream {
+                        return Ok(StreamSplit {
+                            items,
+                            starts,
+                            tail_start: this_start,
+                        });
+                    }
+                    if checked {
+                        return Err(AppError::new(
+                            "COPY FROM stdin data is missing the terminating `\\.` line",
+                        ));
+                    }
                 }
                 items.push(Item::Copy {
                     stmt: copy_stmt,
                     data: flush(data),
                 });
+                if stream {
+                    starts.push(this_start);
+                }
+                stmt_start = i;
             } else {
                 items.push(Item::Sql(stmt));
+                if stream {
+                    starts.push(this_start);
+                }
             }
             continue;
         }
@@ -334,6 +396,13 @@ fn split_impl(
         i += 1;
     }
 
+    if stream {
+        return Ok(StreamSplit {
+            items,
+            starts,
+            tail_start: stmt_start,
+        });
+    }
     let last = flush(cur).trim().to_string();
     if !last.is_empty() {
         if checked && is_copy_from_stdin(&last) {
@@ -343,7 +412,11 @@ fn split_impl(
         }
         items.push(Item::Sql(last));
     }
-    Ok(items)
+    Ok(StreamSplit {
+        items,
+        starts,
+        tail_start: n,
+    })
 }
 
 /// Skip leading whitespace and comment lines, returning the SQL that follows.

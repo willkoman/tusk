@@ -1113,6 +1113,241 @@ async fn bool_export_battery(b: &mut Backend, eng: &Eng) {
     exec(b, &format!("DROP TABLE IF EXISTS {}", q("bool_t"))).await;
 }
 
+/// Best-effort teardown of an FK cycle: drop the constraints, then the tables.
+async fn reset(b: &mut Backend, statements: &[String]) {
+    for sql in statements {
+        b.rollback_cursor().await;
+        let _ = b.run_single(sql, 100, false).await;
+    }
+}
+
+/// Native backup → restore on a real engine, with the cases that only a server can
+/// show: PostgreSQL `COPY … FROM stdin` data blocks and `setval`, MySQL's inline
+/// foreign keys lifted into trailing ALTERs, and — on both — an FK CYCLE, which only
+/// restores because every foreign key is emitted after all data.
+async fn backup_restore_battery(b: &mut Backend, eng: &Eng) {
+    let q = eng.quote;
+    let a_name = q("bk_a");
+    let b_name = q("bk_b");
+    // Cleanup must drop the constraints first: a cycle makes either DROP TABLE fail.
+    let drop_fk = |table: &str, name: &str| match eng.name {
+        "mysql" => format!("ALTER TABLE {table} DROP FOREIGN KEY {}", q(name)),
+        _ => format!("ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {}", q(name)),
+    };
+    let reset_sql = [
+        drop_fk(&a_name, "bk_a_b_fk"),
+        drop_fk(&b_name, "bk_b_a_fk"),
+        format!("DROP TABLE IF EXISTS {a_name}"),
+        format!("DROP TABLE IF EXISTS {b_name}"),
+    ];
+    reset(b, &reset_sql).await;
+
+    exec(b, &format!("CREATE TABLE {a_name} (id INTEGER NOT NULL PRIMARY KEY, b_id INTEGER, note VARCHAR(80))")).await;
+    exec(
+        b,
+        &format!("CREATE TABLE {b_name} (id INTEGER NOT NULL PRIMARY KEY, a_id INTEGER)"),
+    )
+    .await;
+    exec(
+        b,
+        &format!(
+            "ALTER TABLE {a_name} ADD CONSTRAINT {} FOREIGN KEY (b_id) REFERENCES {b_name} (id)",
+            q("bk_a_b_fk")
+        ),
+    )
+    .await;
+    exec(
+        b,
+        &format!(
+            "ALTER TABLE {b_name} ADD CONSTRAINT {} FOREIGN KEY (a_id) REFERENCES {a_name} (id)",
+            q("bk_b_a_fk")
+        ),
+    )
+    .await;
+    // Insert with NULL references, then close the cycle with UPDATEs.
+    exec(
+        b,
+        &format!(
+            "INSERT INTO {a_name} (id, b_id, note) VALUES (1, NULL, 'it''s a \"quoted\" note')"
+        ),
+    )
+    .await;
+    exec(
+        b,
+        &format!("INSERT INTO {a_name} (id, b_id, note) VALUES (2, NULL, NULL)"),
+    )
+    .await;
+    exec(b, &format!("INSERT INTO {b_name} (id, a_id) VALUES (1, 1)")).await;
+    exec(b, &format!("UPDATE {a_name} SET b_id = 1 WHERE id = 1")).await;
+
+    let schema = eng.schema.to_string();
+    let options = crate::backup::BackupOptions {
+        scope: "tables".into(),
+        schemas: Vec::new(),
+        tables: vec![
+            crate::backup::QualifiedName {
+                schema: schema.clone(),
+                name: "bk_a".into(),
+            },
+            crate::backup::QualifiedName {
+                schema,
+                name: "bk_b".into(),
+            },
+        ],
+        content: "all".into(),
+        include_drop: true,
+        single_transaction: false,
+    };
+    let path = std::env::temp_dir().join(format!(
+        "tusk_backup_{}_{}.sql",
+        eng.name,
+        std::process::id()
+    ));
+    let p = path.to_string_lossy().to_string();
+    let flag = std::sync::atomic::AtomicBool::new(false);
+    let summary = crate::backup::run_backup(b, "conformance", &options, &p, &flag, &mut |_| {})
+        .await
+        .unwrap_or_else(|e| panic!("[{}] backup: {}", eng.name, e.message));
+    assert_eq!(summary.rows, 3, "[{}] rows dumped", eng.name);
+    let text = std::fs::read_to_string(&path).unwrap();
+
+    // Data representation per engine, and FK statements strictly AFTER the data.
+    let data_at = if eng.name == "postgres" {
+        assert!(
+            text.contains("FROM stdin;"),
+            "[{}] COPY blocks:\n{text}",
+            eng.name
+        );
+        assert!(text.contains("\n\\.\n"), "[{}] COPY terminator", eng.name);
+        text.find("FROM stdin;").unwrap()
+    } else {
+        assert!(
+            text.contains("INSERT INTO"),
+            "[{}] INSERTs:\n{text}",
+            eng.name
+        );
+        text.find("INSERT INTO").unwrap()
+    };
+    let fk_at = text
+        .find("ADD CONSTRAINT")
+        .unwrap_or_else(|| panic!("[{}] foreign keys deferred to ALTERs:\n{text}", eng.name));
+    assert!(
+        fk_at > data_at,
+        "[{}] foreign keys must follow all data:\n{text}",
+        eng.name
+    );
+
+    // Restore into the same database after removing the cycle by hand.
+    reset(b, &reset_sql).await;
+    let restored = crate::backup::run_restore(
+        b,
+        eng.engine,
+        &p,
+        &crate::backup::RestoreOptions {
+            stop_on_error: true,
+            single_transaction: false,
+        },
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut |_| {},
+    )
+    .await
+    .unwrap_or_else(|e| panic!("[{}] restore: {}", eng.name, e.message));
+    assert_eq!(
+        restored.statements_failed, 0,
+        "[{}] restore errors: {:?}",
+        eng.name, restored.first_error
+    );
+    let rows = all(
+        b,
+        &format!("SELECT id, b_id, note FROM {a_name} ORDER BY id"),
+    )
+    .await;
+    assert_eq!(
+        cell(&rows[0], 1).as_deref(),
+        Some("1"),
+        "[{}] cycle restored",
+        eng.name
+    );
+    assert_eq!(
+        cell(&rows[0], 2).as_deref(),
+        Some("it's a \"quoted\" note"),
+        "[{}] quoted text restored",
+        eng.name
+    );
+    assert_eq!(cell(&rows[1], 2), None, "[{}] NULL restored", eng.name);
+    assert_eq!(
+        cell(
+            &all(b, &format!("SELECT COUNT(*) FROM {b_name}")).await[0],
+            0
+        )
+        .as_deref(),
+        Some("1"),
+        "[{}] second table restored",
+        eng.name
+    );
+
+    // PostgreSQL only: a schema-scoped dump carries CREATE SEQUENCE + setval, so a
+    // serial column continues where it left off instead of colliding on restore.
+    if eng.name == "postgres" {
+        exec(b, "DROP SCHEMA IF EXISTS tusk_bk CASCADE").await;
+        exec(b, "CREATE SCHEMA tusk_bk").await;
+        exec(
+            b,
+            "CREATE TABLE tusk_bk.counter (id serial PRIMARY KEY, label text)",
+        )
+        .await;
+        exec(
+            b,
+            "INSERT INTO tusk_bk.counter (label) VALUES ('a'), ('b'), ('c')",
+        )
+        .await;
+        let seq_options = crate::backup::BackupOptions {
+            scope: "schemas".into(),
+            schemas: vec!["tusk_bk".into()],
+            tables: Vec::new(),
+            content: "all".into(),
+            include_drop: true,
+            single_transaction: false,
+        };
+        crate::backup::run_backup(b, "conformance", &seq_options, &p, &flag, &mut |_| {})
+            .await
+            .unwrap_or_else(|e| panic!("[pg] sequence backup: {}", e.message));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("CREATE SEQUENCE"), "sequence DDL:\n{text}");
+        assert!(text.contains("pg_catalog.setval("), "setval:\n{text}");
+        exec(b, "DROP SCHEMA tusk_bk CASCADE").await;
+        let restored = crate::backup::run_restore(
+            b,
+            eng.engine,
+            &p,
+            &crate::backup::RestoreOptions {
+                stop_on_error: true,
+                single_transaction: false,
+            },
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .await
+        .unwrap_or_else(|e| panic!("[pg] sequence restore: {}", e.message));
+        assert_eq!(
+            restored.statements_failed, 0,
+            "[pg] sequence restore errors: {:?}",
+            restored.first_error
+        );
+        exec(b, "INSERT INTO tusk_bk.counter (label) VALUES ('d')").await;
+        let rows = all(b, "SELECT id FROM tusk_bk.counter ORDER BY id DESC LIMIT 1").await;
+        assert_eq!(
+            cell(&rows[0], 0).as_deref(),
+            Some("4"),
+            "the restored sequence continues past the dumped rows"
+        );
+        exec(b, "DROP SCHEMA tusk_bk CASCADE").await;
+    }
+
+    let _ = std::fs::remove_file(&path);
+    reset(b, &reset_sql).await;
+}
+
 // --- entry points ---
 
 #[tokio::test]
@@ -1173,6 +1408,7 @@ async fn conformance_postgres() {
     bool_export_battery(&mut b, &eng).await;
     binary_output_battery(&mut b, &eng).await;
     buffered_export_dialect_battery(&eng).await;
+    backup_restore_battery(&mut b, &eng).await;
     transaction_battery(&cfg, &eng).await;
 }
 
@@ -1196,6 +1432,7 @@ async fn conformance_mysql() {
     bool_export_battery(&mut b, &eng).await;
     binary_output_battery(&mut b, &eng).await;
     buffered_export_dialect_battery(&eng).await;
+    backup_restore_battery(&mut b, &eng).await;
     transaction_battery(&cfg, &eng).await;
 }
 

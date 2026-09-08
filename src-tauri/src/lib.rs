@@ -1,4 +1,5 @@
 mod ai;
+mod backup;
 mod crash;
 mod db;
 mod ddl;
@@ -46,12 +47,32 @@ struct CancelEntry {
     completed_notify: Arc<tokio::sync::Notify>,
     owner: Option<String>,
     transaction: TransactionStatus,
+    /// Cooperative stop flag for long multi-statement operations (backup/restore),
+    /// which check it between units. `None` for operations that only rely on the
+    /// engine's out-of-band query cancel.
+    soft: Option<Arc<AtomicBool>>,
 }
 
 struct CancelRegistration<'a> {
     state: &'a AppState,
     id: String,
     generation: u64,
+}
+
+impl CancelRegistration<'_> {
+    /// Install and return this generation's cooperative cancel flag. `cancel_operation`
+    /// sets it, which lets backup/restore stop between statements even on drivers with
+    /// no out-of-band query cancel (SQLite/MySQL, and DuckDB on Windows).
+    fn soft_cancel_flag(&self) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut cancels = lock_sync(&self.state.cancels);
+        if let Some(entry) = cancels.get_mut(&self.id) {
+            if entry.generation == self.generation {
+                entry.soft = Some(flag.clone());
+            }
+        }
+        flag
+    }
 }
 
 impl Drop for CancelRegistration<'_> {
@@ -131,6 +152,7 @@ impl AppState {
                 completed_notify: Arc::new(tokio::sync::Notify::new()),
                 owner: owner.map(str::to_string),
                 transaction,
+                soft: None,
             },
         );
         drop(cancels);
@@ -165,6 +187,11 @@ impl AppState {
             return None;
         }
         entry.cancelling = true;
+        // Cooperative operations stop at their next unit boundary; the handle-based
+        // cancel below (where the driver has one) still interrupts the live statement.
+        if let Some(flag) = &entry.soft {
+            flag.store(true, Ordering::Release);
+        }
         Some(entry.clone())
     }
 
@@ -1706,7 +1733,10 @@ async fn cancel_operation(
         return Err(AppError::new("in-flight operation is owned by another tab")
             .with_transaction(entry.transaction));
     }
-    if matches!(entry.handle, CancelHandle::None) {
+    // A cooperative operation is already stopping (begin_cancel set its flag), so the
+    // absence of an out-of-band handle is not a failure there.
+    let soft = entry.soft.is_some();
+    if matches!(entry.handle, CancelHandle::None) && !soft {
         state.abort_cancel_generation(&connection_id, entry.generation);
         return Err(
             AppError::new("this database driver cannot cancel an in-flight query")
@@ -1714,8 +1744,10 @@ async fn cancel_operation(
         );
     }
     if let Err(error) = entry.handle.clone().cancel(&entry.config).await {
-        state.abort_cancel_generation(&connection_id, entry.generation);
-        return Err(error.with_transaction(entry.transaction));
+        if !soft {
+            state.abort_cancel_generation(&connection_id, entry.generation);
+            return Err(error.with_transaction(entry.transaction));
+        }
     }
 
     // Keep the generation tombstone until the owning command has observed the
@@ -1886,6 +1918,109 @@ async fn export_to_file(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Write a native plain-SQL dump of the selected objects. Read-only connections may
+/// back up (a dump is a read). Requires an idle session: no manual transaction owns
+/// it, and the frontend interrupts any open result stream first.
+#[tauri::command]
+async fn backup_to_file(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    connection_id: String,
+    options: backup::BackupOptions,
+    path: String,
+) -> Result<backup::BackupSummary, AppError> {
+    use tauri::Emitter;
+    options.validate()?;
+    let version = app.package_info().version.to_string();
+    let conn = state.get(&connection_id)?;
+    let mut c = lock_conn(&conn).await?;
+    ensure_alive(&mut c).await?;
+    c.require_idle("backup")?;
+    c.backend.rollback_cursor().await;
+    c.stream_owner = None;
+    let cancel_registration = state.arm_cancel(
+        &connection_id,
+        c.backend.cancel_handle(),
+        c.backend.config().clone(),
+        None,
+        c.transaction.clone(),
+    )?;
+    let cancel = cancel_registration.soft_cancel_flag();
+    let emitter = app.clone();
+    let mut progress = move |p: backup::BackupProgress| {
+        let _ = emitter.emit("backup-progress", p);
+    };
+    let result = backup::run_backup(
+        &mut c.backend,
+        &version,
+        &options,
+        &path,
+        &cancel,
+        &mut progress,
+    )
+    .await;
+    drop(c);
+    drop(cancel_registration);
+    result
+}
+
+/// Read the leading bytes of a dump so the restore dialog can show its header
+/// (engine / database / generated timestamp) before anything runs.
+#[tauri::command]
+async fn read_backup_header(path: String) -> Result<String, AppError> {
+    backup::read_header(&path).await
+}
+
+/// Replay a dump file onto the connected database, streaming it statement by
+/// statement. Blocked on read-only connections and while a manual transaction owns
+/// the session; a statement is never replayed after the server may have seen it.
+#[tauri::command]
+async fn restore_from_file(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    connection_id: String,
+    path: String,
+    options: backup::RestoreOptions,
+) -> Result<backup::RestoreSummary, AppError> {
+    use tauri::Emitter;
+    let conn = state.get(&connection_id)?;
+    let mut c = lock_conn(&conn).await?;
+    ensure_alive(&mut c).await?;
+    c.require_idle("restore")?;
+    if c.read_only {
+        return Err(AppError::new(
+            "connection is read-only — restore is blocked",
+        ));
+    }
+    c.backend.rollback_cursor().await;
+    c.stream_owner = None;
+    let engine = c.transaction_engine();
+    let cancel_registration = state.arm_cancel(
+        &connection_id,
+        c.backend.cancel_handle(),
+        c.backend.config().clone(),
+        None,
+        c.transaction.clone(),
+    )?;
+    let cancel = cancel_registration.soft_cancel_flag();
+    let emitter = app.clone();
+    let mut progress = move |p: backup::RestoreProgress| {
+        let _ = emitter.emit("restore-progress", p);
+    };
+    let result = backup::run_restore(
+        &mut c.backend,
+        engine,
+        &path,
+        &options,
+        &cancel,
+        &mut progress,
+    )
+    .await;
+    drop(c);
+    drop(cancel_registration);
+    result
 }
 
 #[tauri::command]
@@ -2363,6 +2498,9 @@ pub fn run() {
             transaction_status,
             permissions,
             cancel_operation,
+            backup_to_file,
+            restore_from_file,
+            read_backup_header,
             import_rows,
             read_text_file,
             write_text_file,
