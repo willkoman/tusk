@@ -1788,6 +1788,7 @@ mod tests {
             sslmode: None,
             read_only: false,
             path: Some(":memory:".to_string()),
+            ssh: None,
         }
     }
 
