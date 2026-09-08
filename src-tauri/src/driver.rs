@@ -1983,6 +1983,44 @@ fn sqlite_build_tree(conn: &rusqlite::Connection) -> Result<tree::DbTree, AppErr
     })
 }
 
+/// MySQL reports `COLUMN_DEFAULT` UNQUOTED: a `DEFAULT 'abc'` comes back as `abc`,
+/// indistinguishable from an expression by shape alone. Anything that has to put the
+/// default back into SQL — the Modify dialog's `MODIFY COLUMN`, which restates the whole
+/// definition — would then emit `DEFAULT abc` and fail. Turn it into a runnable
+/// expression here, once, where the column type and `extra` are both in hand.
+fn mysql_default_expr(raw: &str, column_type: &str, extra: &str) -> String {
+    let d = raw.trim();
+    if d.is_empty() {
+        return String::new();
+    }
+    // 8.0.13+ marks a real expression default in `extra`.
+    if extra.to_ascii_lowercase().contains("default_generated") {
+        return d.to_string();
+    }
+    let upper = d.to_ascii_uppercase();
+    // Temporal auto-defaults are expressions without the DEFAULT_GENERATED marker.
+    let temporal = ["CURRENT_TIMESTAMP", "NOW()", "CURRENT_DATE", "CURRENT_TIME"];
+    if temporal.iter().any(|k| upper == *k)
+        || (upper.starts_with("CURRENT_TIMESTAMP(") && upper.ends_with(')'))
+    {
+        return d.to_string();
+    }
+    // Bit / hex literals are already written as literals.
+    if upper.starts_with("B'") || upper.starts_with("X'") || upper.starts_with("0X") {
+        return d.to_string();
+    }
+    // A numeric column with a numeric default needs no quoting.
+    let ty = column_type.to_ascii_lowercase();
+    let numeric = [
+        "int", "decimal", "numeric", "float", "double", "real", "bit", "year",
+    ];
+    if numeric.iter().any(|k| ty.starts_with(k)) && d.parse::<f64>().is_ok() {
+        return d.to_string();
+    }
+    // Everything else is the literal text of a string/temporal/enum default.
+    format!("'{}'", d.replace('\\', "\\\\").replace('\'', "''"))
+}
+
 /// One foreign key while its per-column catalog rows are being grouped (SQLite).
 struct FkGroup {
     id: String,
@@ -2943,18 +2981,23 @@ async fn mysql_table_detail(
         .map(|r| {
             let cname = dcell(r, 0);
             let comment = dcell(r, 6);
+            let column_type = dcell(r, 1);
+            let extra = dcell(r, 5);
             tree::Column {
-                identity: dcell(r, 5).to_ascii_lowercase().contains("auto_increment"),
+                identity: extra.to_ascii_lowercase().contains("auto_increment"),
                 is_fk: fk_cols.contains(&cname),
-                data_type: dcell(r, 1),
                 nullable: dcell(r, 2).eq_ignore_ascii_case("YES"),
                 is_pk: dcell(r, 4) == "PRI",
-                default: r.get(3).and_then(|v| v.clone()),
+                default: r
+                    .get(3)
+                    .and_then(|v| v.clone())
+                    .map(|d| mysql_default_expr(&d, &column_type, &extra)),
                 comment: if comment.is_empty() {
                     None
                 } else {
                     Some(comment)
                 },
+                data_type: column_type,
                 name: cname,
             }
         })

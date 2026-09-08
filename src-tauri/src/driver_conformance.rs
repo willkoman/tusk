@@ -2254,3 +2254,53 @@ async fn mysql_ddl_builder_forms_apply() {
         exec(&mut b, s).await;
     }
 }
+
+/// MySQL's `MODIFY COLUMN` restates the whole column definition, and MySQL reports
+/// `COLUMN_DEFAULT` UNQUOTED — so a string default read back from the catalog and put
+/// straight into a MODIFY produces `DEFAULT abc` and fails. `table_detail` must hand the
+/// frontend a RUNNABLE default expression; this round-trips one of each shape through
+/// the exact statement the Modify dialog emits.
+#[tokio::test]
+async fn mysql_column_defaults_round_trip_through_modify() {
+    let Some(cfg) = mysql_cfg() else {
+        eprintln!("SKIP mysql_column_defaults_round_trip (set TUSK_TEST_MYSQL_PORT)");
+        return;
+    };
+    let (mut b, _v) = connect(&cfg).await.expect("connect mysql");
+    exec(&mut b, "DROP TABLE IF EXISTS `test`.`defs`").await;
+    exec(
+        &mut b,
+        "CREATE TABLE `test`.`defs` (\
+         `s` varchar(20) DEFAULT 'ab''c', \
+         `n` int DEFAULT 7, \
+         `d` datetime DEFAULT CURRENT_TIMESTAMP, \
+         `e` varchar(10) DEFAULT 'x\\\\y')",
+    )
+    .await;
+    let detail = b.table_detail("test", "defs").await.expect("detail");
+    for c in &detail.columns {
+        let def = c.default.clone().unwrap_or_default();
+        assert!(!def.is_empty(), "column {} lost its default", c.name);
+        // Exactly what `columnDef` emits for MySQL, with the default as reported.
+        let sql = format!(
+            "ALTER TABLE `test`.`defs` MODIFY COLUMN `{}` {} DEFAULT {}",
+            c.name, c.data_type, def
+        );
+        exec(&mut b, &sql).await;
+    }
+    let after = b.table_detail("test", "defs").await.expect("detail again");
+    assert_eq!(
+        after
+            .columns
+            .iter()
+            .map(|c| c.default.clone().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        detail
+            .columns
+            .iter()
+            .map(|c| c.default.clone().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        "defaults must survive a MODIFY COLUMN round trip unchanged"
+    );
+    exec(&mut b, "DROP TABLE `test`.`defs`").await;
+}

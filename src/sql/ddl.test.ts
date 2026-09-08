@@ -338,6 +338,8 @@ describe("mysql ALTER forms", () => {
   it("rename table / drop index / typed constraint drops", () => {
     setSqlDialect("mysql");
     expect(renameRelation("table", "test", "t", "t2")).toBe("RENAME TABLE `test`.`t` TO `test`.`t2`");
+    // MySQL has no `ALTER VIEW … RENAME TO`; RENAME TABLE renames a view too.
+    expect(renameRelation("view", "test", "v", "v2")).toBe("RENAME TABLE `test`.`v` TO `test`.`v2`");
     expect(dropIndex("test", "idx", false, "t")).toBe("DROP INDEX `idx` ON `test`.`t`");
     expect(dropConstraint("test", "t", "fk_o", false, "foreign_key")).toBe(
       "ALTER TABLE `test`.`t` DROP FOREIGN KEY `fk_o`",

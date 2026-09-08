@@ -674,9 +674,10 @@ export function renameRelation(kind: string, schema: string, name: string, newNa
   const caps = ddlCaps();
   const kw = kind === "view" ? "VIEW" : kind === "matview" ? "MATERIALIZED VIEW" : "TABLE";
   const q = caps.schemas ? qualify(schema, name) : ident(name);
-  // MySQL renames a table with RENAME TABLE (its ALTER form exists but RENAME TABLE
-  // is the documented one and also moves a table between databases).
-  if (caps.renameTableForm === "rename-table" && kw === "TABLE")
+  // MySQL renames with RENAME TABLE — the documented form, which also moves a
+  // relation between databases and is the ONLY way to rename a view there
+  // (MySQL has no `ALTER VIEW … RENAME TO`).
+  if (caps.renameTableForm === "rename-table")
     return `RENAME TABLE ${q} TO ${qualify(schema, newName)}`;
   return `ALTER ${kw} ${q} RENAME TO ${ident(newName)}`;
 }
