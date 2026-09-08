@@ -71,6 +71,22 @@ describe("import parsing boundaries", () => {
     expect(() => parseJSON(JSON.stringify({ huge: "x".repeat(1_000_001) }))).toThrow(/field/i);
   });
 
+  // PARITY FIXTURES — the same inputs are asserted by the streaming Rust parser in
+  // src-tauri/src/import.rs (`csv_*` / `json_*` tests). Change both together.
+  it("strips a UTF-8 BOM from the first header cell", () => {
+    expect(parseCSV("﻿id,name\n1,duck", true).columns).toEqual(["id", "name"]);
+    expect(parseJSON('﻿[{"a":1}]').columns).toEqual(["a"]);
+  });
+
+  it("pads short rows with NULL and rejects rows wider than the header", () => {
+    expect(parseCSV("id,name,note\n1,duck", true).rows).toEqual([["1", "duck", null]]);
+    expect(() => parseCSV("id,name\n1,duck,extra", true)).toThrow(/more fields/i);
+  });
+
+  it("rejects an empty header cell", () => {
+    expect(() => parseCSV("id,\n1,2", true)).toThrow(/empty column name/i);
+  });
+
   it("rejects duplicate JSON keys before JSON.parse can discard them", () => {
     expect(() => parseJSON('{"a":1,"a":2}')).toThrow(/duplicate object key/i);
     expect(() => parseJSON('{"a":1,"\\u0061":2}')).toThrow(/duplicate object key/i);
@@ -137,11 +153,30 @@ describe("formatWithOptions boolean mapping", () => {
   it("sql emits unquoted TRUE/FALSE and a boolean CREATE type", () => {
     const out = formatWithOptions(
       data,
-      opts({ format: "sql", sql: { table: "exported", multiRow: false, includeCreate: true } }),
+      opts({ format: "sql", sql: { table: "exported", multiRow: false, includeCreate: true, createSql: "" } }),
     );
     expect(out).toContain('CREATE TABLE "exported" ("id" text, "active" boolean, "note" text);');
     expect(out).toContain(`INSERT INTO "exported" ("id", "active", "note") VALUES ('1', TRUE, 't');`);
     expect(out).toContain(`INSERT INTO "exported" ("id", "active", "note") VALUES ('3', NULL, NULL);`);
+  });
+
+  // PARITY PAIR with `header_text` in src-tauri/src/export.rs: reconstructed engine DDL
+  // replaces the synthetic all-text CREATE, normalized to exactly one trailing `;`.
+  it("sql uses reconstructed engine DDL when one is supplied", () => {
+    const out = formatWithOptions(
+      data,
+      opts({
+        format: "sql",
+        sql: {
+          table: "exported",
+          multiRow: false,
+          includeCreate: true,
+          createSql: 'CREATE TABLE "exported" ("id" integer NOT NULL);\n',
+        },
+      }),
+    );
+    expect(out.startsWith('CREATE TABLE "exported" ("id" integer NOT NULL);\n')).toBe(true);
+    expect(out).not.toContain('"active" boolean');
   });
 
   it("markdown maps to the display words", () => {
@@ -189,11 +224,11 @@ describe("formatWithOptions boolean mapping", () => {
 
   it("matches backend SQL dialect quoting and mode-safe values", () => {
     const d: Dataset = { columns: ["co`l"], rows: [["path\\name's"]] };
-    const pg = formatWithOptions(d, opts({ format: "sql", boolCols: [], sql: { table: "t", multiRow: false, includeCreate: false } }));
+    const pg = formatWithOptions(d, opts({ format: "sql", boolCols: [], sql: { table: "t", multiRow: false, includeCreate: false, createSql: "" } }));
     expect(pg).toContain(`VALUES (E'path\\\\name''s');`);
 
     setSqlDialect("mysql");
-    const mysql = formatWithOptions(d, opts({ format: "sql", boolCols: [], sql: { table: "ta`ble", multiRow: false, includeCreate: true } }));
+    const mysql = formatWithOptions(d, opts({ format: "sql", boolCols: [], sql: { table: "ta`ble", multiRow: false, includeCreate: true, createSql: "" } }));
     expect(mysql).toContain("CREATE TABLE `ta``ble` (`co``l` text);");
     expect(mysql).toContain("CONVERT(X'706174685c6e616d652773' USING utf8mb4)");
   });

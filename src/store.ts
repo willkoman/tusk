@@ -386,3 +386,36 @@ export const tabsStore = {
     return lastTabsFailure;
   },
 };
+
+// Last-used export options, per format. Only formatting choices are remembered — the
+// column projection, boolean metadata, SQL table name and reconstructed DDL belong to
+// one result and are always recomputed.
+const EXPORT_OPTIONS_KEY = "tusk.exportOptions";
+
+export type RememberedExportOptions = Record<string, Record<string, unknown>>;
+
+export const exportOptionsStore = {
+  load(): RememberedExportOptions {
+    try {
+      const raw = localStorage.getItem(EXPORT_OPTIONS_KEY);
+      if (raw && raw.length > MAX_SMALL_STORE_CHARS) return {};
+      const parsed: unknown = raw ? JSON.parse(raw) : null;
+      if (!isRecord(parsed)) return {};
+      const out: RememberedExportOptions = {};
+      for (const [format, value] of Object.entries(parsed))
+        if (isRecord(value) && format.length <= 20) out[format] = value;
+      return out;
+    } catch {
+      return {};
+    }
+  },
+  /** False when persistence failed — the options still apply this session. */
+  save(all: RememberedExportOptions): boolean {
+    try {
+      localStorage.setItem(EXPORT_OPTIONS_KEY, JSON.stringify(all));
+      return true;
+    } catch {
+      return false;
+    }
+  },
+};

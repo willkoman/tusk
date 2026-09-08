@@ -61,7 +61,7 @@ describe("cross-module integration contracts", () => {
     const sql = {
       ...defaultExportOptions("ta`ble"),
       format: "sql" as const,
-      sql: { table: "ta`ble", multiRow: false, includeCreate: true },
+      sql: { table: "ta`ble", multiRow: false, includeCreate: true, createSql: "" },
     };
     // Explicit source dialect wins even if the mutable editor dialect says Postgres.
     expect(formatWithOptions(sqlData, sql, "mysql")).toBe(

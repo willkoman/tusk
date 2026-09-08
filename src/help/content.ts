@@ -1226,11 +1226,11 @@ export const TOPICS: Topic[] = [
   {
     "id": "import-export",
     "title": "Import & export",
-    "blurb": "Export results in six formats, streamed or loaded; import CSV/JSON transactionally.",
+    "blurb": "Export results in six formats, streamed or loaded; import CSV, JSON or xlsx transactionally on any engine.",
     "blocks": [
       {
         "k": "p",
-        "md": "Data moves through three doors: **Export…** on the result toolbar (file or clipboard, six formats, streaming), the sidebar's **Import data** icon (CSV/JSON file → table via `COPY`), and the grid's copy commands ([[kbd:Mod-C]] + right-click — see [[topic:results|Results]]). Export works on every engine; import is Postgres-only (the button appears only when the driver reports `bulkCopy`). Moving a whole database rather than one result is a different job — see [[topic:backup|Backup & restore]]."
+        "md": "Data moves through four doors: **Export…** on the result toolbar (file or clipboard, six formats, streaming), the Explorer's right-click **Export table…** / **Export tables…**, the sidebar's **Import data** icon and the Explorer's **Import data into table…** / **Import file as new table…**, and the grid's copy commands ([[kbd:Mod-C]] + right-click — see [[topic:results|Results]]). Import and export both work on every engine. Moving a whole database rather than one result is a different job — see [[topic:backup|Backup & restore]]."
       },
       {
         "k": "h",
@@ -1246,8 +1246,8 @@ export const TOPICS: Topic[] = [
         "ordered": false,
         "items": [
           "**Columns** — check/uncheck and reorder with the ↑/↓ buttons; keep at least one selected.",
-          "**Preview** — live, from the first 12 loaded rows (skipped for xlsx).",
-          "**Defaults** — CSV, comma delimiter, quote *as needed*, header row on, NULL as empty, LF line endings, no BOM."
+          "**Preview** — live, from the first 12 rows of the chosen scope (skipped for xlsx).",
+          "**Defaults** — CSV, comma delimiter, quote *as needed*, header row on, NULL as empty, LF line endings, no BOM. Your last-used options are remembered per format; the column selection and table name always come from the result being exported."
         ]
       },
       {
@@ -1267,7 +1267,7 @@ export const TOPICS: Topic[] = [
           ],
           [
             "**SQL inserts**",
-            "`INSERT` statements with a configurable table name; **Multi-row INSERT** batches 1,000 value tuples per statement; **Include CREATE TABLE** prepends a `CREATE TABLE` (all columns `text` — results are untyped strings)."
+            "`INSERT` statements with a configurable table name; **Multi-row INSERT** batches 1,000 value tuples per statement; **Include CREATE TABLE** prepends the source table's reconstructed DDL (real types, keys and defaults) when the result is a plain table, and otherwise a generated all-`text` `CREATE` with a note saying so."
           ],
           [
             "**Markdown**",
@@ -1293,6 +1293,7 @@ export const TOPICS: Topic[] = [
         "ordered": false,
         "items": [
           "**Loaded rows (N)** — formats what the grid currently holds, in memory.",
+          "**Selection (N rows)** — offered when rows are selected in the grid: the selected rows at full width, in memory. The dialog's own column checkboxes still apply.",
           "**All rows (re-run query)** — re-executes server-side. Postgres streams via a dedicated cursor (`tusk_export_cur`) in **10,000-row batches** (constant memory); DuckDB, SQLite, and MySQL page via `LIMIT`/`OFFSET`. This scope is frozen while a manual transaction owns the session; export Loaded rows instead."
         ]
       },
@@ -1329,19 +1330,75 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**Import data** (sidebar toolbar, Postgres only) opens the import modal. **Choose file…** accepts `.csv`, `.tsv`, `.json`, and `.txt`. A `.json` file parses as an array of objects (union of keys → columns, nested values stringified); everything else uses the CSV parser, where **First row is header (CSV)** names the columns — unchecked gives `col1`, `col2`, …"
+        "md": "**Import data** opens a three-step dialog on any engine. **1. File** — pick the file and its parsing options; Tusk parses the head of it in the backend and shows the detected columns, the first 50 rows and any warnings. **2. Columns** — choose the target table and map the file's columns onto it. **3. Run** — watch the load with live progress, **Cancel &amp; roll back**, and a result summary. The file is read from disk by the backend in bounded batches: it is never loaded into the window, so size is limited by the format's budget rather than by memory."
       },
       {
         "k": "list",
         "ordered": false,
         "items": [
-          "**Existing table** — pick any `schema.table` Tusk knows; rows append.",
-          "**New table** — name pre-filled from the file name (extension stripped, non-word chars → `_`); created with all-`text` columns in `public`."
+          "**Delimited text** — configurable delimiter (comma / tab / semicolon / pipe / custom), quote character, optional backslash-style escape character, **UTF-8** (a BOM is accepted and stripped) or **Latin-1** encoding, **skip N rows** for a preamble above the header, and a **NULL text** placeholder such as `\N`.",
+          "**JSON** — either an array of objects or newline-delimited objects (NDJSON). Keys become columns in first-seen order, nested values are stringified, and a duplicate key is rejected rather than silently dropped.",
+          "**Excel (xlsx)** — the first sheet by default, with a sheet picker when the workbook has more than one.",
+          "**First row is the header** — unchecked gives `col1`, `col2`, … A row with more fields than the header is an error; a short row imports its missing fields as NULL and says so in the warnings."
         ]
       },
       {
         "k": "p",
-        "md": "The `CREATE TABLE` (if any) plus the `COPY` run in **one transaction**: **Cancel & roll back** (or any error) undoes everything — status reads *\"Import cancelled — rolled back.\"* On success the sidebar schema refreshes so the table appears in the tree and autocomplete ([[topic:sidebar|Sidebar]])."
+        "md": "The `CREATE TABLE` (if any), the optional table clear, and every insert batch run in **one transaction**: **Cancel &amp; roll back** (or any error, including a value that doesn't fit its column) undoes everything and names the offending row. PostgreSQL uses `COPY`-grade batching; the other engines use batched multi-row `INSERT`s. On success the sidebar schema refreshes so a new table appears in the tree and autocomplete ([[topic:sidebar|Sidebar]]), and the run lands in [[topic:history|history]] as `-- [Import] …`."
+      },
+      {
+        "k": "h",
+        "text": "Choosing the target and mapping columns",
+        "id": "import-mapping"
+      },
+      {
+        "k": "list",
+        "ordered": false,
+        "items": [
+          "**Existing table** — pick any table Tusk knows (the Explorer's *Import data into table…* pre-selects one). File columns are auto-matched to target columns by name, case- and punctuation-insensitively; anything left over can be pointed at a column by hand or set to **— skip —**, which leaves that column at its database default.",
+          "**New table** — the name is pre-filled from the file name (extension stripped, non-word characters → `_`). Each column's type is **inferred from the sampled values** — integer, bigint, decimal, boolean, date, timestamp, or text — and each one can be overridden before the table is created. The dropdown shows the engine type each token creates as.",
+          "**Empty the table first** — clears the table inside the same transaction, so a failure leaves the original rows intact.",
+          "**Empty → NULL** — per column, imports an empty string as NULL. On by default for every non-text column, because an empty string is not a number, date or boolean."
+        ]
+      },
+      {
+        "k": "table",
+        "head": [
+          "On conflict",
+          "What each engine runs"
+        ],
+        "rows": [
+          [
+            "**Fail**",
+            "A plain `INSERT`. A key collision fails the import and rolls it back."
+          ],
+          [
+            "**Skip conflicting rows**",
+            "PostgreSQL `ON CONFLICT DO NOTHING`, MySQL `INSERT IGNORE`, SQLite and DuckDB `INSERT OR IGNORE`."
+          ],
+          [
+            "**Update / replace conflicting rows**",
+            "PostgreSQL `ON CONFLICT (keys) DO UPDATE` — pick the conflict key columns; MySQL `ON DUPLICATE KEY UPDATE` (which fires on *any* unique key, not only the columns you mapped); SQLite and DuckDB `INSERT OR REPLACE`, where an unmapped column resets to its default."
+          ]
+        ]
+      },
+      {
+        "k": "tip",
+        "kind": "warn",
+        "md": "MySQL DDL implicitly commits. Creating a table as part of a MySQL import can therefore leave the empty table behind if the row load then fails — the rows still roll back. The other three engines create and load atomically."
+      },
+      {
+        "k": "h",
+        "text": "Exporting from the Explorer",
+        "id": "explorer-export"
+      },
+      {
+        "k": "p",
+        "md": "Right-click a table, view or materialized view for **Export table…** — the same configurator, aimed at that relation's full contents. Right-click a schema or the database for **Export tables…**: tick the tables, choose a format, pick a directory, and get one configured file per table named `schema_table.<ext>`, with per-table progress and a Cancel."
+      },
+      {
+        "k": "p",
+        "md": "Every file is written atomically. If one table fails, it is reported by name and the files already written are kept — nothing is rolled back on the filesystem."
       },
       {
         "k": "h",
