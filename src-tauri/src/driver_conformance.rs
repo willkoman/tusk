@@ -327,8 +327,15 @@ async fn filter_where_battery(b: &mut Backend, eng: &Eng) {
         "postgres" => r" ESCAPE E'\\'",
         _ => r" ESCAPE '\'",
     };
-    // MySQL processes backslash escapes inside literals; the others do not.
-    let bs = if eng.name == "mysql" { r"\\" } else { r"\" };
+    // How a single literal backslash reaches the engine. MySQL processes backslash
+    // escapes inside literals, and `lit()` switches PostgreSQL to an E'' string (which
+    // ALSO processes them) as soon as the value carries one — so both need it doubled.
+    // DuckDB/SQLite read plain literals, where one backslash is one backslash.
+    let bs = if eng.name == "mysql" || eng.name == "postgres" {
+        r"\\"
+    } else {
+        r"\"
+    };
     // PG's `lit` switches to E'…' whenever the value carries a backslash.
     let epfx = if eng.name == "postgres" { "E" } else { "" };
     let text_cast = |col: &str| match eng.name {
@@ -2029,4 +2036,221 @@ COMMIT;"#;
         .query_row("SELECT c FROM t WHERE id = 7", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, 0, "default applied to new rows");
+}
+
+// --- frontend DDL builder parity (sql/ddl.ts -> real engines) ----------------
+//
+// Every fixture below is COPIED from `src/sql/ddl.test.ts`, which asserts the
+// TypeScript builders produce exactly these strings. Vitest pins the text; these tests
+// pin that a real engine accepts it. Change one side and the other fails.
+
+/// SQLite forms — mirrors `createTable · sqlite`, `sqlite ALTER forms` and
+/// `sqlite rebuild` in `src/sql/ddl.test.ts`.
+#[test]
+fn sqlite_ddl_builder_forms_apply() {
+    let c = rusqlite::Connection::open_in_memory().unwrap();
+    let steps: &[&str] = &[
+        // createTable · sqlite: INTEGER PRIMARY KEY AUTOINCREMENT + inline UNIQUE/CHECK
+        r#"CREATE TABLE "main"."orders" (
+  "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+  "code" text NOT NULL UNIQUE,
+  "qty" integer DEFAULT 0 CHECK (qty > 0)
+)"#,
+        // createTable · sqlite: the FK target is BARE (SQLite rejects a qualified one)
+        r#"CREATE TABLE "main"."lines" (
+  "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+  "order_id" integer NOT NULL,
+  "note" text DEFAULT '-',
+  FOREIGN KEY ("order_id") REFERENCES "orders" ("id") ON DELETE CASCADE
+)"#,
+        r#"INSERT INTO "main"."orders" ("code", "qty") VALUES ('a', 3)"#,
+        // sqlite ALTER forms: the four actions SQLite's ALTER TABLE actually has
+        r#"ALTER TABLE "main"."orders" ADD COLUMN "c" text"#,
+        r#"ALTER TABLE "main"."orders" RENAME COLUMN "c" TO "c2""#,
+        r#"ALTER TABLE "main"."orders" DROP COLUMN "c2""#,
+        // sqlite ALTER forms: CREATE INDEX leaves the TABLE bare, keeps a partial WHERE
+        r#"CREATE UNIQUE INDEX "idx_q" ON "orders" ("qty") WHERE qty IS NOT NULL"#,
+        r#"DROP INDEX "main"."idx_q""#,
+        // sqlite ALTER forms: no TRUNCATE — an unqualified DELETE is the equivalent
+        r#"DELETE FROM "main"."lines""#,
+        // sqlite rebuild: create -> copy -> drop -> rename, then replay the indexes
+        r#"CREATE TABLE "main"."orders__tusk_rebuild" (
+  "id" integer PRIMARY KEY,
+  "code" text NOT NULL,
+  "qty" bigint
+)"#,
+        r#"INSERT INTO "main"."orders__tusk_rebuild" ("id", "code", "qty")
+SELECT "id", "code", "qty" FROM "main"."orders""#,
+        r#"DROP TABLE "main"."orders""#,
+        r#"ALTER TABLE "main"."orders__tusk_rebuild" RENAME TO "orders""#,
+        r#"CREATE INDEX "orders_qty_idx" ON "orders" ("qty")"#,
+        // rename / drop the relation
+        r#"ALTER TABLE "main"."orders" RENAME TO "orders2""#,
+        r#"DROP TABLE "main"."lines""#,
+        r#"DROP TABLE "main"."orders2""#,
+    ];
+    for s in steps {
+        c.execute_batch(s)
+            .unwrap_or_else(|e| panic!("SQLite rejected builder DDL:\n  {s}\n  -> {e}"));
+    }
+}
+
+/// The SQLite rebuild the builders emit runs through `script::run` wrapped in
+/// BEGIN…COMMIT, so the whole create -> copy -> drop -> rename swap must succeed as one
+/// unit AND keep the rows — including while another table holds a foreign key on the
+/// table being rebuilt. (Tusk leaves `PRAGMA foreign_keys` at SQLite's default off, and
+/// the pragma is a no-op inside a transaction anyway, so the intermediate DROP is safe.)
+#[test]
+fn sqlite_ddl_rebuild_runs_transactionally() {
+    let c = rusqlite::Connection::open_in_memory().unwrap();
+    c.execute_batch(
+        r#"CREATE TABLE "t" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "qty" integer);
+CREATE TABLE "child" ("id" integer, FOREIGN KEY ("id") REFERENCES "t" ("id"));
+INSERT INTO "t" ("qty") VALUES (7);"#,
+    )
+    .unwrap();
+    let script = r#"BEGIN;
+CREATE TABLE "main"."t__tusk_rebuild" (
+  "id" integer PRIMARY KEY,
+  "qty" bigint NOT NULL DEFAULT 0
+);
+INSERT INTO "main"."t__tusk_rebuild" ("id", "qty")
+SELECT "id", "qty" FROM "main"."t";
+DROP TABLE "main"."t";
+ALTER TABLE "main"."t__tusk_rebuild" RENAME TO "t";
+CREATE INDEX "t_qty_idx" ON "t" ("qty");
+COMMIT;"#;
+    c.execute_batch(script)
+        .expect("SQLite must accept the whole rebuild in one transaction");
+    let v: i64 = c
+        .query_row("SELECT qty FROM t WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 7, "rows survive the rebuild");
+}
+
+/// PostgreSQL forms — mirrors `createTable · postgres`, `addColumn`, `editColumn` and
+/// the shared drop/rename builders in `src/sql/ddl.test.ts`.
+#[tokio::test]
+async fn postgres_ddl_builder_forms_apply() {
+    let Some(cfg) = pg_cfg() else {
+        eprintln!("SKIP postgres_ddl_builder_forms_apply (set TUSK_TEST_PG_PORT)");
+        return;
+    };
+    let (mut b, _v) = connect(&cfg).await.expect("connect pg");
+    let steps: &[&str] = &[
+        r#"DROP TABLE IF EXISTS "public"."lines""#,
+        r#"DROP TABLE IF EXISTS "public"."t2""#,
+        r#"DROP TABLE IF EXISTS "public"."orders""#,
+        r#"DROP TABLE IF EXISTS "public"."orders2""#,
+        r#"DROP SCHEMA IF EXISTS "s1" CASCADE"#,
+        // createTable · postgres: identity key, inline UNIQUE/CHECK, comments
+        r#"CREATE TABLE IF NOT EXISTS "public"."orders" (
+  "id" bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  "code" text NOT NULL UNIQUE,
+  "qty" integer DEFAULT 0 NOT NULL CHECK (qty > 0)
+)"#,
+        r#"COMMENT ON TABLE "public"."orders" IS 'customer orders'"#,
+        r#"COMMENT ON COLUMN "public"."orders"."code" IS 'order code'"#,
+        // createTable · postgres: composite key + a deferrable foreign key
+        r#"CREATE TABLE "public"."lines" (
+  "order_id" bigint NOT NULL,
+  "line_no" integer NOT NULL,
+  PRIMARY KEY ("order_id", "line_no"),
+  CONSTRAINT "lines_order_fk" FOREIGN KEY ("order_id") REFERENCES "public"."orders" ("id") ON DELETE CASCADE ON UPDATE NO ACTION DEFERRABLE INITIALLY DEFERRED
+)"#,
+        // addColumn / editColumn (actions comma-joined) / comment / rename / drop
+        r#"ALTER TABLE "public"."orders" ADD COLUMN "c" int DEFAULT 0 NOT NULL"#,
+        r#"ALTER TABLE "public"."orders" ALTER COLUMN "c" TYPE bigint, ALTER COLUMN "c" SET NOT NULL, ALTER COLUMN "c" SET DEFAULT 0"#,
+        r#"COMMENT ON COLUMN "public"."orders"."c" IS 'a note'"#,
+        r#"ALTER TABLE "public"."orders" RENAME COLUMN "c" TO "c2""#,
+        r#"ALTER TABLE "public"."orders" DROP COLUMN "c2""#,
+        // createIndex (access method + partial WHERE) / rename / drop
+        r#"CREATE INDEX "idx_q" ON "public"."orders" USING hash ("qty")"#,
+        r#"DROP INDEX "public"."idx_q""#,
+        r#"CREATE UNIQUE INDEX "idx_p" ON "public"."orders" ("qty") WHERE qty > 0"#,
+        r#"ALTER INDEX "public"."idx_p" RENAME TO "idx_p2""#,
+        r#"DROP INDEX "public"."idx_p2" CASCADE"#,
+        // constraint ALTERs
+        r#"ALTER TABLE "public"."orders" ADD CONSTRAINT "uq_q" UNIQUE ("qty")"#,
+        r#"ALTER TABLE "public"."orders" ADD CONSTRAINT "ck_q" CHECK (qty >= 0)"#,
+        r#"ALTER TABLE "public"."orders" RENAME CONSTRAINT "ck_q" TO "ck_q2""#,
+        r#"ALTER TABLE "public"."orders" DROP CONSTRAINT "ck_q2""#,
+        r#"ALTER TABLE "public"."orders" DROP CONSTRAINT "uq_q""#,
+        // move a table between schemas
+        r#"CREATE SCHEMA "s1""#,
+        r#"ALTER TABLE "public"."orders" SET SCHEMA "s1""#,
+        r#"ALTER TABLE "s1"."orders" SET SCHEMA "public""#,
+        r#"DROP SCHEMA "s1""#,
+        // duplicate / truncate / rename / drop
+        r#"CREATE TABLE "public"."t2" (LIKE "public"."orders" INCLUDING ALL)"#,
+        r#"TRUNCATE TABLE "public"."t2" RESTART IDENTITY CASCADE"#,
+        r#"ALTER TABLE "public"."orders" RENAME TO "orders2""#,
+        r#"DROP TABLE "public"."lines""#,
+        r#"DROP TABLE "public"."t2""#,
+        r#"DROP TABLE "public"."orders2" CASCADE"#,
+    ];
+    for s in steps {
+        exec(&mut b, s).await;
+    }
+}
+
+/// MySQL forms — mirrors `createTable · mysql`, `mysql ALTER forms` and
+/// `tableDiff · mysql` in `src/sql/ddl.test.ts`.
+#[tokio::test]
+async fn mysql_ddl_builder_forms_apply() {
+    let Some(cfg) = mysql_cfg() else {
+        eprintln!("SKIP mysql_ddl_builder_forms_apply (set TUSK_TEST_MYSQL_PORT)");
+        return;
+    };
+    let (mut b, _v) = connect(&cfg).await.expect("connect mysql");
+    let steps: &[&str] = &[
+        r#"DROP TABLE IF EXISTS `test`.`lines`"#,
+        r#"DROP TABLE IF EXISTS `test`.`t2`"#,
+        r#"DROP TABLE IF EXISTS `test`.`orders`"#,
+        r#"DROP TABLE IF EXISTS `test`.`orders2`"#,
+        // createTable · mysql: AUTO_INCREMENT key, inline COMMENT, table options
+        r#"CREATE TABLE IF NOT EXISTS `test`.`orders` (
+  `id` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  `code` varchar(32) NOT NULL UNIQUE COMMENT 'order code',
+  `qty` int DEFAULT 0
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='customer orders'"#,
+        r#"CREATE TABLE `test`.`lines` (
+  `order_id` bigint NOT NULL,
+  `line_no` int NOT NULL,
+  PRIMARY KEY (`order_id`, `line_no`),
+  CONSTRAINT `lines_order_fk` FOREIGN KEY (`order_id`) REFERENCES `test`.`orders` (`id`) ON DELETE CASCADE ON UPDATE NO ACTION
+)"#,
+        // addColumn / MODIFY restating the definition / default-only edit / rename / drop
+        r#"ALTER TABLE `test`.`orders` ADD COLUMN `c` int NOT NULL DEFAULT 0"#,
+        r#"ALTER TABLE `test`.`orders` MODIFY COLUMN `c` bigint NOT NULL DEFAULT 0 COMMENT 'count'"#,
+        r#"ALTER TABLE `test`.`orders` ALTER COLUMN `c` SET DEFAULT 5"#,
+        r#"ALTER TABLE `test`.`orders` ALTER COLUMN `c` DROP DEFAULT"#,
+        r#"ALTER TABLE `test`.`orders` RENAME COLUMN `c` TO `c2`"#,
+        r#"ALTER TABLE `test`.`orders` DROP COLUMN `c2`"#,
+        // createIndex / renameIndex / dropIndex (MySQL needs the table on DROP INDEX)
+        r#"CREATE INDEX `idx_q` ON `test`.`orders` (`qty`)"#,
+        r#"ALTER TABLE `test`.`orders` RENAME INDEX `idx_q` TO `idx_q2`"#,
+        r#"DROP INDEX `idx_q2` ON `test`.`orders`"#,
+        // constraint ALTERs, dropped by kind
+        r#"ALTER TABLE `test`.`orders` ADD CONSTRAINT `uq_q` UNIQUE (`qty`)"#,
+        r#"ALTER TABLE `test`.`orders` DROP INDEX `uq_q`"#,
+        r#"ALTER TABLE `test`.`orders` ADD CONSTRAINT `ck_q` CHECK (qty >= 0)"#,
+        r#"ALTER TABLE `test`.`orders` DROP CHECK `ck_q`"#,
+        r#"ALTER TABLE `test`.`lines` DROP FOREIGN KEY `lines_order_fk`"#,
+        r#"ALTER TABLE `test`.`lines` DROP PRIMARY KEY"#,
+        r#"ALTER TABLE `test`.`lines` ADD PRIMARY KEY (`order_id`)"#,
+        // comments are table/column OPTIONS on MySQL, not statements
+        r#"ALTER TABLE `test`.`orders` COMMENT = 'hello'"#,
+        r#"ALTER TABLE `test`.`orders` MODIFY COLUMN `qty` int COMMENT 'note'"#,
+        // duplicate / truncate / rename / drop
+        r#"CREATE TABLE `test`.`t2` LIKE `test`.`orders`"#,
+        r#"TRUNCATE TABLE `test`.`t2`"#,
+        r#"RENAME TABLE `test`.`orders` TO `test`.`orders2`"#,
+        r#"DROP TABLE `test`.`lines`"#,
+        r#"DROP TABLE `test`.`t2`"#,
+        r#"DROP TABLE `test`.`orders2`"#,
+    ];
+    for s in steps {
+        exec(&mut b, s).await;
+    }
 }

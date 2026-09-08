@@ -1983,33 +1983,215 @@ fn sqlite_build_tree(conn: &rusqlite::Connection) -> Result<tree::DbTree, AppErr
     })
 }
 
+/// One foreign key while its per-column catalog rows are being grouped (SQLite).
+struct FkGroup {
+    id: String,
+    cols: Vec<String>,
+    ref_cols: Vec<String>,
+    ref_table: String,
+    actions: String,
+}
+
+/// Same, for MySQL, where the referenced table is schema-qualified.
+struct MySqlFkGroup {
+    name: String,
+    cols: Vec<String>,
+    ref_schema: String,
+    ref_table: String,
+    ref_cols: Vec<String>,
+}
+
+/// SQLite has no `information_schema`: columns come from `PRAGMA table_info`, keys and
+/// indexes from `PRAGMA index_list`/`index_info`/`foreign_key_list`, and the index DDL
+/// from `sqlite_master`. Constraint `def`s are synthesized as the CLAUSE the table
+/// rebuild can paste straight back into a `CREATE TABLE` (see `rebuildTable` in
+/// `sql/ddl.ts`) — CHECK constraints are the one shape SQLite refuses to enumerate,
+/// so the Modify dialog warns instead of silently dropping them.
 fn sqlite_table_detail(
     conn: &rusqlite::Connection,
     name: &str,
 ) -> Result<tree::RelationDetail, AppError> {
+    let q = db::ident(name);
+    // The stored CREATE text is the only place AUTOINCREMENT is visible.
+    let stored = sqlite_query(
+        conn,
+        &format!(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name={}",
+            sqlite_lit(name)
+        ),
+    )
+    .ok()
+    .and_then(|(_c, rs)| rs.first().map(|r| dcell(r, 0)))
+    .unwrap_or_default();
+    let autoincrement = stored.to_ascii_uppercase().contains("AUTOINCREMENT");
+
     // PRAGMA table_info → (cid, name, type, notnull, dflt_value, pk).
-    let (_c, rows) = sqlite_query(conn, &format!("PRAGMA table_info({})", db::ident(name)))?;
-    let columns = rows
+    let (_c, rows) = sqlite_query(conn, &format!("PRAGMA table_info({q})"))?;
+
+    // foreign_key_list → (id, seq, table, from, to, on_update, on_delete, match).
+    let fk_rows = sqlite_query(conn, &format!("PRAGMA foreign_key_list({q})"))
+        .map(|(_c, rs)| rs)
+        .unwrap_or_default();
+    let fk_cols: std::collections::HashSet<String> = fk_rows.iter().map(|r| dcell(r, 3)).collect();
+
+    let columns: Vec<tree::Column> = rows
         .iter()
-        .map(|r| tree::Column {
-            name: dcell(r, 1),
-            data_type: dcell(r, 2),
-            nullable: dcell(r, 3) != "1",
-            is_pk: dcell(r, 5) != "0" && !dcell(r, 5).is_empty(),
-            is_fk: false,
-            default: r.get(4).and_then(|v| v.clone()),
-            comment: None,
+        .map(|r| {
+            let is_pk = dcell(r, 5) != "0" && !dcell(r, 5).is_empty();
+            let name = dcell(r, 1);
+            let data_type = dcell(r, 2);
+            tree::Column {
+                identity: is_pk && autoincrement && data_type.eq_ignore_ascii_case("INTEGER"),
+                is_fk: fk_cols.contains(&name),
+                name,
+                data_type,
+                nullable: dcell(r, 3) != "1",
+                is_pk,
+                default: r.get(4).and_then(|v| v.clone()),
+                comment: None, // SQLite has no COMMENT syntax at all
+            }
         })
         .collect();
+
+    let mut constraints: Vec<tree::Constraint> = Vec::new();
+    let pk_cols: Vec<String> = columns
+        .iter()
+        .filter(|c| c.is_pk)
+        .map(|c| db::ident(&c.name))
+        .collect();
+    if !pk_cols.is_empty() {
+        constraints.push(tree::Constraint {
+            name: format!("{name}_pk"),
+            kind: "primary_key".to_string(),
+            def: format!("PRIMARY KEY ({})", pk_cols.join(", ")),
+        });
+    }
+
+    // index_list → (seq, name, unique, origin, partial); origin 'u' = UNIQUE constraint,
+    // 'pk' = the primary key's index, 'c' = an explicit CREATE INDEX.
+    let idx_rows = sqlite_query(conn, &format!("PRAGMA index_list({q})"))
+        .map(|(_c, rs)| rs)
+        .unwrap_or_default();
+    let mut indexes: Vec<tree::Index> = Vec::new();
+    for r in &idx_rows {
+        let iname = dcell(r, 1);
+        let unique = dcell(r, 2) == "1";
+        let origin = dcell(r, 3);
+        let cols: Vec<String> =
+            sqlite_query(conn, &format!("PRAGMA index_info({})", db::ident(&iname)))
+                .map(|(_c, rs)| rs.iter().map(|x| dcell(x, 2)).collect())
+                .unwrap_or_default();
+        if origin == "u" {
+            constraints.push(tree::Constraint {
+                name: iname.clone(),
+                kind: "unique".to_string(),
+                def: format!(
+                    "UNIQUE ({})",
+                    cols.iter()
+                        .map(|c| db::ident(c))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+        let def = sqlite_query(
+            conn,
+            &format!(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name={} AND sql IS NOT NULL",
+                sqlite_lit(&iname)
+            ),
+        )
+        .ok()
+        .and_then(|(_c, rs)| rs.first().map(|x| dcell(x, 0)))
+        .unwrap_or_default();
+        indexes.push(tree::Index {
+            name: iname,
+            unique,
+            primary: origin == "pk",
+            def,
+        });
+    }
+
+    // Group the FK rows by constraint id, keeping column order.
+    let mut fk_groups: Vec<FkGroup> = Vec::new();
+    for r in &fk_rows {
+        let id = dcell(r, 0);
+        let entry = match fk_groups.iter_mut().find(|g| g.id == id) {
+            Some(e) => e,
+            None => {
+                fk_groups.push(FkGroup {
+                    id,
+                    cols: Vec::new(),
+                    ref_cols: Vec::new(),
+                    ref_table: dcell(r, 2),
+                    actions: String::new(),
+                });
+                fk_groups.last_mut().expect("just pushed")
+            }
+        };
+        entry.cols.push(db::ident(&dcell(r, 3)));
+        entry.ref_cols.push(db::ident(&dcell(r, 4)));
+        let on_update = dcell(r, 5);
+        let on_delete = dcell(r, 6);
+        entry.actions = format!(
+            "{}{}",
+            if on_delete.is_empty() || on_delete == "NO ACTION" {
+                String::new()
+            } else {
+                format!(" ON DELETE {on_delete}")
+            },
+            if on_update.is_empty() || on_update == "NO ACTION" {
+                String::new()
+            } else {
+                format!(" ON UPDATE {on_update}")
+            }
+        );
+    }
+    for g in fk_groups {
+        constraints.push(tree::Constraint {
+            name: format!("{name}_fk_{}", g.id),
+            kind: "foreign_key".to_string(),
+            def: format!(
+                "FOREIGN KEY ({}) REFERENCES {} ({}){}",
+                g.cols.join(", "),
+                db::ident(&g.ref_table),
+                g.ref_cols.join(", "),
+                g.actions
+            ),
+        });
+    }
+
+    let triggers = sqlite_query(
+        conn,
+        &format!(
+            "SELECT name, COALESCE(sql,'') FROM sqlite_master WHERE type='trigger' AND tbl_name={} ORDER BY name",
+            sqlite_lit(name)
+        ),
+    )
+    .map(|(_c, rs)| {
+        rs.iter()
+            .map(|r| tree::Trigger {
+                name: dcell(r, 0),
+                def: dcell(r, 1),
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+
     Ok(tree::RelationDetail {
         name: name.to_string(),
         kind: "table".to_string(),
         comment: None,
         columns,
-        indexes: vec![],
-        constraints: vec![],
-        triggers: vec![],
+        indexes,
+        constraints,
+        triggers,
     })
+}
+
+/// A SQLite text literal for catalog lookups (identifier quoting is `db::ident`).
+fn sqlite_lit(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// A live MySQL connection pool. A `Pool` is Send+Sync+Clone (no `!Sync`-connection
@@ -2731,31 +2913,208 @@ async fn mysql_table_detail(
     schema: &str,
     name: &str,
 ) -> Result<tree::RelationDetail, AppError> {
-    let q = "SELECT column_name, data_type, is_nullable, column_default, column_key \
+    // `column_type` (not `data_type`) keeps the length/precision — the Modify dialog's
+    // MODIFY COLUMN restates the definition, so `varchar` alone would truncate it.
+    let q = "SELECT column_name, column_type, is_nullable, column_default, column_key, \
+             COALESCE(extra,''), COALESCE(column_comment,'') \
              FROM information_schema.columns \
              WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position";
     let params = mysql_async::Params::Positional(vec![schema.into(), name.into()]);
     let (_c, rows, _a) = mysql_run_params(pool, q, params).await?;
+
+    // Foreign-key columns + the FK constraint shapes, in key order.
+    let fk_sql = "SELECT kcu.CONSTRAINT_NAME, kcu.COLUMN_NAME, kcu.REFERENCED_TABLE_SCHEMA, \
+                  kcu.REFERENCED_TABLE_NAME, kcu.REFERENCED_COLUMN_NAME \
+                  FROM information_schema.KEY_COLUMN_USAGE kcu \
+                  WHERE kcu.TABLE_SCHEMA = ? AND kcu.TABLE_NAME = ? AND kcu.REFERENCED_TABLE_NAME IS NOT NULL \
+                  ORDER BY kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION";
+    let fk_rows = mysql_run_params(
+        pool,
+        fk_sql,
+        mysql_async::Params::Positional(vec![schema.into(), name.into()]),
+    )
+    .await
+    .map(|(_c, rs, _a)| rs)
+    .unwrap_or_default();
+    let fk_cols: std::collections::HashSet<String> = fk_rows.iter().map(|r| dcell(r, 1)).collect();
+
     let columns = rows
         .iter()
-        .map(|r| tree::Column {
-            name: dcell(r, 0),
-            data_type: dcell(r, 1),
-            nullable: dcell(r, 2).eq_ignore_ascii_case("YES"),
-            is_pk: dcell(r, 4) == "PRI",
-            is_fk: false,
-            default: r.get(3).and_then(|v| v.clone()),
-            comment: None,
+        .map(|r| {
+            let cname = dcell(r, 0);
+            let comment = dcell(r, 6);
+            tree::Column {
+                identity: dcell(r, 5).to_ascii_lowercase().contains("auto_increment"),
+                is_fk: fk_cols.contains(&cname),
+                data_type: dcell(r, 1),
+                nullable: dcell(r, 2).eq_ignore_ascii_case("YES"),
+                is_pk: dcell(r, 4) == "PRI",
+                default: r.get(3).and_then(|v| v.clone()),
+                comment: if comment.is_empty() {
+                    None
+                } else {
+                    Some(comment)
+                },
+                name: cname,
+            }
         })
         .collect();
+
+    // Indexes: information_schema.statistics has one row per (index, column).
+    let idx_sql = "SELECT index_name, non_unique, column_name FROM information_schema.statistics \
+                   WHERE table_schema = ? AND table_name = ? ORDER BY index_name, seq_in_index";
+    let idx_rows = mysql_run_params(
+        pool,
+        idx_sql,
+        mysql_async::Params::Positional(vec![schema.into(), name.into()]),
+    )
+    .await
+    .map(|(_c, rs, _a)| rs)
+    .unwrap_or_default();
+    let mut indexes: Vec<tree::Index> = Vec::new();
+    let mut index_cols: Vec<(String, Vec<String>)> = Vec::new();
+    for r in &idx_rows {
+        let iname = dcell(r, 0);
+        let unique = dcell(r, 1) == "0";
+        match indexes.last_mut() {
+            Some(last) if last.name == iname => {}
+            _ => {
+                indexes.push(tree::Index {
+                    name: iname.clone(),
+                    unique,
+                    primary: iname == "PRIMARY",
+                    def: String::new(),
+                });
+                index_cols.push((iname.clone(), Vec::new()));
+            }
+        }
+        if let Some((_n, cols)) = index_cols.last_mut() {
+            cols.push(dcell(r, 2));
+        }
+    }
+    for (ix, (_n, cols)) in indexes.iter_mut().zip(index_cols.iter()) {
+        let quoted: Vec<String> = cols.iter().map(|c| db::ident(c)).collect();
+        ix.def = if ix.primary {
+            format!("PRIMARY KEY ({})", quoted.join(", "))
+        } else {
+            format!(
+                "{}INDEX {} ({})",
+                if ix.unique { "UNIQUE " } else { "" },
+                db::ident(&ix.name),
+                quoted.join(", ")
+            )
+        };
+    }
+
+    // Constraints: PK/UNIQUE from the index list, FKs grouped above, CHECKs from 8.0.16+.
+    let mut constraints: Vec<tree::Constraint> = Vec::new();
+    for (ix, (_n, cols)) in indexes.iter().zip(index_cols.iter()) {
+        if !ix.unique {
+            continue;
+        }
+        let quoted: Vec<String> = cols.iter().map(|c| db::ident(c)).collect();
+        constraints.push(tree::Constraint {
+            name: ix.name.clone(),
+            kind: if ix.primary { "primary_key" } else { "unique" }.to_string(),
+            def: format!(
+                "{} ({})",
+                if ix.primary { "PRIMARY KEY" } else { "UNIQUE" },
+                quoted.join(", ")
+            ),
+        });
+    }
+    let mut fk_groups: Vec<MySqlFkGroup> = Vec::new();
+    for r in &fk_rows {
+        let cname = dcell(r, 0);
+        let entry = match fk_groups.iter_mut().find(|g| g.name == cname) {
+            Some(e) => e,
+            None => {
+                fk_groups.push(MySqlFkGroup {
+                    name: cname,
+                    cols: Vec::new(),
+                    ref_schema: dcell(r, 2),
+                    ref_table: dcell(r, 3),
+                    ref_cols: Vec::new(),
+                });
+                fk_groups.last_mut().expect("just pushed")
+            }
+        };
+        entry.cols.push(db::ident(&dcell(r, 1)));
+        entry.ref_cols.push(db::ident(&dcell(r, 4)));
+    }
+    for g in fk_groups {
+        constraints.push(tree::Constraint {
+            name: g.name,
+            kind: "foreign_key".to_string(),
+            def: format!(
+                "FOREIGN KEY ({}) REFERENCES {}.{} ({})",
+                g.cols.join(", "),
+                db::ident(&g.ref_schema),
+                db::ident(&g.ref_table),
+                g.ref_cols.join(", ")
+            ),
+        });
+    }
+    let check_sql = "SELECT cc.CONSTRAINT_NAME, cc.CHECK_CLAUSE \
+                     FROM information_schema.CHECK_CONSTRAINTS cc \
+                     JOIN information_schema.TABLE_CONSTRAINTS tc \
+                       ON tc.CONSTRAINT_SCHEMA = cc.CONSTRAINT_SCHEMA \
+                      AND tc.CONSTRAINT_NAME = cc.CONSTRAINT_NAME \
+                     WHERE tc.TABLE_SCHEMA = ? AND tc.TABLE_NAME = ? ORDER BY cc.CONSTRAINT_NAME";
+    // CHECK_CONSTRAINTS only exists on MySQL 8.0.16+ — a missing view is not an error.
+    if let Ok((_c, crows, _a)) = mysql_run_params(
+        pool,
+        check_sql,
+        mysql_async::Params::Positional(vec![schema.into(), name.into()]),
+    )
+    .await
+    {
+        for r in &crows {
+            constraints.push(tree::Constraint {
+                name: dcell(r, 0),
+                kind: "check".to_string(),
+                def: format!("CHECK ({})", dcell(r, 1)),
+            });
+        }
+    }
+
+    let comment = mysql_run_params(
+        pool,
+        "SELECT COALESCE(table_comment,'') FROM information_schema.tables \
+         WHERE table_schema = ? AND table_name = ?",
+        mysql_async::Params::Positional(vec![schema.into(), name.into()]),
+    )
+    .await
+    .ok()
+    .and_then(|(_c, rs, _a)| rs.first().map(|r| dcell(r, 0)))
+    .filter(|s| !s.is_empty());
+
+    let triggers = mysql_run_params(
+        pool,
+        "SELECT trigger_name, CONCAT(action_timing,' ',event_manipulation,' ON ',event_object_table) \
+         FROM information_schema.triggers \
+         WHERE event_object_schema = ? AND event_object_table = ? ORDER BY trigger_name",
+        mysql_async::Params::Positional(vec![schema.into(), name.into()]),
+    )
+    .await
+    .map(|(_c, rs, _a)| {
+        rs.iter()
+            .map(|r| tree::Trigger {
+                name: dcell(r, 0),
+                def: dcell(r, 1),
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+
     Ok(tree::RelationDetail {
         name: name.to_string(),
         kind: "table".to_string(),
-        comment: None,
+        comment,
         columns,
-        indexes: vec![],
-        constraints: vec![],
-        triggers: vec![],
+        indexes,
+        constraints,
+        triggers,
     })
 }
 
@@ -3771,28 +4130,93 @@ fn duck_table_detail(
     )
     .map(|(_c, rs)| rs.iter().map(|r| dcell(r, 0)).collect())
     .unwrap_or_default();
+    // FK columns from the same edge scan the ERD uses.
+    let fk_cols: std::collections::HashSet<String> = duck_fk_edges(conn)
+        .into_iter()
+        .filter(|e| e.src_schema == schema && e.src_table == name)
+        .flat_map(|e| e.src_cols)
+        .collect();
     let columns = rows
         .iter()
         .map(|r| {
             let nm = dcell(r, 0);
+            let default = r.get(3).and_then(|v| v.clone());
             tree::Column {
                 is_pk: pk.contains(&nm),
+                identity: default
+                    .as_deref()
+                    .is_some_and(|d| d.trim_start().to_ascii_lowercase().starts_with("nextval(")),
+                is_fk: fk_cols.contains(&nm),
                 name: nm,
                 data_type: dcell(r, 1),
                 nullable: dcell(r, 2).eq_ignore_ascii_case("YES"),
-                is_fk: false,
-                default: r.get(3).and_then(|v| v.clone()),
+                default,
                 comment: None,
             }
         })
         .collect();
+
+    // Indexes + constraints, best-effort: an older DuckDB may not have these catalog
+    // functions, and an empty list is the documented fallback (never an error).
+    let indexes = duck_query(
+        conn,
+        &format!(
+            "SELECT index_name, is_unique, COALESCE(sql,'') FROM duckdb_indexes() \
+             WHERE schema_name = {} AND table_name = {} ORDER BY index_name",
+            dlit(schema),
+            dlit(name)
+        ),
+    )
+    .map(|(_c, rs)| {
+        rs.iter()
+            .map(|r| tree::Index {
+                name: dcell(r, 0),
+                unique: dcell(r, 1) == "true" || dcell(r, 1) == "t",
+                primary: false,
+                def: dcell(r, 2),
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+    let constraints = duck_query(
+        conn,
+        &format!(
+            "SELECT constraint_type, COALESCE(constraint_text,'') FROM duckdb_constraints() \
+             WHERE schema_name = {} AND table_name = {}",
+            dlit(schema),
+            dlit(name)
+        ),
+    )
+    .map(|(_c, rs)| {
+        rs.iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let raw = dcell(r, 0).to_ascii_uppercase();
+                let kind = match raw.as_str() {
+                    "PRIMARY KEY" => "primary_key",
+                    "FOREIGN KEY" => "foreign_key",
+                    "UNIQUE" => "unique",
+                    "CHECK" => "check",
+                    _ => "other",
+                };
+                // DuckDB doesn't name table constraints; synthesize a stable label.
+                tree::Constraint {
+                    name: format!("{name}_{}_{i}", kind),
+                    kind: kind.to_string(),
+                    def: dcell(r, 1),
+                }
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+
     Ok(tree::RelationDetail {
         name: name.to_string(),
         kind: "table".to_string(),
         comment: None,
         columns,
-        indexes: vec![],
-        constraints: vec![],
+        indexes,
+        constraints,
         triggers: vec![],
     })
 }
