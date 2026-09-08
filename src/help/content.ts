@@ -12,7 +12,7 @@ export const TOPICS: Topic[] = [
     "blocks": [
       {
         "k": "p",
-        "md": "Tusk opens on the **connect screen**: saved connections on the left, a connection form on the right. Postgres is first-class, but the same form connects to DuckDB, SQLite, and MySQL — the mascot on the card, topbar, and OS window title adapts to the driver (🐘 PostgreSQL, 🦆 DuckDB, 🪶 SQLite, 🐬 MySQL)."
+        "md": "Tusk opens on the **connect screen**: saved connections on the left, a connection form on the right. Postgres is first-class, but the same form connects to DuckDB, SQLite, MySQL, and SQL Server — the mascot on the card, topbar, and OS window title adapts to the driver (🐘 PostgreSQL, 🦆 DuckDB, 🪶 SQLite, 🐬 MySQL, 🧱 SQL Server)."
       },
       {
         "k": "h",
@@ -51,7 +51,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**PostgreSQL / MySQL** — *Host / Port / User / Password / Database / SSL Mode*; picking MySQL flips the default port from 5432 to 3306 and makes *Database* optional.",
+          "**PostgreSQL / MySQL / SQL Server** — *Host / Port / User / Password / Database / SSL Mode*; switching driver moves the default port (5432 / 3306 / 1433) and makes *Database* optional away from PostgreSQL. SQL Server takes a SQL login — Windows integrated authentication isn't supported yet.",
           "**DuckDB / SQLite** — a single **Database file** field with *Browse…*; **leave it blank for a scratch in-memory database**. No password or SSL — *Save password* disappears."
         ]
       },
@@ -133,7 +133,8 @@ export const TOPICS: Topic[] = [
           "PostgreSQL",
           "DuckDB",
           "SQLite",
-          "MySQL"
+          "MySQL",
+          "SQL Server"
         ],
         "rows": [
           [
@@ -141,24 +142,28 @@ export const TOPICS: Topic[] = [
             "yes",
             "paged (LIMIT/OFFSET)",
             "paged (LIMIT/OFFSET)",
-            "paged (LIMIT/OFFSET)"
+            "paged (LIMIT/OFFSET)",
+            "paged (OFFSET/FETCH)"
           ],
           [
             "Active-schema selector (`search_path`)",
             "yes",
             "—",
             "—",
-            "— (uses `USE db`)"
+            "— (uses `USE db`)",
+            "—"
           ],
           [
             "CSV/JSON import (COPY)",
             "yes",
             "—",
             "—",
+            "—",
             "—"
           ],
           [
             "Export to file",
+            "yes",
             "yes",
             "yes",
             "yes",
@@ -169,12 +174,14 @@ export const TOPICS: Topic[] = [
             "yes",
             "yes (per-action gating)",
             "—",
+            "—",
             "—"
           ],
           [
             "Copy DDL / [[topic:erd|relationships & ERD]]",
             "yes",
             "best-effort",
+            "yes",
             "yes",
             "yes"
           ],
@@ -183,47 +190,54 @@ export const TOPICS: Topic[] = [
             "yes",
             "yes",
             "—",
-            "yes"
+            "yes",
+            "— (no T-SQL EXPLAIN)"
           ],
           [
             "Transactional DDL",
             "yes",
             "yes",
             "yes",
-            "— (auto-commits)"
+            "— (auto-commits)",
+            "yes"
           ],
           [
             "Manual transactions",
             "yes",
             "yes",
             "yes",
-            "yes (pinned session)"
+            "yes (pinned session)",
+            "yes (`BEGIN TRANSACTION`)"
           ],
           [
             "Savepoints",
             "yes",
             "—",
             "yes",
-            "yes"
+            "yes",
+            "yes (`SAVE TRANSACTION`, no RELEASE)"
           ],
           [
             "`SET TRANSACTION`",
             "yes (active, before work)",
             "—",
             "—",
-            "yes (before START)"
+            "yes (before START)",
+            "— (session-wide in T-SQL)"
           ],
           [
             "Persistent autocommit-off mode",
             "—",
             "—",
             "—",
-            "yes (pinned session)"
+            "yes (pinned session)",
+            "—"
           ],
           [
             "Cancel a running query",
             "yes (`CancelRequest`)",
             "yes, except on Windows",
+            "—",
             "—",
             "—"
           ],
@@ -232,11 +246,13 @@ export const TOPICS: Topic[] = [
             "yes",
             "n/a",
             "n/a",
+            "yes",
             "yes"
           ],
           [
             "Permission-aware UI",
             "yes",
+            "—",
             "—",
             "—",
             "—"
@@ -314,7 +330,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**Run ▶** ([[kbd:Mod-Enter]]) runs the selection — *exactly* the selected text — otherwise the buffer. In flight the button becomes **✕ Cancel** with a live elapsed counter on engines that can cancel; where cancellation is impossible (SQLite, MySQL, DuckDB on Windows) it shows a disabled **Running 0:12** timer instead of a Cancel that can't work. PostgreSQL uses a real server-side `CancelRequest`; a rejected cancel resets the button and reports why rather than sitting on *Cancelling…*."
+        "md": "**Run ▶** ([[kbd:Mod-Enter]]) runs the selection — *exactly* the selected text — otherwise the buffer. In flight the button becomes **✕ Cancel** with a live elapsed counter on engines that can cancel; where cancellation is impossible (SQLite, MySQL, SQL Server, DuckDB on Windows) it shows a disabled **Running 0:12** timer instead of a Cancel that can't work. PostgreSQL uses a real server-side `CancelRequest`; a rejected cancel resets the button and reports why rather than sitting on *Cancelling…*."
       },
       {
         "k": "p",
@@ -322,7 +338,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Statement splitting is **engine-aware**, matching execution. On MySQL, `#` comments and `--` without trailing whitespace lex correctly and backslash escapes inside quotes are honored; backtick identifiers are first-class on MySQL and SQLite. Everything built on the lexer — Run selection or current statement, auto-fold, linting, parameter detection, and grid sort/filter — reads MySQL and SQLite SQL the way the server does."
+        "md": "Statement splitting is **engine-aware**, matching execution. On MySQL, `#` comments and `--` without trailing whitespace lex correctly and backslash escapes inside quotes are honored; backtick identifiers are first-class on MySQL and SQLite. On SQL Server, `[bracketed identifiers]` (with `]]` escapes), `N'literals'`, and nested `/* … /* … */ … */` comments hold semicolons inertly, and a line-only `GO` ends the batch **without being sent to the server** (a `GO 5` repeat count is refused rather than run once). Everything built on the lexer — Run selection or current statement, auto-fold, linting, parameter detection, and grid sort/filter — reads each engine's SQL the way the server does."
       },
       {
         "k": "p",
@@ -393,7 +409,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Run raw `BEGIN` or `START TRANSACTION`, `COMMIT` or `END`, and `ROLLBACK` or `ABORT` directly. Transaction-control scripts are lifecycle-preflighted and run statement by statement on one owner session — self-contained (`BEGIN; …; COMMIT`) or across separate runs. Savepoint / rollback-to / release work on PostgreSQL, SQLite, and MySQL. PostgreSQL supports `SET TRANSACTION` while active and before work; MySQL supports it before `START TRANSACTION`. DuckDB has neither savepoints nor `SET TRANSACTION`; SQLite has no `SET TRANSACTION`."
+        "md": "Run raw `BEGIN` or `START TRANSACTION`, `COMMIT` or `END`, and `ROLLBACK` or `ABORT` directly. Transaction-control scripts are lifecycle-preflighted and run statement by statement on one owner session — self-contained (`BEGIN; …; COMMIT`) or across separate runs. Savepoint / rollback-to / release work on PostgreSQL, SQLite, and MySQL. PostgreSQL supports `SET TRANSACTION` while active and before work; MySQL supports it before `START TRANSACTION`. DuckDB has neither savepoints nor `SET TRANSACTION`; SQLite has no `SET TRANSACTION`. SQL Server uses its own words — `BEGIN TRANSACTION`/`BEGIN TRAN`, `SAVE TRANSACTION name`, and `ROLLBACK TRANSACTION name` to return to a savepoint — while a bare `BEGIN`/`END` stays a statement block; it has no `RELEASE SAVEPOINT`, and `SET TRANSACTION ISOLATION LEVEL` / `SET IMPLICIT_TRANSACTIONS` are refused because they change the whole session rather than one unit."
       },
       {
         "k": "p",
@@ -568,7 +584,7 @@ export const TOPICS: Topic[] = [
         "items": [
           "**Bare identifiers** — checked only in DML (`SELECT`/`INSERT`/`UPDATE`/`DELETE`/`WITH`) where **every** table reference resolved; otherwise only one-edit clause-keyword typos are flagged. Statements with CTEs or derived tables skip the check entirely.",
           "**Grammatical `FROM`s** — `EXTRACT(YEAR FROM x)`, `SUBSTRING`, `POSITION`, `OVERLAY`, `TRIM` are masked before table scanning.",
-          "**Empty function catalog** — the unknown-function check switches off (MySQL can't enumerate builtins; a partial list would flag every uncommon function).",
+          "**Empty function catalog** — the unknown-function check switches off (neither MySQL nor SQL Server can enumerate builtins; a partial list would flag every uncommon function).",
           "**Half-typed keywords** — `SEL` under the cursor is a prefix of `SELECT` and skipped until you move on."
         ],
         "ordered": false
@@ -636,7 +652,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Reads stream in pages of **1,000 rows** (`PAGE` in `App.tsx`) — a server-side cursor on Postgres, a LIMIT/OFFSET pager on DuckDB/SQLite/MySQL."
+        "md": "Reads stream in pages of **1,000 rows** (`PAGE` in `App.tsx`) — a server-side cursor on Postgres, a LIMIT/OFFSET pager on DuckDB/SQLite/MySQL, and `OFFSET … ROWS FETCH NEXT … ROWS ONLY` on SQL Server. There the clause is appended to your statement, so an existing `ORDER BY` is preserved exactly; a statement that can't take it (`TOP`, its own `OFFSET`/`FETCH`, `FOR JSON`/`FOR XML`, `OPTION (…)`, or an unordered `UNION`) is read once under the result limits and labelled *read in one page*."
       },
       {
         "k": "list",
@@ -686,7 +702,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**Sort** — click a header to cycle **ascending → descending → none**; [[kbd:Shift]]-click adds to a multi-sort (priority numbers next to the arrows).",
-          "**Filter** — *Filter…* in the header menu, or the sidebar's *Filter rows…* (opens the table with the row visible). Each column does a case-insensitive contains match (`ILIKE '%text%'` on Postgres/DuckDB, `CAST … LIKE` on MySQL/SQLite), AND-combined, debounced 300 ms."
+          "**Filter** — *Filter…* in the header menu, or the sidebar's *Filter rows…* (opens the table with the row visible). Each column does a case-insensitive contains match (`ILIKE '%text%'` on Postgres/DuckDB, `CAST … LIKE` on MySQL/SQLite/SQL Server — case sensitivity there follows the column collation), AND-combined, debounced 300 ms."
         ]
       },
       {
@@ -702,7 +718,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**Disabled** for multi-statement runs, anything that isn't `SELECT`/`WITH`/`TABLE`/`VALUES`, and on **MySQL** when the result has duplicate column names (error 1060).",
+          "**Disabled** for multi-statement runs, anything that isn't `SELECT`/`WITH`/`TABLE`/`VALUES`, on **MySQL and SQL Server** when the result has duplicate column names, and on **SQL Server** for `WITH`-led or already-ordered statements (T-SQL rejects both inside the derived table the wrap needs).",
           "Re-running the *same unedited* query text keeps active rules; edit the text first for a clean result.",
           "A sort/filter re-run resets scroll and selection — the rows underneath changed."
         ]
@@ -830,7 +846,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Double-click a cell to edit ([[kbd:Mod]]+double-click keeps *View value*); with a cell selected, [[kbd:Enter]] or [[kbd:F2]] also opens the editor. Boolean columns get a **TRUE / FALSE** dropdown (plus `<null>` when nullable) committing the driver's token — `true`/`false` on Postgres and DuckDB, `1`/`0` on SQLite and MySQL; re-picking the original value reverts the edit."
+        "md": "Double-click a cell to edit ([[kbd:Mod]]+double-click keeps *View value*); with a cell selected, [[kbd:Enter]] or [[kbd:F2]] also opens the editor. Boolean columns get a **TRUE / FALSE** dropdown (plus `<null>` when nullable) committing the driver's token — `true`/`false` on Postgres, DuckDB, and SQL Server `bit`, `1`/`0` on SQLite and MySQL; re-picking the original value reverts the edit."
       },
       {
         "k": "table",
@@ -1105,7 +1121,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**Read-only connection** — everything mutating disables with *\"Connection is read-only\"* (see [[topic:safety|Safety & read-only mode]]). **Drop database** passes the same gates as every other DDL action — manual-transaction freeze, read-only, driver support — and is blocked outright on DuckDB.",
-          "**Driver support** — sidebar DDL is live on **Postgres and DuckDB**; MySQL/SQLite items disable with *\"DDL editing isn't supported for … yet\"*.",
+          "**Driver support** — sidebar DDL is live on **Postgres and DuckDB**; MySQL/SQLite/SQL Server items disable with *\"DDL editing isn't supported for … yet\"*.",
           "**DuckDB engine limits** — individually disabled with a reason: add/drop/rename constraints (*\"define them in CREATE TABLE\"*), rename index or sequence, `ALTER SEQUENCE RESTART`, `CREATE DATABASE` (*\"DuckDB attaches database files rather than CREATE DATABASE\"*). Duplicate uses `CREATE TABLE … AS SELECT`; multi-action ALTERs split into one statement each.",
           "**Postgres effective privileges** — Tusk fetches your role's real privileges (membership, `PUBLIC`, ownership): *Modify/Add/Rename/Drop* need table ownership, *Duplicate* and *Create table* need `CREATE` on the schema, *Truncate* accepts the `TRUNCATE` grant or ownership, *New schema* needs `CREATE` on the database, *New database* needs `CREATEDB`. Tooltips state the missing right, e.g. *\"Requires ownership of orders\"*."
         ],
@@ -1118,7 +1134,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**Copy DDL** rebuilds a runnable `CREATE` from the system catalogs on every engine — Postgres pg_dump-style from `pg_catalog`, SQLite via `sqlite_master`, MySQL via `SHOW CREATE`, DuckDB best-effort. On Postgres it covers tables (identity/generated/serial defaults, inline PK/unique/check), views, matviews, functions (including overloads), and sequences; **foreign keys emit as trailing `ALTER TABLE … ADD CONSTRAINT`** (so copied tables replay in any order) and constraint-backed indexes are skipped."
+        "md": "**Copy DDL** rebuilds a runnable `CREATE` from the system catalogs on every engine — Postgres pg_dump-style from `pg_catalog`, SQLite via `sqlite_master`, MySQL via `SHOW CREATE`, SQL Server reconstructed from `sys.*` (with `sys.sql_modules` text for views, procedures and functions), DuckDB best-effort. On Postgres it covers tables (identity/generated/serial defaults, inline PK/unique/check), views, matviews, functions (including overloads), and sequences; **foreign keys emit as trailing `ALTER TABLE … ADD CONSTRAINT`** (so copied tables replay in any order) and constraint-backed indexes are skipped."
       },
       {
         "k": "tip",
@@ -1202,7 +1218,7 @@ export const TOPICS: Topic[] = [
         "ordered": false,
         "items": [
           "**Loaded rows (N)** — formats what the grid currently holds, in memory.",
-          "**All rows (re-run query)** — re-executes server-side. Postgres streams via a dedicated cursor (`tusk_export_cur`) in **10,000-row batches** (constant memory); DuckDB, SQLite, and MySQL page via `LIMIT`/`OFFSET`. This scope is frozen while a manual transaction owns the session; export Loaded rows instead."
+          "**All rows (re-run query)** — re-executes server-side. Postgres streams via a dedicated cursor (`tusk_export_cur`) in **10,000-row batches** (constant memory); DuckDB, SQLite, and MySQL page via `LIMIT`/`OFFSET`, SQL Server via `OFFSET`/`FETCH`. This scope is frozen while a manual transaction owns the session; export Loaded rows instead."
         ]
       },
       {
@@ -1212,7 +1228,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "On the paged engines (DuckDB, SQLite, MySQL) the all-rows export is **not snapshot-consistent** — concurrent writes between pages can skew it. Postgres streams inside one transaction."
+        "md": "On the paged engines (DuckDB, SQLite, MySQL, SQL Server) the all-rows export is **not snapshot-consistent** — concurrent writes between pages can skew it. Postgres streams inside one transaction."
       },
       {
         "k": "p",
@@ -1225,7 +1241,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "During an all-rows stream the dialog locks its controls and shows **Cancel export**. Postgres gets an immediate `CancelRequest`, DuckDB the equivalent interrupt; SQLite and MySQL have no out-of-band cancel, so the current query finishes first."
+        "md": "During an all-rows stream the dialog locks its controls and shows **Cancel export**. Postgres gets an immediate `CancelRequest`, DuckDB the equivalent interrupt; SQLite, MySQL, and SQL Server have no out-of-band cancel, so the current query finishes first."
       },
       {
         "k": "p",
@@ -1313,6 +1329,11 @@ export const TOPICS: Topic[] = [
             "MySQL",
             "`EXPLAIN FORMAT=JSON …`",
             "`EXPLAIN ANALYZE …`"
+          ],
+          [
+            "SQL Server",
+            "— not supported; Explain reports that T-SQL has no `EXPLAIN` and Tusk can't render SHOWPLAN output yet",
+            "— not supported"
           ],
           [
             "SQLite",
@@ -1555,6 +1576,7 @@ export const TOPICS: Topic[] = [
           "**Postgres** — `pg_constraint`, column lists in declared key order.",
           "**SQLite** — `pragma_foreign_key_list`; a FK that omits target columns resolves to the referenced table's PK.",
           "**MySQL** — `information_schema.KEY_COLUMN_USAGE`.",
+          "**SQL Server** — `sys.foreign_keys` joined to `sys.foreign_key_columns`.",
           "**DuckDB** — `duckdb_constraints()` structured columns, falling back to parsing the constraint text."
         ],
         "ordered": false
@@ -1760,7 +1782,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**Your skills** — the ones in scope, first, as above.",
-          "**Dialect + version** — driver label, server version, and a quoting note (backticks on MySQL, double quotes elsewhere).",
+          "**Dialect + version** — driver label, server version, and a quoting note (backticks on MySQL, brackets on SQL Server, double quotes elsewhere).",
           "**Your role** — user name, superuser flag, and (on Postgres) whether privileges are enforced; a limited role gets an explicit \"prefer reads, warn before writes/DDL\" instruction.",
           "**Active schema** — the tab's search-path schema, so bare table names resolve as your queries do.",
           "**Schema summary** — `schema.table(col type, …)` lines up to a **12,000-character budget**, relevance-ranked: tables named in the conversation get full columns first. Tables past the budget are still listed by name.",
@@ -2039,7 +2061,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "Config edits (allowlists, caps, timeout, policy, AI provider, sample consent) reload per-question. Replacing tokens validates them and restarts the running bot; restart failure stops and disables it.",
-          "The timeout only preempts the async network drivers (Postgres/MySQL) — **DuckDB and SQLite run synchronously**, so a pathological embedded query holds the connection until it finishes (the timeout message notes the server may still be finishing it).",
+          "The timeout only preempts the async network drivers (Postgres/MySQL/SQL Server) — **DuckDB and SQLite run synchronously**, so a pathological embedded query holds the connection until it finishes (the timeout message notes the server may still be finishing it).",
           "The bot lives inside the desktop app — Tusk must be **open and connected**.",
           "One Slack query at a time (events handled sequentially)."
         ],
@@ -2492,7 +2514,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**Brand mark** — driver-adaptive mascot (🐘 Postgres, 🦆 DuckDB, 🪶 SQLite, 🐬 MySQL; same emoji in the OS window title)",
+          "**Brand mark** — driver-adaptive mascot (🐘 Postgres, 🦆 DuckDB, 🪶 SQLite, 🐬 MySQL, 🧱 SQL Server; same emoji in the OS window title)",
           "**Connection chip** — database name, or file basename / `:memory:` for embedded drivers",
           "Driver label + server version",
           "**🔒 Read-only** badge when the connection blocks writes and DDL",
@@ -2656,7 +2678,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "ordered": true,
         "items": [
-          "**Engine-level** — Postgres gets `SET default_transaction_read_only = on`; file-backed DuckDB opens with `AccessMode::ReadOnly`; SQLite with `SQLITE_OPEN_READ_ONLY`; MySQL applies `SET SESSION TRANSACTION READ ONLY` on every pooled connection.",
+          "**Engine-level** — Postgres gets `SET default_transaction_read_only = on`; file-backed DuckDB opens with `AccessMode::ReadOnly`; SQLite with `SQLITE_OPEN_READ_ONLY`; MySQL applies `SET SESSION TRANSACTION READ ONLY` on every pooled connection; SQL Server has no session-level equivalent, so there the uniform client guard below is the whole enforcement.",
           "**Statement classification** — read forms and non-writable manual transaction control pass; writes, writable transaction modes, DDL, and `COPY` reject before execution with *\"connection is read-only — writes and DDL are blocked\"*.",
           "**UI gating** — mutating sidebar items disable with a *\"Connection is read-only\"* tooltip; [[topic:grid-editing|in-grid editing]] refuses to start (the grid menu shows *\"connection is read-only\"*); imports are blocked by the backend (*\"connection is read-only — import blocked\"*)."
         ]
@@ -2690,7 +2712,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "tip",
-        "md": "DuckDB, SQLite, and MySQL have no comparable permission catalog — Tusk reports them unenforced and adds no UI restrictions. The read-only layers above still apply."
+        "md": "DuckDB, SQLite, MySQL, and SQL Server have no comparable permission catalog — Tusk reports them unenforced and adds no UI restrictions. The read-only layers above still apply."
       },
       {
         "k": "h",
@@ -2708,7 +2730,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "While a query runs, the Run button becomes **✕ Cancel** with a live elapsed counter. It sends a real **Postgres `CancelRequest`** over a fresh short-lived connection — the server actually stops the query; DuckDB fires its interrupt handle except on Windows, where unsafe interruption is disabled; SQLite and MySQL have no out-of-band cancel, so their queries run to completion. Cancelling work inside a PostgreSQL manual transaction normally leaves it in **Recovery required** until `ROLLBACK` or `ROLLBACK TO`. Where no out-of-band cancel exists — SQLite, MySQL, DuckDB on Windows — the button doesn't pretend: it shows a disabled **Running** timer instead of a Cancel, and a cancel the backend rejects resets the button with the reason rather than hanging on *Cancelling…*. `Mod-F2` is the shipped shortcut (Ctrl+Esc is reserved by Windows) and works while typing and while dialogs are open."
+        "md": "While a query runs, the Run button becomes **✕ Cancel** with a live elapsed counter. It sends a real **Postgres `CancelRequest`** over a fresh short-lived connection — the server actually stops the query; DuckDB fires its interrupt handle except on Windows, where unsafe interruption is disabled; SQLite, MySQL, and SQL Server have no out-of-band cancel, so their queries run to completion. Cancelling work inside a PostgreSQL manual transaction normally leaves it in **Recovery required** until `ROLLBACK` or `ROLLBACK TO`. Where no out-of-band cancel exists — SQLite, MySQL, SQL Server, DuckDB on Windows — the button doesn't pretend: it shows a disabled **Running** timer instead of a Cancel, and a cancel the backend rejects resets the button with the reason rather than hanging on *Cancelling…*. `Mod-F2` is the shipped shortcut (Ctrl+Esc is reserved by Windows) and works while typing and while dialogs are open."
       },
       {
         "k": "keys",
@@ -2796,6 +2818,20 @@ export const TOPICS: Topic[] = [
         "k": "tip",
         "kind": "tip",
         "md": "The updater shipped in v0.4.5 — earlier installs can't auto-update. Grab a fresh installer once; every version after keeps itself current."
+      },
+      {
+        "k": "h",
+        "text": "Unreleased — Microsoft SQL Server",
+        "id": "v-unreleased"
+      },
+      {
+        "k": "list",
+        "ordered": false,
+        "items": [
+          "**SQL Server is a connectable driver.** Pick **SQL Server** on the connect screen (port 1433, SQL login, keychain-stored password, the usual `sslmode` choices). Results page with `OFFSET`/`FETCH`, the Explorer shows schemas, tables and views with row counts and sizes, columns, indexes, constraints, triggers, sequences and routines, and Copy DDL reconstructs tables from `sys.*` with foreign keys as trailing `ALTER`s.",
+          "**The editor speaks T-SQL.** `[bracketed identifiers]`, `N'literals'`, nested block comments, and `GO` batch separators are handled by the same lexer that drives statement splitting, folding, linting and grid wrapping; `GO` never reaches the server, and a repeat count is refused.",
+          "**Manual transactions use T-SQL's vocabulary** — `BEGIN TRANSACTION`, `SAVE TRANSACTION`, `ROLLBACK TRANSACTION name` — verified against `@@TRANCOUNT` and `XACT_STATE()` after every statement. Explain is disabled there: T-SQL has no `EXPLAIN`."
+        ]
       },
       {
         "k": "h",
@@ -2901,8 +2937,8 @@ export const TOPICS: Topic[] = [
         "items": [
           "Post-update **What's new** panel — bundled changelog, offline, dismiss-once; reopen any time from the command palette.",
           "**AI reply max tokens** on the desktop (Settings → AI, 256–128,000) — same knob the Slack bot honors.",
-          "Cancel is honest per engine: a **Running** timer where cancel is impossible (SQLite, MySQL, DuckDB on Windows), a rejected cancel reports why, default [[kbd:Mod-F2]].",
-          "Engine-aware editor lexing (MySQL `#` comments and backslash escapes; backticks on MySQL/SQLite) and one shared active-schema resolver for completion, lint, and grid editing.",
+          "Cancel is honest per engine: a **Running** timer where cancel is impossible (SQLite, MySQL, SQL Server, DuckDB on Windows), a rejected cancel reports why, default [[kbd:Mod-F2]].",
+          "Engine-aware editor lexing (MySQL `#` comments and backslash escapes; backticks on MySQL/SQLite; T-SQL brackets, nested comments and `GO`) and one shared active-schema resolver for completion, lint, and grid editing.",
           "`WHERE a = 1, b = 2` squiggles instantly — the comma-for-AND typo is caught offline.",
           "Grid **Copy as X** is byte-identical to Export; empty strings stay distinct from NULL.",
           "Explorer DDL and full-query exports land in history as `-- [Explorer]` / `-- [Export]`.",
