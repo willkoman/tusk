@@ -2394,6 +2394,7 @@ mod tests {
             sslmode: None,
             read_only: false,
             path: Some(":memory:".into()),
+            ssh: None,
         };
         crate::driver::connect(&cfg).await.unwrap().0
     }

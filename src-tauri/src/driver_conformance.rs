@@ -1467,6 +1467,8 @@ async fn backup_restore_battery(b: &mut Backend, eng: &Eng) {
 
     let _ = std::fs::remove_file(&path);
     reset(b, &reset_sql).await;
+}
+
 /// Bulk file import (src/import.rs) against every engine: create-and-load, per-engine
 /// conflict handling (PostgreSQL `ON CONFLICT`, MySQL `INSERT IGNORE` / `ON DUPLICATE
 /// KEY UPDATE`, SQLite/DuckDB `INSERT OR IGNORE` / `OR REPLACE`), truncate-and-reload,
