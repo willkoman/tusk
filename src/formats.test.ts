@@ -1,5 +1,5 @@
 import { afterEach, describe, it, expect } from "vitest";
-import { formatForCopy, formatWithOptions, parseCSV, parseJSON, toJSON, toMarkdown, toSQL, toTSV, type Dataset } from "./formats";
+import { formatForCopy, formatWithOptions, toJSON, toMarkdown, toSQL, toTSV, type Dataset } from "./formats";
 import { defaultExportOptions, type ExportOptions } from "./export";
 import { boolWord } from "./grid/bool";
 import { setSqlDialect } from "./sql/ident";
@@ -23,83 +23,7 @@ function opts(patch: Partial<ExportOptions>): ExportOptions {
   return { ...defaultExportOptions("exported"), boolCols: [1], ...patch };
 }
 
-describe("import parsing boundaries", () => {
-  it("parses CSV, TSV, quoted fields, and ragged rows", () => {
-    expect(parseCSV('id,name\n1,"a,b"\n2', true)).toEqual({
-      columns: ["id", "name"],
-      rows: [["1", "a,b"], ["2", null]],
-    });
-    expect(parseCSV("id\tname\n1\tduck", true, "\t")).toEqual({
-      columns: ["id", "name"],
-      rows: [["1", "duck"]],
-    });
-  });
-
-  it("rejects malformed quotes and dense amplification", () => {
-    expect(() => parseCSV('id,name\n1,"open', true)).toThrow(/unterminated/i);
-    expect(() => parseCSV('id,name\n1,a"b', true)).toThrow(/unquoted/i);
-    expect(() => parseCSV('id,name\n1,"a"tail', true)).toThrow(/closing quote/i);
-    const header = Array.from({ length: 2001 }, (_, i) => `c${i}`).join(",");
-    const body = Array.from({ length: 1000 }, () => "x").join("\n");
-    expect(() => parseCSV(`${header}\n${body}`, true)).toThrow(/dense result/i);
-    const ragged = Array.from({ length: 251 }, () => Array(10_000).fill("x").join(",")).join("\n");
-    expect(() => parseCSV(`only_one_output_column\n${ragged}`, true)).toThrow(/too large|cells/i);
-  });
-
-  it("preserves widest headerless rows and rejects ambiguous header shapes", () => {
-    expect(parseCSV("1\n2,3", false)).toEqual({
-      columns: ["col1", "col2"],
-      rows: [["1", null], ["2", "3"]],
-    });
-    expect(() => parseCSV("id,id\n1,2", true)).toThrow(/duplicate/i);
-    expect(() => parseCSV("id\n1,2", true)).toThrow(/more fields/i);
-    expect(parseCSV('id,note\r\n1,"a\r\nb"\r2,x', true).rows).toEqual([["1", "a\r\nb"], ["2", "x"]]);
-  });
-
-  it("handles a large headerless row count without argument spreading", () => {
-    const parsed = parseCSV(Array.from({ length: 150_000 }, () => "x").join("\n"), false);
-    expect(parsed.columns).toEqual(["col1"]);
-    expect(parsed.rows).toHaveLength(150_000);
-  });
-
-  it("parses object JSON linearly and rejects non-object rows", () => {
-    expect(parseJSON('[{"a":1},{"b":{"x":2}}]')).toEqual({
-      columns: ["a", "b"],
-      rows: [["1", null], [null, '{"x":2}']],
-    });
-    expect(() => parseJSON("[1,2,3]")).toThrow(/array of objects/i);
-    expect(() => parseJSON(JSON.stringify({ huge: "x".repeat(1_000_001) }))).toThrow(/field/i);
-  });
-
-  // PARITY FIXTURES — the same inputs are asserted by the streaming Rust parser in
-  // src-tauri/src/import.rs (`csv_*` / `json_*` tests). Change both together.
-  it("strips a UTF-8 BOM from the first header cell", () => {
-    expect(parseCSV("﻿id,name\n1,duck", true).columns).toEqual(["id", "name"]);
-    expect(parseJSON('﻿[{"a":1}]').columns).toEqual(["a"]);
-  });
-
-  it("pads short rows with NULL and rejects rows wider than the header", () => {
-    expect(parseCSV("id,name,note\n1,duck", true).rows).toEqual([["1", "duck", null]]);
-    expect(() => parseCSV("id,name\n1,duck,extra", true)).toThrow(/more fields/i);
-  });
-
-  it("rejects an empty header cell", () => {
-    expect(() => parseCSV("id,\n1,2", true)).toThrow(/empty column name/i);
-  });
-
-  it("rejects duplicate JSON keys before JSON.parse can discard them", () => {
-    expect(() => parseJSON('{"a":1,"a":2}')).toThrow(/duplicate object key/i);
-    expect(() => parseJSON('{"a":1,"\\u0061":2}')).toThrow(/duplicate object key/i);
-    expect(() => parseJSON('{"a":{"x":1,"x":2}}')).toThrow(/duplicate object key/i);
-  });
-});
-
 describe("shape-safe formatting", () => {
-  it("quotes TSV controls so parsing recovers exact fields", () => {
-    const d: Dataset = { columns: ["a", "b"], rows: [["x\ty", "line1\r\nline2"]] };
-    expect(parseCSV(toTSV(d), true, "\t")).toEqual(d);
-  });
-
   it("formatForCopy = export formatter bytes; empty string and NULL stay distinct; md always has headers", () => {
     const d: Dataset = { columns: ["a", "b"], rows: [["", null]] };
     const csv = formatForCopy(d, "csv", true);

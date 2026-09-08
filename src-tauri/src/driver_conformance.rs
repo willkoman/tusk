@@ -1698,6 +1698,59 @@ async fn import_battery(b: &mut Backend, eng: &Eng) {
         eng.name
     );
 
+    // 6. A create-and-load that fails mid-load: the ROWS must never survive. MySQL
+    //    commits DDL immediately, so its (deliberately pre-transaction) CREATE stays and
+    //    the error says so; the other three engines roll the table back with the rows.
+    let fresh = format!("{}.{}", q(eng.schema), q("imp_fresh"));
+    let _ = b
+        .run_single(&format!("DROP TABLE IF EXISTS {fresh}"), 10, false)
+        .await;
+    b.rollback_cursor().await;
+    let mut create_fail = target(true, false, "error");
+    create_fail.table = "imp_fresh".to_string();
+    let err = run_import(b, &request(&broken, create_fail), &cancel, |_| {})
+        .await
+        .unwrap_err();
+    assert!(
+        err.message.contains("not a valid integer"),
+        "[{}] {}",
+        eng.name,
+        err.message
+    );
+    b.rollback_cursor().await;
+    let loaded = b
+        .run_single(&format!("SELECT COUNT(*) FROM {fresh}"), 10, true)
+        .await;
+    if eng.name == "mysql" {
+        assert!(
+            err.message.contains("still exists"),
+            "[{}] MySQL must report the separately committed CREATE: {}",
+            eng.name,
+            err.message
+        );
+        match loaded {
+            Ok(crate::db::QueryOutcome::Rows { rows, .. }) => assert_eq!(
+                cell(&rows[0], 0).as_deref(),
+                Some("0"),
+                "[{}] the rows must still roll back",
+                eng.name
+            ),
+            other => panic!(
+                "[{}] expected the committed empty table: {other:?}",
+                eng.name
+            ),
+        }
+        b.rollback_cursor().await;
+        exec(b, &format!("DROP TABLE {fresh}")).await;
+    } else {
+        assert!(
+            loaded.is_err(),
+            "[{}] a failed create import must leave no table",
+            eng.name
+        );
+    }
+    b.rollback_cursor().await;
+
     exec(b, &format!("DROP TABLE {table}")).await;
 }
 

@@ -71,6 +71,8 @@ fn embedded_script<C>(
 pub struct Capabilities {
     pub kind: &'static str,
     pub server_cursor: bool,
+    /// The engine has a server-side bulk-copy protocol (PostgreSQL `COPY`). File import
+    /// works on every engine regardless — this only says which loader path is used.
     pub bulk_copy: bool,
     pub export: bool,
     pub schemas: bool,
@@ -123,8 +125,8 @@ impl Capabilities {
         Self {
             kind: "duckdb",
             server_cursor: false, // paged via LIMIT/OFFSET, not a server cursor
-            bulk_copy: false,     // import not yet abstracted for DuckDB
-            export: true,         // paged export (export::run_export_paged)
+            bulk_copy: false,
+            export: true, // paged export (export::run_export_paged)
             schemas: true,
             search_path: false,
             transactional_ddl: true,

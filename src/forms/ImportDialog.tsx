@@ -28,6 +28,8 @@ type Step = "source" | "mapping" | "run";
 type Mode = "existing" | "new";
 
 const SKIP = "-";
+/** Columns rendered in the preview grid. The mapping table still lists every one. */
+const PREVIEW_COLUMNS = 60;
 
 /**
  * Multi-step file import: choose a file and parsing options, review the parsed preview,
@@ -64,7 +66,9 @@ export function ImportDialog(props: {
   const [err, setErr] = createSignal("");
   const [summary, setSummary] = createSignal<ImportSummary | null>(null);
 
-  const [mode, setMode] = createSignal<Mode>(props.initialTarget ? "existing" : "new");
+  // An Explorer schema node passes its schema with no table: that means "new table HERE",
+  // not "pick an existing one".
+  const [mode, setMode] = createSignal<Mode>(props.initialTarget?.name ? "existing" : "new");
   const [schema, setSchema] = createSignal(props.initialTarget?.schema ?? props.defaultSchema);
   const [table, setTable] = createSignal(props.initialTarget?.name ?? "");
   const [truncate, setTruncate] = createSignal(false);
@@ -93,30 +97,41 @@ export function ImportDialog(props: {
     await reparse(picked);
   }
 
+  // Every option change fires a preview; two in-flight parses can resolve in either
+  // order, so a stale one must never overwrite the preview OR the mapping derived
+  // from it.
+  let previewGeneration = 0;
+
   async function reparse(target = path()) {
     if (!target) return;
+    const generation = ++previewGeneration;
+    const current = () => generation === previewGeneration;
     setBusy(true);
     setErr("");
     try {
       const p = await props.onPreview(target, { ...options(), sourceColumns: [] });
+      if (!current()) return;
       setPreview(p);
       // A new target table mirrors the file; an existing one keeps its own columns.
       if (mode() === "new") setMapping(newTableMapping(p.columns, inferTypes(p.columns, p.rows)));
-      else if (table()) await loadTargetColumns(p);
+      else if (table()) await loadTargetColumns(p, current);
     } catch (e) {
+      if (!current()) return;
       setPreview(null);
       setErr(message(e));
     } finally {
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   }
 
-  async function loadTargetColumns(p = preview()) {
+  async function loadTargetColumns(p = preview(), current: () => boolean = () => true) {
     if (!p || !table()) return;
     try {
       const columns = await props.onTargetColumns(schema(), table());
+      if (!current()) return;
       setMapping(existingTableMapping(p.columns, columns));
     } catch (e) {
+      if (!current()) return;
       setErr(message(e));
       setMapping([]);
     }
@@ -196,6 +211,9 @@ export function ImportDialog(props: {
     }
   }
 
+  /** The preview grid is bounded; a 10,000-column file must not render 10,000 `<th>`. */
+  const previewColumns = (p: ImportPreview) => p.columns.slice(0, PREVIEW_COLUMNS);
+
   const percent = () => {
     const p = props.progress();
     if (!p || !p.totalBytes) return 0;
@@ -251,12 +269,12 @@ export function ImportDialog(props: {
                         onChange={(e) => { set({ customDelimiter: e.currentTarget.value }); void reparse(); }} />
                     </label>
                   </Show>
-                  <label>Quote
-                    <input class="export-narrow" maxLength={1} value={options().quoteChar}
+                  <label title="Blank turns quoting off entirely — every delimiter and quote byte is literal field content.">Quote
+                    <input class="export-narrow" maxLength={1} placeholder="none" value={options().quoteChar}
                       onChange={(e) => { set({ quoteChar: e.currentTarget.value }); void reparse(); }} />
                   </label>
-                  <label>Escape
-                    <input class="export-narrow" maxLength={1} placeholder='""' value={options().escapeChar}
+                  <label title="Backslash-style escape inside a quoted field. Blank uses RFC 4180 doubled quotes; it must differ from both the quote character and the delimiter.">Escape
+                    <input class="export-narrow" maxLength={1} placeholder="none" value={options().escapeChar}
                       onChange={(e) => { set({ escapeChar: e.currentTarget.value }); void reparse(); }} />
                   </label>
                 </Show>
@@ -304,15 +322,16 @@ export function ImportDialog(props: {
                 <div class="export-label">
                   Preview — {p().columns.length} columns, first {p().rows.length} row{p().rows.length === 1 ? "" : "s"}
                   {p().truncated ? " (more follow)" : ""}
+                  {p().columns.length > PREVIEW_COLUMNS ? `, showing ${PREVIEW_COLUMNS}` : ""}
                 </div>
                 <div class="import-preview">
                   <table>
-                    <thead><tr><For each={p().columns}>{(c) => <th>{c}</th>}</For></tr></thead>
+                    <thead><tr><For each={previewColumns(p())}>{(c) => <th>{c}</th>}</For></tr></thead>
                     <tbody>
                       <For each={p().rows.slice(0, 20)}>
                         {(row) => (
                           <tr>
-                            <For each={p().columns}>
+                            <For each={previewColumns(p())}>
                               {(_, i) => <td classList={{ "import-null": row[i()] === null }}>{row[i()] ?? "NULL"}</td>}
                             </For>
                           </tr>
@@ -506,6 +525,17 @@ export function ImportDialog(props: {
                 <div><b>{s().rowsInserted.toLocaleString()}</b> rows written into {table()}.</div>
                 <Show when={s().rowsSkipped > 0}>
                   <div>{s().rowsSkipped.toLocaleString()} row(s) skipped by the conflict rule.</div>
+                </Show>
+                <Show when={s().createdOutsideTransaction}>
+                  <div>
+                    MySQL commits DDL immediately, so <b>{table()}</b> was created as a separate,
+                    already-committed step before the rows were loaded in one transaction.
+                  </div>
+                </Show>
+                <Show when={s().warnings.length}>
+                  <ul class="import-warnings">
+                    <For each={s().warnings}>{(w) => <li>{w}</li>}</For>
+                  </ul>
                 </Show>
               </div>
             )}
