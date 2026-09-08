@@ -12,6 +12,9 @@ mod relgraph;
 mod script;
 mod skills;
 mod slack;
+mod ssh;
+#[cfg(test)]
+mod ssh_tests;
 mod tree;
 
 use std::collections::HashMap;
@@ -482,11 +485,13 @@ async fn connect(
     config: ConnectionConfig,
 ) -> Result<ConnectResult, AppError> {
     let read_only = config.read_only;
+    let via_ssh = config.tunnelled();
     let (backend, server_version) = driver::connect(&config).await?;
     Ok(ConnectResult {
         connection_id: state.register(backend, read_only),
         server_version,
         read_only,
+        via_ssh,
     })
 }
 
@@ -512,6 +517,20 @@ async fn connect_profile(
             "couldn't read the saved password from the keychain (macOS may block keychain access for unsigned dev builds) — reconnect via the form, or re-save the connection",
         ));
     }
+    // The SSH secret lives under its own keychain account and is loaded the same way:
+    // server-side only, never handed back to the frontend.
+    let mut ssh = p.ssh.clone();
+    if let Some(ssh) = ssh.as_mut() {
+        if p.save_ssh_secret {
+            let secret = profiles::get_ssh_secret(&id).unwrap_or_default();
+            if secret.is_empty() && !matches!(ssh.auth_method(), Ok(ssh::SshAuth::Agent)) {
+                return Err(AppError::new(
+                    "couldn't read the saved SSH secret from the keychain — reconnect via the form, or re-save the connection",
+                ));
+            }
+            ssh.set_secret(secret);
+        }
+    }
     let config = ConnectionConfig {
         driver: p.driver.clone(),
         host: p.host,
@@ -522,14 +541,24 @@ async fn connect_profile(
         sslmode: p.sslmode,
         read_only: p.read_only,
         path: p.path.clone(),
+        ssh,
     };
     let read_only = config.read_only;
+    let via_ssh = config.tunnelled();
     let (backend, server_version) = driver::connect(&config).await?;
     Ok(ConnectResult {
         connection_id: state.register(backend, read_only),
         server_version,
         read_only,
+        via_ssh,
     })
+}
+
+/// Record an SSH host key the user explicitly accepted after seeing its fingerprint.
+/// Only reachable from the unknown-host prompt; a CHANGED key never offers this path.
+#[tauri::command]
+async fn ssh_trust_host(host: String, port: u16, fingerprint: String) -> Result<(), AppError> {
+    ssh::trust_host(&host, port, &fingerprint)
 }
 
 #[tauri::command]
@@ -579,8 +608,9 @@ async fn save_profile(
     app: tauri::AppHandle,
     profile: Profile,
     password: Option<String>,
+    ssh_secret: Option<String>,
 ) -> Result<Profile, AppError> {
-    profiles::upsert(&app, profile, password)
+    profiles::upsert(&app, profile, password, ssh_secret)
 }
 
 #[tauri::command]
@@ -1271,6 +1301,7 @@ mod bind_param_tests {
             sslmode: Some("verify-full".into()),
             read_only: false,
             path: None,
+            ssh: None,
         };
         assert!(cfg.validate().is_ok());
         cfg.sslmode = Some("verfy-full".into());
@@ -1293,6 +1324,7 @@ mod bind_param_tests {
             sslmode: None,
             read_only: false,
             path: Some(":memory:".into()),
+            ssh: None,
         }
     }
 
@@ -1373,6 +1405,7 @@ mod bind_param_tests {
             sslmode: None,
             read_only: false,
             path: Some(path.to_string_lossy().into_owned()),
+            ssh: None,
         };
         let (mut backend, _) = driver::connect(&cfg).await.unwrap();
         backend
@@ -2325,6 +2358,11 @@ pub fn run() {
         .manage(ai::AiCancels::default())
         .setup(|app| {
             crash::install(app.handle());
+            // Publish the app-config directory to the SSH module before any connect can
+            // run, so host-key trust decisions have somewhere to live.
+            if let Ok(dir) = tauri::Manager::path(app).app_config_dir() {
+                ssh::set_trust_dir(dir);
+            }
             // Auto-start the Slack bot when enabled + tokens saved. Failures are
             // non-fatal: the settings pane shows the status and can retry.
             let handle = app.handle().clone();
@@ -2347,6 +2385,7 @@ pub fn run() {
             list_profiles,
             save_profile,
             delete_profile,
+            ssh_trust_host,
             run_query,
             validate_sql,
             fetch_more,

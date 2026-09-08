@@ -39,6 +39,17 @@ import { detectParams, type Param, type ParamValue } from "./sql/params";
 import { type FkEdge } from "./sql/fk";
 import { type Skill } from "./ai/skills";
 import { ParamDialog } from "./forms/ParamDialog";
+import {
+  SshSection,
+  emptySshForm,
+  sshFormFromProfile,
+  sshNeedsSecret,
+  sshPayload,
+  validateSshForm,
+  type SshFormState,
+  type SshMeta,
+} from "./forms/SshSection";
+import { SshHostKeyDialog, type SshHostKeyPrompt } from "./forms/SshHostKeyDialog";
 import { detectPlan } from "./plan/detect";
 import { explainSql, analyzeExecutesWrite, isSingleExplainStatement } from "./plan/explainSql";
 import { Dialog, SqlPreview } from "./Dialog";
@@ -84,12 +95,15 @@ type Profile = {
   default_connect: boolean;
   driver?: string | null;
   path?: string | null;
+  ssh?: SshMeta | null;
+  save_ssh_secret: boolean;
 };
 type QueryOutcome =
   | { kind: "rows"; columns: string[]; rows: (string | null)[][]; done: boolean; note?: string }
   | { kind: "exec"; message: string };
 type QueryResult = QueryOutcome & { transaction: TransactionStatus };
 type FetchResult = { rows: (string | null)[][]; done: boolean; interrupted?: boolean; transaction: TransactionStatus };
+type ConnectReply = { connection_id: string; server_version: string; read_only: boolean; viaSsh?: boolean };
 type Connected = {
   id: string;
   version: string;
@@ -98,6 +112,8 @@ type Connected = {
   generation: number;
   key: string;
   target: string;
+  /** The session reaches the database through an SSH tunnel (drives the "via SSH" badge). */
+  viaSsh: boolean;
 };
 type UiOrigin = {
   connectionId: string | null;
@@ -321,6 +337,35 @@ function App() {
   const [defaultConnect, setDefaultConnect] = createSignal(false);
   const [connecting, setConnecting] = createSignal(false);
   const [connErr, setConnErr] = createSignal("");
+  // SSH tunnel section of the connect form + the first-contact host-key prompt.
+  const [ssh, setSshState] = createSignal<SshFormState>(emptySshForm());
+  const patchSsh = (patch: Partial<SshFormState>) => setSshState((s) => ({ ...s, ...patch }));
+  // True while editing a profile that already has an SSH secret in the keychain — drives
+  // the masked "(stored)" placeholder, exactly like the database password.
+  const [sshSecretStored, setSshSecretStored] = createSignal(false);
+  // Set when a connect attempt failed on an unknown host key. `retry` re-runs the exact
+  // attempt that failed, so Trust never redirects to a different destination.
+  const [sshPrompt, setSshPrompt] = createSignal<{ prompt: SshHostKeyPrompt; retry: () => Promise<void> } | null>(null);
+  /** The structured unknown-host payload, when a rejection carries one. */
+  const sshHostKeyOf = (e: unknown): SshHostKeyPrompt | null => {
+    if (!e || typeof e !== "object" || !("sshHostKey" in e)) return null;
+    const p = (e as { sshHostKey?: unknown }).sshHostKey;
+    if (!p || typeof p !== "object") return null;
+    const { host, port, algorithm, fingerprint } = p as Record<string, unknown>;
+    if (typeof host !== "string" || typeof port !== "number") return null;
+    if (typeof algorithm !== "string" || typeof fingerprint !== "string") return null;
+    return { host, port, algorithm, fingerprint };
+  };
+  /** Run a connect attempt, and on an unknown host key offer Trust + the same retry. */
+  async function connectWithHostKeyPrompt(attempt: () => Promise<void>) {
+    try {
+      await attempt();
+    } catch (e) {
+      const prompt = sshHostKeyOf(e);
+      if (!prompt) throw e;
+      setSshPrompt({ prompt, retry: attempt });
+    }
+  }
 
   // workspace
   const [tree, setTree] = createSignal<DbTree | null>(null);
@@ -1647,6 +1692,8 @@ function App() {
     setSslmode("prefer");
     setReadOnly(false);
     setDefaultConnect(false);
+    setSshState(emptySshForm());
+    setSshSecretStored(false);
     setConnErr("");
   }
 
@@ -1664,25 +1711,35 @@ function App() {
     setSslmode(p.sslmode ?? "prefer");
     setReadOnly(p.read_only);
     setDefaultConnect(p.default_connect);
+    // Metadata round-trips; the secret stays in the keychain and the field stays blank.
+    setSshState(sshFormFromProfile(p.ssh, p.save_ssh_secret));
+    setSshSecretStored(!!p.ssh && p.save_ssh_secret && sshNeedsSecret(p.ssh.auth));
     setConnErr("");
   }
 
   const isEmbeddedDriver = (d?: string | null) => d === "duckdb" || d === "sqlite";
 
+  /** A tunnel that authenticates with a password or key passphrase can only connect
+   *  unattended when that secret is in the keychain; otherwise the form must ask. */
+  const sshSecretMissing = (p: Profile) =>
+    !!p.ssh && sshNeedsSecret(p.ssh.auth) && !p.save_ssh_secret;
+
   function useProfile(p: Profile) {
     // Embedded profiles need no password; saved-password profiles connect directly.
-    if (isEmbeddedDriver(p.driver) || p.save_password) connectProfile(p.id);
+    if (isEmbeddedDriver(p.driver)) connectProfile(p.id);
+    else if (p.save_password && !sshSecretMissing(p)) connectProfile(p.id);
     else editProfile(p);
   }
 
   async function afterConnect(
-    r: { connection_id: string; server_version: string; read_only: boolean },
+    r: ConnectReply,
     meta: { key: string; legacyKey: string | null; target: string; driver: string },
   ) {
     const connected: Connected = {
       id: r.connection_id,
       version: r.server_version,
       readOnly: r.read_only,
+      viaSsh: !!r.viaSsh,
       driver: meta.driver,
       generation: ++connectionGeneration,
       key: meta.key,
@@ -1808,6 +1865,14 @@ function App() {
       if (!isFile && (!Number.isInteger(networkPort) || networkPort < 1 || networkPort > 65535)) {
         throw new Error("port must be a whole number between 1 and 65535");
       }
+      // Tunnel settings are frozen with the rest of the submission, so a Trust-and-retry
+      // can only ever re-run the attempt the user actually made.
+      const submittedSsh = isFile ? null : ssh();
+      if (submittedSsh) {
+        const problem = validateSshForm(submittedSsh);
+        if (problem) throw new Error(problem);
+      }
+      const sshConfig = submittedSsh ? sshPayload(submittedSsh, true) : null;
       const config = isFile
         ? { driver: submittedDriver, path: submittedPath, read_only: readOnly() }
         : {
@@ -1819,18 +1884,26 @@ function App() {
             dbname: submittedDatabase,
             sslmode: sslmode(),
             read_only: readOnly(),
+            ssh: sshConfig,
           };
       const submittedLegacyKey = isFile
         ? `adhoc:${submittedDriver}:${submittedPath || ":memory:"}`
         : `adhoc:${submittedHost}:${networkPort}:${submittedDatabase}:${submittedUser}`;
+      // A tunnelled connection is a different destination than the same host/port
+      // reached directly, so it gets its own key. The suffix is appended only when a
+      // tunnel is in play, which leaves every existing key byte-identical.
       const submittedKey = `adhoc:${JSON.stringify(isFile
         ? [submittedDriver, submittedPath || ":memory:"]
-        : [submittedDriver, submittedHost, networkPort, submittedDatabase, submittedUser])}`;
-      const r = await invoke<{ connection_id: string; server_version: string; read_only: boolean }>("connect", { config });
+        : sshConfig
+          ? [submittedDriver, submittedHost, networkPort, submittedDatabase, submittedUser, "ssh", sshConfig.host, sshConfig.port, sshConfig.user]
+          : [submittedDriver, submittedHost, networkPort, submittedDatabase, submittedUser])}`;
       const submittedTarget = isFile
         ? basename(submittedPath || ":memory:")
         : submittedDatabase || submittedHost;
-      await afterConnect(r, { key: submittedKey, legacyKey: submittedLegacyKey, target: submittedTarget, driver: submittedDriver });
+      await connectWithHostKeyPrompt(async () => {
+        const r = await invoke<ConnectReply>("connect", { config });
+        await afterConnect(r, { key: submittedKey, legacyKey: submittedLegacyKey, target: submittedTarget, driver: submittedDriver });
+      });
     } catch (e) {
       setConnErr(errMsg(e));
     } finally {
@@ -1857,14 +1930,13 @@ function App() {
     setConnErr("");
     try {
       const profile = profiles().find((p) => p.id === id);
-      const r = await invoke<{ connection_id: string; server_version: string; read_only: boolean }>(
-        "connect_profile",
-        { id },
-      );
       const target = profile
         ? isEmbeddedDriver(profile.driver) ? basename(profile.path || ":memory:") : profile.dbname || profile.host
         : id;
-      await afterConnect(r, { key: `profile:${id}`, legacyKey: null, target, driver: profile?.driver ?? "postgres" });
+      await connectWithHostKeyPrompt(async () => {
+        const r = await invoke<ConnectReply>("connect_profile", { id });
+        await afterConnect(r, { key: `profile:${id}`, legacyKey: null, target, driver: profile?.driver ?? "postgres" });
+      });
     } catch (e) {
       setConnErr(errMsg(e));
     } finally {
@@ -1880,6 +1952,12 @@ function App() {
       if (!embedded && (!Number.isInteger(networkPort) || networkPort < 1 || networkPort > 65535)) {
         throw new Error("port must be a whole number between 1 and 65535");
       }
+      const sshState = embedded ? null : ssh();
+      if (sshState) {
+        const problem = validateSshForm(sshState);
+        if (problem) throw new Error(problem);
+      }
+      const saveSshSecret = !!sshState?.enabled && sshState.saveSecret && sshNeedsSecret(sshState.auth);
       const p = await invoke<Profile>("save_profile", {
         profile: {
           id: editingId(),
@@ -1894,10 +1972,15 @@ function App() {
           default_connect: defaultConnect(),
           driver: driver(),
           path: embedded ? path() || null : null,
+          // Metadata only — the secret travels in `sshSecret` and lands in the keychain.
+          ssh: sshState ? sshPayload(sshState, false) : null,
+          save_ssh_secret: saveSshSecret,
         },
         password: !embedded && savePassword() && password() ? password() : null,
+        sshSecret: saveSshSecret && sshState?.secret ? sshState.secret : null,
       });
       setEditingId(p.id);
+      setSshSecretStored(!!p.ssh && p.save_ssh_secret && sshNeedsSecret(p.ssh.auth));
       await loadProfiles();
     } catch (e) {
       setConnErr(errMsg(e));
@@ -3520,8 +3603,9 @@ function App() {
   async function duplicateProfile(p: Profile) {
     try {
       await invoke("save_profile", {
-        profile: { id: "", name: `${p.name} copy`, host: p.host, port: p.port, user: p.user, dbname: p.dbname, save_password: false, sslmode: p.sslmode, read_only: p.read_only, default_connect: false, driver: p.driver ?? "postgres", path: p.path ?? null },
+        profile: { id: "", name: `${p.name} copy`, host: p.host, port: p.port, user: p.user, dbname: p.dbname, save_password: false, sslmode: p.sslmode, read_only: p.read_only, default_connect: false, driver: p.driver ?? "postgres", path: p.path ?? null, ssh: p.ssh ?? null, save_ssh_secret: false },
         password: null,
+        sshSecret: null,
       });
       await loadProfiles();
     } catch (e) {
@@ -3530,7 +3614,7 @@ function App() {
   }
   async function setProfileDefault(p: Profile, val: boolean) {
     try {
-      await invoke("save_profile", { profile: { ...p, default_connect: val }, password: null });
+      await invoke("save_profile", { profile: { ...p, default_connect: val }, password: null, sshSecret: null });
       await loadProfiles();
     } catch (e) {
       setConnErr(errMsg(e));
@@ -3665,6 +3749,7 @@ function App() {
                           </div>
                           <div class="profile-sub">
                             <span>{isEmbeddedDriver(p.driver) ? (p.path || ":memory:") : `${p.user}@${p.host}:${p.port}/${p.dbname}`}</span>
+                            <Show when={p.ssh}>{(t) => <span class="chip-ssh" title={`Tunnelled through ${t().user}@${t().host}:${t().port}`}>SSH</span>}</Show>
                             <Show when={p.save_password}><Icon name="lock" /></Show>
                           </div>
                         </div>
@@ -3755,6 +3840,14 @@ function App() {
                 </label>
                 <div class="empty-hint">Leave blank for a scratch in-memory database.</div>
               </Show>
+              <Show when={!isEmbeddedDriver(driver())}>
+                <SshSection
+                  state={ssh()}
+                  onChange={patchSsh}
+                  hasStoredSecret={sshSecretStored()}
+                  onError={setConnErr}
+                />
+              </Show>
               <label class="checkbox"><input type="checkbox" checked={readOnly()} onChange={(e) => setReadOnly(e.currentTarget.checked)} />Read-only (block writes &amp; DDL)</label>
               <Show when={!isEmbeddedDriver(driver())}>
                 <label class="checkbox"><input type="checkbox" checked={savePassword()} onChange={(e) => setSavePassword(e.currentTarget.checked)} />Save password</label>
@@ -3773,9 +3866,12 @@ function App() {
       <div class="workspace">
         <header class="topbar">
           <span class="brand-sm">{driverMascot(connectionKind())} Tusk</span>
-          <span class="conn-chip" title={connTarget()}>
+          <span class="conn-chip" title={conn()?.viaSsh ? `${connTarget()} — reached through an SSH tunnel` : connTarget()}>
             <span class="conn-dot" />
             <span class="conn-name">{connTarget()}</span>
+            <Show when={conn()?.viaSsh}>
+              <span class="conn-ssh" title="Reached through an SSH tunnel">SSH</span>
+            </Show>
           </span>
           <span class="meta">{driverLabel(connectionKind())} {conn()!.version}</span>
           <Show when={conn()!.readOnly}>
@@ -4583,6 +4679,47 @@ function App() {
       {/* Update pill renders in both screens (connect + workspace). */}
       <UpdateBadge />
       <WhatsNew requestShow={whatsNewRequest} />
+
+      {/* First contact with an SSH host key. Rendered outside the connect screen's own
+          tree so it survives whichever screen raised it, and Trust re-runs the exact
+          attempt that failed rather than rebuilding the payload. */}
+      <Show when={sshPrompt()}>
+        {(p) => (
+          <SshHostKeyDialog
+            prompt={p().prompt}
+            onCancel={() => {
+              setSshPrompt(null);
+              setConnErr("connection cancelled — the SSH host key was not trusted");
+            }}
+            onTrust={async () => {
+              const { prompt, retry } = p();
+              try {
+                await invoke("ssh_trust_host", {
+                  host: prompt.host,
+                  port: prompt.port,
+                  fingerprint: prompt.fingerprint,
+                });
+              } catch (e) {
+                setSshPrompt(null);
+                setConnErr(errMsg(e));
+                return;
+              }
+              setSshPrompt(null);
+              setConnErr("");
+              setConnecting(true);
+              try {
+                // A second unknown-host failure would mean the key changed again
+                // mid-flight; surface it rather than re-prompting in a loop.
+                await retry();
+              } catch (e) {
+                setConnErr(errMsg(e));
+              } finally {
+                setConnecting(false);
+              }
+            }}
+          />
+        )}
+      </Show>
 
       {/* Manual + Settings work on both screens (connect screen has its own buttons). */}
       <Show when={helpOpen()}>

@@ -4,6 +4,19 @@ use serde::{Deserialize, Serialize};
 use tokio_postgres::config::SslMode;
 use tokio_postgres::{Client, SimpleQueryMessage};
 
+/// An SSH host key the user has never trusted, attached to the connect failure so the
+/// frontend can show the fingerprint and offer Trust / Cancel. Only the *unknown* case
+/// carries this payload: a host key that CHANGED is a plain error with no prompt,
+/// because there is no safe one-click answer to it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshHostKeyPrompt {
+    pub host: String,
+    pub port: u16,
+    pub algorithm: String,
+    pub fingerprint: String,
+}
+
 /// Error type returned to the frontend. Transaction-aware commands attach the
 /// authoritative state observed after the failure.
 #[derive(Debug, Serialize)]
@@ -11,6 +24,11 @@ pub struct AppError {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transaction: Option<TransactionStatus>,
+    #[serde(rename = "sshHostKey", skip_serializing_if = "Option::is_none")]
+    /// Boxed so `AppError` stays small: it is the `Err` half of nearly every function
+    /// in this crate, and an inline prompt would push every `Result` past clippy's
+    /// large-error threshold.
+    pub ssh_host_key: Option<Box<SshHostKeyPrompt>>,
 }
 
 impl AppError {
@@ -18,11 +36,17 @@ impl AppError {
         Self {
             message: msg.into(),
             transaction: None,
+            ssh_host_key: None,
         }
     }
 
     pub fn with_transaction(mut self, transaction: TransactionStatus) -> Self {
         self.transaction = Some(transaction);
+        self
+    }
+
+    pub fn with_ssh_host_key(mut self, prompt: SshHostKeyPrompt) -> Self {
+        self.ssh_host_key = Some(Box::new(prompt));
         self
     }
 }
@@ -46,6 +70,7 @@ impl From<tokio_postgres::Error> for AppError {
         Self {
             message,
             transaction: None,
+            ssh_host_key: None,
         }
     }
 }
@@ -75,6 +100,11 @@ pub struct ConnectionConfig {
     /// Embedded-driver database file (DuckDB/SQLite): an absolute path or ":memory:".
     #[serde(default)]
     pub path: Option<String>,
+    /// Optional SSH tunnel. `host`/`port` above stay the DATABASE endpoint as reached
+    /// from the SSH server; the driver dials a loopback port instead (see `ssh.rs`).
+    /// Network drivers only.
+    #[serde(default)]
+    pub ssh: Option<crate::ssh::SshConfig>,
 }
 
 impl ConnectionConfig {
@@ -84,6 +114,9 @@ impl ConnectionConfig {
             return Err(AppError::new(format!("unknown driver: {driver}")));
         }
         if matches!(driver, "postgres" | "mysql") {
+            if let Some(ssh) = &self.ssh {
+                ssh.validate()?;
+            }
             if self.port == 0 {
                 return Err(AppError::new("port must be between 1 and 65535"));
             }
@@ -101,10 +134,22 @@ impl ConnectionConfig {
             ) {
                 return Err(AppError::new(format!("unknown sslmode: {ssl}")));
             }
-        } else if self.path.as_ref().is_some_and(|p| p.len() > 32_768) {
-            return Err(AppError::new("database path is too long"));
+        } else {
+            if self.ssh.is_some() {
+                return Err(AppError::new(
+                    "SSH tunnelling is only available for network drivers (PostgreSQL, MySQL)",
+                ));
+            }
+            if self.path.as_ref().is_some_and(|p| p.len() > 32_768) {
+                return Err(AppError::new("database path is too long"));
+            }
         }
         Ok(())
+    }
+
+    /// True when this connection reaches the database through an SSH tunnel.
+    pub fn tunnelled(&self) -> bool {
+        self.ssh.is_some()
     }
 }
 
@@ -113,6 +158,10 @@ pub struct ConnectResult {
     pub connection_id: String,
     pub server_version: String,
     pub read_only: bool,
+    /// The session reaches the database through an SSH tunnel — surfaced next to the
+    /// connection target so the displayed host is never mistaken for a direct route.
+    #[serde(rename = "viaSsh")]
+    pub via_ssh: bool,
 }
 
 /// Result of a query: either a page of rows (reads) or a status message (writes/DDL).

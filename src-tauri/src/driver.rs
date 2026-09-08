@@ -232,7 +232,13 @@ impl CancelHandle {
 /// A live Postgres connection plus its single streaming-cursor flag.
 pub struct PgConn {
     pub client: Client,
+    /// The configuration the USER supplied — the real database host/port and any SSH
+    /// settings. Dialling goes through `ssh::dial_config`, so everything else
+    /// (Slack isolation, connection display, cancel TLS) keeps seeing the true target.
     pub config: ConnectionConfig,
+    /// Kept alive for the lifetime of the connection: dropping it closes the SSH
+    /// session and its loopback listener.
+    tunnel: Option<crate::ssh::Tunnel>,
     cursor_name: Option<String>,
     cursor_auto_transaction: bool,
 }
@@ -491,11 +497,16 @@ pub async fn connect(config: &ConnectionConfig) -> Result<(Backend, String), App
     config.validate()?;
     match config.driver.as_deref().unwrap_or("postgres") {
         "postgres" => {
-            let (client, version) = db::open(config).await?;
+            // The tunnel comes up first so a failure names the SSH stage, not the DB.
+            let tunnel = crate::ssh::ensure(None, config).await?;
+            let (client, version) = db::open(&crate::ssh::dial_config(config, tunnel.as_ref()))
+                .await
+                .map_err(|e| crate::ssh::explain_db_failure(tunnel.as_ref(), e))?;
             Ok((
                 Backend::Pg(PgConn {
                     client,
                     config: config.clone(),
+                    tunnel,
                     cursor_name: None,
                     cursor_auto_transaction: false,
                 }),
@@ -504,7 +515,7 @@ pub async fn connect(config: &ConnectionConfig) -> Result<(Backend, String), App
         }
         "duckdb" => DuckConn::open(config),
         "sqlite" => SqliteConn::open(config),
-        "mysql" => MySqlConn::open(config).await,
+        "mysql" => MySqlConn::open(config, None).await,
         other => Err(AppError::new(format!("unknown driver: {other}"))),
     }
 }
@@ -606,10 +617,17 @@ impl Backend {
     }
 
     /// Re-open a dropped connection. PG re-dials; DuckDB re-opens the file (no-op-ish).
+    /// Tunnelled connections re-verify the SSH session first: a live tunnel is reused,
+    /// a dead one is rebuilt on a fresh loopback port, and a tunnel that cannot be
+    /// rebuilt fails the reconnect rather than dialling a port that is no longer ours.
     pub async fn reopen(&mut self) -> Result<(), AppError> {
         match self {
             Backend::Pg(p) => {
-                let (client, _version) = db::open(&p.config).await?;
+                p.tunnel = crate::ssh::ensure(p.tunnel.take(), &p.config).await?;
+                let (client, _version) =
+                    db::open(&crate::ssh::dial_config(&p.config, p.tunnel.as_ref()))
+                        .await
+                        .map_err(|e| crate::ssh::explain_db_failure(p.tunnel.as_ref(), e))?;
                 p.client = client;
                 p.cursor_name = None;
                 p.cursor_auto_transaction = false;
@@ -627,7 +645,10 @@ impl Backend {
                 Ok(())
             }
             Backend::MySql(m) => {
-                let (backend, _v) = MySqlConn::open(&m.config).await?;
+                // Hand the live tunnel to the replacement pool so the reconnect keeps
+                // the same SSH session (and so `*m = nm` cannot drop it mid-flight).
+                let tunnel = crate::ssh::ensure(m.tunnel.take(), &m.config).await?;
+                let (backend, _v) = MySqlConn::open(&m.config, tunnel).await?;
                 if let Backend::MySql(nm) = backend {
                     *m = nm;
                 }
@@ -1996,9 +2017,13 @@ fn sqlite_table_detail(
 /// query — fine over a pool).
 pub struct MySqlConn {
     pub pool: mysql_async::Pool,
+    /// The user's configuration (real host/port + SSH settings); the pool dials
+    /// `ssh::dial_config` instead when tunnelled.
     pub config: ConnectionConfig,
     pub stream_sql: Option<String>,
     pub offset: usize,
+    /// Owns the SSH session for this connection; dropping it closes the tunnel.
+    tunnel: Option<crate::ssh::Tunnel>,
     pinned: Option<mysql_async::Conn>,
     manual_lost: bool,
     autocommit_off: bool,
@@ -2011,10 +2036,17 @@ struct MySqlSessionState {
 }
 
 impl MySqlConn {
-    async fn open(config: &ConnectionConfig) -> Result<(Backend, String), AppError> {
+    /// `tunnel` is `None` for a fresh connect (one is opened when the config asks for
+    /// it) and `Some(live)` when a reconnect hands over an already-verified session.
+    async fn open(
+        config: &ConnectionConfig,
+        tunnel: Option<crate::ssh::Tunnel>,
+    ) -> Result<(Backend, String), AppError> {
+        let tunnel = crate::ssh::ensure(tunnel, config).await?;
+        let dial = crate::ssh::dial_config(config, tunnel.as_ref());
         let mut builder = mysql_async::OptsBuilder::default()
-            .ip_or_hostname(config.host.clone())
-            .tcp_port(config.port)
+            .ip_or_hostname(dial.host.clone())
+            .tcp_port(dial.port)
             .user(Some(config.user.clone()))
             .pass(Some(config.password.clone()));
         if !config.dbname.is_empty() {
@@ -2041,7 +2073,9 @@ impl MySqlConn {
         }
         let pool = mysql_async::Pool::new(builder);
         // Fail fast + capture the server version.
-        let (_c, rows, _a) = mysql_run(&pool, "SELECT version()").await?;
+        let (_c, rows, _a) = mysql_run(&pool, "SELECT version()")
+            .await
+            .map_err(|e| crate::ssh::explain_db_failure(tunnel.as_ref(), e))?;
         let version = rows
             .first()
             .and_then(|r| r.first().cloned().flatten())
@@ -2052,6 +2086,7 @@ impl MySqlConn {
                 config: config.clone(),
                 stream_sql: None,
                 offset: 0,
+                tunnel,
                 pinned: None,
                 manual_lost: false,
                 autocommit_off: false,
@@ -3158,6 +3193,7 @@ mod tests {
             sslmode: None,
             read_only: false,
             path: Some(":memory:".to_string()),
+            ssh: None,
         }
     }
     fn duck_mem() -> ConnectionConfig {

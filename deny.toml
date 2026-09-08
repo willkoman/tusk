@@ -5,7 +5,20 @@ yanked = "warn"
 # crates with no maintained replacement. Fail if Tusk adopts one directly;
 # vulnerabilities and unsound advisories remain denied at every depth.
 unmaintained = "workspace"
-ignore = []
+ignore = [
+  # RUSTSEC-2023-0071 — the "Marvin Attack" timing sidechannel in the `rsa` crate,
+  # reached through `russh`'s optional `rsa` feature (SSH tunnelling). There is no
+  # fixed version: RustCrypto has listed no safe upgrade since 2023. Dropping the
+  # feature would drop `ssh-rsa` host keys and `id_rsa` client keys, which is still
+  # what most existing bastions and users have.
+  #
+  # The advisory is an adaptive timing oracle over repeated RSA *decryptions*. Tusk
+  # never decrypts with RSA: the crate verifies a server host-key signature and signs
+  # at most one authentication challenge per connection attempt, against a host the
+  # user chose and whose key they already trusted. Revisit when `rsa` ships a
+  # mitigated release.
+  "RUSTSEC-2023-0071",
+]
 
 [licenses]
 version = 2
