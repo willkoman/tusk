@@ -1246,8 +1246,8 @@ export const TOPICS: Topic[] = [
         "ordered": false,
         "items": [
           "**Columns** — check/uncheck and reorder with the ↑/↓ buttons; keep at least one selected.",
-          "**Preview** — live, from the first 12 rows of the chosen scope (skipped for xlsx).",
-          "**Defaults** — CSV, comma delimiter, quote *as needed*, header row on, NULL as empty, LF line endings, no BOM. Your last-used options are remembered per format; the column selection and table name always come from the result being exported."
+          "**Preview** — live, from the first 12 rows already in memory (the loaded rows, or the selection when that scope is chosen); skipped for xlsx, and empty for an Explorer table export, which has loaded no rows.",
+          "**Defaults** — CSV, comma delimiter, quote *as needed*, header row on, NULL as empty, LF line endings, no BOM. Your last-used formatting options are remembered per format; the column selection, the table name and **Include CREATE TABLE** always come from the result being exported."
         ]
       },
       {
@@ -1267,7 +1267,7 @@ export const TOPICS: Topic[] = [
           ],
           [
             "**SQL inserts**",
-            "`INSERT` statements with a configurable table name; **Multi-row INSERT** batches 1,000 value tuples per statement; **Include CREATE TABLE** prepends the source table's reconstructed DDL (real types, keys and defaults) when the result is a plain table, and otherwise a generated all-`text` `CREATE` with a note saying so."
+            "`INSERT` statements with a configurable table name; **Multi-row INSERT** batches 1,000 value tuples per statement; **Include CREATE TABLE** prepends the source table's reconstructed DDL (real types, keys and defaults) when the result is a plain table, and otherwise a generated all-`text` `CREATE` with a note saying so. Views and materialized views always use the generated form — their real DDL is a `CREATE VIEW`, which nothing can insert into — and renaming **Table** drops the reconstruction too, because that DDL names the original relation."
           ],
           [
             "**Markdown**",
@@ -1275,7 +1275,7 @@ export const TOPICS: Topic[] = [
           ],
           [
             "**Excel (xlsx)**",
-            "File-only. Sheet name (defaults to the table name detected in the query, trimmed to 26 chars), **Bold header**, **Auto-filter**, **Freeze header**. Rows past **1,048,576** roll into additional sheets automatically."
+            "File-only. Sheet name (defaults to the table name detected in the query, trimmed to 26 chars, with the characters Excel forbids — `[ ] : * ? / \\` — replaced by `_`), **Bold header**, **Auto-filter**, **Freeze header**. Rows past **1,048,576** roll into additional sheets automatically."
           ]
         ]
       },
@@ -1293,7 +1293,7 @@ export const TOPICS: Topic[] = [
         "ordered": false,
         "items": [
           "**Loaded rows (N)** — formats what the grid currently holds, in memory.",
-          "**Selection (N rows)** — offered when rows are selected in the grid: the selected rows at full width, in memory. The dialog's own column checkboxes still apply.",
+          "**Selection (N rows)** — offered when rows are selected in the grid: the selected rows at full width, in memory. The dialog's own column checkboxes still apply. Like *Loaded rows* it exports the **stored** values, so unapplied edits and pinned new rows are left out and an exported file never holds rows the database does not have.",
           "**All rows (re-run query)** — re-executes server-side. Postgres streams via a dedicated cursor (`tusk_export_cur`) in **10,000-row batches** (constant memory); DuckDB, SQLite, and MySQL page via `LIMIT`/`OFFSET`. This scope is frozen while a manual transaction owns the session; export Loaded rows instead."
         ]
       },
@@ -1308,7 +1308,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**To** switches between **File** and **Clipboard**; the clipboard uses a TypeScript formatter kept **byte-identical** to the Rust file writer (delimiter, quoting, NULL text, header, column projection, line endings). Clipboard forces the scope to *Loaded rows*; xlsx forces the destination to *File*."
+        "md": "**To** switches between **File** and **Clipboard**; the clipboard uses a TypeScript formatter kept **byte-identical** to the Rust file writer (delimiter, quoting, NULL text, header, column projection, line endings). The clipboard formats in memory, so it takes *Loaded rows* or *Selection* but not *All rows*; xlsx forces the destination to *File*."
       },
       {
         "k": "h",
@@ -1336,15 +1336,15 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "ordered": false,
         "items": [
-          "**Delimited text** — configurable delimiter (comma / tab / semicolon / pipe / custom), quote character, optional backslash-style escape character, **UTF-8** (a BOM is accepted and stripped) or **Latin-1** encoding, **skip N rows** for a preamble above the header, and a **NULL text** placeholder such as `\N`.",
-          "**JSON** — either an array of objects or newline-delimited objects (NDJSON). Keys become columns in first-seen order, nested values are stringified, and a duplicate key is rejected rather than silently dropped.",
-          "**Excel (xlsx)** — the first sheet by default, with a sheet picker when the workbook has more than one.",
-          "**First row is the header** — unchecked gives `col1`, `col2`, … A row with more fields than the header is an error; a short row imports its missing fields as NULL and says so in the warnings."
+          "**Delimited text** — configurable delimiter (comma / tab / semicolon / pipe / custom), quote character (leave it blank to turn quoting off, for a file with a bare double quote inside an unquoted field), optional backslash-style escape character (which must differ from both the quote character and the delimiter), **UTF-8** (a BOM is accepted and stripped) or **Latin-1** encoding, **skip N rows** for a preamble above the header, and a **NULL text** placeholder such as `\\N`. Wholly blank lines are separators, not rows. The encoding choice applies to delimited text only — JSON is always read as UTF-8.",
+          "**JSON** — either an array of objects or newline-delimited objects (NDJSON). Keys become columns in first-seen order, nested values are stringified, and a duplicate key is rejected rather than silently dropped. Columns come from the previewed sample: a key that first appears past it is reported in the run warnings (reopen the dialog to map it), and a file whose keys no longer overlap the preview at all is refused rather than imported as NULLs.",
+          "**Excel (xlsx)** — the first sheet by default, with a sheet picker when the workbook has more than one. A workbook is read whole rather than streamed, so its progress bar tracks rows rather than bytes.",
+          "**First row is the header** — unchecked gives `col1`, `col2`, … A row with more fields than the header is an error; a short row imports its missing fields as NULL and says so in the warnings, both in the preview and in the run summary."
         ]
       },
       {
         "k": "p",
-        "md": "The `CREATE TABLE` (if any), the optional table clear, and every insert batch run in **one transaction**: **Cancel &amp; roll back** (or any error, including a value that doesn't fit its column) undoes everything and names the offending row. PostgreSQL uses `COPY`-grade batching; the other engines use batched multi-row `INSERT`s. On success the sidebar schema refreshes so a new table appears in the tree and autocomplete ([[topic:sidebar|Sidebar]]), and the run lands in [[topic:history|history]] as `-- [Import] …`."
+        "md": "The `CREATE TABLE` (if any), the optional table clear, and every insert batch run in **one transaction**: **Cancel &amp; roll back** (or any error, including a value that doesn't fit its column) undoes everything and names the offending row. PostgreSQL streams a plain load through `COPY … FROM STDIN`; a conflict mode falls back to batched multi-row `INSERT`s, because `COPY` has no `ON CONFLICT`. The other engines always use batched multi-row `INSERT`s. On success the sidebar schema refreshes so a new table appears in the tree and autocomplete ([[topic:sidebar|Sidebar]]), and the run lands in [[topic:history|history]] as `-- [Import] …`."
       },
       {
         "k": "h",
@@ -1356,9 +1356,9 @@ export const TOPICS: Topic[] = [
         "ordered": false,
         "items": [
           "**Existing table** — pick any table Tusk knows (the Explorer's *Import data into table…* pre-selects one). File columns are auto-matched to target columns by name, case- and punctuation-insensitively; anything left over can be pointed at a column by hand or set to **— skip —**, which leaves that column at its database default.",
-          "**New table** — the name is pre-filled from the file name (extension stripped, non-word characters → `_`). Each column's type is **inferred from the sampled values** — integer, bigint, decimal, boolean, date, timestamp, or text — and each one can be overridden before the table is created. The dropdown shows the engine type each token creates as.",
+          "**New table** — the name is pre-filled from the file name (extension stripped, non-word characters → `_`), and an Explorer schema node pre-selects its own schema. Each column's type is **inferred from the sampled values** — integer, bigint, numeric, boolean, date, timestamp, or text — and each one can be overridden before the table is created. The dropdown shows the engine type each token creates as. Inference stays conservative: a value too wide for a 64-bit integer keeps the column `text`, and a column already near the 32-bit limit widens to `bigint`.",
           "**Empty the table first** — clears the table inside the same transaction, so a failure leaves the original rows intact.",
-          "**Empty → NULL** — per column, imports an empty string as NULL. On by default for every non-text column, because an empty string is not a number, date or boolean."
+          "**Empty → NULL** — per column, imports an empty (or whitespace-only) string as NULL. On by default for every non-text column, because a blank is not a number, date or boolean."
         ]
       },
       {
@@ -1385,7 +1385,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "MySQL DDL implicitly commits. Creating a table as part of a MySQL import can therefore leave the empty table behind if the row load then fails — the rows still roll back. The other three engines create and load atomically."
+        "md": "MySQL DDL implicitly commits. A MySQL import that creates its table therefore runs the `CREATE TABLE` **before** the transaction, as a separately committed step, and says so in the summary. The rows still load in one transaction and still roll back on a failure or a cancel — but the empty table stays behind, and the error tells you to drop it. The other three engines create and load atomically."
       },
       {
         "k": "h",
@@ -1394,11 +1394,11 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Right-click a table, view or materialized view for **Export table…** — the same configurator, aimed at that relation's full contents. Right-click a schema or the database for **Export tables…**: tick the tables, choose a format, pick a directory, and get one configured file per table named `schema_table.<ext>`, with per-table progress and a Cancel."
+        "md": "Right-click a table for **Export table…** — the same configurator, aimed at that relation's full contents; on a view or materialized view the item reads **Export…**. Right-click a schema or the database for **Export tables…**: tick the tables, choose a format, pick a directory, and get one configured file per table named `schema_table.<ext>`, with per-table progress and a Cancel that works on every engine. That dialog exposes fewer options than the single-result one, and anything it does not show stays at its default instead of being inherited from your last export."
       },
       {
         "k": "p",
-        "md": "Every file is written atomically. If one table fails, it is reported by name and the files already written are kept — nothing is rolled back on the filesystem."
+        "md": "Every file is written atomically. A table that fails is reported by name and the run continues with the rest; the files already written are kept, and nothing is rolled back on the filesystem. Cancelling stops the run and reports the remaining tables as cancelled."
       },
       {
         "k": "h",
