@@ -23,8 +23,15 @@ import { planPaste, mergePaste, type RowRef } from "./grid/paste";
 import { orderedRows, sortedRowOrder } from "./grid/sort";
 import { interruptedResult } from "./tabs";
 import { makeIndexer } from "./sql/aliases";
-import { type Dataset, IMPORT_LIMITS, parseCSV, parseJSON, formatWithOptions } from "./formats";
+import { type Dataset, formatWithOptions } from "./formats";
 import { FORMAT_EXT, type ExportOptions, type ExportScope } from "./export";
+import {
+  type ImportOptions,
+  type ImportPreview,
+  type ImportProgress,
+  type ImportSummary,
+  type ImportTarget,
+} from "./import";
 import { save, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Tree, type DbTree, type RelationDetail, type NodeDescriptor, nodeKey, relKey } from "./Tree";
 import { ContextMenu, type MenuItem, type MenuState } from "./ContextMenu";
@@ -33,7 +40,7 @@ import { type SettingsTab } from "./settings/SettingsDialog";
 const HelpDialog = lazy(() => import("./help/HelpDialog"));
 import { fontStack } from "./editor/theme";
 import { ACTIONS, type ActionCtx, type ActionId, type KeyOverrides, canonicalKey, displayKey, effectiveKey, normalizeKeyEvent } from "./actions";
-import { keymapStore } from "./store";
+import { exportOptionsStore, keymapStore, type RememberedExportOptions } from "./store";
 import { historyStore, makeEntryId, type HistoryEntry } from "./history/store";
 import { detectParams, type Param, type ParamValue } from "./sql/params";
 import { type FkEdge } from "./sql/fk";
@@ -120,6 +127,8 @@ const DDL_RE = /^\s*(create|alter|drop|truncate|comment|grant|revoke)\b/i;
 const SqlEditor = lazy(() => import("./SqlEditor").then((m) => ({ default: m.SqlEditor })));
 const AiPanel = lazy(() => import("./ai/AiPanel").then((m) => ({ default: m.AiPanel })));
 const ExportDialog = lazy(() => import("./forms/ExportDialog").then((m) => ({ default: m.ExportDialog })));
+const ExportTablesDialog = lazy(() => import("./forms/ExportTablesDialog").then((m) => ({ default: m.ExportTablesDialog })));
+const ImportDialog = lazy(() => import("./forms/ImportDialog").then((m) => ({ default: m.ImportDialog })));
 const WorkbenchDialogs = lazy(() => import("./WorkbenchDialogs").then((m) => ({ default: m.WorkbenchDialogs })));
 const SettingsDialog = lazy(() => import("./settings/SettingsDialog").then((m) => ({ default: m.SettingsDialog })));
 const ShortcutsPane = lazy(() => import("./settings/ShortcutsPane").then((m) => ({ default: m.ShortcutsPane })));
@@ -290,6 +299,7 @@ function App() {
   const canCreateSchema = () => !pEnforced() || !!perms()?.createInCurrentDb;
   const canCreateDatabase = () => !pEnforced() || !!perms()?.canCreateDb;
   const canTruncate = (s: string, t: string) => ownsTable(s, t) || !!tablePriv(s, t)?.truncate;
+  const canInsert = (s: string, t: string) => ownsTable(s, t) || !!tablePriv(s, t)?.insert;
   // Merge into a MenuItem: read-only wins, then driver support (the sidebar DDL
   // builders in sql/ddl.ts emit Postgres syntax — offering them on MySQL/SQLite/
   // DuckDB produced SQL errors at apply time), then the privilege. Every gate()
@@ -486,10 +496,10 @@ function App() {
       setDdlGraph(null);
       setActiveDialog(null);
       if (importOpen() && !importBusy()) {
-        importReadGeneration++;
-        setImportOpen(false);
+        setImportOpen(null);
         importOrigin = null;
       }
+      if (exportTables()) setExportTables(null);
       if (next.state === "lost") {
         setTransactionWarning(`Transaction ${next.id ?? "session"} was lost. Its outcome may be unknown; disconnect and reconnect before continuing.`);
       }
@@ -724,13 +734,19 @@ function App() {
   let nativeCloseUnlisten: UnlistenFn | null = null;
   // Snapshot of the result being exported, frozen when the dialog opens so a tab
   // switch while it's open can't redirect the export to a different tab.
+  /** Live grid selection, registered by ResultGrid (Export → Selection scope). */
+  let gridSelection: (() => Dataset | null) | null = null;
   const [exportSrc, setExportSrc] = createSignal<
     {
       columns: string[];
       rows: (string | null)[][];
+      /** Frozen copy of the grid selection when the dialog opened (scope=selection). */
+      selectionRows: (string | null)[][];
       query: string;
       table: string;
       searchSchema: string | null;
+      /** Source relation for "Include CREATE TABLE" (absent = not a plain table). */
+      ddl?: { schema: string; name: string; kind: string };
       /** The grid's bool-column set (source indices) frozen with the snapshot — export shows what the grid shows. */
       boolCols: number[];
       /** Non-empty when the loaded rows are a partial result (stream interrupted). */
@@ -751,10 +767,19 @@ function App() {
       if (wrapped === null) return;
       query = wrapped;
     }
+    const selection = gridSelection?.() ?? null;
+    // "Include CREATE TABLE" needs a plain source table; reuse the grid's own
+    // single-table resolver rather than re-parsing the query here.
+    const resolved = editTarget(tab.result.baseQuery, editIndexer(schema()), tab.searchSchema);
+    const ddlTarget = resolved.ok ? resolved.table : null;
     setExportSrc({
       columns: columns(),
       rows: orderedRows(rows(), order),
+      selectionRows: selection && selection.columns.length === columns().length ? selection.rows : [],
       incomplete: tab.result.incomplete,
+      ddl: ddlTarget && caps()?.ddl !== false
+        ? { schema: ddlTarget.schema, name: ddlTarget.name, kind: "table" }
+        : undefined,
       query,
       table: tableNameFromSql(query),
       searchSchema: tab.searchSchema,
@@ -937,19 +962,26 @@ function App() {
   const saveActiveTab = () => saveTab(activeTabId(), false);
   const saveAsActiveTab = () => saveTab(activeTabId(), true);
 
-  // import dialog
-  const [importOpen, setImportOpen] = createSignal(false);
-  const [importData, setImportData] = createSignal<Dataset | null>(null);
-  const [importRaw, setImportRaw] = createSignal<{ text: string; name: string } | null>(null);
-  const [importHasHeader, setImportHasHeader] = createSignal(true);
-  const [importMode, setImportMode] = createSignal<"existing" | "new">("existing");
-  const [importTarget, setImportTarget] = createSignal("");
-  const [importNewName, setImportNewName] = createSignal("");
+  // import dialog — multi-step; the backend streams the file from disk, so no file
+  // bytes cross the IPC boundary and progress arrives as `import-progress` events.
+  const [importOpen, setImportOpen] = createSignal<{ target: { schema: string; name: string } | null } | null>(null);
   const [importBusy, setImportBusy] = createSignal(false);
-  const [importMsg, setImportMsg] = createSignal("");
-  let importReadGeneration = 0;
-  let importCloseTimer: ReturnType<typeof setTimeout> | undefined;
+  const [importProgress, setImportProgress] = createSignal<ImportProgress | null>(null);
   let importOrigin: { origin: UiOrigin; connection: Connected } | null = null;
+
+  // Explorer multi-table export.
+  const [exportTables, setExportTables] = createSignal<
+    { title: string; tables: { schema: string; name: string }[]; selection: { schema: string; name: string }[]; connectionId: string } | null
+  >(null);
+  const [exportTablesProgress, setExportTablesProgress] = createSignal<
+    { index: number; total: number; table: string; rows: number; done: boolean } | null
+  >(null);
+  const [rememberedExport, setRememberedExport] = createSignal<RememberedExportOptions>(exportOptionsStore.load());
+  const rememberExportOptions = (format: string, values: Record<string, unknown>) => {
+    const next = { ...rememberedExport(), [format]: values };
+    setRememberedExport(next);
+    exportOptionsStore.save(next);
+  };
 
   // Lazy EXPLAIN detection: null for normal results (the leading-keyword gate
   // makes this free), a ParsedPlan when the active tab's result is a plan.
@@ -1371,7 +1403,6 @@ function App() {
   const [loadingAll, setLoadingAll] = createSignal(false);
   const [schemaLoading, setSchemaLoading] = createSignal(false);
   let cancelAll = false;
-  let importFileInput: HTMLInputElement | undefined;
   // Reactive so the "streaming…" spinner spins only during an actual in-flight fetch
   // (not merely while more rows remain, i.e. !done()).
   const [fetchingMore, setFetchingMore] = createSignal(false);
@@ -1479,6 +1510,21 @@ function App() {
       /* Browser preview has no native close event; beforeunload remains the fallback. */
     }
     void refreshSkills();
+    // Bulk import/export progress. Best-effort: a rejected listen must never break
+    // the app, and a stale event only paints a progress bar.
+    try {
+      const importUnlisten = await listen<ImportProgress>("import-progress", (e) => {
+        if (importBusy()) setImportProgress(e.payload);
+      });
+      if (!appMounted) importUnlisten(); else slackUnlisten.push(importUnlisten);
+      const tablesUnlisten = await listen<{ index: number; total: number; table: string; rows: number; done: boolean }>(
+        "export-tables-progress",
+        (e) => { if (exportTables()) setExportTablesProgress(e.payload); },
+      );
+      if (!appMounted) tablesUnlisten(); else slackUnlisten.push(tablesUnlisten);
+    } catch {
+      /* progress events unavailable; the dialogs still report their result */
+    }
     // Suppress the WebView's native right-click menu app-wide; the sidebar shows
     // its own context menu, and the editor uses keyboard shortcuts for copy/paste.
     document.addEventListener("contextmenu", preventNativeContextMenu);
@@ -1542,7 +1588,6 @@ function App() {
     window.removeEventListener("focus", onWindowFocus);
     window.removeEventListener("beforeunload", onBeforeUnload);
     for (const u of slackUnlisten) u();
-    clearTimeout(importCloseTimer);
     clearTimeout(saveTimer);
     if (transactionTimer) clearInterval(transactionTimer);
     nativeCloseUnlisten?.();
@@ -1984,13 +2029,12 @@ function App() {
     setTransactionResolution(null);
     setTransactionResolutionBusy(false);
     setExportSrc(null);
-    importReadGeneration++;
-    clearTimeout(importCloseTimer);
+    setExportTables(null);
+    setExportTablesProgress(null);
     setImportBusy(false);
-    setImportOpen(false);
+    setImportProgress(null);
+    setImportOpen(null);
     importOrigin = null;
-    setImportData(null);
-    setImportRaw(null);
     setConfirmAnalyze(null);
     setCommitView(null);
     transactionResolutionAfterApply = null;
@@ -2781,10 +2825,11 @@ function App() {
     if (!path) return false;
     if (!originCurrent(src.origin, true)) return false;
     if (src.origin.tabId) patchResult(src.origin.tabId, { status: "exporting…" });
+    const inline = scope === "selection" ? src.selectionRows : src.rows;
     const args =
       scope === "all"
         ? { connectionId: src.connectionId, sql: src.query, options: opts, path, searchPath: src.searchSchema }
-        : { connectionId: src.connectionId, columns: src.columns, rows: src.rows, options: opts, path };
+        : { connectionId: src.connectionId, columns: src.columns, rows: inline, options: opts, path };
     const t0 = performance.now();
     // A scope=all export RE-RUNS the query server-side — that belongs in history
     // like every other server execution (Slack runs and Explorer DDL are recorded).
@@ -2831,17 +2876,18 @@ function App() {
     }
   }
 
-  async function exportToClipboard(opts: ExportOptions): Promise<boolean> {
+  async function exportToClipboard(opts: ExportOptions, scope: ExportScope = "loaded"): Promise<boolean> {
     const src = exportSrc();
     if (!src || !originCurrent(src.origin, true)) return false;
-    const cells = src.rows.length * src.columns.length;
+    const source = scope === "selection" ? src.selectionRows : src.rows;
+    const cells = source.length * src.columns.length;
     if (cells > 1_000_000) {
       const message = `result too large for clipboard (${cells.toLocaleString()} cells) - export to a file instead`;
       if (src.origin.tabId) patchResult(src.origin.tabId, { status: message });
       throw new Error(message);
     }
     let chars = src.columns.reduce((n, col) => n + col.length, 0);
-    outer: for (const row of src.rows) {
+    outer: for (const row of source) {
       for (const value of row) {
         chars += value?.length ?? 0;
         if (chars > 8 * 1024 * 1024) break outer;
@@ -2854,19 +2900,19 @@ function App() {
     }
     let text: string;
     try {
-      text = formatWithOptions({ columns: src.columns, rows: src.rows }, opts, src.dialect);
+      text = formatWithOptions({ columns: src.columns, rows: source }, opts, src.dialect);
     } catch (e) {
       if (src.origin.tabId) patchResult(src.origin.tabId, { status: `format rejected: ${errMsg(e)}` });
       throw e;
     }
     const ok = await clipWrite(text);
     if (originCurrent(src.origin, true) && src.origin.tabId)
-      patchResult(src.origin.tabId, { status: ok ? `copied ${src.rows.length} rows` : "clipboard unavailable" });
+      patchResult(src.origin.tabId, { status: ok ? `copied ${source.length} rows` : "clipboard unavailable" });
     if (!ok) throw new Error("clipboard unavailable");
     return true;
   }
 
-  function openImport() {
+  function openImport(target: { schema: string; name: string } | null = null) {
     const c = conn();
     if (!c || metadataFrozen() || running() || fetchingMore() || commitBusy()) {
       setStatus(metadataFrozen()
@@ -2875,118 +2921,158 @@ function App() {
       return;
     }
     importOrigin = { origin: captureOrigin(), connection: c };
-    importReadGeneration++;
-    clearTimeout(importCloseTimer);
-    setImportData(null);
-    setImportRaw(null);
-    setImportMsg("");
-    setImportMode(schema().length ? "existing" : "new");
-    setImportTarget(schema().length ? relKey(schema()[0].schema, schema()[0].name) : "");
-    setImportNewName("");
-    setImportOpen(true);
+    setImportProgress(null);
+    setImportBusy(false);
+    setImportOpen({ target });
   }
 
-  function reparseImport() {
-    const raw = importRaw();
-    if (!raw) return;
-    setImportData(null);
-    try {
-      const lower = raw.name.toLowerCase();
-      const d = lower.endsWith(".json")
-        ? parseJSON(raw.text)
-        : parseCSV(raw.text, importHasHeader(), lower.endsWith(".tsv") ? "\t" : ",");
-      setImportData(d);
-      setImportMsg("");
-      if (!importNewName()) setImportNewName(raw.name.replace(/\.[^.]+$/, "").replace(/[^\w]/g, "_"));
-    } catch (err) {
-      setImportMsg(errMsg(err));
-    }
+  /** Parse the head of a file in Rust. No connection is involved. */
+  function previewImport(path: string, options: ImportOptions): Promise<ImportPreview> {
+    return invoke<ImportPreview>("import_preview", { path, options });
   }
 
-  async function onImportFile(e: Event) {
-    const input = e.currentTarget as HTMLInputElement;
-    const f = input.files?.[0];
-    input.value = "";
-    if (!f) return;
-    const generation = ++importReadGeneration;
-    setImportData(null);
-    setImportRaw(null);
-    if (f.size > IMPORT_LIMITS.bytes) {
-      setImportMsg(`import is too large: file exceeds ${IMPORT_LIMITS.bytes.toLocaleString()} bytes`);
-      return;
-    }
-    try {
-      const text = await f.text();
-      if (generation !== importReadGeneration || !importOpen()) return;
-      setImportRaw({ text, name: f.name });
-      setImportMsg("");
-      reparseImport();
-    } catch (err) {
-      if (generation !== importReadGeneration || !importOpen()) return;
-      setImportMsg(errMsg(err));
-    }
+  /** Target-table columns for the mapping step (cached tree detail where possible). */
+  async function importTargetColumns(schemaName: string, table: string) {
+    const c = conn();
+    if (!c || !table) return [];
+    const cached = details()[relKey(schemaName, table)];
+    if (cached) return cached.columns.map((col) => ({ name: col.name, data_type: col.data_type }));
+    await loadDetail(schemaName, table, false, c);
+    const loaded = details()[relKey(schemaName, table)];
+    return loaded ? loaded.columns.map((col) => ({ name: col.name, data_type: col.data_type })) : [];
   }
 
-  async function doImport() {
+  /**
+   * Stream a file into the database. Like every other server-executing path this
+   * records history (`-- [Import] …`) and frees the shared cursor first; the whole
+   * load is one transaction, so a failure or cancel leaves nothing behind.
+   */
+  async function runImport(
+    path: string,
+    options: ImportOptions,
+    target: ImportTarget,
+  ): Promise<ImportSummary> {
     const binding = importOrigin;
     const c = binding?.connection;
-    const d = importData();
-    if (!binding || !c || metadataFrozen() || !connectionCurrent(c) || !originCurrent(binding.origin) || !d || !d.columns.length) return;
-    let schemaName = "public";
-    let table = "";
-    let create = false;
-    if (importMode() === "existing") {
-      const target = schema().find((t) => relKey(t.schema, t.name) === importTarget());
-      if (!target) {
-        setImportMsg("choose a valid target table");
-        return;
-      }
-      schemaName = target.schema;
-      table = target.name;
-    } else {
-      table = importNewName();
-      create = true;
+    if (!binding || !c || !connectionCurrent(c) || metadataFrozen()) {
+      throw new Error("connection changed — reopen the import dialog");
     }
-    if (!table) {
-      setImportMsg("choose a target table");
-      return;
-    }
-    const generation = importReadGeneration;
-    const connectionId = c.id;
-    const stillCurrent = () => generation === importReadGeneration && connectionCurrent(c) && originCurrent(binding.origin);
-    const operationCurrent = () => generation === importReadGeneration && importOrigin === binding;
+    const label = `${target.schema ? `${target.schema}.` : ""}${target.table}`;
+    const t0 = performance.now();
     setImportBusy(true);
-    setImportMsg("");
+    setImportProgress(null);
     interruptStream("an import closed the result stream");
     try {
-      const n = await invoke<number>("import_rows", {
-        connectionId,
-        schema: schemaName,
-        table,
-        columns: d.columns,
-        rows: d.rows,
-        create,
+      const summary = await invoke<ImportSummary>("import_from_file", {
+        connectionId: c.id,
+        path,
+        options,
+        target,
       });
-      if (!stillCurrent()) return;
-      await loadSchema(c);
-      if (!stillCurrent()) return;
-      setImportMsg(`imported ${n} rows`);
-      importCloseTimer = setTimeout(() => {
-        if (generation === importReadGeneration) setImportOpen(false);
-      }, 900);
+      recordHistory({
+        sql: `-- [Import] ${path} → ${label} (${summary.rowsInserted} rows)`,
+        durationMs: Math.round(performance.now() - t0),
+        status: "ok",
+        rows: summary.rowsInserted,
+        error: null,
+        schema: target.schema || null,
+      }, c.key);
+      if (connectionCurrent(c) && !metadataFrozen()) await loadSchema(c);
+      return summary;
     } catch (e) {
-      if (!stillCurrent()) return;
-      const m = errMsg(e);
-      setImportMsg(/cancel/i.test(m) ? "Import cancelled — rolled back." : m);
+      const message = errMsg(e);
+      recordHistory({
+        sql: `-- [Import] ${path} → ${label}`,
+        durationMs: Math.round(performance.now() - t0),
+        status: "error",
+        rows: null,
+        error: message.split("\n")[0],
+        schema: target.schema || null,
+      }, c.key);
+      throw new Error(/cancel/i.test(message) ? "Import cancelled — rolled back." : message);
     } finally {
-      if (operationCurrent()) {
-        setImportBusy(false);
-        if (metadataFrozen()) {
-          setImportOpen(false);
-          importOrigin = null;
-        }
-      }
+      setImportBusy(false);
+      setImportProgress(null);
     }
+  }
+
+  function closeImport() {
+    if (importBusy()) return;
+    setImportOpen(null);
+    importOrigin = null;
+  }
+
+  // --- Explorer table export ---
+
+  /** Export one relation's full contents through the ordinary safe query path. */
+  async function openTableExport(schemaName: string, name: string, kind = "table") {
+    const c = conn();
+    if (!c || rejectFrozenExplorer()) return;
+    const origin = captureOrigin();
+    // The dialog's column list comes from the relation detail — fetch it BEFORE the
+    // export opens, never while a stream is live (it rolls the shared cursor back).
+    interruptStream("reading table columns closed the result stream");
+    await loadDetail(schemaName, name, false, c);
+    if (!connectionCurrent(c) || !originCurrent(origin)) return;
+    const detail = details()[relKey(schemaName, name)];
+    const query = `SELECT * FROM ${qualifyIn(schemaName, name, schemaName)}`;
+    setExportSrc({
+      columns: detail?.columns.map((col) => col.name) ?? [],
+      rows: [],
+      selectionRows: [],
+      incomplete: "",
+      query,
+      table: name,
+      searchSchema: caps()?.searchPath ? schemaName : null,
+      boolCols: [],
+      origin,
+      connectionId: c.id,
+      dialect: connectionKind(),
+      ddl: caps()?.ddl !== false ? { schema: schemaName, name, kind } : undefined,
+    });
+  }
+
+  function openTablesExport(schemaName: string | null) {
+    const c = conn();
+    if (!c || rejectFrozenExplorer()) return;
+    const all = schema().map((t) => ({ schema: t.schema, name: t.name }));
+    if (!all.length) {
+      setStatus("no tables to export");
+      return;
+    }
+    setExportTablesProgress(null);
+    setExportTables({
+      title: schemaName ? `Export tables in ${schemaName}` : "Export tables",
+      tables: all,
+      selection: schemaName ? all.filter((t) => t.schema === schemaName) : all,
+      connectionId: c.id,
+    });
+  }
+
+  async function runTablesExport(
+    tables: { schema: string; name: string }[],
+    options: ExportOptions,
+    directory: string,
+  ) {
+    const src = exportTables();
+    const c = conn();
+    if (!src || !c || c.id !== src.connectionId) throw new Error("connection changed");
+    interruptStream("a table export closed the result stream");
+    const t0 = performance.now();
+    const results = await invoke<{ schema: string; name: string; path: string; rows: number; error: string }[]>(
+      "export_tables",
+      { connectionId: src.connectionId, tables, options, directory },
+    );
+    const ok = results.filter((r) => !r.error).length;
+    recordHistory({
+      sql: `-- [Export] ${options.format} → ${directory} (${ok}/${results.length} tables)`,
+      durationMs: Math.round(performance.now() - t0),
+      status: ok === results.length ? "ok" : "error",
+      rows: results.reduce((n, r) => n + r.rows, 0),
+      error: results.find((r) => r.error)?.error ?? null,
+      schema: null,
+    }, c.key);
+    return results;
   }
 
   function startResize(e: MouseEvent) {
@@ -3296,6 +3382,9 @@ function App() {
           { label: "Select all rows", icon: "play", onClick: () => runTable(s!, n.name) },
           { label: "Filter rows…", icon: "search", onClick: () => void filterTable(s!, n.name) },
           { sep: true },
+          { label: "Export table…", icon: "download", onClick: () => void openTableExport(s!, n.name) },
+          { label: "Import data into table…", icon: "download", ...gate(canInsert(s!, n.name), `Requires INSERT on ${n.name}`), onClick: () => openImport({ schema: s!, name: n.name }) },
+          { sep: true },
           { label: "Modify table…", icon: "edit", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openModify(n) },
           { label: "Add column…", icon: "plus", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "addColumn", ctx: n }) },
           { label: "Add index…", icon: "index", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openIndexDialog(n) },
@@ -3326,6 +3415,7 @@ function App() {
         items.push(
           { label: "Select all rows", icon: "play", onClick: () => runTable(s!, n.name) },
           { label: "Filter rows…", icon: "search", onClick: () => void filterTable(s!, n.name) },
+          { label: "Export…", icon: "download", onClick: () => void openTableExport(s!, n.name, kw) },
         );
         if (kw === "matview")
           items.push(
@@ -3366,6 +3456,8 @@ function App() {
             ? [{ label: "Schema diagram…", icon: "link" as const, onClick: () => openDdlGraph(n.name, null, "table") }, { sep: true as const }]
             : []),
           { label: "Create table…", icon: "plus", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => setActiveDialog({ kind: "createTable", schema: n.name }) },
+          { label: "Import file as new table…", icon: "download", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => openImport(null) },
+          { label: "Export tables…", icon: "download", onClick: () => openTablesExport(n.name) },
           { label: "Rename…", icon: "edit", ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename schema ${n.name}`, current: n.name, build: (nn) => ddl.renameSchema(n.name, nn) }) },
           { sep: true },
           { label: "Drop…", icon: "trash", danger: true, ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop schema ${n.name}`, primaryLabel: "Drop schema", showCascade: true, build: (o) => ddl.dropSchema(n.name, o.cascade) }) },
@@ -3377,6 +3469,8 @@ function App() {
         const cur = tree()?.database === n.name;
         items.push(
           { label: "Create schema…", icon: "plus", ...gate(canCreateSchema(), "Requires CREATE on the database"), onClick: () => setActiveDialog({ kind: "createSchema" }) },
+          { label: "Import file as new table…", icon: "download", ...gate(!pEnforced() || canCreateSchema() || schema().length > 0, "Requires CREATE somewhere in this database"), onClick: () => openImport(null) },
+          { label: "Export tables…", icon: "download", onClick: () => openTablesExport(null) },
           // Same gate() as every other Explorer DDL item (manual-transaction freeze,
           // read-only, driver support) — DROP DATABASE least of all may skip the freeze.
           { label: cur ? "Drop… (connected)" : "Drop…", icon: "trash", danger: true, ...gate(!pEnforced() || isSuper(), "Requires database ownership (or superuser)"), ...noDuck("DuckDB has no DROP DATABASE"), ...(cur ? { disabled: true, title: "Can't drop the connected database" } : {}), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop database ${n.name}`, primaryLabel: "Drop database", build: () => ddl.dropDatabase(n.name) }) },
@@ -3860,7 +3954,7 @@ function App() {
               <div class="head-actions">
                 <button class="icon" title="New… (based on selection)" disabled={metadataFrozen()} onClick={(e) => openPlusMenu(e)}><Icon name="plus" /></button>
                 <Show when={caps()?.bulkCopy !== false}>
-                  <button class="icon" title="Import data" disabled={metadataFrozen()} onClick={openImport}><Icon name="download" /></button>
+                  <button class="icon" title="Import data" disabled={metadataFrozen()} onClick={() => openImport(null)}><Icon name="download" /></button>
                 </Show>
                 <button class="icon" title={metadataFrozen() ? "Refresh deferred until transaction ends" : "Refresh"} disabled={schemaLoading() || metadataFrozen()} onClick={() => loadSchema()}>{schemaLoading() ? <span class="spinner-sm" /> : <Icon name="refresh" />}</button>
               </div>
@@ -4163,6 +4257,7 @@ function App() {
                   onEditCell={onEditCell}
                   onMarkDelete={onMarkDelete}
                   onAddRow={onAddRow}
+                  registerSelectionSource={(get) => { gridSelection = get; }}
                   onPaste={onPaste}
                   copyHeaders={() => prefs().copyHeaders}
                   gridStyle={() => ({
@@ -4329,47 +4424,50 @@ function App() {
         </Show>
 
         <Show when={importOpen()}>
-          <Dialog title="Import data" onClose={() => setImportOpen(false)} dismissable={!importBusy()}>
-            {/* All configuration controls disable while an import is running. */}
-            <fieldset class="import-fieldset" disabled={importBusy()}>
-              <input ref={importFileInput} type="file" accept=".csv,.tsv,.json,.txt" style={{ display: "none" }} onChange={onImportFile} />
-              <button class="ghost full" onClick={() => importFileInput?.click()}>Choose file…</button>
-              <Show when={importRaw()}>
-                <label class="checkbox"><input type="checkbox" checked={importHasHeader()} onChange={(e) => { setImportHasHeader(e.currentTarget.checked); reparseImport(); }} />First row is header (CSV)</label>
-              </Show>
-              <Show when={importData()}>
-                {(d) => (
-                  <>
-                    <div class="import-info">{d().columns.length} cols · {d().rows.length} rows · {d().columns.slice(0, 6).join(", ")}{d().columns.length > 6 ? "…" : ""}</div>
-                    <div class="seg">
-                      <button classList={{ active: importMode() === "existing" }} onClick={() => setImportMode("existing")}>Existing table</button>
-                      <button classList={{ active: importMode() === "new" }} onClick={() => setImportMode("new")}>New table</button>
-                    </div>
-                    <Show
-                      when={importMode() === "existing"}
-                      fallback={<label>New table name<input value={importNewName()} onInput={(e) => setImportNewName(e.currentTarget.value)} placeholder="table_name" /></label>}
-                    >
-                      <label>Target table
-                        <select value={importTarget()} onChange={(e) => setImportTarget(e.currentTarget.value)}>
-                          <For each={schema()}>{(t) => <option value={relKey(t.schema, t.name)}>{t.schema}.{t.name}</option>}</For>
-                        </select>
-                      </label>
-                    </Show>
-                  </>
-                )}
-              </Show>
-            </fieldset>
-            <Show when={importData()}>
-              <Show
-                when={importBusy()}
-                fallback={<button class="run full" onClick={doImport}>Import</button>}
-              >
-                <div class="import-busy"><span class="spinner-sm" />Importing…</div>
-                <button class="ghost full" onClick={() => void cancelOperation(importOrigin?.connection.id, importOrigin?.origin.tabId ?? activeTabId())}>Cancel &amp; roll back</button>
-              </Show>
-            </Show>
-            <Show when={importMsg()}><div class="import-msg">{importMsg()}</div></Show>
-          </Dialog>
+          {(open) => (
+            <ImportDialog
+              dialect={connectionKind()}
+              supportsSchemas={caps()?.schemas !== false}
+              schemas={tree()?.schemas.map((sc) => sc.name) ?? []}
+              tables={schema().map((t) => ({ schema: t.schema, name: t.name }))}
+              defaultSchema={activeTab().searchSchema ?? tree()?.schemas.find((sc) => sc.name === "public")?.name ?? tree()?.schemas[0]?.name ?? "public"}
+              initialTarget={open().target}
+              onPickFile={async () => {
+                const picked = await openDialog({
+                  multiple: false,
+                  filters: [{ name: "Data files", extensions: ["csv", "tsv", "txt", "json", "ndjson", "jsonl", "xlsx"] }],
+                });
+                return typeof picked === "string" ? picked : null;
+              }}
+              onPreview={previewImport}
+              onTargetColumns={importTargetColumns}
+              onRun={runImport}
+              onCancelRun={() => void cancelOperation(importOrigin?.connection.id, importOrigin?.origin.tabId ?? activeTabId())}
+              progress={importProgress}
+              onClose={closeImport}
+            />
+          )}
+        </Show>
+
+        <Show when={exportTables()}>
+          {(src) => (
+            <ExportTablesDialog
+              title={src().title}
+              tables={src().tables}
+              supportsSchemas={caps()?.schemas !== false}
+              initialSelection={src().selection}
+              remembered={rememberedExport()}
+              onRememberOptions={rememberExportOptions}
+              onPickDirectory={async () => {
+                const picked = await openDialog({ directory: true, multiple: false });
+                return typeof picked === "string" ? picked : null;
+              }}
+              onRun={runTablesExport}
+              onCancelRun={() => void cancelOperation(src().connectionId, activeTabId())}
+              progress={exportTablesProgress}
+              onClose={() => setExportTables(null)}
+            />
+          )}
         </Show>
 
         <Show when={activeDialog()}>
@@ -4396,6 +4494,17 @@ function App() {
               dialect={src().dialect}
               boolCols={src().boolCols}
               allowAllRows={!transactionOpen(transaction())}
+              selection={src().selectionRows.length ? { columns: src().columns, rows: src().selectionRows } : null}
+              remembered={rememberedExport()}
+              onRememberOptions={rememberExportOptions}
+              onFetchCreateSql={src().ddl
+                ? async () => {
+                  const d = src().ddl!;
+                  if (metadataFrozen()) return "";
+                  interruptStream("reading object DDL closed the result stream");
+                  return await invoke<string>("object_ddl", { connectionId: src().connectionId, kind: d.kind, schema: d.schema, name: d.name });
+                }
+                : undefined}
               onClose={() => setExportSrc(null)}
               onExportFile={exportToFile}
               onExportClipboard={exportToClipboard}

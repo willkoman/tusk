@@ -17,7 +17,12 @@ function importLimit(message: string): never {
 
 // ---------- parsing (import) ----------
 
-export function parseCSV(text: string, hasHeader: boolean, delimiter = ","): Dataset {
+/** A leading UTF-8 BOM is metadata, never part of the first field. Parity with the
+ *  streaming Rust parser in src-tauri/src/import.rs. */
+const stripBom = (text: string): string => (text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+
+export function parseCSV(rawText: string, hasHeader: boolean, delimiter = ","): Dataset {
+  const text = stripBom(rawText);
   if (text.length > IMPORT_LIMITS.chars) importLimit(`file exceeds ${IMPORT_LIMITS.chars.toLocaleString()} characters`);
   if (delimiter !== "," && delimiter !== "\t") throw new Error("unsupported import delimiter");
   const rows: string[][] = [];
@@ -188,7 +193,8 @@ function assertUniqueJsonKeys(text: string): void {
   if (i !== text.length) malformed();
 }
 
-export function parseJSON(text: string): Dataset {
+export function parseJSON(rawText: string): Dataset {
+  const text = stripBom(rawText);
   if (text.length > IMPORT_LIMITS.chars) importLimit(`file exceeds ${IMPORT_LIMITS.chars.toLocaleString()} characters`);
   assertUniqueJsonKeys(text);
   const parsed = JSON.parse(text);
@@ -464,6 +470,8 @@ export function formatWithOptions(d: Dataset, o: ExportOptions, sourceDialect = 
     quoteChars.length !== 1 || /[\r\n]/.test(o.quoteChar) ||
     (o.delimiter === "custom" && (delimiterChars.length !== 1 || /[\r\n]/.test(o.customDelimiter)))
   ) throw new Error("export delimiter and quote character must each be one non-newline character");
+  if ((o.sql.createSql ?? "").length > 1024 * 1024)
+    throw new Error("the SQL export CREATE statement exceeds the 1 MiB limit");
   if (
     o.nullText.length > FORMAT_LIMITS.fieldChars || o.sql.table.length > 1_000 ||
     o.columnIndices.length > FORMAT_LIMITS.columns || (o.boolCols ?? []).length > FORMAT_LIMITS.columns
@@ -530,7 +538,12 @@ export function formatWithOptions(d: Dataset, o: ExportOptions, sourceDialect = 
           })
           .join(", ")})`;
       let out = "";
-      if (o.sql.includeCreate) {
+      if (o.sql.includeCreate && o.sql.createSql) {
+        // Engine-reconstructed DDL wins over the synthetic all-text CREATE (parity with
+        // `header_text` in src-tauri/src/export.rs).
+        const ddl = o.sql.createSql.replace(/\s+$/, "").replace(/;$/, "");
+        out += `${ddl};${nl}`;
+      } else if (o.sql.includeCreate) {
         out += `CREATE TABLE ${sqlIdent(table)} (${cols.map((c, k) => `${sqlIdent(c)} ${pbool[k] ? "boolean" : "text"}`).join(", ")});${nl}`;
       }
       if (o.sql.multiRow) {

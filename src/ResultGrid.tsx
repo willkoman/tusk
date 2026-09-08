@@ -78,6 +78,10 @@ export type ResultGridProps = {
   /** Toggle delete-marks on the given rows (insert rows are removed outright). */
   onMarkDelete: (rows: RowRef[]) => void;
   onAddRow: () => void;
+  /** Hands the workbench a getter for the current selection, so Export can offer it as
+   *  a scope. Returns null when nothing is selected or the selection exceeds the copy
+   *  ceiling (Export "All rows"/"Loaded rows" covers those). */
+  registerSelectionSource?: (get: () => Dataset | null) => void;
   /**
    * Paste a parsed clipboard grid. `anchor`/`anchorDisplayIdx`/`displayOrigCols`
    * describe where a positional paste starts; header-mapped pastes ignore them.
@@ -574,6 +578,20 @@ export function ResultGrid(props: ResultGridProps) {
     for (let r = r0; r <= r1; r++) rows.push(cols.map((oi) => copyVal(r, oi)));
     return { columns: cols.map((oi) => names[oi]), rows };
   }
+  // The workbench reads the live selection through this getter (Export → Selection).
+  // It returns the selected ROWS at full width in ORIGINAL column order, so the export
+  // dialog's own column checkboxes and ordering still apply on top.
+  props.registerSelectionSource?.(() => {
+    if (sel().mode === "none") return null;
+    const b = selectionBounds();
+    const names = props.columns();
+    if (b.r1 < b.r0 || !names.length) return null;
+    if ((b.r1 - b.r0 + 1) * names.length > MAX_COPY_CELLS) return null;
+    const out: (string | null)[][] = [];
+    for (let r = b.r0; r <= b.r1; r++) out.push(names.map((_, oi) => copyVal(r, oi)));
+    return { columns: names.slice(), rows: out };
+  });
+
   async function copySelection(fmt: "tsv" | "csv" | "json" | "md") {
     const tabId = props.activeTabId();
     const generation = props.resultGeneration();

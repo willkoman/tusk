@@ -6,10 +6,17 @@ export type DelimiterKind = "comma" | "tab" | "semicolon" | "pipe" | "custom";
 export type QuoteMode = "always" | "asNeeded" | "never";
 export type NullMode = "empty" | "literal" | "custom";
 export type LineEnding = "lf" | "crlf";
-export type ExportScope = "all" | "loaded";
+export type ExportScope = "all" | "loaded" | "selection";
 export type ExportDest = "file" | "clipboard";
 
-export type SqlExportOptions = { table: string; multiRow: boolean; includeCreate: boolean };
+export type SqlExportOptions = {
+  table: string;
+  multiRow: boolean;
+  includeCreate: boolean;
+  /** Reconstructed engine DDL for the source table; used verbatim when `includeCreate`
+   *  is on. Empty falls back to the synthetic all-`text` CREATE. */
+  createSql: string;
+};
 export type XlsxExportOptions = {
   sheetName: string;
   headerStyling: boolean;
@@ -79,7 +86,7 @@ export function defaultExportOptions(table: string): ExportOptions {
     bom: false,
     columnIndices: [],
     boolCols: [],
-    sql: { table: table || "exported", multiRow: false, includeCreate: false },
+    sql: { table: table || "exported", multiRow: false, includeCreate: false, createSql: "" },
     xlsx: { sheetName: (table || "Sheet1").slice(0, 26), headerStyling: true, autoFilter: true, freezeHeader: true },
   };
 }
@@ -101,4 +108,77 @@ export function resolvedDelimiter(o: ExportOptions): string {
 
 export function nullString(o: ExportOptions): string {
   return o.nullMode === "literal" ? "NULL" : o.nullMode === "custom" ? o.nullText : "";
+}
+
+// --- last-used options, per format --------------------------------------------
+// Only formatting choices persist. Column projection, boolean metadata, the SQL table
+// name and any reconstructed CREATE belong to one result and are always recomputed.
+
+const REMEMBERED_KEYS = [
+  "delimiter",
+  "customDelimiter",
+  "quote",
+  "quoteChar",
+  "header",
+  "nullMode",
+  "nullText",
+  "lineEnding",
+  "bom",
+] as const;
+
+const REMEMBERED_SQL_KEYS = ["multiRow", "includeCreate"] as const;
+const REMEMBERED_XLSX_KEYS = ["headerStyling", "autoFilter", "freezeHeader"] as const;
+
+/** The subset of `o` worth remembering for its format. */
+export function rememberableExportOptions(o: ExportOptions): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of REMEMBERED_KEYS) out[key] = o[key];
+  for (const key of REMEMBERED_SQL_KEYS) out[`sql.${key}`] = o.sql[key];
+  for (const key of REMEMBERED_XLSX_KEYS) out[`xlsx.${key}`] = o.xlsx[key];
+  return out;
+}
+
+const ALLOWED: Record<string, readonly string[]> = {
+  delimiter: ["comma", "tab", "semicolon", "pipe", "custom"],
+  quote: ["always", "asNeeded", "never"],
+  nullMode: ["empty", "literal", "custom"],
+  lineEnding: ["lf", "crlf"],
+};
+
+/**
+ * Merge a remembered blob over freshly built defaults, ignoring anything that isn't a
+ * value this build accepts. Stored settings are user data, not a contract: an unknown
+ * or malformed entry degrades to the default rather than producing an invalid export.
+ */
+export function applyRememberedExportOptions(
+  defaults: ExportOptions,
+  remembered: Record<string, unknown> | undefined,
+): ExportOptions {
+  if (!remembered || typeof remembered !== "object") return defaults;
+  const out: ExportOptions = { ...defaults, sql: { ...defaults.sql }, xlsx: { ...defaults.xlsx } };
+  for (const key of REMEMBERED_KEYS) {
+    const value = (remembered as Record<string, unknown>)[key];
+    const fallback = defaults[key];
+    if (typeof fallback === "boolean") {
+      if (typeof value === "boolean") (out as Record<string, unknown>)[key] = value;
+      continue;
+    }
+    if (typeof value !== "string" || value.length > 1_000) continue;
+    if (ALLOWED[key] && !ALLOWED[key].includes(value)) continue;
+    if ((key === "quoteChar" || key === "customDelimiter") && (Array.from(value).length > 1 || /[\r\n]/.test(value)))
+      continue;
+    (out as Record<string, unknown>)[key] = value;
+  }
+  for (const key of REMEMBERED_SQL_KEYS) {
+    const value = (remembered as Record<string, unknown>)[`sql.${key}`];
+    if (typeof value === "boolean") out.sql[key] = value;
+  }
+  for (const key of REMEMBERED_XLSX_KEYS) {
+    const value = (remembered as Record<string, unknown>)[`xlsx.${key}`];
+    if (typeof value === "boolean") out.xlsx[key] = value;
+  }
+  // A custom delimiter with no character would silently fall back to a comma.
+  if (out.delimiter === "custom" && Array.from(out.customDelimiter).length !== 1)
+    out.delimiter = defaults.delimiter;
+  return out;
 }

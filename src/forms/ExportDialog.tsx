@@ -2,8 +2,10 @@ import { createSignal, createMemo, For, Show } from "solid-js";
 import { Dialog } from "../Dialog";
 import { formatWithOptions } from "../formats";
 import {
+  applyRememberedExportOptions,
   defaultExportOptions,
   isDelimited,
+  rememberableExportOptions,
   EXPORT_FORMATS,
   type ExportOptions,
   type ExportScope,
@@ -27,10 +29,21 @@ export function ExportDialog(props: {
   onExportClipboard: (opts: ExportOptions) => Promise<boolean>;
   /** Full-query export is blocked while a manual transaction owns the connection. */
   allowAllRows?: boolean;
+  /** The grid's current cell/row selection, offered as a third scope when non-empty. */
+  selection?: { columns: string[]; rows: (string | null)[][] } | null;
+  /** Last-used options per format (src/store.ts `exportOptionsStore`). */
+  remembered?: Record<string, Record<string, unknown>>;
+  onRememberOptions?: (format: string, values: Record<string, unknown>) => void;
+  /** Reconstruct the source table's DDL for "Include CREATE TABLE". Absent (or a
+   *  rejection) means the result isn't a plain table and the synthetic CREATE is used. */
+  onFetchCreateSql?: () => Promise<string>;
   /** Immediately cancel + roll back an in-flight (streaming) export. */
   onCancel?: () => void | Promise<void>;
 }) {
-  const [opts, setOpts] = createSignal<ExportOptions>(defaultExportOptions(props.defaultTable));
+  const [opts, setOpts] = createSignal<ExportOptions>(
+    applyRememberedExportOptions(defaultExportOptions(props.defaultTable), props.remembered?.csv),
+  );
+  const [ddlNote, setDdlNote] = createSignal("");
   const [scope, setScope] = createSignal<ExportScope>(props.allowAllRows === false ? "loaded" : "all");
   const [dest, setDest] = createSignal<"file" | "clipboard">("file");
   const [cols, setCols] = createSignal<ColState[]>(
@@ -54,12 +67,15 @@ export function ExportDialog(props: {
     setCols(next);
   };
 
+  const selectionRows = () => props.selection?.rows ?? [];
+  const hasSelection = () => selectionRows().length > 0;
   const finalOpts = (): ExportOptions => ({ ...opts(), columnIndices: columnIndices(), boolCols: props.boolCols ?? [] });
 
   // Live preview of the first rows (cheap). Not shown for xlsx.
   const preview = createMemo(() => {
     if (isXlsx()) return "";
-    const sample = { columns: props.columns, rows: props.loadedRows.slice(0, 12) };
+    const source = scope() === "selection" && hasSelection() ? selectionRows() : props.loadedRows;
+    const sample = { columns: props.columns, rows: source.slice(0, 12) };
     try {
       return formatWithOptions(sample, finalOpts(), props.dialect);
     } catch {
@@ -69,9 +85,32 @@ export function ExportDialog(props: {
 
   // When xlsx is chosen, clipboard isn't possible; clipboard forces loaded scope.
   const pickFormat = (f: ExportOptions["format"]) => {
-    set({ format: f });
+    // Carry the current SQL/xlsx sub-objects' identity fields, then layer the remembered
+    // formatting for the newly chosen format over fresh defaults.
+    const base = { ...defaultExportOptions(props.defaultTable), format: f };
+    base.sql.table = opts().sql.table;
+    setOpts(applyRememberedExportOptions(base, props.remembered?.[f]));
+    setDdlNote("");
     if (f === "xlsx" && dest() === "clipboard") setDest("file");
   };
+
+  /** "Include CREATE TABLE" pulls the real engine DDL when the source is a plain table. */
+  async function toggleCreate(on: boolean) {
+    setOpts({ ...opts(), sql: { ...opts().sql, includeCreate: on, createSql: "" } });
+    setDdlNote("");
+    if (!on || !props.onFetchCreateSql) {
+      if (on) setDdlNote("Using a generated all-text CREATE — the result is not a plain table.");
+      return;
+    }
+    try {
+      const ddl = await props.onFetchCreateSql();
+      if (!opts().sql.includeCreate) return;
+      if (ddl) setOpts({ ...opts(), sql: { ...opts().sql, createSql: ddl } });
+      else setDdlNote("Using a generated all-text CREATE — the result is not a plain table.");
+    } catch {
+      setDdlNote("Could not read the table DDL — using a generated all-text CREATE.");
+    }
+  }
   const pickDest = (d: "file" | "clipboard") => {
     setDest(d);
     if (d === "clipboard") setScope("loaded");
@@ -84,6 +123,7 @@ export function ExportDialog(props: {
     }
     setBusy(true);
     setErr("");
+    props.onRememberOptions?.(opts().format, rememberableExportOptions(opts()));
     try {
       const completed = dest() === "clipboard"
         ? await props.onExportClipboard(finalOpts())
@@ -174,8 +214,9 @@ export function ExportDialog(props: {
                 <input value={opts().sql.table} onInput={(e) => setOpts({ ...opts(), sql: { ...opts().sql, table: e.currentTarget.value } })} />
               </label>
               <label class="export-check"><input type="checkbox" checked={opts().sql.multiRow} onChange={(e) => setOpts({ ...opts(), sql: { ...opts().sql, multiRow: e.currentTarget.checked } })} />Multi-row INSERT</label>
-              <label class="export-check"><input type="checkbox" checked={opts().sql.includeCreate} onChange={(e) => setOpts({ ...opts(), sql: { ...opts().sql, includeCreate: e.currentTarget.checked } })} />Include CREATE TABLE</label>
+              <label class="export-check"><input type="checkbox" checked={opts().sql.includeCreate} onChange={(e) => void toggleCreate(e.currentTarget.checked)} />Include CREATE TABLE</label>
             </div>
+            <Show when={ddlNote()}><div class="export-note">{ddlNote()}</div></Show>
           </section>
         </Show>
 
@@ -219,6 +260,9 @@ export function ExportDialog(props: {
               <select value={scope()} onChange={(e) => setScope(e.currentTarget.value as ExportScope)} disabled={dest() === "clipboard"}>
                 <option value="all" disabled={props.allowAllRows === false}>All rows (re-run query)</option>
                 <option value="loaded">Loaded rows ({props.loadedRows.length}{props.loadedIncomplete ? ", incomplete" : ""})</option>
+                <Show when={hasSelection()}>
+                  <option value="selection">Selection ({selectionRows().length} rows)</option>
+                </Show>
               </select>
             </label>
             <label>To
