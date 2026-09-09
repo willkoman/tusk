@@ -1,6 +1,7 @@
 import { For, Show, createEffect, createMemo, createSignal, on, type Accessor } from "solid-js";
 import { type EditorPrefs } from "../editor/types";
 import { PanZoomCanvas } from "../viz/PanZoomCanvas";
+import { heatLegend, heatOf } from "./heat";
 import { edgePath, layoutTree } from "./layout";
 import { MAX_PLAN_NODES, type ParsedPlan, type PlanNode, type PlanTree } from "./types";
 
@@ -34,27 +35,6 @@ function fmtNum(n: number): string {
   return n.toFixed(2);
 }
 const fmtMs = (ms: number) => (ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${ms.toFixed(ms < 1 ? 3 : 1)}ms`);
-
-/** 0..1 heat for a node under the chosen metric (sqrt — mid values stay visible). */
-function heatOf(n: PlanNode, plan: PlanTree, metric: EditorPrefs["planHeat"]): number {
-  // cost → time → rows fallback when the engine has no costs (DuckDB has no cost numbers:
-  // ANALYZE gives per-operator time, plain EXPLAIN only estimated cardinality).
-  let m = metric;
-  if (m === "cost" && plan.maxSelfCost === 0) m = plan.maxSelfTimeMs > 0 ? "time" : "rows";
-  let v = 0;
-  let max = 0;
-  if (m === "cost") {
-    v = n.selfCost ?? 0;
-    max = plan.maxSelfCost;
-  } else if (m === "time") {
-    v = n.selfTimeMs ?? 0;
-    max = plan.maxSelfTimeMs;
-  } else if (m === "rows") {
-    v = n.actualRows ?? n.planRows ?? 0;
-    max = plan.maxRows;
-  }
-  return max > 0 ? Math.sqrt(v / max) : 0;
-}
 
 export function PlanView(props: {
   plan: Accessor<ParsedPlan>;
@@ -148,6 +128,9 @@ export function PlanView(props: {
                 <Show when={t().planningMs !== undefined}><span class="plan-stat">planning {fmtMs(t().planningMs!)}</span></Show>
                 <Show when={t().executionMs !== undefined}><span class="plan-stat">execution {fmtMs(t().executionMs!)}</span></Show>
                 <Show when={!t().hasActual}><span class="plan-stat dim">estimates only</span></Show>
+                <Show when={heatLegend(t(), props.prefs().planHeat)}>
+                  {(legend) => <span class="plan-stat dim">{legend()}</span>}
+                </Show>
                 <span class="spacer" />
                 <span class="plan-stat dim">Raw plan output is under Grid</span>
               </div>
@@ -191,7 +174,7 @@ export function PlanView(props: {
                             width: `${CARD_W}px`,
                             height: `${H()}px`,
                             "border-left-color": heat() > 0.02 ? mix() : "var(--border)",
-                            background: heat() > 0.02 ? `rgba(${colors.hot[0]}, ${colors.hot[1]}, ${colors.hot[2]}, ${(heat() * 0.16).toFixed(3)})` : undefined,
+                            background: heat() > 0.02 ? `rgba(${colors.hot[0]}, ${colors.hot[1]}, ${colors.hot[2]}, ${(heat() * 0.22).toFixed(3)})` : undefined,
                           }}
                           onPointerDown={(e) => e.stopPropagation()}
                           onClick={() => setSelectedId(selectedId() === n.id ? null : n.id)}
