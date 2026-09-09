@@ -345,7 +345,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
-        "text": "Dropped idle connections heal themselves",
+        "text": "Dropped idle connections reopen",
         "id": "resilience"
       },
       {
@@ -1242,7 +1242,7 @@ export const TOPICS: Topic[] = [
         "rows": [
           [
             "Table",
-            "Select 100 rows · Select all rows · Filter rows… · Export table… · Import data into table… · **Modify table…** · Add column… · Add index… · Add constraint… · Rename… · Duplicate… · Edit comment… · Truncate… · Drop… · Backup table… · Generate SELECT/INSERT/UPDATE · DDL & relationships… · Copy DDL / Copy DDL → editor · Copy name / Copy qualified name"
+            "Select 100 rows · Select all rows · Filter rows… · Export table… · Import data into table… · **Modify table…** · Add column… · Add index… · Add constraint… · Rename… · Duplicate… · Edit comment… · Truncate… · Drop… · Backup table… · Generate SELECT/INSERT/UPDATE · DDL & relationships… · Copy DDL / Copy DDL to editor · Copy name / Copy qualified name"
           ],
           [
             "View / matview",
@@ -1262,15 +1262,15 @@ export const TOPICS: Topic[] = [
           ],
           [
             "Sequence",
-            "Restart… · Rename… · Drop… · Copy DDL / Copy DDL → editor · Copy name"
+            "Restart… · Rename… · Drop… · Copy DDL / Copy DDL to editor · Copy name"
           ],
           [
             "Function",
-            "Drop… · Copy DDL / Copy DDL → editor · Copy name"
+            "Drop… · Copy DDL / Copy DDL to editor · Copy name"
           ],
           [
             "Trigger",
-            "Copy DDL / Copy DDL → editor · Drop… · Copy name"
+            "Copy DDL / Copy DDL to editor · Drop… · Copy name"
           ],
           [
             "Schema",
@@ -1389,7 +1389,7 @@ export const TOPICS: Topic[] = [
           "**Copy DDL** rebuilds a runnable `CREATE` from the system catalogs on every engine, best-effort on DuckDB.",
           "On Postgres it covers tables, views, matviews, functions including overloads, and sequences.",
           "Foreign keys emit as trailing `ALTER TABLE … ADD CONSTRAINT`, so copied tables replay in any order. Constraint-backed indexes are skipped.",
-          "**Copy DDL → editor** pastes the reconstruction at the cursor — useful for [[topic:import-export|exporting]] a structure alongside its data."
+          "**Copy DDL to editor** pastes the reconstruction at the cursor — useful for [[topic:import-export|exporting]] a structure alongside its data."
         ]
       },
       {
@@ -1803,7 +1803,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "`EXPLAIN ANALYZE` executes the statement, so a non-read — including `WITH … UPDATE` — raises a confirmation dialog whose red **Run it** button is the only way through."
+        "md": "`EXPLAIN ANALYZE` executes the statement, so a non-read — including `WITH … UPDATE` — raises a confirmation whose **Modify data and explain** button is the only way through."
       },
       {
         "k": "h",
@@ -3021,7 +3021,28 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Up to **16** databases can be open at once. The topbar carries one chip per connection — mascot, database name, state dot — and **＋** adds one."
+        "md": "Up to **16** databases can be open at once. The topbar carries one chip per connection — mascot, database name, state dot, colour rail — and **+** adds one."
+      },
+      {
+        "k": "p",
+        "md": "Two connections reporting the same database name are named by where they connect (`db.internal/postgres`)."
+      },
+      {
+        "k": "h",
+        "text": "Environment tags",
+        "id": "environment"
+      },
+      {
+        "k": "p",
+        "md": "A saved connection can be tagged **Development**, **Staging** or **Production** on the connect form. The tag is metadata: it never reaches the driver."
+      },
+      {
+        "k": "list",
+        "items": [
+          "A tagged connection takes its environment's colour for the rail on its chip and its editor tabs.",
+          "The badge repeats on the connection chip, the saved-connections list, the statusbar, and the title of every confirmation dialog.",
+          "**Production** uses the red family. Untagged connections keep their cycled colour and show no badge."
+        ]
       },
       {
         "k": "table",
@@ -3292,6 +3313,21 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
+        "text": "Destructive confirmations",
+        "id": "confirmations"
+      },
+      {
+        "k": "list",
+        "items": [
+          "Drop and Truncate name the object, its kind, and its row estimate and size when the Explorer knows them.",
+          "Dropping a table, schema or database needs its name typed into the dialog first.",
+          "`CASCADE` is stated as what it widens; leave it off to fail on a dependency instead.",
+          "The red button is the only destructive control in the footer, and the destructive group sits last in every context menu.",
+          "A connection tagged **Production** shows its badge in the title of every confirmation."
+        ]
+      },
+      {
+        "k": "h",
         "text": "Permission-aware UI on Postgres",
         "id": "permissions"
       },
@@ -3369,7 +3405,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
-        "text": "Dropped idle connections heal themselves",
+        "text": "Dropped idle connections reopen",
         "id": "resilience"
       },
       {
@@ -3430,6 +3466,15 @@ export const TOPICS: Topic[] = [
         "k": "h",
         "text": "Unreleased — several databases at once, backups, SSH, SQL Server",
         "id": "v-unreleased"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Visible keyboard focus** on every control, in every theme.",
+          "**A running query dims and labels the previous result**, disables the toolbar acting on it, and shows a live timer.",
+          "**Drop and Truncate state what goes** — kind, name, rows, size — and a table, schema or database needs its name typed.",
+          "**Environment tags** mark a saved connection Development, Staging or Production on its chip, tabs, statusbar and confirmations."
+        ]
       },
       {
         "k": "list",
