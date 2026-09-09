@@ -1163,7 +1163,7 @@ export const TOPICS: Topic[] = [
           ],
           [
             "Schema",
-            "Schema diagram… · Create table… · Rename… · Drop… · Copy name"
+            "Schema diagram… · Create table… · Rename… · Drop… (on MySQL a schema IS a database, so it reads **Drop database…**, confirms as one, and refuses the connected database) · Copy name"
           ],
           [
             "Database",
@@ -1194,12 +1194,12 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**Modify table…** is a DataGrip-style diff editor: edit a column's name, type, nullability, default, PK membership, or comment; reorder, add and drop columns; tick indexes and constraints for removal; add UNIQUE, CHECK and foreign-key constraints; rename, re-comment, and on Postgres move the table to another schema. The preview is the **minimal `ALTER` script** — type/null/default edits run against original column names, renames run last, and a PK change emits a key drop + `ADD PRIMARY KEY` only when the key actually changed. It refuses to run on an empty or duplicate column name (case-insensitively, since every engine folds unquoted names) or a nullable primary-key column, and says underneath whether the script runs as one transaction."
+        "md": "**Modify table…** is a DataGrip-style diff editor: edit a column's name, type, nullability, default, PK membership, or comment; reorder, add and drop columns; tick indexes and constraints for removal; add UNIQUE, CHECK and foreign-key constraints; rename, re-comment, and on Postgres move the table to another schema. The preview is the **minimal `ALTER` script** — type/null/default edits run against original column names, renames run last, and a PK change emits a key drop + `ADD PRIMARY KEY` only when the key actually changed. It refuses to run on an empty column name, a duplicate one (case-insensitively on DuckDB, MySQL and SQLite, which treat two spellings as one column — Postgres is left alone because Tusk always quotes, so `\"Id\"` and `\"id\"` are two legal columns), a nullable primary key (except on SQLite, which allows NULLs in a non-INTEGER key), or a generated column, whose expression no `ALTER` here can restate. Column reordering is offered on SQLite only, the one engine that can express it. It says underneath whether the script runs as one transaction."
       },
       {
         "k": "tip",
         "kind": "warn",
-        "md": "**SQLite rebuilds instead of altering.** SQLite's `ALTER TABLE` only renames the table, renames a column, adds a column and drops one. Anything else — a type change, a NOT NULL or default change, a key change, a constraint edit — makes Tusk generate the documented rebuild: `CREATE` the new shape, `INSERT … SELECT` the rows, `DROP` the original, `RENAME` the replacement into place, then recreate its indexes. The whole script runs as one transaction, the preview is labelled, and the primary button reads **Rebuild table**. Constraints and indexes shown in the dialog are carried across; triggers on the table are dropped with it and are named in the note so you can recreate them."
+        "md": "**SQLite rebuilds instead of altering.** SQLite's `ALTER TABLE` only renames the table, renames a column, adds a column and drops one. Anything else — a type change, a NOT NULL or default change, a key change, a constraint edit, a column reorder, or dropping a column SQLite won't drop in place — makes Tusk generate the documented rebuild: `CREATE` the new shape, `INSERT … SELECT` the rows, `DROP` the original, `RENAME` the replacement into place, then recreate its indexes and triggers. The whole script runs as one transaction, the preview is labelled, and the primary button reads **Rebuild table**. The new shape is built from the table's stored `CREATE` text, so CHECK constraints (names included), column collations, generated columns and `WITHOUT ROWID` / `STRICT` are carried across; the swap runs under `PRAGMA legacy_alter_table` so a table a view or trigger refers to can be rebuilt at all. Tusk refuses a rebuild it cannot do safely and says why: a rename in the same pass (do the rename on its own first), dropping a column an index, constraint or trigger still uses (drop that too), and a stored definition it could not read."
       },
       {
         "k": "p",
