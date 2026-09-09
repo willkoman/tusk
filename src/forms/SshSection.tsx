@@ -1,5 +1,5 @@
 import { Show } from "solid-js";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { pickOpenPath, UNVERIFIED_PICKER } from "../filePicker";
 
 /** SSH tunnel metadata as it round-trips through profiles. Secrets never live here. */
 export type SshMeta = {
@@ -107,8 +107,10 @@ export function SshSection(props: {
 
   const browseKey = async () => {
     try {
-      const picked = await openDialog({ multiple: false, title: "Select an SSH private key" });
-      if (typeof picked === "string") props.onChange({ keyPath: picked });
+      // A key file Tusk cannot prove the user picked is never adopted (see filePicker).
+      const picked = await pickOpenPath({ title: "Select an SSH private key" });
+      if (picked.path && !picked.verified) props.onError(UNVERIFIED_PICKER);
+      else if (picked.path) props.onChange({ keyPath: picked.path });
     } catch (e) {
       props.onError(e instanceof Error ? e.message : String(e));
     }

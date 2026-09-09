@@ -36,7 +36,7 @@ import {
   type ImportSummary,
   type ImportTarget,
 } from "./import";
-import { save, open as openDialog } from "@tauri-apps/plugin-dialog";
+import { pickOpenPath, pickSavePath, type PickedPath, type PickerOptions } from "./filePicker";
 import { Tree, type DbTree, type RelationDetail, type NodeDescriptor, nodeKey, relKey } from "./Tree";
 import { ContextMenu, type MenuItem, type MenuState } from "./ContextMenu";
 import { type DialogState } from "./WorkbenchDialogs";
@@ -1257,9 +1257,9 @@ function App() {
   async function openFileDialog() {
     const origin = captureOrigin();
     try {
-      const path = await openDialog({ multiple: false, filters: [{ name: "SQL", extensions: ["sql", "txt"] }] });
+      const path = await chooseOpenPath({ filters: [{ name: "SQL", extensions: ["sql", "txt"] }] });
       if (!originCurrent(origin)) return;
-      if (typeof path !== "string") return;
+      if (!path) return;
       const existing = tabs().find((t) => t.filePath === path);
       if (existing) {
         switchTab(existing.id);
@@ -1282,6 +1282,31 @@ function App() {
     }
   }
 
+  /**
+   * Every native picker in the workbench funnels through here. `filePicker` reports a
+   * destination as UNVERIFIED when the dialog resolved without ever taking focus — the
+   * failure a smoke run hit on Windows/WebView2, where `save()` handed back a default
+   * path in Downloads and no window was ever shown. A path Tusk cannot prove the user
+   * chose is confirmed, never written to on its own.
+   */
+  const [confirmPickedPath, setConfirmPickedPath] = createSignal<
+    { path: string; resolve: (ok: boolean) => void } | null
+  >(null);
+  const settlePickedPath = (ok: boolean) => {
+    const pending = confirmPickedPath();
+    setConfirmPickedPath(null);
+    pending?.resolve(ok);
+  };
+  async function confirmedPath(picked: PickedPath): Promise<string | null> {
+    if (!picked.path) return null;
+    if (picked.verified) return picked.path;
+    const path = picked.path;
+    const ok = await new Promise<boolean>((resolve) => setConfirmPickedPath({ path, resolve }));
+    return ok ? path : null;
+  }
+  const chooseSavePath = async (options: PickerOptions) => confirmedPath(await pickSavePath(options));
+  const chooseOpenPath = async (options: PickerOptions) => confirmedPath(await pickOpenPath(options));
+
   const saveOperations = new Map<string, number>();
   const fileWrites = new KeyedSerialQueue<string>();
   async function saveTab(tabId: string, saveAs: boolean): Promise<boolean> {
@@ -1290,7 +1315,7 @@ function App() {
     try {
       let filePath = t.filePath;
       if (saveAs || !filePath) {
-        filePath = await save({ defaultPath: t.filePath ?? `${t.title}.sql`, filters: [{ name: "SQL", extensions: ["sql"] }] });
+        filePath = await chooseSavePath({ defaultPath: t.filePath ?? `${t.title}.sql`, filters: [{ name: "SQL", extensions: ["sql"] }] });
         if (!filePath) return false;
       }
       t = tabs().find((x) => x.id === tabId);
@@ -2525,11 +2550,10 @@ function App() {
   // Pick an existing DuckDB/SQLite database file (a new file can also be typed).
   async function browseDbFile() {
     try {
-      const p = await openDialog({
-        multiple: false,
+      const p = await chooseOpenPath({
         filters: [{ name: "Database", extensions: ["duckdb", "ddb", "db", "sqlite", "sqlite3"] }],
       });
-      if (typeof p === "string") setPath(p);
+      if (p) setPath(p);
     } catch (e) {
       setConnErr(errMsg(e));
     }
@@ -3675,7 +3699,7 @@ function App() {
       throw new Error("All-rows query export is frozen during a manual transaction; export loaded rows instead");
     }
     const table = opts.sql.table || src.table;
-    const path = await save({
+    const path = await chooseSavePath({
       defaultPath: `${table}.${FORMAT_EXT[opts.format]}`,
       filters: [{ name: opts.format.toUpperCase(), extensions: [FORMAT_EXT[opts.format]] }],
     });
@@ -3770,7 +3794,7 @@ function App() {
   }
 
   const pickBackupPath = (suggested: string) =>
-    save({
+    chooseSavePath({
       defaultPath: `${suggested || "backup"}.sql`,
       filters: [{ name: "SQL", extensions: ["sql"] }],
     });
@@ -3815,8 +3839,8 @@ function App() {
   }
 
   async function pickRestoreFile(): Promise<BackupFileInfo | null> {
-    const path = await openDialog({ multiple: false, filters: [{ name: "SQL", extensions: ["sql"] }] });
-    if (typeof path !== "string") return null;
+    const path = await chooseOpenPath({ filters: [{ name: "SQL", extensions: ["sql"] }] });
+    if (!path) return null;
     return invoke<BackupFileInfo>("read_backup_header", { path });
   }
 
@@ -5718,11 +5742,9 @@ function App() {
               defaultSchema={open().defaultSchema}
               initialTarget={open().target}
               onPickFile={async () => {
-                const picked = await openDialog({
-                  multiple: false,
+                return await chooseOpenPath({
                   filters: [{ name: "Data files", extensions: ["csv", "tsv", "txt", "json", "ndjson", "jsonl", "xlsx"] }],
                 });
-                return typeof picked === "string" ? picked : null;
               }}
               onPreview={previewImport}
               onTargetColumns={importTargetColumns}
@@ -5744,8 +5766,7 @@ function App() {
               remembered={rememberedExport()}
               onRememberOptions={rememberExportOptions}
               onPickDirectory={async () => {
-                const picked = await openDialog({ directory: true, multiple: false });
-                return typeof picked === "string" ? picked : null;
+                return await chooseOpenPath({ directory: true });
               }}
               onRun={runTablesExport}
               onCancelRun={() => void cancelOperation(src().connectionId, activeTabId())}
@@ -6062,6 +6083,26 @@ function App() {
               }
             }}
           />
+        )}
+      </Show>
+
+      {/* A picker result Tusk could not prove the user saw. `filePicker` flags a dialog
+          that resolved without ever taking focus — the Windows/WebView2 failure where
+          `save()` returned a default path in Downloads and no window appeared. Confirm
+          the destination rather than writing to it. */}
+      <Show when={confirmPickedPath()}>
+        {(p) => (
+          <Dialog title="Use this file?" onClose={() => settlePickedPath(false)} width={520}>
+            <p class="confirm-text">
+              Tusk could not confirm the file picker appeared, so this may be a default
+              location rather than your choice:
+            </p>
+            <p class="confirm-text"><b>{p().path}</b></p>
+            <div class="form-actions">
+              <button class="ghost" onClick={() => settlePickedPath(false)}>Cancel</button>
+              <button class="run" onClick={() => settlePickedPath(true)}>Use this path</button>
+            </div>
+          </Dialog>
         )}
       </Show>
 

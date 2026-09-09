@@ -15,7 +15,7 @@
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { save as saveDialog, open as openDialog } from "@tauri-apps/plugin-dialog";
+import { pickOpenPath, pickSavePath, UNVERIFIED_PICKER } from "../filePicker";
 import {
   AI_PROVIDERS, aiStore, defaultModel, isKeyless, normalizeMaxTokens,
   approvedBaseOverride, connectionTestProbe, endpointOrigin, normalizeAiConfig, originApproved,
@@ -257,8 +257,11 @@ export function AiPane(props: { database: string }) {
     await refreshSkills();
   }
   async function exportSkill(s: Skill) {
-    const path = await saveDialog({ defaultPath: `${s.id || s.name}.md`, filters: [{ name: "Markdown", extensions: ["md"] }] });
-    if (!path) return;
+    // A destination Tusk cannot prove the user chose is not written to (see filePicker).
+    const picked = await pickSavePath({ defaultPath: `${s.id || s.name}.md`, filters: [{ name: "Markdown", extensions: ["md"] }] });
+    if (!picked.path) return;
+    if (!picked.verified) { setSkillNote(UNVERIFIED_PICKER); return; }
+    const path = picked.path;
     try {
       const text = await invoke<string>("skills_export", { id: s.id });
       await invoke("write_text_file", { path, contents: text });
@@ -266,9 +269,10 @@ export function AiPane(props: { database: string }) {
     } catch (e) { setSkillNote(errMsg(e)); }
   }
   async function importSkill() {
-    const picked = await openDialog({ multiple: false, filters: [{ name: "Markdown", extensions: ["md", "markdown", "txt"] }] });
-    const path = Array.isArray(picked) ? picked[0] : picked;
-    if (!path) return;
+    const picked = await pickOpenPath({ filters: [{ name: "Markdown", extensions: ["md", "markdown", "txt"] }] });
+    if (!picked.path) return;
+    if (!picked.verified) { setSkillNote(UNVERIFIED_PICKER); return; }
+    const path = picked.path;
     try {
       const text = await invoke<string>("read_text_file", { path });
       const stem = path.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, "") ?? "Imported skill";
