@@ -1219,17 +1219,18 @@ export const TOPICS: Topic[] = [
     "icon": "edit"
   },
   {
+    "blurb": "Browse the database tree; run SQL-previewed DDL from right-click menus.",
     "id": "sidebar",
     "title": "Schema explorer & DDL",
-    "blurb": "Browse the database tree; run SQL-previewed DDL from right-click menus.",
     "blocks": [
       {
-        "k": "p",
-        "md": "The Explorer always shows the **connection the focused tab belongs to**. With several connections open, switching connection in the topbar strip (or clicking a tab that belongs to another one) swaps the whole tree, its cached table detail, the permission gating on this menu, and the Refresh state — each connection keeps its own. Refreshing one Explorer never disturbs another connection's tree or a result still streaming on it."
-      },
-      {
-        "k": "p",
-        "md": "Every node in the **Explorer** tree carries a right-click menu of real actions, and DDL forms and drop/truncate confirms preview the **exact SQL** before running (two exceptions: matview *Refresh* runs immediately; sequence *Restart…* drops its statement into your editor). Mutating items are gated by connection mode, driver capability, and (on Postgres) your actual privileges — disabled items say *why* in their tooltip."
+        "k": "list",
+        "items": [
+          "The Explorer shows the connection the focused tab belongs to. Switching connection swaps the tree, its cached detail, permission gating, and Refresh state.",
+          "Every node has a right-click menu. DDL forms and drop/truncate confirms preview the exact SQL first.",
+          "Two exceptions run without a preview: matview *Refresh*, and sequence *Restart…*, which drops its statement into the editor.",
+          "Mutating items are gated by connection mode, driver capability, and on Postgres by role privileges. Disabled items name the reason in their tooltip."
+        ]
       },
       {
         "k": "h",
@@ -1237,22 +1238,16 @@ export const TOPICS: Topic[] = [
         "id": "tree-structure"
       },
       {
-        "k": "p",
-        "md": "The hierarchy is **databases → schemas → Tables / Views / Sequences / Functions**; other databases on the server are listed but muted — browsing them means reconnecting (for now). The tree loads shallow at connect (names, kinds, comments, headline stats — no columns); expanding a table lazily fetches and caches **Columns, Indexes, Constraints, Triggers**, with a brief *loading…* row on first expand."
-      },
-      {
         "k": "list",
         "items": [
-          "**Row estimates & sizes (Postgres)** — `≈1.2K · 64 MB` style metadata from the planner's `reltuples` and `pg_size_pretty(pg_total_relation_size)`. Never-analyzed tables show no estimate (not a wrong `0`); sizes appear on tables and matviews only.",
-          "**Comments as tooltips** — hover a table for its comment; a column tooltip adds its `default:` plus any comment. Index/constraint/trigger tooltips show the full definition; functions show `name(args) → returns`.",
-          "**Column badges** — key icon = primary key, link icon = foreign key, `·NN` after the type = `NOT NULL`. FK-internal triggers are hidden.",
-          "**Filter box** (`Filter objects…`) — live substring match. Structural containers auto-expand to reveal matches, but relations don't (that would fetch detail per match); a matching schema keeps all its children."
-        ],
-        "ordered": false
-      },
-      {
-        "k": "p",
-        "md": "**Refresh** in the sidebar header re-introspects everything: shallow tree, autocomplete catalog, effective privileges, and already-expanded details. Every sidebar DDL action triggers the same refresh automatically."
+          "Hierarchy: databases → schemas → Tables / Views / Sequences / Functions. Other databases are listed but muted; browsing one means reconnecting.",
+          "The tree loads shallow at connect — names, kinds, comments, headline stats. Expanding a table lazily fetches and caches Columns, Indexes, Constraints, Triggers.",
+          "**Row estimates and sizes (Postgres)** — `≈1.2K · 64 MB`, from planner `reltuples` and `pg_total_relation_size`. Never-analyzed tables show no estimate; sizes appear on tables and matviews only.",
+          "**Tooltips** — a table shows its comment; a column adds its `default:`; indexes, constraints and triggers show the full definition; functions show `name(args) → returns`.",
+          "**Column badges** — key icon for primary key, link icon for foreign key, `·NN` after the type for `NOT NULL`. FK-internal triggers are hidden.",
+          "**Filter box** — live substring match. Structural containers auto-expand to reveal matches; relations do not, and a matching schema keeps all its children.",
+          "**Refresh** re-introspects the shallow tree, autocomplete catalog, effective privileges, and expanded details. Every sidebar DDL action refreshes automatically."
+        ]
       },
       {
         "k": "h",
@@ -1260,12 +1255,13 @@ export const TOPICS: Topic[] = [
         "id": "browse-data"
       },
       {
-        "k": "p",
-        "md": "**Double-click** a table or view to stream all rows in a new tab (see [[topic:results|Results grid]]). The context menu adds **Select 100 rows** (tables only), **Select all rows**, and **Filter rows…** (runs the table and opens the [[topic:results|filter builder]] over it, pre-loaded with the relation's columns and types) — all open a *new* tab with active schema preset to the relation's, so the generated query stays unqualified and still resolves."
-      },
-      {
-        "k": "p",
-        "md": "**Generate SELECT / INSERT / UPDATE** scaffold a full statement from the column list (UPDATE includes a primary-key `WHERE`) into a new tab — never clobbering your buffer. See [[topic:editor|the editor]]."
+        "k": "list",
+        "items": [
+          "**Double-click** a table or view to stream all rows in a new tab — see [[topic:results|Results grid]].",
+          "The context menu adds **Select 100 rows** (tables only), **Select all rows**, and **Filter rows…**, which runs the table and opens the [[topic:results|filter builder]] pre-loaded with its columns and types.",
+          "All open a new tab with active schema preset to the relation's, so the generated query stays unqualified and still resolves.",
+          "**Generate SELECT / INSERT / UPDATE** scaffold a full statement from the column list into a new tab; UPDATE includes a primary-key `WHERE`. See [[topic:editor|the editor]]."
+        ]
       },
       {
         "k": "h",
@@ -1285,7 +1281,7 @@ export const TOPICS: Topic[] = [
           ],
           [
             "View / matview",
-            "Select all rows · Filter rows… · Export… · (matview only: **Refresh** / **Refresh concurrently**) · Rename… · Edit comment… · Drop… · DDL & relationships… · Copy DDL / Copy DDL → editor · Copy name / qualified name"
+            "Select all rows · Filter rows… · Export… · matview only: **Refresh** / **Refresh concurrently** · Rename… · Edit comment… · Drop… · DDL & relationships… · Copy DDL / Copy DDL → editor · Copy name / qualified name"
           ],
           [
             "Column",
@@ -1301,7 +1297,7 @@ export const TOPICS: Topic[] = [
           ],
           [
             "Sequence",
-            "Restart… (edit value) · Rename… · Drop… · Copy DDL / Copy DDL → editor · Copy name"
+            "Restart… · Rename… · Drop… · Copy DDL / Copy DDL → editor · Copy name"
           ],
           [
             "Function",
@@ -1309,25 +1305,25 @@ export const TOPICS: Topic[] = [
           ],
           [
             "Trigger",
-            "Copy DDL / Copy DDL → editor (the definition rides on the node — no server roundtrip) · Drop… · Copy name"
+            "Copy DDL / Copy DDL → editor · Drop… · Copy name"
           ],
           [
             "Schema",
-            "Schema diagram… · Create table… · Import file as new table… · Export tables… · Rename… · Drop… (on MySQL a schema IS a database, so it reads **Drop database…**, confirms as one, and refuses the connected database) · Backup schema… · Copy name"
+            "Schema diagram… · Create table… · Import file as new table… · Export tables… · Rename… · Drop… (on MySQL a schema is a database, so it reads **Drop database…** and refuses the connected one) · Backup schema… · Copy name"
           ],
           [
             "Database",
-            "Create schema… · Import file as new table… · Export tables… · Drop… (the connected database can't be dropped) · Backup database… · Restore from file… · Copy name"
+            "Create schema… · Import file as new table… · Export tables… · Drop… (not the connected database) · Backup database… · Restore from file… · Copy name"
           ]
         ]
       },
       {
-        "k": "p",
-        "md": "**DDL & relationships…** opens the combined DDL + FK graph viewer; **Schema diagram…** opens the whole-schema ERD — both covered in [[topic:erd|the relationship viewer]]. **Truncate…** and **Drop…** are danger items and always confirm, with a `CASCADE` checkbox (truncate adds `RESTART IDENTITY`)."
-      },
-      {
-        "k": "p",
-        "md": "The **＋** button in the sidebar header is selection-aware: with a table (or its column/index/constraint) selected it offers *New column in X…*, *New index on X…*, *New constraint on X…*, then *New table in ‹schema›…*, *New schema…*, *New database…* — schema defaulting to your selection, else `public` (or the first schema)."
+        "k": "list",
+        "items": [
+          "**DDL & relationships…** opens the DDL and FK graph viewer; **Schema diagram…** opens the whole-schema ERD. See [[topic:erd|the relationship viewer]].",
+          "**Truncate…** and **Drop…** always confirm, with a `CASCADE` checkbox. Truncate adds `RESTART IDENTITY`.",
+          "The header **＋** button is selection-aware: with a table selected it offers *New column in X…*, *New index on X…*, *New constraint on X…*, then *New table in ‹schema›…*, *New schema…*, *New database…*, defaulting the schema to the selection."
+        ]
       },
       {
         "k": "h",
@@ -1335,53 +1331,91 @@ export const TOPICS: Topic[] = [
         "id": "dialogs"
       },
       {
-        "k": "p",
-        "md": "Every form derives a live SQL preview as you type. The footer always offers **Cancel**, **Edit as SQL** (drops the statement into your editor at the cursor instead of running it), and the primary action; failures show inline, success refreshes the tree."
+        "k": "list",
+        "items": [
+          "Every form derives a live SQL preview. The footer offers **Cancel**, **Edit as SQL**, and the primary action; failures show inline and success refreshes the tree.",
+          "Every Explorer DDL statement lands in [[topic:history|query history]] with a leading `-- [Explorer]` marker, and its result or error surfaces even when the results panel is collapsed."
+        ]
       },
       {
         "k": "p",
-        "md": "Every Explorer DDL statement lands in [[topic:history|query history]] with a leading `-- [Explorer]` marker, and its result or error surfaces even when the results panel is collapsed — the same audit convention as `-- [Slack]` and `-- [Export]`."
-      },
-      {
-        "k": "p",
-        "md": "**Modify table…** is a DataGrip-style diff editor: edit a column's name, type, nullability, default, PK membership, or comment; reorder, add and drop columns; tick indexes and constraints for removal; add UNIQUE, CHECK and foreign-key constraints; rename, re-comment, and on Postgres move the table to another schema. The preview is the **minimal `ALTER` script** — type/null/default edits run against original column names, column renames follow those in-place edits so the earlier statements still resolve, the table rename runs last of all, and a PK change emits a key drop + `ADD PRIMARY KEY` only when the key actually changed. It refuses to run on an empty column name, a duplicate one (case-insensitively on DuckDB, MySQL and SQLite, which treat two spellings as one column — Postgres is left alone because Tusk always quotes, so `\"Id\"` and `\"id\"` are two legal columns), a nullable primary key (except on SQLite, which allows NULLs in a non-INTEGER key), or a generated column, whose expression no `ALTER` here can restate. Column reordering is offered on SQLite only, the one engine that can express it. When the script is more than one statement it says underneath how it runs — plainly, when it is not atomic, as on MySQL, where every DDL statement commits itself."
-      },
-      {
-        "k": "tip",
-        "kind": "warn",
-        "md": "**SQLite rebuilds instead of altering.** SQLite's `ALTER TABLE` only renames the table, renames a column, adds a column and drops one. Anything else — a type change, a NOT NULL or default change, a key change, a constraint edit, a column reorder, or dropping a column SQLite won't drop in place — makes Tusk generate the documented rebuild: `CREATE` the new shape, `INSERT … SELECT` the rows, `DROP` the original, `RENAME` the replacement into place, then recreate its indexes and triggers. The whole script runs as one transaction, the preview is labelled, and the primary button reads **Rebuild table**. The new shape is built from the table's stored `CREATE` text, so CHECK constraints (names included), column collations, generated columns and `WITHOUT ROWID` / `STRICT` are carried across; the swap runs under `PRAGMA legacy_alter_table` so a table a view or trigger refers to can be rebuilt at all. Triggers are replayed verbatim, semicolons in their bodies included. Because dropping the original deletes its rows out from under anything that references them, Tusk switches `PRAGMA foreign_keys` off for the rebuild and back on immediately after — SQLite ignores that pragma inside a transaction, so the two statements run around the rebuild's own transaction, and the dialog note says so. Tusk refuses a rebuild it cannot do safely and says why: a rename in the same pass (do the rename on its own first), dropping a column an index, constraint or trigger still uses (drop that too), and a stored definition it could not read."
-      },
-      {
-        "k": "p",
-        "md": "**Create table…** builds the whole common surface: per-column type (offered from the connected engine's type list), NOT NULL, default expression, primary key (single or composite), unique, check, and auto-numbering in that engine's form — Postgres `GENERATED BY DEFAULT AS IDENTITY`, MySQL `AUTO_INCREMENT`, SQLite `INTEGER PRIMARY KEY AUTOINCREMENT`, DuckDB a sequence created alongside the table. Rows reorder with ↑/↓ and duplicate with ⧉. An expandable section adds per-column checks and comments, foreign keys, `IF NOT EXISTS`, `TEMPORARY`, and on MySQL the `ENGINE` / charset / collation options."
-      },
-      {
-        "k": "p",
-        "md": "**Foreign keys get a picker.** In Create table, Modify table and Add constraint, choosing *FOREIGN KEY* gives a searchable `schema.table` box fed by the loaded tree; picking a table fetches that table's columns so **key columns are listed first and marked** `pk` or `unique`. Add a row per column for a composite key, then set `ON DELETE` / `ON UPDATE`, and `DEFERRABLE` where the engine supports it. If the local and referenced column types look incompatible you get a warning, not a block — the engine has the final say."
-      },
-      {
-        "k": "tip",
-        "kind": "warn",
-        "md": "Sidebar DDL shares your query connection: while idle, a sidebar action rolls back an open streaming cursor — a tab still paging a big result stops where it is (loaded rows stay) and is marked **Incomplete result**. Sidebar DDL is frozen while a manual transaction owns the session."
-      },
-      {
-        "k": "h",
-        "text": "What's enabled where (and why)",
-        "id": "gating"
-      },
-      {
-        "k": "p",
-        "md": "Mutating items pass through four gates; the failing gate's reason becomes the disabled item's tooltip:"
+        "md": "**Modify table…** is a diff editor. Edit a column's name, type, nullability, default, PK membership, or comment; reorder, add and drop columns; drop indexes and constraints; add UNIQUE, CHECK and FK constraints; rename, re-comment, and on Postgres move the table to another schema."
       },
       {
         "k": "list",
         "items": [
-          "**Manual transaction** — while one owns the session every Explorer database action is frozen, with *\"Explorer database actions are frozen during a manual transaction\"* as the tooltip. Commit or roll back first.",
-          "**Read-only connection** — everything mutating disables with *\"Connection is read-only\"* (see [[topic:safety|Safety & read-only mode]]). **Drop database** passes the same gates as every other DDL action — manual-transaction freeze, read-only, engine support.",
-          "**Engine limits** — sidebar DDL is live on **PostgreSQL, DuckDB, MySQL and SQLite**, and each action is offered only where that engine can express it; the tooltip names the engine, e.g. *\"DuckDB can't add constraints with ALTER TABLE — define them in CREATE TABLE\"*. DuckDB also has no constraint drops, index/sequence renames, `ALTER SEQUENCE RESTART`, `CREATE DATABASE` / `DROP DATABASE`, or `TRUNCATE` options, and splits multi-action ALTERs into one statement each. MySQL rewrites a column with `MODIFY COLUMN`, renames tables with `RENAME TABLE`, drops each constraint kind with its own action, and has no schema rename, sequences, index methods or partial indexes. SQLite has no comments, `CREATE SCHEMA`, `CREATE DATABASE`, `TRUNCATE` (*Delete all rows…* runs `DELETE FROM`), or constraint ALTERs. SQL Server has no sidebar DDL builders yet, so its mutating items disable with *\"DDL editing isn't supported for SQL Server yet\"*.",
-          "**Postgres effective privileges** — Tusk fetches your role's real privileges (membership, `PUBLIC`, ownership): *Modify/Add/Rename/Drop* need table ownership, *Duplicate* and *Create table* need `CREATE` on the schema, *Truncate* accepts the `TRUNCATE` grant or ownership, *New schema* needs `CREATE` on the database, *New database* needs `CREATEDB`. Tooltips state the missing right, e.g. *\"Requires ownership of orders\"*."
-        ],
-        "ordered": false
+          "The preview is the minimal `ALTER` script. Type, null and default edits run against original column names; renames follow them; the table rename runs last.",
+          "A PK change emits a key drop plus `ADD PRIMARY KEY` only when the key actually changed.",
+          "It refuses an empty or duplicate column name, a nullable primary key, or a generated column. Duplicates are case-insensitive on DuckDB, MySQL and SQLite; SQLite allows NULLs in a non-INTEGER key.",
+          "Column reordering is offered on SQLite only.",
+          "A multi-statement script says underneath how it runs, including when it is not atomic, as on MySQL."
+        ]
+      },
+      {
+        "k": "tip",
+        "kind": "warn",
+        "md": "On SQLite anything beyond a rename, an add or a plain drop generates a full table rebuild, and the primary button reads **Rebuild table**."
+      },
+      {
+        "k": "list",
+        "items": [
+          "The rebuild is `CREATE` the new shape, `INSERT … SELECT`, `DROP` the original, `RENAME` the replacement, then recreate indexes and triggers, all in one labelled transaction.",
+          "The new shape comes from the stored `CREATE` text, so CHECK constraints with their names, collations, generated columns and `WITHOUT ROWID` / `STRICT` carry across. Triggers are replayed verbatim.",
+          "The swap runs under `PRAGMA legacy_alter_table`, and `PRAGMA foreign_keys` is switched off around the rebuild's transaction, as the dialog note says.",
+          "A rebuild is refused with a reason for a rename in the same pass, dropping a column an index, constraint or trigger still uses, or a stored definition that could not be read."
+        ]
+      },
+      {
+        "k": "p",
+        "md": "**Create table…** covers per-column type from the engine's type list, NOT NULL, default expression, single or composite primary key, unique, check, and that engine's auto-numbering."
+      },
+      {
+        "k": "list",
+        "items": [
+          "Auto-numbering: Postgres `GENERATED BY DEFAULT AS IDENTITY`, MySQL `AUTO_INCREMENT`, SQLite `INTEGER PRIMARY KEY AUTOINCREMENT`, DuckDB a sequence created alongside the table.",
+          "Rows reorder with ↑/↓ and duplicate with ⧉.",
+          "An expandable section adds per-column checks and comments, foreign keys, `IF NOT EXISTS`, `TEMPORARY`, and on MySQL the `ENGINE`, charset and collation options."
+        ]
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Foreign keys get a picker** in Create table, Modify table and Add constraint: a searchable `schema.table` box fed by the loaded tree.",
+          "Picking a table fetches its columns, listing key columns first and marking them `pk` or `unique`.",
+          "Add a row per column for a composite key, then set `ON DELETE` / `ON UPDATE`, and `DEFERRABLE` where supported.",
+          "Incompatible-looking local and referenced column types raise a warning, not a block."
+        ]
+      },
+      {
+        "k": "tip",
+        "kind": "warn",
+        "md": "An idle sidebar action rolls back an open streaming cursor, so a tab paging a big result stops and is marked **Incomplete result**."
+      },
+      {
+        "k": "h",
+        "text": "What's enabled where",
+        "id": "gating"
+      },
+      {
+        "k": "p",
+        "md": "Mutating items pass four gates. The failing gate's reason becomes the disabled item's tooltip."
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Manual transaction** — every Explorer database action is frozen while one owns the session. Commit or roll back first.",
+          "**Read-only connection** — everything mutating disables with *Connection is read-only*. See [[topic:safety|Safety & read-only mode]].",
+          "**Engine limits** — sidebar DDL is live on PostgreSQL, DuckDB, MySQL and SQLite, each action offered only where the engine can express it. SQL Server has no builders yet.",
+          "**Postgres effective privileges** — Modify, Add, Rename and Drop need table ownership; Duplicate and Create table need `CREATE` on the schema; Truncate accepts the `TRUNCATE` grant or ownership; New schema needs `CREATE` on the database; New database needs `CREATEDB`."
+        ]
+      },
+      {
+        "k": "list",
+        "items": [
+          "**DuckDB** — no constraint `ALTER`s, index or sequence renames, `ALTER SEQUENCE RESTART`, `CREATE`/`DROP DATABASE`, or `TRUNCATE` options. Multi-action ALTERs split into one statement each.",
+          "**MySQL** — rewrites a column with `MODIFY COLUMN`, renames tables with `RENAME TABLE`, drops each constraint kind with its own action. No schema rename, sequences, index methods or partial indexes.",
+          "**SQLite** — no comments, `CREATE SCHEMA`, `CREATE DATABASE`, or constraint ALTERs. *Delete all rows…* runs `DELETE FROM`."
+        ]
       },
       {
         "k": "h",
@@ -1389,17 +1423,18 @@ export const TOPICS: Topic[] = [
         "id": "copy-ddl"
       },
       {
-        "k": "p",
-        "md": "**Copy DDL** rebuilds a runnable `CREATE` from the system catalogs on every engine — Postgres pg_dump-style from `pg_catalog`, SQLite via `sqlite_master`, MySQL via `SHOW CREATE`, SQL Server reconstructed from `sys.*` (with `sys.sql_modules` text for views, procedures and functions), DuckDB best-effort. On Postgres it covers tables (identity/generated/serial defaults, inline PK/unique/check), views, matviews, functions (including overloads), and sequences; **foreign keys emit as trailing `ALTER TABLE … ADD CONSTRAINT`** (so copied tables replay in any order) and constraint-backed indexes are skipped."
+        "k": "list",
+        "items": [
+          "**Copy DDL** rebuilds a runnable `CREATE` from the system catalogs: `pg_catalog` on Postgres, `sqlite_master` on SQLite, `SHOW CREATE` on MySQL, `sys.*` on SQL Server, best-effort on DuckDB.",
+          "On Postgres it covers tables with identity, generated and serial defaults and inline PK/unique/check, views, matviews, functions including overloads, and sequences.",
+          "Foreign keys emit as trailing `ALTER TABLE … ADD CONSTRAINT`, so copied tables replay in any order. Constraint-backed indexes are skipped.",
+          "**Copy DDL → editor** pastes the reconstruction at the cursor instead of the clipboard — see [[topic:import-export|exporting]] a structure alongside its data."
+        ]
       },
       {
         "k": "tip",
         "kind": "warn",
-        "md": "Omitted rather than guessed: partitioning, inheritance, row-level security, triggers (copy those from the trigger node), storage parameters, tablespaces, and collations."
-      },
-      {
-        "k": "p",
-        "md": "**Copy DDL → editor** pastes the reconstruction at your cursor instead of the clipboard — handy for duplicating a table across schemas or [[topic:import-export|exporting]] a structure alongside its data."
+        "md": "Omitted rather than guessed: partitioning, inheritance, row-level security, triggers, storage parameters, tablespaces, and collations."
       }
     ],
     "icon": "folder"
@@ -1730,13 +1765,13 @@ export const TOPICS: Topic[] = [
     "icon": "duplicate"
   },
   {
+    "blurb": "EXPLAIN output rendered as a pan/zoomable, heat-colored tree on every engine.",
     "id": "plans",
     "title": "EXPLAIN plan visualization",
-    "blurb": "EXPLAIN output rendered as a pan/zoomable, heat-colored tree on every engine.",
     "blocks": [
       {
         "k": "p",
-        "md": "Any `EXPLAIN` result is auto-detected and rendered as a tree of node cards on a pan/zoom canvas — type `EXPLAIN` yourself or use the **Explain ▾** toolbar button. Detection is a cheap leading-keyword check, so a plain `SELECT` never pays for plan parsing."
+        "md": "Any `EXPLAIN` result renders as a tree of node cards on a pan/zoom canvas. Type `EXPLAIN` directly or use the **Explain ▾** toolbar button."
       },
       {
         "k": "h",
@@ -1744,8 +1779,12 @@ export const TOPICS: Topic[] = [
         "id": "running"
       },
       {
-        "k": "p",
-        "md": "**Explain ▾** in the [[topic:editor|editor toolbar]] offers **Explain** and **Explain Analyze (runs the query)** — registry actions (`explain` / `explainAnalyze`), unbound by default; bind them in [[topic:shortcuts|Settings → Shortcuts]] or fire them from the ⌘/Ctrl K command palette. Each takes exactly one selected statement, or the statement under the cursor, and wraps it in the engine's best structured form; a multi-statement selection is refused so trailing SQL can never run outside the `EXPLAIN` prefix:"
+        "k": "list",
+        "items": [
+          "**Explain ▾** in the [[topic:editor|editor toolbar]] offers **Explain** and **Explain Analyze (runs the query)**.",
+          "Both are registry actions, unbound by default; bind them in [[topic:shortcuts|Settings → Shortcuts]] or run them from the command palette.",
+          "Each takes exactly one selected statement, or the statement under the cursor, and wraps it in the engine's best structured form. A multi-statement selection is refused."
+        ]
       },
       {
         "k": "table",
@@ -1762,7 +1801,7 @@ export const TOPICS: Topic[] = [
           ],
           [
             "DuckDB",
-            "`EXPLAIN (FORMAT json) …` when the build supports it, else plain `EXPLAIN`",
+            "`EXPLAIN (FORMAT json) …` where supported, else plain `EXPLAIN`",
             "`EXPLAIN (ANALYZE, FORMAT json) …` or `EXPLAIN ANALYZE`"
           ],
           [
@@ -1772,24 +1811,24 @@ export const TOPICS: Topic[] = [
           ],
           [
             "SQL Server",
-            "— not supported; Explain reports that T-SQL has no `EXPLAIN` and Tusk can't render SHOWPLAN output yet",
+            "— T-SQL has no `EXPLAIN`; SHOWPLAN output is not rendered yet",
             "— not supported"
           ],
           [
             "SQLite",
             "`EXPLAIN QUERY PLAN …`",
-            "— not supported; the menu item is disabled (\"Not supported by this engine\")"
+            "— disabled, *Not supported by this engine*"
           ]
         ]
       },
       {
         "k": "p",
-        "md": "DuckDB's parenthesized options are probed once at connect (`EXPLAIN (FORMAT json) SELECT 1`); the answer drives the wrapping for the whole session."
+        "md": "DuckDB's parenthesized options are probed once at connect with `EXPLAIN (FORMAT json) SELECT 1`, and the answer drives wrapping for the session."
       },
       {
         "k": "tip",
         "kind": "warn",
-        "md": "`EXPLAIN ANALYZE` **executes** the statement. If it isn't a read (`SELECT`/`TABLE`/`VALUES`, or a `WITH` that feeds one — `WITH … UPDATE` counts as a write), Tusk shows an *Explain Analyze* confirmation dialog — only the red **Run it** button proceeds."
+        "md": "`EXPLAIN ANALYZE` executes the statement, so a non-read — including `WITH … UPDATE` — raises a confirmation dialog whose red **Run it** button is the only way through."
       },
       {
         "k": "h",
@@ -1797,8 +1836,12 @@ export const TOPICS: Topic[] = [
         "id": "plan-grid"
       },
       {
-        "k": "p",
-        "md": "A parsed plan adds a **Plan / Grid** toggle to the [[topic:results|result toolbar]] — Plan is the default, Grid is the raw engine output; the choice is per-tab and **resets on every new run**. SQLite's bytecode `EXPLAIN` (opcode listing) and MySQL's tabular `EXPLAIN` (more than 2 columns) read better as tables, so they stay in the grid with no toggle."
+        "k": "list",
+        "items": [
+          "A parsed plan adds a **Plan / Grid** toggle to the [[topic:results|result toolbar]]. Plan is the default, Grid is the raw engine output.",
+          "The choice is per-tab and resets on every new run.",
+          "SQLite's bytecode `EXPLAIN` and MySQL's tabular `EXPLAIN` stay in the grid with no toggle."
+        ]
       },
       {
         "k": "h",
@@ -1811,29 +1854,22 @@ export const TOPICS: Topic[] = [
         "caption": "Heat coloring surfaces the expensive nodes at a glance."
       },
       {
-        "k": "p",
-        "md": "Each card shows the operator label, the object it touches, and — except in compact density — a stats line: actual time and rows when the plan ran (`EXPLAIN ANALYZE`), estimated cost and `~rows` otherwise. A header strip shows the engine badge, planning/execution totals when the engine reports them, and an **estimates only** marker for plans without actual measurements."
+        "k": "list",
+        "items": [
+          "Each card shows the operator label and the object it touches, plus a stats line outside compact density: actual time and rows after `EXPLAIN ANALYZE`, estimated cost and `~rows` otherwise.",
+          "The header strip shows the engine badge, planning and execution totals where reported, and an **estimates only** marker for plans without measurements.",
+          "**Click a card** — dock a details panel with self cost, self time, and every parsed property.",
+          "**▾ / ▸ N** — collapse or expand a subtree; the badge counts hidden nodes.",
+          "**Drag** to pan, **wheel** to zoom, **double-click the background** to fit the tree."
+        ]
       },
       {
         "k": "list",
         "items": [
-          "**Click a card** — dock a details panel: self cost, self time, every parsed property (filters, join conditions, buffers, …).",
-          "**▾ / ▸ N** — collapse or expand a subtree; the badge counts hidden nodes. Collapsing doesn't re-fit the view.",
-          "**Drag** to pan, **wheel** to zoom, **double-click the background** to fit the whole tree."
-        ],
-        "ordered": false
-      },
-      {
-        "k": "p",
-        "md": "Heat coloring paints each card's left border and background on a cold→hot ramp scaled by `sqrt(value / max)`, so mid-cost nodes stay visible next to one dominant node."
-      },
-      {
-        "k": "list",
-        "items": [
-          "**Metric fallback** — cost → time → rows. DuckDB has no cost numbers (ANALYZE gives per-operator time, plain EXPLAIN only estimated cardinality), so it uses time or rows.",
-          "**Timing semantics** — DuckDB reports *exclusive* per-operator time; Postgres *inclusive* per-loop time (Tusk multiplies by `loops` for the card)."
-        ],
-        "ordered": false
+          "Heat coloring paints each card's left border and background on a cold-to-hot ramp scaled by `sqrt(value / max)`.",
+          "Metric fallback is cost → time → rows. DuckDB has no cost numbers, so it uses time or rows.",
+          "DuckDB reports exclusive per-operator time; Postgres reports inclusive per-loop time, which Tusk multiplies by `loops`."
+        ]
       },
       {
         "k": "h",
@@ -1863,7 +1899,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "All three live-apply from the gear-icon Settings dialog; an orientation change re-fits the view."
+        "md": "All three apply live. An orientation change re-fits the view."
       },
       {
         "k": "h",
@@ -1871,20 +1907,28 @@ export const TOPICS: Topic[] = [
         "id": "fallback"
       },
       {
-        "k": "p",
-        "md": "An unparseable plan is **never an error** — it falls back to a formatted monospace text block (Postgres text-mode `EXPLAIN` gets its own text parser first; DuckDB's box-art output and MySQL's `EXPLAIN ANALYZE` tree text render as styled text), and the raw rows are always one Grid-toggle away. Detection handles pretty-printed JSON split across multiple rows, and comments before the `EXPLAIN` keyword don't defeat it."
+        "k": "list",
+        "items": [
+          "An unparseable plan falls back to a formatted monospace text block, and the raw rows stay one Grid-toggle away.",
+          "Postgres text-mode `EXPLAIN` gets its own text parser first. DuckDB box-art output and MySQL `EXPLAIN ANALYZE` tree text render as styled text.",
+          "Detection handles pretty-printed JSON split across rows, and comments before the `EXPLAIN` keyword."
+        ]
       }
     ],
     "icon": "eye"
   },
   {
+    "blurb": "Foreign keys visually: neighborhood graphs, whole-schema ERD, reconstructed DDL.",
     "id": "erd",
     "title": "Relationships & ERD",
-    "blurb": "Foreign keys visually: neighborhood graphs, whole-schema ERD, reconstructed DDL.",
     "blocks": [
       {
         "k": "p",
-        "md": "One dialog, two scopes: a **Neighborhood** view centered on one table, and a **Whole schema** ERD — both beside a syntax-highlighted pane of the relation's reconstructed `CREATE` DDL. Everything is read-only; SQL leaves only through the DDL pane's **Copy** and **Open in editor** buttons."
+        "md": "One dialog, two scopes: a **Neighborhood** view centered on one table, and a **Whole schema** ERD. Both sit beside a syntax-highlighted pane of the relation's reconstructed `CREATE` DDL."
+      },
+      {
+        "k": "p",
+        "md": "The viewer is read-only. SQL leaves only through the DDL pane's **Copy** and **Open in editor** buttons."
       },
       {
         "k": "h",
@@ -1894,14 +1938,11 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**DDL & relationships…** — right-click a table, view, or materialized view in the [[topic:sidebar|sidebar]]; opens in Neighborhood scope, centered on it.",
-          "**Schema diagram…** — right-click a schema node; jumps straight to the Whole schema ERD (DDL pane starts collapsed — click a table card to load its DDL)."
-        ],
-        "ordered": false
-      },
-      {
-        "k": "p",
-        "md": "The DDL pane auto-collapses to a thin `DDL` rail in schema scope and expands back in Neighborhood scope; the rail's chevron overrides either way. Postgres DDL is reconstructed pg_dump-style from the catalogs; other engines use native sources (SQLite `sqlite_master`, MySQL `SHOW CREATE`, DuckDB catalog, best-effort) — caveats in [[topic:sidebar|the sidebar topic]]."
+          "**DDL & relationships…** — right-click a table, view, or matview in the [[topic:sidebar|sidebar]]. Opens in Neighborhood scope, centered on it.",
+          "**Schema diagram…** — right-click a schema node for the Whole schema ERD. The DDL pane starts collapsed; click a table card to load its DDL.",
+          "The DDL pane auto-collapses to a thin `DDL` rail in schema scope and expands in Neighborhood scope; the rail's chevron overrides either way.",
+          "Postgres DDL is reconstructed from the catalogs; other engines use native sources. Caveats in [[topic:sidebar|the sidebar topic]]."
+        ]
       },
       {
         "k": "h",
@@ -1911,15 +1952,11 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**Center card** — the focused table's columns (up to **14**, then \"+N more columns\") with PK/FK marks; a self-referencing FK shows as a ↺ badge, not a loop.",
-          "**Left stack** — tables that *reference* it (\"references this\"); **right stack** — tables it *references* (\"referenced\").",
-          "**Edge labels** — the exact column mapping (`customer_id → id`; multi-column FKs comma-joined). The column gap sizes to the longest label."
-        ],
-        "ordered": false
-      },
-      {
-        "k": "p",
-        "md": "**Click** a neighbor card to re-center on it and walk the graph hop by hop; **drag** any card to reposition it, edges following live. A **5px pointer tolerance** separates click from drag; manual positions clear when you re-center."
+          "**Center card** — the focused table's columns, up to 14 then \"+N more columns\", with PK and FK marks. A self-referencing FK shows as a ↺ badge.",
+          "**Left stack** — tables that reference it. **Right stack** — tables it references.",
+          "**Edge labels** — the exact column mapping (`customer_id → id`), multi-column FKs comma-joined. The column gap sizes to the longest label.",
+          "**Click** a neighbor card to re-center on it; **drag** any card to reposition it, edges following. A 5 px tolerance separates click from drag, and manual positions clear on re-center."
+        ]
       },
       {
         "k": "h",
@@ -1929,21 +1966,17 @@ export const TOPICS: Topic[] = [
       {
         "k": "demo",
         "id": "erd-mini",
-        "caption": "The schema ERD: family clusters, hue-coded edges, click a card to drill into its neighborhood."
+        "caption": "Family clusters, hue-coded edges, and click-to-drill into a table's neighborhood."
       },
       {
         "k": "list",
         "items": [
-          "**Cards** — key columns only (PK 🔑 and FK, up to 12 rows, then \"+N more keys\"); a table with no keys shows its column count.",
-          "**Family blocks** — tables sharing a name prefix (`product_*`, `purchase_order_*` — the longest 1- or 2-token `_`-prefix shared by at least two tables) group into labeled dashed containers, each laid out as a small layered flow.",
-          "**Placement** — a greedy proximity packer lands each cluster next to what it references; connected components shelf-pack toward a ~3:2 aspect.",
-          "**FK-less tables** — a dense grid at the bottom behind a gutter, never mixed into the relationship story."
-        ],
-        "ordered": false
-      },
-      {
-        "k": "p",
-        "md": "The layout is **deterministic by construction** — no randomness, no convergence loops — so the same schema always produces bit-for-bit the same diagram."
+          "**Cards** — key columns only, up to 12 rows then \"+N more keys\". A table with no keys shows its column count.",
+          "**Family blocks** — tables sharing the longest one- or two-token `_`-prefix held by at least two tables group into labeled dashed containers, each a small layered flow.",
+          "**Placement** — a greedy proximity packer lands each cluster next to what it references; connected components shelf-pack toward a 3:2 aspect.",
+          "**FK-less tables** — a dense grid at the bottom behind a gutter.",
+          "The layout is deterministic, so the same schema always produces the same diagram."
+        ]
       },
       {
         "k": "table",
@@ -1954,27 +1987,27 @@ export const TOPICS: Topic[] = [
         "rows": [
           [
             "Click a card",
-            "Drill into that table's Neighborhood view (loads its DDL)"
+            "Drill into that table's Neighborhood view and load its DDL"
           ],
           [
             "Drag a card",
-            "Reposition it (5px tolerance separates click from drag); edges follow"
+            "Reposition it; edges follow"
           ],
           [
             "Drag a family label strip",
-            "Move the whole container and every member table together"
+            "Move the container and every member table"
           ],
           [
             "Hover a card",
-            "Unrelated cards and edges dim; only its edges stay lit"
+            "Unrelated cards and edges dim"
           ],
           [
             "Hover an edge",
-            "Shows the column-mapping label"
+            "Show the column-mapping label"
           ],
           [
             "**Reset layout**",
-            "Discards all manual repositioning, back to the computed layout (disabled when nothing was moved)"
+            "Discard manual repositioning; disabled when nothing moved"
           ],
           [
             "Wheel / drag background",
@@ -1985,7 +2018,11 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "tip",
-        "md": "Manual nudges overlay the computed layout (zoom-aware) but are session-scoped: they clear when the schema graph reloads or you hit **Reset layout**. Past **300 tables** a \"large schema\" warning shows in the header — layout still completes (roughly 100ms at 200 tables)."
+        "md": "Manual nudges are session-scoped: they clear when the schema graph reloads or on **Reset layout**."
+      },
+      {
+        "k": "p",
+        "md": "Past 300 tables a *large schema* warning shows in the header. Layout still completes, taking roughly 100 ms at 200 tables."
       },
       {
         "k": "h",
@@ -1995,11 +2032,10 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**Color** — each edge takes the hue of the table it **points at** (deterministic per-table hue, 14-step palette), so all FKs into `users` read as one stream; the matching chip sits on that card's header. In Neighborhood view, edges match the neighbor card's chip instead.",
-          "**Fanning** — edges sharing an anchor point (several FKs into one PK) fan apart by a few pixels.",
-          "**Hub damping** — a table whose incoming FK count reaches **35% of the schema's table count** (minimum 8), like audit-style `created_by` FKs, renders faint thin edges that light up only on hover."
-        ],
-        "ordered": false
+          "**Color** — each edge takes the hue of the table it points at, from a deterministic 14-step palette, so all FKs into `users` read as one stream. The matching chip sits on that card's header, and Neighborhood edges match the neighbor card's chip.",
+          "**Fanning** — edges sharing an anchor point fan apart by a few pixels.",
+          "**Hub damping** — a table whose incoming FK count reaches 35% of the schema's table count, minimum 8, renders faint thin edges that light up on hover."
+        ]
       },
       {
         "k": "h",
@@ -2008,23 +2044,22 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "FK introspection is **best-effort per driver** — an engine that can't answer returns an empty graph, never an error. A table genuinely without FKs shows \"No foreign-key relationships found for this relation.\" with its column card."
+        "md": "FK introspection is best-effort per driver; an engine that cannot answer returns an empty graph. A table without FKs shows its column card and *No foreign-key relationships found for this relation.*"
       },
       {
         "k": "list",
         "items": [
           "**Postgres** — `pg_constraint`, column lists in declared key order.",
-          "**SQLite** — `pragma_foreign_key_list`; a FK that omits target columns resolves to the referenced table's PK.",
+          "**SQLite** — `pragma_foreign_key_list`; a FK omitting target columns resolves to the referenced table's PK.",
           "**MySQL** — `information_schema.KEY_COLUMN_USAGE`.",
           "**SQL Server** — `sys.foreign_keys` joined to `sys.foreign_key_columns`.",
-          "**DuckDB** — `duckdb_constraints()` structured columns, falling back to parsing the constraint text."
-        ],
-        "ordered": false
+          "**DuckDB** — `duckdb_constraints()`, falling back to parsing the constraint text."
+        ]
       },
       {
         "k": "tip",
         "kind": "tip",
-        "md": "The same FK catalog powers autocomplete: right after `JOIN … ON` it proposes complete join conditions like `o.user_id = u.id` (multi-column FKs AND-ed), fetched lazily for the active schema plus `public`. See [[topic:editor-intel|Editor intelligence]]."
+        "md": "The same FK catalog powers autocomplete's `JOIN … ON` conditions — see [[topic:editor-intel|Editor intelligence]]."
       }
     ],
     "icon": "link"
