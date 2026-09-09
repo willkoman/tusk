@@ -2626,6 +2626,18 @@ export const TOPICS: Topic[] = [
           {
             "action": "toggleResults",
             "does": "Collapse / restore the results panel (running a query reopens it automatically)"
+          },
+          {
+            "action": "nextConnection",
+            "does": "Focus the next open connection (enabled only past one)"
+          },
+          {
+            "action": "prevConnection",
+            "does": "Focus the previous open connection"
+          },
+          {
+            "action": "newConnection",
+            "does": "Open another connection over the workspace"
           }
         ]
       },
