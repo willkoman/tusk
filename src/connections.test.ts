@@ -34,6 +34,8 @@ const conn = (id: string, over: Partial<Connected> = {}): Connected => ({
   generation: 1,
   key: `profile:${id}`,
   target: id,
+  origin: "",
+  environment: "none",
   viaSsh: false,
   profileId: null,
   ...over,
@@ -119,16 +121,28 @@ describe("labels", () => {
     expect(connectionLabel(state("c", {}, { target: "", driver: "mysql" }))).toBe("MySQL");
   });
 
-  it("disambiguates duplicate labels in open order", () => {
+  it("names a duplicate by where it connects, not by an ordinal", () => {
     const list = [
-      state("a", {}, { target: "app" }),
-      state("b", {}, { target: "app" }),
-      state("c", {}, { target: "warehouse" }),
+      state("a", {}, { target: "postgres", origin: "db.internal" }),
+      state("b", {}, { target: "postgres", origin: "localhost" }),
+      state("c", {}, { target: "warehouse", origin: "db.internal" }),
     ];
     const labels = connectionLabels(list);
-    expect(labels.get("a")).toBe("app #1");
-    expect(labels.get("b")).toBe("app #2");
+    expect(labels.get("a")).toBe("db.internal/postgres");
+    expect(labels.get("b")).toBe("localhost/postgres");
     expect(labels.get("c")).toBe("warehouse");
+  });
+
+  it("falls back to an ordinal only when the origin cannot separate them", () => {
+    const list = [
+      state("a", {}, { target: "app", origin: "db.internal" }),
+      state("b", {}, { target: "app", origin: "db.internal" }),
+      state("c", {}, { target: "app" }),
+    ];
+    const labels = connectionLabels(list);
+    expect(labels.get("a")).toBe("db.internal/app #1");
+    expect(labels.get("b")).toBe("db.internal/app #2");
+    expect(labels.get("c")).toBe("app");
   });
 });
 

@@ -11,6 +11,8 @@ const FIELD_SELECTOR = 'input:not([type="hidden"]):not(:disabled), select:not(:d
 /** Generic modal shell — reuses the `.modal` / `.modal-overlay` CSS. */
 export function Dialog(props: {
   title: string;
+  /** Rendered beside the title — the production badge, on every confirmation. */
+  titleBadge?: JSX.Element;
   /** One short line under the title: what this dialog acts on. */
   subtitle?: string;
   onClose: () => void;
@@ -110,7 +112,7 @@ export function Dialog(props: {
       >
         <div class="modal-head">
           <div class="modal-titles">
-            <div class="modal-title">{props.title}</div>
+            <div class="modal-title">{props.title}{props.titleBadge}</div>
             <Show when={props.subtitle}>
               <div class="modal-sub">{props.subtitle}</div>
             </Show>
@@ -149,7 +151,7 @@ export function SqlPreview(props: { sql: string }) {
         <span class="spacer" />
         <button class="ghost sql-copy" disabled={!props.sql} onClick={copy}>{copied() ? "Copied" : "Copy"}</button>
       </div>
-      <pre class="sql-preview">{props.sql || "-- nothing to run"}</pre>
+      <pre class="sql-preview" classList={{ "is-empty": !props.sql }}>{props.sql || "Nothing to run yet."}</pre>
     </div>
   );
 }
@@ -168,6 +170,8 @@ export function DialogFooter(props: {
   onEditAsSql?: () => void;
   /** Override the secondary button's label (defaults to "Edit as SQL"). */
   editAsSqlLabel?: string;
+  /** Drop the secondary entirely (destructive confirms keep Cancel + primary only). */
+  hideEditAsSql?: boolean;
   /** Extra ghost buttons rendered before Cancel (e.g. Clear / Copy). */
   extra?: JSX.Element;
   onCancel: () => void;
@@ -185,7 +189,7 @@ export function DialogFooter(props: {
       <div class="form-actions">
         <button class="ghost" onClick={props.onCancel}>Cancel</button>
         {props.extra}
-        <Show when={props.onEditAsSql}>
+        <Show when={props.onEditAsSql && !props.hideEditAsSql}>
           <button class="ghost" disabled={props.disabled} onClick={() => props.onEditAsSql!()}>
             {props.editAsSqlLabel ?? "Edit as SQL"}
           </button>

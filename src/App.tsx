@@ -58,6 +58,7 @@ import { pickOpenPath, pickSavePath, type PickedPath, type PickerOptions } from 
 import { Tree, type DbTree, type RelationDetail, type NodeDescriptor, nodeKey, relKey } from "./Tree";
 import { ContextMenu, type MenuItem, type MenuState } from "./ContextMenu";
 import { type DialogState } from "./WorkbenchDialogs";
+import { type DangerFacts } from "./forms/ConfirmDialog";
 import { type SettingsTab } from "./settings/SettingsDialog";
 const HelpDialog = lazy(() => import("./help/HelpDialog"));
 import { fontStack } from "./editor/theme";
@@ -112,6 +113,16 @@ import {
   type Permissions,
   type TableInfo,
 } from "./connections";
+import {
+  ENVIRONMENTS,
+  ENVIRONMENT_BADGES,
+  ENVIRONMENT_LABELS,
+  environmentClass,
+  isProduction,
+  parseEnvironment,
+  serializeEnvironment,
+  type Environment,
+} from "./environment";
 import * as ddl from "./sql/ddl";
 import { limitedSelect } from "./sql/ddl";
 import { ddlCaps, ddlSupported } from "./sql/ddlCaps";
@@ -157,6 +168,8 @@ type Profile = {
   path?: string | null;
   ssh?: SshMeta | null;
   save_ssh_secret: boolean;
+  /** "dev" | "staging" | "prod"; null/absent = untagged. See src/environment.ts. */
+  environment?: string | null;
 };
 type QueryOutcome =
   | { kind: "rows"; columns: string[]; rows: (string | null)[][]; done: boolean; note?: string }
@@ -479,6 +492,7 @@ function App() {
   const [sslmode, setSslmode] = createSignal("prefer");
   const [readOnly, setReadOnly] = createSignal(false);
   const [defaultConnect, setDefaultConnect] = createSignal(false);
+  const [environment, setEnvironment] = createSignal<Environment>("none");
   const [connecting, setConnecting] = createSignal(false);
   const [connErr, setConnErr] = createSignal("");
   // SSH tunnel section of the connect form + the first-contact host-key prompt.
@@ -646,13 +660,25 @@ function App() {
    * untracked.
    */
   const connectionLabelKey = createMemo(() =>
-    connections().map((e) => `${e.conn.id}\u0000${e.state().tree?.database ?? ""}\u0000${e.conn.target}`).join("\u0001"));
+    connections().map((e) => `${e.conn.id}\u0000${e.state().tree?.database ?? ""}\u0000${e.conn.target} ${e.conn.origin}`).join("\u0001"));
   const connectionLabelMap = createMemo(
     on(connectionLabelKey, () => connectionLabels(connections().map((e) => e.state()))),
   );
   const labelOf = (connectionId: string) =>
     connectionLabelMap().get(connectionId) ?? entryOf(connectionId)?.conn.target ?? "";
   const kindOf = (connectionId: string) => connectionKindOf(stateOf(connectionId));
+  const envOf = (connectionId: string): Environment => parseEnvironment(entryOf(connectionId)?.conn.environment);
+  /** Environment of the connection in front of the user; drives the prod markers. */
+  const activeEnvironment = (): Environment => parseEnvironment(conn()?.environment);
+  /** Production marker rendered in the title of every confirmation dialog. */
+  const prodBadge = () =>
+    isProduction(activeEnvironment())
+      ? <span class="env-badge env-prod" title={ENVIRONMENT_LABELS.prod}>{ENVIRONMENT_BADGES.prod}</span>
+      : undefined;
+  const activeConnColor = () => {
+    const e = activeEntry();
+    return e ? connectionColor(e.colorIndex) : undefined;
+  };
   /** The first connection holding an open manual transaction (window close scans all). */
   const anyTransactionOpen = () => connections().find((e) => transactionOpen(e.state().transaction)) ?? null;
 
@@ -2390,6 +2416,7 @@ function App() {
     setSslmode("prefer");
     setReadOnly(false);
     setDefaultConnect(false);
+    setEnvironment("none");
     setSshState(emptySshForm());
     setSshSecretStored(false);
     setConnErr("");
@@ -2409,6 +2436,7 @@ function App() {
     setSslmode(p.sslmode ?? "prefer");
     setReadOnly(p.read_only);
     setDefaultConnect(p.default_connect);
+    setEnvironment(parseEnvironment(p.environment));
     // Metadata round-trips; the secret stays in the keychain and the field stays blank.
     setSshState(sshFormFromProfile(p.ssh, p.save_ssh_secret));
     setSshSecretStored(!!p.ssh && p.save_ssh_secret && sshNeedsSecret(p.ssh.auth));
@@ -2492,7 +2520,7 @@ function App() {
    */
   async function afterConnect(
     r: ConnectReply,
-    meta: { key: string; legacyKey: string | null; target: string; driver: string; profileId: string | null },
+    meta: { key: string; legacyKey: string | null; target: string; origin?: string; environment?: Environment; driver: string; profileId: string | null },
   ) {
     try {
       await registerConnection(r, meta);
@@ -2515,7 +2543,7 @@ function App() {
    */
   async function registerConnection(
     r: ConnectReply,
-    meta: { key: string; legacyKey: string | null; target: string; driver: string; profileId: string | null },
+    meta: { key: string; legacyKey: string | null; target: string; origin?: string; environment?: Environment; driver: string; profileId: string | null },
   ) {
     const connected: Connected = {
       id: r.connection_id,
@@ -2526,6 +2554,8 @@ function App() {
       generation: ++connectionGeneration,
       key: meta.key,
       target: meta.target,
+      origin: meta.origin ?? "",
+      environment: meta.environment ?? "none",
       profileId: meta.profileId,
     };
     const runtime = makeRuntime();
@@ -2725,7 +2755,7 @@ function App() {
         : submittedDatabase || submittedHost;
       await connectWithHostKeyPrompt(async () => {
         const r = await invoke<ConnectReply>("connect", { config });
-        await afterConnect(r, { key: submittedKey, legacyKey: submittedLegacyKey, target: submittedTarget, driver: submittedDriver, profileId: null });
+        await afterConnect(r, { key: submittedKey, legacyKey: submittedLegacyKey, target: submittedTarget, origin: isFile ? "" : submittedHost, driver: submittedDriver, profileId: null });
       });
     } catch (e) {
       setConnErr(errMsg(e));
@@ -2757,9 +2787,15 @@ function App() {
       const target = profile
         ? isEmbeddedDriver(profile.driver) ? basename(profile.path || ":memory:") : profile.dbname || profile.host
         : id;
+      // The origin only shows on the chip when it is what separates two labels;
+      // the environment tag rides along so the strip, tab bar, status bar and
+      // every confirmation can mark a production session.
+      const origin = profile
+        ? isEmbeddedDriver(profile.driver) ? "" : profile.host
+        : "";
       await connectWithHostKeyPrompt(async () => {
         const r = await invoke<ConnectReply>("connect_profile", { id });
-        await afterConnect(r, { key: `profile:${id}`, legacyKey: null, target, driver: profile?.driver ?? "postgres", profileId: id });
+        await afterConnect(r, { key: `profile:${id}`, legacyKey: null, target, origin, environment: parseEnvironment(profile?.environment), driver: profile?.driver ?? "postgres", profileId: id });
       });
       return "";
     } catch (e) {
@@ -2797,6 +2833,7 @@ function App() {
           sslmode: sslmode(),
           read_only: readOnly(),
           default_connect: defaultConnect(),
+          environment: serializeEnvironment(environment()),
           driver: driver(),
           path: embedded ? path() || null : null,
           // Metadata only — the secret travels in `sshSecret` and lands in the keychain.
@@ -4686,6 +4723,25 @@ function App() {
     const qual = s ? qualify(s, n.name) : ident(n.name);
     const copyName: MenuItem = { label: "Copy name", icon: "copy", onClick: () => copyText(n.name, `copied ${n.name}`) };
     const copyQual: MenuItem = { label: "Copy qualified name", icon: "copy", onClick: () => copyText(qual, "copied name") };
+    /**
+     * What a destructive confirmation states before it runs. The row estimate and
+     * size come from the Explorer's own shallow tree (planner `reltuples` and
+     * `pg_total_relation_size`), so nothing is queried to open the dialog; when a
+     * driver reports neither, the row simply does not appear.
+     */
+    const dangerFacts = (kind: string, schema: string | undefined, name: string): DangerFacts => {
+      const stub = schema
+        ? [...(tree()?.schemas ?? [])].find((sc) => sc.name === schema)
+        : undefined;
+      const rel = stub ? [...stub.tables, ...stub.views].find((r) => r.name === name) : undefined;
+      return {
+        kind,
+        name: schema && schema !== name ? `${schema}.${name}` : name,
+        rows: rel?.rows != null && rel.rows >= 0 ? `about ${rel.rows.toLocaleString()}` : undefined,
+        size: rel?.size ?? undefined,
+      };
+    };
+
     const copyDdl: MenuItem[] = [
       { label: "Copy DDL", icon: "fileCode", onClick: () => copyDDL(n, false) },
       { label: "Copy DDL → editor", icon: "fileCode", onClick: () => copyDDL(n, true) },
@@ -4711,8 +4767,8 @@ function App() {
           { label: "Duplicate…", icon: "duplicate", ...gate(canCreateInSchema(s!), `Requires CREATE on schema ${s}`), onClick: () => setActiveDialog({ kind: "duplicate", title: `Duplicate ${n.name}`, defaultName: `${n.name}_copy`, build: (nn, wd) => ddl.duplicateTable(s!, n.name, nn, wd) }) },
           { label: "Edit comment…", icon: "comment", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), ...engineCan(dcaps().comments !== "none", "comment on a table"), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.commentOnTable(s!, n.name, t) }) },
           { sep: true },
-          { label: dcaps().truncate ? "Truncate…" : "Delete all rows…", icon: "eraser", danger: true, ...gate(canTruncate(s!, n.name), `Requires TRUNCATE or ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: dcaps().truncate ? `Truncate ${n.name}` : `Delete all rows from ${n.name}`, primaryLabel: dcaps().truncate ? "Truncate" : "Delete all rows", showCascade: dcaps().truncateOptions, showRestartIdentity: dcaps().truncateOptions, build: (o) => ddl.truncate(s!, n.name, o) }) },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop table ${n.name}`, primaryLabel: "Drop table", showCascade: true, build: (o) => ddl.dropRelation("table", s!, n.name, o.cascade) }) },
+          { label: dcaps().truncate ? "Truncate…" : "Delete all rows…", icon: "eraser", danger: true, ...gate(canTruncate(s!, n.name), `Requires TRUNCATE or ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: dcaps().truncate ? "Truncate table" : "Delete all rows", subtitle: `${s}.${n.name}`, primaryLabel: dcaps().truncate ? "Truncate" : "Delete all rows", lead: "Every row goes. The table and its structure stay.", facts: dangerFacts("Table", s, n.name), showCascade: dcaps().truncateOptions, showRestartIdentity: dcaps().truncateOptions, build: (o) => ddl.truncate(s!, n.name, o) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop table", subtitle: `${s}.${n.name}`, primaryLabel: "Drop table", lead: "The table and every row in it go. This cannot be undone.", facts: dangerFacts("Table", s, n.name), confirmName: n.name, showCascade: true, build: (o) => ddl.dropRelation("table", s!, n.name, o.cascade) }) },
           { sep: true },
           { label: "Backup table…", icon: "download", onClick: () => openBackup({ scope: "tables", schemas: [], tables: [{ schema: s!, name: n.name }], suggestedName: n.name }) },
           { sep: true },
@@ -4745,7 +4801,7 @@ function App() {
           { sep: true },
           { label: "Rename…", icon: "edit", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename ${n.name}`, current: n.name, build: (nn) => ddl.renameRelation(kw, s!, n.name, nn) }) },
           { label: "Edit comment…", icon: "comment", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), ...engineCan(dcaps().comments === "standard", "comment on a view"), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.comment(`${kw === "matview" ? "MATERIALIZED VIEW" : "VIEW"} ${qual}`, t) }) },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop ${n.name}`, primaryLabel: "Drop", showCascade: true, build: (o) => ddl.dropRelation(kw, s!, n.name, o.cascade) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: kw === "matview" ? "Drop materialized view" : "Drop view", subtitle: `${s}.${n.name}`, primaryLabel: kw === "matview" ? "Drop materialized view" : "Drop view", lead: "The definition goes. This cannot be undone.", facts: dangerFacts(kw === "matview" ? "Materialized view" : "View", s, n.name), showCascade: true, build: (o) => ddl.dropRelation(kw, s!, n.name, o.cascade) }) },
           { sep: true },
           ...(caps()?.ddl !== false || caps()?.relationships !== false
             ? [{ label: "DDL & relationships…", icon: "fileCode" as const, onClick: () => openDdlGraph(s!, n.name, kw) }]
@@ -4765,7 +4821,7 @@ function App() {
           // definition, so the builder needs the column as the catalog reports it.
           { label: "Edit comment…", icon: "comment", ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), ...engineCan(dcaps().comments !== "none", "comment on a column"), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: c.comment ?? "", build: (t) => ddl.commentOnColumn(s!, n.table!, { name: c.name, type: c.data_type, nullable: c.nullable, default: c.default ?? "", identity: c.identity }, t) }) },
           { sep: true },
-          { label: "Drop column…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop column ${n.name}`, primaryLabel: "Drop column", showCascade: true, build: (o) => ddl.dropColumn(s!, n.table!, n.name, o.cascade) }) },
+          { label: "Drop column…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop column", subtitle: `${s}.${n.table}.${n.name}`, primaryLabel: "Drop column", lead: "The column and its data go from every row.", facts: { kind: "Column", name: `${s}.${n.table}.${n.name}` }, showCascade: true, build: (o) => ddl.dropColumn(s!, n.table!, n.name, o.cascade) }) },
           { sep: true },
           copyName,
         );
@@ -4787,7 +4843,7 @@ function App() {
           { label: "Rename…", icon: "edit", ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), ...engineCan(dcaps().renameSchema, "rename a schema"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename schema ${n.name}`, current: n.name, build: (nn) => ddl.renameSchema(n.name, nn) }) },
           { sep: true },
           {
-            label: dropsDatabase ? (droppingCurrentDb ? "Drop database… (connected)" : "Drop database…") : "Drop…",
+            label: dropsDatabase ? "Drop database…" : "Drop…",
             icon: "trash",
             danger: true,
             ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`),
@@ -4796,8 +4852,14 @@ function App() {
             onClick: () =>
               setActiveDialog({
                 kind: "confirm",
-                title: dropsDatabase ? `Drop database ${n.name}` : `Drop schema ${n.name}`,
+                title: dropsDatabase ? "Drop database" : "Drop schema",
+                subtitle: n.name,
                 primaryLabel: dropsDatabase ? "Drop database" : "Drop schema",
+                lead: dropsDatabase
+                  ? "Every schema, table and row in this database goes. This cannot be undone."
+                  : "Every object in this schema goes. This cannot be undone.",
+                facts: { kind: dropsDatabase ? "Database" : "Schema", name: n.name },
+                confirmName: n.name,
                 showCascade: !dropsDatabase && dcaps().cascade,
                 build: (o) => (dropsDatabase ? ddl.dropDatabase(n.name) : ddl.dropSchema(n.name, o.cascade)),
               }),
@@ -4818,7 +4880,7 @@ function App() {
 
           // Same gate() as every other Explorer DDL item (manual-transaction freeze,
           // read-only, driver support) — DROP DATABASE least of all may skip the freeze.
-          { label: cur ? "Drop… (connected)" : "Drop…", icon: "trash", danger: true, ...gate(!pEnforced() || isSuper(), "Requires database ownership (or superuser)"), ...engineCan(dcaps().dropDatabase, "drop a database from here"), ...(cur ? { disabled: true, title: "Can't drop the connected database" } : {}), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop database ${n.name}`, primaryLabel: "Drop database", build: () => ddl.dropDatabase(n.name) }) },
+          { label: "Drop database…", icon: "trash", danger: true, ...gate(!pEnforced() || isSuper(), "Requires database ownership (or superuser)"), ...engineCan(dcaps().dropDatabase, "drop a database from here"), ...(cur ? { disabled: true, title: "Can't drop the connected database" } : {}), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop database", subtitle: n.name, primaryLabel: "Drop database", lead: "Every schema, table and row in this database goes. This cannot be undone.", facts: { kind: "Database", name: n.name }, confirmName: n.name, build: () => ddl.dropDatabase(n.name) }) },
           { sep: true },
           // Backup/restore run against the CONNECTED database — offer them only there.
           { label: "Backup database…", icon: "download", disabled: !cur, title: cur ? undefined : "Connect to this database to back it up", onClick: () => openBackup({ scope: "database", schemas: [], tables: [], suggestedName: n.name }) },
@@ -4831,7 +4893,7 @@ function App() {
       case "index":
         items.push(
           { label: "Rename…", icon: "edit", ...gate(true, ""), ...engineCan(dcaps().renameIndex, "rename an index"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename index ${n.name}`, current: n.name, build: (nn) => ddl.renameIndex(s!, n.name, nn, n.table) }) },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop index ${n.name}`, primaryLabel: "Drop index", showCascade: true, build: (o) => ddl.dropIndex(s!, n.name, o.cascade, n.table) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop index", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop index", facts: { kind: "Index", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropIndex(s!, n.name, o.cascade, n.table) }) },
           { sep: true },
           copyName,
         );
@@ -4839,7 +4901,7 @@ function App() {
       case "constraint":
         items.push(
           { label: "Rename…", icon: "edit", ...gate(true, ""), ...engineCan(dcaps().renameConstraint, "rename a constraint"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename constraint ${n.name}`, current: n.name, build: (nn) => ddl.renameConstraint(s!, n.table!, n.name, nn) }) },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), ...engineCan(dcaps().dropConstraint !== "none", "drop a constraint with ALTER TABLE"), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop constraint ${n.name}`, primaryLabel: "Drop constraint", showCascade: true, build: (o) => ddl.dropConstraint(s!, n.table!, n.name, o.cascade, constraintKindOf(s!, n.table!, n.name)) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), ...engineCan(dcaps().dropConstraint !== "none", "drop a constraint with ALTER TABLE"), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop constraint", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop constraint", facts: { kind: "Constraint", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropConstraint(s!, n.table!, n.name, o.cascade, constraintKindOf(s!, n.table!, n.name)) }) },
           { sep: true },
           copyName,
         );
@@ -4848,7 +4910,7 @@ function App() {
         items.push(
           { label: "Restart… (edit value)", icon: "refresh", ...gate(true, ""), ...engineCan(dcaps().alterSequence, "restart a sequence"), onClick: () => editAsSql(ddl.alterSequenceRestart(s!, n.name, "1")) },
           { label: "Rename…", icon: "edit", ...gate(true, ""), ...engineCan(dcaps().renameSequence, "rename a sequence"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename sequence ${n.name}`, current: n.name, build: (nn) => ddl.renameSequence(s!, n.name, nn) }) },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop sequence ${n.name}`, primaryLabel: "Drop sequence", showCascade: true, build: (o) => ddl.dropSequence(s!, n.name, o.cascade) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop sequence", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop sequence", facts: { kind: "Sequence", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropSequence(s!, n.name, o.cascade) }) },
           { sep: true },
           ...copyDdl,
           copyName,
@@ -4856,7 +4918,7 @@ function App() {
         break;
       case "function":
         items.push(
-          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop function ${n.name}`, primaryLabel: "Drop function", showCascade: true, build: (o) => ddl.dropFunction(s!, n.name, o.cascade) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop function", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop function", facts: { kind: "Function", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropFunction(s!, n.name, o.cascade) }) },
           { sep: true },
           ...copyDdl,
           copyName,
@@ -4868,7 +4930,7 @@ function App() {
         items.push(
           { label: "Copy DDL", icon: "fileCode", onClick: () => copyText(def.endsWith(";") ? def : def + ";", "copied DDL") },
           { label: "Copy DDL → editor", icon: "fileCode", onClick: () => editAsSql(def) },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop trigger ${n.name}`, primaryLabel: "Drop trigger", showCascade: true, build: (o) => ddl.dropTrigger(s!, n.table!, n.name, o.cascade) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop trigger", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop trigger", facts: { kind: "Trigger", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropTrigger(s!, n.table!, n.name, o.cascade) }) },
           { sep: true },
           copyName,
         );
@@ -4966,7 +5028,7 @@ function App() {
   async function duplicateProfile(p: Profile) {
     try {
       await invoke("save_profile", {
-        profile: { id: "", name: `${p.name} copy`, host: p.host, port: p.port, user: p.user, dbname: p.dbname, save_password: false, sslmode: p.sslmode, read_only: p.read_only, default_connect: false, driver: p.driver ?? "postgres", path: p.path ?? null, ssh: p.ssh ?? null, save_ssh_secret: false },
+        profile: { id: "", name: `${p.name} copy`, host: p.host, port: p.port, user: p.user, dbname: p.dbname, save_password: false, sslmode: p.sslmode, read_only: p.read_only, default_connect: false, environment: p.environment ?? null, driver: p.driver ?? "postgres", path: p.path ?? null, ssh: p.ssh ?? null, save_ssh_secret: false },
         password: null,
         sshSecret: null,
       });
@@ -5125,9 +5187,14 @@ function App() {
                               <span class="profile-name-text">{p.name || (isEmbeddedDriver(p.driver) ? basename(p.path || ":memory:") : p.host)}</span>
                               <Show when={p.default_connect}><span class="profile-star" title="Connects on startup"><Icon name="star" /></span></Show>
                               <Show when={p.read_only}><span class="chip-ro" title="Read-only connection">RO</span></Show>
+                              <Show when={parseEnvironment(p.environment) !== "none"}>
+                                <span class={`env-badge ${environmentClass(parseEnvironment(p.environment))}`} title={ENVIRONMENT_LABELS[parseEnvironment(p.environment)]}>
+                                  {ENVIRONMENT_BADGES[parseEnvironment(p.environment)]}
+                                </span>
+                              </Show>
                             </div>
                             <div class="profile-sub">
-                              <span>{isEmbeddedDriver(p.driver) ? (p.path || ":memory:") : `${p.user}@${p.host}:${p.port}/${p.dbname}`}</span>
+                              <span class="profile-sub-text">{isEmbeddedDriver(p.driver) ? (p.path || ":memory:") : `${p.user}@${p.host}:${p.port}/${p.dbname}`}</span>
                               <Show when={p.ssh}>{(t) => <span class="chip-ssh" title={`Tunnelled through ${t().user}@${t().host}:${t().port}`}>SSH</span>}</Show>
                               <Show when={p.save_password}><Icon name="lock" /></Show>
                             </div>
@@ -5207,7 +5274,7 @@ function App() {
                       <label>Password<input type="password" value={password()} onInput={(e) => setPassword(e.currentTarget.value)} placeholder={editingId() && savePassword() ? "•••••• (stored)" : ""} /></label>
                       <div class="field-row halves">
                         <label>Database<input value={dbname()} onInput={(e) => setDbname(e.currentTarget.value)} placeholder={driver() === "postgres" ? "postgres" : "(optional)"} /></label>
-                        <label>SSL Mode
+                        <label>SSL mode
                           <select value={sslmode()} onChange={(e) => setSslmode(e.currentTarget.value)}>
                             <option value="disable">disable</option>
                             <option value="prefer">prefer</option>
@@ -5240,6 +5307,15 @@ function App() {
                   <label class="checkbox"><input type="checkbox" checked={savePassword()} onChange={(e) => setSavePassword(e.currentTarget.checked)} />Save password</label>
                 </Show>
                 <label class="checkbox"><input type="checkbox" checked={defaultConnect()} onChange={(e) => setDefaultConnect(e.currentTarget.checked)} />Connect on startup</label>
+                {/* Environment tag. Saved with the profile, never sent to the driver:
+                    it marks the session in the strip, the tab bar, the status bar and
+                    every confirmation dialog. */}
+                <label>Environment
+                  <select value={environment()} onChange={(e) => setEnvironment(parseEnvironment(e.currentTarget.value))}>
+                    <For each={ENVIRONMENTS}>{(e) => <option value={e}>{ENVIRONMENT_LABELS[e]}</option>}</For>
+                  </select>
+                  <span class="field-hint">Marks this connection everywhere it is named.</span>
+                </label>
                 <div class="form-actions">
                   <button type="button" class="ghost" onClick={saveProfile}>Save</button>
                   <button type="submit" disabled={connecting()}>{connecting() ? <><span class="spinner-sm" />Connecting…</> : "Connect"}</button>
@@ -5276,14 +5352,19 @@ function App() {
                 const id = entry.conn.id;
                 const active = () => activeConnectionId() === id;
                 const dot = () => connectionDot(entry.state());
+                const env = () => parseEnvironment(entry.conn.environment);
+                // A tagged connection shows its rail even when it is the only one
+                // open: the whole point of the tag is that "am I on prod" is never
+                // a question you answer by counting chips.
+                const railed = () => connections().length > 1 || env() !== "none";
                 return (
                   <span
                     class="conn-chip"
                     role="tab"
                     aria-selected={active()}
-                    classList={{ active: active(), multi: connections().length > 1 }}
-                    style={connections().length > 1 ? { "--conn-color": connectionColor(entry.colorIndex) } : undefined}
-                    title={`${labelOf(id)} (${driverLabel(kindOf(id))}${entry.conn.viaSsh ? ", over SSH" : ""}): ${connectionDotTitle(dot())}`}
+                    classList={{ active: active(), multi: railed(), [environmentClass(env())]: env() !== "none" }}
+                    style={railed() ? { "--conn-color": connectionColor(entry.colorIndex) } : undefined}
+                    title={`${labelOf(id)} (${driverLabel(kindOf(id))}${env() === "none" ? "" : `, ${ENVIRONMENT_LABELS[env()]}`}${entry.conn.viaSsh ? ", over SSH" : ""}): ${connectionDotTitle(dot())}`}
                     onClick={() => focusConnection(id)}
                   >
                     <Show when={connections().length > 1}>
@@ -5305,6 +5386,9 @@ function App() {
                       />
                     </Show>
                     <span class="conn-name">{labelOf(id)}</span>
+                    <Show when={env() !== "none"}>
+                      <span class={`env-badge ${environmentClass(env())}`} title={ENVIRONMENT_LABELS[env()]}>{ENVIRONMENT_BADGES[env()]}</span>
+                    </Show>
                     <Show when={entry.conn.viaSsh}>
                       <span class="conn-ssh" title="Connected over an SSH tunnel">SSH</span>
                     </Show>
@@ -5493,12 +5577,14 @@ function App() {
                         "pin-edge": t.pinned && i() === pinnedTabCount(tabs()) - 1,
                         "tx-owner": stateOf(t.connectionId)?.transaction.owner === t.id,
                         frozen: transactionOpen(stateOf(t.connectionId)?.transaction ?? IDLE_TRANSACTION) && stateOf(t.connectionId)?.transaction.owner !== t.id,
-                        "other-conn": connections().length > 1 && t.connectionId !== activeConnectionId(),
                         "dnd-source": dragTabId() === t.id,
                         renaming: inlineRename()?.id === t.id,
+                        // Which connection a tab talks to is carried by its colour
+                        // rail, never by dimming — a dimmed tab reads as disabled.
+                        [environmentClass(envOf(t.connectionId))]: envOf(t.connectionId) !== "none",
                       }}
-                      style={connections().length > 1 ? { "--conn-color": connectionColor(entryOf(t.connectionId)?.colorIndex ?? 0) } : undefined}
-                      title={`${t.filePath ?? tabLabel(t)}${connections().length > 1 ? ` (${labelOf(t.connectionId)})` : ""}`}
+                      style={connections().length > 1 || envOf(t.connectionId) !== "none" ? { "--conn-color": connectionColor(entryOf(t.connectionId)?.colorIndex ?? 0) } : undefined}
+                      title={`${t.filePath ?? tabLabel(t)}${connections().length > 1 ? ` (${labelOf(t.connectionId)})` : ""}${envOf(t.connectionId) === "none" ? "" : ` — ${ENVIRONMENT_LABELS[envOf(t.connectionId)]}`}`}
                       // Press-and-move reorder (src/dnd.ts): the press switches tabs,
                       // and travel past the threshold turns it into a drag whose
                       // trailing click must not switch back.
@@ -5699,9 +5785,11 @@ function App() {
             <Show when={resultsOpen()}>
             <div class="splitter" onMouseDown={startResize} />
 
-            <div class="result">
+            <div class="result" classList={{ "is-running": running() }}>
               <Show when={columns().length > 0 || planMemo() || !done() || pendingCount(tabPending()) > 0}>
-                <div class="result-toolbar">
+                {/* While a query runs every control here would act on the PREVIOUS
+                    result, so the whole bar is inert and the timing is blanked. */}
+                <div class="result-toolbar" classList={{ "is-running": running(), "has-conn": !!conn() }} style={{ "--conn-color": activeConnColor() }}>
                   <Show when={planMemo()}>
                     <div class="result-viewtoggle">
                       <button classList={{ active: resultView() === "plan" }} onClick={() => patchTab(activeTabId(), { resultView: "plan" })}>Plan</button>
@@ -5710,7 +5798,7 @@ function App() {
                   </Show>
                   <span class="spacer" />
                   <Show when={!done()}>
-                    <button class="ghost export-btn" disabled={!activeDatabaseAllowed()} onClick={loadAll}>{loadingAll() ? <><span class="spinner-sm" />Cancel</> : "Load all"}</button>
+                    <button class="ghost export-btn" disabled={running() || !activeDatabaseAllowed()} onClick={loadAll}>{loadingAll() ? <><span class="spinner-sm" />Cancel</> : "Load all"}</button>
                     <span class="streaming" classList={{ idle: !(fetchingMore() || loadingAll()) }}>
                       <Show when={fetchingMore() || loadingAll()} fallback={<><span class="stream-dot" />Idle</>}>
                         <span class="spinner-sm" />Streaming…
@@ -5722,17 +5810,17 @@ function App() {
                     <Show when={pendingCount(tabPending()) > 0}>
                       <span class="sb-pending" title="Uncommitted grid changes">✎ {pendingCount(tabPending())} change{pendingCount(tabPending()) === 1 ? "" : "s"}</span>
                       <button class="ghost export-btn sb-commit" onClick={openCommit} disabled={!editCtx().editable || running()} title={editCtx().editable ? "Preview & run the change script" : editCtx().reason}>{activeOwnsTransaction() ? "Apply…" : "Commit…"}</button>
-                      <button class="ghost export-btn" onClick={discardPending}>Discard</button>
+                      <button class="ghost export-btn" onClick={discardPending} disabled={running()}>Discard</button>
                     </Show>
                     <Show when={editCtx().editable}>
-                      <button class="ghost export-btn" title="Add a row, committed as INSERT" onClick={onAddRow}>+ Row</button>
+                      <button class="ghost export-btn" title="Add a row, committed as INSERT" onClick={onAddRow} disabled={running()}><Icon name="plus" /> Row</button>
                     </Show>
                     <span class="sb-sep" />
                   </Show>
-                  <Show when={columns().length > 0}>
+                  <Show when={columns().length > 0 && !(planMemo() && resultView() === "plan")}>
                     <label class="checkbox sb-copyhdr" title="Include a header row when copying">
-                      <input type="checkbox" checked={prefs().copyHeaders} onChange={(e) => updatePrefs({ copyHeaders: e.currentTarget.checked })} />
-                      Copy w/ column names
+                      <input type="checkbox" checked={prefs().copyHeaders} onChange={(e) => updatePrefs({ copyHeaders: e.currentTarget.checked })} disabled={running()} />
+                      Copy with column names
                     </label>
                   </Show>
                   <Show when={activeTab().result.incomplete}>
@@ -5741,24 +5829,26 @@ function App() {
                   <Show when={activeTab().result.transactionStale}>
                     <span class="transaction-result-stale" title={activeTab().result.transactionStale}>Stale transaction result</span>
                   </Show>
-                  <Show when={columns().length > 0}>
+                  <Show when={columns().length > 0 && !(planMemo() && resultView() === "plan")}>
                     <span class="sb-sep" />
                     <button
                       class="ghost export-btn"
                       classList={{ "filter-active": hasConditions(gridView().filters) }}
-                      disabled={!canFilter()}
+                      disabled={running() || !canFilter()}
                       title={canFilter() ? "Build a result filter" : sortUnavailable() || "This result can't be filtered"}
                       onClick={() => openFilterBuilder()}
                     >
                       <Icon name="search" /> Filter
                     </button>
                   </Show>
-                  <Show when={(lastQuery() || columns().length > 0) && caps()?.export !== false}>
+                  <Show when={(lastQuery() || columns().length > 0) && caps()?.export !== false && !(planMemo() && resultView() === "plan")}>
                     <span class="sb-sep" />
-                    <button class="ghost export-btn" onClick={openExport}>Export…</button>
+                    <button class="ghost export-btn" onClick={openExport} disabled={running()}>Export…</button>
                   </Show>
-                  <span class="sb-sep" />
-                  <span class="status-elapsed"><Icon name="clock" /> {elapsed()} ms</span>
+                  <Show when={!running()}>
+                    <span class="sb-sep" />
+                    <span class="status-elapsed"><Icon name="clock" /> {elapsed().toLocaleString()} ms</span>
+                  </Show>
                 </div>
               </Show>
               <Show when={runErr()}><div class="error result-error">{runErr()}</div></Show>
@@ -5825,17 +5915,47 @@ function App() {
                   })}
                 />
               </Show>
+              {/* A run does not politely dim the previous result: it desaturates it
+                  and says what it is. Reading last query's rows as this query's rows
+                  is the costliest mistake this UI can cause. */}
               <Show when={running()}>
-                <div class="result-spinner"><div class="spinner" /></div>
+                <div class="result-running">
+                  <div class="result-running-card">
+                    <span class="spinner-sm" />
+                    <span>Running {fmtDur(runMs())}</span>
+                    <Show when={columns().length > 0}>
+                      <span class="result-running-note">Showing the previous result</span>
+                    </Show>
+                  </div>
+                </div>
               </Show>
             </div>
             </Show>
 
-            <footer class="statusbar">
-              {/* The run status (row counts included) keeps its own slot: a Slack notice
-                  used to occupy it, so `N rows` vanished until the notice was cleared —
-                  and it could only be cleared from the small badge further along. */}
-              <span title={persistenceWarning() || transactionWarning() || undefined}>{persistenceWarning() || transactionWarning() || status()}</span>
+            <footer class="statusbar" classList={{ "has-conn": !!conn() }} style={{ "--conn-color": activeConnColor() }}>
+              {/* Slot 1: which connection this is, and whether it is production. */}
+              <Show when={conn()}>
+                <span class="sb-conn" title={`${labelOf(conn()!.id)} (${driverLabel(connectionKind())})`}>
+                  <span class="sb-conn-name">{labelOf(conn()!.id)}</span>
+                  <Show when={activeEnvironment() !== "none"}>
+                    <span class={`env-badge ${environmentClass(activeEnvironment())}`} title={ENVIRONMENT_LABELS[activeEnvironment()]}>
+                      {ENVIRONMENT_BADGES[activeEnvironment()]}
+                    </span>
+                  </Show>
+                </span>
+                <span class="sb-sep" />
+              </Show>
+              {/* Slot 2: the run status (row counts included) keeps its own slot: a
+                  Slack notice used to occupy it, so `N rows` vanished until the notice
+                  was cleared — and it could only be cleared from the badge further
+                  along. While a query runs it is the elapsed timer, not a stale count. */}
+              <span
+                class="sb-status"
+                classList={{ running: running() }}
+                title={persistenceWarning() || transactionWarning() || undefined}
+              >
+                {running() ? `Running ${fmtDur(runMs())}` : (persistenceWarning() || transactionWarning() || status())}
+              </span>
               <Show when={slackNotice()}>
                 <button
                   class="status-notice"
@@ -5850,12 +5970,16 @@ function App() {
               <Show when={slackStatus().running || slackStopped()}>
                 <span
                   class="slack-badge"
-                  classList={{ stopped: !!slackStopped() }}
+                  classList={{
+                    stopped: !!slackStopped(),
+                    on: slackStatus().running && slackStatus().state === "connected",
+                    wait: slackStatus().running && slackStatus().state !== "connected",
+                  }}
                   title={slackStopped()
                     ? `Slack: ${slackStopped()}`
                     : slackStatus().error ? `Slack ${slackStatus().state}: ${slackStatus().error}` : `Slack bot ${slackStatus().state}`}
                 >
-                  {slackStatus().running ? (slackStatus().state === "connected" ? "🟢" : "🟡") : "🔴"} Slack
+                  <span class="slack-led" aria-hidden="true" />Slack
                 </span>
               </Show>
               <span class="spacer" />
@@ -6028,6 +6152,7 @@ function App() {
 
         <Show when={activeDialog()}>
           <WorkbenchDialogs
+            titleBadge={prodBadge()}
             state={activeDialog()}
             onClose={() => setActiveDialog(null)}
             onRun={(sql) => {

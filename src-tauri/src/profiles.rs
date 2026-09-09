@@ -45,6 +45,13 @@ pub struct Profile {
     /// Keep the SSH password / key passphrase in the OS keychain.
     #[serde(default)]
     pub save_ssh_secret: bool,
+    /// Environment tag: `None` (untagged), "dev", "staging" or "prod". Metadata
+    /// only — it never reaches the driver; the frontend uses it to mark a
+    /// production session in the connection strip, tab bar, status bar and every
+    /// confirmation dialog. Unknown values are treated as untagged by the UI, so
+    /// a file written by a newer Tusk degrades quietly instead of mis-labelling.
+    #[serde(default)]
+    pub environment: Option<String>,
 }
 
 /// The keychain account holding this profile's SSH secret. Distinct from the DB
@@ -547,6 +554,7 @@ mod tests {
             path: None,
             ssh: None,
             save_ssh_secret: false,
+            environment: None,
         }
     }
 
@@ -748,10 +756,36 @@ mod tests {
     }
 
     #[test]
+    fn the_environment_tag_round_trips_and_is_optional() {
+        // Present: survives a save/load cycle byte for byte.
+        let tagged = Profile {
+            environment: Some("prod".into()),
+            ..profile()
+        };
+        let json = serde_json::to_string(&tagged).unwrap();
+        assert!(json.contains("\"environment\":\"prod\""));
+        let back: Profile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.environment.as_deref(), Some("prod"));
+
+        // Absent: an untagged profile stays untagged.
+        let plain: Profile =
+            serde_json::from_str(&serde_json::to_string(&profile()).unwrap()).unwrap();
+        assert!(plain.environment.is_none());
+
+        // A tag is cosmetic: changing it must not invalidate the saved password.
+        let next = Profile {
+            environment: Some("staging".into()),
+            ..profile()
+        };
+        assert!(same_destination(&profile(), &next));
+    }
+
+    #[test]
     fn legacy_profiles_without_ssh_fields_still_load() {
         let json = r#"{"id":"p1","name":"local","host":"h","port":5432,"user":"u","dbname":"d"}"#;
         let p: Profile = serde_json::from_str(json).unwrap();
         assert!(p.ssh.is_none());
+        assert!(p.environment.is_none());
         assert!(!p.save_ssh_secret);
     }
 }

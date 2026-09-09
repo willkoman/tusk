@@ -142,7 +142,7 @@ describe("ModifyTableForm — constraint drops", () => {
       "Index: orders_note_idx",
       "Constraints: orders_note_chk, orders_note_uq",
     ]);
-    expect([...document.querySelectorAll(".confirm-text")].map((e) => e.textContent)).toContain(
+    expect([...document.querySelectorAll(".danger-lead")].map((e) => e.textContent)).toContain(
       "These objects are dropped and cannot be recovered.",
     );
   });

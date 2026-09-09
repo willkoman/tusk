@@ -10,6 +10,7 @@ import type { DbTree, RelationDetail } from "./Tree";
 import type { FkEdge } from "./sql/fk";
 import type { HistoryEntry } from "./history/store";
 import { IDLE_TRANSACTION, transactionOpen, type TransactionStatus } from "./transaction";
+import { connectionDisplayName, parseEnvironment, type Environment } from "./environment";
 
 // --- driver catalogue -------------------------------------------------------
 
@@ -88,6 +89,10 @@ export type Connected = {
   key: string;
   /** Database name / file basename — the chip label. */
   target: string;
+  /** Host, or the database file's directory. Only shown when it disambiguates. */
+  origin: string;
+  /** Environment tag from the saved profile (`none` for ad-hoc sessions). */
+  environment: Environment;
   /** The session reaches the database through an SSH tunnel. */
   viaSsh: boolean;
   /** Saved profile this session came from, when any (drives "reopen last session"). */
@@ -132,13 +137,19 @@ export type ConnectionState = {
 /** Hard ceiling on simultaneously open connections (mirrors the Rust registry cap). */
 export const MAX_CONNECTIONS = 16;
 
-/** Distinct chip tints, cycled by open order. Values are CSS colours used as-is. */
+/** Distinct chip tints, cycled by open order. Each is a theme token (App.css
+ *  section 1) rather than a literal, so every palette tunes its own hues. */
 export const CONNECTION_COLORS = [
-  "#5b9dd9", "#c98f4b", "#5fae7f", "#b06fc4", "#d0705f", "#6f8fd0", "#b3a44e", "#4faab0",
+  "var(--conn-1)", "var(--conn-2)", "var(--conn-3)", "var(--conn-4)",
+  "var(--conn-5)", "var(--conn-6)", "var(--conn-7)", "var(--conn-8)",
 ] as const;
 
 export const connectionColor = (index: number): string =>
   CONNECTION_COLORS[((index % CONNECTION_COLORS.length) + CONNECTION_COLORS.length) % CONNECTION_COLORS.length];
+
+/** The tag a session inherits from its saved profile, if any. */
+export const connectionEnvironment = (state: { conn: Pick<Connected, "environment"> }): Environment =>
+  parseEnvironment(state.conn.environment);
 
 /** Fresh per-connection state for a session that just opened. */
 export function makeConnectionState(conn: Connected, colorIndex: number): ConnectionState {
@@ -265,27 +276,43 @@ export const connectionLabel = (state: ConnectionState): string =>
 
 /**
  * Labels for the whole strip, with duplicates disambiguated. Two sessions on the
- * same database name are common (different hosts, or read-only vs read-write), and
- * an ambiguous chip is worse than a long one, so repeats get a `#n` suffix in open
- * order.
+ * same database name are common (different hosts, or read-only vs read-write),
+ * and an ambiguous chip is worse than a long one. A repeat is qualified by where
+ * it connects — `db.internal/postgres` — and falls back to a bare `#n` ordinal
+ * only when the origin cannot separate them either. Three identical chips
+ * reading `postgres #1/#2/#3` said nothing about which database was in front of
+ * the user.
  */
 export function connectionLabels(list: readonly ConnectionState[]): Map<string, string> {
-  const counts = new Map<string, number>();
-  for (const c of list) {
-    const base = connectionLabel(c);
-    counts.set(base, (counts.get(base) ?? 0) + 1);
-  }
+  const tally = (fn: (c: ConnectionState) => string) => {
+    const m = new Map<string, number>();
+    for (const c of list) {
+      const k = fn(c);
+      m.set(k, (m.get(k) ?? 0) + 1);
+    }
+    return m;
+  };
+  const qualified = (c: ConnectionState) =>
+    connectionDisplayName(connectionLabel(c), c.conn.origin ?? "", true);
+  const plain = tally(connectionLabel);
+  const qual = tally(qualified);
+
   const seen = new Map<string, number>();
   const out = new Map<string, string>();
   for (const c of list) {
     const base = connectionLabel(c);
-    if ((counts.get(base) ?? 0) < 2) {
+    if ((plain.get(base) ?? 0) < 2) {
       out.set(c.conn.id, base);
       continue;
     }
-    const n = (seen.get(base) ?? 0) + 1;
-    seen.set(base, n);
-    out.set(c.conn.id, `${base} #${n}`);
+    const withOrigin = qualified(c);
+    if ((qual.get(withOrigin) ?? 0) < 2) {
+      out.set(c.conn.id, withOrigin);
+      continue;
+    }
+    const n = (seen.get(withOrigin) ?? 0) + 1;
+    seen.set(withOrigin, n);
+    out.set(c.conn.id, `${withOrigin} #${n}`);
   }
   return out;
 }

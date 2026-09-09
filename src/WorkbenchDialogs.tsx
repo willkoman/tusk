@@ -1,4 +1,4 @@
-import { Switch, Match } from "solid-js";
+import { type JSX, Switch, Match } from "solid-js";
 import type { NodeDescriptor, RelationDetail } from "./Tree";
 import { ColumnForm } from "./forms/ColumnForm";
 import { EditColumnForm } from "./forms/EditColumnForm";
@@ -11,7 +11,7 @@ import { DatabaseForm } from "./forms/DatabaseForm";
 import { RenameDialog } from "./forms/RenameDialog";
 import { DuplicateDialog } from "./forms/DuplicateDialog";
 import { CommentDialog } from "./forms/CommentDialog";
-import { ConfirmDialog } from "./forms/ConfirmDialog";
+import { ConfirmDialog, type DangerFacts } from "./forms/ConfirmDialog";
 import { FilterBuilder } from "./forms/FilterBuilder";
 import type { FilterTree } from "./grid/filterModel";
 import type { RefColumn, RefTable } from "./forms/FkEditor";
@@ -47,7 +47,15 @@ export type DialogState =
   | {
       kind: "confirm";
       title: string;
+      /** Qualified name, shown under the title in mono. */
+      subtitle?: string;
       primaryLabel: string;
+      lead?: string;
+      lines?: string[];
+      /** What the confirmation states before it destroys anything. */
+      facts?: DangerFacts;
+      /** Require this exact name to be typed before the primary unlocks. */
+      confirmName?: string;
       showCascade?: boolean;
       showRestartIdentity?: boolean;
       build: (o: { cascade: boolean; restartIdentity: boolean }) => string;
@@ -56,6 +64,8 @@ export type DialogState =
 export type DialogKind = DialogState["kind"];
 
 type Handlers = {
+  /** Production badge, rendered in every confirmation's title. */
+  titleBadge?: JSX.Element;
   onClose: () => void;
   onRun: (sql: string) => Promise<{ ok: boolean; error?: string }>;
   onEditAsSql: (sql: string) => void;
@@ -170,7 +180,13 @@ export function WorkbenchDialogs(props: { state: DialogState | null } & Handlers
           return (
             <ConfirmDialog
               title={st.title}
+              titleBadge={props.titleBadge}
+              subtitle={st.subtitle}
               primaryLabel={st.primaryLabel}
+              lead={st.lead}
+              lines={st.lines}
+              facts={st.facts}
+              confirmName={st.confirmName}
               showCascade={st.showCascade}
               showRestartIdentity={st.showRestartIdentity}
               build={st.build}
