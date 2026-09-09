@@ -3,6 +3,8 @@ import { Dialog, DialogFooter } from "../Dialog";
 
 export function DuplicateDialog(props: {
   title: string;
+  /** The source object, shown under the title. */
+  subtitle?: string;
   defaultName: string;
   build: (newName: string, withData: boolean) => string;
   onClose: () => void;
@@ -26,26 +28,34 @@ export function DuplicateDialog(props: {
   };
 
   return (
-    <Dialog title={props.title} onClose={props.onClose}>
+    <Dialog
+      title={props.title}
+      subtitle={props.subtitle}
+      size="md"
+      onClose={props.onClose}
+      onEnter={apply}
+      footer={
+        <DialogFooter
+          sql={sql()}
+          error={error()}
+          busy={busy()}
+          disabled={!name().trim()}
+          primaryLabel="Duplicate"
+          onPrimary={apply}
+          onEditAsSql={() => props.onEditAsSql(sql())}
+          onCancel={props.onClose}
+        />
+      }
+    >
       <label>
-        New table name
-        <input value={name()} onInput={(e) => setName(e.currentTarget.value)} autofocus />
+        New table name<span class="req">*</span>
+        <input value={name()} onInput={(e) => setName(e.currentTarget.value)} />
       </label>
       <label class="checkbox">
         <input type="checkbox" checked={withData()} onChange={(e) => setWithData(e.currentTarget.checked)} />
-        Copy data too (INSERT … SELECT)
+        Copy data too
       </label>
-      <div class="import-info">Structure via LIKE … INCLUDING ALL — excludes foreign keys referencing it and triggers.</div>
-      <DialogFooter
-        sql={sql()}
-        error={error()}
-        busy={busy()}
-        disabled={!name().trim()}
-        primaryLabel="Duplicate"
-        onPrimary={apply}
-        onEditAsSql={() => props.onEditAsSql(sql())}
-        onCancel={props.onClose}
-      />
+      <div class="import-info">Copies columns, defaults, constraints and indexes. Incoming foreign keys and triggers are not copied.</div>
     </Dialog>
   );
 }

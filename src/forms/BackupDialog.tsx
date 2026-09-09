@@ -145,7 +145,39 @@ export function BackupDialog(props: {
   }
 
   return (
-    <Dialog title="Backup" onClose={props.onClose} width={620} dismissable={!busy()}>
+    <Dialog
+      title="Backup"
+      size="lg"
+      onClose={props.onClose}
+      dismissable={!busy()}
+      footer={
+        <>
+          {/* A disabled <button> fires no hover events on WebView2, so its `title` never
+              appears. The reason why Back up is unavailable is visible text instead. */}
+          <Show when={blocker() && !busy() && !done()}><div class="field-error">{blocker()}</div></Show>
+          <Show when={err() && !busy() && !done()}><div class="error">{err()}</div></Show>
+          <div class="form-actions">
+            <Show
+              when={busy()}
+              fallback={
+                <>
+                  <button class="ghost" onClick={props.onClose}>{done() ? "Close" : "Cancel"}</button>
+                  <Show when={!done()}>
+                    <button class="run" disabled={!!blocker()} onClick={() => void run()}>
+                      Back up
+                    </button>
+                  </Show>
+                </>
+              }
+            >
+              <span class="busy-label"><span class="spinner-sm" />Backing up…</span>
+              <span class="spacer" />
+              <button class="ghost" onClick={() => props.onCancel()}>Cancel backup</button>
+            </Show>
+          </div>
+        </>
+      }
+    >
       <Show
         when={!busy() && !done()}
         fallback={
@@ -267,7 +299,7 @@ export function BackupDialog(props: {
                     checked={opts().content === c.value}
                     onChange={() => set({ content: c.value as BackupContent })}
                   />
-                  {c.label} <span class="export-note">— {c.hint}</span>
+                  {c.label} <span class="export-note">{c.hint}</span>
                 </label>
               )}
             </For>
@@ -284,7 +316,7 @@ export function BackupDialog(props: {
               />
               Emit DROP … IF EXISTS before each CREATE
             </label>
-            <label class="export-check" title={canWrap() ? undefined : "MySQL commits DDL implicitly, so a dump cannot be one transaction"}>
+            <label class="export-check">
               <input
                 type="checkbox"
                 checked={opts().singleTransaction && canWrap()}
@@ -293,7 +325,7 @@ export function BackupDialog(props: {
               />
               Wrap the dump in one transaction
               <Show when={!canWrap()}>
-                <span class="export-note"> — not available on {props.driverKind}</span>
+                <span class="export-note">Not available on {props.driverKind}.</span>
               </Show>
             </label>
           </section>
@@ -308,26 +340,6 @@ export function BackupDialog(props: {
         </fieldset>
       </Show>
 
-      <Show when={err() && !busy() && !done()}><div class="error">{err()}</div></Show>
-      <div class="form-actions">
-        <Show
-          when={busy()}
-          fallback={
-            <>
-              <button class="ghost" onClick={props.onClose}>{done() ? "Close" : "Cancel"}</button>
-              <Show when={!done()}>
-                <button class="run" disabled={!!blocker()} title={blocker() || undefined} onClick={() => void run()}>
-                  Back up
-                </button>
-              </Show>
-            </>
-          }
-        >
-          <span class="busy-label"><span class="spinner-sm" />Backing up…</span>
-          <span class="spacer" />
-          <button class="ghost" onClick={() => props.onCancel()}>Cancel backup</button>
-        </Show>
-      </div>
     </Dialog>
   );
 }

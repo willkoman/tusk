@@ -162,14 +162,27 @@ export function CreateTableForm(props: {
 
   return (
     <Dialog
-      title={`Create table · ${props.schema}`}
+      title="Create table"
+      subtitle={props.schema}
+      size="xl"
       onClose={props.onClose}
-      width={Math.min(window.innerWidth - 80, 1020)}
+      footer={
+        <DialogFooter
+          sql={sql()}
+          error={error()}
+          busy={busy()}
+          disabled={!sql()}
+          primaryLabel="Create table"
+          onPrimary={apply}
+          onEditAsSql={() => props.onEditAsSql(sql())}
+          onCancel={props.onClose}
+        />
+      }
     >
       <div class="modify-head">
         <label>
-          Table name
-          <input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="table_name" autofocus />
+          Table name<span class="req">*</span>
+          <input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="table_name" />
         </label>
         <Show when={caps.comments !== "none"}>
           <label>
@@ -328,21 +341,11 @@ export function CreateTableForm(props: {
       </Show>
 
       <Show when={errors().length}>
-        <div class="error">{errors()[0].message}</div>
+        <div class="field-error">{errors()[0].message}</div>
       </Show>
       <Show when={note()}>
         <div class="muted-hint script-note">{note()}</div>
       </Show>
-      <DialogFooter
-        sql={sql()}
-        error={error()}
-        busy={busy()}
-        disabled={!sql()}
-        primaryLabel="Create table"
-        onPrimary={apply}
-        onEditAsSql={() => props.onEditAsSql(sql())}
-        onCancel={props.onClose}
-      />
     </Dialog>
   );
 }

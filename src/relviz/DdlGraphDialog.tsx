@@ -374,8 +374,14 @@ export function DdlGraphDialog(props: {
 
   return (
     <Dialog
-      title={center().name ? `DDL & relationships — ${graphDisplayText(center().schema)}.${graphDisplayText(center().name!)}` : `Schema diagram — ${graphDisplayText(center().schema)}`}
-      width={Math.min(window.innerWidth - 64, 1280)}
+      title={center().name ? "DDL & relationships" : "Schema diagram"}
+      subtitle={
+        center().name
+          ? `${graphDisplayText(center().schema)}.${graphDisplayText(center().name!)}`
+          : graphDisplayText(center().schema)
+      }
+      size="xl"
+      noAutoFocus
       class="modal-tall"
       onClose={props.onClose}
     >

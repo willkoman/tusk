@@ -27,14 +27,24 @@ export function ParamDialog(props: {
     return text.length <= limit ? text : `${text.slice(0, limit)}\n-- preview truncated; full SQL will run`;
   });
 
+  const run = () => props.onRun(values(), preview());
+
   return (
-    <Dialog title="Query parameters" width={560} onClose={props.onClose}>
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          props.onRun(values(), preview());
-        }}
-      >
+    <Dialog
+      title="Query parameters"
+      size="md"
+      onClose={props.onClose}
+      onEnter={run}
+      footer={
+        <>
+          <SqlPreview sql={previewText()} />
+          <div class="form-actions">
+            <button type="button" class="ghost" onClick={props.onClose}>Cancel</button>
+            <button type="button" class="run" onClick={run}>Run</button>
+          </div>
+        </>
+      }
+    >
         <div class="param-rows">
           <For each={props.params}>
             {(p, i) => (
@@ -51,7 +61,7 @@ export function ParamDialog(props: {
                   <input type="checkbox" checked={values()[p.name].isNull} onChange={(e) => patch(p.name, { isNull: e.currentTarget.checked })} />
                   NULL
                 </label>
-                <label class="checkbox param-flag" title="Insert the value verbatim (numbers, expressions) instead of as a quoted string">
+                <label class="checkbox param-flag" title="Insert verbatim, unquoted">
                   <input type="checkbox" checked={values()[p.name].raw} disabled={values()[p.name].isNull} onChange={(e) => patch(p.name, { raw: e.currentTarget.checked })} />
                   raw
                 </label>
@@ -61,15 +71,9 @@ export function ParamDialog(props: {
         </div>
         <Show when={props.params.some((p) => p.name.startsWith("%s #"))}>
           <div class="import-info">
-            `%s` values are quoted by default. For PostgreSQL <code>ANY(%s)</code>, enter an array literal such as <code>{`{1,2}`}</code>, or enable raw and enter <code>ARRAY[1,2]</code>.
+            <code>%s</code> values are quoted. For PostgreSQL <code>ANY(%s)</code>, enter <code>{`{1,2}`}</code>, or tick raw and enter <code>ARRAY[1,2]</code>.
           </div>
         </Show>
-        <SqlPreview sql={previewText()} />
-        <div class="form-actions">
-          <button type="button" class="ghost" onClick={props.onClose}>Cancel</button>
-          <button type="submit" class="run">Run ▶</button>
-        </div>
-      </form>
     </Dialog>
   );
 }

@@ -57,24 +57,44 @@ export function EditColumnForm(props: {
   };
 
   return (
-    <Dialog title={`Edit column · ${col.name}`} onClose={props.onClose}>
+    <Dialog
+      title="Edit column"
+      subtitle={`${props.ctx.schema}.${props.ctx.table}.${col.name}`}
+      size="md"
+      onClose={props.onClose}
+      footer={
+        <DialogFooter
+          sql={sql()}
+          error={error()}
+          busy={busy()}
+          disabled={!sql().trim()}
+          primaryLabel="Apply"
+          onPrimary={apply}
+          onEditAsSql={() => props.onEditAsSql(sql())}
+          onCancel={props.onClose}
+        />
+      }
+    >
       <label>
-        Name
+        Name<span class="req">*</span>
         <input value={name()} onInput={(e) => setName(e.currentTarget.value)} />
       </label>
       <label>
-        Type <span class="muted-hint">(empty = keep {col.data_type})</span>
+        Type
         <SqlField value={type()} typesOnly onChange={setType} placeholder={col.data_type} />
+        <small class="field-hint">Empty keeps {col.data_type}.</small>
       </label>
       <Show when={caps.usingClause}>
         <label>
-          USING (cast expression, optional)
+          USING
           <SqlField value={using()} columns={[col.name]} onChange={setUsing} placeholder={`${col.name}::text`} />
+          <small class="field-hint">Cast expression for the type change.</small>
         </label>
       </Show>
       <label>
-        Default (empty = drop default)
+        Default
         <SqlField value={def()} columns={[col.name]} onChange={setDef} placeholder="(none)" />
+        <small class="field-hint">Empty drops the default.</small>
       </label>
       <Show when={caps.comments !== "none"}>
         <label>
@@ -88,23 +108,12 @@ export function EditColumnForm(props: {
       </label>
       <Show when={caps.changeType === "rebuild"}>
         <div class="warn-note">
-          SQLite can only rename this column here. Type, NOT NULL and default changes need a table rebuild — use
-          <b> Modify table…</b> on the parent table.
+          This dialog only renames the column on {caps.label}. For type, NOT NULL or default, use <b>Modify table…</b>.
         </div>
       </Show>
       <Show when={note()}>
         <div class="muted-hint script-note">{note()}</div>
       </Show>
-      <DialogFooter
-        sql={sql()}
-        error={error()}
-        busy={busy()}
-        disabled={!sql().trim()}
-        primaryLabel="Apply"
-        onPrimary={apply}
-        onEditAsSql={() => props.onEditAsSql(sql())}
-        onCancel={props.onClose}
-      />
     </Dialog>
   );
 }

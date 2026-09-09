@@ -125,11 +125,36 @@ export function FilterBuilder(props: {
   };
 
   return (
-    <Dialog title="Filter rows" onClose={props.onClose} width={720}>
+    <Dialog
+      title="Filter rows"
+      size="lg"
+      onClose={props.onClose}
+      footer={
+        <DialogFooter
+          sql={preview()}
+          error={error()}
+          disabled={!!error()}
+          primaryLabel="Apply filter"
+          onPrimary={apply}
+          onEditAsSql={() => {
+            props.onOpenQuery(tree());
+            props.onClose();
+          }}
+          editAsSqlLabel="Open as query"
+          extra={
+            <>
+              <button class="ghost" onClick={clear} disabled={!tree().items.length}>Clear</button>
+              <button class="ghost" onClick={() => props.onCopyWhere(where())} disabled={!where()}>Copy WHERE</button>
+            </>
+          }
+          onCancel={props.onClose}
+        />
+      }
+    >
       <div class="filter-builder" onKeyDown={onKeyDown}>
         <Show
           when={props.columns.length}
-          fallback={<div class="filter-empty">Run a query first — the builder filters the columns of a loaded result.</div>}
+          fallback={<div class="filter-empty">Run a query first. The builder filters the columns of a loaded result.</div>}
         >
           <GroupEditor
             group={tree()}
@@ -142,25 +167,6 @@ export function FilterBuilder(props: {
           />
         </Show>
       </div>
-      <DialogFooter
-        sql={preview()}
-        error={error()}
-        disabled={!!error()}
-        primaryLabel="Apply filter"
-        onPrimary={apply}
-        onEditAsSql={() => {
-          props.onOpenQuery(tree());
-          props.onClose();
-        }}
-        editAsSqlLabel="Open as query"
-        extra={
-          <>
-            <button class="ghost" onClick={clear} disabled={!tree().items.length}>Clear</button>
-            <button class="ghost" onClick={() => props.onCopyWhere(where())} disabled={!where()}>Copy WHERE</button>
-          </>
-        }
-        onCancel={props.onClose}
-      />
     </Dialog>
   );
 }

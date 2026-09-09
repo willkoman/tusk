@@ -51,12 +51,31 @@ export function IndexForm(props: {
   };
 
   return (
-    <Dialog title={`Add index · ${props.ctx.name}`} onClose={props.onClose}>
+    <Dialog
+      title="Add index"
+      subtitle={`${props.ctx.schema}.${props.ctx.name}`}
+      size="md"
+      onClose={props.onClose}
+      footer={
+        <DialogFooter
+          sql={sql()}
+          error={error()}
+          busy={busy()}
+          disabled={!sql()}
+          primaryLabel="Create index"
+          onPrimary={apply}
+          onEditAsSql={() => props.onEditAsSql(sql())}
+          onCancel={props.onClose}
+        />
+      }
+    >
       <label>
-        Name (optional — server auto-names if blank)
+        Name
         <input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="idx_name" />
+        <small class="field-hint">Leave blank to let the server name it.</small>
       </label>
-      <div class="field-label">Columns (click to add, in order)</div>
+      <div class="field-label">Columns</div>
+      <div class="field-hint">Click to add, in order.</div>
       <div class="chip-picker">
         <For each={props.columns}>
           {(c) => (
@@ -84,20 +103,11 @@ export function IndexForm(props: {
       </label>
       <Show when={caps.partialIndex}>
         <label>
-          WHERE (partial index, optional)
+          WHERE
           <SqlField value={where()} columns={props.columns} onChange={setWhere} placeholder="e.g. active" />
+          <small class="field-hint">Indexes only the rows matching this expression.</small>
         </label>
       </Show>
-      <DialogFooter
-        sql={sql()}
-        error={error()}
-        busy={busy()}
-        disabled={!sql()}
-        primaryLabel="Create index"
-        onPrimary={apply}
-        onEditAsSql={() => props.onEditAsSql(sql())}
-        onCancel={props.onClose}
-      />
     </Dialog>
   );
 }

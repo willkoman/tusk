@@ -3,6 +3,8 @@ import { Dialog, DialogFooter } from "../Dialog";
 
 export function RenameDialog(props: {
   title: string;
+  /** The object being renamed, shown under the title. */
+  subtitle?: string;
   current: string;
   build: (newName: string) => string;
   onClose: () => void;
@@ -26,21 +28,29 @@ export function RenameDialog(props: {
   };
 
   return (
-    <Dialog title={props.title} onClose={props.onClose}>
+    <Dialog
+      title={props.title}
+      subtitle={props.subtitle}
+      size="sm"
+      onClose={props.onClose}
+      onEnter={apply}
+      footer={
+        <DialogFooter
+          sql={sql()}
+          error={error()}
+          busy={busy()}
+          disabled={!changed()}
+          primaryLabel="Rename"
+          onPrimary={apply}
+          onEditAsSql={() => props.onEditAsSql(sql())}
+          onCancel={props.onClose}
+        />
+      }
+    >
       <label>
-        New name
-        <input value={name()} onInput={(e) => setName(e.currentTarget.value)} autofocus />
+        New name<span class="req">*</span>
+        <input value={name()} onInput={(e) => setName(e.currentTarget.value)} />
       </label>
-      <DialogFooter
-        sql={sql()}
-        error={error()}
-        busy={busy()}
-        disabled={!changed()}
-        primaryLabel="Rename"
-        onPrimary={apply}
-        onEditAsSql={() => props.onEditAsSql(sql())}
-        onCancel={props.onClose}
-      />
     </Dialog>
   );
 }

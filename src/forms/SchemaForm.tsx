@@ -24,25 +24,32 @@ export function SchemaForm(props: {
   };
 
   return (
-    <Dialog title="Create schema" onClose={props.onClose}>
+    <Dialog
+      title="Create schema"
+      size="md"
+      onClose={props.onClose}
+      onEnter={apply}
+      footer={
+        <DialogFooter
+          sql={sql()}
+          error={error()}
+          busy={busy()}
+          disabled={!sql()}
+          primaryLabel="Create schema"
+          onPrimary={apply}
+          onEditAsSql={() => props.onEditAsSql(sql())}
+          onCancel={props.onClose}
+        />
+      }
+    >
       <label>
-        Name
-        <input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="schema_name" autofocus />
+        Name<span class="req">*</span>
+        <input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="schema_name" />
       </label>
       <label>
-        Owner (optional)
+        Owner
         <input value={owner()} onInput={(e) => setOwner(e.currentTarget.value)} placeholder="role" />
       </label>
-      <DialogFooter
-        sql={sql()}
-        error={error()}
-        busy={busy()}
-        disabled={!sql()}
-        primaryLabel="Create schema"
-        onPrimary={apply}
-        onEditAsSql={() => props.onEditAsSql(sql())}
-        onCancel={props.onClose}
-      />
     </Dialog>
   );
 }

@@ -163,7 +163,32 @@ export function ExportDialog(props: {
   }
 
   return (
-    <Dialog title="Export" onClose={props.onClose} width={620} dismissable={!busy()}>
+    <Dialog
+      title="Export"
+      size="lg"
+      onClose={props.onClose}
+      dismissable={!busy()}
+      footer={
+        <>
+          <Show when={err()}><div class="error">{err()}</div></Show>
+          <div class="form-actions">
+            <Show
+              when={busy()}
+              fallback={
+                <>
+                  <button class="ghost" onClick={props.onClose}>Cancel</button>
+                  <button class="run" onClick={run}>{dest() === "clipboard" ? "Copy" : "Export"}</button>
+                </>
+              }
+            >
+              <span class="busy-label"><span class="spinner-sm" />{dest() === "clipboard" ? "Copying…" : "Exporting…"}</span>
+              <span class="spacer" />
+              <button class="ghost" onClick={() => void props.onCancel?.()}>Cancel export</button>
+            </Show>
+          </div>
+        </>
+      }
+    >
       <fieldset class="export-grid export-fieldset" disabled={busy()}>
         <section class="export-sec">
           <div class="export-label">Format</div>
@@ -313,26 +338,9 @@ export function ExportDialog(props: {
         </Show>
 
         <Show when={isXlsx()}>
-          <div class="export-note">Excel streams through temporary worksheet files; rows past 1,048,576 roll into additional sheets.</div>
+          <div class="export-note">Rows past 1,048,576 roll into additional sheets.</div>
         </Show>
       </fieldset>
-
-      <Show when={err()}><div class="error">{err()}</div></Show>
-      <div class="form-actions">
-        <Show
-          when={busy()}
-          fallback={
-            <>
-              <button class="ghost" onClick={props.onClose}>Cancel</button>
-              <button class="run" onClick={run}>{dest() === "clipboard" ? "Copy" : "Export"}</button>
-            </>
-          }
-        >
-          <span class="busy-label"><span class="spinner-sm" />{dest() === "clipboard" ? "Copying…" : "Exporting…"}</span>
-          <span class="spacer" />
-          <button class="ghost" onClick={() => void props.onCancel?.()}>Cancel export</button>
-        </Show>
-      </div>
     </Dialog>
   );
 }
