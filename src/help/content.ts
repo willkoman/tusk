@@ -389,7 +389,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Statement splitting is **engine-aware**, matching execution. On MySQL, `#` comments and `--` without trailing whitespace lex correctly and backslash escapes inside quotes are honored; backtick identifiers are first-class on MySQL and SQLite. On SQL Server, `[bracketed identifiers]` (with `]]` escapes), `N'literals'`, and nested `/* … /* … */ … */` comments hold semicolons inertly, and a line-only `GO` ends the batch **without being sent to the server** (a `GO 5` repeat count is refused rather than run once). Everything built on the lexer — Run selection or current statement, auto-fold, linting, parameter detection, and grid sort/filter — reads each engine's SQL the way the server does."
+        "md": "Statement splitting is **engine-aware**, matching execution. On MySQL, `#` comments and `--` without trailing whitespace lex correctly and backslash escapes inside quotes are honored; backtick identifiers are first-class on MySQL and SQLite. On SQL Server, `[bracketed identifiers]` (with `]]` escapes), `N'literals'`, and nested `/* … /* … */ … */` comments hold semicolons inertly, and a line-only `GO` ends the batch **without being sent to the server**, with or without a trailing comment (a `GO 5` repeat count is refused rather than run once). A `;` inside a T-SQL block — `BEGIN … END`, `BEGIN TRY`/`BEGIN CATCH`, `CASE … END` — belongs to the statement, so a `CREATE PROCEDURE` body runs as written instead of being chopped up; `BEGIN TRAN[SACTION]` still opens a transaction, not a block. Everything built on the lexer — Run selection or current statement, auto-fold, linting, parameter detection, and grid sort/filter — reads each engine's SQL the way the server does."
       },
       {
         "k": "p",
@@ -1258,7 +1258,7 @@ export const TOPICS: Topic[] = [
     "blocks": [
       {
         "k": "p",
-        "md": "Data moves through four doors: **Export…** on the result toolbar (file or clipboard, six formats, streaming), the Explorer's right-click **Export table…** / **Export tables…**, the sidebar's **Import data** icon and the Explorer's **Import data into table…** / **Import file as new table…**, and the grid's copy commands ([[kbd:Mod-C]] + right-click — see [[topic:results|Results]]). Import and export both work on every engine. Moving a whole database rather than one result is a different job — see [[topic:backup|Backup & restore]]."
+        "md": "Data moves through four doors: **Export…** on the result toolbar (file or clipboard, six formats, streaming), the Explorer's right-click **Export table…** / **Export tables…**, the sidebar's **Import data** icon and the Explorer's **Import data into table…** / **Import file as new table…**, and the grid's copy commands ([[kbd:Mod-C]] + right-click — see [[topic:results|Results]]). Export works on every engine; import covers PostgreSQL, MySQL, SQLite and DuckDB — it isn't wired up for SQL Server yet, and the Explorer's import items say so. Moving a whole database rather than one result is a different job — see [[topic:backup|Backup & restore]]."
       },
       {
         "k": "h",
@@ -1358,7 +1358,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**Import data** opens a three-step dialog on any engine. **1. File** — pick the file and its parsing options; Tusk parses the head of it in the backend and shows the detected columns, the first 50 rows and any warnings. **2. Columns** — choose the target table and map the file's columns onto it. **3. Run** — watch the load with live progress, **Cancel &amp; roll back**, and a result summary. The file is read from disk by the backend in bounded batches: it is never loaded into the window, so size is limited by the format's budget rather than by memory."
+        "md": "**Import data** opens a three-step dialog on PostgreSQL, MySQL, SQLite and DuckDB (SQL Server isn't supported yet). **1. File** — pick the file and its parsing options; Tusk parses the head of it in the backend and shows the detected columns, the first 50 rows and any warnings. **2. Columns** — choose the target table and map the file's columns onto it. **3. Run** — watch the load with live progress, **Cancel &amp; roll back**, and a result summary. The file is read from disk by the backend in bounded batches: it is never loaded into the window, so size is limited by the format's budget rather than by memory."
       },
       {
         "k": "list",
@@ -2340,7 +2340,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "Every proposal is pinned to the exact Tusk connection, server-reported database, workspace, channel, thread, source message, and requester that created it. Switching connection or database makes approval fail closed. Execution uses a fresh read-only backend and does not join or roll back the UI cursor."
+        "md": "Every proposal is pinned to the exact Tusk connection, server-reported database, workspace, channel, thread, source message, and requester that created it. Switching connection or database makes approval fail closed. Execution uses a fresh read-only backend and does not join or roll back the UI cursor. SQL Server connections are refused outright, at the question and again at approval: it has no session read-only mode, so that backend could not be engine-enforced."
       },
       {
         "k": "list",
@@ -2967,7 +2967,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "ordered": true,
         "items": [
-          "**Engine-level** — Postgres gets `SET default_transaction_read_only = on`; file-backed DuckDB opens with `AccessMode::ReadOnly`; SQLite with `SQLITE_OPEN_READ_ONLY`; MySQL applies `SET SESSION TRANSACTION READ ONLY` on every pooled connection; SQL Server has no session-level equivalent, so there the uniform client guard below is the whole enforcement.",
+          "**Engine-level** — Postgres gets `SET default_transaction_read_only = on`; file-backed DuckDB opens with `AccessMode::ReadOnly`; SQLite with `SQLITE_OPEN_READ_ONLY`; MySQL applies `SET SESSION TRANSACTION READ ONLY` on every pooled connection; SQL Server has no session-level equivalent, so there the uniform client guard below is the whole enforcement — and that guard reads T-SQL's nested comments and `[bracket]` names the way the server does, so commented-out text can't disguise a write.",
           "**Statement classification** — read forms and non-writable manual transaction control pass; writes, writable transaction modes, DDL, and `COPY` reject before execution with *\"connection is read-only — writes and DDL are blocked\"*.",
           "**UI gating** — mutating sidebar items disable with a *\"Connection is read-only\"* tooltip; [[topic:grid-editing|in-grid editing]] refuses to start (the grid menu shows *\"connection is read-only\"*); imports are blocked by the backend (*\"connection is read-only — import blocked\"*)."
         ]
@@ -3118,8 +3118,9 @@ export const TOPICS: Topic[] = [
         "ordered": false,
         "items": [
           "**SQL Server is a connectable driver.** Pick **SQL Server** on the connect screen (port 1433, SQL login, keychain-stored password, the usual `sslmode` choices). Results page with `OFFSET`/`FETCH`, the Explorer shows schemas, tables and views with row counts and sizes, columns, indexes, constraints, triggers, sequences and routines, and Copy DDL reconstructs tables from `sys.*` with foreign keys as trailing `ALTER`s.",
-          "**The editor speaks T-SQL.** `[bracketed identifiers]`, `N'literals'`, nested block comments, and `GO` batch separators are handled by the same lexer that drives statement splitting, folding, linting and grid wrapping; `GO` never reaches the server, and a repeat count is refused.",
-          "**Manual transactions use T-SQL's vocabulary** — `BEGIN TRANSACTION`, `SAVE TRANSACTION`, `ROLLBACK TRANSACTION name` — verified against `@@TRANCOUNT` and `XACT_STATE()` after every statement. Explain is disabled there: T-SQL has no `EXPLAIN`."
+          "**The editor speaks T-SQL.** `[bracketed identifiers]`, `N'literals'`, nested block comments, `BEGIN … END` blocks and `GO` batch separators are handled by the same lexer that drives statement splitting, folding, linting and grid wrapping; `GO` never reaches the server, and a repeat count is refused.",
+          "**Manual transactions use T-SQL's vocabulary** — `BEGIN TRANSACTION`, `SAVE TRANSACTION`, and `ROLLBACK TRANSACTION name` for either a savepoint or the named transaction itself — verified against `@@TRANCOUNT` and `XACT_STATE()` after every statement. When the server ends the unit (a deadlock victim, or an error under `XACT_ABORT ON`) you get its own message and an idle transaction bar, not a \"connection dropped\". Explain is disabled there: T-SQL has no `EXPLAIN`.",
+          "**What SQL Server doesn't do yet.** File import isn't supported, the Slack bot won't run queries against it (Tusk can't open an engine-enforced read-only session there), sidebar DDL builders are missing, and Copy DDL needs SQL Server 2017+ — on an older server it refuses rather than emitting a table script with the keys silently missing."
         ]
       },
       {
@@ -3299,7 +3300,7 @@ export const TOPICS: Topic[] = [
         "ordered": false,
         "items": [
           "DM or `@mention` the bot with a question → the AI proposes SQL with **Approve / Reject** buttons. Only the requester can click; proposals expire after 5 minutes.",
-          "Approved queries are **read-only by construction**: one wrappable read, mutation/output/lock scans, executable-comment rejection, a conservative deterministic-function allowlist, a hard row cap, and a fresh engine-enforced read-only backend — layered guards, never prompt-only (see [[topic:safety|Safety]]).",
+          "Approved queries are **read-only by construction**: one wrappable read, mutation/output/lock scans, executable-comment rejection, a conservative deterministic-function allowlist, a hard row cap, and a fresh engine-enforced read-only backend (which is why SQL Server connections are refused) — layered guards, never prompt-only (see [[topic:safety|Safety]]).",
           "Results reply in-thread as an inline table, CSV/XLSX attachment, or a **chart rendered fully locally** (plotters → PNG, embedded font — nothing leaves your machine). Ask explicitly (\"as a bar chart, months on x\") and the AI's chart spec controls type, axes, and series; date+numeric results auto-chart too (Settings toggle, default on).",
           "Every result carries **Export as… CSV / TSV / Excel / JSON / SQL / Markdown** buttons (results cached 15 minutes; requester-only).",
           "Every approved run lands in [[topic:history|query history]] with a `-- [Slack] asked by <user>` marker.",
