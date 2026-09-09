@@ -3775,7 +3775,7 @@ function App() {
     });
     if (!path) return false;
     if (!originCurrent(src.origin, true)) return false;
-    if (src.origin.tabId) patchResult(src.origin.tabId, { status: "exporting…" });
+    if (src.origin.tabId) patchResult(src.origin.tabId, { status: "Exporting…" });
     const inline = scope === "selection" ? src.selectionRows : src.rows;
     const args =
       scope === "all"

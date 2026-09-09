@@ -53,7 +53,7 @@ describe("relationship graph limits", () => {
     const load = { kind: "error", message: "permission denied" } as const;
     expect(schemaGraphFallback(load, "public")).toBe("permission denied");
     expect(schemaGraphFallback({ kind: "ok", graph: { tables: [], edges: [] } }, "public")).toContain("No tables found");
-    expect(schemaGraphFallback({ kind: "ok", graph: { tables: [{ schema: "public", name: "t", columns: [] }], edges: [] } }, "public")).toContain("could not be laid out safely");
+    expect(schemaGraphFallback({ kind: "ok", graph: { tables: [{ schema: "public", name: "t", columns: [] }], edges: [] } }, "public")).toContain("could not be laid out");
   });
 
   it("bounds edge labels and error values", () => {

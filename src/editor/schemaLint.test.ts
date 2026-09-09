@@ -40,18 +40,18 @@ describe("schemaDiagnostics — detections", () => {
   it("flags unknown qualified columns with a suggestion", () => {
     const out = diag("SELECT u.emial FROM users u");
     expect(out.length).toBe(1);
-    expect(out[0].message).toContain('no column "emial"');
+    expect(out[0].message).toContain('No column "emial"');
     expect(out[0].suggestion).toBe("email");
   });
 
   it("flags unknown tables", () => {
-    expect(msgs("SELECT * FROM userz")[0]).toContain('unknown table "userz"');
+    expect(msgs("SELECT * FROM userz")[0]).toContain('Unknown table "userz"');
   });
 
   it("flags unknown bare columns in a fully-resolved statement", () => {
     const out = diag("SELECT emial FROM users");
     expect(out.length).toBe(1);
-    expect(out[0].message).toContain('unknown identifier "emial"');
+    expect(out[0].message).toContain('Unknown identifier "emial"');
     expect(out[0].suggestion).toBe("email");
   });
 
@@ -77,14 +77,14 @@ describe("schemaDiagnostics — detections", () => {
 
   it("flags unknown functions when the catalog is loaded", () => {
     const out = diag("SELECT cont(id) FROM users");
-    const hit = out.find((d) => d.message.includes('unknown function "cont"'));
+    const hit = out.find((d) => d.message.includes('Unknown function "cont"'));
     expect(hit).toBeTruthy();
     expect(hit!.suggestion).toBe("count");
   });
 
   it("flags unknown procs in CALL statements", () => {
     const out = diag("CALL my_prok(1)");
-    expect(out.some((d) => d.message.includes('unknown function "my_prok"'))).toBe(true);
+    expect(out.some((d) => d.message.includes('Unknown function "my_prok"'))).toBe(true);
   });
 });
 
@@ -120,7 +120,7 @@ describe("schemaDiagnostics — false-positive guards", () => {
   it("statements with an unresolved table skip bare-column checking (one squiggle, not two)", () => {
     const out = diag("SELECT email FROM userz");
     expect(out.length).toBe(1); // only the unknown-table warning
-    expect(out[0].message).toContain("unknown table");
+    expect(out[0].message).toContain("Unknown table");
   });
 
   it("window definitions and USING refs are not flagged", () => {
@@ -164,6 +164,6 @@ describe("schemaDiagnostics — false-positive guards", () => {
     };
     expect(pg('SELECT id FROM "public"."users"')).toEqual([]);
     // Real unknowns are still reported through the bracket form.
-    expect(lint("SELECT id FROM [dbo].[userz]")[0]).toContain("unknown table");
+    expect(lint("SELECT id FROM [dbo].[userz]")[0]).toContain("Unknown table");
   });
 });

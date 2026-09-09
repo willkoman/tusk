@@ -191,7 +191,7 @@ export function Tree(props: {
   }
 
   const colTitle = (c: Column) =>
-    [c.default ? `default: ${c.default}` : null, c.comment ? `💬 ${c.comment}` : null]
+    [c.default ? `default: ${c.default}` : null, c.comment ? `comment: ${c.comment}` : null]
       .filter(Boolean)
       .join("\n") || undefined;
 
@@ -243,7 +243,7 @@ export function Tree(props: {
           onContext={(e) => props.onContext(e, { kind, schema, name: rel.name, detail: det() })}
         />
         <Show when={isOpen(tk)}>
-          <Show when={det()} fallback={<Row depth={depth + 1} icon={<Icon name="dot" />} label="loading…" muted />}>
+          <Show when={det()} fallback={<Row depth={depth + 1} icon={<Icon name="dot" />} label="Loading…" muted />}>
             {(d) => (
               <>
                 <Row depth={depth + 1} header icon={<Icon name="columns" />} label="Columns" detail={`${d().columns.length}`} expandable open={isOpen(ck)} onToggle={() => toggle(ck)} />

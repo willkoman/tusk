@@ -23,7 +23,7 @@ describe("WHERE-clause comma detection", () => {
 
   it("flags HAVING commas too", () => {
     expect(messages("SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 1, a > 2")).toContain(
-      "',' is not valid between conditions — join them with AND or OR",
+      "Comma between conditions. Use AND or OR.",
     );
   });
 
@@ -55,7 +55,7 @@ describe("WHERE-clause comma detection", () => {
   });
 
   it("keeps existing checks intact", () => {
-    expect(messages("SELCT 1")).toEqual(expect.arrayContaining([expect.stringContaining("unknown statement")]));
+    expect(messages("SELCT 1")).toEqual(expect.arrayContaining([expect.stringContaining("Unknown statement")]));
     expect(messages("DELETE FROM t")).toEqual(expect.arrayContaining([expect.stringContaining("without WHERE")]));
   });
 });
@@ -63,23 +63,23 @@ describe("WHERE-clause comma detection", () => {
 describe("paste-artifact detection", () => {
   it("flags NBSP indentation (the web-paste syntax-error class) and points at each char", () => {
     const doc = "SELECT DISTINCT" + String.fromCharCode(10) + " NBSP NBSPp.master_id FROM product p".split("NBSP").join(String.fromCharCode(0xa0));
-    const found = lint(doc).filter((d) => /non-breaking space/.test(d.message));
+    const found = lint(doc).filter((d) => /Non-breaking space/.test(d.message));
     expect(found.length).toBe(2);
     for (const d of found) expect(doc.charCodeAt(d.from)).toBe(0xa0);
     expect(found[0].severity).toBe("error");
-    expect(found[0].actions?.[0]?.name).toBe("fix all in document");
+    expect(found[0].actions?.[0]?.name).toBe("Fix all in document");
   });
 
   it("flags zero-width and curly-quote artifacts with their code points", () => {
     const zw = "SELECT id" + String.fromCharCode(0x200b) + " FROM t";
     expect(messages(zw)).toEqual(expect.arrayContaining([expect.stringContaining("U+200B")]));
     const cq = "SELECT " + String.fromCharCode(0x2018) + "x" + String.fromCharCode(0x2019) + " FROM t";
-    expect(messages(cq)).toEqual(expect.arrayContaining([expect.stringContaining("straight quotes")]));
+    expect(messages(cq)).toEqual(expect.arrayContaining([expect.stringContaining("straight quote")]));
   });
 
   it("ignores artifacts inside string literals and comments (they are data)", () => {
     const doc = "SELECT 'a" + String.fromCharCode(0xa0) + "b' FROM t -- note" + String.fromCharCode(0xa0) + "here";
-    expect(lint(doc).filter((d) => /non-breaking space/.test(d.message))).toEqual([]);
+    expect(lint(doc).filter((d) => /Non-breaking space/.test(d.message))).toEqual([]);
   });
 
   it("fix-all replaces every code artifact and leaves string data untouched", () => {

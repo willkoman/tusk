@@ -246,11 +246,11 @@ export function connectionDot(state: ConnectionState): ConnectionDot {
 }
 
 const DOT_TITLES: Record<ConnectionDot, string> = {
-  lost: "transaction session lost — disconnect and reconnect",
-  failed: "transaction failed — rollback required",
-  transaction: "manual transaction open",
-  running: "query running",
-  idle: "idle",
+  lost: "Transaction session lost. Disconnect and reconnect.",
+  failed: "Transaction failed. Rollback required.",
+  transaction: "Manual transaction open",
+  running: "Query running",
+  idle: "Idle",
 };
 
 export const connectionDotTitle = (dot: ConnectionDot): string => DOT_TITLES[dot];

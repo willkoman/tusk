@@ -400,13 +400,13 @@ export function DdlGraphDialog(props: {
             <div class="relviz-pane-head">
               <Icon name="fileCode" /> DDL
               <span class="spacer" />
-              <button class="ghost" disabled={!ddl()?.ok} onClick={() => props.onCopy(ddl()!.ok!, "copied DDL")}>Copy</button>
+              <button class="ghost" disabled={!ddl()?.ok} onClick={() => props.onCopy(ddl()!.ok!, "Copied DDL")}>Copy</button>
               <button class="ghost" disabled={!ddl()?.ok} onClick={() => props.onOpenSql(ddl()!.ok!)}>Open in editor</button>
-              <button class="icon" title="Collapse the DDL pane (full-width graph)" onClick={() => setDdlCollapsed(true)}>«</button>
+              <button class="icon" title="Collapse the DDL pane" onClick={() => setDdlCollapsed(true)}>«</button>
             </div>
             <Switch>
               <Match when={!center().name}><div class="relviz-note">Click a table card to load its DDL.</div></Match>
-              <Match when={ddl.loading}><div class="relviz-note">loading…</div></Match>
+              <Match when={ddl.loading}><div class="relviz-note">Loading…</div></Match>
               <Match when={ddl()?.err}><div class="relviz-note">{ddl()!.err}</div></Match>
               <Match when={ddl()?.ok}>
                 <pre class="ddl-code"><code><For each={highlightSql(ddl()!.ok!)}>{(t) => (t.cls ? <span class={t.cls}>{t.text}</span> : t.text)}</For></code></pre>
@@ -431,12 +431,12 @@ export function DdlGraphDialog(props: {
             </span>
             <span class="spacer" />
             <Show when={scope() === "schema" && erdTableCount() > 300}>
-              <span class="relviz-warn">large schema — {erdTableCount()} tables</span>
+              <span class="relviz-warn">Large schema: {erdTableCount()} tables</span>
             </Show>
             <button
               class="ghost"
               disabled={scope() === "schema" ? nudges().size === 0 && groupNudges().size === 0 : hoodNudges().size === 0}
-              title="Discard manual repositioning, back to the computed layout"
+              title="Reset cards to the computed layout"
               onClick={() => {
                 if (scope() === "schema") {
                   setNudges(new Map());
@@ -453,7 +453,7 @@ export function DdlGraphDialog(props: {
           <Switch>
             <Match when={scope() === "neighborhood"}>
               <Switch>
-                <Match when={rels.loading}><div class="relviz-note">loading…</div></Match>
+                <Match when={rels.loading}><div class="relviz-note">Loading…</div></Match>
                 <Match when={relError()}>{(message) => <div class="relviz-empty">{message()}</div>}</Match>
                 <Match when={hood()}>
                   {(h) => (
@@ -464,7 +464,7 @@ export function DdlGraphDialog(props: {
                         <div class="relviz-center-solo">
                           <CenterCard name={center().name ?? ""} cols={h().cols} more={h().moreCols} />
                         </div>
-                        No foreign-key relationships found for this relation.
+                        No foreign keys on this relation.
                       </div>
                     }
                   >
@@ -557,7 +557,7 @@ export function DdlGraphDialog(props: {
             </Match>
 
             <Match when={scope() === "schema"}>
-              <Show when={!erd.loading} fallback={<div class="relviz-note">loading schema graph…</div>}>
+              <Show when={!erd.loading} fallback={<div class="relviz-note">Loading schema graph…</div>}>
                 <Show
                   when={erdLayoutMemo()}
                   fallback={
@@ -575,7 +575,7 @@ export function DdlGraphDialog(props: {
                             <div class="erd-groupbox" style={{ left: `${gr.x + gn().x}px`, top: `${gr.y + gn().y}px`, width: `${gr.w}px`, height: `${gr.h}px` }}>
                               <div
                                 class="erd-grouplabel"
-                                title="Drag to move the whole family block"
+                                title="Drag to move this group"
                                 onPointerDown={(e) => beginDrag(e, "group", gr.label, gi(), gr.members)}
                                 onPointerMove={moveDrag}
                                 onPointerUp={(e) => endDrag(e)}
@@ -664,7 +664,7 @@ export function DdlGraphDialog(props: {
                                 onPointerCancel={cancelDrag}
                                 onMouseEnter={() => setHoverTable(t.name)}
                                 onMouseLeave={() => setHoverTable(null)}
-                                title="Click: neighborhood view · drag: reposition"
+                                title="Click to focus, drag to move"
                               >
                                 <div class="erd-card-head"><span class="erd-hue" style={{ background: edgeColor(t.name) }} /><Icon name="table" /> {t.name}</div>
                                 <For each={keys.slice(0, ERD_MAX_ROWS)}>

@@ -179,7 +179,7 @@ export function edgeDisplayLabel(e: FkEdge): string {
 export function schemaGraphFallback(load: SchemaGraphLoad | undefined, schema: string): string {
   if (!load) return "Schema graph unavailable.";
   if (load.kind === "error") return load.message;
-  if (load.kind === "too-large") return `Schema too large for the ERD (${load.tableCount} tables, limit ${ERD_MAX_TABLES}) \u2014 use the Neighborhood view per table.`;
-  if (load.graph.tables.length) return "Schema graph could not be laid out safely.";
+  if (load.kind === "too-large") return `Schema has ${load.tableCount} tables, over the ${ERD_MAX_TABLES} the diagram supports. Use the Neighborhood view per table.`;
+  if (load.graph.tables.length) return "Schema graph could not be laid out.";
   return `No tables found in schema \u201c${graphDisplayText(schema)}\u201d.`;
 }

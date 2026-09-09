@@ -54,14 +54,14 @@ export function HistoryPanel(props: {
             </button>
           }
         >
-          <button class="ghost hist-confirm" onClick={() => { props.onClear(); setConfirmClear(false); }}>Clear all?</button>
+          <button class="ghost hist-confirm" onClick={() => { props.onClear(); setConfirmClear(false); }}>Clear all</button>
           <button class="icon" onClick={() => setConfirmClear(false)}><Icon name="close" /></button>
         </Show>
         <button class="icon" title="Close" onClick={props.onClose}><Icon name="close" /></button>
       </div>
       <input class="hist-search" type="text" placeholder="Search history…" value={q()} onInput={(e) => setQ(e.currentTarget.value)} />
       <div class="hist-list">
-        <Show when={filtered().length} fallback={<div class="hist-empty">{props.entries().length ? "no matches" : "no queries yet"}</div>}>
+        <Show when={filtered().length} fallback={<div class="hist-empty">{props.entries().length ? "No matches" : "No queries yet"}</div>}>
           <For each={filtered()}>
             {(e) => (
               <div class="hist-entry" classList={{ open: openId() === e.id }}>

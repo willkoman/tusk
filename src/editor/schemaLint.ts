@@ -134,7 +134,7 @@ export function schemaDiagnostics(
       if (add({
         from: colStart,
         to: colStart + col.length,
-        message: `no column "${col}" on ${t.name}${sugg ? ` — did you mean "${sugg}"?` : ""}`,
+        message: `No column "${col}" on ${t.name}.${sugg ? ` Did you mean "${sugg}"?` : ""}`,
         suggestion: sugg ?? undefined,
       })) return diags;
     }
@@ -170,7 +170,7 @@ export function schemaDiagnostics(
       if (add({
         from: tokStart,
         to: tokStart + raw.length,
-        message: `unknown table "${name}"${sugg ? ` — did you mean "${sugg}"?` : ""}`,
+        message: `Unknown table "${name}".${sugg ? ` Did you mean "${sugg}"?` : ""}`,
         suggestion: sugg ?? undefined,
       })) return diags;
     }
@@ -195,7 +195,7 @@ export function schemaDiagnostics(
         if (add({
           from: start,
           to: start + name.length,
-          message: `unknown function "${name}"${sugg ? ` — did you mean "${sugg}"?` : ""}`,
+          message: `Unknown function "${name}".${sugg ? ` Did you mean "${sugg}"?` : ""}`,
           suggestion: sugg ?? undefined,
         })) return diags;
       }
@@ -289,7 +289,7 @@ export function schemaDiagnostics(
         if (add({
           from: base + at,
           to: base + at + tok.length,
-          message: `unknown identifier "${tok}"${sugg ? ` — did you mean "${sugg}"?` : ""}`,
+          message: `Unknown identifier "${tok}".${sugg ? ` Did you mean "${sugg}"?` : ""}`,
           suggestion: sugg ?? undefined,
         })) return diags;
       } else {
@@ -298,7 +298,7 @@ export function schemaDiagnostics(
           if (add({
             from: base + at,
             to: base + at + tok.length,
-            message: `unknown keyword "${tok}" — did you mean ${kw}?`,
+            message: `Unknown keyword "${tok}". Did you mean ${kw}?`,
             suggestion: kw,
           })) return diags;
         }

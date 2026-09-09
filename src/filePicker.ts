@@ -90,7 +90,7 @@ export async function pickSavePath(options: PickerOptions): Promise<PickedPath> 
 
 /** Message for a caller that has a status line rather than a confirmation dialog. */
 export const UNVERIFIED_PICKER =
-  "The file picker did not open, so nothing was chosen. Try again, or check whether another window is blocking it.";
+  "The file picker did not open. Try again, or close any window blocking it.";
 
 /** Native "open" picker, guarded (single selection; file or, with `directory`, folder). */
 export async function pickOpenPath(options: PickerOptions): Promise<PickedPath> {

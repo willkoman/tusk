@@ -521,7 +521,7 @@ export function ResultGrid(props: ResultGridProps) {
         // Row-selection only — a stray Delete on a cell selection must not mark rows.
         if (props.editable() && s.mode === "rows") {
           const count = Math.max(0, rect().r1 - rect().r0 + 1);
-          if (count > 100_000) props.onStatus("select at most 100,000 rows per edit", props.activeTabId(), props.resultGeneration());
+          if (count > 100_000) props.onStatus("Select at most 100,000 rows per edit", props.activeTabId(), props.resultGeneration());
           else props.onMarkDelete(selectedRowIndices().map(rowRef));
           e.preventDefault();
         }
@@ -544,7 +544,7 @@ export function ResultGrid(props: ResultGridProps) {
     try {
       const text = await clipRead();
       if (props.activeTabId() !== tabId || resultKey() !== key || props.pending() !== pending) {
-        props.onStatus("paste cancelled because the result changed", tabId, generation);
+        props.onStatus("Paste cancelled. The result was replaced.", tabId, generation);
         return;
       }
       if (text == null || text === "") return;
@@ -554,7 +554,7 @@ export function ResultGrid(props: ResultGridProps) {
       // loaded rows; otherwise anchor at the focused cell captured before clipboard I/O.
       props.onPaste(anchor, selected.mode === "none" ? 0 : anchorCol, dc, table);
     } catch (e) {
-      props.onStatus(`paste rejected: ${e instanceof Error ? e.message : String(e)}`, tabId, generation);
+      props.onStatus(`Paste rejected: ${e instanceof Error ? e.message : String(e)}`, tabId, generation);
     }
   }
 
@@ -626,7 +626,7 @@ export function ResultGrid(props: ResultGridProps) {
     const b = selectionBounds();
     const cells = (b.r1 - b.r0 + 1) * b.cols.length;
     if (cells > MAX_COPY_CELLS) {
-      props.onStatus(`selection too large to copy (${cells.toLocaleString()} cells) — use Export… instead`, tabId, generation);
+      props.onStatus(`Selection too large to copy (${cells.toLocaleString()} cells). Use Export… instead.`, tabId, generation);
       return;
     }
     let chars = props.copyHeaders() ? b.cols.reduce((n, oi) => n + (props.columns()[oi]?.length ?? 0), 0) : 0;
@@ -637,7 +637,7 @@ export function ResultGrid(props: ResultGridProps) {
       }
     }
     if (chars > MAX_COPY_CHARS) {
-      props.onStatus(`selection too large to copy (${chars.toLocaleString()}+ characters) — use Export… instead`, tabId, generation);
+      props.onStatus(`Selection too large to copy (${chars.toLocaleString()}+ characters). Use Export… instead.`, tabId, generation);
       return;
     }
     const d = selectionDataset(b);
@@ -645,23 +645,23 @@ export function ResultGrid(props: ResultGridProps) {
     try {
       const text = formatForCopy(d, fmt, h);
       const ok = await clipWrite(text);
-      props.onStatus(ok ? `copied ${d.rows.length}×${d.columns.length}` : "clipboard unavailable", tabId, generation);
+      props.onStatus(ok ? `Copied ${d.rows.length}×${d.columns.length}` : "Clipboard unavailable", tabId, generation);
     } catch (e) {
-      props.onStatus(`copy rejected: ${e instanceof Error ? e.message : String(e)}`, tabId, generation);
+      props.onStatus(`Copy rejected: ${e instanceof Error ? e.message : String(e)}`, tabId, generation);
     }
   }
   async function copyText(t: string, msg: string) {
     const tabId = props.activeTabId();
     const generation = props.resultGeneration();
     if (t.length > MAX_COPY_CHARS) {
-      props.onStatus(`value too large to copy (${t.length.toLocaleString()} characters) — use Export… instead`, tabId, generation);
+      props.onStatus(`Value too large to copy (${t.length.toLocaleString()} characters). Use Export… instead.`, tabId, generation);
       return;
     }
     try {
       const ok = await clipWrite(t);
-      props.onStatus(ok ? msg : "clipboard unavailable", tabId, generation);
+      props.onStatus(ok ? msg : "Clipboard unavailable", tabId, generation);
     } catch (e) {
-      props.onStatus(`copy rejected: ${e instanceof Error ? e.message : String(e)}`, tabId, generation);
+      props.onStatus(`Copy rejected: ${e instanceof Error ? e.message : String(e)}`, tabId, generation);
     }
   }
   const columnDataset = (oi: number): Dataset => ({
@@ -670,16 +670,16 @@ export function ResultGrid(props: ResultGridProps) {
   });
   function copyColumn(oi: number) {
     if (nRows() > MAX_COPY_CELLS) {
-      props.onStatus(`column too large to copy (${nRows().toLocaleString()} rows) — use Export… instead`, props.activeTabId(), props.resultGeneration());
+      props.onStatus(`Column too large to copy (${nRows().toLocaleString()} rows). Use Export… instead.`, props.activeTabId(), props.resultGeneration());
       return;
     }
     let chars = props.copyHeaders() ? props.columns()[oi]?.length ?? 0 : 0;
     for (let r = 0; r < nRows() && chars <= MAX_COPY_CHARS; r++) chars += copyVal(r, oi)?.length ?? 0;
     if (chars > MAX_COPY_CHARS) {
-      props.onStatus(`column too large to copy (${chars.toLocaleString()}+ characters) — use Export… instead`, props.activeTabId(), props.resultGeneration());
+      props.onStatus(`Column too large to copy (${chars.toLocaleString()}+ characters). Use Export… instead.`, props.activeTabId(), props.resultGeneration());
       return;
     }
-    void copyText(formatForCopy(columnDataset(oi), "tsv", props.copyHeaders()), "copied column");
+    void copyText(formatForCopy(columnDataset(oi), "tsv", props.copyHeaders()), "Copied column");
   }
 
   function bindMenuItems(items: MenuItem[]): MenuItem[] {
@@ -715,7 +715,7 @@ export function ResultGrid(props: ResultGridProps) {
       const allDel = loadedSel.length > 0 && loadedSel.every(isDeleted);
       const colOk = props.canEditCol(oi) && !isDeleted(r);
       editItems.push(
-        { label: "Edit cell", icon: "edit", disabled: !colOk, title: colOk ? undefined : "column doesn't belong to the table", onClick: () => beginEdit(r, dc) },
+        { label: "Edit cell", icon: "edit", disabled: !colOk, title: colOk ? undefined : "Column is not part of the table", onClick: () => beginEdit(r, dc) },
         { label: "Set NULL", icon: "slash", disabled: !colOk, onClick: () => props.onEditCell(clickedRef, oi, null) },
       );
       if (isDirty(r, oi)) editItems.push({ label: "Revert cell", icon: "eraser", onClick: () => props.onEditCell(clickedRef, oi, undefined) });
@@ -742,7 +742,7 @@ export function ResultGrid(props: ResultGridProps) {
       { label: "Copy as JSON", icon: "copy", onClick: () => void copySelection("json") },
       { label: "Copy as Markdown", icon: "copy", onClick: () => void copySelection("md") },
       { sep: true },
-      { label: val === null ? "Copy value (NULL→empty)" : "Copy cell value", icon: "copy", onClick: () => void copyText(copiedVal ?? "", "copied value") },
+      { label: val === null ? "Copy value (empty for NULL)" : "Copy cell value", icon: "copy", onClick: () => void copyText(copiedVal ?? "", "Copied value") },
       { label: "Copy column", icon: "copy", onClick: () => copyColumn(oi) },
       { label: "View value…", icon: "search", onClick: () => props.onViewValue(name, val) },
     ]));
@@ -988,9 +988,9 @@ export function ResultGrid(props: ResultGridProps) {
                       class="rg-filter-input"
                       classList={{ "has-rules": hidden() > 0 }}
                       style={{ left: `${offsets()[k]}px`, width: `${colWidth(oi()) - 6}px` }}
-                      placeholder={hidden() > 0 ? `${hidden()} rule${hidden() === 1 ? "" : "s"} · Edit…` : "filter…"}
+                      placeholder={hidden() > 0 ? `${hidden()} rule${hidden() === 1 ? "" : "s"}` : "Filter…"}
                       title={hidden() > 0
-                        ? `${hidden()} filter rule${hidden() === 1 ? "" : "s"} on this column come from the filter builder — open it to see or change them`
+                        ? `${hidden()} filter rule${hidden() === 1 ? "" : "s"} from the filter builder. Open Edit… to change them.`
                         : undefined}
                       value={filterFor(oi())}
                       disabled={!props.canFilter()}
@@ -1059,7 +1059,7 @@ export function ResultGrid(props: ResultGridProps) {
                         onContextMenu={(e) => onCellContext(e, r, k, oi(), val())}
                       >
                         {(() => {
-                          if (isInsUntouched(r, oi())) return <span class="rg-defaultval" title="column default" />;
+                          if (isInsUntouched(r, oi())) return <span class="rg-defaultval" title="Column default" />;
                           const v = val();
                           if (v === null)
                             return <span class="null">{props.gridStyle().nullStyle === "null" ? "NULL" : props.gridStyle().nullStyle === "dash" ? "—" : ""}</span>;

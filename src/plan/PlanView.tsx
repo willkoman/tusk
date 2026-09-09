@@ -149,7 +149,7 @@ export function PlanView(props: {
                 <Show when={t().executionMs !== undefined}><span class="plan-stat">execution {fmtMs(t().executionMs!)}</span></Show>
                 <Show when={!t().hasActual}><span class="plan-stat dim">estimates only</span></Show>
                 <span class="spacer" />
-                <span class="plan-stat dim">double-click background to fit · raw output under Grid</span>
+                <span class="plan-stat dim">Raw plan output is under Grid</span>
               </div>
               <div class="plan-body">
                 <PanZoomCanvas bbox={layout()!.bbox} fitKey={`${props.fitKey()}:${props.prefs().planOrientation}`}>

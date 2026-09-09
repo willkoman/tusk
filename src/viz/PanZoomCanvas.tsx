@@ -64,7 +64,7 @@ export function PanZoomCanvas(props: {
         {props.children}
       </div>
       <div class="viz-toolbar" onPointerDown={(e) => e.stopPropagation()}>
-        <button class="icon" title="Fit (double-click background)" onClick={doFit}>⊡</button>
+        <button class="icon" title="Fit to view (double-click background)" onClick={doFit}>⊡</button>
         <button class="icon" title="Zoom in" onClick={() => viewport && pz.zoomBy(1.25, viewport.clientWidth / 2, viewport.clientHeight / 2)}>＋</button>
         <button class="icon" title="Zoom out" onClick={() => viewport && pz.zoomBy(0.8, viewport.clientWidth / 2, viewport.clientHeight / 2)}>－</button>
       </div>
