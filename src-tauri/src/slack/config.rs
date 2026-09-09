@@ -153,6 +153,17 @@ impl SlackConfig {
     }
 }
 
+/// Turn autostart off. The bot answers against exactly ONE connection; when that
+/// connection is closed the bot stops, and leaving `enabled: true` on disk means the
+/// next launch silently brings it back bound to whichever session happens to open
+/// first — a different database than the one the user picked. Returns whether the
+/// stored value actually changed.
+pub fn disarm_autostart(cfg: &mut SlackConfig) -> bool {
+    let was = cfg.enabled;
+    cfg.enabled = false;
+    was
+}
+
 fn store_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, AppError> {
     use tauri::Manager;
     let dir = app
@@ -331,5 +342,20 @@ mod tests {
     fn missing_sample_setting_migrates_to_off() {
         let cfg: SlackConfig = serde_json::from_str("{}").unwrap();
         assert!(!cfg.share_samples);
+    }
+
+    /// Losing the bound connection must not leave autostart armed: the next launch
+    /// would rebind the bot to whichever connection opens first.
+    #[test]
+    fn disarming_autostart_is_idempotent_and_reports_the_change() {
+        let mut cfg = SlackConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(disarm_autostart(&mut cfg));
+        assert!(!cfg.enabled);
+        assert!(!disarm_autostart(&mut cfg));
+        assert!(!cfg.enabled);
+        assert!(cfg.validate().is_ok());
     }
 }
