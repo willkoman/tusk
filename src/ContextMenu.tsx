@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Show, createEffect, createSignal, on, onCleanup, onMount } from "solid-js";
 import { Icon, type IconName } from "./Icons";
 
 /** A leaf: the thing that runs. */
@@ -64,6 +64,24 @@ export function ContextMenu(props: {
     setOpenIdx(null);
     if (refocus) row?.focus();
   };
+
+  // Clamp the open panel after it renders — Solid reuses the same element when the
+  // pointer moves from one group to the next, so this cannot ride on the ref.
+  createEffect(
+    on(openIdx, (idx) => {
+      if (idx === null) return;
+      queueMicrotask(() => {
+        const node = subEl();
+        if (!node) return;
+        const r = node.getBoundingClientRect();
+        const parent = groupRow(idx)?.getBoundingClientRect();
+        let { x, y } = subPos();
+        if (r.right > window.innerWidth - 4 && parent) x = Math.max(4, parent.left - r.width + 3);
+        if (r.bottom > window.innerHeight - 4) y = Math.max(4, window.innerHeight - r.height - 4);
+        if (x !== subPos().x || y !== subPos().y) setSubPos({ x, y });
+      });
+    }),
+  );
 
   const onDocDown = (e: MouseEvent) => {
     if (el && !el.contains(e.target as Node)) props.onClose();
@@ -207,19 +225,7 @@ export function ContextMenu(props: {
         {(group) => (
           <div
             class="ctx-menu ctx-sub"
-            ref={(node) => {
-              sub = node;
-              // Flip left / lift up rather than run off the edge.
-              queueMicrotask(() => {
-                if (!node?.isConnected) return;
-                const r = node.getBoundingClientRect();
-                const parent = groupRow(openIdx())?.getBoundingClientRect();
-                let { x, y } = subPos();
-                if (r.right > window.innerWidth - 4 && parent) x = Math.max(4, parent.left - r.width + 3);
-                if (r.bottom > window.innerHeight - 4) y = Math.max(4, window.innerHeight - r.height - 4);
-                if (x !== subPos().x || y !== subPos().y) setSubPos({ x, y });
-              });
-            }}
+            ref={(node) => (sub = node)}
             role="menu"
             aria-label={group().label}
             style={{ left: `${subPos().x}px`, top: `${subPos().y}px` }}
