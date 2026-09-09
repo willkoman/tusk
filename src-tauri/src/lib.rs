@@ -2682,18 +2682,17 @@ pub fn run() {
             if let Ok(dir) = tauri::Manager::path(app).app_config_dir() {
                 ssh::set_trust_dir(dir);
             }
-            // Auto-start the Slack bot when enabled + tokens saved. Failures are
-            // non-fatal: the settings pane shows the status and can retry.
+            // Arm the Slack bot when autostart is enabled. It is NOT started here: the
+            // bot answers against exactly one connection and none is open this early, so
+            // starting now could only produce an unbound bot that later latched onto
+            // whichever session appeared first. `arm_autostart` publishes the waiting
+            // status; the workbench starts the bot when the BOUND saved connection opens.
             let handle = app.handle().clone();
             if slack::config::load(&handle)
                 .map(|c| c.enabled)
                 .unwrap_or(false)
             {
-                tauri::async_runtime::spawn(async move {
-                    if let Err(e) = slack::start(handle, None).await {
-                        eprintln!("[tusk-slack] autostart failed: {}", e.message);
-                    }
-                });
+                slack::arm_autostart(&handle);
             }
             Ok(())
         })

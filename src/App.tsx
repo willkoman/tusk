@@ -1867,31 +1867,49 @@ function App() {
   const slackHistoryKeys = new Map<string, string>();
   let slackStatusRevision = 0;
   /**
-   * The bot answers against exactly ONE connection. It can be running before any
-   * connection exists (autostart), in which case it is bound to the first one the
-   * workspace opens; after that the binding only changes on an explicit pick in
-   * Settings → Slack, so switching tabs never redirects Slack at another database.
+   * Slack autostart, scoped to ONE SAVED connection. The bot answers against a single
+   * connection, so it used to be armed as a bare `enabled` flag and bound to whichever
+   * session opened first — a database chosen by nobody — and disconnecting that session
+   * rewrote the user's settings to disarm it. Instead the bound profile id is persisted:
+   * the backend comes up armed-but-stopped, and the bot starts only when THAT saved
+   * connection opens. An ad-hoc connection has no profile, so it can be bound by hand
+   * but never autostarted.
    */
-  const bindSlackIfUnbound = (connectionId: string) => {
-    const status = slackStatus();
-    if (!status.running || status.connectionId) return;
-    void invoke("slack_set_connection", { connectionId }).catch(() => {});
-  };
-  /**
-   * Autostart and the first connect race: the bot can come up unbound before any
-   * connection exists, and a connect can land before the first `slack:status` event
-   * arrives. Watching both means whichever happens second does the binding, instead
-   * of the bot staying unbound until the user opens a second connection or picks one
-   * by hand.
-   */
-  createEffect(() => {
-    const status = slackStatus();
-    const id = activeConnectionId();
-    if (status.running && !status.connectionId && id) bindSlackIfUnbound(id);
+  const [slackAutostart, setSlackAutostart] = createSignal<{ enabled: boolean; profileId: string | null }>({
+    enabled: false,
+    profileId: null,
   });
+  async function refreshSlackAutostart() {
+    try {
+      const info = await invoke<{ config: { enabled?: boolean; boundProfileId?: string | null } }>("slack_load_config");
+      setSlackAutostart({
+        enabled: info.config?.enabled === true,
+        profileId: info.config?.boundProfileId || null,
+      });
+    } catch {
+      // Settings → Slack surfaces config failures; autostart just stays off here.
+    }
+  }
+  /** Start (or bind) the Slack bot when the connection it is armed for opens. */
+  async function slackAutostartFor(connectionId: string, profileId: string | null) {
+    const auto = slackAutostart();
+    if (!auto.enabled || !auto.profileId || !profileId || auto.profileId !== profileId) return;
+    const status = slackStatus();
+    if (status.running) {
+      if (!status.connectionId) await invoke("slack_set_connection", { connectionId }).catch(() => {});
+      return;
+    }
+    // Failures publish their reason through `slack:status`; the badge and Settings show it.
+    await invoke("slack_start", { connectionId }).catch(() => {});
+  }
   /** Connections offered as the Slack bot's target (Settings → Slack picker). */
   const slackConnectionOptions = () =>
-    connections().map((e) => ({ id: e.conn.id, label: labelOf(e.conn.id), mascot: driverMascot(kindOf(e.conn.id)) }));
+    connections().map((e) => ({
+      id: e.conn.id,
+      label: labelOf(e.conn.id),
+      mascot: driverMascot(kindOf(e.conn.id)),
+      profileId: e.conn.profileId,
+    }));
 
   const preventNativeContextMenu = (e: Event) => e.preventDefault();
   const showPersistenceFailure = (failure: TabsPersistenceFailure) => {
@@ -2047,6 +2065,9 @@ function App() {
     // the Slack event bridge (a rejected listen() would otherwise abort onMount and
     // leave the connect screen empty).
     await loadProfiles();
+    // Before any auto-connect: `afterConnect` consults this to decide whether the
+    // opening connection is the one Slack autostart is armed for.
+    await refreshSlackAutostart();
     // Offer (never perform) a session restore; a default-connect profile still wins.
     const remembered = (savedLayout.openConnections ?? []).filter((id) => profiles().some((p) => p.id === id));
     const def = profiles().find((p) => p.default_connect);
@@ -2441,9 +2462,10 @@ function App() {
     } finally {
       restoring = false;
     }
-    // The backend's "active connection" is what a Slack bot binds to by default.
     void invoke("set_active_connection", { connectionId: connected.id }).catch(() => {});
-    bindSlackIfUnbound(connected.id);
+    // Slack starts here, not at launch: it is armed for one saved connection and this is
+    // the moment that connection exists. Never "whichever connection opened first".
+    void slackAutostartFor(connected.id, meta.profileId);
 
     try {
       const status = await invoke<TransactionStatus>("transaction_status", { connectionId: r.connection_id });
@@ -6135,7 +6157,7 @@ function App() {
           update={updatePrefs}
           // Skills live on disk and are only mutated from Settings → AI, so a reload on
           // close is enough to keep `aiContext().skills` fresh without polling.
-          onClose={() => { setSettingsOpen(null); void refreshSkills(); }}
+          onClose={() => { setSettingsOpen(null); void refreshSkills(); void refreshSlackAutostart(); }}
           initialTab={settingsOpen()!}
           connected={!!conn()}
           database={tree()?.database ?? ""}

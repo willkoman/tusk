@@ -178,39 +178,61 @@ pub fn on_connection_closed(app: &AppHandle, connection_id: &str) {
     // events (an empty "disconnected" followed by the real one) let a listener that
     // coalesces show the blank one and hide why the bot stopped.
     teardown(app);
-    // Disarm autostart too. Left `enabled: true` on disk, the bot came back on the next
-    // launch bound to whichever connection opened first — a different database than the
-    // one it was answering against, chosen by nobody. Re-enable it (and pick a target)
-    // in Settings → Slack. Best-effort: a config write failure must not swallow the
-    // status the workbench needs to show.
-    let disarmed = config::load(app)
-        .ok()
-        .filter(|cfg| cfg.enabled)
-        .is_some_and(|mut cfg| {
-            config::disarm_autostart(&mut cfg);
-            config::save(app, &cfg).is_ok()
-        });
-    let reason = if disarmed {
-        "Slack bot stopped: the Tusk connection it was answering against was disconnected. Autostart is now off — re-enable it and pick a connection in Settings → Slack."
-    } else {
-        "Slack bot stopped: the Tusk connection it was answering against was disconnected."
+    // Autostart is NOT disarmed here. It used to be: with `enabled: true` left on disk the
+    // bot came back bound to whichever connection opened first, a database chosen by
+    // nobody. But rewriting the user's settings because a session closed is its own
+    // surprise — merely opening a dev build silently disabled a working bot. Autostart is
+    // scoped to one SAVED connection now (`boundProfileId`), so leaving it armed is safe:
+    // the bot returns only when that same saved connection is open again.
+    let reason = match autostart_label(app) {
+        Some(name) => format!(
+            "Slack bot stopped: the Tusk connection it was answering against was disconnected. It starts again when “{name}” is open."
+        ),
+        None => "Slack bot stopped: the Tusk connection it was answering against was disconnected. It answers against one saved connection — pick one in Settings → Slack so it can start again by itself.".to_string(),
     };
-    runtime.set_status("disconnected", Some(reason.to_string()));
+    runtime.set_status("disconnected", Some(reason));
+    let _ = app.emit("slack:status", runtime.status_info());
+}
+
+/// The saved connection autostart is armed for, as a display name. `None` when autostart
+/// is off, no profile is bound, or the bound profile has since been deleted.
+pub fn autostart_label(app: &AppHandle) -> Option<String> {
+    let cfg = config::load(app).ok()?;
+    let target = config::autostart_target(&cfg)?;
+    crate::profiles::load_all(app)
+        .ok()?
+        .into_iter()
+        .find(|p| p.id == target)
+        .map(|p| p.name)
+}
+
+/// Publish the "armed but waiting" status at launch. Autostart deliberately does NOT
+/// open the socket here: the bot answers against exactly one connection, none is open
+/// this early, and coming up unbound is how it used to end up pointed at whichever
+/// session appeared first. The workbench starts it when the bound saved connection opens.
+pub fn arm_autostart(app: &AppHandle) {
+    let runtime = app.state::<SlackRuntime>();
+    let reason = match autostart_label(app) {
+        Some(name) => format!("Slack bot is armed — waiting for connection “{name}” to open."),
+        None => "Slack autostart is on but no saved connection is bound to it — pick one in Settings → Slack.".to_string(),
+    };
+    runtime.set_status("disconnected", Some(reason));
     let _ = app.emit("slack:status", runtime.status_info());
 }
 
 /// Start the bot: validate tokens, spawn the socket loop + event consumer.
 /// Idempotent — a running bot is stopped first. `connection_id` pins the ONE Tusk
-/// connection it answers against (None = whichever the workbench has focused).
+/// connection it answers against; `None` starts it UNBOUND (it answers nothing until a
+/// connection is picked in Settings → Slack). It never falls back to "the active
+/// connection": the bot must not follow the workbench around the databases it opens.
 pub async fn start(app: AppHandle, connection_id: Option<String>) -> Result<(), AppError> {
     stop(&app); // drop any previous session
 
     let runtime = app.state::<SlackRuntime>();
     // Resolve the binding BEFORE any status is published: an explicit pick that is not
-    // open is a hard error, while "no pick and nothing connected yet" is the ordinary
-    // autostart case — the bot starts UNBOUND and the workbench binds it as soon as it
-    // opens a connection. Questions asked before that are refused with a clear reason
-    // rather than silently answered from whichever session happens to exist.
+    // open is a hard error, while no pick starts the bot UNBOUND. Questions asked before
+    // a connection is bound are refused with a clear reason rather than silently answered
+    // from whichever session happens to exist.
     let bound = match connection_id {
         Some(requested) => match require_open(&app, &requested) {
             Ok(id) => Some(id),
@@ -220,11 +242,7 @@ pub async fn start(app: AppHandle, connection_id: Option<String>) -> Result<(), 
                 return Err(e);
             }
         },
-        None => app
-            .state::<crate::AppState>()
-            .active()
-            .ok()
-            .map(|(id, _)| id),
+        None => None,
     };
     let cancel = CancellationToken::new();
     let my_gen = runtime.next_generation();

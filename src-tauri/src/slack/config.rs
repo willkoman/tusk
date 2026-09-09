@@ -19,6 +19,13 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 pub struct SlackConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// The SAVED CONNECTION (profile id) the bot answers against. Autostart waits for
+    /// exactly this one: the bot answers against a single connection, so coming up bound
+    /// to whichever session happened to open first would point it at a database nobody
+    /// chose. Empty (or a profile that no longer exists) means autostart has no target
+    /// and the bot stays stopped until one is picked in Settings → Slack.
+    #[serde(default)]
+    pub bound_profile_id: Option<String>,
     /// Channel IDs the bot answers in. Empty = any channel the bot is a member of.
     #[serde(default)]
     pub allowlist_channels: Vec<String>,
@@ -132,6 +139,15 @@ impl SlackConfig {
                 "Slack allowlists may contain at most 100 IDs of 100 characters each",
             ));
         }
+        if self
+            .bound_profile_id
+            .as_ref()
+            .is_some_and(|id| id.len() > 200)
+        {
+            return Err(AppError::new(
+                "Slack boundProfileId exceeds the 200-character limit",
+            ));
+        }
         if self.ai_provider.len() > 100
             || self.ai_wire.len() > 32
             || self.ai_model.len() > 500
@@ -153,15 +169,19 @@ impl SlackConfig {
     }
 }
 
-/// Turn autostart off. The bot answers against exactly ONE connection; when that
-/// connection is closed the bot stops, and leaving `enabled: true` on disk means the
-/// next launch silently brings it back bound to whichever session happens to open
-/// first — a different database than the one the user picked. Returns whether the
-/// stored value actually changed.
-pub fn disarm_autostart(cfg: &mut SlackConfig) -> bool {
-    let was = cfg.enabled;
-    cfg.enabled = false;
-    was
+/// What autostart is waiting for: the bound profile id, when autostart is on and one is
+/// recorded. `None` means "do not bring the bot up by itself" — either autostart is off,
+/// or the bot is bound to an ad-hoc (unsaved) connection that cannot be identified across
+/// launches. Losing the connection no longer turns autostart OFF on disk: the arming
+/// stays, and it is scoped to one saved connection instead of "whoever opens first".
+pub fn autostart_target(cfg: &SlackConfig) -> Option<&str> {
+    if !cfg.enabled {
+        return None;
+    }
+    cfg.bound_profile_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
 }
 
 fn store_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, AppError> {
@@ -344,18 +364,54 @@ mod tests {
         assert!(!cfg.share_samples);
     }
 
-    /// Losing the bound connection must not leave autostart armed: the next launch
-    /// would rebind the bot to whichever connection opens first.
+    /// Autostart is scoped to ONE saved connection. Without a bound profile it must not
+    /// fire at all — the old behaviour (bind to whichever connection opens first) pointed
+    /// the bot at a database nobody chose.
     #[test]
-    fn disarming_autostart_is_idempotent_and_reports_the_change() {
-        let mut cfg = SlackConfig {
+    fn autostart_only_targets_a_bound_saved_connection() {
+        let armed = SlackConfig {
             enabled: true,
+            bound_profile_id: Some("prof-1".into()),
             ..Default::default()
         };
-        assert!(disarm_autostart(&mut cfg));
-        assert!(!cfg.enabled);
-        assert!(!disarm_autostart(&mut cfg));
-        assert!(!cfg.enabled);
-        assert!(cfg.validate().is_ok());
+        assert_eq!(autostart_target(&armed), Some("prof-1"));
+        assert!(armed.validate().is_ok());
+
+        // Off, unbound, or bound to an ad-hoc connection: nothing to start.
+        assert_eq!(
+            autostart_target(&SlackConfig {
+                enabled: false,
+                ..armed.clone()
+            }),
+            None
+        );
+        assert_eq!(
+            autostart_target(&SlackConfig {
+                enabled: true,
+                bound_profile_id: None,
+                ..Default::default()
+            }),
+            None
+        );
+        assert_eq!(
+            autostart_target(&SlackConfig {
+                enabled: true,
+                bound_profile_id: Some("   ".into()),
+                ..Default::default()
+            }),
+            None
+        );
+
+        // A config written before this field existed reads as unbound, not as "any".
+        let legacy: SlackConfig = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert!(legacy.enabled);
+        assert_eq!(autostart_target(&legacy), None);
+
+        assert!(SlackConfig {
+            bound_profile_id: Some("x".repeat(201)),
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
     }
 }

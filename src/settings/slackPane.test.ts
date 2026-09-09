@@ -42,4 +42,21 @@ describe("Slack settings persistence helpers", () => {
     expect(pane.DEFAULT_CONFIG.shareSamples).toBe(false);
     expect(pane.DEFAULT_CONFIG.maxRowsFile).toBeLessThanOrEqual(100000);
   });
+
+  // Autostart binds to ONE saved connection. A config that predates the field must read
+  // as unbound rather than "any connection" — the old behaviour started the bot against
+  // whichever session opened first, and disconnecting that session disarmed autostart on
+  // disk behind the user's back.
+  it("treats a missing or blank bound profile as unbound, never as 'any connection'", () => {
+    expect(pane.DEFAULT_CONFIG.boundProfileId).toBeNull();
+    expect(pane.normalizeSlackConfig({ enabled: true }).boundProfileId).toBeNull();
+    expect(pane.normalizeSlackConfig({ enabled: true, boundProfileId: "   " }).boundProfileId).toBeNull();
+    expect(pane.normalizeSlackConfig({ enabled: true, boundProfileId: "prof-1" }).boundProfileId).toBe("prof-1");
+    // The binding is part of the save/read-back verification, so re-pointing the bot
+    // cannot silently fail to persist.
+    const saved: SlackConfig = { ...pane.DEFAULT_CONFIG, enabled: true, boundProfileId: "prof-1" };
+    expect(pane.slackConfigMatches(saved, { ...saved })).toBe(true);
+    expect(pane.slackConfigMatches(saved, { ...saved, boundProfileId: "prof-2" })).toBe(false);
+    expect(pane.slackConfigMatches(saved, { ...saved, boundProfileId: null })).toBe(false);
+  });
 });

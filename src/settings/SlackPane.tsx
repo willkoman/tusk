@@ -15,6 +15,13 @@ import { KeyedSerialQueue } from "../asyncQueue";
 
 export type SlackConfig = {
   enabled: boolean;
+  /**
+   * The SAVED connection (profile id) the bot answers against. Autostart waits for this
+   * one and no other: the bot answers against a single connection, so coming up bound to
+   * whichever session opened first pointed it at a database nobody chose. Null means the
+   * bot is bound to an ad-hoc connection (or nothing yet) and cannot start by itself.
+   */
+  boundProfileId: string | null;
   allowlistChannels: string[];
   allowlistUsers: string[];
   maxRowsInline: number;
@@ -41,11 +48,14 @@ export type SlackStatus = {
   connectionId?: string | null;
 };
 
-/** One open Tusk connection, as offered in the bot's connection picker. */
-export type SlackConnectionOption = { id: string; label: string; mascot: string };
+/** One open Tusk connection, as offered in the bot's connection picker. `profileId` is
+ *  null for an ad-hoc connection — the bot can be pointed at one, but autostart cannot
+ *  wait for something that was never saved. */
+export type SlackConnectionOption = { id: string; label: string; mascot: string; profileId: string | null };
 
 export const DEFAULT_CONFIG: SlackConfig = {
   enabled: false,
+  boundProfileId: null,
   allowlistChannels: [],
   allowlistUsers: [],
   maxRowsInline: 20,
@@ -74,6 +84,7 @@ export const normalizeSlackConfig = (raw?: Partial<SlackConfig> | null): SlackCo
   allowlistChannels: Array.isArray(raw?.allowlistChannels) ? raw.allowlistChannels : [],
   allowlistUsers: Array.isArray(raw?.allowlistUsers) ? raw.allowlistUsers : [],
   shareSamples: raw?.shareSamples === true,
+  boundProfileId: typeof raw?.boundProfileId === "string" && raw.boundProfileId.trim() ? raw.boundProfileId : null,
   aiMaxTokens: normalizeSlackMaxTokens(raw?.aiMaxTokens ?? DEFAULT_CONFIG.aiMaxTokens),
 });
 
@@ -124,6 +135,9 @@ export function SlackPane(props: {
   const [status, setStatus] = createSignal<SlackStatus>({ running: false, state: "disconnected", error: null, connectionId: null });
   const openConnections = () => props.connections?.() ?? [];
   const boundConnection = () => openConnections().find((c) => c.id === status().connectionId) ?? null;
+  /** The saved connection behind an open connection id — what autostart is armed for. */
+  const profileOf = (connectionId: string | null | undefined) =>
+    (connectionId && openConnections().find((c) => c.id === connectionId)?.profileId) || null;
   const [note, setNote] = createSignal("");
   const [busy, setBusy] = createSignal(false);
   const [maxTokensInput, setMaxTokensInput] = createSignal(String(DEFAULT_CONFIG.aiMaxTokens));
@@ -282,7 +296,11 @@ export function SlackPane(props: {
         // Persist enabled:FALSE first, then start; only persist enabled:true after a
         // clean start. So a failed start never leaves enabled:true on disk (which
         // would autostart the bot on the next launch despite the toggle showing off).
-        if (!(await save({ enabled: false }))) {
+        const target = props.activeConnectionId?.() ?? null;
+        // Autostart is armed for the SAVED connection behind the binding, so a later
+        // launch waits for that one instead of grabbing whichever opens first.
+        const boundProfileId = profileOf(target);
+        if (!(await save({ enabled: false, boundProfileId }))) {
           patch({ enabled: false });
           return;
         }
@@ -290,8 +308,8 @@ export function SlackPane(props: {
         // Bind the bot to the connection the workbench has focused. The backend
         // treats this as the ONE connection it answers against until it is
         // repointed here; switching tabs later never redirects it.
-        await invoke("slack_start", { connectionId: props.activeConnectionId?.() ?? null });
-        if (!(await save({ enabled: true }))) {
+        await invoke("slack_start", { connectionId: target });
+        if (!(await save({ enabled: true, boundProfileId }))) {
           await disableAfterRestartFailure("Bot started, but enabling could not be persisted. Bot stopped and remains disabled.");
           return;
         }
@@ -393,7 +411,16 @@ export function SlackPane(props: {
     }
     if (error) return { cls: "err", title: "Bot off", sub: error };
     if (!tokensReady()) return { cls: "off", title: "Bot off", sub: "Add both Slack app tokens below, then switch it on." };
-    if (cfg().enabled) return { cls: "off", title: "Bot off", sub: "Starts with Tusk on the next launch." };
+    if (cfg().enabled)
+      return {
+        cls: "off",
+        title: "Bot off",
+        // Autostart is scoped to one saved connection, so say which — "starts on the
+        // next launch" was a promise the bot could only keep by binding to anything.
+        sub: cfg().boundProfileId
+          ? "Starts when its saved connection is open."
+          : "Autostart is on, but no saved connection is bound — it can only be started by hand.",
+      };
     return { cls: "off", title: "Bot off", sub: "Switch on to start answering questions in Slack." };
   });
 
@@ -451,9 +478,15 @@ export function SlackPane(props: {
                 if (!id) return;
                 setBusy(true);
                 setNote("");
+                const boundProfileId = profileOf(id);
                 void slackIo
                   .run("io", () => invoke("slack_set_connection", { connectionId: id }))
-                  .then(() => setNote("Bot repointed — it applies from the next question."))
+                  // Repointing also re-arms autostart at the new target, so the next
+                  // launch waits for the connection the bot is actually answering on.
+                  .then(() => save({ boundProfileId }, false))
+                  .then(() => setNote(boundProfileId
+                    ? "Bot repointed — it applies from the next question."
+                    : "Bot repointed — it applies from the next question. This connection isn't saved, so the bot can't start by itself next launch."))
                   .catch((err) => setNote(`❌ ${errMsg(err)}`))
                   .finally(() => setBusy(false));
               }}
