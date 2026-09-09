@@ -289,7 +289,12 @@ function ConditionRow(props: {
     <div class="filter-row">
       <select
         class="filter-col"
-        ref={props.selectRef}
+        // A CALLBACK ref, never `ref={props.selectRef}`: Solid compiles a non-literal
+        // ref to "call it if it is a function, otherwise ASSIGN el to it", and
+        // `selectRef` is only passed for the very first row — so every other row (a
+        // second condition, anything inside a group) assigned to the getter-only props
+        // proxy and threw, taking the whole app to the crash screen.
+        ref={(el) => props.selectRef?.(el)}
         value={props.cond.column}
         onChange={(e) => onColumn(e.currentTarget.value)}
         aria-label="Column"

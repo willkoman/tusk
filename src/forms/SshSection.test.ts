@@ -1,3 +1,6 @@
+// @vitest-environment jsdom
+// The helpers under test are pure, but they live beside a Solid component whose
+// compiled module calls `delegateEvents` at import time — that needs a DOM.
 import { describe, expect, it } from "vitest";
 import {
   SSH_DEFAULT_PORT,
