@@ -1,15 +1,29 @@
-import { createSignal, createMemo, createEffect, on, onCleanup, For, Show, type Accessor } from "solid-js";
-import { type Dataset, formatForCopy } from "./formats";
+import { createSignal, createMemo, createEffect, on, onCleanup, untrack, For, Show, type Accessor } from "solid-js";
+import { type Dataset, formatForCopy, formatWithOptions } from "./formats";
+import { defaultExportOptions } from "./export";
 import { clipWrite, clipRead } from "./clipboard";
 import { type MenuItem } from "./ContextMenu";
 import { type GridView, type SortKey, type PendingEdits } from "./tabs";
 import { hiddenRuleCount, quickFilterOf, setQuickFilter, type FilterTree } from "./grid/filterModel";
 import { boolWord } from "./grid/bool";
 import { parseClipboardTable, type RowRef } from "./grid/paste";
+import { cellTitle, columnRenders, displayText, type ColumnRender } from "./grid/cellRender";
+import { findMatches, matchAtOrAfter, matchSet, stepMatch, type GridMatch } from "./grid/find";
+import { summarizeSelection, type SelectionSummary } from "./grid/summary";
 import { slotOffset, startPointerDrag, type PointerDragHandle } from "./dnd";
 
 /** A grid selection offered to Export, bound to the result it was taken from. */
 export type SelectionSource = Dataset & { tabId: string; generation: number };
+
+/** What the status bar shows about the selection (loaded rows only). */
+export type GridSelectionInfo = {
+  /** 1-based position of the focused cell. */
+  row: number;
+  col: number;
+  /** Column name under the focused cell. */
+  column: string;
+  summary: SelectionSummary;
+};
 
 // Hand-rolled, two-axis-virtualized, read-only result grid. Uses a synchronized-pane
 // layout (header + gutter are transform-translated siblings of the body scroller, NOT
@@ -18,7 +32,10 @@ export type SelectionSource = Dataset & { tabId: string; generation: number };
 
 const HEAD_H = 30;
 const FILTER_H = 30;
+const FIND_H = 30;
 const GUTTER_W = 56;
+/** Gutter width with row numbers off — still wide enough to grab a row. */
+const GUTTER_W_SLIM = 22;
 const MIN_COL_W = 48;
 const MAX_COL_W = 900;
 const ROW_OVERSCAN = 8;
@@ -77,6 +94,12 @@ export type ResultGridProps = {
   onEditCell: (ref: RowRef, origCol: number, val: string | null | undefined) => void;
   /** Per ORIGINAL column: render textual booleans as TRUE/FALSE badges. */
   isBoolCol: (origCol: number) => boolean;
+  /** Driver type of an ORIGINAL column when the source relation's detail is loaded. */
+  colType: (origCol: number) => string | undefined;
+  /** Table name "Copy as SQL INSERT" writes into ("" falls back to `exported`). */
+  sqlTable: Accessor<string>;
+  /** Focused-cell position and selection aggregates for the status bar. */
+  onSelectionInfo?: (info: GridSelectionInfo | null) => void;
   /** Boolean editor info for an ORIGINAL column (null = free-text editor). */
   boolEdit: (origCol: number) => { trueVal: string; falseVal: string; nullable: boolean } | null;
   /** Toggle delete-marks on the given rows (insert rows are removed outright). */
@@ -113,6 +136,13 @@ export function ResultGrid(props: ResultGridProps) {
 
   const headTop = () => HEAD_H + (props.view().filterRowOpen ? FILTER_H : 0);
   const rowH = () => props.gridStyle().rowH;
+  // View toggles read through memos: `props.view()` gets a new identity on every
+  // setView, so a plain accessor would re-fire the effects keyed off them.
+  const findOpen = createMemo(() => props.view().findOpen);
+  const recordOpen = createMemo(() => props.view().recordOpen);
+  /** Height reserved above the header for the find bar. */
+  const topOffset = () => (findOpen() ? FIND_H : 0);
+  const gutW = () => (props.view().rowNumbers ? GUTTER_W : GUTTER_W_SLIM);
 
   // --- display-column mapping (recomputes only on order/hidden change) ---
   const displayCols = createMemo(() => {
@@ -120,6 +150,9 @@ export function ResultGrid(props: ResultGridProps) {
     const order = props.view().order;
     return order.filter((oi) => !hidden.has(oi));
   });
+  /** First display column pinned in place (pointless with a single column). */
+  const sticky = createMemo(() => props.view().stickyFirst && displayCols().length > 1);
+  const frozenW = () => (sticky() ? colWidth(displayCols()[0]) : 0);
   const colWidth = (oi: number) => props.view().widths[oi] ?? props.gridStyle().defaultColW;
   const offsets = createMemo(() => {
     const dc = displayCols();
@@ -189,6 +222,22 @@ export function ResultGrid(props: ResultGridProps) {
     return { start, end };
   });
   const range = (a: number, b: number) => Array.from({ length: Math.max(0, b - a) }, (_, i) => a + i);
+  // Display indices to render. With a pinned first column it stays in the list
+  // even when scrolled far to the right — it is painted at the viewport edge by
+  // a translate, so virtualization is untouched and hit-testing keeps using the
+  // same content coordinates as every other column.
+  const colWindow = createMemo(() => {
+    const { start, end } = visCols();
+    const window = range(start, end);
+    return sticky() && start > 0 ? [0, ...window] : window;
+  });
+
+  // --- type-aware rendering (presentation only; copy/export read raw text) ---
+  const DEFAULT_RENDER: ColumnRender = { cls: "text", badge: "", badgeTitle: "", inferred: true };
+  const renders = createMemo(() =>
+    columnRenders(props.columns(), props.rows(), props.colType, props.isBoolCol),
+  );
+  const renderOf = (oi: number): ColumnRender => renders()[oi] ?? DEFAULT_RENDER;
 
   // --- scroll handling (rAF-coalesced) ---
   // Scroll updates ONLY the local signals (which only the grid's row/col window memos
@@ -242,6 +291,7 @@ export function ResultGrid(props: ResultGridProps) {
     on(resultKey, (key, prev) => {
       setSel(EMPTY_SEL);
       setEditing(null);
+      setFindIdx(-1); // match positions belong to the result they were found in
       const tab = key.split(":")[0];
       const switched = !prev || prev.split(":")[0] !== tab;
       if (!switched) scrollMem.set(tab, { top: 0, left: 0 }); // new query → reset
@@ -308,8 +358,12 @@ export function ResultGrid(props: ResultGridProps) {
     if (top < sc.scrollTop) sc.scrollTop = top;
     else if (top + rowH() > sc.scrollTop + sc.clientHeight) sc.scrollTop = top + rowH() - sc.clientHeight;
     const o = offsets();
+    // The pinned column sits over the left `frozenW` px of the viewport: it never
+    // needs scrolling to, and everything else must clear it.
+    if (dc === 0 && sticky()) return;
+    const fw = frozenW();
     if (dc < o.length - 1) {
-      if (o[dc] < sc.scrollLeft) sc.scrollLeft = o[dc];
+      if (o[dc] < sc.scrollLeft + fw) sc.scrollLeft = Math.max(0, o[dc] - fw);
       else if (o[dc + 1] > sc.scrollLeft + sc.clientWidth) sc.scrollLeft = o[dc + 1] - sc.clientWidth;
     }
   }
@@ -322,6 +376,9 @@ export function ResultGrid(props: ResultGridProps) {
     const sc = scroller!;
     const b = sc.getBoundingClientRect();
     const r = Math.max(0, Math.min(nRows() - 1, Math.floor((cy - b.top + sc.scrollTop) / rowH())));
+    // A pinned first column covers the left edge of the viewport, so a press there
+    // belongs to it whatever the scroll position says.
+    if (sticky() && cx - b.left < frozenW()) return { r, c: 0 };
     const c = Math.max(0, Math.min(displayCols().length - 1, colAt(cx - b.left + sc.scrollLeft)));
     return { r, c };
   }
@@ -397,6 +454,81 @@ export function ResultGrid(props: ResultGridProps) {
     setSel({ mode: "range", ar: 0, ac: 0, fr: nr - 1, fc: nc - 1 });
   }
 
+  // --- find in loaded rows ---
+  // Client-side only: it scans the rows already in memory and never re-runs the
+  // query, which is why every label says "loaded rows". The server-side filter
+  // builder is the other surface, and the two never share state.
+  // The box updates on every keystroke; the SCAN is debounced, because one pass
+  // over a fully loaded result is millions of comparisons and must not run per
+  // character typed.
+  const [findText, setFindText] = createSignal("");
+  const [findQuery, setFindQuery] = createSignal("");
+  const [findIdx, setFindIdx] = createSignal(-1);
+  let findInput: HTMLInputElement | undefined;
+  let findTimer: ReturnType<typeof setTimeout> | undefined;
+  function onFindInput(text: string) {
+    setFindText(text);
+    clearTimeout(findTimer);
+    findTimer = setTimeout(() => setFindQuery(text), 180);
+  }
+  /** Scan now instead of waiting out the debounce (Enter, next/previous). */
+  function flushFind() {
+    clearTimeout(findTimer);
+    if (findQuery() !== findText()) setFindQuery(findText());
+  }
+  const findHits = createMemo<{ matches: GridMatch[]; truncated: boolean }>(() => {
+    if (!findOpen() || !findQuery()) return { matches: [], truncated: false };
+    const dc = displayCols();
+    return findMatches(nRows(), dc.length, findQuery(), (r, k) => {
+      const oi = dc[k];
+      return oi === undefined ? null : copyVal(r, oi);
+    });
+  });
+  const findHitSet = createMemo(() => matchSet(findHits().matches));
+  const isHit = (r: number, k: number) => findHitSet().has(`${r}:${k}`);
+  const curHit = () => findHits().matches[findIdx()];
+  const isCurHit = (r: number, k: number) => {
+    const m = curHit();
+    return !!m && m.r === r && m.dc === k;
+  };
+  function goToMatch(i: number) {
+    const m = findHits().matches[i];
+    setFindIdx(m ? i : -1);
+    if (!m) return;
+    setSel({ mode: "cell", ar: m.r, ac: m.dc, fr: m.r, fc: m.dc });
+    scrollCellIntoView(m.r, m.dc);
+  }
+  function stepFind(dir: 1 | -1) {
+    flushFind();
+    goToMatch(stepMatch(findHits().matches.length, findIdx(), dir));
+  }
+  // A new needle re-seeds the cursor from the focused cell, so Find lands on the
+  // nearest match instead of jumping to the top, and reveals it without taking
+  // the selection away from the user. Reading the hits untracked keeps a
+  // streaming append from silently moving the current match.
+  createEffect(
+    on(findQuery, () => {
+      untrack(() => {
+        const s = sel();
+        const i = matchAtOrAfter(findHits().matches, Math.max(0, s.fr), Math.max(0, s.fc));
+        setFindIdx(i);
+        const m = findHits().matches[i];
+        if (m) scrollCellIntoView(m.r, m.dc);
+      });
+    }, { defer: true }),
+  );
+  createEffect(
+    on(findOpen, (open) => {
+      if (open) queueMicrotask(() => findInput?.focus());
+      else setFindIdx(-1);
+    }),
+  );
+  function closeFind() {
+    clearTimeout(findTimer);
+    props.setView({ findOpen: false });
+    focusGrid();
+  }
+
   // --- inline cell editing ---
   const [editing, setEditing] = createSignal<{ r: number; dc: number } | null>(null);
   let editInput: HTMLInputElement | undefined;
@@ -415,6 +547,31 @@ export function ResultGrid(props: ResultGridProps) {
     setEditing({ r, dc });
     scrollCellIntoView(r, dc);
   }
+  /** Commit one boolean dropdown choice. Shared by the in-cell editor and the record view. */
+  function applyBoolChoice(r: number, oi: number, v: string) {
+    const be = props.boolEdit(oi);
+    if (!be) return;
+    if (v === DEFAULT_OPT) {
+      props.onEditCell(rowRef(r), oi, undefined);
+      return;
+    }
+    if (v === NULL_OPT) {
+      props.onEditCell(rowRef(r), oi, null);
+      return;
+    }
+    // Re-picking the original value reverts the pending edit instead of
+    // recording a no-op write (PG snapshot "t" vs dropdown "true" would
+    // otherwise compare unequal and stay dirty forever).
+    const snap = !isInsRow(r) ? props.rows()[loadedAt(r)]?.[oi] ?? null : undefined;
+    if (snap !== undefined && snap !== null && boolWord(snap) === v) props.onEditCell(rowRef(r), oi, undefined);
+    else props.onEditCell(rowRef(r), oi, v === "TRUE" ? be.trueVal : be.falseVal);
+  }
+  /** Commit one text value. `orig` is what the editor opened on. */
+  function applyTextValue(r: number, oi: number, orig: string | null, v: string) {
+    // Typing nothing over a NULL is not an edit (don't turn NULL into '').
+    if (orig === null && v === "") return;
+    props.onEditCell(rowRef(r), oi, v);
+  }
   function commitEdit(move?: "down" | "right") {
     const ed = editing();
     if (!ed) return;
@@ -424,22 +581,12 @@ export function ResultGrid(props: ResultGridProps) {
       if (!editSelect) return;
       const v = editSelect.value;
       setEditing(null);
-      if (v === DEFAULT_OPT) props.onEditCell(rowRef(ed.r), oi, undefined);
-      else if (v === NULL_OPT) props.onEditCell(rowRef(ed.r), oi, null);
-      else {
-        // Re-picking the original value reverts the pending edit instead of
-        // recording a no-op write (PG snapshot "t" vs dropdown "true" would
-        // otherwise compare unequal and stay dirty forever).
-        const snap = !isInsRow(ed.r) ? props.rows()[loadedAt(ed.r)]?.[oi] ?? null : undefined;
-        if (snap !== undefined && snap !== null && boolWord(snap) === v) props.onEditCell(rowRef(ed.r), oi, undefined);
-        else props.onEditCell(rowRef(ed.r), oi, v === "TRUE" ? be.trueVal : be.falseVal);
-      }
+      applyBoolChoice(ed.r, oi, v);
     } else {
       if (!editInput) return;
       const v = editInput.value;
       setEditing(null);
-      // Typing nothing over a NULL is not an edit (don't turn NULL into '').
-      if (!(editOrig === null && v === "")) props.onEditCell(rowRef(ed.r), oi, v);
+      applyTextValue(ed.r, oi, editOrig, v);
     }
     focusGrid();
     if (move === "down") moveSelTo(ed.r + 1, ed.dc);
@@ -480,9 +627,18 @@ export function ResultGrid(props: ResultGridProps) {
 
   // --- keyboard ---
   function onKeyDown(e: KeyboardEvent) {
-    if ((e.target as HTMLElement).tagName === "INPUT") return;
+    const tag = (e.target as HTMLElement).tagName;
+    if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
     const nr = nRows(),
       nc = displayCols().length;
+    // Find stays reachable on an empty result so the bar can be dismissed.
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f" && !e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      e.stopPropagation();
+      props.setView({ findOpen: true });
+      queueMicrotask(() => findInput?.select());
+      return;
+    }
     if (!nr || !nc) return;
     const s = sel();
     const fr = s.fr < 0 ? 0 : s.fr,
@@ -506,16 +662,26 @@ export function ResultGrid(props: ResultGridProps) {
       case "End": mod ? move(nr - 1, nc - 1) : move(fr, nc - 1); break;
       case "PageDown": move(fr + Math.floor(viewportH() / rowH()), fc); break;
       case "PageUp": move(fr - Math.floor(viewportH() / rowH()), fc); break;
-      case "Escape": setSel({ mode: "cell", ar: fr, ac: fc, fr, fc }); break;
+      case "Escape":
+        if (findOpen()) { closeFind(); e.preventDefault(); }
+        else setSel({ mode: "cell", ar: fr, ac: fc, fr, fc });
+        break;
       case "a": if (mod) { selectAll(); e.preventDefault(); } break;
       case "c": if (mod) { void copySelection("tsv"); e.preventDefault(); } break;
       case "v":
         if (mod && props.editable()) { e.preventDefault(); e.stopPropagation(); void doPaste(); }
         break;
       case "Enter":
-      case "F2":
-        if (props.editable() && s.mode !== "none") { beginEdit(fr, fc); e.preventDefault(); }
+      case "F2": {
+        if (s.mode === "none") break;
+        const oi = displayCols()[fc];
+        // Editable cell → edit it; anything else → open the value viewer, so
+        // Enter always does something on the focused cell.
+        if (props.editable() && oi !== undefined && props.canEditCol(oi) && !isDeleted(fr)) beginEdit(fr, fc);
+        else if (oi !== undefined) props.onViewValue(props.columns()[oi], cellVal(fr, oi));
+        e.preventDefault();
         break;
+      }
       case "Delete":
       case "Backspace":
         // Row-selection only — a stray Delete on a cell selection must not mark rows.
@@ -620,10 +786,93 @@ export function ResultGrid(props: ResultGridProps) {
   // A disposed grid must not keep feeding Export → Selection.
   onCleanup(() => props.registerSelectionSource?.(null));
 
-  async function copySelection(fmt: "tsv" | "csv" | "json" | "md") {
+  // --- selection facts for the status bar ---
+  // Position and size are published immediately; the aggregate scan is deferred
+  // for anything but a small selection so dragging a range stays smooth. The
+  // deferred emit re-checks the tab and result generation, so a summary can
+  // never land on a result it was not taken from.
+  const SUMMARY_INLINE_CELLS = 2_000;
+  let summaryTimer: ReturnType<typeof setTimeout> | undefined;
+  createEffect(() => {
+    const report = props.onSelectionInfo;
+    if (!report) return;
+    const s = sel();
+    const dc = displayCols();
+    void props.rows();
+    void props.pending();
+    clearTimeout(summaryTimer);
+    if (s.mode === "none" || !dc.length || !nRows()) {
+      report(null);
+      return;
+    }
+    const b = selectionBounds();
+    const rowsN = Math.max(0, b.r1 - b.r0 + 1);
+    const colsN = b.cols.length;
+    const at = {
+      row: Math.max(0, s.fr) + 1,
+      col: Math.max(0, s.fc) + 1,
+      column: props.columns()[dc[Math.max(0, s.fc)]] ?? "",
+    };
+    const compute = () => summarizeSelection(rowsN, colsN, (r, c) => copyVal(b.r0 + r, b.cols[c]));
+    if (rowsN * colsN <= SUMMARY_INLINE_CELLS) {
+      report({ ...at, summary: compute() });
+      return;
+    }
+    report({ ...at, summary: { rows: rowsN, cols: colsN, cells: rowsN * colsN, nulls: 0, numeric: null, truncated: false } });
+    const tabId = props.activeTabId();
+    const generation = props.resultGeneration();
+    summaryTimer = setTimeout(() => {
+      if (props.activeTabId() === tabId && props.resultGeneration() === generation) report({ ...at, summary: compute() });
+    }, 150);
+  });
+  onCleanup(() => {
+    clearTimeout(summaryTimer);
+    props.onSelectionInfo?.(null);
+  });
+
+  /** Clipboard shapes offered by "Copy as". `headers` copies column names only. */
+  type CopyFmt = "tsv" | "csv" | "json" | "md" | "sql" | "headers";
+
+  /**
+   * INSERT statements for the selection, through the same options-driven
+   * formatter Export uses, so clipboard bytes match an exported .sql file.
+   * `selectionDataset` has already mapped booleans to TRUE/FALSE, and
+   * `boolCols` (projected indices) makes them unquoted literals of the source
+   * dialect rather than quoted strings.
+   */
+  function sqlInsertText(d: Dataset, cols: number[]): string {
+    const o = defaultExportOptions("");
+    o.format = "sql";
+    o.sql = { ...o.sql, table: props.sqlTable() || "exported", includeCreate: false, multiRow: false };
+    o.boolCols = cols.map((oi, k) => (props.isBoolCol(oi) ? k : -1)).filter((k) => k >= 0);
+    return formatWithOptions(d, o);
+  }
+
+  function copyColumnNames(cols: number[]) {
+    const names = cols.map((oi) => props.columns()[oi]).filter((n): n is string => n != null);
+    if (!names.length) return;
+    const o = defaultExportOptions("");
+    o.format = "tsv";
+    o.delimiter = "tab";
+    o.header = true;
+    try {
+      void copyText(
+        formatWithOptions({ columns: names, rows: [] }, o),
+        `copied ${names.length} column name${names.length === 1 ? "" : "s"}`,
+      );
+    } catch (e) {
+      props.onStatus(`copy rejected: ${e instanceof Error ? e.message : String(e)}`, props.activeTabId(), props.resultGeneration());
+    }
+  }
+
+  async function copySelection(fmt: CopyFmt) {
     const tabId = props.activeTabId();
     const generation = props.resultGeneration();
     const b = selectionBounds();
+    if (fmt === "headers") {
+      copyColumnNames(b.cols);
+      return;
+    }
     const cells = (b.r1 - b.r0 + 1) * b.cols.length;
     if (cells > MAX_COPY_CELLS) {
       props.onStatus(`selection too large to copy (${cells.toLocaleString()} cells) — use Export… instead`, tabId, generation);
@@ -643,7 +892,7 @@ export function ResultGrid(props: ResultGridProps) {
     const d = selectionDataset(b);
     const h = props.copyHeaders();
     try {
-      const text = formatForCopy(d, fmt, h);
+      const text = fmt === "sql" ? sqlInsertText(d, b.cols) : formatForCopy(d, fmt, h);
       const ok = await clipWrite(text);
       props.onStatus(ok ? `copied ${d.rows.length}×${d.columns.length}` : "clipboard unavailable", tabId, generation);
     } catch (e) {
@@ -698,6 +947,18 @@ export function ResultGrid(props: ResultGridProps) {
   }
 
   // --- context menus ---
+  /** "Copy as…" — every clipboard shape for the current selection, loaded rows only. */
+  function openCopyAs(x: number, y: number) {
+    props.onMenu(x, y, bindMenuItems([
+      { label: "TSV", icon: "copy", onClick: () => void copySelection("tsv") },
+      { label: "CSV", icon: "copy", onClick: () => void copySelection("csv") },
+      { label: "JSON", icon: "copy", onClick: () => void copySelection("json") },
+      { label: "Markdown", icon: "copy", onClick: () => void copySelection("md") },
+      { label: "SQL INSERT", icon: "code", onClick: () => void copySelection("sql") },
+      { sep: true },
+      { label: "Column names", icon: "columns", onClick: () => void copySelection("headers") },
+    ]));
+  }
   function onCellContext(e: MouseEvent, r: number, dc: number, oi: number, val: string | null) {
     e.preventDefault();
     e.stopPropagation();
@@ -735,12 +996,13 @@ export function ResultGrid(props: ResultGridProps) {
       editItems.push({ label: "Edit cell", icon: "edit", disabled: true, title: props.editReason(), onClick: () => {} }, { sep: true });
     }
     const copiedVal = copyVal(r, oi);
-    props.onMenu(e.clientX, e.clientY, bindMenuItems([
+    const at = { x: e.clientX, y: e.clientY };
+    props.onMenu(at.x, at.y, bindMenuItems([
       ...editItems,
       { label: "Copy", icon: "copy", onClick: () => void copySelection("tsv") },
-      { label: "Copy as CSV", icon: "copy", onClick: () => void copySelection("csv") },
-      { label: "Copy as JSON", icon: "copy", onClick: () => void copySelection("json") },
-      { label: "Copy as Markdown", icon: "copy", onClick: () => void copySelection("md") },
+      // A second menu at the same point rather than a nested one: the menu
+      // component is flat by design, and one click still reaches every format.
+      { label: "Copy as…", icon: "copy", onClick: () => openCopyAs(at.x, at.y) },
       { sep: true },
       { label: val === null ? "Copy value (NULL→empty)" : "Copy cell value", icon: "copy", onClick: () => void copyText(copiedVal ?? "", "copied value") },
       { label: "Copy column", icon: "copy", onClick: () => copyColumn(oi) },
@@ -768,6 +1030,16 @@ export function ResultGrid(props: ResultGridProps) {
     items.push(
       { label: "Autofit column", icon: "resize", onClick: () => autofit(oi) },
       { label: "Hide column", icon: "eyeOff", onClick: () => hideCol(oi) },
+      {
+        label: props.view().stickyFirst ? "Unfreeze first column" : "Freeze first column",
+        icon: "lock",
+        onClick: () => props.setView({ stickyFirst: !props.view().stickyFirst }),
+      },
+      {
+        label: props.view().rowNumbers ? "Hide row numbers" : "Show row numbers",
+        icon: "hash",
+        onClick: () => props.setView({ rowNumbers: !props.view().rowNumbers }),
+      },
     );
     const hidden = props.view().hidden;
     if (hidden.length) {
@@ -836,6 +1108,7 @@ export function ResultGrid(props: ResultGridProps) {
 
   onCleanup(() => {
     clearTimeout(filterTimer);
+    clearTimeout(findTimer);
     resizeObserver?.disconnect();
     if (scrollRaf !== undefined) cancelAnimationFrame(scrollRaf);
     if (measureRaf !== undefined) cancelAnimationFrame(measureRaf);
@@ -942,23 +1215,90 @@ export function ResultGrid(props: ResultGridProps) {
     });
   }
 
+  // --- record view (the focused row as a name/value list) ---
+  /** Fields rendered at once. The grid virtualizes columns; this list does not. */
+  const MAX_RECORD_FIELDS = 200;
+  const recFields = createMemo(() => displayCols().slice(0, MAX_RECORD_FIELDS));
+  /** Virtual row the record view shows; -1 when nothing is selected. */
+  const recRow = () => {
+    const s = sel();
+    if (s.mode === "none" || !nRows()) return -1;
+    return Math.min(Math.max(0, s.fr), nRows() - 1);
+  };
+  function stepRecord(dir: 1 | -1) {
+    const s = sel();
+    moveSelTo(Math.max(0, s.fr) + dir, Math.max(0, s.fc));
+  }
+  function onRecordKey(e: KeyboardEvent) {
+    if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
+    e.preventDefault();
+    e.stopPropagation();
+    stepRecord(e.key === "ArrowDown" ? 1 : -1);
+  }
+  const findCountText = () => {
+    if (!findQuery()) return "";
+    const h = findHits();
+    if (!h.matches.length) return "no matches";
+    const at = findIdx() >= 0 && findIdx() < h.matches.length ? findIdx() + 1 : 1;
+    return `${at} of ${h.matches.length}${h.truncated ? "+" : ""}`;
+  };
+  /** Cell text as painted: booleans keep their word, long values are elided. */
+  const shownText = (v: string) => displayText(v).text;
+
   return (
-    <div class="rg" ref={root} tabindex={0} onKeyDown={onKeyDown}>
+    <div
+      class="rg"
+      classList={{ "rg-has-record": recordOpen() }}
+      ref={root}
+      tabindex={0}
+      onKeyDown={onKeyDown}
+      style={{ "--rg-rec": recordOpen() ? "clamp(200px, 28%, 360px)" : "0px" }}
+    >
+      {/* find in loaded rows — a strip above the header, never over it */}
+      <Show when={findOpen()}>
+        <div class="rg-find" style={{ height: `${FIND_H}px` }}>
+          <span class="rg-find-label">Find (loaded rows)</span>
+          <input
+            ref={(el) => (findInput = el)}
+            class="rg-find-input"
+            value={findText()}
+            placeholder="text to match"
+            spellcheck={false}
+            onInput={(e) => onFindInput(e.currentTarget.value)}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Enter") { e.preventDefault(); stepFind(e.shiftKey ? -1 : 1); }
+              else if (e.key === "Escape") { e.preventDefault(); closeFind(); }
+            }}
+          />
+          <span class="rg-find-count">{findCountText()}</span>
+          <button class="rg-find-btn" title="Previous match (Shift+Enter)" disabled={!findHits().matches.length} onClick={() => stepFind(-1)}>‹</button>
+          <button class="rg-find-btn" title="Next match (Enter)" disabled={!findHits().matches.length} onClick={() => stepFind(1)}>›</button>
+          <button class="rg-find-btn" title="Close find (Esc)" onClick={closeFind}>✕</button>
+        </div>
+      </Show>
+
       {/* corner: select-all */}
-      <div class="rg-corner" style={{ width: `${GUTTER_W}px`, height: `${headTop()}px` }} onClick={selectAll} title="Select all (⌘/Ctrl+A)" />
+      <div class="rg-corner" style={{ width: `${gutW()}px`, top: `${topOffset()}px`, height: `${headTop()}px` }} onClick={selectAll} title="Select all (⌘/Ctrl+A)" />
 
       {/* header (+ optional filter row), translated horizontally */}
-      <div class="rg-headwrap" style={{ left: `${GUTTER_W}px`, height: `${headTop()}px` }}>
+      <div class="rg-headwrap" style={{ left: `${gutW()}px`, top: `${topOffset()}px`, height: `${headTop()}px` }}>
         <div class="rg-head" style={{ width: `${contentW()}px`, transform: `translateX(${-scrollLeft()}px)` }}>
-          <For each={range(visCols().start, visCols().end)}>
+          <For each={colWindow()}>
             {(k) => {
               const oi = () => displayCols()[k];
               const s = () => sortFor(oi());
+              const pinned = () => sticky() && k === 0;
               return (
                 <div
                   class="rg-headcell"
-                  classList={{ sel: sel().mode === "cols" && isSel(0, k), "dnd-source": dragCol() === oi() }}
-                  style={{ left: `${offsets()[k]}px`, width: `${colWidth(oi())}px`, height: `${HEAD_H}px` }}
+                  classList={{ sel: sel().mode === "cols" && isSel(0, k), "dnd-source": dragCol() === oi(), "rg-pinned": pinned() }}
+                  style={{
+                    left: `${offsets()[k]}px`,
+                    width: `${colWidth(oi())}px`,
+                    height: `${HEAD_H}px`,
+                    ...(pinned() ? { transform: `translateX(${scrollLeft()}px)`, "z-index": "6" } : {}),
+                  }}
                   title={props.columns()[oi()]}
                   onPointerDown={(e) => onHeaderDown(e, k, oi())}
                   // Chromium starts a text selection on press and paints it once the
@@ -969,6 +1309,15 @@ export function ResultGrid(props: ResultGridProps) {
                   onContextMenu={(e) => onHeaderContext(e, oi(), k)}
                 >
                   <span class="rg-headname">{props.columns()[oi()]}</span>
+                  <Show when={renderOf(oi()).badge}>
+                    <span
+                      class="rg-type"
+                      classList={{ inferred: renderOf(oi()).inferred }}
+                      title={renderOf(oi()).inferred ? `${renderOf(oi()).badgeTitle} (guessed from loaded rows)` : renderOf(oi()).badgeTitle}
+                    >
+                      {renderOf(oi()).badge}
+                    </span>
+                  </Show>
                   <Show when={s()}>
                     {(sk) => <span class="rg-sort">{sk().dir === "asc" ? "▲" : "▼"}{props.view().sorts.length > 1 ? sortIndex(oi()) + 1 : ""}</span>}
                   </Show>
@@ -979,15 +1328,20 @@ export function ResultGrid(props: ResultGridProps) {
           </For>
           <Show when={props.view().filterRowOpen}>
             <div class="rg-filter" style={{ top: `${HEAD_H}px`, width: `${contentW()}px`, height: `${FILTER_H}px` }}>
-              <For each={range(visCols().start, visCols().end)}>
+              <For each={colWindow()}>
                 {(k) => {
                   const oi = () => displayCols()[k];
                   const hidden = () => hiddenRulesFor(oi());
+                  const pinned = () => sticky() && k === 0;
                   return (
                     <input
                       class="rg-filter-input"
-                      classList={{ "has-rules": hidden() > 0 }}
-                      style={{ left: `${offsets()[k]}px`, width: `${colWidth(oi()) - 6}px` }}
+                      classList={{ "has-rules": hidden() > 0, "rg-pinned": pinned() }}
+                      style={{
+                        left: `${offsets()[k]}px`,
+                        width: `${colWidth(oi()) - 6}px`,
+                        ...(pinned() ? { transform: `translateX(${scrollLeft()}px)`, "z-index": "6" } : {}),
+                      }}
                       placeholder={hidden() > 0 ? `${hidden()} rule${hidden() === 1 ? "" : "s"} · Edit…` : "filter…"}
                       title={hidden() > 0
                         ? `${hidden()} filter rule${hidden() === 1 ? "" : "s"} on this column come from the filter builder — open it to see or change them`
@@ -1013,17 +1367,17 @@ export function ResultGrid(props: ResultGridProps) {
       </div>
 
       {/* gutter: row numbers, translated vertically */}
-      <div class="rg-gutwrap" style={{ width: `${GUTTER_W}px`, top: `${headTop()}px` }}>
+      <div class="rg-gutwrap" style={{ width: `${gutW()}px`, top: `${headTop() + topOffset()}px` }}>
         <div class="rg-gut" style={{ height: `${totalH()}px`, transform: `translateY(${-scrollTop()}px)` }}>
           <For each={range(visRows().start, visRows().end)}>
             {(r) => (
               <div
                 class="rg-gutnum"
-                classList={{ sel: sel().mode === "rows" && isSel(r, 0), "rg-del": isDeleted(r), "rg-new": isInsRow(r) }}
+                classList={{ sel: sel().mode === "rows" && isSel(r, 0), "rg-del": isDeleted(r), "rg-new": isInsRow(r), slim: !props.view().rowNumbers }}
                 style={{ top: `${r * rowH()}px`, height: `${rowH()}px` }}
                 onMouseDown={(e) => onGutterDown(e, r)}
               >
-                {isInsRow(r) ? "+" : displayLoadedAt(r) + 1}
+                {isInsRow(r) ? "+" : props.view().rowNumbers ? displayLoadedAt(r) + 1 : ""}
               </div>
             )}
           </For>
@@ -1031,7 +1385,7 @@ export function ResultGrid(props: ResultGridProps) {
       </div>
 
       {/* body scroller */}
-      <div class="rg-scroll" ref={mountScroller} style={{ top: `${headTop()}px`, left: `${GUTTER_W}px` }} onScroll={onScroll}>
+      <div class="rg-scroll" ref={mountScroller} style={{ top: `${headTop() + topOffset()}px`, left: `${gutW()}px` }} onScroll={onScroll}>
         <div class="rg-sizer" style={{ width: `${contentW()}px`, height: `${totalH()}px` }}>
           <For each={range(visRows().start, visRows().end)}>
             {(r) => (
@@ -1040,15 +1394,31 @@ export function ResultGrid(props: ResultGridProps) {
                 classList={{ odd: props.gridStyle().zebra && r % 2 === 1, "rg-del": isDeleted(r), "rg-new": isInsRow(r) }}
                 style={{ top: `${r * rowH()}px`, height: `${rowH()}px`, width: `${contentW()}px` }}
               >
-                <For each={range(visCols().start, visCols().end)}>
+                <For each={colWindow()}>
                   {(k) => {
                     const oi = () => displayCols()[k];
                     const val = () => cellVal(r, oi());
+                    const cls = () => renderOf(oi()).cls;
+                    const pinned = () => sticky() && k === 0;
                     return (
                       <div
                         class="rg-cell"
-                        classList={{ sel: isSel(r, k), active: isActive(r, k), "rg-dirty": isDirty(r, oi()) }}
-                        style={{ left: `${offsets()[k]}px`, width: `${colWidth(oi())}px` }}
+                        classList={{
+                          sel: isSel(r, k),
+                          active: isActive(r, k),
+                          "rg-dirty": isDirty(r, oi()),
+                          "rg-num": cls() === "number",
+                          "rg-jsoncell": cls() === "json",
+                          "rg-hit": isHit(r, k),
+                          "rg-hit-cur": isCurHit(r, k),
+                          "rg-pinned": pinned(),
+                        }}
+                        style={{
+                          left: `${offsets()[k]}px`,
+                          width: `${colWidth(oi())}px`,
+                          ...(pinned() ? { transform: `translateX(${scrollLeft()}px)`, "z-index": "2" } : {}),
+                        }}
+                        title={cellTitle(val()) || undefined}
                         onMouseDown={(e) => onCellDown(e, r, k)}
                         onDblClick={(e) => {
                           // Editable grids edit on dbl-click; Ctrl/Cmd+dbl-click (or a
@@ -1064,7 +1434,16 @@ export function ResultGrid(props: ResultGridProps) {
                           if (v === null)
                             return <span class="null">{props.gridStyle().nullStyle === "null" ? "NULL" : props.gridStyle().nullStyle === "dash" ? "—" : ""}</span>;
                           const w = props.isBoolCol(oi()) ? boolWord(v) : null;
-                          return w ? <span class={w === "TRUE" ? "rg-bool rg-true" : "rg-bool rg-false"}>{w}</span> : v;
+                          if (w)
+                            return (
+                              <span class={w === "TRUE" ? "rg-bool rg-true" : "rg-bool rg-false"}>
+                                <span class="rg-bool-mark" aria-hidden="true">{w === "TRUE" ? "✓" : "✕"}</span>
+                                {w}
+                              </span>
+                            );
+                          // Long values are elided in the DOM, not in the data: copy,
+                          // export and the value viewer still see the whole string.
+                          return shownText(v);
                         })()}
                       </div>
                     );
@@ -1147,6 +1526,92 @@ export function ResultGrid(props: ResultGridProps) {
           </Show>
         </div>
       </div>
+
+      {/* record view: the focused row as a name/value list, docked right */}
+      <Show when={recordOpen()}>
+        <div class="rg-record" style={{ top: `${topOffset()}px` }} onKeyDown={onRecordKey}>
+          <div class="rg-rec-head">
+            <span class="rg-rec-title">Record</span>
+            <Show when={recRow() >= 0}>
+              <span class="rg-rec-pos">{isInsRow(recRow()) ? "new row" : `row ${displayLoadedAt(recRow()) + 1}`}</span>
+            </Show>
+            <span class="rg-rec-spacer" />
+            <button class="rg-find-btn" title="Previous row (Alt+↑)" disabled={recRow() <= 0} onClick={() => stepRecord(-1)}>‹</button>
+            <button class="rg-find-btn" title="Next row (Alt+↓)" disabled={recRow() < 0 || recRow() >= nRows() - 1} onClick={() => stepRecord(1)}>›</button>
+            <button class="rg-find-btn" title="Close record view" onClick={() => { props.setView({ recordOpen: false }); focusGrid(); }}>✕</button>
+          </div>
+          <Show when={recRow() >= 0} fallback={<div class="rg-rec-empty">Select a cell to see its row.</div>}>
+            <div class="rg-rec-body">
+              <For each={recFields()}>
+                {(oi) => {
+                  const r = () => recRow();
+                  const val = () => cellVal(r(), oi);
+                  const editable = () => props.editable() && props.canEditCol(oi) && !isDeleted(r());
+                  const be = () => (editable() ? props.boolEdit(oi) : null);
+                  return (
+                    <div class="rg-rec-row" classList={{ dirty: isDirty(r(), oi) }}>
+                      <div class="rg-rec-name" title={props.columns()[oi]}>
+                        <span class="rg-rec-col">{props.columns()[oi]}</span>
+                        <Show when={renderOf(oi).badge}>
+                          <span class="rg-type" classList={{ inferred: renderOf(oi).inferred }}>{renderOf(oi).badge}</span>
+                        </Show>
+                      </div>
+                      <Show
+                        when={editable()}
+                        fallback={
+                          <div class="rg-rec-val" classList={{ "rg-num": renderOf(oi).cls === "number" }}>
+                            <Show when={val() !== null} fallback={<span class="null">NULL</span>}>{shownText(val() ?? "")}</Show>
+                          </div>
+                        }
+                      >
+                        <Show
+                          when={be()}
+                          fallback={
+                            <input
+                              class="rg-rec-input"
+                              value={val() ?? ""}
+                              placeholder={val() === null ? "NULL" : ""}
+                              onKeyDown={(e) => {
+                                e.stopPropagation();
+                                if (e.key === "Enter") e.currentTarget.blur();
+                                else if (e.key === "Escape") { e.currentTarget.value = val() ?? ""; e.currentTarget.blur(); }
+                              }}
+                              onChange={(e) => applyTextValue(r(), oi, val(), e.currentTarget.value)}
+                            />
+                          }
+                        >
+                          {(b) => (
+                            <select
+                              class="rg-rec-input"
+                              value={isInsUntouched(r(), oi) ? DEFAULT_OPT : val() === null ? NULL_OPT : boolWord(val()!) ?? "TRUE"}
+                              onKeyDown={(e) => e.stopPropagation()}
+                              onChange={(e) => applyBoolChoice(r(), oi, e.currentTarget.value)}
+                            >
+                              <Show when={isInsUntouched(r(), oi)}>
+                                <option value={DEFAULT_OPT}>{"<default>"}</option>
+                              </Show>
+                              <option value="TRUE">TRUE</option>
+                              <option value="FALSE">FALSE</option>
+                              <Show when={b().nullable}>
+                                <option value={NULL_OPT}>{"<null>"}</option>
+                              </Show>
+                            </select>
+                          )}
+                        </Show>
+                      </Show>
+                    </div>
+                  );
+                }}
+              </For>
+              <Show when={displayCols().length > MAX_RECORD_FIELDS}>
+                <div class="rg-rec-empty">
+                  First {MAX_RECORD_FIELDS} of {displayCols().length.toLocaleString()} columns.
+                </div>
+              </Show>
+            </div>
+          </Show>
+        </div>
+      </Show>
     </div>
   );
 }

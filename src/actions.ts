@@ -39,7 +39,9 @@ export type ActionId =
   | "newConnection"
   | "loadAllRows"
   | "exportResult"
-  | "openFilterBuilder";
+  | "openFilterBuilder"
+  | "findInResults"
+  | "toggleRecordView";
 
 /** What an `enabled` predicate can see (kept tiny on purpose). */
 export type ActionCtx = {
@@ -90,6 +92,12 @@ export const ACTIONS: readonly ActionDef[] = [
   { id: "loadAllRows", title: "Load all rows", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.hasResult && c.canRunDatabase },
   { id: "exportResult", title: "Export result…", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.hasResult && c.canExport },
   { id: "openFilterBuilder", title: "Filter rows…", category: "Query", defaultKey: "Mod-Shift-f", scope: "global", enabled: (c) => c.hasResult && c.canFilter },
+  // Mod-f reaches this only when CodeMirror hasn't already consumed it: the
+  // editor's own search keymap runs first and marks the event handled, so the
+  // chord means "find in the editor" while typing and "find in loaded rows"
+  // everywhere else.
+  { id: "findInResults", title: "Find in loaded rows", category: "Query", defaultKey: "Mod-f", scope: "global", enabled: (c) => c.hasResult },
+  { id: "toggleRecordView", title: "Toggle record view", category: "View", defaultKey: "Mod-Alt-v", scope: "global", enabled: (c) => c.hasResult },
   { id: "format", title: "Format SQL", category: "Editor", defaultKey: "Shift-Alt-f", scope: "editor" },
   { id: "find", title: "Find & replace", category: "Editor", defaultKey: null, scope: "editor" },
   { id: "toggleComment", title: "Toggle comment", category: "Editor", defaultKey: "Mod-/", scope: "editor" },
