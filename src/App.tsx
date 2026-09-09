@@ -2744,13 +2744,17 @@ function App() {
     const rt = entry?.runtime ?? null;
     if (!c || !rt || entry!.state().running || !sqlToRun.trim()) return false;
     const event = transactionEvent(sqlToRun);
-    if (!transactionDatabaseAllowed(transaction(), runTabId)) {
-      patchResult(runTabId, { status: transaction().state === "lost"
+    // Read the RUN TAB's connection transaction, not `transaction()`. They are the
+    // same by the active-tab/active-connection invariant, but naming the connection
+    // keeps this correct if a future path ever runs a non-focused tab.
+    const runTx = () => entry!.state().transaction;
+    if (!transactionDatabaseAllowed(runTx(), runTabId)) {
+      patchResult(runTabId, { status: runTx().state === "lost"
         ? "Transaction session lost; disconnect and reconnect"
-        : `Database actions are frozen in this tab while ${ownerTab()?.title ?? transaction().owner ?? "another tab"} owns the transaction` });
+        : `Database actions are frozen in this tab while ${tabs().find((t) => t.id === runTx().owner)?.title ?? runTx().owner ?? "another tab"} owns the transaction` });
       return false;
     }
-    if (!transactionRecoveryAllowed(transaction(), sqlToRun)) {
+    if (!transactionRecoveryAllowed(runTx(), sqlToRun)) {
       patchResult(runTabId, { status: "Transaction failed; ROLLBACK is required before any other database action" });
       return false;
     }
