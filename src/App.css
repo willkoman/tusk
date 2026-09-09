@@ -1949,3 +1949,179 @@ button { padding: var(--pad-y) var(--pad-x); }
 @media (prefers-reduced-motion: reduce) {
   .tab, .tab-overflow, .tab-rename { transition: none; }
 }
+
+/* =====================================================================
+   ui/grid-qol — result grid: type-aware cells, find bar, record view,
+   pinned first column, status-bar selection facts.
+   ===================================================================== */
+
+/* Panes leave room for the record view (0px when it is closed). */
+.rg-headwrap, .rg-scroll { right: var(--rg-rec, 0px); }
+.rg:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* Header type badge. A dotted underline marks a class guessed from values. */
+.rg-type {
+  flex: none;
+  max-width: 84px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--panel);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  text-transform: lowercase;
+}
+.rg-type.inferred { background: transparent; border-bottom: 1px dotted var(--border); border-radius: 0; opacity: 0.75; }
+
+/* Numeric cells align right on tabular figures so magnitudes line up. */
+.rg-cell.rg-num { justify-content: flex-end; font-variant-numeric: tabular-nums; }
+.rg-cell.rg-jsoncell { color: var(--accent-2); }
+.rg-bool-mark { margin-right: 4px; font-size: 9px; }
+
+/* Find matches over loaded rows. */
+.rg-cell.rg-hit { background: rgba(230, 170, 60, 0.18); }
+.rg-cell.rg-hit-cur { background: rgba(230, 170, 60, 0.38); outline: 1.5px solid #e6aa3c; outline-offset: -1.5px; }
+
+/* Pinned first column: painted at the viewport edge by a translate, so the body
+   keeps one set of content coordinates for hit-testing and drag. The opaque
+   backing is a ::before inside the cell's OWN stacking context (the inline
+   z-index creates one), so the selection, dirty and match tints still compose
+   over it instead of being replaced by an opaque background. */
+.rg-cell.rg-pinned, .rg-headcell.rg-pinned { box-shadow: 1px 0 0 var(--border); }
+.rg-cell.rg-pinned::before, .rg-headcell.rg-pinned::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background-color: var(--bg);
+}
+.rg-headcell.rg-pinned::before { background-color: var(--panel-2); }
+.rg-row.odd .rg-cell.rg-pinned::before { background-image: linear-gradient(var(--zebra), var(--zebra)); }
+
+/* Gutter without row numbers stays grabbable. */
+.rg-gutnum.slim { padding-right: 0; }
+
+/* Find bar — a strip above the header, never an overlay on it. */
+.rg-find {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: var(--rg-rec, 0px);
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  box-sizing: border-box;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 11.5px;
+}
+.rg-find-label { color: var(--muted); white-space: nowrap; }
+.rg-find-input {
+  flex: 1;
+  min-width: 60px;
+  max-width: 320px;
+  height: 22px;
+  font: inherit;
+  font-family: var(--mono);
+  padding: 0 6px;
+  box-sizing: border-box;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.rg-find-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.rg-find-count { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rg-find-btn {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  line-height: 1;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.rg-find-btn:hover:not(:disabled) { color: var(--text); border-color: var(--border); }
+.rg-find-btn:disabled { opacity: 0.4; cursor: default; }
+
+/* Record view — the focused row as a name/value list. Width is proportional,
+   so it can never squeeze the grid off a small window. */
+.rg-record {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  z-index: 6;
+  width: var(--rg-rec, 0px);
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  font-size: 11.5px;
+}
+.rg-rec-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px 4px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.rg-rec-title { font-weight: 600; }
+.rg-rec-pos { color: var(--muted); font-variant-numeric: tabular-nums; }
+.rg-rec-spacer { flex: 1; }
+.rg-rec-empty { padding: 12px 10px; color: var(--muted); }
+.rg-rec-body { flex: 1; min-height: 0; overflow: auto; }
+.rg-rec-row {
+  display: grid;
+  grid-template-columns: minmax(0, 40%) minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  padding: 3px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.rg-rec-row.dirty { box-shadow: inset 2px 0 0 #e6aa3c; }
+.rg-rec-name { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.rg-rec-col { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.rg-rec-val {
+  min-width: 0;
+  max-height: 84px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  font-family: var(--mono);
+}
+.rg-rec-val.rg-num { text-align: right; font-variant-numeric: tabular-nums; }
+.rg-rec-input {
+  width: 100%;
+  height: 22px;
+  font: inherit;
+  font-family: var(--mono);
+  padding: 0 6px;
+  box-sizing: border-box;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.rg-rec-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+
+/* Value viewer: the format label above a pretty-printed body. */
+.value-kind { margin-bottom: 4px; color: var(--muted); font-family: var(--mono); font-size: 10.5px; }
+
+/* Status bar: focused cell and selection aggregates (loaded rows only). */
+.grid-info { display: inline-flex; align-items: center; gap: 10px; color: var(--muted); white-space: nowrap; }
+.grid-info .gi-pos, .grid-info .gi-size, .grid-info .gi-agg { font-variant-numeric: tabular-nums; }
+.grid-info .gi-agg { font-family: var(--mono); }
+
+:root[data-mode="light"] .rg-cell.rg-hit { background: rgba(180, 83, 9, 0.15); }
+:root[data-mode="light"] .rg-cell.rg-hit-cur { background: rgba(180, 83, 9, 0.30); outline-color: #b45309; }
+:root[data-mode="light"] .rg-rec-row.dirty { box-shadow: inset 2px 0 0 #b45309; }

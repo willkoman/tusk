@@ -31,7 +31,12 @@ import { densityTokens, gridRowH, normalizeDensity, rootFontSize } from "./appea
 import { FilterBar } from "./grid/FilterBar";
 import { classResolver, conditions, emptyFilter, hasConditions, removeNode, type FilterTree } from "./grid/filterModel";
 import { activeConditionCount } from "./grid/filterSql";
-import { ResultGrid, type SelectionSource } from "./ResultGrid";
+import { ResultGrid, type GridSelectionInfo, type SelectionSource } from "./ResultGrid";
+// --- ui/grid-qol: type-aware rendering, record view, find, selection summary ---
+import { carryViewPrefs } from "./tabs";
+import { prettyJson } from "./grid/cellRender";
+import { fmtNumber } from "./grid/summary";
+// --- end ui/grid-qol imports ---
 import { UpdateBadge } from "./UpdateBadge";
 import { WhatsNew } from "./WhatsNew";
 import { wrapQuery, wrappableQuery, stripTrailingSemi, hasDuplicateColumns, hasViewRules, mssqlWrappable } from "./grid/query";
@@ -1721,6 +1726,19 @@ function App() {
     return Object.fromEntries(det.columns.map((c) => [c.name, c.data_type]));
   };
   const filterClassOf = () => classResolver(filterColumnTypes());
+  /**
+   * Driver type per RESULT column index, when the source relation's detail is
+   * loaded. Feeds the grid's header type badges and cell alignment; absent
+   * metadata is not an error — the grid then guesses from the loaded values.
+   */
+  const resultColTypes = createMemo<(string | undefined)[]>(() => {
+    const types = filterColumnTypes();
+    if (!types) return [];
+    const lower = new Map(Object.entries(types).map(([k, v]) => [k.toLowerCase(), v]));
+    return editCols().map((c) => lower.get(c.toLowerCase()));
+  });
+  /** Focused-cell position and selection aggregates published by the grid. */
+  const [gridInfo, setGridInfo] = createSignal<GridSelectionInfo | null>(null);
   /** Dropdown editor info for a bool column; tokens match the driver's textual booleans. */
   const boolEditInfo = (oi: number): { trueVal: string; falseVal: string; nullable: boolean } | null => {
     const det = editDetail();
@@ -2323,6 +2341,16 @@ function App() {
       case "loadAllRows": if (!done()) void loadAll(); break;
       case "exportResult": openExport(); break;
       case "openFilterBuilder": openFilterBuilder(); break;
+      // Both act on the grid, so they reopen a collapsed results panel first —
+      // otherwise the chord would toggle something the user cannot see.
+      case "findInResults":
+        if (!resultsOpen()) { setResultsOpen(true); persistLayout(); }
+        setGridView({ findOpen: true });
+        break;
+      case "toggleRecordView":
+        if (!resultsOpen()) { setResultsOpen(true); persistLayout(); }
+        setGridView({ recordOpen: !gridView().recordOpen });
+        break;
       case "nextConnection": case "prevConnection": {
         const next = stepConnection(connections(), activeConnectionId(), id === "nextConnection" ? 1 : -1);
         if (next) focusConnection(next);
@@ -3353,12 +3381,13 @@ function App() {
           transactionStale: "",
         });
         if (mode === "base") {
-          // A fresh result resets sort/filter, but the filter-row VISIBILITY is a UI
-          // preference (e.g. "Filter rows…" from the sidebar) — keep it across the reset.
+          // A fresh result resets sort/filter, but the panel toggles (filter row,
+          // row numbers, frozen column, record view, find) are UI preferences the
+          // user turned on — `carryViewPrefs` keeps them across the reset.
           patchTab(runTabId, {
             gridView: sameColumns(prevCols, out.columns)
               ? { ...(runTabNow?.gridView ?? gridViewFor(out.columns.length)), sorts: [], filters: emptyFilter() }
-              : { ...gridViewFor(out.columns.length), filterRowOpen: runTabNow?.gridView.filterRowOpen ?? false },
+              : { ...gridViewFor(out.columns.length), ...carryViewPrefs(runTabNow?.gridView) },
           });
         }
         if (!out.done) {
@@ -5741,6 +5770,26 @@ function App() {
                   <Show when={activeTab().result.transactionStale}>
                     <span class="transaction-result-stale" title={activeTab().result.transactionStale}>Stale transaction result</span>
                   </Show>
+                  {/* ui/grid-qol: loaded-row find + record view, both grid-local */}
+                  <Show when={columns().length > 0}>
+                    <span class="sb-sep" />
+                    <button
+                      class="ghost export-btn"
+                      classList={{ "filter-active": gridView().findOpen }}
+                      title={`Find in loaded rows (${displayKey(effectiveKey("findInResults", keys())) || "unbound"})`}
+                      onClick={() => setGridView({ findOpen: !gridView().findOpen })}
+                    >
+                      <Icon name="search" /> Find
+                    </button>
+                    <button
+                      class="ghost export-btn"
+                      classList={{ "filter-active": gridView().recordOpen }}
+                      title={`Show the focused row as a field list (${displayKey(effectiveKey("toggleRecordView", keys())) || "unbound"})`}
+                      onClick={() => setGridView({ recordOpen: !gridView().recordOpen })}
+                    >
+                      <Icon name="columns" /> Record
+                    </button>
+                  </Show>
                   <Show when={columns().length > 0}>
                     <span class="sb-sep" />
                     <button
@@ -5808,6 +5857,9 @@ function App() {
                   editReason={() => editCtx().reason}
                   canEditCol={(oi) => editCtx().plan?.isTableCol[oi] ?? false}
                   isBoolCol={(oi) => boolCols().has(oi)}
+                  colType={(oi) => resultColTypes()[oi]}
+                  sqlTable={() => editCtx().plan?.table ?? ""}
+                  onSelectionInfo={setGridInfo}
                   boolEdit={boolEditInfo}
                   pending={tabPending}
                   onEditCell={onEditCell}
@@ -5859,6 +5911,31 @@ function App() {
                 </span>
               </Show>
               <span class="spacer" />
+              {/* ui/grid-qol: grid position + aggregates over LOADED rows only */}
+              <Show when={resultsOpen() && gridInfo()}>
+                {(gi) => (
+                  <span class="grid-info" title="Selection facts over the rows loaded in the grid">
+                    <span class="gi-pos">R {gi().row.toLocaleString()}, C {gi().col.toLocaleString()}</span>
+                    <Show when={gi().summary.cells > 1}>
+                      <span class="gi-size">{gi().summary.rows.toLocaleString()}×{gi().summary.cols.toLocaleString()} selected</span>
+                    </Show>
+                    <Show when={gi().summary.numeric}>
+                      {(n) => (
+                        <>
+                          <span class="gi-agg">Sum {fmtNumber(n().sum)}</span>
+                          <span class="gi-agg">Avg {fmtNumber(n().avg)}</span>
+                          <span class="gi-agg">Min {fmtNumber(n().min)}</span>
+                          <span class="gi-agg">Max {fmtNumber(n().max)}</span>
+                          <span class="gi-agg">Count {n().count.toLocaleString()}</span>
+                        </>
+                      )}
+                    </Show>
+                  </span>
+                )}
+              </Show>
+              <Show when={!resultsOpen() && elapsed() > 0}>
+                <span class="grid-info"><span class="gi-agg">Last run {elapsed()} ms</span></span>
+              </Show>
               <Show when={cursorInfo()}>
                 {(ci) => (
                   <span class="cursor-info">
@@ -6439,7 +6516,15 @@ function App() {
         {(cv) => (
           <Dialog title="Value" subtitle={cv().col} size="md" noAutoFocus onClose={() => setCellView(null)}>
             <Show when={cv().val !== null} fallback={<div class="null" style={{ padding: "8px 0" }}>NULL</div>}>
-              <pre class="value-view">{cv().val}</pre>
+              {/* ui/grid-qol: JSON is shown pretty-printed; Copy still writes the raw value. */}
+              <Show when={prettyJson(cv().val!)} fallback={<pre class="value-view">{cv().val}</pre>}>
+                {(pretty) => (
+                  <>
+                    <div class="value-kind">JSON</div>
+                    <pre class="value-view">{pretty()}</pre>
+                  </>
+                )}
+              </Show>
             </Show>
             <div class="form-actions">
               <button class="ghost" onClick={() => setCellView(null)}>Close</button>
