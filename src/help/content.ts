@@ -828,7 +828,23 @@ export const TOPICS: Topic[] = [
         "items": [
           "**Resize** — drag the header edge, 48–900 px. Double-click it or use *Autofit column* to size to visible content.",
           "**Reorder** — drag a header label; a bar marks the slot, Escape cancels. Display-only.",
-          "**Hide** — header right-click → *Hide column*; restore with *Show all columns*. Export is unaffected; grid copies follow the display."
+          "**Hide** — header right-click → *Hide column*; restore with *Show all columns*. Export is unaffected; grid copies follow the display.",
+          "**Freeze first column** — header right-click. The first displayed column stays at the left edge while the rest scroll.",
+          "**Show / hide row numbers** — header right-click. The gutter still selects rows when the numbers are off."
+        ]
+      },
+      {
+        "k": "h",
+        "text": "Column types and cell rendering",
+        "id": "types"
+      },
+      {
+        "k": "list",
+        "items": [
+          "Each header carries a small type badge. A solid badge is the driver's type; a dotted one is guessed from the loaded values.",
+          "Numeric columns align right on tabular figures. Booleans render as a glyph plus TRUE/FALSE. NULL follows the *NULL cells show* setting.",
+          "Values over 300 characters are cut in the cell with `…`; hover for the head of the value, or open **View value…** for all of it.",
+          "Rendering never changes the data: copy, export and the value viewer use the raw driver text."
         ]
       },
       {
@@ -945,8 +961,12 @@ export const TOPICS: Topic[] = [
             "does": "Move by one viewport of rows"
           },
           {
+            "combo": "Enter",
+            "does": "Edit the focused cell, or open its value"
+          },
+          {
             "combo": "Escape",
-            "does": "Collapse the selection to the focused cell"
+            "does": "Close the find bar, else collapse the selection to the focused cell"
           },
           {
             "combo": "Mod-a",
@@ -966,8 +986,70 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "[[kbd:Mod-c]] copies TSV. The cell menu adds **Copy as CSV / JSON / Markdown**, *Copy cell value*, and *Copy column*.",
-          "Copy runs the same formatter as Export, so clipboard bytes match the file. See [[topic:import-export|Import & export]]."
+          "[[kbd:Mod-c]] copies TSV. The cell menu's **Copy as…** offers TSV, CSV, JSON, Markdown, SQL INSERT, and column names; it also has *Copy cell value* and *Copy column*.",
+          "SQL INSERT names the edit target table when the result has one, `exported` otherwise, and uses the connected engine's identifier and literal syntax.",
+          "Copy runs the same formatter as Export, so clipboard bytes match the file. See [[topic:import-export|Import & export]].",
+          "Copy caps at 1,000,000 cells and 8,388,608 characters; past that the status line points to Export."
+        ]
+      },
+      {
+        "k": "h",
+        "text": "Find in loaded rows",
+        "id": "find"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Find** in the result toolbar, or [[kbd:Mod-f]] with the grid focused, opens a bar above the header labelled *Find (loaded rows)*.",
+          "It matches text case-insensitively across the rows already in memory. It never re-runs the query — for a server-side match use the filter builder.",
+          "Matches are highlighted, the current one framed. [[kbd:Enter]] is the next match, [[kbd:Shift-Enter]] the previous, [[kbd:Escape]] closes.",
+          "The counter reads `3 of 128`. A `+` means the scan stopped at its ceiling of 5,000 matches or 2,000,000 cells."
+        ]
+      },
+      {
+        "k": "keys",
+        "rows": [
+          {
+            "action": "findInResults",
+            "does": "Find text in the loaded rows"
+          }
+        ]
+      },
+      {
+        "k": "h",
+        "text": "Record view",
+        "id": "record-view"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Record** in the result toolbar docks a panel showing the focused row as a name/value list, one field per line with its type badge.",
+          "**‹** and **›**, or [[kbd:Alt-ArrowUp]] / [[kbd:Alt-ArrowDown]], step rows. Moving the focused cell in the grid updates the panel.",
+          "Where the grid is editable the fields are editable: [[kbd:Enter]] commits into the same pending-change overlay, [[kbd:Escape]] restores the value. See [[topic:grid-editing|Editing data in the grid]].",
+          "The panel lists the first 200 displayed columns."
+        ]
+      },
+      {
+        "k": "keys",
+        "rows": [
+          {
+            "action": "toggleRecordView",
+            "does": "Show or hide the record view"
+          }
+        ]
+      },
+      {
+        "k": "h",
+        "text": "Status bar",
+        "id": "status-bar"
+      },
+      {
+        "k": "list",
+        "items": [
+          "The right of the status bar shows the focused cell as `R n, C n`, and the size of a multi-cell selection.",
+          "When every non-NULL value in the selection is a number it adds Sum, Avg, Min, Max and Count, computed over loaded rows only.",
+          "Aggregates cover up to 1,000,000 cells and are computed after a short pause, so dragging a large range stays smooth.",
+          "The last run's duration sits at the right of the result toolbar, and moves to the status bar while the results panel is collapsed."
         ]
       },
       {
@@ -979,7 +1061,8 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "NULLs render as a dimmed `NULL`, a dash, or empty, per the *NULL cells show* setting.",
-          "**View value…** — the context menu, double-click on a non-editable grid, or [[kbd:Mod]]+double-click on an editable one — opens the full raw cell.",
+          "**View value…** — the context menu, double-click on a non-editable grid, [[kbd:Enter]] on the focused cell, or [[kbd:Mod]]+double-click on an editable one — opens the full raw cell.",
+          "A value that parses as a JSON object or array is shown pretty-printed under a `JSON` label. **Copy** still writes the raw value.",
           "A recognized `EXPLAIN` result adds a **Plan / Grid** toggle — see [[topic:plans|Plan visualization]]."
         ]
       },
@@ -1043,7 +1126,8 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "Double-click a cell to edit; [[kbd:Mod]]+double-click keeps *View value*. With a cell selected, [[kbd:Enter]] or [[kbd:F2]] opens the editor.",
-          "Boolean columns get a **TRUE / FALSE** dropdown, plus `<null>` when nullable. Re-picking the original reverts the edit."
+          "Boolean columns get a **TRUE / FALSE** dropdown, plus `<null>` when nullable. Re-picking the original reverts the edit.",
+          "The [[topic:results|record view]] edits the same row field by field, through the same pending overlay and the same column rules."
         ]
       },
       {
@@ -2713,6 +2797,14 @@ export const TOPICS: Topic[] = [
           {
             "action": "openFilterBuilder",
             "does": "Open the filter builder for the current result"
+          },
+          {
+            "action": "findInResults",
+            "does": "Find text in the loaded rows"
+          },
+          {
+            "action": "toggleRecordView",
+            "does": "Show or hide the record view beside the grid"
           },
           {
             "action": "format",
