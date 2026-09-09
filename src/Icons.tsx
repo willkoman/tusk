@@ -72,7 +72,19 @@ export type IconName =
   | "bolt"
   | "help"
   | "panelLeft"
-  | "panelBottom";
+  | "panelBottom"
+  | "alert"
+  // Direction matters in a menu: the same download arrow used to mark export,
+  // import and backup, so the icon column actively misled.
+  | "import"
+  | "export"
+  | "archive"
+  | "save"
+  | "paste"
+  | "minus"
+  | "more"
+  | "chevronDown"
+  | "chevronRight";
 
 export function Icon(props: { name: IconName }): JSX.Element {
   switch (props.name) {
@@ -142,6 +154,26 @@ export function Icon(props: { name: IconName }): JSX.Element {
       return svg("currentColor", <><circle cx="12" cy="12" r="9" /><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 2.6-3 4" /><path d="M12 17.5h.01" /></>);
     case "panelLeft":
       return svg("currentColor", <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16" /></>);
+    case "alert":
+      return svg("currentColor", <><path d="M10.3 3.9 2.4 17.5A2 2 0 0 0 4.1 20.5h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" /><path d="M12 9v4" /><path d="M12 17h.01" /></>);
+    case "import":
+      return svg("currentColor", <><path d="M12 3v12M7 10l5 5 5-5" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></>);
+    case "export":
+      return svg("currentColor", <><path d="M12 15V3M7 8l5-5 5 5" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></>);
+    case "archive":
+      return svg("currentColor", <><rect x="3" y="4" width="18" height="4" rx="1" /><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8" /><path d="M10 12h4" /></>);
+    case "save":
+      return svg("currentColor", <><path d="M5 3h11l3 3v15H5z" /><path d="M8 3v6h7V3" /><path d="M8 21v-6h8v6" /></>);
+    case "paste":
+      return svg("currentColor", <><rect x="7" y="4" width="10" height="16" rx="2" /><path d="M10 4V3h4v1" /><path d="M10 11h4M10 15h4" /></>);
+    case "minus":
+      return svg("currentColor", <path d="M5 12h14" />);
+    case "more":
+      return svg("currentColor", <><circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /></>);
+    case "chevronDown":
+      return svg("currentColor", <path d="m6 9 6 6 6-6" />);
+    case "chevronRight":
+      return svg("currentColor", <path d="m9 6 6 6-6 6" />);
     case "panelBottom":
       return svg("currentColor", <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M3 14h18" /></>);
     case "eyeOff":

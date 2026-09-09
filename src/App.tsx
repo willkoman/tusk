@@ -216,6 +216,15 @@ function errMsg(e: unknown): string {
   return String(e);
 }
 
+/**
+ * One row-count string for the whole app. Grouped thousands, a real plural, and
+ * a trailing `+` only while rows are still arriving — the toolbar and the status
+ * bar used to disagree about all three in the same screenshot.
+ */
+function rowCountText(n: number, done: boolean): string {
+  return `${n.toLocaleString()}${done ? "" : "+"} row${n === 1 && done ? "" : "s"}`;
+}
+
 /** Duration as m:ss, or h:mm:ss past an hour. */
 function fmtDur(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -3384,7 +3393,7 @@ function App() {
           columns: out.columns, rows: out.rows, done: out.done, lastQuery: sqlToRun, baseQuery: base, epoch, generation: loadedGeneration,
           incomplete: "",
           rowsAreBase: mode === "base" || sqlToRun === base,
-          status: `${out.rows.length}${out.done ? "" : "+"} rows${out.note ? ` · ${out.note}` : ""}`,
+          status: `${rowCountText(out.rows.length, out.done)}${out.note ? `. ${out.note}` : ""}`,
           transactionId: transactionOpen(out.transaction) ? out.transaction.id : null,
           transactionRevision: out.transaction.revision,
           transactionStale: "",
@@ -3852,7 +3861,7 @@ function App() {
         // intercept. Never present the partial rows as the full result.
         patchResult(id, { rows: merged, ...interruptedResult({ rows: merged, done: false }, "Another database action closed the result stream") });
       } else {
-        patchResult(id, { rows: merged, done: r.done, status: `${merged.length}${r.done ? "" : "+"} rows` });
+        patchResult(id, { rows: merged, done: r.done, status: rowCountText(merged.length, r.done) });
       }
       if (r.done) {
         rt.cursorOwner = null;
@@ -4483,7 +4492,7 @@ function App() {
       if (!connectionOpen(c) || !originCurrent(origin)) return { ok: false, error: "Connection or tab changed" };
       if (origin.tabId) {
         if (!resultsOpen()) { setResultsOpen(true); persistLayout(); }
-        patchResult(origin.tabId, { status: out.kind === "exec" ? out.message : `${out.rows.length}${out.done ? "" : "+"} rows` });
+        patchResult(origin.tabId, { status: out.kind === "exec" ? out.message : rowCountText(out.rows.length, out.done) });
       }
       await loadSchema(c);
       return { ok: true };
@@ -4744,7 +4753,7 @@ function App() {
 
     const copyDdl: MenuItem[] = [
       { label: "Copy DDL", icon: "fileCode", onClick: () => copyDDL(n, false) },
-      { label: "Copy DDL → editor", icon: "fileCode", onClick: () => copyDDL(n, true) },
+      { label: "Copy DDL to editor", icon: "fileCode", onClick: () => copyDDL(n, true) },
     ];
     const items: MenuItem[] = [];
 
@@ -4755,8 +4764,8 @@ function App() {
           { label: "Select all rows", icon: "play", onClick: () => runTable(s!, n.name) },
           { label: "Filter rows…", icon: "search", onClick: () => void filterTable(s!, n.name) },
           { sep: true },
-          { label: "Export table…", icon: "download", onClick: () => void openTableExport(s!, n.name) },
-          { label: "Import data into table…", icon: "download", ...importGate(canInsert(s!, n.name), `Requires INSERT on ${n.name}`), onClick: () => openImport({ schema: s!, name: n.name }) },
+          { label: "Export table…", icon: "export", onClick: () => void openTableExport(s!, n.name) },
+          { label: "Import data into table…", icon: "import", ...importGate(canInsert(s!, n.name), `Requires INSERT on ${n.name}`), onClick: () => openImport({ schema: s!, name: n.name }) },
           { sep: true },
           { label: "Modify table…", icon: "edit", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openModify(n) },
           { label: "Add column…", icon: "plus", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "addColumn", ctx: n }) },
@@ -4767,10 +4776,7 @@ function App() {
           { label: "Duplicate…", icon: "duplicate", ...gate(canCreateInSchema(s!), `Requires CREATE on schema ${s}`), onClick: () => setActiveDialog({ kind: "duplicate", title: `Duplicate ${n.name}`, defaultName: `${n.name}_copy`, build: (nn, wd) => ddl.duplicateTable(s!, n.name, nn, wd) }) },
           { label: "Edit comment…", icon: "comment", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), ...engineCan(dcaps().comments !== "none", "comment on a table"), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.commentOnTable(s!, n.name, t) }) },
           { sep: true },
-          { label: dcaps().truncate ? "Truncate…" : "Delete all rows…", icon: "eraser", danger: true, ...gate(canTruncate(s!, n.name), `Requires TRUNCATE or ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: dcaps().truncate ? "Truncate table" : "Delete all rows", subtitle: `${s}.${n.name}`, primaryLabel: dcaps().truncate ? "Truncate" : "Delete all rows", lead: "Every row goes. The table and its structure stay.", facts: dangerFacts("Table", s, n.name), showCascade: dcaps().truncateOptions, showRestartIdentity: dcaps().truncateOptions, build: (o) => ddl.truncate(s!, n.name, o) }) },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop table", subtitle: `${s}.${n.name}`, primaryLabel: "Drop table", lead: "The table and every row in it go. This cannot be undone.", facts: dangerFacts("Table", s, n.name), confirmName: n.name, showCascade: true, build: (o) => ddl.dropRelation("table", s!, n.name, o.cascade) }) },
-          { sep: true },
-          { label: "Backup table…", icon: "download", onClick: () => openBackup({ scope: "tables", schemas: [], tables: [{ schema: s!, name: n.name }], suggestedName: n.name }) },
+          { label: "Backup table…", icon: "archive", onClick: () => openBackup({ scope: "tables", schemas: [], tables: [{ schema: s!, name: n.name }], suggestedName: n.name }) },
           { sep: true },
           { label: "Generate SELECT", icon: "code", onClick: () => generate(n, "select") },
           { label: "Generate INSERT", icon: "code", onClick: () => generate(n, "insert") },
@@ -4782,6 +4788,9 @@ function App() {
           ...copyDdl,
           copyName,
           copyQual,
+          { sep: "danger" },
+          { label: dcaps().truncate ? "Truncate…" : "Delete all rows…", icon: "eraser", danger: true, ...gate(canTruncate(s!, n.name), `Requires TRUNCATE or ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: dcaps().truncate ? "Truncate table" : "Delete all rows", subtitle: `${s}.${n.name}`, primaryLabel: dcaps().truncate ? "Truncate" : "Delete all rows", lead: "Every row goes. The table and its structure stay.", facts: dangerFacts("Table", s, n.name), showCascade: dcaps().truncateOptions, showRestartIdentity: dcaps().truncateOptions, build: (o) => ddl.truncate(s!, n.name, o) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop table", subtitle: `${s}.${n.name}`, primaryLabel: "Drop table", lead: "The table and every row in it go. This cannot be undone.", facts: dangerFacts("Table", s, n.name), confirmName: n.name, showCascade: true, build: (o) => ddl.dropRelation("table", s!, n.name, o.cascade) }) },
         );
         break;
       case "view":
@@ -4790,7 +4799,7 @@ function App() {
         items.push(
           { label: "Select all rows", icon: "play", onClick: () => runTable(s!, n.name) },
           { label: "Filter rows…", icon: "search", onClick: () => void filterTable(s!, n.name) },
-          { label: "Export…", icon: "download", onClick: () => void openTableExport(s!, n.name, kw) },
+          { label: "Export…", icon: "export", onClick: () => void openTableExport(s!, n.name, kw) },
         );
         if (kw === "matview")
           items.push(
@@ -4838,8 +4847,8 @@ function App() {
             ? [{ label: "Schema diagram…", icon: "link" as const, onClick: () => openDdlGraph(n.name, null, "table") }, { sep: true as const }]
             : []),
           { label: "Create table…", icon: "plus", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => setActiveDialog({ kind: "createTable", schema: n.name, tables: schema() }) },
-          { label: "Import file as new table…", icon: "download", ...importGate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => openImport({ schema: n.name, name: "" }) },
-          { label: "Export tables…", icon: "download", onClick: () => openTablesExport(n.name) },
+          { label: "Import file as new table…", icon: "import", ...importGate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => openImport({ schema: n.name, name: "" }) },
+          { label: "Export tables…", icon: "export", onClick: () => openTablesExport(n.name) },
           { label: "Rename…", icon: "edit", ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), ...engineCan(dcaps().renameSchema, "rename a schema"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename schema ${n.name}`, current: n.name, build: (nn) => ddl.renameSchema(n.name, nn) }) },
           { sep: true },
           {
@@ -4865,7 +4874,7 @@ function App() {
               }),
           },
           { sep: true },
-          { label: "Backup schema…", icon: "download", onClick: () => openBackup({ scope: "schemas", schemas: [n.name], tables: [], suggestedName: n.name }) },
+          { label: "Backup schema…", icon: "archive", onClick: () => openBackup({ scope: "schemas", schemas: [n.name], tables: [], suggestedName: n.name }) },
           { sep: true },
           copyName,
         );
@@ -4875,15 +4884,15 @@ function App() {
         const cur = tree()?.database === n.name;
         items.push(
           { label: "Create schema…", icon: "plus", ...gate(canCreateSchema(), "Requires CREATE on the database"), ...engineCan(dcaps().createSchema, "create a schema"), onClick: () => setActiveDialog({ kind: "createSchema" }) },
-          { label: "Import file as new table…", icon: "download", ...importGate(!pEnforced() || canCreateSchema() || schema().length > 0, "Requires CREATE somewhere in this database"), onClick: () => openImport(null) },
-          { label: "Export tables…", icon: "download", onClick: () => openTablesExport(null) },
+          { label: "Import file as new table…", icon: "import", ...importGate(!pEnforced() || canCreateSchema() || schema().length > 0, "Requires CREATE somewhere in this database"), onClick: () => openImport(null) },
+          { label: "Export tables…", icon: "export", onClick: () => openTablesExport(null) },
 
           // Same gate() as every other Explorer DDL item (manual-transaction freeze,
           // read-only, driver support) — DROP DATABASE least of all may skip the freeze.
           { label: "Drop database…", icon: "trash", danger: true, ...gate(!pEnforced() || isSuper(), "Requires database ownership (or superuser)"), ...engineCan(dcaps().dropDatabase, "drop a database from here"), ...(cur ? { disabled: true, title: "Can't drop the connected database" } : {}), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop database", subtitle: n.name, primaryLabel: "Drop database", lead: "Every schema, table and row in this database goes. This cannot be undone.", facts: { kind: "Database", name: n.name }, confirmName: n.name, build: () => ddl.dropDatabase(n.name) }) },
           { sep: true },
           // Backup/restore run against the CONNECTED database — offer them only there.
-          { label: "Backup database…", icon: "download", disabled: !cur, title: cur ? undefined : "Connect to this database to back it up", onClick: () => openBackup({ scope: "database", schemas: [], tables: [], suggestedName: n.name }) },
+          { label: "Backup database…", icon: "archive", disabled: !cur, title: cur ? undefined : "Connect to this database to back it up", onClick: () => openBackup({ scope: "database", schemas: [], tables: [], suggestedName: n.name }) },
           { label: "Restore from file…", icon: "fileCode", disabled: !cur || !!conn()?.readOnly, title: !cur ? "Connect to this database to restore into it" : conn()?.readOnly ? "Connection is read-only" : undefined, onClick: () => { setMenu(null); if (!rejectFrozenExplorer()) openRestore(); } },
           { sep: true },
           copyName,
@@ -4929,7 +4938,7 @@ function App() {
         const def = n.trigger?.def ?? "";
         items.push(
           { label: "Copy DDL", icon: "fileCode", onClick: () => copyText(def.endsWith(";") ? def : def + ";", "copied DDL") },
-          { label: "Copy DDL → editor", icon: "fileCode", onClick: () => editAsSql(def) },
+          { label: "Copy DDL to editor", icon: "fileCode", onClick: () => editAsSql(def) },
           { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop trigger", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop trigger", facts: { kind: "Trigger", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropTrigger(s!, n.table!, n.name, o.cascade) }) },
           { sep: true },
           copyName,
@@ -4961,7 +4970,7 @@ function App() {
           if (await clipWrite(selection.text) && originCurrent(origin)) api.replaceCapturedSelection(selection, "");
         } },
         { label: "Copy", icon: "copy", disabled: !hasSel, onClick: () => copyText(api.getSelection(), "copied selection") },
-        { label: "Paste", icon: "download", onClick: async () => {
+        { label: "Paste", icon: "paste", onClick: async () => {
           const origin = captureOrigin();
           const selection = api.captureSelection();
           const text = await clipRead();
@@ -5004,13 +5013,13 @@ function App() {
       y: r.bottom + 4,
       items: [
         { label: "Open…", icon: "fileCode", onClick: openFileDialog },
-        { label: "Save", icon: "download", onClick: () => void saveActiveTab() },
-        { label: "Save As…", icon: "download", onClick: () => void saveAsActiveTab() },
+        { label: "Save", icon: "save", onClick: () => void saveActiveTab() },
+        { label: "Save As…", icon: "save", onClick: () => void saveAsActiveTab() },
         { sep: true },
         { label: "Format", icon: "edit", onClick: () => editorApi()?.format() },
         { label: "Find", icon: "search", onClick: () => editorApi()?.openSearch() },
         { sep: true },
-        { label: "Backup…", icon: "download", onClick: () => openBackup({ scope: "database", schemas: [], tables: [], suggestedName: tree()?.database || "backup" }) },
+        { label: "Backup…", icon: "archive", onClick: () => openBackup({ scope: "database", schemas: [], tables: [], suggestedName: tree()?.database || "backup" }) },
         { label: "Restore from file…", icon: "fileCode", disabled: !!conn()?.readOnly, title: conn()?.readOnly ? "Connection is read-only" : undefined, onClick: () => { setMenu(null); if (!rejectFrozenExplorer()) openRestore(); } },
         { sep: true },
         ...explainMenuItems(),
@@ -5170,7 +5179,7 @@ function App() {
             <div class="reopen-bar">
               <span>{pendingReopen().length} saved connection{pendingReopen().length === 1 ? "" : "s"} from your last session {pendingReopen().length === 1 ? "is" : "are"} not open.</span>
               <button class="ghost" disabled={connecting()} onClick={() => void reopenLastSession()}>Reopen last session</button>
-              <button class="icon" title="Forget" onClick={() => { setReopenable([]); persistLayout(); }}>&#10005;</button>
+              <button class="icon" title="Forget" onClick={() => { setReopenable([]); persistLayout(); }}><Icon name="close" /></button>
             </div>
           </Show>
             <div class="connect-layout">
@@ -5214,7 +5223,7 @@ function App() {
                     </div>
                   </Show>
                 </div>
-                <button class="ghost full" onClick={newProfile}>＋ New connection</button>
+                <button class="ghost full" onClick={newProfile}><Icon name="plus" /> New connection</button>
                 <div class="connect-foot">Right-click a connection for more actions. <kbd class="kb-kbd">F1</kbd> opens the manual.</div>
               </div>
   
@@ -5397,7 +5406,7 @@ function App() {
                         class="conn-close"
                         title={`Disconnect ${labelOf(id)}`}
                         onClick={(e) => { e.stopPropagation(); void disconnectConnection(id); }}
-                      >&#215;</button>
+                      ><Icon name="close" /></button>
                     </Show>
                   </span>
                 );
@@ -5408,14 +5417,14 @@ function App() {
               title={connectionLimitError(connections()) || `Open another connection (${displayKey(effectiveKey("newConnection", keys()))})`}
               disabled={!!connectionLimitError(connections())}
               onClick={() => openConnectScreen()}
-            >&#65291;</button>
+            ><Icon name="plus" /></button>
           </div>
           <span class="meta">{driverLabel(connectionKind())} {conn()?.version ?? ""}</span>
           <Show when={conn()?.readOnly}>
             <span class="badge badge-ro" title="Writes & DDL are blocked"><Icon name="lock" /> Read-only</span>
           </Show>
           <Show when={caps()?.manualTransactions !== false && !transactionOpen(transaction())}>
-            <button class="ghost tx-start" disabled={running()} onClick={openTransactionStartMenu} title="Begin or configure a manual transaction">Transaction ▾</button>
+            <button class="ghost tx-start" disabled={running()} onClick={openTransactionStartMenu} title="Begin or configure a manual transaction">Transaction <Icon name="chevronDown" /></button>
           </Show>
           <span class="spacer" />
           <button class="icon" classList={{ active: sidebarOpen() }} title={`${sidebarOpen() ? "Hide" : "Show"} explorer (${displayKey(effectiveKey("toggleSidebar", keys()))})`} onClick={toggleSidebar}><Icon name="panelLeft" /></button>
@@ -5516,7 +5525,7 @@ function App() {
                 />
               </div>
               <Show when={treeFilter()}>
-                <button class="icon" title="Clear" onClick={() => setTreeFilter("")}>✕</button>
+                <button class="icon" title="Clear" onClick={() => setTreeFilter("")}><Icon name="close" /></button>
               </Show>
             </div>
             <div
@@ -5673,14 +5682,14 @@ function App() {
                       </Show>
                       <Show when={stateOf(t.connectionId)?.running && stateOf(t.connectionId)?.runningTabId === t.id}><span class="spinner-sm tab-spin" title="Query running" /></Show>
                       <Show when={stateOf(t.connectionId)?.transaction.owner === t.id}><span class="tab-tx" title={`Owns ${stateOf(t.connectionId)?.transaction.id ?? "manual transaction"}`}>TX</span></Show>
-                      <Show when={t.dirty}><span class="tab-dot" title="Unsaved changes">●</span></Show>
+                      <Show when={t.dirty}><span class="tab-dot" title="Unsaved changes" /></Show>
                       <Show when={!t.pinned}>
-                        <button class="tab-close" title="Close (⌘/Ctrl+W)" onClick={(e) => { e.stopPropagation(); closeTab(t.id); }}>×</button>
+                        <button class="tab-close" title="Close tab" onClick={(e) => { e.stopPropagation(); closeTab(t.id); }}><Icon name="close" /></button>
                       </Show>
                     </div>
                   )}
                 </For>
-                <button class="tab-new" title="New tab (⌘/Ctrl+T)" onClick={openNewTab}>＋</button>
+                <button class="tab-new" title="New tab" onClick={openNewTab}><Icon name="plus" /></button>
                 {/* Insertion bar: placed with translateX so it slides between slots
                     (`.dnd-bar`, 120 ms, disabled under prefers-reduced-motion). The
                     slot is pin-clamped so the bar only ever promises a legal drop. */}
@@ -5699,7 +5708,7 @@ function App() {
                 title={`Show all tabs (${displayKey(effectiveKey("showAllTabs", keys()))})`}
                 aria-label="Show all tabs"
                 onClick={() => setAllTabsOpen(true)}
-              >⌄</button>
+              ><Icon name="chevronDown" /></button>
               </div>
               <div class="toolbar">
                 <button
@@ -5721,8 +5730,8 @@ function App() {
                   {running()
                     ? (cancelling() ? <><span class="spinner-sm" />Cancelling…</>
                       : caps()?.cancelQuery === false ? <><span class="spinner-sm" />Running {fmtDur(runMs())}</>
-                      : <>✕ Cancel {fmtDur(runMs())}</>)
-                    : transaction().state === "lost" ? "Reconnect required" : !activeDatabaseAllowed() ? "Go to transaction" : "Run ▶"}
+                      : <><Icon name="close" /> Cancel {fmtDur(runMs())}</>)
+                    : transaction().state === "lost" ? "Reconnect required" : !activeDatabaseAllowed() ? "Go to transaction" : <>Run <Icon name="play" /></>}
                 </button>
                 <button class="ghost tb-text" onClick={openFileDialog}>Open</button>
                 <button class="ghost tb-text" onClick={() => void saveActiveTab()}>Save</button>
@@ -5737,9 +5746,9 @@ function App() {
                     setMenu({ x: r.left, y: r.bottom + 4, items: explainMenuItems() });
                   }}
                 >
-                  Explain ▾
+                  Explain <Icon name="chevronDown" />
                 </button>
-                <button class="ghost tb-more" title="More actions" onClick={openToolbarOverflow}>⋯</button>
+                <button class="ghost tb-more" title="More actions" onClick={openToolbarOverflow}><Icon name="more" /></button>
                 <span class="hint">{displayKey(effectiveKey("run", keys())) || "unbound"} runs selection or all</span>
                 <span class="spacer" />
                 <Show when={caps()?.searchPath !== false}>
@@ -5808,7 +5817,7 @@ function App() {
                   </Show>
                   <Show when={editCtx().editable || pendingCount(tabPending()) > 0}>
                     <Show when={pendingCount(tabPending()) > 0}>
-                      <span class="sb-pending" title="Uncommitted grid changes">✎ {pendingCount(tabPending())} change{pendingCount(tabPending()) === 1 ? "" : "s"}</span>
+                      <span class="sb-pending" title="Unapplied grid changes"><Icon name="edit" /> {pendingCount(tabPending())} change{pendingCount(tabPending()) === 1 ? "" : "s"}</span>
                       <button class="ghost export-btn sb-commit" onClick={openCommit} disabled={!editCtx().editable || running()} title={editCtx().editable ? "Preview & run the change script" : editCtx().reason}>{activeOwnsTransaction() ? "Apply…" : "Commit…"}</button>
                       <button class="ghost export-btn" onClick={discardPending} disabled={running()}>Discard</button>
                     </Show>
@@ -5862,7 +5871,7 @@ function App() {
               <Show when={!(planMemo() && resultView() === "plan") && columns().length > 0}>
                 <FilterBar
                   tree={() => gridView().filters}
-                  rowText={() => `${rows().length.toLocaleString()}${done() ? "" : "+"} row${rows().length === 1 && done() ? "" : "s"}`}
+                  rowText={() => rowCountText(rows().length, done())}
                   disabled={() => !canFilter()}
                   onEdit={() => openFilterBuilder()}
                   onRemove={(id) => onSortFilter(gridView().sorts, removeNode(gridView().filters, id), "filter")}
@@ -5964,7 +5973,7 @@ function App() {
                   onClick={() => setSlackNotice("")}
                 >
                   <span class="status-notice-text">{slackNotice()}</span>
-                  <span class="status-notice-x" aria-hidden="true">✕</span>
+                  <span class="status-notice-x" aria-hidden="true"><Icon name="close" /></span>
                 </button>
               </Show>
               <Show when={slackStatus().running || slackStopped()}>
@@ -6088,9 +6097,9 @@ function App() {
         </Show>
 
         <Show when={confirmAnalyze()}>
-          <Dialog title="Explain Analyze" size="sm" noAutoFocus onClose={() => setConfirmAnalyze(null)}>
+          <Dialog title="Explain Analyze" titleBadge={prodBadge()} size="sm" noAutoFocus onClose={() => setConfirmAnalyze(null)}>
             <div class="confirm-note">
-              EXPLAIN ANALYZE <b>executes</b> the statement, and this statement modifies data.
+              This statement modifies data, and Explain Analyze runs it to measure it.
             </div>
             <div class="form-actions">
               <button class="ghost" onClick={() => setConfirmAnalyze(null)}>Cancel</button>
@@ -6100,7 +6109,7 @@ function App() {
                 if (!originCurrent(binding.origin)) return;
                 runParameterized(binding.sql, (substituted) => void executeQuery(substituted, "", "base", false, binding.sql));
               }}>
-                Run it
+                Modify data and explain
               </button>
             </div>
           </Dialog>
@@ -6268,12 +6277,12 @@ function App() {
         </Show>
         <Show when={confirmClose()}>
           {(cc) => (
-            <Dialog title="Uncommitted changes" size="sm" noAutoFocus onClose={() => setConfirmClose(null)}>
+            <Dialog title="Unsaved work in this tab" size="sm" noAutoFocus onClose={() => setConfirmClose(null)}>
               <p class="confirm-text">
                 “{tabs().find((t) => t.id === cc().tabId)?.title}” has
                 {cc().dirty ? " unsaved editor changes" : ""}
                 {cc().dirty && cc().pending ? " and" : ""}
-                {cc().pending ? ` ${cc().pending} uncommitted grid change${cc().pending === 1 ? "" : "s"}` : ""}.
+                {cc().pending ? ` ${cc().pending} unapplied grid change${cc().pending === 1 ? "" : "s"}` : ""}.
                 {cc().pending ? " Grid changes are discarded when this tab closes." : ""}
               </p>
               <div class="form-actions">
@@ -6497,14 +6506,14 @@ function App() {
           connect screen AND inside the "Open another connection" modal. */}
       <Show when={confirmDeleteProfile()}>
         {(p) => (
-          <Dialog title="Delete saved connection?" size="sm" noAutoFocus onClose={() => setConfirmDeleteProfile(null)}>
+          <Dialog title="Delete saved connection" size="sm" noAutoFocus onClose={() => setConfirmDeleteProfile(null)}>
             <p class="confirm-text">
               Delete <b>{p().name || p().dbname || p().host}</b> from your saved connections?
               {p().save_password ? " Its password is removed from the OS keychain too." : ""} This
               can't be undone.
             </p>
             <div class="form-actions">
-              <button class="ghost" onClick={() => setConfirmDeleteProfile(null)}>Keep it</button>
+              <button class="ghost" onClick={() => setConfirmDeleteProfile(null)}>Cancel</button>
               <button class="btn-danger" onClick={() => void deleteProfile(p().id)}>Delete connection</button>
             </div>
           </Dialog>

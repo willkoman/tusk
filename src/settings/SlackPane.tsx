@@ -448,6 +448,7 @@ export function SlackPane(props: {
             <span>{cfg().enabled ? "On" : "Off"}</span>
             <input
               type="checkbox"
+              class="switch"
               role="switch"
               checked={cfg().enabled}
               disabled={busy() || (!cfg().enabled && !tokensReady())}

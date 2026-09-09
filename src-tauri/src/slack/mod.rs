@@ -215,8 +215,9 @@ pub fn arm_autostart(app: &AppHandle) {
     let reason = match autostart_label(app) {
         Some(name) => format!("Slack bot is waiting for connection “{name}” to open."),
         None => {
-            "Slack autostart is on with no saved connection bound. Pick one in Settings → Slack."
-                .to_string()
+            // Shown in the statusbar AND on the Settings → Slack card itself, so it
+            // states the fact rather than sending the reader where they already are.
+            "Slack autostart is on and no saved connection is bound to the bot.".to_string()
         }
     };
     runtime.set_status("disconnected", Some(reason));

@@ -611,7 +611,7 @@ export function AiPanel(props: {
             }
             if (e.key === "Escape" && streaming()) cancel();
           }}
-          placeholder={streaming() ? "Streaming… Esc to stop" : "Ask the AI… Shift+Enter for a newline"}
+          placeholder={streaming() ? "Streaming… Esc to stop" : "Ask about this database"}
         />
         {/* Send doubles as Stop while streaming — one button, never both. `run cancel` is
             the app's existing cancel-while-busy style (solid --danger); don't invent one. */}

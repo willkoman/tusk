@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ErrorBoundary, Show, createEffect, createSignal, onCleanup, onMount, type JSX } from "solid-js";
 import { crashConsent, setCrashConsent } from "./store";
+import { Icon } from "./Icons";
 
 const SUPPORT_EMAIL = "willko@willko.dev";
 const MAX_REPORT_BYTES = 96_000;
@@ -71,17 +72,17 @@ function CrashPanel(props: { report: string; prior?: boolean; onContinue: () => 
   return (
     <div class="crash-overlay" role="alertdialog" aria-modal="true" aria-label="Tusk error report">
       <section class="crash-card">
-        <div class="crash-mark">!</div>
+        <div class="crash-mark"><Icon name="alert" /></div>
         <div>
-          <h1>{props.prior ? "Tusk stopped unexpectedly" : "Tusk hit an unexpected error"}</h1>
+          <h1>{props.prior ? "Tusk stopped unexpectedly" : "Tusk hit an error and recovered"}</h1>
           <p>
             {props.prior
-              ? "A local crash report was recovered from the previous run."
-              : "The error was contained. Report it, or try to continue."}
+              ? "A crash report was recovered from the previous run."
+              : "Report it, or try to continue."}
           </p>
         </div>
         <div class="crash-privacy">
-          Nothing is sent automatically. Connection settings, credentials, and query text are never collected intentionally. Exception messages can still contain data. Review the report before sending.
+          Reports are never sent automatically. Exception messages can contain data. Review the details before sending.
         </div>
         <details>
           <summary>Report details</summary>
@@ -91,7 +92,8 @@ function CrashPanel(props: { report: string; prior?: boolean; onContinue: () => 
         <div class="crash-actions">
           <button class="ghost" onClick={() => void copyReport()}>Copy report</button>
           <Show when={offerEmail()}>
-            <button class="ghost" onClick={() => void emailReport()}>Email {SUPPORT_EMAIL}</button>
+            <span class="crash-hint">{SUPPORT_EMAIL}</span>
+            <button class="ghost" onClick={() => void emailReport()}>Email the report</button>
           </Show>
           <button class="run" onClick={props.onContinue}>{props.prior ? "Dismiss" : "Try to continue"}</button>
         </div>

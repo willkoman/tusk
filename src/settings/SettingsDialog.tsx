@@ -73,7 +73,7 @@ export function SettingsDialog(props: {
                 <input type="checkbox" checked={p().autoFold} onChange={(e) => props.update({ autoFold: e.currentTarget.checked })} />
               </label>
               <label class="settings-row">
-                <span>Server-side lint (PREPARE-only)</span>
+                <span>Check statements against the server</span>
                 <input type="checkbox" checked={p().serverLint} onChange={(e) => props.update({ serverLint: e.currentTarget.checked })} />
               </label>
               <label class="settings-row" title={props.connected ? "The dialect follows the connected driver" : undefined}>

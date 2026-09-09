@@ -2,8 +2,10 @@ import { For, Show, createEffect, createSignal, onCleanup, onMount } from "solid
 import { Icon, type IconName } from "./Icons";
 
 export type MenuItem =
-  | { sep: true }
-  | { label: string; icon?: IconName; danger?: boolean; disabled?: boolean; title?: string; valid?: () => boolean; onClick: () => void };
+  /** `sep: "danger"` is the wider rule before a destructive group: extra space
+   *  above it, so a mis-aimed click near a benign item cannot land on Drop. */
+  | { sep: true | "danger" }
+  | { label: string; icon?: IconName; danger?: boolean; disabled?: boolean; title?: string; key?: string; valid?: () => boolean; onClick: () => void };
 
 export type MenuState = { x: number; y: number; items: MenuItem[]; scope?: string } | null;
 
@@ -93,7 +95,7 @@ export function ContextMenu(props: {
       <For each={props.items}>
         {(it) =>
           "sep" in it ? (
-            <div class="ctx-sep" role="separator" />
+            <div class="ctx-sep" classList={{ "ctx-sep-danger": it.sep === "danger" }} role="separator" />
           ) : (
               <div
                 class="ctx-item"
@@ -110,6 +112,7 @@ export function ContextMenu(props: {
             >
               <span class="ctx-icon"><Show when={it.icon}>{(n) => <Icon name={n()} />}</Show></span>
               <span class="ctx-text">{it.label}</span>
+              <Show when={it.key}><span class="ctx-key">{it.key}</span></Show>
             </div>
           )
         }

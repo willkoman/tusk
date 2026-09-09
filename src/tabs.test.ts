@@ -41,7 +41,7 @@ describe("interruptedResult", () => {
     expect(patch).toEqual({
       done: true,
       incomplete: "Import closed the result stream",
-      status: "2 rows loaded. Import closed the result stream. Re-run for the full result.",
+      status: "2 rows loaded. Re-run for all rows.",
     });
   });
 

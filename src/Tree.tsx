@@ -148,6 +148,9 @@ export function Tree(props: {
     icon: JSX.Element;
     label: string;
     detail?: string;
+    /** Fixed-width badges pinned right. The type truncates; these never do — a
+     *  column whose NOT NULL marker vanished at 270px was unrecoverable. */
+    flags?: { text: string; kind?: string; title?: string }[];
     title?: string;
     muted?: boolean;
     header?: boolean;
@@ -164,6 +167,15 @@ export function Tree(props: {
         class="tw-row"
         classList={{ muted: p.muted, selected: p.selected, "is-header": p.header }}
         title={p.title}
+        tabindex={p.muted ? undefined : 0}
+        role="treeitem"
+        aria-expanded={p.expandable ? !!p.open : undefined}
+        onKeyDown={(e) => {
+          if (e.key !== "Enter" && e.key !== " ") return;
+          e.preventDefault();
+          p.onSelect?.();
+          p.expandable ? p.onToggle?.() : p.onActivate?.();
+        }}
         style={{ "padding-left": `${p.depth * 13 + 6}px`, "--d": p.depth }}
         onClick={(e) => {
           // The 2nd click of a double-click also fires `click` — without this
@@ -186,9 +198,29 @@ export function Tree(props: {
         <Show when={p.detail}>
           <span class="tw-detail" classList={{ "is-count": /^\d+$/.test(p.detail!) }}>{p.detail}</span>
         </Show>
+        <Show when={p.flags?.length}>
+          <span class="tw-flags">
+            <For each={p.flags}>
+              {(f) => <span class="tw-flag" classList={{ [f.kind ?? ""]: !!f.kind }} title={f.title}>{f.text}</span>}
+            </For>
+          </span>
+        </Show>
       </div>
     );
   }
+
+  /** `timestamp with time zone` never fits the detail slot; the full type is in
+   *  the row's tooltip. */
+  const shortType = (t: string): string =>
+    t
+      .replace(/ with time zone/gi, "tz")
+      .replace(/ without time zone/gi, "")
+      .replace(/^character varying/i, "varchar")
+      .replace(/^character/i, "char")
+      .replace(/^double precision/i, "float8");
+
+  const conBadge = (kind: string): string =>
+    kind === "primary_key" ? "PK" : kind === "foreign_key" ? "FK" : kind === "unique" ? "UQ" : kind === "check" ? "CK" : kind.slice(0, 2).toUpperCase();
 
   const colTitle = (c: Column) =>
     [c.default ? `default: ${c.default}` : null, c.comment ? `comment: ${c.comment}` : null]
@@ -254,8 +286,13 @@ export function Tree(props: {
                         depth={depth + 2}
                         icon={<Icon name={c.is_pk ? "key" : c.is_fk ? "link" : "dot"} />}
                         label={c.name}
-                        detail={c.data_type + (c.nullable ? "" : " ·NN")}
-                        title={colTitle(c)}
+                        detail={shortType(c.data_type)}
+                        flags={[
+                          ...(c.is_pk ? [{ text: "PK", kind: "pk", title: "Primary key" }] : []),
+                          ...(c.is_fk ? [{ text: "FK", kind: "fk", title: "Foreign key" }] : []),
+                          ...(c.nullable ? [] : [{ text: "NN", title: "NOT NULL" }]),
+                        ]}
+                        title={[c.data_type, colTitle(c)].filter(Boolean).join("\n") || undefined}
                         selected={props.selectedKey === nodeKey({ kind: "column", schema, table: rel.name, name: c.name })}
                         onSelect={() => props.onSelect({ kind: "column", schema, table: rel.name, name: c.name, column: c })}
                         onContext={(e) => props.onContext(e, { kind: "column", schema, table: rel.name, name: c.name, column: c })}
@@ -272,7 +309,7 @@ export function Tree(props: {
                           depth={depth + 2}
                           icon={<Icon name={x.primary ? "key" : x.unique ? "hash" : "index"} />}
                           label={x.name}
-                          detail={x.primary ? "pk" : x.unique ? "unique" : ""}
+                          flags={x.primary ? [{ text: "PK", kind: "pk" }] : x.unique ? [{ text: "UQ" }] : []}
                           title={x.def}
                           selected={props.selectedKey === nodeKey({ kind: "index", schema, table: rel.name, name: x.name })}
                           onSelect={() => props.onSelect({ kind: "index", schema, table: rel.name, name: x.name })}
@@ -291,7 +328,7 @@ export function Tree(props: {
                           depth={depth + 2}
                           icon={<Icon name={conIconName(cn.kind)} />}
                           label={cn.name}
-                          detail={cn.kind.replace("_", " ")}
+                          flags={[{ text: conBadge(cn.kind), title: cn.kind.replace("_", " ") }]}
                           title={cn.def}
                           selected={props.selectedKey === nodeKey({ kind: "constraint", schema, table: rel.name, name: cn.name })}
                           onSelect={() => props.onSelect({ kind: "constraint", schema, table: rel.name, name: cn.name })}
