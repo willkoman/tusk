@@ -4,6 +4,7 @@ import { oneDark } from "@codemirror/theme-one-dark";
 import { lightTheme } from "./lightTheme";
 import { cmThemes } from "./cmThemes";
 import { type EditorPrefs } from "./types";
+import { clampLineHeight } from "../appearance";
 
 export const DEFAULT_FONT_STACK = '"JetBrains Mono","SF Mono",Menlo,Consolas,monospace';
 
@@ -35,6 +36,7 @@ export function themeFor(prefs: EditorPrefs): Extension {
       },
       ".cm-scroller": {
         fontFamily: fontStack(prefs.fontFamily),
+        lineHeight: String(clampLineHeight(prefs.lineHeight)),
       },
     }),
   ];

@@ -2,9 +2,9 @@ import { type Accessor, For, Match, Show, Switch, createSignal } from "solid-js"
 import { Dialog, type DialogSize } from "../Dialog";
 import { type EditorPrefs } from "../editor/types";
 import { type DialectId } from "../sql/dialects";
-import { THEMES } from "../themes";
 import { SlackPane, type SlackConnectionOption } from "./SlackPane";
 import { AiPane } from "./AiPane";
+import { AppearancePane } from "./AppearancePane";
 import { crashConsent, setCrashConsent } from "../store";
 
 export type SettingsTab = "editor" | "appearance" | "grid" | "plans" | "ai" | "slack" | "shortcuts" | "privacy";
@@ -19,9 +19,6 @@ const TABS: { id: SettingsTab; label: string }[] = [
   { id: "shortcuts", label: "Shortcuts" },
   { id: "privacy", label: "Privacy" },
 ];
-
-const FONT_PRESETS = ["JetBrains Mono", "Cascadia Code", "Fira Code", "SF Mono", "Menlo", "Consolas", "Courier New"];
-const ACCENT_PRESETS = ["#3b82f6", "#2dd4bf", "#a78bfa", "#f472b6", "#fb923c", "#3fb950"];
 
 /**
  * Tabbed settings modal. Every control applies live through `update` (the same
@@ -66,19 +63,7 @@ export function SettingsDialog(props: {
         <div class="settings-pane">
           <Switch>
             <Match when={tab() === "editor"}>
-              <label class="settings-row">
-                <span>Font size</span>
-                <input
-                  type="number"
-                  min="9"
-                  max="24"
-                  value={p().fontSize}
-                  onChange={(e) => {
-                    const v = Math.max(9, Math.min(24, Number(e.currentTarget.value) || 13));
-                    props.update({ fontSize: v });
-                  }}
-                />
-              </label>
+              {/* Font size and line height moved to Appearance → Editor text. */}
               <label class="settings-row">
                 <span>Word wrap</span>
                 <input type="checkbox" checked={p().wordWrap} onChange={(e) => props.update({ wordWrap: e.currentTarget.checked })} />
@@ -107,53 +92,7 @@ export function SettingsDialog(props: {
             </Match>
 
             <Match when={tab() === "appearance"}>
-              <label class="settings-row">
-                <span>Theme</span>
-                <select value={p().theme} onChange={(e) => props.update({ theme: e.currentTarget.value as EditorPrefs["theme"] })}>
-                  <optgroup label="Dark">
-                    <For each={THEMES.filter((t) => t.dark)}>{(t) => <option value={t.id}>{t.label}</option>}</For>
-                  </optgroup>
-                  <optgroup label="Light">
-                    <For each={THEMES.filter((t) => !t.dark)}>{(t) => <option value={t.id}>{t.label}</option>}</For>
-                  </optgroup>
-                  <option value="system">Follow system</option>
-                </select>
-              </label>
-              <label class="settings-row">
-                <span>Editor / grid font</span>
-                <span class="settings-inline">
-                  <input
-                    type="text"
-                    list="tusk-font-presets"
-                    placeholder="default (JetBrains Mono)"
-                    value={p().fontFamily}
-                    onChange={(e) => props.update({ fontFamily: e.currentTarget.value.trim() })}
-                  />
-                  <datalist id="tusk-font-presets">
-                    <For each={FONT_PRESETS}>{(f) => <option value={f} />}</For>
-                  </datalist>
-                  <Show when={p().fontFamily}>
-                    <button class="ghost" onClick={() => props.update({ fontFamily: "" })}>Reset</button>
-                  </Show>
-                </span>
-              </label>
-              <label class="settings-row">
-                <span>Accent color</span>
-                <span class="settings-inline">
-                  <input type="color" value={p().accent} onChange={(e) => props.update({ accent: e.currentTarget.value })} />
-                  <For each={ACCENT_PRESETS}>
-                    {(c) => (
-                      <button
-                        class="accent-swatch"
-                        classList={{ active: p().accent === c }}
-                        style={{ background: c }}
-                        title={c}
-                        onClick={() => props.update({ accent: c })}
-                      />
-                    )}
-                  </For>
-                </span>
-              </label>
+              <AppearancePane prefs={props.prefs} update={props.update} />
             </Match>
 
             <Match when={tab() === "grid"}>

@@ -131,6 +131,29 @@ export function pendingCount(p: PendingEdits | undefined): number {
   return editedRows + p.deletes.length + p.inserts.length;
 }
 
+// --- tab organisation: custom title, pin, colour tag ---
+
+/** Colour tags offered in the tab context menu. "" = untagged. */
+export const TAB_COLORS = ["red", "amber", "green", "teal", "violet", "pink"] as const;
+export type TabColor = "" | (typeof TAB_COLORS)[number];
+
+export const TAB_COLOR_LABELS: Record<Exclude<TabColor, "">, string> = {
+  red: "Red",
+  amber: "Amber",
+  green: "Green",
+  teal: "Teal",
+  violet: "Violet",
+  pink: "Pink",
+};
+
+/** Untrusted values (persisted state) resolve to "" rather than a bogus class. */
+export function normalizeTabColor(v: unknown): TabColor {
+  return (TAB_COLORS as readonly string[]).includes(String(v)) ? (v as TabColor) : "";
+}
+
+/** Longest custom title accepted (matches the persisted-title bound in store.ts). */
+export const MAX_TAB_TITLE = 200;
+
 export type Tab = {
   id: string;
   /**
@@ -139,7 +162,14 @@ export type Tab = {
    * what decides where a query runs and which dialect its SQL is built with.
    */
   connectionId: string;
+  /** Automatic title: "Untitled N", or the file basename once bound to a file. */
   title: string;
+  /** User-set title. Non-empty wins over `title` and survives a Save as. */
+  customTitle: string;
+  /** Pinned tabs hold a fixed group at the left of the strip and resist close-many. */
+  pinned: boolean;
+  /** Colour tag shown as a dot in the strip. */
+  color: TabColor;
   sql: string;
   filePath: string | null;
   dirty: boolean;
@@ -175,6 +205,9 @@ export function makeTab(init?: Partial<Tab>): Tab {
     id: `tab-${counter}`,
     connectionId: init?.connectionId ?? "",
     title: init?.title ?? `Untitled ${counter}`,
+    customTitle: init?.customTitle ?? "",
+    pinned: init?.pinned ?? false,
+    color: normalizeTabColor(init?.color),
     sql: init?.sql ?? "",
     filePath: init?.filePath ?? null,
     dirty: init?.dirty ?? false,
@@ -188,6 +221,93 @@ export function makeTab(init?: Partial<Tab>): Tab {
   };
 }
 
+// --- pure tab-organisation operations (covered by tabs.test.ts) -------------
+
+/** The title to show: the user's, or the automatic one. */
+export function tabLabel(tab: Pick<Tab, "title" | "customTitle">): string {
+  return tab.customTitle.trim() || tab.title;
+}
+
+/** Clean a typed title: trimmed and bounded. Empty restores the automatic title. */
+export function cleanTabTitle(raw: string): string {
+  return raw.trim().slice(0, MAX_TAB_TITLE);
+}
+
+/**
+ * Compact label for a pinned tab: the name without its extension, cut to `max`
+ * characters. Pinned tabs are recognised by position and colour, so the strip
+ * spends as little width on them as it can and keeps the full name in a tooltip.
+ */
+export function shortTabLabel(label: string, max = 4): string {
+  const stem = label.replace(/\.[A-Za-z0-9]{1,8}$/, "").trim() || label.trim();
+  return stem.length <= max ? stem : stem.slice(0, max);
+}
+
+/** How many tabs at the head of the strip are pinned (the invariant's boundary). */
+export function pinnedCount(tabs: readonly Tab[]): number {
+  let n = 0;
+  while (n < tabs.length && tabs[n].pinned) n++;
+  return n;
+}
+
+/**
+ * Restore the invariant the strip relies on: every pinned tab precedes every
+ * unpinned one, relative order preserved inside each group. Returns the SAME
+ * array reference when nothing moves, so callers can skip a state write.
+ */
+export function sortPinned(tabs: readonly Tab[]): readonly Tab[] {
+  if (tabs.length < 2) return tabs;
+  if (pinnedCount(tabs) === tabs.filter((t) => t.pinned).length) return tabs;
+  return [...tabs.filter((t) => t.pinned), ...tabs.filter((t) => !t.pinned)];
+}
+
+/**
+ * Clamp a drag/keyboard insertion slot so it stays inside the dragged tab's own
+ * group: a pinned tab can never land right of an unpinned one, and vice versa.
+ */
+export function clampPinSlot(tabs: readonly Tab[], from: number, slot: number): number {
+  const boundary = pinnedCount(tabs);
+  const bounded = Math.max(0, Math.min(tabs.length, slot));
+  if (from < 0 || from >= tabs.length) return bounded;
+  return tabs[from].pinned
+    ? Math.min(bounded, boundary)
+    : Math.max(bounded, boundary);
+}
+
+export type CloseScope = "others" | "right" | "saved";
+
+/**
+ * Which tabs of ONE connection a close-many action targets. Pinned tabs are
+ * never targeted, and the anchor survives "others"/"right". The caller still
+ * applies the per-tab guards (dirty, pending edits, running query, transaction
+ * owner) — this only decides the candidate set.
+ */
+export function closeManyTargets(owned: readonly Tab[], anchorId: string, scope: CloseScope): Tab[] {
+  const anchor = owned.findIndex((t) => t.id === anchorId);
+  return owned.filter((t, i) => {
+    if (t.pinned) return false;
+    if (scope === "others") return t.id !== anchorId;
+    if (scope === "right") return anchor >= 0 && i > anchor;
+    return !t.dirty;
+  });
+}
+
+/**
+ * Filter for the "All tabs" list: case-insensitive substring over the shown
+ * title, the file path, and the connection label, so `orders.sql`, `prod`, and
+ * a renamed tab all find their tab. A blank needle keeps everything.
+ */
+export function filterTabs<T extends { label: string; detail: string; connectionLabel: string }>(
+  items: readonly T[],
+  needle: string,
+): T[] {
+  const q = needle.trim().toLowerCase();
+  if (!q) return [...items];
+  return items.filter((it) =>
+    `${it.label} ${it.detail} ${it.connectionLabel}`.toLowerCase().includes(q),
+  );
+}
+
 /** Capture editor recovery state, including unsaved status and the active CM document. */
 export function snapshotTabs(tabs: Tab[], activeTabId: string, activeDoc?: string): PersistedTabs {
   return {
@@ -197,6 +317,9 @@ export function snapshotTabs(tabs: Tab[], activeTabId: string, activeDoc?: strin
         sql: live,
         filePath: tab.filePath,
         title: tab.title,
+        customTitle: tab.customTitle,
+        pinned: tab.pinned,
+        color: tab.color,
         searchSchema: tab.searchSchema,
         dirty: tab.dirty || live !== tab.sql,
       };
