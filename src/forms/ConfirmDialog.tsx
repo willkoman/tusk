@@ -1,10 +1,16 @@
-import { createMemo, createSignal, Show } from "solid-js";
+import { createMemo, createSignal, For, Show } from "solid-js";
 import { Dialog, DialogFooter } from "../Dialog";
 
 /** Destructive-op confirm (DROP / TRUNCATE): shows exact SQL + CASCADE / RESTART IDENTITY. */
 export function ConfirmDialog(props: {
   title: string;
+  /** One line under the title naming what is acted on. */
+  subtitle?: string;
   primaryLabel: string;
+  /** One sentence above the list: what the primary action does. */
+  lead?: string;
+  /** Body lines shown above the options, e.g. every object a drop will destroy. */
+  lines?: string[];
   showCascade?: boolean;
   showRestartIdentity?: boolean;
   build: (o: { cascade: boolean; restartIdentity: boolean }) => string;
@@ -28,7 +34,33 @@ export function ConfirmDialog(props: {
   };
 
   return (
-    <Dialog title={props.title} onClose={props.onClose}>
+    <Dialog
+      title={props.title}
+      subtitle={props.subtitle}
+      size="md"
+      noAutoFocus
+      onClose={props.onClose}
+      footer={
+        <DialogFooter
+          sql={sql()}
+          error={error()}
+          busy={busy()}
+          primaryLabel={props.primaryLabel}
+          primaryDanger
+          onPrimary={apply}
+          onEditAsSql={() => props.onEditAsSql(sql())}
+          onCancel={props.onClose}
+        />
+      }
+    >
+      <Show when={props.lead}>
+        <p class="confirm-text">{props.lead}</p>
+      </Show>
+      <Show when={props.lines?.length}>
+        <ul class="confirm-list">
+          <For each={props.lines}>{(l) => <li>{l}</li>}</For>
+        </ul>
+      </Show>
       <Show when={props.showCascade}>
         <label class="checkbox">
           <input type="checkbox" checked={cascade()} onChange={(e) => setCascade(e.currentTarget.checked)} />
@@ -41,16 +73,6 @@ export function ConfirmDialog(props: {
           RESTART IDENTITY (reset owned sequences)
         </label>
       </Show>
-      <DialogFooter
-        sql={sql()}
-        error={error()}
-        busy={busy()}
-        primaryLabel={props.primaryLabel}
-        primaryDanger
-        onPrimary={apply}
-        onEditAsSql={() => props.onEditAsSql(sql())}
-        onCancel={props.onClose}
-      />
     </Dialog>
   );
 }
