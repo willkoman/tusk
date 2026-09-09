@@ -72,6 +72,19 @@ export function isDelimited(f: ExportFormat): boolean {
   return f === "csv" || f === "tsv";
 }
 
+/**
+ * Excel sheet names may not be empty, exceed 31 characters, or contain `[ ] : * ? / \`.
+ * PARITY PAIR with `sanitize_sheet` in src-tauri/src/export.rs: the backend validates
+ * the option for xlsx, so an unsanitized relation name (`2024/Q1`) has to be cleaned
+ * here rather than becoming an export error.
+ */
+export function sanitizeSheetName(name: string): string {
+  const cleaned = Array.from(name)
+    .map((c) => ("[]:*?/\\".includes(c) ? "_" : c))
+    .join("");
+  return Array.from(cleaned).slice(0, 26).join("") || "Sheet1";
+}
+
 export function defaultExportOptions(table: string): ExportOptions {
   return {
     format: "csv",
@@ -87,7 +100,7 @@ export function defaultExportOptions(table: string): ExportOptions {
     columnIndices: [],
     boolCols: [],
     sql: { table: table || "exported", multiRow: false, includeCreate: false, createSql: "" },
-    xlsx: { sheetName: (table || "Sheet1").slice(0, 26), headerStyling: true, autoFilter: true, freezeHeader: true },
+    xlsx: { sheetName: sanitizeSheetName(table), headerStyling: true, autoFilter: true, freezeHeader: true },
   };
 }
 
@@ -126,7 +139,10 @@ const REMEMBERED_KEYS = [
   "bom",
 ] as const;
 
-const REMEMBERED_SQL_KEYS = ["multiRow", "includeCreate"] as const;
+// `includeCreate` is deliberately NOT remembered: restoring it would re-tick the box
+// without re-fetching the source table's DDL, silently writing the synthetic all-`text`
+// CREATE with none of the promised note.
+const REMEMBERED_SQL_KEYS = ["multiRow"] as const;
 const REMEMBERED_XLSX_KEYS = ["headerStyling", "autoFilter", "freezeHeader"] as const;
 
 /** The subset of `o` worth remembering for its format. */
@@ -180,5 +196,30 @@ export function applyRememberedExportOptions(
   // A custom delimiter with no character would silently fall back to a comma.
   if (out.delimiter === "custom" && Array.from(out.customDelimiter).length !== 1)
     out.delimiter = defaults.delimiter;
+  return out;
+}
+
+/**
+ * Options for the Explorer's multi-table export. It exposes far fewer controls than the
+ * single-result dialog, so anything it cannot show is reset to the default rather than
+ * silently inherited from the last single-result export — a remembered custom NULL text
+ * or CRLF ending would otherwise apply to every file with nothing on screen saying so.
+ */
+export function tablesExportOptions(
+  format: ExportFormat,
+  remembered: Record<string, Record<string, unknown>> | undefined,
+): ExportOptions {
+  const defaults = defaultExportOptions("");
+  const out = applyRememberedExportOptions({ ...defaults, format }, remembered?.[format]);
+  out.quote = defaults.quote;
+  out.quoteChar = defaults.quoteChar;
+  out.lineEnding = defaults.lineEnding;
+  out.customDelimiter = defaults.customDelimiter;
+  out.nullText = defaults.nullText;
+  if (out.delimiter === "custom") out.delimiter = defaults.delimiter;
+  if (out.nullMode === "custom") out.nullMode = defaults.nullMode;
+  // The per-table CREATE would be the synthetic all-`text` one (export_tables never
+  // reconstructs DDL), and there is no checkbox here to turn it back off.
+  out.sql = { ...out.sql, includeCreate: false, createSql: "" };
   return out;
 }

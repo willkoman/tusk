@@ -1,18 +1,18 @@
 // Structured result-grid filters. Pure + vitest-covered.
 //
 // A filter is a TREE: one root group (`and`/`or`) holding conditions and nested
-// groups, so "AND of ORs" and "OR of ANDs" are both expressible. The flat
-// `Filter[]` the per-column quick-filter row used before this is the degenerate
-// case — a top-level AND of `contains` conditions — and `normalizeFilters`
-// migrates it (and any older persisted shape) forward without dropping rules.
+// groups, so "AND of ORs" and "OR of ANDs" are both expressible. The per-column
+// quick-filter row is the degenerate case — top-level `contains` conditions in
+// the same tree — so there is exactly one filter model, never two.
+//
+// Grid views are NOT persisted (`snapshotTabs` stores buffers and paths only), so
+// there is no older on-disk filter shape to migrate: a tab always starts from
+// `emptyFilter()`.
 //
 // Conditions reference a column by NAME, not by result index: the name is what
 // SQL generation needs, it survives a re-run that reorders columns, and the
 // Explorer can pre-build a filter from `table_detail` before any result exists.
-// Ambiguity (two result columns with the same name) is rejected in filterSql,
-// exactly as the old flat filter did.
-
-import type { Filter } from "../tabs";
+// Ambiguity (two result columns with the same name) is rejected in filterSql.
 
 /** Value class a column's operator menu and literal rendering are driven by. */
 export type ColumnClass = "text" | "number" | "boolean" | "datetime" | "other";
@@ -330,82 +330,48 @@ export function updateCondition(tree: FilterTree, id: string, patch: Partial<Omi
   return updateNode(tree, id, (n) => (isGroup(n) ? n : { ...n, ...patch }));
 }
 
-// --- flat-filter interop / migration ---------------------------------------
+// --- per-column quick filters (the header filter row) -----------------------
 
-/** The quick-filter row's operator: the old flat filter's case-insensitive contains. */
+/** The quick-filter row's operator: a case-insensitive contains match. */
 export const QUICK_OPERATOR: FilterOperator = "contains";
 
-/** Legacy `Filter[]` (column index + contains text) → a root AND of conditions. */
-export function treeFromFlat(filters: Filter[], columns: string[]): FilterTree {
-  const items: FilterNode[] = [];
-  for (const f of filters) {
-    const name = columns[f.col];
-    if (name == null || f.text.trim() === "") continue;
-    items.push(makeCondition(name, QUICK_OPERATOR, [f.text]));
-  }
-  return { kind: "group", id: "root", op: "and", items };
-}
-
-/** Either shape accepted at the boundaries so old call sites keep compiling. */
-export type FilterInput = Filter[] | FilterTree;
-
-export function toFilterTree(input: FilterInput, columns: string[]): FilterTree {
-  return Array.isArray(input) ? treeFromFlat(input, columns) : input;
-}
-
-const isOperator = (v: unknown): v is FilterOperator => typeof v === "string" && BY_ID.has(v as FilterOperator);
-
-function normalizeNode(value: unknown, depth: number): FilterNode | null {
-  if (!value || typeof value !== "object") return null;
-  const v = value as Record<string, unknown>;
-  if (v.kind === "group" || Array.isArray(v.items)) {
-    if (depth >= MAX_DEPTH) return null;
-    const items = Array.isArray(v.items)
-      ? v.items.map((i) => normalizeNode(i, depth + 1)).filter((i): i is FilterNode => i !== null)
-      : [];
-    return { kind: "group", id: typeof v.id === "string" ? v.id : nextId("g"), op: v.op === "or" ? "or" : "and", items };
-  }
-  if (typeof v.column !== "string") return null;
-  const operator = isOperator(v.operator) ? v.operator : QUICK_OPERATOR;
-  const values = Array.isArray(v.values)
-    ? v.values.filter((x): x is string => typeof x === "string").map((x) => x.slice(0, MAX_VALUE_CHARS))
-    : [];
-  return { kind: "cond", id: typeof v.id === "string" ? v.id : nextId("c"), column: v.column, operator, values };
-}
-
-/**
- * Accept anything a previous version may have stored in a grid view — the flat
- * `Filter[]`, a tree, or junk — and return a usable tree. Saved rules survive
- * the shape change; unrecognizable entries are dropped rather than thrown.
- */
-export function normalizeFilters(value: unknown, columns: string[] = []): FilterTree {
-  if (Array.isArray(value)) {
-    // Legacy flat shape: [{ col, text }].
-    if (value.every((v) => v && typeof v === "object" && typeof (v as Filter).col === "number"))
-      return treeFromFlat(value as Filter[], columns);
-    const items = value.map((v) => normalizeNode(v, 1)).filter((i): i is FilterNode => i !== null);
-    return { kind: "group", id: "root", op: "and", items };
-  }
-  const node = normalizeNode(value, 0);
-  if (!node) return emptyFilter();
-  if (!isGroup(node)) return { kind: "group", id: "root", op: "and", items: [node] };
-  return { ...node, id: node.id || "root" };
-}
-
-// --- per-column quick filters (the header filter row) -----------------------
+const isQuick = (node: FilterNode, column: string): boolean =>
+  !isGroup(node) && node.column === column && node.operator === QUICK_OPERATOR;
 
 /** Text of the top-level quick (`contains`) condition on `column`, or "". */
 export function quickFilterOf(tree: FilterTree, column: string): string {
-  for (const item of tree.items)
-    if (!isGroup(item) && item.column === column && item.operator === QUICK_OPERATOR) return item.values[0] ?? "";
+  for (const item of tree.items) if (isQuick(item, column)) return (item as Condition).values[0] ?? "";
   return "";
 }
 
-/** Set/clear the top-level quick condition for one column, leaving the rest alone. */
+/**
+ * Set/clear the top-level quick condition for one column, leaving the rest alone.
+ *
+ * The header row reads as "AND this column's text too". Pushing into an OR root
+ * would WIDEN the result instead of narrowing it, so setting a quick filter on an
+ * OR root re-roots the tree as `and[ <old root as a group>, <quick condition> ]`.
+ * Conditions that move into that nested group are no longer shown by the header
+ * row — `hiddenRuleCount` reports them so the grid can mark the column.
+ */
 export function setQuickFilter(tree: FilterTree, column: string, text: string): FilterTree {
-  const items = tree.items.filter((i) => isGroup(i) || i.column !== column || i.operator !== QUICK_OPERATOR);
-  if (text.trim() !== "") items.push(makeCondition(column, QUICK_OPERATOR, [text]));
-  return { ...tree, items };
+  const kept = tree.items.filter((i) => !isQuick(i, column));
+  if (text.trim() === "") return { ...tree, items: kept };
+  const quick = makeCondition(column, QUICK_OPERATOR, [text]);
+  if (tree.op === "or" && kept.length)
+    return { kind: "group", id: tree.id, op: "and", items: [{ ...tree, id: nextId("g"), items: kept }, quick] };
+  return { ...tree, op: "and", items: [...kept, quick] };
+}
+
+/**
+ * Complete conditions on `column` that the header filter row can neither show nor
+ * edit: anything nested in a group, plus top-level conditions with another
+ * operator. Non-zero means the column carries builder rules the one-line box
+ * cannot represent, so the grid renders a read-only indicator instead of letting
+ * the empty box imply "no filter on this column".
+ */
+export function hiddenRuleCount(tree: FilterTree, column: string): number {
+  const quick = tree.items.find((i) => isQuick(i, column));
+  return conditions(tree).filter((c) => c.column === column && c !== quick).length;
 }
 
 // --- labels -----------------------------------------------------------------

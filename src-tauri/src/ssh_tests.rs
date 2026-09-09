@@ -228,6 +228,49 @@ async fn tunnel_forwards_bytes_in_both_directions() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn dropping_a_tunnel_also_kills_its_in_flight_forwards() {
+    // `Drop` used to abort only the accept loop. An already-established forward kept
+    // copying between its loopback socket and its SSH channel, so a replaced or
+    // reconnected tunnel left the previous session pumping bytes.
+    let _guard = trust_store_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let ssh_server = start_ssh_server().await;
+    let (db_port, _db) = start_echo_server().await;
+    trust(&dir, ssh_server.port, &ssh_server.host_key);
+
+    let tunnel = Tunnel::open(&ssh_config(ssh_server.port, PASSWORD), "127.0.0.1", db_port)
+        .await
+        .unwrap();
+
+    // Open a connection and leave it OPEN across the drop.
+    let mut held = TcpStream::connect(("127.0.0.1", tunnel.local_port()))
+        .await
+        .unwrap();
+    held.write_all(b"first").await.unwrap();
+    let mut echoed = [0u8; 5];
+    held.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"FIRST");
+
+    drop(tunnel);
+
+    // The held connection must stop being served. A local write can still be buffered,
+    // so prove it by the read side going away rather than by a write error.
+    for _ in 0..50 {
+        let _ = held.write_all(b"second").await;
+        let mut buf = [0u8; 6];
+        match tokio::time::timeout(Duration::from_millis(20), held.read_exact(&mut buf)).await {
+            // EOF or reset: the forwarder is gone, which is the point.
+            Ok(Err(_)) => return,
+            // Still echoing: the abort-only-the-accept-loop bug.
+            Ok(Ok(_)) => {}
+            Err(_) => {} // timed out — keep trying until the abort lands
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("an in-flight forward kept serving after its tunnel was dropped");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_wrong_password_fails_at_the_authentication_stage() {
     let _guard = trust_store_guard();
     let dir = tempfile::tempdir().unwrap();

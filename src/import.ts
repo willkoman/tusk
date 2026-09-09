@@ -73,6 +73,9 @@ export type ImportSummary = {
   rowsInserted: number;
   rowsSkipped: number;
   warnings: string[];
+  /** MySQL commits DDL immediately, so a create-and-load import runs its `CREATE TABLE`
+   *  before the transaction: the table is already committed when the rows load. */
+  createdOutsideTransaction: boolean;
 };
 
 export type ImportProgress = {
@@ -129,13 +132,30 @@ const TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z
 /** `0`/`1` are deliberately excluded — an integer column must not read as boolean. */
 const BOOL_WORDS = new Set(["true", "false", "t", "f", "yes", "no", "y", "n"]);
 
-const INT32_MIN = -2147483648;
-const INT32_MAX = 2147483647;
+/**
+ * Above this magnitude an `integer` column is a bad bet even when every sampled value
+ * fits: the sample is at most 50 rows, and a later row past `int4` would be rejected by
+ * the engine after the load has already been running for a while.
+ */
+const INT32_SAFE = 1073741823; // INT32_MAX / 2
+const INT64_MIN = -(2n ** 63n);
+const INT64_MAX = 2n ** 63n - 1n;
+
+/** Does this all-digits token fit the `bigint` the loader coerces with? */
+function fitsInt64(v: string): boolean {
+  try {
+    const n = BigInt(v);
+    return n >= INT64_MIN && n <= INT64_MAX;
+  } catch {
+    return false;
+  }
+}
 
 /**
- * Infer one column's type from sampled values. Blank and NULL values are ignored; a
- * column with nothing to go on stays `text`, which never rejects a row. Integers are
- * checked before booleans so a 0/1 column imports as a number.
+ * Infer one column's type from sampled values. Blank (including whitespace-only) and
+ * NULL values are ignored — the loader treats them as empty too — and a column with
+ * nothing to go on stays `text`, which never rejects a row. Integers are checked before
+ * booleans so a 0/1 column imports as a number.
  */
 export function inferType(values: (string | null)[]): ImportColumnType {
   const seen: string[] = [];
@@ -148,9 +168,12 @@ export function inferType(values: (string | null)[]): ImportColumnType {
   }
   if (!seen.length) return "text";
   if (seen.every((v) => INT_RE.test(v))) {
+    // A value the loader's i64 coercion would reject is not an integer column at all —
+    // `bigint` would fail at row 1 and truncate even if it landed. Text keeps it.
+    if (!seen.every(fitsInt64)) return "text";
     const fitsInt32 = seen.every((v) => {
       const n = Number(v);
-      return Number.isSafeInteger(n) && n >= INT32_MIN && n <= INT32_MAX;
+      return Number.isSafeInteger(n) && Math.abs(n) <= INT32_SAFE;
     });
     return fitsInt32 ? "integer" : "bigint";
   }
@@ -173,8 +196,11 @@ export function inferTypes(columns: string[], rows: (string | null)[][]): Import
  */
 export function tokenForDeclaredType(declared: string): ImportColumnType {
   const t = declared.toLowerCase().replace(/\(.*$/, "").trim();
-  if (/^(bool|boolean|tinyint\b)/.test(t)) return "boolean";
-  if (/^(smallint|int2|integer|int|int4|mediumint|serial)$/.test(t)) return "integer";
+  // NOT tinyint: MySQL reports `tinyint` for every width, and DuckDB's TINYINT is a
+  // true 1-byte integer with a separate BOOLEAN. Mapping it to boolean rejected every
+  // value outside 0/1 (`4` in a ratings column failed the whole import).
+  if (/^(bool|boolean)$/.test(t)) return "boolean";
+  if (/^(smallint|int2|integer|int|int4|mediumint|serial|tinyint)$/.test(t)) return "integer";
   if (/^(bigint|int8|bigserial)$/.test(t)) return "bigint";
   if (/^(numeric|decimal|real|double|double precision|float|float4|float8|hugeint)$/.test(t))
     return "numeric";

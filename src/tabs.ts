@@ -72,12 +72,6 @@ export function interruptedResult(
 
 // --- result-grid display state (per tab, ephemeral — not persisted) ---
 export type SortKey = { col: number; dir: "asc" | "desc" }; // col = ORIGINAL column index
-/**
- * LEGACY flat filter (one case-insensitive contains match per column index).
- * Superseded by the structured `FilterTree`; kept as the degenerate input shape
- * that `grid/filterModel.normalizeFilters` migrates forward.
- */
-export type Filter = { col: number; text: string };
 
 export type GridView = {
   /** origIdx -> px width (sparse; absent = default). */
