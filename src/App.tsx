@@ -674,7 +674,7 @@ function App() {
    * untracked.
    */
   const connectionLabelKey = createMemo(() =>
-    connections().map((e) => `${e.conn.id}\u0000${e.state().tree?.database ?? ""}\u0000${e.conn.target} ${e.conn.origin}`).join("\u0001"));
+    connections().map((e) => `${e.conn.id}\u0000${e.state().tree?.database ?? ""}\u0000${e.conn.target}\u0000${e.conn.origin}`).join("\u0001"));
   const connectionLabelMap = createMemo(
     on(connectionLabelKey, () => connectionLabels(connections().map((e) => e.state()))),
   );
