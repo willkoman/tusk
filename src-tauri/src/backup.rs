@@ -8,25 +8,27 @@
 //! -- header comment (tusk version, engine, database, timestamp, options)
 //! PRAGMA foreign_keys = OFF;   -- SQLite only, before any BEGIN
 //! BEGIN;                       -- only where DDL is transactional and asked for
+//!                              -- (`BEGIN TRANSACTION;` on SQL Server: T-SQL's bare
+//!                              --  BEGIN opens a statement block, not a transaction)
 //! DROP … IF EXISTS             -- include_drop, reverse dependency order
 //! CREATE SCHEMA IF NOT EXISTS
 //! CREATE SEQUENCE
-//! CREATE TABLE (+ indexes, comments)      -- PG/MySQL: FOREIGN KEYs held back
+//! CREATE TABLE (+ indexes, comments)   -- PG/MySQL/SQL Server: FOREIGN KEYs held back
 //! <data>                       -- PG: COPY … FROM stdin blocks; others: INSERTs
 //! CREATE VIEW / MATERIALIZED VIEW
 //! CREATE FUNCTION / CREATE TRIGGER        -- PostgreSQL only
-//! ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY   -- PG/MySQL, after all data
+//! ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY  -- PG/MySQL/SQL Server, after all data
 //! SELECT pg_catalog.setval(…)  -- PostgreSQL sequence positions
 //! COMMIT;
 //! PRAGMA foreign_keys = ON;    -- SQLite only
 //! ```
 //!
-//! **Foreign keys are only deferred on PostgreSQL and MySQL.** Those are the engines
-//! that can add a constraint with `ALTER TABLE`, so their FKs are lifted out of the
-//! table body and re-emitted after all the data — table order, cycles included, cannot
-//! break the restore. SQLite and DuckDB have no `ALTER TABLE … ADD CONSTRAINT`, so
-//! their FKs stay inline: SQLite's dump switches enforcement off instead, and a cycle
-//! that `topo_order` cannot resolve is recorded as a warning in the dump and the
+//! **Foreign keys are deferred on PostgreSQL, MySQL and SQL Server.** Those are the
+//! engines that can add a constraint with `ALTER TABLE`, so their FKs are lifted out of
+//! the table body and re-emitted after all the data — table order, cycles included,
+//! cannot break the restore. SQLite and DuckDB have no `ALTER TABLE … ADD CONSTRAINT`,
+//! so their FKs stay inline: SQLite's dump switches enforcement off instead, and a
+//! cycle that `topo_order` cannot resolve is recorded as a warning in the dump and the
 //! summary rather than silently written.
 //!
 //! Restore streams the file back through `script::parse_stream_chunk` so a
@@ -553,6 +555,20 @@ fn topo_order(
     (out, unordered)
 }
 
+/// The statement that opens a transaction in this dialect.
+///
+/// T-SQL's bare `BEGIN` opens a statement BLOCK, not a transaction — a dump (or a
+/// restore) that used it would run in autocommit while claiming to be wrapped, and the
+/// trailing `COMMIT` would have nothing to commit. `BEGIN TRANSACTION` is the T-SQL
+/// form (the same one `driver.rs`'s own SQL Server script wrapper uses); every other
+/// supported engine takes plain `BEGIN`.
+fn begin_stmt(dialect: SqlDialect) -> &'static str {
+    match dialect {
+        SqlDialect::MsSql => "BEGIN TRANSACTION",
+        _ => "BEGIN",
+    }
+}
+
 // --- backup -----------------------------------------------------------------
 
 /// Write a plain-SQL dump of the selected objects to `path`.
@@ -820,7 +836,7 @@ async fn backup_inner(
         ));
     }
     if wrap {
-        out.put("BEGIN;\n\n").await?;
+        out.put(&format!("{};\n\n", begin_stmt(dialect))).await?;
     }
     if is_mysql {
         out.stmt("SET FOREIGN_KEY_CHECKS = 0").await?;
@@ -1297,6 +1313,11 @@ async fn data_columns(
         .map(|d| {
             d.columns
                 .into_iter()
+                // A generated / computed column has no insertable value: naming it in
+                // an INSERT is an error on every engine that has them (MySQL 3105,
+                // SQL Server 271), so the dump would not restore. The PostgreSQL branch
+                // above filters the same class with `a.attgenerated = ''`.
+                .filter(|c| c.generated.is_none())
                 .map(|c| DataColumn {
                     binary: is_binary_type(&c.data_type, dialect),
                     identity: c.identity,
@@ -1630,6 +1651,7 @@ pub async fn run_restore(
 ) -> Result<RestoreSummary, AppError> {
     opts.validate()?;
     let caps = backend.capabilities();
+    let dialect = SqlDialect::parse(caps.kind)?;
     let meta = tokio::fs::metadata(path)
         .await
         .map_err(|e| AppError::new(format!("cannot read {path}: {e}")))?;
@@ -1658,7 +1680,7 @@ pub async fn run_restore(
     backend.begin_bulk_session().await?;
     let wrap = opts.single_transaction;
     if wrap {
-        if let Err(e) = backend.run_single("BEGIN", 1, false).await {
+        if let Err(e) = backend.run_single(begin_stmt(dialect), 1, false).await {
             backend.end_bulk_session().await;
             return Err(e);
         }
@@ -1946,6 +1968,20 @@ mod tests {
         assert!(opts(r#"{"scope":"schemas","schemas":["a\u0000b"]}"#)
             .validate()
             .is_err());
+    }
+
+    #[test]
+    fn the_transaction_opener_is_dialect_correct() {
+        // T-SQL's bare `BEGIN` opens a statement block, not a transaction.
+        assert_eq!(begin_stmt(SqlDialect::MsSql), "BEGIN TRANSACTION");
+        for d in [
+            SqlDialect::Postgres,
+            SqlDialect::DuckDb,
+            SqlDialect::Sqlite,
+            SqlDialect::MySql,
+        ] {
+            assert_eq!(begin_stmt(d), "BEGIN");
+        }
     }
 
     #[test]

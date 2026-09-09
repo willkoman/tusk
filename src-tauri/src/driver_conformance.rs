@@ -943,14 +943,17 @@ async fn relationship_battery(b: &mut Backend, eng: &Eng) {
         );
     }
 
-    // Composite-key FK ordering (declared order, not alphabetical) — PG + MySQL.
-    if eng.name == "postgres" || eng.name == "mysql" {
+    // Composite-key FK ordering (declared order, not alphabetical) — PG, MySQL and
+    // SQL Server, whose FK queries all order by the constraint's own key position
+    // (`fkc.constraint_column_id` in `MSSQL_FK_ORDER`). NOT NULL is spelled out because
+    // SQL Server, unlike PG/MySQL, refuses a PRIMARY KEY over nullable columns.
+    if matches!(eng.name, "postgres" | "mysql" | "mssql") {
         exec(b, &format!("DROP TABLE IF EXISTS {}", q("rel_c2"))).await;
         exec(b, &format!("DROP TABLE IF EXISTS {}", q("rel_p2"))).await;
         exec(
             b,
             &format!(
-                "CREATE TABLE {} (a INTEGER, b INTEGER, PRIMARY KEY (b, a))",
+                "CREATE TABLE {} (a INTEGER NOT NULL, b INTEGER NOT NULL, PRIMARY KEY (b, a))",
                 q("rel_p2")
             ),
         )
@@ -1504,6 +1507,99 @@ async fn backup_restore_battery(b: &mut Backend, eng: &Eng) {
         eng.name
     );
 
+    // `single_transaction`, on both sides. The wrapper has to open with the engine's
+    // real transaction statement: T-SQL's bare `BEGIN` opens a statement BLOCK, so a
+    // dump (or a restore) using it replays in autocommit while claiming to be wrapped,
+    // and the trailing COMMIT has nothing to commit.
+    if b.capabilities().transactional_ddl {
+        let expected_begin = if eng.name == "mssql" {
+            "BEGIN TRANSACTION;"
+        } else {
+            "BEGIN;"
+        };
+        let wrapped_options = crate::backup::BackupOptions {
+            single_transaction: true,
+            ..options.clone()
+        };
+        crate::backup::run_backup(b, "conformance", &wrapped_options, &p, &flag, &mut |_| {})
+            .await
+            .unwrap_or_else(|e| panic!("[{}] wrapped backup: {}", eng.name, e.message));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let begin_at = text.find(expected_begin).unwrap_or_else(|| {
+            panic!(
+                "[{}] a single-transaction dump must open with {expected_begin}:\n{text}",
+                eng.name
+            )
+        });
+        let commit_at = text
+            .find("COMMIT;")
+            .unwrap_or_else(|| panic!("[{}] wrapped dump commits:\n{text}", eng.name));
+        assert!(
+            commit_at > begin_at,
+            "[{}] COMMIT must follow the opener:\n{text}",
+            eng.name
+        );
+        // The engine has to actually accept the opener it was handed.
+        reset(b, &reset_sql).await;
+        let restored = crate::backup::run_restore(
+            b,
+            eng.engine,
+            &p,
+            &crate::backup::RestoreOptions {
+                stop_on_error: true,
+                single_transaction: false,
+            },
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .await
+        .unwrap_or_else(|e| panic!("[{}] wrapped restore: {}", eng.name, e.message));
+        assert_eq!(
+            restored.statements_failed, 0,
+            "[{}] wrapped restore errors: {:?}",
+            eng.name, restored.first_error
+        );
+
+        // …and restore's OWN opener, used when the dump does not wrap itself.
+        crate::backup::run_backup(b, "conformance", &options, &p, &flag, &mut |_| {})
+            .await
+            .unwrap_or_else(|e| panic!("[{}] plain backup: {}", eng.name, e.message));
+        reset(b, &reset_sql).await;
+        let restored = crate::backup::run_restore(
+            b,
+            eng.engine,
+            &p,
+            &crate::backup::RestoreOptions {
+                stop_on_error: true,
+                single_transaction: true,
+            },
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .await
+        .unwrap_or_else(|e| panic!("[{}] single-transaction restore: {}", eng.name, e.message));
+        assert_eq!(
+            restored.statements_failed, 0,
+            "[{}] single-transaction restore errors: {:?}",
+            eng.name, restored.first_error
+        );
+        assert!(
+            restored.committed,
+            "[{}] a clean single-transaction restore commits",
+            eng.name
+        );
+        assert_eq!(
+            cell(
+                &all(b, &format!("SELECT COUNT(*) FROM {a_name}")).await[0],
+                0
+            )
+            .as_deref(),
+            Some("2"),
+            "[{}] single-transaction restore landed its rows",
+            eng.name
+        );
+    }
+
     // PostgreSQL only: a schema-scoped dump carries CREATE SEQUENCE + setval, so a
     // serial column continues where it left off instead of colliding on restore.
     if eng.name == "postgres" {
@@ -2045,8 +2141,10 @@ async fn conformance_mysql() {
     sweep_battery(&mut b, &eng).await;
     export_battery(&mut b, &eng).await;
     bool_export_battery(&mut b, &eng).await;
+    import_battery(&mut b, &eng).await;
     binary_output_battery(&mut b, &eng).await;
     buffered_export_dialect_battery(&eng).await;
+    backup_restore_battery(&mut b, &eng).await;
     transaction_battery(&cfg, &eng).await;
 }
 

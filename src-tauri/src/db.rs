@@ -135,7 +135,7 @@ impl ConnectionConfig {
         } else {
             if self.ssh.is_some() {
                 return Err(AppError::new(
-                    "SSH tunnelling is only available for network drivers (PostgreSQL, MySQL)",
+                    "SSH tunnelling is only available for network drivers (PostgreSQL, MySQL, SQL Server)",
                 ));
             }
             if self.path.as_ref().is_some_and(|p| p.len() > 32_768) {

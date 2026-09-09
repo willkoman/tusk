@@ -71,8 +71,10 @@ fn embedded_script<C>(
 pub struct Capabilities {
     pub kind: &'static str,
     pub server_cursor: bool,
-    /// The engine has a server-side bulk-copy protocol (PostgreSQL `COPY`). File import
-    /// works on every engine regardless — this only says which loader path is used.
+    /// The engine has a server-side bulk-copy protocol (PostgreSQL `COPY`). This only
+    /// says which loader path file import uses, not whether import exists: PostgreSQL
+    /// copies, DuckDB/SQLite/MySQL batch-INSERT, and SQL Server has no import path at
+    /// all (`import.rs` refuses it).
     pub bulk_copy: bool,
     pub export: bool,
     pub schemas: bool,
@@ -3771,7 +3773,8 @@ impl MsSqlConn {
         // The tunnel comes up first so a failure names the SSH stage, not the DB.
         let tunnel = crate::ssh::ensure(tunnel, config).await?;
         let dial = crate::ssh::dial_config(config, tunnel.as_ref());
-        let client = Self::open_client(&dial)
+        let tls_host = crate::ssh::tls_host(config, tunnel.as_ref());
+        let client = Self::open_client(&dial, tls_host.as_deref())
             .await
             .map_err(|e| crate::ssh::explain_db_failure(tunnel.as_ref(), e))?;
         let mut conn = MsSqlConn {
@@ -3809,11 +3812,23 @@ impl MsSqlConn {
         ))
     }
 
-    async fn open_client(config: &ConnectionConfig) -> Result<MsSqlClient, AppError> {
+    /// `config` is the endpoint actually dialled (loopback when tunnelled). `tls_host`
+    /// is the untunnelled hostname the certificate must be valid for: through an SSH
+    /// tunnel the socket is `127.0.0.1` while the TLS peer is still the real server, so
+    /// `verify-ca`/`verify-full` has to check the certificate (and send SNI) for the
+    /// configured hostname or it fails every time. tiberius splits exactly this way —
+    /// `host` is the address, `hostname_in_certificate` the validated name.
+    async fn open_client(
+        config: &ConnectionConfig,
+        tls_host: Option<&str>,
+    ) -> Result<MsSqlClient, AppError> {
         use tokio_util::compat::TokioAsyncWriteCompatExt;
 
         let mut cfg = tiberius::Config::new();
         cfg.host(&config.host);
+        if let Some(name) = tls_host.filter(|name| !name.is_empty()) {
+            cfg.hostname_in_certificate(name);
+        }
         cfg.port(if config.port == 0 { 1433 } else { config.port });
         if !config.dbname.is_empty() {
             cfg.database(&config.dbname);
@@ -4414,6 +4429,10 @@ impl MsSqlConn {
                 default: row.get(3).cloned().flatten(),
                 comment: row.get(6).cloned().flatten(),
                 identity: dcell(row, 7) == "1",
+                // A computed column's whole clause. It carries no insertable value, so
+                // the backup's column list has to skip it (SQL Server error 271), and
+                // the Modify dialog must not restate it as a plain column.
+                generated: row.get(8).cloned().flatten().filter(|g| !g.is_empty()),
                 ..Default::default()
             })
             .collect();
@@ -4699,9 +4718,14 @@ fn mssql_columns_sql(oid: i64) -> String {
         "SELECT c.name, {MSSQL_TYPE_EXPR}, CAST(c.is_nullable AS int), dc.definition, \
                 CAST(CASE WHEN pk.column_id IS NULL THEN 0 ELSE 1 END AS int), \
                 CAST(CASE WHEN fk.parent_column_id IS NULL THEN 0 ELSE 1 END AS int), \
-                CAST(ep.value AS nvarchar(max)), CAST(c.is_identity AS int) \
+                CAST(ep.value AS nvarchar(max)), CAST(c.is_identity AS int), \
+                CASE WHEN c.is_computed = 1 \
+                     THEN CONCAT('AS ', cc.definition, \
+                                 CASE WHEN cc.is_persisted = 1 THEN ' PERSISTED' ELSE '' END) \
+                END \
          FROM sys.columns c \
          JOIN sys.types t ON t.user_type_id = c.user_type_id \
+         LEFT JOIN sys.computed_columns cc ON cc.object_id = c.object_id AND cc.column_id = c.column_id \
          LEFT JOIN sys.default_constraints dc ON dc.object_id = c.default_object_id \
          LEFT JOIN (SELECT ic.object_id, ic.column_id FROM sys.index_columns ic \
                     JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id \
@@ -5949,6 +5973,29 @@ mod tests {
         assert_eq!(det.columns.len(), 2);
         assert_eq!(det.columns[0].name, "a");
     }
+
+    /// The sidebar offers *Edit comment…* on DuckDB, so a comment that is written must
+    /// also come back — it used to be hardcoded `None` and silently vanished.
+    #[test]
+    fn duckdb_comments_are_read_back() {
+        let (backend, _v) = DuckConn::open(&duck_mem()).unwrap();
+        let d = match backend {
+            Backend::Duck(d) => d,
+            _ => panic!("expected DuckDB backend"),
+        };
+        d.lock()
+            .execute_batch(
+                "CREATE TABLE c(a INTEGER, b VARCHAR); \
+                 COMMENT ON TABLE c IS 'the table'; \
+                 COMMENT ON COLUMN c.a IS 'the column'",
+            )
+            .unwrap();
+        let det = duck_table_detail(&d.lock(), "main", "c").unwrap();
+        assert_eq!(det.comment.as_deref(), Some("the table"));
+        assert_eq!(det.columns[0].comment.as_deref(), Some("the column"));
+        // An uncommented column stays None, not Some("").
+        assert_eq!(det.columns[1].comment, None);
+    }
 }
 
 #[allow(clippy::items_after_test_module)]
@@ -5982,6 +6029,45 @@ fn duck_table_detail(
         .filter(|e| e.src_schema == schema && e.src_table == name)
         .flat_map(|e| e.src_cols)
         .collect();
+    // Column comments. `COMMENT ON COLUMN` is offered on DuckDB, so they have to be
+    // read back or the user's comment silently vanishes. `information_schema.columns`
+    // does not expose one; `duckdb_columns()` does. Best-effort like the index and
+    // constraint scans below: a build without the column yields no comments rather
+    // than an error (a missing column is a BINDER error on an internally composed
+    // query, which cannot poison the connection — no parse gate needed).
+    let col_comments: std::collections::HashMap<String, String> = duck_query(
+        conn,
+        &format!(
+            "SELECT column_name, comment FROM duckdb_columns() \
+             WHERE schema_name = {} AND table_name = {}",
+            dlit(schema),
+            dlit(name)
+        ),
+    )
+    .map(|(_c, rs)| {
+        rs.iter()
+            .filter_map(|r| {
+                let text = r.get(1).and_then(|v| v.clone()).filter(|s| !s.is_empty())?;
+                Some((dcell(r, 0), text))
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+    // The relation's own comment, same best-effort contract. `duckdb_tables()` covers
+    // tables only; a view keeps the previous `None`.
+    let table_comment = duck_query(
+        conn,
+        &format!(
+            "SELECT comment FROM duckdb_tables() \
+             WHERE schema_name = {} AND table_name = {}",
+            dlit(schema),
+            dlit(name)
+        ),
+    )
+    .ok()
+    .and_then(|(_c, rs)| rs.into_iter().next())
+    .and_then(|r| r.into_iter().next().flatten())
+    .filter(|s| !s.is_empty());
     let columns = rows
         .iter()
         .map(|r| {
@@ -5993,11 +6079,11 @@ fn duck_table_detail(
                     .as_deref()
                     .is_some_and(|d| d.trim_start().to_ascii_lowercase().starts_with("nextval(")),
                 is_fk: fk_cols.contains(&nm),
+                comment: col_comments.get(&nm).cloned(),
                 name: nm,
                 data_type: dcell(r, 1),
                 nullable: dcell(r, 2).eq_ignore_ascii_case("YES"),
                 default,
-                comment: None,
                 ..Default::default()
             }
         })
@@ -6063,7 +6149,7 @@ fn duck_table_detail(
     Ok(tree::RelationDetail {
         name: name.to_string(),
         kind: "table".to_string(),
-        comment: None,
+        comment: table_comment,
         columns,
         indexes,
         constraints,
