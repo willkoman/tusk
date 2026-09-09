@@ -131,7 +131,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**Save … in the OS keychain** stores the SSH password or key passphrase under its own keychain entry, separate from the database password, and it is read server-side at connect time — never sent to the frontend and never written to `connections.json`. The destination rule matches the database password: change the SSH host, port, user, or authentication method and Tusk asks you to enter the secret again rather than pointing the old one at a new machine."
+        "md": "**Save … in the OS keychain** stores the SSH password or key passphrase under its own keychain entry, separate from the database password, and it is read server-side at connect time — never sent to the frontend and never written to `connections.json`. The destination rule matches the database password: change the SSH host, port, user, authentication method, or private-key file and Tusk asks you to enter the secret again rather than pointing the old one at a new machine."
       },
       {
         "k": "p",
@@ -144,21 +144,21 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Tusk checks the SSH server's host key against your `~/.ssh/known_hosts` — plain, `[host]:port`, comma-lists, `*`/`?` wildcards, `!` negations, hashed (`ssh-keygen -H`) names and the `@revoked` / `@cert-authority` markers are all understood — and against its own trust store in the app config directory. `known_hosts` is only ever **read**; Tusk does not write to it."
+        "md": "Tusk checks the SSH server's host key against your `~/.ssh/known_hosts` — plain, `[host]:port`, comma-lists, `*`/`?` wildcards, `!` negations and hashed (`ssh-keygen -H`) names are all understood — and against its own trust store in the app config directory. `@revoked` is honoured; `@cert-authority` lines are parsed and then skipped, because Tusk does not verify host certificates yet, so a CA-covered bastion still prompts as an unknown host. `known_hosts` is only ever **read**; Tusk does not write to it."
       },
       {
         "k": "list",
         "items": [
           "**Unknown host** — the connection stops and a dialog shows the key type and `SHA256:…` fingerprint. Compare it against the server (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` prints the same value), then **Trust and connect** records it and retries.",
           "**Key changed** — refused outright, with no accept button. A host key that changed against a stored one is what a man-in-the-middle looks like; if the change really is legitimate, remove the old entry from `known_hosts` or from `ssh_known_hosts.json` in the app config directory.",
-          "**Key revoked** — a key listed under `@revoked` in `known_hosts` is refused, and is never offered for trust.",
+          "**Key revoked** — a key listed under `@revoked` in `known_hosts` is refused, and is never offered for trust. Two things take precedence over it, so keep the file tidy: a key you have already accepted into Tusk's own trust store is checked first, and `known_hosts` is read in file order, so a plain entry for the same key *above* the `@revoked` line wins.",
           "**Records unreadable** — if `known_hosts` or the trust store cannot be read, or holds an entry for this host that cannot be parsed, the connection is refused with that reason. Tusk will not offer to trust a key it could not compare against what you already have."
         ]
       },
       {
         "k": "tip",
         "kind": "tip",
-        "md": "`verify-full` works through a tunnel: TLS still runs end to end with the real database server, so the certificate is checked against the **Host** you entered rather than against the loopback address the tunnel listens on."
+        "md": "`verify-full` works through a tunnel on all three tunnelling drivers: TLS still runs end to end with the real database server, so the certificate is checked against the **Host** you entered rather than against the loopback address the tunnel listens on."
       },
       {
         "k": "h",
@@ -172,10 +172,10 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "`SET default_transaction_read_only = on` server-side (Postgres)",
-          "Client-side guard rejects writes and DDL before they're sent",
+          "Engine enforcement where the engine has it — `SET default_transaction_read_only = on` on Postgres, `AccessMode::ReadOnly` on file-backed DuckDB, `SQLITE_OPEN_READ_ONLY` on SQLite, `SET SESSION TRANSACTION READ ONLY` on MySQL. SQL Server has no session-level equivalent, so there the client guard below is the whole enforcement",
+          "One uniform, engine-aware client guard rejects writes and DDL before they're sent",
           "Mutating sidebar items disabled with a *\"Connection is read-only\"* tooltip",
-          "[[topic:grid-editing|In-grid editing]] switches off with the same reason"
+          "[[topic:grid-editing|In-grid editing]] switches off with the same reason, and file import is blocked in the backend"
         ]
       },
       {
@@ -215,11 +215,11 @@ export const TOPICS: Topic[] = [
             "—"
           ],
           [
-            "CSV/JSON import (COPY)",
+            "File import (CSV / JSON / xlsx)",
+            "yes (`COPY`)",
             "yes",
-            "—",
-            "—",
-            "—",
+            "yes",
+            "yes",
             "—"
           ],
           [
@@ -234,8 +234,8 @@ export const TOPICS: Topic[] = [
             "Sidebar DDL editing",
             "yes",
             "yes (per-action gating)",
-            "—",
-            "—",
+            "yes (per-action gating)",
+            "yes (per-action gating)",
             "—"
           ],
           [
@@ -769,7 +769,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "code",
-        "text": "SELECT * FROM (\n  SELECT * FROM film JOIN inventory USING (film_id)\n) AS _tusk\nWHERE \"title\"::text ILIKE '%dino%'\nORDER BY 3 DESC",
+        "text": "SELECT * FROM (\n  SELECT * FROM film JOIN inventory USING (film_id)\n) AS _tusk\nWHERE \"title\"::text ILIKE '%dino%' ESCAPE '!'\nORDER BY 3 DESC",
         "caption": "What a header sort + filter actually re-streams (ORDER BY uses the ordinal to dodge duplicate names)."
       },
       {
@@ -780,7 +780,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**Disabled** for multi-statement runs, anything that isn't `SELECT`/`WITH`/`TABLE`/`VALUES`, on **MySQL and SQL Server** when the result has duplicate column names, and on **SQL Server** for `WITH`-led or already-ordered statements (T-SQL rejects both inside the derived table the wrap needs).",
+          "**Disabled** for multi-statement runs, anything that isn't `SELECT`/`WITH`/`TABLE`/`VALUES` (plus DuckDB's `FROM`-first and `PIVOT` reads), on **MySQL and SQL Server** when the result has duplicate column names, and on **SQL Server** for any statement containing `WITH` or `ORDER BY` outside a literal or comment — table hints such as `WITH (NOLOCK)`, window ordering and ordered subqueries included — because T-SQL rejects both inside the derived table the wrap needs.",
           "Re-running the *same unedited* query text keeps active rules; edit the text first for a clean result.",
           "A sort/filter re-run resets scroll and selection — the rows underneath changed."
         ]
@@ -792,7 +792,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "A filter is a **tree**, not a list: one root group joined by AND or OR, holding conditions and nested groups, so \"A and (B or C)\" and \"(A and B) or C\" are both expressible. A condition is a column, an operator, and its values; the operator menu offers only what the column's class supports, and a badge next to the name says which class Tusk inferred (`text`, `num`, `bool`, `date`, `any`). Types come from the relation's detail when it's loaded — without it every column is `any`, which still offers the conservative set and casts to text for matching."
+        "md": "A filter is a **tree**, not a list: one root group joined by AND or OR, holding conditions and nested groups, so \"A and (B or C)\" and \"(A and B) or C\" are both expressible. A condition is a column, an operator, and its values; the operator menu offers only what the column's class supports, and a badge next to the name says which class Tusk inferred (`text`, `num`, `bool`, `date`, `any`). Types come from the relation's detail when it's loaded — without it every column is `any`, which offers every operator except `is true` / `is false` and casts to text for LIKE-family matching, while `=`, `<`, `between` and `in` still compare against the raw column."
       },
       {
         "k": "keys",
@@ -813,7 +813,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "The generated SQL is per engine. Identifiers are always quoted and values are always literals — only strictly numeric text is emitted unquoted, and only against a numeric column. `ILIKE` is native on Postgres/DuckDB and becomes `LOWER(col) LIKE LOWER(pattern)` everywhere else, MySQL and SQLite included: their default collations usually ignore case, but a `_bin`/`_cs` column does not, and *contains* has to mean the same thing on every engine. Every LIKE-family comparison is made on the text form of the column, so a `char(n)` never matches on its blank padding. Booleans emit `TRUE`/`FALSE` on Postgres/DuckDB and `1`/`0` on MySQL/SQLite. `%` and `_` you type are escaped with `!` under an explicit `ESCAPE '!'` — never a backslash, which MySQL rejects under `sql_mode=ANSI`."
+        "md": "The generated SQL is per engine. Identifiers are always quoted and values are always literals — only strictly numeric text is emitted unquoted, and only against a numeric column. `ILIKE` is native on Postgres/DuckDB and becomes `LOWER(col) LIKE LOWER(pattern)` everywhere else, MySQL and SQLite included: their default collations usually ignore case, but a `_bin`/`_cs` column does not, and *contains* has to mean the same thing on every engine. Every LIKE-family comparison is made on the text form of the column, so a `char(n)` never matches on its blank padding. Booleans emit `TRUE`/`FALSE` on Postgres/DuckDB and `1`/`0` on MySQL, SQLite and SQL Server. `%` and `_` you type are escaped with `!` under an explicit `ESCAPE '!'` — never a backslash, which MySQL rejects under `sql_mode=ANSI`."
       },
       {
         "k": "tip",
@@ -822,7 +822,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "While a filter is active a bar above the grid shows one chip per condition, grouped as the filter is and joined by AND/OR, with an ✕ to drop just that rule, the row count the server reported, and **Edit…** / **Clear all**. A condition whose column left the result is dropped silently on the next run; a column name that appears twice in the result is refused outright (`filter rejected: …` / `sort/filter rejected: …` in the status line) rather than matching the wrong one. A filter is only recorded once the query it produces actually runs, so a rule that cannot be applied never leaves a chip behind."
+        "md": "While a filter is active a bar above the grid shows one chip per condition, grouped as the filter is and joined by AND/OR, with an ✕ to drop just that rule, the loaded row count (with a trailing `+` while rows are still streaming), and **Edit…** / **Clear all**. A condition whose column left the result is dropped silently on the next run; a column name that appears twice in the result is refused outright (`filter rejected: …` / `sort/filter rejected: …` in the status line) rather than matching the wrong one. A filter is only recorded once the query it produces actually runs, so a rule that cannot be applied never leaves a chip behind."
       },
       {
         "k": "h",
@@ -947,7 +947,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Double-click a cell to edit ([[kbd:Mod]]+double-click keeps *View value*); with a cell selected, [[kbd:Enter]] or [[kbd:F2]] also opens the editor. Boolean columns get a **TRUE / FALSE** dropdown (plus `<null>` when nullable) committing the driver's token — `true`/`false` on Postgres, DuckDB, and SQL Server `bit`, `1`/`0` on SQLite and MySQL; re-picking the original value reverts the edit."
+        "md": "Double-click a cell to edit ([[kbd:Mod]]+double-click keeps *View value*); with a cell selected, [[kbd:Enter]] or [[kbd:F2]] also opens the editor. Boolean columns get a **TRUE / FALSE** dropdown (plus `<null>` when nullable) committing the driver's token — `true`/`false` on Postgres and DuckDB, `1`/`0` on SQLite, MySQL and SQL Server (whose boolean is `bit`, and T-SQL has no `TRUE`/`FALSE` literal); re-picking the original value reverts the edit."
       },
       {
         "k": "table",
@@ -1143,11 +1143,11 @@ export const TOPICS: Topic[] = [
         "rows": [
           [
             "Table",
-            "Select 100 rows · Select all rows · Filter rows… · **Modify table…** · Add column… · Add index… · Add constraint… · Rename… · Duplicate… · Edit comment… · Truncate… (*Delete all rows…* on SQLite) · Drop… · Generate SELECT/INSERT/UPDATE · DDL & relationships… · Copy DDL / Copy DDL → editor · Copy name / Copy qualified name"
+            "Select 100 rows · Select all rows · Filter rows… · Export table… · Import data into table… · **Modify table…** · Add column… · Add index… · Add constraint… · Rename… · Duplicate… · Edit comment… · Truncate… (*Delete all rows…* on SQLite) · Drop… · Backup table… · Generate SELECT/INSERT/UPDATE · DDL & relationships… · Copy DDL / Copy DDL → editor · Copy name / Copy qualified name"
           ],
           [
             "View / matview",
-            "Select all rows · Filter rows… · (matview only: **Refresh** / **Refresh concurrently**) · Rename… · Edit comment… · Drop… · DDL & relationships… · Copy DDL / Copy DDL → editor · Copy name / qualified name"
+            "Select all rows · Filter rows… · Export… · (matview only: **Refresh** / **Refresh concurrently**) · Rename… · Edit comment… · Drop… · DDL & relationships… · Copy DDL / Copy DDL → editor · Copy name / qualified name"
           ],
           [
             "Column",
@@ -1175,11 +1175,11 @@ export const TOPICS: Topic[] = [
           ],
           [
             "Schema",
-            "Schema diagram… · Create table… · Rename… · Drop… (on MySQL a schema IS a database, so it reads **Drop database…**, confirms as one, and refuses the connected database) · Copy name"
+            "Schema diagram… · Create table… · Import file as new table… · Export tables… · Rename… · Drop… (on MySQL a schema IS a database, so it reads **Drop database…**, confirms as one, and refuses the connected database) · Backup schema… · Copy name"
           ],
           [
             "Database",
-            "Create schema… · Drop… (the connected database can't be dropped) · Copy name"
+            "Create schema… · Import file as new table… · Export tables… · Drop… (the connected database can't be dropped) · Backup database… · Restore from file… · Copy name"
           ]
         ]
       },
@@ -1206,7 +1206,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**Modify table…** is a DataGrip-style diff editor: edit a column's name, type, nullability, default, PK membership, or comment; reorder, add and drop columns; tick indexes and constraints for removal; add UNIQUE, CHECK and foreign-key constraints; rename, re-comment, and on Postgres move the table to another schema. The preview is the **minimal `ALTER` script** — type/null/default edits run against original column names, renames run last, and a PK change emits a key drop + `ADD PRIMARY KEY` only when the key actually changed. It refuses to run on an empty column name, a duplicate one (case-insensitively on DuckDB, MySQL and SQLite, which treat two spellings as one column — Postgres is left alone because Tusk always quotes, so `\"Id\"` and `\"id\"` are two legal columns), a nullable primary key (except on SQLite, which allows NULLs in a non-INTEGER key), or a generated column, whose expression no `ALTER` here can restate. Column reordering is offered on SQLite only, the one engine that can express it. It says underneath whether the script runs as one transaction."
+        "md": "**Modify table…** is a DataGrip-style diff editor: edit a column's name, type, nullability, default, PK membership, or comment; reorder, add and drop columns; tick indexes and constraints for removal; add UNIQUE, CHECK and foreign-key constraints; rename, re-comment, and on Postgres move the table to another schema. The preview is the **minimal `ALTER` script** — type/null/default edits run against original column names, column renames follow those in-place edits so the earlier statements still resolve, the table rename runs last of all, and a PK change emits a key drop + `ADD PRIMARY KEY` only when the key actually changed. It refuses to run on an empty column name, a duplicate one (case-insensitively on DuckDB, MySQL and SQLite, which treat two spellings as one column — Postgres is left alone because Tusk always quotes, so `\"Id\"` and `\"id\"` are two legal columns), a nullable primary key (except on SQLite, which allows NULLs in a non-INTEGER key), or a generated column, whose expression no `ALTER` here can restate. Column reordering is offered on SQLite only, the one engine that can express it. When the script is more than one statement it says underneath how it runs — plainly, when it is not atomic, as on MySQL, where every DDL statement commits itself."
       },
       {
         "k": "tip",
@@ -1238,8 +1238,9 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
+          "**Manual transaction** — while one owns the session every Explorer database action is frozen, with *\"Explorer database actions are frozen during a manual transaction\"* as the tooltip. Commit or roll back first.",
           "**Read-only connection** — everything mutating disables with *\"Connection is read-only\"* (see [[topic:safety|Safety & read-only mode]]). **Drop database** passes the same gates as every other DDL action — manual-transaction freeze, read-only, engine support.",
-          "**Engine limits** — sidebar DDL is live on **all four engines**, and each action is offered only where that engine can express it; the tooltip names the engine, e.g. *\"DuckDB can't add constraints with ALTER TABLE — define them in CREATE TABLE\"*. DuckDB also has no constraint drops, index/sequence renames, `ALTER SEQUENCE RESTART`, `CREATE DATABASE`, or `TRUNCATE` options, and splits multi-action ALTERs into one statement each. MySQL rewrites a column with `MODIFY COLUMN`, renames tables with `RENAME TABLE`, drops each constraint kind with its own action, and has no schema rename, sequences, index methods or partial indexes. SQLite has no comments, `CREATE SCHEMA`, `CREATE DATABASE`, `TRUNCATE` (*Delete all rows…* runs `DELETE FROM`), or constraint ALTERs. SQL Server has no sidebar DDL builders yet, so its mutating items disable with *\"DDL editing isn't supported for SQL Server yet\"*.",
+          "**Engine limits** — sidebar DDL is live on **PostgreSQL, DuckDB, MySQL and SQLite**, and each action is offered only where that engine can express it; the tooltip names the engine, e.g. *\"DuckDB can't add constraints with ALTER TABLE — define them in CREATE TABLE\"*. DuckDB also has no constraint drops, index/sequence renames, `ALTER SEQUENCE RESTART`, `CREATE DATABASE` / `DROP DATABASE`, or `TRUNCATE` options, and splits multi-action ALTERs into one statement each. MySQL rewrites a column with `MODIFY COLUMN`, renames tables with `RENAME TABLE`, drops each constraint kind with its own action, and has no schema rename, sequences, index methods or partial indexes. SQLite has no comments, `CREATE SCHEMA`, `CREATE DATABASE`, `TRUNCATE` (*Delete all rows…* runs `DELETE FROM`), or constraint ALTERs. SQL Server has no sidebar DDL builders yet, so its mutating items disable with *\"DDL editing isn't supported for SQL Server yet\"*.",
           "**Postgres effective privileges** — Tusk fetches your role's real privileges (membership, `PUBLIC`, ownership): *Modify/Add/Rename/Drop* need table ownership, *Duplicate* and *Create table* need `CREATE` on the schema, *Truncate* accepts the `TRUNCATE` grant or ownership, *New schema* needs `CREATE` on the database, *New database* needs `CREATEDB`. Tooltips state the missing right, e.g. *\"Requires ownership of orders\"*."
         ],
         "ordered": false
@@ -1268,7 +1269,7 @@ export const TOPICS: Topic[] = [
   {
     "id": "import-export",
     "title": "Import & export",
-    "blurb": "Export results in six formats, streamed or loaded; import CSV, JSON or xlsx transactionally on any engine.",
+    "blurb": "Export results in six formats, streamed or loaded; import CSV, JSON or xlsx transactionally on four engines.",
     "blocks": [
       {
         "k": "p",
@@ -1359,7 +1360,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "During an all-rows stream the dialog locks its controls and shows **Cancel export**. Postgres gets an immediate `CancelRequest`, DuckDB the equivalent interrupt; SQLite, MySQL, and SQL Server have no out-of-band cancel, so the current query finishes first."
+        "md": "During an all-rows stream the dialog locks its controls and shows **Cancel export**. Postgres gets an immediate `CancelRequest` and DuckDB the equivalent interrupt (except on Windows, where DuckDB's interrupt is disabled because it corrupts the bundled connection); SQLite, MySQL, and SQL Server have no out-of-band cancel, so the current query finishes first."
       },
       {
         "k": "p",
@@ -1372,7 +1373,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**Import data** opens a three-step dialog on PostgreSQL, MySQL, SQLite and DuckDB (SQL Server isn't supported yet). **1. File** — pick the file and its parsing options; Tusk parses the head of it in the backend and shows the detected columns, the first 50 rows and any warnings. **2. Columns** — choose the target table and map the file's columns onto it. **3. Run** — watch the load with live progress, **Cancel &amp; roll back**, and a result summary. The file is read from disk by the backend in bounded batches: it is never loaded into the window, so size is limited by the format's budget rather than by memory."
+        "md": "**Import data** opens a three-step dialog on PostgreSQL, MySQL, SQLite and DuckDB (SQL Server isn't supported yet). **1. File** — pick the file and its parsing options; Tusk parses the head of it in the backend and shows the detected columns, a sample of the parsed rows (50 parsed, 20 shown) and any warnings. **2. Columns** — choose the target table and map the file's columns onto it. **3. Run** — watch the load with live progress, **Cancel & roll back**, and a result summary. The file is read from disk by the backend in bounded batches: it is never loaded into the window, so size is limited by the format's budget rather than by memory."
       },
       {
         "k": "list",
@@ -1386,7 +1387,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "The `CREATE TABLE` (if any), the optional table clear, and every insert batch run in **one transaction**: **Cancel &amp; roll back** (or any error, including a value that doesn't fit its column) undoes everything and names the offending row. PostgreSQL streams a plain load through `COPY … FROM STDIN`; a conflict mode falls back to batched multi-row `INSERT`s, because `COPY` has no `ON CONFLICT`. The other engines always use batched multi-row `INSERT`s. On success the sidebar schema refreshes so a new table appears in the tree and autocomplete ([[topic:sidebar|Sidebar]]), and the run lands in [[topic:history|history]] as `-- [Import] …`."
+        "md": "The `CREATE TABLE` (if any), the optional table clear, and every insert batch run in **one transaction**: **Cancel & roll back** (or any error, including a value that doesn't fit its column) undoes everything and names the offending row. PostgreSQL streams a plain load through `COPY … FROM STDIN`; a conflict mode falls back to batched multi-row `INSERT`s, because `COPY` has no `ON CONFLICT`. The other engines always use batched multi-row `INSERT`s. On success the sidebar schema refreshes so a new table appears in the tree and autocomplete ([[topic:sidebar|Sidebar]]), and the run lands in [[topic:history|history]] as `-- [Import] …`."
       },
       {
         "k": "h",
@@ -1398,7 +1399,7 @@ export const TOPICS: Topic[] = [
         "ordered": false,
         "items": [
           "**Existing table** — pick any table Tusk knows (the Explorer's *Import data into table…* pre-selects one). File columns are auto-matched to target columns by name, case- and punctuation-insensitively; anything left over can be pointed at a column by hand or set to **— skip —**, which leaves that column at its database default.",
-          "**New table** — the name is pre-filled from the file name (extension stripped, non-word characters → `_`), and an Explorer schema node pre-selects its own schema. Each column's type is **inferred from the sampled values** — integer, bigint, numeric, boolean, date, timestamp, or text — and each one can be overridden before the table is created. The dropdown shows the engine type each token creates as. Inference stays conservative: a value too wide for a 64-bit integer keeps the column `text`, and a column already near the 32-bit limit widens to `bigint`.",
+          "**New table** — the name is pre-filled from the file name (extension stripped, lower-cased, non-word characters → `_`), and an Explorer schema node pre-selects its own schema. Each column's type is **inferred from the sampled values** — integer, bigint, numeric, boolean, date, timestamp, or text — and each one can be overridden before the table is created. The dropdown shows the engine type each token creates as. Inference stays conservative: a value too wide for a 64-bit integer keeps the column `text`, and a column already near the 32-bit limit widens to `bigint`.",
           "**Empty the table first** — clears the table inside the same transaction, so a failure leaves the original rows intact.",
           "**Empty → NULL** — per column, imports an empty (or whitespace-only) string as NULL. On by default for every non-text column, because a blank is not a number, date or boolean."
         ]
@@ -1436,7 +1437,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Right-click a table for **Export table…** — the same configurator, aimed at that relation's full contents; on a view or materialized view the item reads **Export…**. Right-click a schema or the database for **Export tables…**: tick the tables, choose a format, pick a directory, and get one configured file per table named `schema_table.<ext>`, with per-table progress and a Cancel that works on every engine. That dialog exposes fewer options than the single-result one, and anything it does not show stays at its default instead of being inherited from your last export."
+        "md": "Right-click a table for **Export table…** — the same configurator, aimed at that relation's full contents; on a view or materialized view the item reads **Export…**. Right-click a schema or the database for **Export tables…**: tick the tables, choose a format, pick a directory, and get one configured file per table named `schema_table.<ext>`, with per-table progress and a Cancel that works on every engine. That dialog exposes fewer options than the single-result one, and anything it does not show falls back to the default rather than to your last export — the exception being the Excel **Bold header** / **Auto-filter** / **Freeze header** flags, which are still remembered."
       },
       {
         "k": "p",
@@ -1470,7 +1471,7 @@ export const TOPICS: Topic[] = [
     "blocks": [
       {
         "k": "p",
-        "md": "Tusk writes and replays backups itself, through the same driver it queries with — there is **no external binary** to install or keep version-matched, and nothing shells out. A dump is plain SQL: Tusk restores it, and so does the engine's own CLI client (`psql`, `mysql`, `sqlite3`, `duckdb`)."
+        "md": "Tusk writes and replays backups itself, through the same driver it queries with — there is **no external binary** to install or keep version-matched, and nothing shells out. It works on all five drivers. A dump is plain SQL: Tusk restores it, and so does the engine's own CLI client (`psql`, `mysql`, `sqlite3`, `duckdb`). SQL Server is the exception — its dumps carry no `GO` batch separators, so replay them with Tusk rather than with `sqlcmd`, which needs one before a `CREATE VIEW` or `CREATE PROCEDURE`."
       },
       {
         "k": "h",
@@ -1482,7 +1483,7 @@ export const TOPICS: Topic[] = [
         "ordered": false,
         "items": [
           "**Explorer right-click** — a database node offers **Backup database…** and **Restore from file…**, a schema node **Backup schema…**, a table node **Backup table…**. Each pre-fills the dialog's scope.",
-          "**Toolbar ⋯ overflow** — **Backup…** (whole database) and **Restore from file…**.",
+          "**Toolbar ⋯ overflow** — **Backup…** (whole database) and **Restore from file…**. The ⋯ button only appears when the editor pane is narrow (880 px or less); at wider sizes use the Explorer right-click.",
           "Both need an idle session: they are blocked while a manual transaction owns the connection, and starting one releases the single result stream (the owning tab's result is marked incomplete, as with any other whole-connection command)."
         ]
       },
@@ -1500,7 +1501,7 @@ export const TOPICS: Topic[] = [
         "rows": [
           [
             "**Scope**",
-            "**Whole database**, **Selected schemas**, or **Selected tables** — the last two show a searchable checklist built from the loaded tree. A table selection covers those tables and their rows only; views, sequences and routines need a schema or database backup."
+            "**Whole database**, **Selected schemas**, or **Selected tables** — the last two show a searchable checklist built from the loaded tree. A table selection covers those tables and their rows, plus — on PostgreSQL — the sequences their `serial` and identity columns own, because a dump without them cannot restore at all; views, other sequences and routines need a schema or database backup."
           ],
           [
             "**Contents**",
@@ -1512,7 +1513,7 @@ export const TOPICS: Topic[] = [
           ],
           [
             "**Wrap in one transaction**",
-            "`BEGIN` … `COMMIT` around the dump. Offered on PostgreSQL, DuckDB and SQLite; **disabled on MySQL**, which commits DDL implicitly."
+            "One transaction around the dump. Offered on PostgreSQL, DuckDB, SQLite and SQL Server; **disabled on MySQL**, which commits DDL implicitly."
           ],
           [
             "**Destination**",
@@ -1537,11 +1538,11 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "ordered": false,
         "items": [
-          "**Foreign keys come last on PostgreSQL and MySQL.** They are lifted out of PostgreSQL's reconstructed DDL and out of MySQL's `SHOW CREATE TABLE` into trailing `ALTER TABLE … ADD CONSTRAINT` statements, so a restore cannot break on table order — including a reference **cycle**, which no ordering can satisfy.",
-          "**SQLite and DuckDB keep foreign keys inline**, because neither engine can add one with `ALTER TABLE`. A SQLite dump writes `PRAGMA foreign_keys = OFF` ahead of everything else so the replay is not order-sensitive; DuckDB has no equivalent, and a cycle it cannot order around is reported as a warning instead of being written out as if it were fine.",
-          "**Functions, procedures and triggers are reconstructed on PostgreSQL only.** On the other engines the dump says so in a `-- warning:` line and in the result panel, naming what it could not carry, rather than looking complete.",
+          "**Foreign keys come last on PostgreSQL, MySQL and SQL Server.** They are lifted out of PostgreSQL's and SQL Server's reconstructed DDL and out of MySQL's `SHOW CREATE TABLE` into trailing `ALTER TABLE … ADD CONSTRAINT` statements, so a restore cannot break on table order — including a reference **cycle**, which no ordering can satisfy.",
+          "**SQLite and DuckDB keep foreign keys inline**, because neither engine can add one with `ALTER TABLE`. A SQLite dump that contains schema writes `PRAGMA foreign_keys = OFF` ahead of everything else so the replay is not order-sensitive (a data-only dump has no pragma to write); on either engine a cycle that cannot be ordered around is reported as a `-- warning:` line in the dump and in the result, instead of being written out as if it were fine.",
+          "**Functions, procedures and triggers are reconstructed on PostgreSQL only.** On the other engines the dump says so in a `-- warning:` line and in the result panel, with a count of the routines it could not carry, rather than looking complete.",
           "**PostgreSQL data streams through `COPY`.** The dump reads `COPY … TO STDOUT` and writes `COPY … FROM stdin;` blocks terminated by `\\.`, so no table is ever held in memory. A new block starts every 16 MiB.",
-          "**Every other engine emits batched multi-row `INSERT`s**, built with the same dialect-aware quoting and literal rules as SQL export, and paged so memory stays flat. Binary columns are written as native blob literals (`X'…'`, `from_hex('…')`), not as text.",
+          "**Every other engine — DuckDB, SQLite, MySQL and SQL Server — emits batched multi-row `INSERT`s**, built with the same dialect-aware quoting and literal rules as SQL export, and paged so memory stays flat. Binary columns are written as native blob literals, not as text: `X'…'` on SQLite and MySQL, `from_hex('…')` on DuckDB, `0x…` on SQL Server. A SQL Server table with an identity column has its data block bracketed with `SET IDENTITY_INSERT … ON` / `OFF`, so the dumped key values restore unchanged.",
           "**PostgreSQL dumps are snapshot-consistent**: the whole read runs inside one read-only repeatable-read transaction. The other engines page a table at a time, so a dump taken during concurrent writes is not a single point in time — the same caveat as grid paging.",
           "**Generated columns are skipped** on PostgreSQL, which would otherwise reject the restore."
         ]
@@ -1553,7 +1554,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**Choose file…** picks the dump; Tusk reads its size and header first and shows what it is about to replay. A dump taken from a different engine is called out before you run it — its SQL is unlikely to replay cleanly. A file without a Tusk header is fine; it is simply replayed as plain SQL. If the header carries a `psql` directive such as `\restrict` (recent `pg_dump` output begins with one), the dialog says so before you start: Tusk replays SQL, not `psql` commands. A byte-order mark left by a Windows editor is ignored."
+        "md": "**Choose file…** picks the dump; Tusk reads its size and header first and shows what it is about to replay. A dump taken from a different engine is called out before you run it — its SQL is unlikely to replay cleanly. A file without a Tusk header is fine; it is simply replayed as plain SQL. If the header carries a `psql` directive such as `\\restrict` (recent `pg_dump` output begins with one), the dialog says so before you start: Tusk replays SQL, not `psql` commands. A byte-order mark left by a Windows editor is ignored."
       },
       {
         "k": "list",
@@ -1561,7 +1562,7 @@ export const TOPICS: Topic[] = [
         "items": [
           "**Stop at the first error** (default) halts and reports; unchecking it keeps going and still records the first failure.",
           "**Run everything in one transaction** rolls the whole restore back on any failure. Same engine rule as backup — not available on MySQL — and it requires stop-on-error, since the first failure aborts the unit anyway.",
-          "Progress shows statements run, rows copied and bytes read; the total is unknown until the file ends, because the file is parsed as it streams.",
+          "Progress shows statements run, rows copied and bytes read; the total is unknown until the file ends, because the file is parsed as it streams. **Rows copied** only advances for `COPY` blocks — that is, for PostgreSQL dumps; an `INSERT`-based dump moves the statement counter instead.",
           "The result panel reports statements run, failures, rows copied, and the **first error with its statement number and line**.",
           "When it finishes, the sidebar and autocomplete reload — the database changed underneath them."
         ]
@@ -1578,14 +1579,14 @@ export const TOPICS: Topic[] = [
           "**A read-only connection can back up but never restore.** A backup is a read; a restore is blocked outright.",
           "**A failed or cancelled backup never touches the previous file.** The dump is written to a sibling temp file, fsynced, then atomically renamed — the same guarantee as export.",
           "**A restore statement is never replayed.** If the connection drops mid-restore the outcome is ambiguous, so Tusk stops and tells you to verify state rather than running it again.",
-          "**Cancel works on every driver.** Backup and restore check for cancellation between units, so they stop even where the engine has no out-of-band query cancel (SQLite, MySQL, DuckDB on Windows).",
+          "**Cancel works on every driver.** Backup and restore check for cancellation between units, so they stop even where the engine has no out-of-band query cancel (SQLite, MySQL, SQL Server, DuckDB on Windows).",
           "**Limits** — a restore reads at most **2 GiB**, and one statement (or one `COPY` data block) at most **256 MiB**. Tusk's own dumps stay well inside the second limit because it reopens `COPY` blocks as it writes."
         ]
       },
       {
         "k": "tip",
         "kind": "warn",
-        "md": "DDL reconstruction is as complete as [[topic:sidebar|Copy DDL]] is, and no more: partitioning, inheritance, row-level security, grants, storage parameters and tablespaces are out of scope, DuckDB dumps carry no `CREATE INDEX` (its catalog stores only the table definition), and MySQL's `CREATE TABLE` is unqualified, so it restores into the connected database. Verify a restore before relying on a dump as your only copy."
+        "md": "DDL reconstruction is as complete as [[topic:sidebar|Copy DDL]] is, and no more: partitioning, inheritance, row-level security, grants, storage parameters and tablespaces are out of scope, DuckDB dumps carry no `CREATE INDEX` (its catalog stores only the table definition), MySQL's `CREATE TABLE` is unqualified, so it restores into the connected database, and SQL Server table reconstruction needs SQL Server 2017 or later — on an older server a table backup refuses rather than dropping the keys silently. Verify a restore before relying on a dump as your only copy."
       }
     ],
     "icon": "duplicate"
@@ -2172,7 +2173,7 @@ export const TOPICS: Topic[] = [
     "blocks": [
       {
         "k": "p",
-        "md": "Teammates ask your database plain-language questions from Slack while Tusk runs on your desk — **desktop-hosted Socket Mode** (one outbound WebSocket, no server, no public endpoint, **bring-your-own Slack app**). The AI proposes SQL; **nothing runs without an Approve click**, and only single read-only SELECTs run — against whatever connection is active in Tusk."
+        "md": "Teammates ask your database plain-language questions from Slack while Tusk runs on your desk — **desktop-hosted Socket Mode** (one outbound WebSocket, no server, no public endpoint, **bring-your-own Slack app**). The AI proposes SQL; **nothing runs without an Approve click**, and only single read-only SELECTs run — against the one Tusk connection the bot was bound to when it started, which switching tabs in Tusk never changes."
       },
       {
         "k": "h",
@@ -2356,7 +2357,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "Every proposal is pinned to the exact Tusk connection, server-reported database, workspace, channel, thread, source message, and requester that created it. The bot answers against exactly one Tusk connection, chosen when it starts and changeable in **Settings ▸ Slack** while several are open; switching tabs in Tusk never redirects it. Approving a proposal after its connection or database changed fails closed. Disconnecting the bound connection stops the bot, says so in the statusbar, and turns **Start the bot on launch** back off, so it never comes back bound to whichever connection happens to open first — re-enable it and pick a target in **Settings ▸ Slack**. Execution uses a fresh read-only backend and does not join or roll back the UI cursor. SQL Server connections are refused outright, at the question and again at approval: it has no session read-only mode, so that backend could not be engine-enforced."
+        "md": "Every proposal is pinned to the exact Tusk connection, server-reported database, workspace, channel, thread, source message, and requester that created it. The bot answers against exactly one Tusk connection, chosen when it starts and changeable in **Settings ▸ Slack** while several are open; switching tabs in Tusk never redirects it. Approving a proposal after its connection or database changed fails closed. Disconnecting the bound connection stops the bot, says so in the statusbar, and switches the bot's **On/Off** toggle in **Settings ▸ Slack** back off, so it never comes back on the next launch bound to whichever connection happens to open first — switch it on again and pick a target there. Execution uses a fresh read-only backend and does not join or roll back the UI cursor. SQL Server connections are refused outright, at the question and again at approval: it has no session read-only mode, so that backend could not be engine-enforced."
       },
       {
         "k": "list",
@@ -2830,7 +2831,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Up to **16** databases can be open at the same time. The topbar carries one chip per open connection — driver mascot, database name, and a state dot — and **＋** opens the connect screen as a panel over your workspace instead of replacing it. With a single connection open the strip looks exactly as it always did."
+        "md": "Up to **16** databases can be open at the same time. The topbar carries one chip per open connection — driver mascot, database name, and a state dot — and **＋** opens the connect screen as a panel over your workspace instead of replacing it. With a single connection open the strip looks as it always did, apart from that **＋** at the end of it."
       },
       {
         "k": "table",
@@ -2849,7 +2850,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Each connection is independent: its own result cursor, manual transaction and transaction bar, Explorer tree, autocomplete catalog, permissions, [[topic:history|query history]], tab set, recovered editor buffers, and **Cancel**. Running a query on one connection never interrupts a result still streaming on another, and refreshing one Explorer never discards another connection's metadata. Opening the same saved connection twice gives each session its own tabs, so neither can overwrite the other's unsaved buffers."
+        "md": "Each connection is independent: its own result cursor, manual transaction and transaction bar, Explorer tree, autocomplete catalog, permissions, tab set, recovered editor buffers, and **Cancel**. [[topic:history|Query history]] is the exception — it is scoped to the *destination*, so opening the same profile twice shows one combined history for both sessions. Running a query on one connection never interrupts a result still streaming on another, and refreshing one Explorer never discards another connection's metadata. Opening the same saved connection twice gives each session its own tabs, so neither can overwrite the other's unsaved buffers."
       },
       {
         "k": "p",
@@ -3125,7 +3126,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Streaming [[topic:import-export|exports and imports]] cancel the same way and clean up: a cancelled or failed export **deletes the partial file** (xlsx only writes at finish), and an import runs `CREATE` + `COPY` in one transaction that **rolls back wholesale**. Ordinary multi-statement scripts get one transaction wrapper on every driver; MySQL DDL and nontransactional tables keep their native rollback limits."
+        "md": "Streaming [[topic:import-export|exports and imports]] cancel the same way and clean up: a cancelled or failed export **deletes the partial file** (xlsx only writes at finish), and an import runs its `CREATE TABLE`, its optional clear and every insert batch in one transaction that **rolls back wholesale** — except on MySQL, where DDL commits itself, so a create-and-load import leaves the empty table behind and says so. (`COPY` is the PostgreSQL load path; the other engines batch multi-row `INSERT`s.) Ordinary multi-statement scripts get one transaction wrapper on every driver; MySQL DDL and nontransactional tables keep their native rollback limits."
       },
       {
         "k": "tip",
@@ -3199,17 +3200,22 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
-        "text": "Unreleased — Microsoft SQL Server",
+        "text": "Unreleased — several databases at once, backups, SSH, SQL Server",
         "id": "v-unreleased"
       },
       {
         "k": "list",
         "ordered": false,
         "items": [
-          "**SQL Server is a connectable driver.** Pick **SQL Server** on the connect screen (port 1433, SQL login, keychain-stored password, the usual `sslmode` choices). Results page with `OFFSET`/`FETCH`, the Explorer shows schemas, tables and views with row counts and sizes, columns, indexes, constraints, triggers, sequences and routines, and Copy DDL reconstructs tables from `sys.*` with foreign keys as trailing `ALTER`s.",
-          "**The editor speaks T-SQL.** `[bracketed identifiers]`, `N'literals'`, nested block comments, `BEGIN … END` blocks and `GO` batch separators are handled by the same lexer that drives statement splitting, folding, linting and grid wrapping; `GO` never reaches the server, and a repeat count is refused.",
-          "**Manual transactions use T-SQL's vocabulary** — `BEGIN TRANSACTION`, `SAVE TRANSACTION`, and `ROLLBACK TRANSACTION name` for either a savepoint or the named transaction itself — verified against `@@TRANCOUNT` and `XACT_STATE()` after every statement. When the server ends the unit (a deadlock victim, or an error under `XACT_ABORT ON`) you get its own message and an idle transaction bar, not a \"connection dropped\". Explain is disabled there: T-SQL has no `EXPLAIN`.",
-          "**What SQL Server doesn't do yet.** File import isn't supported, the Slack bot won't run queries against it (Tusk can't open an engine-enforced read-only session there), sidebar DDL builders are missing, and Copy DDL needs SQL Server 2017+ — on an older server it refuses rather than emitting a table script with the keys silently missing."
+          "**Open several databases at once.** The topbar carries a strip of connection chips — driver mascot, database name, and a state dot (idle, running, transaction open, recovery required, session lost) — with **＋** to open the connect screen as a panel over your workspace and **✕** to disconnect just one. Up to **16** at a time. Each keeps its own result cursor, manual transaction, Explorer tree, autocomplete catalog, permissions, tabs and Cancel, so a query on one never interrupts a result streaming on another. Editor tabs are tagged with their connection and clicking one switches to it. [[kbd:Mod-Alt-ArrowRight]] / [[kbd:Mod-Alt-ArrowLeft]] move between them, [[kbd:Mod-Shift-n]] opens another. See [[topic:workspace|Workspace]].",
+          "**Reopen last session.** The connect screen — and the **＋** panel — offers the saved connections that were open when you last used Tusk, in order, saying how many are left. Anything that fails to reopen is named with its own reason and stays in the offer. Tusk never reconnects on its own, and ad-hoc connections typed in without saving are deliberately not remembered.",
+          "**Backup and restore, built in.** No `pg_dump`, no `mysqldump`, nothing to install: Tusk writes a plain-SQL dump through the driver it is already connected with, on all five engines. Right-click a database, schema or table for **Backup…**, pick scope and contents, optionally emit `DROP … IF EXISTS` or wrap the file in one transaction, and watch object/row/byte counters with a Cancel that works everywhere. **Restore from file…** replays a dump statement by statement and names the first failure with its statement number and line. PostgreSQL streams `COPY` inside one repeatable-read snapshot; the other engines emit batched `INSERT`s. See [[topic:backup|Backup & restore]].",
+          "**Import is a guided, multi-step flow, and export reaches the Explorer.** *Import data* opens **File → Columns → Run** on PostgreSQL, MySQL, SQLite and DuckDB: configurable delimiter/quote/escape, UTF-8 or Latin-1, skip-N-rows, a NULL placeholder, JSON arrays and NDJSON, **xlsx with a sheet picker**, name-matched column mapping, per-column *empty → NULL*, inferred column types for a new table, and conflict handling (fail / skip / update) in each engine's own form. Everything is parsed in Rust straight from disk. The Explorer gains **Export table…** / **Export tables…**, and the export dialog gains a **Selection** scope, a real reconstructed `CREATE TABLE` for plain-table SQL exports, and per-format memory of your last options. See [[topic:import-export|Import & export]].",
+          "**Build result filters visually.** A **Filter** button ([[kbd:Mod-Shift-f]]), *Filter by this column…* in the header menu, and the Explorer's *Filter rows…* open a tree of AND/OR groups. Twenty-one operators, gated by the column's inferred class, up to eight levels and 200 conditions, with the exact `WHERE` shown as you build it — **Apply filter**, **Copy WHERE**, or **Open as query** into a new tab. Active rules show as chips above the grid, and the per-column filter row feeds the same filter. See [[topic:results|Results grid]].",
+          "**Reach a database through an SSH tunnel.** PostgreSQL, MySQL and SQL Server connections can tunnel: host, port, user, and Password / Private key / SSH agent. The SSH client is built in, and the secret goes to the OS keychain under its own entry. Host keys are checked against `~/.ssh/known_hosts` (read-only) and Tusk's own trust store — an unknown host shows its `SHA256:…` fingerprint before **Trust and connect**, a changed key is refused outright. See [[topic:getting-started|Connections & drivers]].",
+          "**Microsoft SQL Server is a connectable driver.** Port 1433, SQL login, keychain password, the usual `sslmode` choices. Results page with `OFFSET`/`FETCH`; the Explorer shows schemas, tables and views with columns, indexes, constraints, triggers, sequences and routines; Copy DDL reconstructs tables from `sys.*` with foreign keys as trailing `ALTER`s. The editor speaks T-SQL — `[bracketed identifiers]`, `N'literals'`, nested block comments, `BEGIN … END` blocks and `GO` batches all lex correctly — and manual transactions use `BEGIN TRANSACTION` / `SAVE TRANSACTION`, verified against `@@TRANCOUNT` and `XACT_STATE()`. ERD, in-grid editing, export, backup and restore all work.",
+          "**What SQL Server doesn't do yet.** File import, the Explorer's DDL builders (no T-SQL builders yet), the Slack bot (Tusk can't open an engine-enforced read-only session there) and Explain (T-SQL has no `EXPLAIN`) are all refused with the reason. Table Copy DDL needs SQL Server 2017 or later — on an older server it refuses rather than emitting a script with the keys silently missing; stored view/procedure/function text still works there.",
+          "**Table editing on every engine that can express it.** *Create table…* covers types, NOT NULL, defaults, single or composite keys, unique, check and each engine's auto-numbering; foreign keys get a searchable picker instead of a typed name. *Modify table…* now reorders columns, adds UNIQUE/CHECK/FK constraints, drops each kind with that engine's own action, and refuses clearly on an empty or duplicate name, a nullable primary key or a generated column. **SQLite rebuilds** — create, `INSERT … SELECT`, drop, rename, recreate indexes and triggers, in one transaction, with the button reading **Rebuild table**. The Explorer's DDL menu is live on PostgreSQL, DuckDB, MySQL and SQLite, each action offered only where the engine has it, and the Explorer now reports real indexes, constraints and triggers on all of them. See [[topic:sidebar|Schema explorer & DDL]]."
         ]
       },
       {
