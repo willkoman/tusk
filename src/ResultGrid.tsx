@@ -1,4 +1,5 @@
 import { createSignal, createMemo, createEffect, on, onCleanup, untrack, For, Show, type Accessor } from "solid-js";
+import { Icon } from "./Icons";
 import { type Dataset, formatForCopy, formatWithOptions } from "./formats";
 import { defaultExportOptions } from "./export";
 import { clipWrite, clipRead } from "./clipboard";
@@ -1323,9 +1324,9 @@ export function ResultGrid(props: ResultGridProps) {
             }}
           />
           <span class="rg-find-count">{findCountText()}</span>
-          <button class="rg-find-btn" title="Previous match (Shift+Enter)" disabled={!findHits().matches.length} onClick={() => stepFind(-1)}>‹</button>
-          <button class="rg-find-btn" title="Next match (Enter)" disabled={!findHits().matches.length} onClick={() => stepFind(1)}>›</button>
-          <button class="rg-find-btn" title="Close find (Esc)" onClick={closeFind}>✕</button>
+          <button class="rg-find-btn" title="Previous match (Shift+Enter)" disabled={!findHits().matches.length} onClick={() => stepFind(-1)}><Icon name="chevronLeft" /></button>
+          <button class="rg-find-btn" title="Next match (Enter)" disabled={!findHits().matches.length} onClick={() => stepFind(1)}><Icon name="chevronRight" /></button>
+          <button class="rg-find-btn" title="Close find (Esc)" onClick={closeFind}><Icon name="close" /></button>
         </div>
       </Show>
 
@@ -1577,9 +1578,9 @@ export function ResultGrid(props: ResultGridProps) {
               <span class="rg-rec-pos">{isInsRow(recRow()) ? "new row" : `row ${displayLoadedAt(recRow()) + 1}`}</span>
             </Show>
             <span class="rg-rec-spacer" />
-            <button class="rg-find-btn" title="Previous row (Alt+↑)" disabled={recRow() <= 0} onClick={() => stepRecord(-1)}>‹</button>
-            <button class="rg-find-btn" title="Next row (Alt+↓)" disabled={recRow() < 0 || recRow() >= nRows() - 1} onClick={() => stepRecord(1)}>›</button>
-            <button class="rg-find-btn" title="Close record view" onClick={() => { props.setView({ recordOpen: false }); focusGrid(); }}>✕</button>
+            <button class="rg-find-btn" title="Previous row (Alt+↑)" disabled={recRow() <= 0} onClick={() => stepRecord(-1)}><Icon name="chevronLeft" /></button>
+            <button class="rg-find-btn" title="Next row (Alt+↓)" disabled={recRow() < 0 || recRow() >= nRows() - 1} onClick={() => stepRecord(1)}><Icon name="chevronRight" /></button>
+            <button class="rg-find-btn" title="Close record view" onClick={() => { props.setView({ recordOpen: false }); focusGrid(); }}><Icon name="close" /></button>
           </div>
           <Show when={recRow() >= 0} fallback={<div class="rg-rec-empty">Select a cell to see its row.</div>}>
             <div class="rg-rec-body">

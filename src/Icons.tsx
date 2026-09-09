@@ -83,6 +83,11 @@ export type IconName =
   | "paste"
   | "minus"
   | "more"
+  // Reorder / fit-to-view. Forms used ↑ ↓ ⧉ ✕ ＋ ▸ « as icons: a typographic
+  // glyph carries the text baseline and weight, not the icon set's.
+  | "arrowUp"
+  | "arrowDown"
+  | "fit"
   | "chevronDown"
   | "chevronRight"
   | "chevronLeft";
@@ -171,6 +176,12 @@ export function Icon(props: { name: IconName }): JSX.Element {
       return svg("currentColor", <path d="M5 12h14" />);
     case "more":
       return svg("currentColor", <><circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /></>);
+    case "arrowUp":
+      return svg("currentColor", <path d="M12 20V4M6 10l6-6 6 6" />);
+    case "arrowDown":
+      return svg("currentColor", <path d="M12 4v16M6 14l6 6 6-6" />);
+    case "fit":
+      return svg("currentColor", <><path d="M3 8V4h4M17 4h4v4M21 16v4h-4M7 20H3v-4" /><rect x="8" y="8" width="8" height="8" rx="1" /></>);
     case "chevronDown":
       return svg("currentColor", <path d="m6 9 6 6 6-6" />);
     case "chevronRight":

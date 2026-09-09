@@ -1,6 +1,7 @@
 import { createMemo, createSignal, For, Show } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { Dialog, DialogFooter } from "../Dialog";
+import { Icon } from "../Icons";
 import { SqlField } from "../SqlField";
 import {
   droppableIndexes,
@@ -361,8 +362,8 @@ export function ModifyTableForm(props: {
                     (SQLite); everywhere else ALTER TABLE has no way to move a column. */}
                 <span class="cb-order">
                   <Show when={caps.rebuild}>
-                    <button class="icon" title="Move up" disabled={i() === 0} onClick={() => move(i(), -1)}>↑</button>
-                    <button class="icon" title="Move down" disabled={i() === cols.length - 1} onClick={() => move(i(), 1)}>↓</button>
+                    <button class="icon" title="Move up" disabled={i() === 0} onClick={() => move(i(), -1)}><Icon name="arrowUp" /></button>
+                    <button class="icon" title="Move down" disabled={i() === cols.length - 1} onClick={() => move(i(), 1)}><Icon name="arrowDown" /></button>
                   </Show>
                 </span>
                 <input
@@ -425,7 +426,7 @@ export function ModifyTableForm(props: {
             </div>
           )}
         </For>
-        <button class="ghost cb-add" onClick={addRow}>＋ Add column</button>
+        <button class="ghost cb-add" onClick={addRow}><Icon name="plus" /> Add column</button>
       </div>
 
       <Show when={shownIndexes().length}>
@@ -484,7 +485,7 @@ export function ModifyTableForm(props: {
 
       <Show when={caps.addConstraint || caps.rebuild}>
         <button class="ghost full" onClick={() => setShowAdd(!showAdd())}>
-          {showAdd() ? "▾" : "▸"} Add unique / check / foreign-key constraints
+          <Icon name={showAdd() ? "chevronDown" : "chevronRight"} /> Add unique / check / foreign-key constraints
         </button>
         <Show when={showAdd()}>
           <div class="field-label">New UNIQUE constraints</div>
@@ -506,7 +507,7 @@ export function ModifyTableForm(props: {
             )}
           </For>
           <button class="ghost full" onClick={() => setUniques(produce((x) => x.push({ uid: uid++, name: "", columns: [] })))}>
-            ＋ Add unique constraint
+            <Icon name="plus" /> Add unique constraint
           </button>
 
           <div class="field-label">New CHECK constraints</div>
@@ -520,7 +521,7 @@ export function ModifyTableForm(props: {
             )}
           </For>
           <button class="ghost full" onClick={() => setChecks(produce((x) => x.push({ uid: uid++, name: "", expr: "" })))}>
-            ＋ Add check constraint
+            <Icon name="plus" /> Add check constraint
           </button>
 
           <Show when={props.tables}>
@@ -540,7 +541,7 @@ export function ModifyTableForm(props: {
               )}
             </For>
             <button class="ghost full" onClick={() => setFks(produce((x) => x.push({ ...emptyFk(), uid: uid++ })))}>
-              ＋ Add foreign key
+              <Icon name="plus" /> Add foreign key
             </button>
           </Show>
         </Show>

@@ -1,5 +1,6 @@
 import { createMemo, createSignal, For, Show, createEffect, on, onCleanup } from "solid-js";
 import { Portal } from "solid-js/web";
+import { Icon } from "../Icons";
 import type { FkSpec } from "../sql/ddl";
 import { ddlCaps } from "../sql/ddlCaps";
 
@@ -266,13 +267,13 @@ export function FkEditor(props: {
                 </For>
               </select>
               <button class="icon cb-x" title="Remove pair" onClick={() => removePair(i())}>
-                ✕
+                <Icon name="close" />
               </button>
             </div>
           )}
         </For>
         <button class="ghost full" onClick={addPair}>
-          ＋ Add column pair
+          <Icon name="plus" /> Add column pair
         </button>
       </div>
 

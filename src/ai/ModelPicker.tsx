@@ -8,6 +8,7 @@
 // is what you want when you know the name.
 
 import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
+import { Icon } from "../Icons";
 import { fuzzyRank, highlight } from "./fuzzy";
 import { providerInfo, type AiProvider } from "./store";
 
@@ -111,7 +112,7 @@ export function ModelPicker(props: {
         onClick={() => { setOpen((v) => !v); queueMicrotask(() => inputEl?.focus()); }}
       >
         <span class="mp-btn-model">{props.current.model || "Select a model"}</span>
-        <span class="mp-btn-caret">▾</span>
+        <span class="mp-btn-caret"><Icon name="chevronDown" /></span>
       </button>
 
       <Show when={open()}>

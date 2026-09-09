@@ -10,6 +10,7 @@
 // "offer everything", which the summary line says in words rather than an empty box.
 
 import { For, Show, createEffect, createMemo, createSignal } from "solid-js";
+import { Icon } from "../Icons";
 import { fuzzyRank, highlight } from "./fuzzy";
 
 type Row = { model: string; indices: number[] };
@@ -203,7 +204,7 @@ export function ModelMultiPicker(props: {
               onMouseEnter={() => setCursor(flatIndex().get(typed()) ?? 0)}
               onClick={addTyped}
             >
-              <span class="mmp-add-icon">＋</span>
+              <span class="mmp-add-icon"><Icon name="plus" /></span>
               <span class="mp-model">Add <code>{typed()}</code> as a model id</span>
             </div>
           </Show>
@@ -216,7 +217,7 @@ export function ModelMultiPicker(props: {
               <span class="mmp-chip" classList={{ off: stale().includes(m), def: isDefault(m) }} title={isDefault(m) ? `${m} (default)` : m}>
                 <Show when={isDefault(m)}><span class="mmp-chip-star">★</span></Show>
                 <span>{m}</span>
-                <button title={`Stop offering ${m}`} onClick={() => toggle(m)}>✕</button>
+                <button title={`Stop offering ${m}`} onClick={() => toggle(m)}><Icon name="close" /></button>
               </span>
             )}
           </For>

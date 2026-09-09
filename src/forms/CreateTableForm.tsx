@@ -1,6 +1,7 @@
 import { createMemo, createSignal, For, Show } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { Dialog, DialogFooter } from "../Dialog";
+import { Icon } from "../Icons";
 import { SqlField } from "../SqlField";
 import {
   createTable,
@@ -32,8 +33,8 @@ const emptyCol = (): Row => ({
 
 const IDENTITY_LABEL: Record<string, string> = {
   identity: "Ident",
-  auto_increment: "Auto↑",
-  rowid: "Auto↑",
+  auto_increment: "Auto",
+  rowid: "Auto",
   sequence: "Seq",
 };
 const IDENTITY_HINT: Record<string, string> = {
@@ -206,8 +207,8 @@ export function CreateTableForm(props: {
               {/* Line 1: what the column IS. */}
               <div class="cb-line1">
                 <span class="cb-order">
-                  <button class="icon" title="Move up" disabled={i() === 0} onClick={() => move(i(), -1)}>↑</button>
-                  <button class="icon" title="Move down" disabled={i() === cols.length - 1} onClick={() => move(i(), 1)}>↓</button>
+                  <button class="icon" title="Move up" disabled={i() === 0} onClick={() => move(i(), -1)}><Icon name="arrowUp" /></button>
+                  <button class="icon" title="Move down" disabled={i() === cols.length - 1} onClick={() => move(i(), 1)}><Icon name="arrowDown" /></button>
                 </span>
                 <input value={c.name} onInput={(e) => update(i(), { name: e.currentTarget.value })} placeholder="name" />
                 <SqlField value={c.type} typesOnly onChange={(v) => update(i(), { type: v })} placeholder="type" />
@@ -272,17 +273,17 @@ export function CreateTableForm(props: {
                 </Show>
               </div>
               <span class="cb-actions">
-                <button class="icon" title="Duplicate column" onClick={() => duplicateRow(i())}>⧉</button>
-                <button class="icon" title="Remove" onClick={() => removeRow(i())}>✕</button>
+                <button class="icon" title="Duplicate column" onClick={() => duplicateRow(i())}><Icon name="copy" /></button>
+                <button class="icon" title="Remove" onClick={() => removeRow(i())}><Icon name="close" /></button>
               </span>
             </div>
           )}
         </For>
-        <button class="ghost cb-add" onClick={addRow}>＋ Add column</button>
+        <button class="ghost cb-add" onClick={addRow}><Icon name="plus" /> Add column</button>
       </div>
 
       <button class="ghost full" onClick={() => setShowAdvanced(!showAdvanced())}>
-        {showAdvanced() ? "▾" : "▸"} Checks, foreign keys{caps.tableOptions ? " and table options" : ""}
+        <Icon name={showAdvanced() ? "chevronDown" : "chevronRight"} /> Checks, foreign keys{caps.tableOptions ? " and table options" : ""}
       </button>
       <Show when={showAdvanced()}>
         <div class="field-label">Per-column check</div>
@@ -318,7 +319,7 @@ export function CreateTableForm(props: {
               </div>
             )}
           </For>
-          <button class="ghost full" onClick={addFk}>＋ Add foreign key</button>
+          <button class="ghost full" onClick={addFk}><Icon name="plus" /> Add foreign key</button>
         </Show>
 
         <div class="seg">

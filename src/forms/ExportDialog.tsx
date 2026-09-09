@@ -1,5 +1,6 @@
 import { createSignal, createMemo, For, Show } from "solid-js";
 import { Dialog } from "../Dialog";
+import { Icon } from "../Icons";
 import { formatWithOptions } from "../formats";
 import {
   applyRememberedExportOptions,
@@ -295,8 +296,8 @@ export function ExportDialog(props: {
                     {c.name}
                   </label>
                   <span class="spacer" />
-                  <button class="icon" title="Move up" disabled={i() === 0} onClick={() => move(i(), -1)}>↑</button>
-                  <button class="icon" title="Move down" disabled={i() === cols().length - 1} onClick={() => move(i(), 1)}>↓</button>
+                  <button class="icon" title="Move up" disabled={i() === 0} onClick={() => move(i(), -1)}><Icon name="arrowUp" /></button>
+                  <button class="icon" title="Move down" disabled={i() === cols().length - 1} onClick={() => move(i(), 1)}><Icon name="arrowDown" /></button>
                 </div>
               )}
             </For>

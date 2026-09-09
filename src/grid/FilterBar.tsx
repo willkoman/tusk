@@ -80,7 +80,7 @@ function Chip(props: { cond: Condition; onRemove: (id: string) => void; disabled
         disabled={props.disabled?.()}
         onClick={() => props.onRemove(props.cond.id)}
       >
-        ✕
+        <Icon name="close" />
       </button>
     </span>
   );

@@ -398,7 +398,7 @@ export function DdlGraphDialog(props: {
               <button class="relviz-rail" title="Expand the DDL pane" onClick={() => setDdlCollapsed(false)}>
                 <Icon name="fileCode" />
                 <span class="relviz-rail-label">DDL</span>
-                <span class="relviz-rail-chev">»</span>
+                <span class="relviz-rail-chev"><Icon name="chevronRight" /></span>
               </button>
             }
           >
@@ -407,7 +407,7 @@ export function DdlGraphDialog(props: {
               <span class="spacer" />
               <button class="ghost" disabled={!ddl()?.ok} onClick={() => props.onCopy(ddl()!.ok!, "Copied DDL")}>Copy</button>
               <button class="ghost" disabled={!ddl()?.ok} onClick={() => props.onOpenSql(ddl()!.ok!)}>Open in editor</button>
-              <button class="icon" title="Collapse the DDL pane" onClick={() => setDdlCollapsed(true)}>«</button>
+              <button class="icon" title="Collapse the DDL pane" onClick={() => setDdlCollapsed(true)}><Icon name="chevronLeft" /></button>
             </div>
             <Switch>
               <Match when={!center().name}><div class="relviz-note">Click a table card to load its DDL.</div></Match>

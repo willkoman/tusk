@@ -1,4 +1,5 @@
 import { For, Show, createEffect, createMemo, createSignal, on, type Accessor } from "solid-js";
+import { Icon } from "../Icons";
 import { type EditorPrefs } from "../editor/types";
 import { PanZoomCanvas } from "../viz/PanZoomCanvas";
 import { heatLegend, heatOf } from "./heat";
@@ -190,7 +191,7 @@ export function PlanView(props: {
                                   toggleCollapse(n.id);
                                 }}
                               >
-                                {collapsed().has(n.id) ? `▸ ${hiddenCount(n)}` : "▾"}
+                                {collapsed().has(n.id) ? <><Icon name="chevronRight" /> {hiddenCount(n)}</> : <Icon name="chevronDown" />}
                               </button>
                             </Show>
                           </div>
@@ -222,7 +223,7 @@ export function PlanView(props: {
                       <div class="plan-details-head">
                         <strong>{sel().label}</strong>
                         <span class="spacer" />
-                        <button class="icon" onClick={() => setSelectedId(null)}>✕</button>
+                        <button class="icon" onClick={() => setSelectedId(null)}><Icon name="close" /></button>
                       </div>
                       <div class="plan-details-body">
                         <Show when={sel().object}><div class="plan-detail-row"><span>Object</span><span>{sel().object}</span></div></Show>

@@ -103,7 +103,7 @@ export default function HelpDialog(props: {
               }}
             />
             <Show when={q()}>
-              <button class="icon kb-searchclear" title="Clear" onClick={() => setQ("")}>✕</button>
+              <button class="icon kb-searchclear" title="Clear" onClick={() => setQ("")}><Icon name="close" /></button>
             </Show>
           </div>
           <div class="kb-navscroll">
@@ -171,7 +171,7 @@ export default function HelpDialog(props: {
                         onAnimationEnd={() => setFlash("")}
                       >
                         <button class="kb-sechead" aria-expanded={isOpen(s.id)} onClick={() => setSec(s.id, !isOpen(s.id))}>
-                          <span class="kb-secchev">{isOpen(s.id) ? "▾" : "▸"}</span>
+                          <span class="kb-secchev"><Icon name={isOpen(s.id) ? "chevronDown" : "chevronRight"} /></span>
                           <span class="kb-sectitle">{s.title}</span>
                           <Show when={!isOpen(s.id)}>
                             <span class="kb-secpreview">{previewLead(s.preview)}</span>

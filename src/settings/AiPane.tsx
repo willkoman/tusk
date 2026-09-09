@@ -14,6 +14,7 @@
 
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { Icon } from "../Icons";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { pickOpenPath, pickSavePath, UNVERIFIED_PICKER } from "../filePicker";
 import {
@@ -310,7 +311,7 @@ export function AiPane(props: { database: string }) {
                   </span>
                   <span class="ai-chip" classList={{ ok: st().cls === "ok", off: st().cls === "off" }}>{st().label}</span>
                   <span class="ai-card-model">{isActive(p.id) ? cfg().model || "—" : cfg().models[p.id] ?? ""}</span>
-                  <span class="ai-card-caret">{open() ? "▾" : "▸"}</span>
+                  <span class="ai-card-caret"><Icon name={open() ? "chevronDown" : "chevronRight"} /></span>
                 </button>
 
                 <Show when={open()}>

@@ -1,4 +1,5 @@
 import { type JSX, onCleanup, onMount } from "solid-js";
+import { Icon } from "../Icons";
 import { createPanZoom, READABLE_FIT, type BBox, type PanZoom } from "./panzoom";
 
 // Shared pan/zoom shell: a clipping viewport with a transformed inner canvas —
@@ -67,9 +68,9 @@ export function PanZoomCanvas(props: {
         {props.children}
       </div>
       <div class="viz-toolbar" onPointerDown={(e) => e.stopPropagation()}>
-        <button class="icon" title="Fit to view (double-click background)" onClick={doFit}>⊡</button>
-        <button class="icon" title="Zoom in" onClick={() => viewport && pz.zoomBy(1.25, viewport.clientWidth / 2, viewport.clientHeight / 2)}>＋</button>
-        <button class="icon" title="Zoom out" onClick={() => viewport && pz.zoomBy(0.8, viewport.clientWidth / 2, viewport.clientHeight / 2)}>－</button>
+        <button class="icon" title="Fit to view (double-click background)" onClick={doFit}><Icon name="fit" /></button>
+        <button class="icon" title="Zoom in" onClick={() => viewport && pz.zoomBy(1.25, viewport.clientWidth / 2, viewport.clientHeight / 2)}><Icon name="plus" /></button>
+        <button class="icon" title="Zoom out" onClick={() => viewport && pz.zoomBy(0.8, viewport.clientWidth / 2, viewport.clientHeight / 2)}><Icon name="minus" /></button>
       </div>
     </div>
   );
