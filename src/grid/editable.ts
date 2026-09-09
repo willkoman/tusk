@@ -1,4 +1,5 @@
-import { lex, maskNonCode } from "../editor/lexer";
+import { lex, maskNonCode, type SqlEngine } from "../editor/lexer";
+import { sqlDialect } from "../sql/ident";
 import { aliasMap, identifierParts, tableByRef, tableByRefUnique, type Index, type Table } from "../sql/aliases";
 import { hasDuplicateColumns, stripTrailingSemi, wrappableQuery } from "./query";
 import type { RelationDetail } from "../Tree";
@@ -161,15 +162,24 @@ function hasCommaJoin(sql: string): boolean {
  * chain. With NO active schema the server default (`"$user", public`) is not
  * knowable client-side, and an ambiguous bare name stays uneditable — a write
  * must never guess which physical table the query read. */
-export function editTarget(baseQuery: string, idx: Index, activeSchema: string | null = null): EditTarget {
+/** `dialect` is the OWNING connection's driver kind: several connections are open,
+ *  and both the wrappability test and the lexer are engine-specific, so a result
+ *  must never be judged editable under another connection's rules. Defaults to the
+ *  active connection for call sites that have no tab in hand. */
+export function editTarget(
+  baseQuery: string,
+  idx: Index,
+  activeSchema: string | null = null,
+  dialect: string = sqlDialect(),
+): EditTarget {
   const resolve = (ref: string) =>
     activeSchema != null ? tableByRef(idx, ref, activeSchema) : tableByRefUnique(idx, ref);
   const base = stripTrailingSemi(baseQuery);
   if (!base) return { ok: false, reason: "results from a script — run a single SELECT to edit" };
   // Plain SELECT only — WITH/TABLE/VALUES results can't be safely mapped back to rows.
-  if (!wrappableQuery(base))
+  if (!wrappableQuery(base, dialect))
     return { ok: false, reason: "only SELECT results are editable" };
-  const { spans, stmts } = lex(base);
+  const { spans, stmts } = lex(base, dialect as SqlEngine);
   if (stmts.length > 1) return { ok: false, reason: "results from a script — run a single SELECT to edit" };
   // keepDquote: quoted identifiers are names the alias map must see (strings stay masked).
   const masked = maskNonCode(base, spans, 0, base.length, true);

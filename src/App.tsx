@@ -1,4 +1,4 @@
-import { createSignal, createMemo, createEffect, on, onMount, onCleanup, For, Show, lazy } from "solid-js";
+import { batch, createSignal, createMemo, createEffect, on, onMount, onCleanup, For, Show, lazy } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -372,7 +372,7 @@ function App() {
           const r = await invoke<{ columns: string[]; rows: (string | null)[][] }>("sample_rows", {
             connectionId: c.id, schema: t.schema, name: t.name, limit: 5,
           });
-          if (!connectionOpen(c) || transaction().revision !== transactionRevision || metadataFrozen()) return null;
+          if (!connectionOpen(c) || (stateOf(c.id)?.transaction.revision ?? -1) !== transactionRevision || frozenFor(c.id)) return null;
           const s: SampleTable = { schema: t.schema, name: t.name, columns: r.columns, rows: r.rows };
           rt.sampleCache.set(key, s);
           return s;
@@ -554,15 +554,37 @@ function App() {
     const target = tabId && owned.some((t) => t.id === tabId)
       ? tabId
       : (owned.some((t) => t.id === lastTabByConn.get(connectionId)) ? lastTabByConn.get(connectionId) : undefined) ?? owned[0]?.id;
-    setActiveConnectionId(connectionId);
-    if (target) {
-      setActiveTabId(target);
-      lastTabByConn.set(connectionId, target);
-    }
+    // A connection with no tab of its own would leave the active tab pointing at
+    // another connection — the one state every "active X" accessor assumes cannot
+    // happen. Give it one rather than publishing the broken pairing.
+    const fallback: Tab | null = target || !entryOf(connectionId) ? null : makeTab({ connectionId });
+    // Batched: see switchTab. The intermediate state is observable and harmful.
+    batch(() => {
+      if (fallback) setTabs((ts) => [...ts, fallback]);
+      setActiveConnectionId(connectionId);
+      const landing = target ?? fallback?.id;
+      if (landing) {
+        setActiveTabId(landing);
+        lastTabByConn.set(connectionId, landing);
+      }
+    });
   }
 
-  /** Chip labels, disambiguated when two sessions report the same database name. */
-  const connectionLabelMap = createMemo(() => connectionLabels(connections().map((e) => e.state())));
+  /**
+   * Chip labels, disambiguated when two sessions report the same database name.
+   *
+   * Two memos on purpose. Reading every connection's whole state tracks the run
+   * timer, which ticks 5×/s during any query; a Map returned from that would never
+   * dedupe by reference, so every dependent — including the window-title effect,
+   * which calls into the OS — would re-run at 5 Hz. The key memo absorbs the ticks
+   * (it returns a string, so it dedupes), and `on()` keeps the map's own reads
+   * untracked.
+   */
+  const connectionLabelKey = createMemo(() =>
+    connections().map((e) => `${e.conn.id}\u0000${e.state().tree?.database ?? ""}\u0000${e.conn.target}`).join("\u0001"));
+  const connectionLabelMap = createMemo(
+    on(connectionLabelKey, () => connectionLabels(connections().map((e) => e.state()))),
+  );
   const labelOf = (connectionId: string) =>
     connectionLabelMap().get(connectionId) ?? entryOf(connectionId)?.conn.target ?? "";
   const kindOf = (connectionId: string) => connectionKindOf(stateOf(connectionId));
@@ -750,8 +772,13 @@ function App() {
     setCellView(null);
     setRunChoice(null);
     setSelected(null);
+    setCommitView(null);
     closeBackup();
     closeRestore();
+    // These are frozen against one connection's result; after a switch their Run
+    // silently fails the origin check, which reads as a dead button.
+    setExportSrc(null);
+    if (!exportTablesBusy()) { setExportTables(null); setExportTablesProgress(null); }
     if (!importBusy()) { setImportOpen(null); importOrigin = null; }
   }, { defer: true }));
 
@@ -976,7 +1003,7 @@ function App() {
       selection.columns.length === columns().length;
     // "Include CREATE TABLE" needs a plain source table; reuse the grid's own
     // single-table resolver rather than re-parsing the query here.
-    const resolved = editTarget(tab.result.baseQuery, editIndexer(schema()), tab.searchSchema);
+    const resolved = editTarget(tab.result.baseQuery, editIndexer(schema()), tab.searchSchema, kindOf(tab.connectionId));
     const ddlTarget = resolved.ok ? resolved.table : null;
     setExportSrc({
       columns: columns(),
@@ -996,13 +1023,24 @@ function App() {
     });
   };
 
-  /** Focus a tab — and, with it, the connection that tab belongs to. */
+  /**
+   * Focus a tab — and, with it, the connection that tab belongs to.
+   *
+   * BATCHED, and that is load-bearing: Solid flushes effects after every write, so
+   * setting the tab and the connection separately would publish an intermediate state
+   * pairing one connection's tab with another connection's schema/details/perms. The
+   * editability effect and the FK-prefetch effect both act on that pairing, and would
+   * fetch (and cache) one connection's relation against the other — closing its result
+   * stream on the way. Never split these two writes.
+   */
   function switchTab(id: string) {
     const t = tabs().find((x) => x.id === id);
     if (!t || id === activeTabId()) return;
-    setActiveTabId(id); // ResultGrid restores its own scroll/selection on the tab change
-    lastTabByConn.set(t.connectionId, id);
-    if (t.connectionId !== activeConnectionId()) setActiveConnectionId(t.connectionId);
+    batch(() => {
+      setActiveTabId(id); // ResultGrid restores its own scroll/selection on the tab change
+      lastTabByConn.set(t.connectionId, id);
+      if (t.connectionId !== activeConnectionId()) setActiveConnectionId(t.connectionId);
+    });
   }
 
   /** New tabs always open on the connection currently in focus. */
@@ -1147,7 +1185,9 @@ function App() {
         switchTab(openedWhileReading.id);
         return;
       }
-      const t = makeTab({ sql: contents, filePath: path, title: basename(path), dirty: false });
+      const owner = activeConnectionId();
+      if (!owner) return;
+      const t = makeTab({ connectionId: owner, sql: contents, filePath: path, title: basename(path), dirty: false });
       setTabs((ts) => [...ts, t]);
       switchTab(t.id);
     } catch (e) {
@@ -1347,7 +1387,7 @@ function App() {
     // The tab's active schema pins the session search_path, so bare-name
     // resolution inside editTarget may use the same active→public chain the
     // server applies; without one, ambiguous names stay uneditable.
-    const tgt = editTarget(editBaseQ(), editIndexer(schema()), activeTab().searchSchema);
+    const tgt = editTarget(editBaseQ(), editIndexer(schema()), activeTab().searchSchema, kindOf(activeTab().connectionId));
     if (!tgt.ok) return { editable: false, reason: tgt.reason, plan: null };
     // PG permission model: no write privilege at all → don't offer editing
     // (partial privileges still commit — the server enforces per statement).
@@ -1670,7 +1710,8 @@ function App() {
       const st = e.state();
       return st.running || st.fetchingMore || st.loadingAll;
     });
-  const closeOperationBusy = () => anyConnectionBusy() || commitBusy() || importBusy();
+  const closeOperationBusy = () =>
+    anyConnectionBusy() || commitBusy() || importBusy() || backupBusy() || restoreBusy();
 
   const [slackStatus, setSlackStatus] = createSignal<SlackStatus>({ running: false, state: "disconnected", error: null });
   const slackUnlisten: UnlistenFn[] = [];
@@ -1687,6 +1728,18 @@ function App() {
     if (!status.running || status.connectionId) return;
     void invoke("slack_set_connection", { connectionId }).catch(() => {});
   };
+  /**
+   * Autostart and the first connect race: the bot can come up unbound before any
+   * connection exists, and a connect can land before the first `slack:status` event
+   * arrives. Watching both means whichever happens second does the binding, instead
+   * of the bot staying unbound until the user opens a second connection or picks one
+   * by hand.
+   */
+  createEffect(() => {
+    const status = slackStatus();
+    const id = activeConnectionId();
+    if (status.running && !status.connectionId && id) bindSlackIfUnbound(id);
+  });
   /** Connections offered as the Slack bot's target (Settings → Slack picker). */
   const slackConnectionOptions = () =>
     connections().map((e) => ({ id: e.conn.id, label: labelOf(e.conn.id), mascot: driverMascot(kindOf(e.conn.id)) }));
@@ -2813,7 +2866,7 @@ function App() {
       // a failure just leaves the grid read-only.
       if (mode === "base" && base && !transactionOpen(txOf())) {
         try {
-          const tgt = editTarget(base, editIndexer(stateOf(c.id)?.schema ?? []), runTab.searchSchema);
+          const tgt = editTarget(base, editIndexer(stateOf(c.id)?.schema ?? []), runTab.searchSchema, connectionKindOf(stateOf(c.id)));
           if (tgt.ok && !(stateOf(c.id)?.details ?? {})[relKey(tgt.table.schema, tgt.table.name)])
             await loadDetail(tgt.table.schema, tgt.table.name, false, c);
         } catch { /* read-only grid until the detail loads later */ }
@@ -3360,8 +3413,10 @@ function App() {
     // like every other server execution (Slack runs and Explorer DDL are recorded).
     const exportHistory = (status: "ok" | "error", rows: number | null, error: string | null) => {
       if (scope !== "all") return;
-      const key = conn()?.key;
-      if (key && conn()?.id === src.connectionId) recordHistory({
+      // Keyed by DESTINATION, like every other history write: an export that finishes
+      // after the user moved to another connection still belongs to the one that ran it.
+      const key = entryOf(src.connectionId)?.conn.key;
+      if (key) recordHistory({
         sql: `-- [Export] ${opts.format} → ${path}\n${src.query}`,
         durationMs: Math.round(performance.now() - t0),
         status,
@@ -3396,12 +3451,26 @@ function App() {
   // rewrite a different database.
   let backupConnection: { id: string; generation: number } | null = null;
   let restoreConnection: { id: string; generation: number } | null = null;
+  // Both dialogs own a long backend operation with its own Cancel and progress. They
+  // must survive a connection switch or a transaction opening elsewhere: unmounting
+  // one mid-run drops its progress listener and its Cancel while the backend keeps
+  // writing. They also gate window close, like an import does.
+  const [backupBusy, setBackupBusy] = createSignal(false);
+  const [restoreBusy, setRestoreBusy] = createSignal(false);
   const boundToCurrentConnection = (b: { id: string; generation: number } | null) => {
     const c = conn();
     return !!c && !!b && c.id === b.id && c.generation === b.generation;
   };
-  const closeBackup = () => { backupConnection = null; setBackupTarget(null); };
-  const closeRestore = () => { restoreConnection = null; setRestoreOpen(false); };
+  const closeBackup = () => {
+    if (backupBusy()) return;
+    backupConnection = null;
+    setBackupTarget(null);
+  };
+  const closeRestore = () => {
+    if (restoreBusy()) return;
+    restoreConnection = null;
+    setRestoreOpen(false);
+  };
   function openRestore() {
     const c = conn();
     if (!c) return;
@@ -3439,6 +3508,7 @@ function App() {
       throw new Error("backup is frozen while a manual transaction owns the session — commit or roll it back first");
     interruptStream("a backup closed the result stream", c.id);
     const t0 = performance.now();
+    setBackupBusy(true);
     try {
       const summary = await invoke<BackupSummary>("backup_to_file", backupPayload(c.id, path, opts));
       recordHistory({
@@ -3460,6 +3530,8 @@ function App() {
         schema: null,
       }, c.key);
       throw e;
+    } finally {
+      setBackupBusy(false);
     }
   }
 
@@ -3487,6 +3559,7 @@ function App() {
         error,
         schema: null,
       }, c.key);
+    setRestoreBusy(true);
     try {
       const summary = await invoke<RestoreSummary>("restore_from_file", { connectionId: c.id, path, options: opts });
       entry(
@@ -3494,13 +3567,18 @@ function App() {
         summary.rowsCopied,
         summary.firstError ? summary.firstError.message.split("\n")[0] : null,
       );
-      // The database changed underneath the sidebar/autocomplete — refetch.
-      if (connectionOpen(c)) await loadSchema();
+      // The database changed underneath the sidebar/autocomplete — refetch. Pass `c`:
+      // a restore can run for minutes, and the default target is whichever connection
+      // is focused when it finishes, which would refresh the wrong tree AND interrupt
+      // an unrelated connection's live stream.
+      if (connectionOpen(c)) await loadSchema(c);
       return summary;
     } catch (e) {
       entry(/cancel/i.test(errMsg(e)) ? "cancelled" : "error", null, errMsg(e).split("\n")[0]);
-      if (connectionOpen(c)) await loadSchema();
+      if (connectionOpen(c)) await loadSchema(c);
       throw e;
+    } finally {
+      setRestoreBusy(false);
     }
   }
 
@@ -3583,10 +3661,13 @@ function App() {
   async function importTargetColumns(schemaName: string, table: string) {
     const c = conn();
     if (!c || !table) return [];
-    const cached = details()[relKey(schemaName, table)];
+    // `stateOf(c.id)`, not `details()`: after the await the focused connection may be
+    // a different one, and a same-named table there would hand back its columns.
+    const detailsOf = () => stateOf(c.id)?.details ?? {};
+    const cached = detailsOf()[relKey(schemaName, table)];
     if (cached) return cached.columns.map((col) => ({ name: col.name, data_type: col.data_type }));
     await loadDetail(schemaName, table, false, c);
-    const loaded = details()[relKey(schemaName, table)];
+    const loaded = detailsOf()[relKey(schemaName, table)];
     return loaded ? loaded.columns.map((col) => ({ name: col.name, data_type: col.data_type })) : [];
   }
 
@@ -3944,7 +4025,9 @@ function App() {
     if (!c || metadataFrozen()) return null;
     await loadDetail(schemaName, table, false, c);
     if (!connectionOpen(c)) return null;
-    const d = details()[relKey(schemaName, table)];
+    // `connectionOpen` means "still the same live session", not "still focused", so
+    // the detail must come from `c`'s own cache rather than the active connection's.
+    const d = (stateOf(c.id)?.details ?? {})[relKey(schemaName, table)];
     if (!d) return null;
     const unique = new Set(
       d.indexes.filter((ix) => ix.unique).flatMap((ix) => d.columns.filter((col) => ix.def.includes(col.name)).map((col) => col.name)),
@@ -5312,7 +5395,7 @@ function App() {
               onClose={closeBackup}
               onPickPath={pickBackupPath}
               onRun={runBackup}
-              onCancel={() => void cancelOperation()}
+              onCancel={() => void cancelOperation(backupConnection?.id, activeTabId())}
             />
           )}
         </Show>
@@ -5323,7 +5406,7 @@ function App() {
             onClose={closeRestore}
             onPickFile={pickRestoreFile}
             onRun={runRestore}
-            onCancel={() => void cancelOperation()}
+            onCancel={() => void cancelOperation(restoreConnection?.id, activeTabId())}
           />
         </Show>
         <Show when={commitView()}>

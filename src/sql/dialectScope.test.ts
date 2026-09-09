@@ -3,6 +3,8 @@ import { ident, lit, qualify, setSqlDialect, sqlDialect, withDialect } from "./i
 import { createTable, dropRelation, renameRelation } from "./ddl";
 import { wrapQuery, wrappableQuery } from "../grid/query";
 import { buildCommitScript } from "../grid/editSql";
+import { editTarget } from "../grid/editable";
+import { makeIndexer } from "./aliases";
 import { formatWithOptions, formatForCopy } from "../formats";
 import { defaultExportOptions } from "../export";
 import { EMPTY_FILTER } from "../grid/filterModel";
@@ -97,6 +99,22 @@ describe("grid SQL is built for the owning tab's connection", () => {
     expect(wrappableQuery(withLed)).toBe(false);
     setSqlDialect("postgres");
     expect(wrappableQuery(withLed)).toBe(true);
+  });
+
+  it("editability is judged under the owning connection's dialect", () => {
+    setSqlDialect("postgres");
+    const idx = makeIndexer()([{ schema: "public", name: "users", columns: [{ name: "id", data_type: "int" }] }]);
+    // T-SQL cannot nest an ORDER BY in a derived table, so this result is not
+    // re-runnable there and must not be offered as editable — while the identical
+    // query on a PostgreSQL connection is.
+    const q = "SELECT * FROM public.users ORDER BY id";
+    expect(editTarget(q, idx, null, "postgres")).toMatchObject({ ok: true });
+    expect(editTarget(q, idx, null, "mssql")).toMatchObject({ ok: false });
+    // The default still follows the active connection, for call sites with no tab.
+    expect(editTarget(q, idx).ok).toBe(true);
+    setSqlDialect("mssql");
+    expect(editTarget(q, idx).ok).toBe(false);
+    setSqlDialect("postgres");
   });
 
   it("commit scripts quote for input.dialect while another connection is active", () => {

@@ -32,11 +32,6 @@ pub struct SlackRuntime {
     /// so an old session finishing an in-flight query after a restart can't wipe the new
     /// session's proposals/results or stomp its status.
     generation: AtomicU64,
-    /// The ONE Tusk connection this bot answers against. Several connections are open
-    /// at once, so "the active connection" is not a stable answer: the binding is
-    /// chosen when the bot starts (default: whatever the workbench had focused) and can
-    /// be repointed from Settings → Slack. Cleared when the bot stops.
-    connection: Mutex<Option<String>>,
     pub approvals: ApprovalStore,
     /// Finished results kept for their "Export as…" buttons (TTL'd + capped).
     pub results: ResultStore,
@@ -49,7 +44,11 @@ pub struct StatusInfo {
     /// "disconnected" | "connecting" | "connected"
     pub state: String,
     pub error: Option<String>,
-    /// Tusk connection id the bot is bound to (None when it is not running).
+    /// The ONE Tusk connection this bot answers against. Several connections are open
+    /// at once, so "the active connection" is not a stable answer: the binding is
+    /// chosen when the bot starts (default: whatever the workbench had focused) and
+    /// can be repointed from Settings → Slack. It lives here, under the SAME mutex as
+    /// `running`, so the two can never be observed or written out of step.
     pub connection_id: Option<String>,
 }
 
@@ -67,34 +66,41 @@ impl Default for StatusInfo {
 impl SlackRuntime {
     pub fn set_status(&self, state: &str, error: Option<String>) {
         let running = state != "disconnected";
-        // A stopped bot is bound to nothing. Keeping a stale id would make
-        // `on_connection_closed` claim a dead bot for the next disconnect, and would
-        // let `bind_connection` repoint something that is not running.
-        if !running {
-            self.set_connection(None);
-        }
-        let connection_id = crate::lock_sync(&self.connection).clone();
         let mut s = crate::lock_sync(&self.status);
         s.state = state.to_string();
         s.error = error;
         s.running = running;
-        s.connection_id = connection_id;
+        // A stopped bot is bound to nothing, and it is cleared under the same lock
+        // that publishes `running:false` — otherwise a concurrent bind could leave a
+        // stopped bot holding a binding, which would make `on_connection_closed`
+        // claim a dead bot and stop the workbench ever rebinding a fresh one.
+        if !running {
+            s.connection_id = None;
+        }
     }
 
     pub fn status_info(&self) -> StatusInfo {
-        let connection_id = crate::lock_sync(&self.connection).clone();
-        let mut s = crate::lock_sync(&self.status).clone();
-        s.connection_id = connection_id;
-        s
+        crate::lock_sync(&self.status).clone()
     }
 
     /// The connection id this bot is bound to, when it is running.
     pub fn bound_connection(&self) -> Option<String> {
-        crate::lock_sync(&self.connection).clone()
+        crate::lock_sync(&self.status).connection_id.clone()
     }
 
     fn set_connection(&self, id: Option<String>) {
-        *crate::lock_sync(&self.connection) = id;
+        crate::lock_sync(&self.status).connection_id = id;
+    }
+
+    /// Bind a RUNNING bot to `id`, atomically. Returns false when the bot stopped
+    /// between the caller's check and this write.
+    fn bind_if_running(&self, id: String) -> bool {
+        let mut s = crate::lock_sync(&self.status);
+        if !s.running {
+            return false;
+        }
+        s.connection_id = Some(id);
+        true
     }
 
     fn take_cancel(&self) -> Option<CancellationToken> {
@@ -149,11 +155,13 @@ fn require_open(app: &AppHandle, id: &str) -> Result<String, AppError> {
 /// and fail closed on approval, which is the intended conservative outcome.
 pub fn bind_connection(app: &AppHandle, connection_id: &str) -> Result<(), AppError> {
     let runtime = app.state::<SlackRuntime>();
-    if !runtime.status_info().running {
+    // Validate the target BEFORE taking the status lock, then commit the binding and
+    // the running check together, so a stop racing this cannot leave a stopped bot
+    // bound to something.
+    let id = require_open(app, connection_id)?;
+    if !runtime.bind_if_running(id) {
         return Err(AppError::new("the Slack bot is not running"));
     }
-    let id = require_open(app, connection_id)?;
-    runtime.set_connection(Some(id));
     let _ = app.emit("slack:status", runtime.status_info());
     Ok(())
 }
@@ -166,7 +174,10 @@ pub fn on_connection_closed(app: &AppHandle, connection_id: &str) {
     if runtime.bound_connection().as_deref() != Some(connection_id) {
         return;
     }
-    stop(app);
+    // Tear down without publishing, then publish ONE status carrying the reason: two
+    // events (an empty "disconnected" followed by the real one) let a listener that
+    // coalesces show the blank one and hide why the bot stopped.
+    teardown(app);
     runtime.set_status(
         "disconnected",
         Some(
@@ -347,8 +358,9 @@ pub async fn start(app: AppHandle, connection_id: Option<String>) -> Result<(), 
     Ok(())
 }
 
-/// Stop the bot (cancels the socket + consumer tasks). Safe when not running.
-pub fn stop(app: &AppHandle) {
+/// Tear the session down without publishing a status, so a caller that wants to
+/// report WHY the bot stopped emits exactly one event.
+fn teardown(app: &AppHandle) {
     let runtime = app.state::<SlackRuntime>();
     runtime.next_generation();
     if let Some(t) = runtime.take_cancel() {
@@ -357,7 +369,12 @@ pub fn stop(app: &AppHandle) {
     runtime.approvals.clear();
     runtime.results.clear();
     runtime.set_status("disconnected", None);
-    let _ = app.emit("slack:status", runtime.status_info());
+}
+
+/// Stop the bot (cancels the socket + consumer tasks). Safe when not running.
+pub fn stop(app: &AppHandle) {
+    teardown(app);
+    let _ = app.emit("slack:status", app.state::<SlackRuntime>().status_info());
 }
 
 #[cfg(test)]
