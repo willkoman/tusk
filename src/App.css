@@ -1724,3 +1724,177 @@ button.btn-danger { background: var(--danger); border-color: var(--danger); colo
 .filter-class { flex: none; }
 .filter-row .icon { flex: none; padding: 2px; }
 .filter-empty { font-size: 11.5px; color: var(--muted); padding: 2px 4px; }
+
+/* ==========================================================================
+   ui/customize — tab organisation + appearance tokens
+   Added as one block by the tab-organisation/appearance change; everything in
+   here is scoped to .tab*, .ts-*, .appearance-pane, or the density/scale/
+   sidebar-side root attributes. Nothing above this line is modified.
+   ========================================================================== */
+
+/* --- density tokens -------------------------------------------------------
+   "comfortable" repeats the sizes the workbench already used, so the default
+   look is unchanged; App also writes these inline from src/appearance.ts, and
+   these declarations are the fallback when no pref has been applied yet. */
+:root {
+  --row-h: 28px;
+  --control-h: 28px;
+  --tab-h: 26px;
+  --tree-row-h: 25px;
+  --pad-y: 6px;
+  --pad-x: 12px;
+  --gap: 8px;
+  /* Tab colour tags. Semantic tokens where one exists, so every theme follows;
+     violet/pink have no semantic token and are pinned per polarity below. */
+  --tag-red: var(--danger);
+  --tag-amber: var(--warn);
+  --tag-green: var(--ok);
+  --tag-teal: var(--accent-2);
+  --tag-violet: #a78bfa;
+  --tag-pink: #f472b6;
+}
+:root[data-density="compact"] {
+  --row-h: 24px;
+  --control-h: 24px;
+  --tab-h: 22px;
+  --tree-row-h: 21px;
+  --pad-y: 3px;
+  --pad-x: 9px;
+  --gap: 5px;
+}
+:root[data-mode="light"] {
+  --tag-violet: #7c3aed;
+  --tag-pink: #db2777;
+}
+
+/* Surfaces that follow the density tokens. The result grid is virtualized and
+   needs its row height as a number, so it mirrors --row-h through `gridRowH()`
+   in src/appearance.ts rather than reading the variable here. */
+button { padding: var(--pad-y) var(--pad-x); }
+.tw-row { height: var(--tree-row-h); }
+.tw-row.is-header { height: calc(var(--tree-row-h) - 2px); }
+.tab { min-height: var(--tab-h); }
+.settings-row select,
+.settings-row input[type="text"],
+.settings-row input[type="number"],
+.settings-row input[type="password"] { min-height: var(--control-h); }
+.sidebar-filter { gap: calc(var(--gap) / 2); }
+
+/* --- Explorer on the right (a flex order swap; widths are unaffected) --- */
+:root[data-sidebar="right"] .body > .sidebar {
+  order: 3;
+  border-right: none;
+  border-left: 1px solid var(--border);
+}
+:root[data-sidebar="right"] .body > .sidebar + .splitter-v { order: 2; }
+
+/* --- tab bar: the scrolling strip plus the fixed "All tabs" button --- */
+.tab-bar { display: flex; align-items: stretch; background: var(--panel); min-width: 0; }
+.tab-bar > .tab-strip { flex: 1; min-width: 0; }
+.tab-overflow {
+  flex: none;
+  align-self: center;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 8px;
+  margin: 4px 4px 0;
+  height: var(--tab-h);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.tab-overflow:hover { background: var(--panel-2); color: var(--text); }
+
+/* --- pinned tabs: a fixed compact group at the left of the strip --- */
+.tab.pinned { max-width: none; padding-left: 8px; padding-right: 8px; gap: 4px; }
+.tab.pinned .tab-title { max-width: 46px; }
+.tab.pin-edge { margin-right: 7px; }
+/* The group divider: drawn on the last pinned tab so it survives reordering. */
+.tab.pin-edge::after {
+  content: "";
+  position: absolute;
+  right: -4px;
+  top: 5px;
+  bottom: 5px;
+  width: 1px;
+  background: var(--border);
+}
+.tab { position: relative; }
+
+/* --- colour tag: a dot, deliberately NOT the top rule (that is the
+       transaction-owner marker) nor the bottom rule (the connection tint) --- */
+.tab-tag { flex-shrink: 0; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+.tab-tag[data-color="red"], .ts-mark[data-color="red"] { background: var(--tag-red); }
+.tab-tag[data-color="amber"], .ts-mark[data-color="amber"] { background: var(--tag-amber); }
+.tab-tag[data-color="green"], .ts-mark[data-color="green"] { background: var(--tag-green); }
+.tab-tag[data-color="teal"], .ts-mark[data-color="teal"] { background: var(--tag-teal); }
+.tab-tag[data-color="violet"], .ts-mark[data-color="violet"] { background: var(--tag-violet); }
+.tab-tag[data-color="pink"], .ts-mark[data-color="pink"] { background: var(--tag-pink); }
+
+/* --- inline rename --- */
+.tab.renaming { cursor: text; }
+.tab-rename {
+  width: 130px;
+  min-width: 60px;
+  font: inherit;
+  padding: 1px 4px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  outline: none;
+}
+
+/* --- "All tabs" popover (over the shared .palette shell) --- */
+.tab-switcher .palette-list { max-height: 380px; }
+.ts-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px 3px;
+  font-size: 10px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.ts-group-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ts-group-count { margin-left: auto; font-variant-numeric: tabular-nums; }
+.ts-item { gap: 7px; }
+.ts-item.current { box-shadow: inset 2px 0 0 var(--accent); }
+.ts-mark { flex: none; width: 7px; height: 7px; border-radius: 50%; background: transparent; }
+.ts-badge {
+  flex: none;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: rgba(var(--accent-rgb), 0.16);
+  color: var(--accent-2);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.3px;
+}
+.ts-name { flex: none; max-width: 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ts-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted);
+}
+.ts-dirty { flex: none; margin-left: auto; color: var(--accent-2); font-size: 9px; line-height: 1; }
+
+/* --- Settings → Appearance --- */
+.appearance-pane .settings-row select { min-width: 150px; }
+.appearance-pane .settings-actions { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
+
+/* Density/scale changes repaint instantly; nothing here animates, and the one
+   transition the strip inherits is already disabled under reduced motion. */
+@media (prefers-reduced-motion: reduce) {
+  .tab, .tab-overflow, .tab-rename { transition: none; }
+}

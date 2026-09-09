@@ -1,3 +1,5 @@
+import type { Density } from "../appearance";
+import { DEFAULT_LINE_HEIGHT } from "../appearance";
 import type { DialectId } from "../sql/dialects";
 import type { Table } from "../sql/aliases";
 import type { ThemeId } from "../themes";
@@ -39,6 +41,14 @@ export type EditorPrefs = {
   planHeat: "cost" | "time" | "rows" | "off";
   /** Plan view: node card detail density. */
   planDensity: "compact" | "normal";
+  /** Editor line height, as a multiple of the editor font size (1.1–2.0). */
+  lineHeight: number;
+  /** App-wide row/control density (see src/appearance.ts) → `<html data-density>`. */
+  density: Density;
+  /** App-wide UI scale in percent (90–125) → the root font size. Not the editor's. */
+  uiScale: number;
+  /** Which side the Explorer sidebar docks to. */
+  sidebarSide: "left" | "right";
 };
 
 export const DEFAULT_PREFS: EditorPrefs = {
@@ -58,6 +68,10 @@ export const DEFAULT_PREFS: EditorPrefs = {
   planOrientation: "vertical",
   planHeat: "cost",
   planDensity: "normal",
+  lineHeight: DEFAULT_LINE_HEIGHT,
+  density: "comfortable",
+  uiScale: 100,
+  sidebarSide: "left",
 };
 
 /** One diagnostic from the backend `validate_sql` command. */

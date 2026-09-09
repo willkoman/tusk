@@ -10,6 +10,24 @@ import { type AiContext, type SampleTable } from "./ai/context";
 import { type CursorInfo, type EditorPrefs, type ServerDiag } from "./editor/types";
 import { prefsStore, tabsStore, layoutStore, type PersistedTabs, type TabsPersistenceFailure } from "./store";
 import { makeTab, basename, gridViewFor, pendingCount, snapshotTabs as recoverySnapshot, type Tab, type ResultSnapshot, type GridView, type SortKey, type PendingEdits } from "./tabs";
+// --- ui/customize: tab organisation + appearance tokens ---
+import {
+  TAB_COLORS,
+  TAB_COLOR_LABELS,
+  cleanTabTitle,
+  clampPinSlot,
+  closeManyTargets,
+  normalizeTabColor,
+  pinnedCount as pinnedTabCount,
+  shortTabLabel,
+  sortPinned,
+  tabLabel,
+  type CloseScope,
+  type TabColor,
+} from "./tabs";
+import { TabSwitcher, type TabSwitcherItem } from "./TabSwitcher";
+import { densityTokens, gridRowH, normalizeDensity, rootFontSize } from "./appearance";
+// --- end ui/customize imports ---
 import { FilterBar } from "./grid/FilterBar";
 import { classResolver, conditions, emptyFilter, hasConditions, removeNode, type FilterTree } from "./grid/filterModel";
 import { activeConditionCount } from "./grid/filterSql";
@@ -976,6 +994,24 @@ function App() {
     el.style.setProperty("--accent-rgb", `${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}`);
   });
 
+  // --- ui/customize: density / UI scale / Explorer side ---
+  // Density stamps <html data-density> AND writes its token set inline, so the
+  // tokens exist even before the CSS block that declares them is reached.
+  // Scale sets the root font size; rem-sized UI follows, the editor does not.
+  createEffect(() => {
+    const el = document.documentElement;
+    const d = normalizeDensity(prefs().density);
+    el.dataset.density = d;
+    for (const [k, v] of Object.entries(densityTokens(d))) el.style.setProperty(k, v);
+  });
+  createEffect(() => {
+    document.documentElement.style.fontSize = rootFontSize(prefs().uiScale);
+  });
+  createEffect(() => {
+    document.documentElement.dataset.sidebar = prefs().sidebarSide === "right" ? "right" : "left";
+  });
+  // --- end ui/customize appearance effects ---
+
   // --- keyboard shortcuts: persisted overrides + a canonical-key → action map ---
   const [keys, setKeys] = createSignal<KeyOverrides>(keymapStore.load());
   const updateKeys = (patch: KeyOverrides) => {
@@ -1152,7 +1188,6 @@ function App() {
   }
 
   // --- tab QoL: rename / close-many / drag-reorder ---
-  const [renameTab, setRenameTab] = createSignal<{ id: string; title: string } | null>(null);
   // Pointer reorder state (src/dnd.ts). `dragTabId` dims the source in place;
   // `tabDropSlot` positions the insertion bar. Neither touches the tab model —
   // `tabs()` only changes on the drop, so a cancelled drag needs no restore and a
@@ -1169,9 +1204,13 @@ function App() {
   const tabEdges = () =>
     stripEl ? measureEdges(Array.from(stripEl.querySelectorAll<HTMLElement>(".tab")), stripEl) : [];
 
-  /** Commit a strip reorder: move the tab at `from` into insertion slot `slot`. */
+  /**
+   * Commit a strip reorder: move the tab at `from` into insertion slot `slot`,
+   * clamped so a pinned tab stays inside the pinned group and an unpinned one
+   * stays out of it (`clampPinSlot`).
+   */
   function moveTabSlot(from: number, slot: number) {
-    setTabs((ts) => reorder(ts, from, slot) as Tab[]);
+    setTabs((ts) => reorder(ts, from, clampPinSlot(ts, from, slot)) as Tab[]);
   }
 
   function startTabDrag(e: PointerEvent, index: number, el: HTMLElement) {
@@ -1201,7 +1240,7 @@ function App() {
     setTabs((ts) => {
       const from = ts.findIndex((t) => t.id === id);
       if (from < 0) return ts;
-      return reorder(ts, from, from + (delta === 1 ? 2 : -1)) as Tab[];
+      return reorder(ts, from, clampPinSlot(ts, from, from + (delta === 1 ? 2 : -1))) as Tab[];
     });
     queueMicrotask(() => stripEl?.querySelector(".tab.active")?.scrollIntoView({ block: "nearest", inline: "nearest" }));
   }
@@ -1215,24 +1254,84 @@ function App() {
   };
 
   /**
-   * Close every tab of ONE connection matching the predicate, skipping dirty, pending
-   * or running ones (reported). Scoped to a connection because the strip is shared:
-   * "Close others" from a tab must not reach into another connection's tabs. The
-   * running guard consults each tab's own connection, never the focused one's.
+   * Close many tabs of ONE connection. Scoped to a connection because the strip is
+   * shared: "Close others" from a tab must not reach into another connection's tabs.
+   *
+   * `closeManyTargets` picks the candidates (pinned tabs are never candidates); each
+   * one still has to pass the same guards a single close does — unsaved buffer,
+   * pending grid edits, a query running on ITS OWN connection, and ownership of a
+   * manual transaction. A tab that refuses is skipped, never forced, and the counts
+   * are reported.
    */
-  function closeTabsWhere(connectionId: string, pred: (t: Tab, i: number, arr: Tab[]) => boolean) {
-    const owned = tabsOf(connectionId);
-    const targets = owned.filter((t, i) => pred(t, i, owned));
-    const busy = (t: Tab) => {
+  function closeTabsScoped(connectionId: string, anchorId: string, scope: CloseScope) {
+    const targets = closeManyTargets(tabsOf(connectionId), anchorId, scope);
+    const refuses = (t: Tab) => {
       const st = stateOf(t.connectionId);
-      return !!st?.running && st.runningTabId === t.id;
+      if (st?.running && st.runningTabId === t.id) return true;
+      const owner = entryOf(t.connectionId);
+      if (owner && transactionOwnedBy(owner.state().transaction, t.id)) return true;
+      return t.dirty || pendingCount(t.pending) > 0;
     };
-    const kept = targets.filter((t) => t.dirty || pendingCount(t.pending) > 0 || busy(t));
+    let closed = 0;
+    let kept = 0;
     for (const t of targets) {
-      if (!t.dirty && !pendingCount(t.pending) && !busy(t)) removeTab(t.id);
+      if (refuses(t)) kept++;
+      else {
+        removeTab(t.id);
+        closed++;
+      }
     }
-    if (kept.length) setStatus(`kept ${kept.length} tab${kept.length > 1 ? "s" : ""} with unsaved, pending, or running work`);
+    const plural = (n: number) => `${n} tab${n === 1 ? "" : "s"}`;
+    if (!closed && !kept) setStatus("no tabs to close");
+    else if (kept) setStatus(`closed ${plural(closed)}; kept ${plural(kept)} with unsaved, pending, running, or transaction work`);
+    else setStatus(`closed ${plural(closed)}`);
   }
+
+  // --- ui/customize: rename, pin, colour tag ---
+  /** Tab being renamed inline in the strip, plus the text typed so far. */
+  const [inlineRename, setInlineRename] = createSignal<{ id: string; text: string } | null>(null);
+
+  function beginRename(id: string) {
+    const t = tabs().find((x) => x.id === id);
+    if (!t) return;
+    setInlineRename({ id, text: t.customTitle || t.title });
+  }
+
+  /** Commit the inline rename. A blank title clears the custom one (auto title returns). */
+  function commitRename() {
+    const r = inlineRename();
+    setInlineRename(null);
+    if (!r) return;
+    if (!tabs().some((t) => t.id === r.id)) return;
+    patchTab(r.id, { customTitle: cleanTabTitle(r.text) });
+  }
+
+  function togglePin(id: string) {
+    setTabs((ts) => {
+      const next = ts.map((t) => (t.id === id ? { ...t, pinned: !t.pinned } : t));
+      return sortPinned(next) as Tab[];
+    });
+    queueMicrotask(() => stripEl?.querySelector(".tab.active")?.scrollIntoView({ block: "nearest", inline: "nearest" }));
+  }
+
+  const setTabColor = (id: string, color: TabColor) => patchTab(id, { color });
+
+  /** The "All tabs" popover (⌄ in the strip, or the showAllTabs action). */
+  const [allTabsOpen, setAllTabsOpen] = createSignal(false);
+  const tabSwitcherItems = (): TabSwitcherItem[] =>
+    tabs().map((t) => ({
+      id: t.id,
+      label: tabLabel(t),
+      detail: t.filePath ?? "",
+      connectionId: t.connectionId,
+      connectionLabel: labelOf(t.connectionId),
+      mascot: driverMascot(kindOf(t.connectionId)),
+      dirty: t.dirty,
+      pinned: t.pinned,
+      color: t.color,
+      active: t.id === activeTabId(),
+    }));
+  // --- end ui/customize tab operations ---
 
   function removeTab(id: string) {
     if (tabIsRunning(id)) {
@@ -2208,6 +2307,9 @@ function App() {
       case "closeTab": closeTab(activeTabId()); break;
       case "moveTabLeft": moveActiveTab(-1); break;
       case "moveTabRight": moveActiveTab(1); break;
+      case "renameTab": beginRename(activeTabId()); break;
+      case "pinTab": togglePin(activeTabId()); break;
+      case "showAllTabs": setAllTabsOpen(true); break;
       case "openFile": void openFileDialog(); break;
       case "saveFile": void saveActiveTab(); break;
       case "saveFileAs": void saveAsActiveTab(); break;
@@ -2234,6 +2336,7 @@ function App() {
     // The editor keymap (and any other in-place handler) marks what it consumed.
     if (e.defaultPrevented) return;
     if (paletteOpen()) return; // the palette owns the keyboard while open
+    if (allTabsOpen()) return; // so does the "All tabs" list (Escape closes it)
     if (paramPrompt()) return; // the parameter modal owns input; never replace its live state
     if (runChoice()) return;
     const k = normalizeKeyEvent(e);
@@ -2490,10 +2593,24 @@ function App() {
         }
       }
       if (saved && saved.tabs.length) {
-        restoredTabs = saved.tabs.map((pt) =>
-          makeTab({ connectionId: connected.id, sql: pt.sql, filePath: pt.filePath, title: pt.title, searchSchema: pt.searchSchema ?? null, dirty: pt.dirty }),
+        // The active tab is restored BY ID below, so re-sorting pinned tabs to the
+        // head of the group cannot select the wrong buffer.
+        const mapped = saved.tabs.map((pt) =>
+          makeTab({
+            connectionId: connected.id,
+            sql: pt.sql,
+            filePath: pt.filePath,
+            title: pt.title,
+            customTitle: pt.customTitle,
+            pinned: pt.pinned,
+            color: normalizeTabColor(pt.color),
+            searchSchema: pt.searchSchema ?? null,
+            dirty: pt.dirty,
+          }),
         );
-        restoredActive = Math.min(saved.activeIndex, restoredTabs.length - 1);
+        const activeId = mapped[Math.max(0, Math.min(saved.activeIndex, mapped.length - 1))]?.id;
+        restoredTabs = sortPinned(mapped) as Tab[];
+        restoredActive = Math.max(0, restoredTabs.findIndex((t) => t.id === activeId));
       } else {
         restoredTabs = [makeTab({ connectionId: connected.id })];
       }
@@ -2855,7 +2972,8 @@ function App() {
     setConfirmDiscard(null);
     setRunChoice(null);
     setParamPrompt(null);
-    setRenameTab(null);
+    setInlineRename(null);
+    setAllTabsOpen(false);
     setCommitView(null);
     transactionResolutionAfterApply = null;
     if (dialogBinding()?.origin.connectionId === connectionId) setActiveDialog(null);
@@ -5349,6 +5467,8 @@ function App() {
 
           <main class="main">
             <div class="editor-pane" classList={{ full: !resultsOpen() }} style={resultsOpen() ? { height: `${editorH()}px` } : undefined}>
+              {/* ui/customize: the strip scrolls; the ⌄ button beside it does not. */}
+              <div class="tab-bar">
               <div
                 class="tab-strip"
                 ref={(el) => (stripEl = el)}
@@ -5368,19 +5488,23 @@ function App() {
                       class="tab"
                       classList={{
                         active: t.id === activeTabId(),
+                        pinned: t.pinned,
+                        // Last pinned tab: the strip draws the group's right edge here.
+                        "pin-edge": t.pinned && i() === pinnedTabCount(tabs()) - 1,
                         "tx-owner": stateOf(t.connectionId)?.transaction.owner === t.id,
                         frozen: transactionOpen(stateOf(t.connectionId)?.transaction ?? IDLE_TRANSACTION) && stateOf(t.connectionId)?.transaction.owner !== t.id,
                         "other-conn": connections().length > 1 && t.connectionId !== activeConnectionId(),
                         "dnd-source": dragTabId() === t.id,
+                        renaming: inlineRename()?.id === t.id,
                       }}
                       style={connections().length > 1 ? { "--conn-color": connectionColor(entryOf(t.connectionId)?.colorIndex ?? 0) } : undefined}
-                      title={`${t.filePath ?? t.title}${connections().length > 1 ? ` — ${labelOf(t.connectionId)}` : ""}`}
+                      title={`${t.filePath ?? tabLabel(t)}${connections().length > 1 ? ` — ${labelOf(t.connectionId)}` : ""}`}
                       // Press-and-move reorder (src/dnd.ts): the press switches tabs,
                       // and travel past the threshold turns it into a drag whose
                       // trailing click must not switch back.
                       onPointerDown={(e) => {
                         if (e.button !== 0) return;
-                        if ((e.target as HTMLElement).closest(".tab-close")) return;
+                        if ((e.target as HTMLElement).closest(".tab-close, .tab-rename")) return;
                         tabClickBlocked = false;
                         switchTab(t.id);
                         startTabDrag(e, i(), e.currentTarget);
@@ -5388,45 +5512,108 @@ function App() {
                       // Cancel the native selection Chromium starts on press, on
                       // mousedown rather than pointerdown so the ×'s click survives.
                       onMouseDown={(e) => {
-                        if (e.button === 0 && !(e.target as HTMLElement).closest(".tab-close")) e.preventDefault();
+                        if (e.button === 0 && !(e.target as HTMLElement).closest(".tab-close, .tab-rename")) e.preventDefault();
                       }}
                       onClick={() => {
                         if (tabClickBlocked) { tabClickBlocked = false; return; }
                         switchTab(t.id);
                       }}
+                      onDblClick={(e) => {
+                        if ((e.target as HTMLElement).closest(".tab-close, .tab-rename")) return;
+                        beginRename(t.id);
+                      }}
                       onAuxClick={(e) => { if (e.button === 1) closeTab(t.id); }}
                       onContextMenu={(e) => {
                         e.preventDefault();
+                        const scoped = (label: string) => (connections().length > 1 ? `${label} on this connection` : label);
                         setMenu({
                           x: e.clientX,
                           y: e.clientY,
                           items: [
-                            { label: "Rename…", icon: "edit", onClick: () => setRenameTab({ id: t.id, title: t.title }) },
+                            { label: "Rename…", icon: "edit", onClick: () => beginRename(t.id) },
+                            { label: t.pinned ? "Unpin tab" : "Pin tab", icon: "star", onClick: () => togglePin(t.id) },
+                            {
+                              // One level down rather than a hover submenu: ContextMenu
+                              // has no nesting, and re-opening in place keeps the
+                              // keyboard path (Arrow/Enter) identical.
+                              label: t.color ? `Colour: ${TAB_COLOR_LABELS[t.color]}` : "Colour…",
+                              icon: "dot",
+                              onClick: () =>
+                                setMenu({
+                                  x: e.clientX,
+                                  y: e.clientY,
+                                  items: [
+                                    { label: "None", onClick: () => setTabColor(t.id, "") },
+                                    ...TAB_COLORS.map((c) => ({
+                                      label: TAB_COLOR_LABELS[c],
+                                      onClick: () => setTabColor(t.id, c),
+                                    })),
+                                  ],
+                                }),
+                            },
+                            ...(t.filePath ? [{ label: "Copy path", icon: "copy" as const, onClick: () => copyText(t.filePath!, "copied path") }] : []),
                             { sep: true },
                             { label: "Close", icon: "close", onClick: () => closeTab(t.id) },
-                            { label: connections().length > 1 ? "Close others on this connection" : "Close others", icon: "close", onClick: () => closeTabsWhere(t.connectionId, (x) => x.id !== t.id) },
-                            { label: "Close tabs to the right", icon: "close", onClick: () => closeTabsWhere(t.connectionId, (_x, i, arr) => i > arr.findIndex((y) => y.id === t.id)) },
+                            { label: scoped("Close others"), icon: "close", onClick: () => closeTabsScoped(t.connectionId, t.id, "others") },
+                            { label: scoped("Close tabs to the right"), icon: "close", onClick: () => closeTabsScoped(t.connectionId, t.id, "right") },
+                            { label: scoped("Close saved tabs"), icon: "close", onClick: () => closeTabsScoped(t.connectionId, t.id, "saved") },
+                            { sep: true },
+                            { label: "Show all tabs…", icon: "search", onClick: () => setAllTabsOpen(true) },
                           ],
                         });
                       }}
                     >
-                      <Show when={connections().length > 1}>
+                      <Show when={t.color}><span class="tab-tag" data-color={t.color} title={`Colour: ${TAB_COLOR_LABELS[t.color as Exclude<TabColor, "">]}`} /></Show>
+                      <Show when={connections().length > 1 || t.pinned}>
                         <span class="tab-conn" title={labelOf(t.connectionId)}>{driverMascot(kindOf(t.connectionId))}</span>
                       </Show>
-                      <span class="tab-title">{t.title}</span>
+                      <Show
+                        when={inlineRename()?.id === t.id}
+                        fallback={<span class="tab-title">{t.pinned ? shortTabLabel(tabLabel(t)) : tabLabel(t)}</span>}
+                      >
+                        <input
+                          class="tab-rename"
+                          aria-label="Tab title"
+                          value={inlineRename()!.text}
+                          ref={(el) => queueMicrotask(() => { if (el.isConnected) { el.focus(); el.select(); } })}
+                          onInput={(e) => setInlineRename({ id: t.id, text: e.currentTarget.value })}
+                          onBlur={commitRename}
+                          onKeyDown={(e) => {
+                            e.stopPropagation();
+                            if (e.key === "Enter") { e.preventDefault(); commitRename(); }
+                            else if (e.key === "Escape") { e.preventDefault(); setInlineRename(null); }
+                          }}
+                        />
+                      </Show>
                       <Show when={stateOf(t.connectionId)?.running && stateOf(t.connectionId)?.runningTabId === t.id}><span class="spinner-sm tab-spin" title="Query running" /></Show>
                       <Show when={stateOf(t.connectionId)?.transaction.owner === t.id}><span class="tab-tx" title={`Owns ${stateOf(t.connectionId)?.transaction.id ?? "manual transaction"}`}>TX</span></Show>
                       <Show when={t.dirty}><span class="tab-dot" title="Unsaved changes">●</span></Show>
-                      <button class="tab-close" title="Close (⌘/Ctrl+W)" onClick={(e) => { e.stopPropagation(); closeTab(t.id); }}>×</button>
+                      <Show when={!t.pinned}>
+                        <button class="tab-close" title="Close (⌘/Ctrl+W)" onClick={(e) => { e.stopPropagation(); closeTab(t.id); }}>×</button>
+                      </Show>
                     </div>
                   )}
                 </For>
                 <button class="tab-new" title="New tab (⌘/Ctrl+T)" onClick={openNewTab}>＋</button>
                 {/* Insertion bar: placed with translateX so it slides between slots
-                    (`.dnd-bar`, 120 ms, disabled under prefers-reduced-motion). */}
+                    (`.dnd-bar`, 120 ms, disabled under prefers-reduced-motion). The
+                    slot is pin-clamped so the bar only ever promises a legal drop. */}
                 <Show when={tabDropSlot() != null}>
-                  <div class="tab-drop dnd-bar" style={{ transform: `translateX(${slotOffset(tabEdges(), tabDropSlot()!) - 1}px)` }} />
+                  <div
+                    class="tab-drop dnd-bar"
+                    style={{
+                      transform: `translateX(${slotOffset(tabEdges(), clampPinSlot(tabs(), tabs().findIndex((x) => x.id === dragTabId()), tabDropSlot()!)) - 1}px)`,
+                    }}
+                  />
                 </Show>
+              </div>
+              {/* "All tabs": the strip scrolls and hides tabs, this list never does. */}
+              <button
+                class="tab-overflow"
+                title={`Show all tabs (${displayKey(effectiveKey("showAllTabs", keys()))})`}
+                aria-label="Show all tabs"
+                onClick={() => setAllTabsOpen(true)}
+              >⌄</button>
               </div>
               <div class="toolbar">
                 <button
@@ -5630,7 +5817,7 @@ function App() {
                   onPaste={onPaste}
                   copyHeaders={() => prefs().copyHeaders}
                   gridStyle={() => ({
-                    rowH: prefs().gridDensity === "compact" ? 22 : 28,
+                    rowH: gridRowH(prefs().density, prefs().gridDensity),
                     font: `12px ${fontStack(prefs().fontFamily)}`,
                     zebra: prefs().gridZebra,
                     nullStyle: prefs().gridNullStyle,
@@ -5771,32 +5958,9 @@ function App() {
           )}
         </Show>
 
-        <Show when={renameTab()}>
-          {(rt) => (
-            <Dialog title="Rename tab" width={380} onClose={() => setRenameTab(null)}>
-              <form
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  const title = rt().title.trim();
-                  if (title) patchTab(rt().id, { title });
-                  setRenameTab(null);
-                }}
-              >
-                <label>
-                  Title
-                  <input
-                    value={rt().title}
-                    ref={(el) => queueMicrotask(() => { if (el.isConnected) { el.focus(); el.select(); } })}
-                    onInput={(e) => setRenameTab({ id: rt().id, title: e.currentTarget.value })}
-                  />
-                </label>
-                <div class="form-actions">
-                  <button type="button" class="ghost" onClick={() => setRenameTab(null)}>Cancel</button>
-                  <button type="submit" class="run">Rename</button>
-                </div>
-              </form>
-            </Dialog>
-          )}
+        {/* ui/customize: renaming is inline in the strip; this is the "All tabs" list. */}
+        <Show when={allTabsOpen()}>
+          <TabSwitcher items={tabSwitcherItems()} onPick={switchTab} onClose={() => setAllTabsOpen(false)} />
         </Show>
 
         <Show when={confirmAnalyze()}>

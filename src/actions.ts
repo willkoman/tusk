@@ -18,6 +18,9 @@ export type ActionId =
   | "closeTab"
   | "moveTabLeft"
   | "moveTabRight"
+  | "renameTab"
+  | "pinTab"
+  | "showAllTabs"
   | "saveFile"
   | "saveFileAs"
   | "openFile"
@@ -101,6 +104,11 @@ export const ACTIONS: readonly ActionDef[] = [
   // dispatches them when focus is anywhere else.
   { id: "moveTabLeft", title: "Move tab left", category: "Tabs", defaultKey: "Alt-Shift-ArrowLeft", scope: "editor", enabled: (c) => c.connected },
   { id: "moveTabRight", title: "Move tab right", category: "Tabs", defaultKey: "Alt-Shift-ArrowRight", scope: "editor", enabled: (c) => c.connected },
+  { id: "renameTab", title: "Rename tab", category: "Tabs", defaultKey: null, scope: "global", enabled: (c) => c.connected },
+  { id: "pinTab", title: "Pin or unpin tab", category: "Tabs", defaultKey: null, scope: "global", enabled: (c) => c.connected },
+  // Mod-Shift-o: free in the default map (Mod-Shift already owns Enter/f/s/h/n),
+  // and next to Mod-o "Open file…" for the same reason DataGrip puts it there.
+  { id: "showAllTabs", title: "Show all tabs", category: "Tabs", defaultKey: "Mod-Shift-o", scope: "global", enabled: (c) => c.connected },
   { id: "openFile", title: "Open file…", category: "File", defaultKey: "Mod-o", scope: "global", enabled: (c) => c.connected },
   { id: "saveFile", title: "Save", category: "File", defaultKey: "Mod-s", scope: "global", enabled: (c) => c.connected },
   { id: "saveFileAs", title: "Save as…", category: "File", defaultKey: "Mod-Shift-s", scope: "global", enabled: (c) => c.connected },

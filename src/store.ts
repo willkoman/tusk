@@ -1,6 +1,9 @@
 import { createSignal } from "solid-js";
 import { DEFAULT_PREFS, type EditorPrefs } from "./editor/types";
 import { type KeyOverrides } from "./actions";
+import { clampLineHeight, clampScale, normalizeDensity } from "./appearance";
+// tabs.ts imports from here TYPE-only, so this edge carries no runtime cycle.
+import { MAX_TAB_TITLE, normalizeTabColor, type TabColor } from "./tabs";
 
 // Lightweight, WebView-local persistence (localStorage). Passwords and tokens never
 // live here, but editor buffers contain query text and possibly literals copied from a
@@ -101,6 +104,10 @@ export const prefsStore = {
         if (["vertical", "horizontal"].includes(String(parsed.planOrientation))) out.planOrientation = parsed.planOrientation as EditorPrefs["planOrientation"];
         if (["cost", "time", "rows", "off"].includes(String(parsed.planHeat))) out.planHeat = parsed.planHeat as EditorPrefs["planHeat"];
         if (["compact", "normal"].includes(String(parsed.planDensity))) out.planDensity = parsed.planDensity as EditorPrefs["planDensity"];
+        if (finite(parsed.lineHeight)) out.lineHeight = clampLineHeight(parsed.lineHeight);
+        if (parsed.density !== undefined) out.density = normalizeDensity(parsed.density);
+        if (finite(parsed.uiScale)) out.uiScale = clampScale(parsed.uiScale);
+        if (["left", "right"].includes(String(parsed.sidebarSide))) out.sidebarSide = parsed.sidebarSide as EditorPrefs["sidebarSide"];
         return out;
       }
     } catch {
@@ -197,9 +204,19 @@ export type PersistedTab = {
   title: string;
   searchSchema: string | null;
   dirty?: boolean;
+  /** User-set title; "" (or absent, in documents written before rename shipped) = automatic. */
+  customTitle?: string;
+  pinned?: boolean;
+  /** One of tabs.ts TAB_COLORS, or "". Validated on load like every persisted value. */
+  color?: string;
 };
 export type PersistedTabs = { tabs: PersistedTab[]; activeIndex: number };
-export type RestoredPersistedTab = Omit<PersistedTab, "dirty"> & { dirty: boolean };
+export type RestoredPersistedTab = Omit<PersistedTab, "dirty" | "customTitle" | "pinned" | "color"> & {
+  dirty: boolean;
+  customTitle: string;
+  pinned: boolean;
+  color: TabColor;
+};
 export type RestoredPersistedTabs = { tabs: RestoredPersistedTab[]; activeIndex: number };
 
 export type TabsPersistenceFailure = {
@@ -248,7 +265,18 @@ function normalizeTabs(value: unknown): RestoredPersistedTabs | null {
       ? v.searchSchema
       : null;
     const dirty = typeof v.dirty === "boolean" ? v.dirty : false;
-    return [{ sql: v.sql, title: v.title.slice(0, 200), filePath, searchSchema, dirty }];
+    const customTitle = typeof v.customTitle === "string" ? v.customTitle.slice(0, MAX_TAB_TITLE) : "";
+    const pinned = v.pinned === true;
+    return [{
+      sql: v.sql,
+      title: v.title.slice(0, MAX_TAB_TITLE),
+      filePath,
+      searchSchema,
+      dirty,
+      customTitle,
+      pinned,
+      color: normalizeTabColor(v.color),
+    }];
   });
   if (!tabs.length) return null;
   return {
@@ -313,6 +341,7 @@ function saveTabs(key: string, data: PersistedTabs): TabsPersistenceResult<void>
       chars += jsonStringChars(tab.sql) + jsonStringChars(tab.title) + 96;
       if (typeof tab.filePath === "string") chars += jsonStringChars(tab.filePath);
       if (typeof tab.searchSchema === "string") chars += jsonStringChars(tab.searchSchema);
+      if (typeof tab.customTitle === "string") chars += jsonStringChars(tab.customTitle);
       if (chars > MAX_TABS_STORE_CHARS) return { ok: false, error: failure("save", "too-large") };
     }
   }

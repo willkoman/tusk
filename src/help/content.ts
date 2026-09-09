@@ -2807,7 +2807,7 @@ export const TOPICS: Topic[] = [
   {
     "id": "workspace",
     "title": "Workspace, themes & settings",
-    "blurb": "Panels, topbar, Settings dialog, 8 themes, accent/font, built-in updater.",
+    "blurb": "Panels, tab organisation, topbar, Settings dialog, 8 themes, density and scale, built-in updater.",
     "blocks": [
       {
         "k": "p",
@@ -2845,10 +2845,29 @@ export const TOPICS: Topic[] = [
         "md": "Drag a tab to reorder the strip, or move the active tab with the chords below. The order persists with the tab set; a tab keeps its connection, its buffer, and any running query."
       },
       {
+        "k": "p",
+        "md": "**Rename** a tab by double-clicking its title, or right-click → *Rename…*. Enter keeps the name, Escape cancels, an empty box restores the automatic title (`Untitled N`, or the file basename). A custom title survives a Save as."
+      },
+      {
+        "k": "p",
+        "md": "**Pin** a tab to hold it in a fixed group at the left of the strip. A pinned tab shows its driver mascot and the first few characters of its name, has no ×, cannot be dragged past an unpinned tab, and is never closed by a close-many action. **Colour ›** tags a tab with one of six theme-aware swatches, drawn as a dot — distinct from the accent top rule that marks a transaction owner and the bottom rule that tints a tab by connection. Titles, pins and colours persist with the tab set."
+      },
+      {
+        "k": "p",
+        "md": "The rest of the tab context menu: **Close**, **Close others**, **Close tabs to the right**, **Close saved tabs** (every tab with no unsaved buffer), **Copy path** on a file tab, and **Show all tabs…**. With several connections open, the close-many items act only on the tabs of that tab's connection. Each one applies the same guards a single close does — an unsaved buffer, pending grid edits, a running query, or ownership of a manual transaction skips that tab — and the statusbar reports how many closed and how many were kept."
+      },
+      {
+        "k": "p",
+        "md": "**All tabs** ([[kbd:Mod-Shift-o]], or the **⌄** beside the strip) lists every open tab grouped by connection, with pin and unsaved markers and a filter box matching title, file path and connection name. ↑/↓ move, Enter switches, Escape closes. The strip scrolls and hides tabs; this list does not."
+      },
+      {
         "k": "keys",
         "rows": [
           { "action": "moveTabLeft", "does": "Move the active tab one slot left" },
-          { "action": "moveTabRight", "does": "Move the active tab one slot right" }
+          { "action": "moveTabRight", "does": "Move the active tab one slot right" },
+          { "action": "renameTab", "does": "Rename the active tab" },
+          { "action": "pinTab", "does": "Pin or unpin the active tab" },
+          { "action": "showAllTabs", "does": "List every open tab, grouped by connection" }
         ]
       },
       {
@@ -2937,15 +2956,15 @@ export const TOPICS: Topic[] = [
         "rows": [
           [
             "**Editor**",
-            "Font size (9–24), Word wrap, Auto-fold large literals, Server-side lint (PREPARE-only), SQL dialect — the dialect select is **disabled while connected** (it follows the driver)"
+            "Word wrap, Auto-fold large literals, Server-side lint (PREPARE-only), SQL dialect — the dialect select is **disabled while connected** (it follows the driver)"
           ],
           [
             "**Appearance**",
-            "Theme, Editor / grid font (free text with presets like JetBrains Mono, Fira Code, Consolas — plus a Reset), Accent color (picker + six swatches)"
+            "Theme and Accent color (picker + six swatches); Density (Comfortable / Compact), UI scale (90–125 % in 5 % steps), Explorer side (Left / Right); Editor / grid font (free text with presets like JetBrains Mono, Fira Code, Consolas — plus a Reset), Editor font size (9–24), Editor line height (1.1–2.0); Reset to defaults"
           ],
           [
             "**Grid**",
-            "Row density (Normal 28 px / Compact 22 px rows), Zebra striping, NULL cells show (`NULL` / empty / —), Default column width (48–900), Copy with column names"
+            "Row density (Normal / Compact) — applied on top of the Appearance density, so Comfortable gives 28/22 px rows and Compact 24/18 px — Zebra striping, NULL cells show (`NULL` / empty / —), Default column width (48–900), Copy with column names"
           ],
           [
             "**Plans**",
@@ -2986,6 +3005,10 @@ export const TOPICS: Topic[] = [
       {
         "k": "p",
         "md": "**Accent color** tints buttons, selection, and focus states app-wide; **Editor / grid font** sets the monospace face in both editor and grid — applied live as CSS variables. Blank font uses the built-in stack (JetBrains Mono first)."
+      },
+      {
+        "k": "p",
+        "md": "**Density** and **UI scale** are separate axes. Density switches the row, tab, tree and control height token set (Comfortable is the shipped size); UI scale multiplies the root font size from 90 % to 125 %, and does not touch the editor's own font size. **Explorer side** docks the sidebar left or right; panel widths are unchanged by the swap. **Reset to defaults** at the foot of the pane restores theme, accent, fonts, density, scale and Explorer side."
       },
       {
         "k": "h",

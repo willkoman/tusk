@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { DEFAULT_PREFS } from "./editor/types";
-import { crashConsent, keymapStore, layoutStore, prefsStore, setCrashConsent, tabsStore } from "./store";
+import { crashConsent, keymapStore, layoutStore, prefsStore, setCrashConsent, tabsStore, type PersistedTab } from "./store";
+import { MAX_TAB_TITLE } from "./tabs";
 
 class MemoryStorage {
   data = new Map<string, string>();
@@ -39,7 +40,7 @@ describe("persisted state normalization", () => {
       activeIndex: -99,
     }));
     expect(tabsStore.load("db")).toEqual({
-      tabs: [{ sql: "SELECT 1", title: "ok", filePath: null, searchSchema: null, dirty: false }],
+      tabs: [{ sql: "SELECT 1", title: "ok", filePath: null, searchSchema: null, dirty: false, customTitle: "", pinned: false, color: "" }],
       activeIndex: 0,
     });
   });
@@ -177,5 +178,87 @@ describe("persisted state normalization", () => {
     });
     expect(result.ok).toBe(true);
     expect(tabsStore.load("db")?.tabs[0].dirty).toBe(true);
+  });
+});
+
+describe("tab organisation persistence", () => {
+  const tab = (over: Partial<PersistedTab> = {}): PersistedTab => ({
+    sql: "SELECT 1",
+    filePath: null,
+    title: "Untitled 1",
+    searchSchema: null,
+    dirty: false,
+    ...over,
+  });
+
+  it("round-trips the custom title, pin, and colour tag", () => {
+    const data = {
+      tabs: [
+        tab({ customTitle: "Nightly rollup", pinned: true, color: "violet" }),
+        tab({ title: "orders.sql", filePath: "/work/orders.sql" }),
+      ],
+      activeIndex: 1,
+    };
+    expect(tabsStore.saveResult("conn", data).ok).toBe(true);
+
+    const loaded = tabsStore.load("conn");
+    expect(loaded?.tabs[0]).toMatchObject({ customTitle: "Nightly rollup", pinned: true, color: "violet" });
+    expect(loaded?.tabs[1]).toMatchObject({ customTitle: "", pinned: false, color: "" });
+    expect(loaded?.activeIndex).toBe(1);
+  });
+
+  it("normalizes documents written before the feature shipped", () => {
+    storage.setItem("tusk.tabs.conn", JSON.stringify({ tabs: [tab()], activeIndex: 0 }));
+    expect(tabsStore.load("conn")?.tabs[0]).toMatchObject({ customTitle: "", pinned: false, color: "" });
+  });
+
+  it("drops an unknown colour and a non-boolean pin rather than trusting them", () => {
+    storage.setItem(
+      "tusk.tabs.conn",
+      JSON.stringify({ tabs: [tab({ color: "chartreuse", pinned: "yes" as unknown as boolean })], activeIndex: 0 }),
+    );
+    expect(tabsStore.load("conn")?.tabs[0]).toMatchObject({ color: "", pinned: false });
+  });
+
+  it("bounds an oversized custom title", () => {
+    storage.setItem("tusk.tabs.conn", JSON.stringify({ tabs: [tab({ customTitle: "x".repeat(5_000) })], activeIndex: 0 }));
+    expect(tabsStore.load("conn")?.tabs[0].customTitle).toHaveLength(MAX_TAB_TITLE);
+  });
+});
+
+describe("appearance preferences", () => {
+  it("defaults to the shipped look", () => {
+    expect(prefsStore.load()).toMatchObject({
+      density: "comfortable",
+      uiScale: 100,
+      sidebarSide: "left",
+      lineHeight: DEFAULT_PREFS.lineHeight,
+    });
+  });
+
+  it("clamps stored scale and line height, and rejects unknown density / side", () => {
+    storage.setItem(
+      "tusk.prefs",
+      JSON.stringify({ density: "cosy", uiScale: 400, sidebarSide: "top", lineHeight: 12 }),
+    );
+    expect(prefsStore.load()).toMatchObject({
+      density: "comfortable",
+      uiScale: 125,
+      sidebarSide: "left",
+      lineHeight: 2,
+    });
+  });
+
+  it("keeps a valid saved appearance", () => {
+    storage.setItem(
+      "tusk.prefs",
+      JSON.stringify({ density: "compact", uiScale: 115, sidebarSide: "right", lineHeight: 1.6 }),
+    );
+    expect(prefsStore.load()).toMatchObject({
+      density: "compact",
+      uiScale: 115,
+      sidebarSide: "right",
+      lineHeight: 1.6,
+    });
   });
 });
