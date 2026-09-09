@@ -69,8 +69,10 @@
   --row-new-soft: rgba(80, 200, 120, 0.10);
   --row-del: #e05050;
   --row-del-soft: rgba(224, 80, 80, 0.10);
+  /* Plan heat ramp. Warm, never the destruction red: a hot node is expensive,
+     not dangerous. Cold is the same slate as an unmeasured node. */
   --heat-cold: #64748b;
-  --heat-hot: #ef4444;
+  --heat-hot: #e08a3c;
   --guide: rgba(148, 163, 184, 0.15);
   --zebra: rgba(148, 163, 184, 0.055);
   --scrollbar-thumb: #2c3645;
@@ -242,7 +244,7 @@
   --scrollbar-thumb-hover: #a7b4c6;
   --zebra: rgba(71, 85, 105, 0.06);
   --heat-cold: #94a3b8;
-  --heat-hot: #dc2626;
+  --heat-hot: #b45309;
 }
 
 :root[data-theme="catppuccinMocha"] {
@@ -275,7 +277,7 @@
   --scrollbar-thumb-hover: #585b70;
   --zebra: rgba(205, 214, 244, 0.045);
   --heat-cold: #6c7086;
-  --heat-hot: #f38ba8;
+  --heat-hot: #fab387;
   --conn-1: #89b4fa;
   --conn-2: #fab387;
   --conn-3: #a6e3a1;
@@ -329,7 +331,7 @@
   --scrollbar-thumb-hover: #6272a4;
   --zebra: rgba(248, 248, 242, 0.04);
   --heat-cold: #6272a4;
-  --heat-hot: #ff5555;
+  --heat-hot: #ffb86c;
   --conn-1: #8be9fd;
   --conn-2: #ffb86c;
   --conn-3: #50fa7b;
@@ -383,7 +385,7 @@
   --scrollbar-thumb-hover: #3b4261;
   --zebra: rgba(192, 202, 245, 0.04);
   --heat-cold: #565f89;
-  --heat-hot: #f7768e;
+  --heat-hot: #ff9e64;
   --conn-1: #7aa2f7;
   --conn-2: #ff9e64;
   --conn-3: #9ece6a;
@@ -438,7 +440,7 @@
   --scrollbar-thumb-hover: #c0b9a0;
   --zebra: rgba(88, 110, 117, 0.06);
   --heat-cold: #93a1a1;
-  --heat-hot: #dc322f;
+  --heat-hot: #cb4b16;
   --e1: 0 6px 18px rgba(101, 123, 131, 0.12);
   --e2: 0 16px 48px rgba(101, 123, 131, 0.20);
   --conn-1: #268bd2;
@@ -493,7 +495,7 @@
   --scrollbar-thumb-hover: #afb8c1;
   --zebra: rgba(31, 35, 40, 0.045);
   --heat-cold: #8c959f;
-  --heat-hot: #cf222e;
+  --heat-hot: #bc4c00;
   --e1: 0 6px 18px rgba(31, 35, 40, 0.10);
   --e2: 0 16px 48px rgba(31, 35, 40, 0.14);
   --conn-1: #0969da;
@@ -548,7 +550,7 @@
   --scrollbar-thumb-hover: #bdae93;
   --zebra: rgba(60, 56, 54, 0.05);
   --heat-cold: #928374;
-  --heat-hot: #9d0006;
+  --heat-hot: #af3a03;
   --e1: 0 6px 18px rgba(60, 56, 54, 0.12);
   --e2: 0 16px 48px rgba(60, 56, 54, 0.18);
   --conn-1: #076678;
@@ -1604,6 +1606,15 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
 .import-info { font-size: var(--fs-sm); color: var(--muted); background: var(--bg); padding: var(--s2) var(--s3); border-radius: var(--r-sm); line-height: var(--lh-body); }
 .import-msg { font-size: var(--fs-sm); color: var(--accent-2); }
 
+/* --- parameter prompt. Two columns: the name, then the value with its two
+       toggles inline. The name sits outside the input's focus ring. --- */
+.param-rows { display: flex; flex-direction: column; gap: var(--s2); }
+.param-row { display: grid; grid-template-columns: minmax(72px, max-content) 1fr; align-items: center; gap: var(--s3); }
+.modal .param-name { display: block; font-family: var(--mono); font-size: var(--fs-sm); font-weight: 600; color: var(--text); text-align: right; overflow: hidden; text-overflow: ellipsis; }
+.param-value { display: flex; align-items: center; gap: var(--s3); min-width: 0; }
+.param-value input:not([type="checkbox"]) { flex: 1; min-width: 0; }
+.modal .param-flag { flex: none; color: var(--muted); }
+
 /* --- visual filter builder --- */
 .filter-builder { display: flex; flex-direction: column; gap: var(--s2); max-height: 52vh; overflow-y: auto; }
 .filter-group { display: flex; flex-direction: column; gap: 6px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--s2); }
@@ -1873,6 +1884,13 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
 .ctx-text { flex: 1; }
 .ctx-key { flex: none; margin-left: var(--s4); font-family: var(--mono); font-size: var(--fs-xs); color: var(--muted); }
 .ctx-item:hover .ctx-key { color: rgba(255, 255, 255, 0.75); }
+/* A group opens one panel to its right (flipped left at the viewport edge) and
+   stays marked while that panel is open, so the trail back is readable. */
+.ctx-group.open { background: var(--accent-soft); }
+.ctx-more { flex: none; display: inline-flex; align-items: center; margin-left: var(--s3); color: var(--muted); }
+.ctx-more svg { width: 13px; height: 13px; display: block; stroke: currentColor; }
+.ctx-item:hover .ctx-more { color: inherit; }
+.ctx-sub { z-index: 101; }
 .ctx-sep { height: 1px; background: var(--border); margin: var(--s1) 6px; }
 /* The separator before the destructive group is wider and carries extra space,
    so a mis-aimed click near a benign item cannot land on Drop. */
