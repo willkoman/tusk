@@ -1268,7 +1268,14 @@ body.dnd-dragging * { cursor: grabbing !important; user-select: none !important;
    ========================================================================== */
 
 .result { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
+/* One error state, boxed and actionable. A bare red sentence with "No results"
+   printed under it was two contradictory empty states stacked. */
 .result-error { margin: var(--s3); }
+.result-errorbox { margin: var(--s3); border: 1px solid var(--danger); border-left-width: 3px; border-radius: var(--r-sm); background: var(--danger-soft); overflow: hidden; }
+.result-errorhead { display: flex; align-items: center; gap: var(--s2); padding: var(--s2) var(--s3); color: var(--danger); font-weight: 600; font-size: var(--fs-sm); border-bottom: 1px solid var(--danger); }
+.result-errorhead svg { width: 14px; height: 14px; flex: none; }
+.result-errorhead .ghost { padding: 2px var(--s2); font-size: var(--fs-xs); color: var(--text); min-width: 0; }
+.result-errormsg { padding: var(--s3); font-family: var(--mono); font-size: var(--fs-sm); line-height: var(--lh-body); color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow-y: auto; user-select: text; }
 .result-empty { padding: var(--s4); color: var(--muted); }
 .result-toolbar {
   display: flex; align-items: center; gap: var(--s3); padding: var(--s1) var(--s3);
@@ -1890,7 +1897,7 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
 .palette-item { display: flex; align-items: center; gap: var(--s2); padding: 7px var(--s3); border-radius: var(--r-sm); cursor: pointer; font-size: var(--fs-base); box-shadow: inset 2px 0 0 transparent; }
 .palette-item.active { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
 .palette-cat { font-size: var(--fs-xs); color: var(--muted); min-width: 60px; flex: none; }
-.palette-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.palette-title, .palette-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .palette-key { font-family: var(--mono); font-size: var(--fs-xs); color: var(--muted); flex: none; width: 132px; text-align: right; }
 
 /* "All tabs" popover (over the shared .palette shell) */

@@ -95,8 +95,7 @@ export function CommandPalette(props: {
                 }}
               >
                 <span class="palette-cat">{a.category}</span>
-                <span class="palette-title">{a.title}</span>
-                <span class="spacer" />
+                <span class="palette-name">{a.title}</span>
                 <span class="palette-key">{displayKey(effectiveKey(a.id, props.keys))}</span>
               </div>
             )}

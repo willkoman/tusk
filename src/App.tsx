@@ -5445,13 +5445,13 @@ function App() {
                 ? "Autocommit off"
                 : transaction().state === "configured" ? "Next transaction configured" : "Manual transaction"}
             </span>
-            <code>{transaction().id ?? "unknown"}</code>
-            <span class="transaction-detail">
-              {transaction().state.replace("_", " ")} · {ownerTab()?.title ?? transaction().owner ?? "unknown owner"} · {fmtDur(Math.max(0, transactionNow() - (transactionStartedAt() ?? transactionNow())))}
+            <span class="transaction-detail" title={`Transaction ${transaction().id ?? "unknown"}`}>
+              {transaction().state.replace("_", " ")} in {ownerTab()?.title ?? transaction().owner ?? "unknown owner"}
             </span>
-            <Show when={transaction().state === "failed"}><span class="transaction-alert">Recovery required</span></Show>
-            <Show when={transaction().state === "lost"}><span class="transaction-alert">Outcome may be unknown</span></Show>
+            <Show when={transaction().state === "failed"}><span class="transaction-alert">Roll back to continue.</span></Show>
+            <Show when={transaction().state === "lost"}><span class="transaction-alert">Verify this unit's outcome.</span></Show>
             <span class="spacer" />
+            <span class="transaction-timer">{fmtDur(Math.max(0, transactionNow() - (transactionStartedAt() ?? transactionNow())))}</span>
             <Show when={!activeOwnsTransaction() && transaction().owner}>
               <button class="ghost" onClick={() => switchTab(transaction().owner!)}>Switch to owner</button>
             </Show>
@@ -5463,16 +5463,18 @@ function App() {
                 when={transaction().state === "configured"}
                 fallback={
                   <>
+                    <Show when={transaction().state !== "failed"}>
+                      <button
+                        class="ghost"
+                        disabled={!transactionControls().commit}
+                        onClick={() => void runTransactionControl("COMMIT")}
+                      >{transaction().mode === "autocommit_off" ? "Commit unit" : "Commit"}</button>
+                    </Show>
                     <button
-                      class="ghost"
-                      disabled={!transactionControls().commit}
-                      onClick={() => void runTransactionControl("COMMIT")}
-                    >{transaction().mode === "autocommit_off" ? "Commit unit" : "Commit"}</button>
-                    <button
-                      class="ghost tx-rollback"
+                      classList={{ ghost: transaction().state !== "failed", "tx-rollback": transaction().state !== "failed", "btn-danger": transaction().state === "failed" }}
                       disabled={!transactionControls().rollback}
                       onClick={() => void runTransactionControl("ROLLBACK")}
-                    >{transaction().mode === "autocommit_off" ? "Rollback unit" : "Rollback"}</button>
+                    >{transaction().mode === "autocommit_off" ? "Roll back unit" : "Roll back"}</button>
                     <Show when={transaction().mode === "autocommit_off"}>
                       <button
                         class="ghost"
@@ -5860,7 +5862,17 @@ function App() {
                   </Show>
                 </div>
               </Show>
-              <Show when={runErr()}><div class="error result-error">{runErr()}</div></Show>
+              <Show when={runErr()}>
+                <div class="result-errorbox">
+                  <div class="result-errorhead">
+                    <Icon name="alert" />
+                    <span>Statement failed</span>
+                    <span class="spacer" />
+                    <button class="ghost" onClick={() => editorApi()?.focus()}>Fix in editor</button>
+                  </div>
+                  <div class="result-errormsg">{runErr()}</div>
+                </div>
+              </Show>
               <Show when={planMemo() && resultView() === "plan"}>
                 <PlanView
                   plan={() => planMemo()!}
@@ -5879,7 +5891,7 @@ function App() {
                 />
               </Show>
               <Show when={!(planMemo() && resultView() === "plan") && columns().length > 0} fallback={
-                <Show when={!planMemo() && columns().length === 0}><div class="result-empty">{status() || "No results"}</div></Show>
+                <Show when={!planMemo() && columns().length === 0 && !runErr()}><div class="result-empty">{status() || "No results"}</div></Show>
               }>
                 <ResultGrid
                   columns={columns}

@@ -1,4 +1,5 @@
-import { createSignal, createEffect, createMemo, Index, Show, onCleanup, onMount, type Accessor } from "solid-js";
+import { createSignal, createEffect, createMemo, For, Index, Show, onCleanup, onMount, type Accessor } from "solid-js";
+import { Icon } from "../Icons";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import {
   aiStore, activeBaseUrl, approvedBaseOverride, defaultModel, normalizeAiConfig,
@@ -460,6 +461,20 @@ export function AiPanel(props: {
 
   // Quick actions seed the chat; the schema/SQL/error already ride in the system prompt.
   const explain = () => send("Explain what the SQL in my editor does, step by step.");
+  /**
+   * Opening prompts, scoped to the schema in front of the user. The empty panel
+   * used to be one grey paragraph over 750px of void.
+   */
+  const starters = () => {
+    const t = props.ctx().tables?.[0];
+    const name = t ? (t.schema && t.schema !== "public" ? `${t.schema}.${t.name}` : t.name) : "";
+    return [
+      "Summarise this schema",
+      name ? `Show me 20 recent rows from ${name}` : "Write a query against this database",
+      "Explain the SQL in my editor",
+    ];
+  };
+
   const fixError = () => send("My last query errored (see the error in context). Diagnose it and give a corrected query.");
   /** The last message, when it's a finished assistant turn that the user can retry. */
   const failedLast = () => {
@@ -486,6 +501,8 @@ export function AiPanel(props: {
   return (
     <div class="ai-panel" style={{ width: `${props.width}px` }}>
       <div class="ai-head">
+        <Icon name="sparkle" />
+        <span class="ai-title">Assistant</span>
         <Show
           when={keyed().length > 0}
           fallback={<button class="ai-setup" onClick={() => props.onOpenSettings()}>Set up a model</button>}
@@ -498,9 +515,9 @@ export function AiPanel(props: {
           />
         </Show>
         <span class="spacer" />
-        <button class="icon" title="New chat" disabled={messages().length === 0} onClick={newChat}>✚</button>
-        <button class="icon" title="Settings" classList={{ active: settingsOpen() }} onClick={() => setSettingsOpen((v) => !v)}>⚙</button>
-        <button class="icon" title="Close" onClick={props.onClose}>✕</button>
+        <button class="icon" title="New chat" disabled={messages().length === 0} onClick={newChat}><Icon name="plus" /></button>
+        <button class="icon" title="Settings" classList={{ active: settingsOpen() }} onClick={() => setSettingsOpen((v) => !v)}><Icon name="gear" /></button>
+        <button class="icon" title="Close" onClick={props.onClose}><Icon name="close" /></button>
       </div>
 
       <Show when={settingsOpen()}>
@@ -532,7 +549,14 @@ export function AiPanel(props: {
 
       <div class="ai-messages" ref={msgEl} onScroll={onMsgScroll}>
         <Show when={messages().length === 0}>
-          <div class="ai-empty">Ask about the schema, generate a query, or explain the SQL in your editor. Proposed SQL never runs on its own.</div>
+          <div class="ai-empty">
+            <span>Proposed SQL never runs on its own.</span>
+            <div class="ai-examples">
+              <For each={starters()}>
+                {(q) => <button class="ai-example" disabled={connMismatch()} onClick={() => send(q)}>{q}</button>}
+              </For>
+            </div>
+          </div>
         </Show>
         {/* Index, not For: streaming replaces the last message OBJECT per delta —
             For keys on identity and would tear down + rebuild the whole bubble's
@@ -592,7 +616,12 @@ export function AiPanel(props: {
       </Show>
       <div class="ai-actions">
         <button class="ghost" disabled={streaming() || connMismatch()} onClick={explain}>Explain</button>
-        <button class="ghost" disabled={streaming() || connMismatch()} onClick={fixError}>Fix error</button>
+        <button
+          class="ghost"
+          disabled={streaming() || connMismatch() || !props.ctx().lastError.trim()}
+          title={props.ctx().lastError.trim() ? "Diagnose the last query error" : "No query has failed yet"}
+          onClick={fixError}
+        >Fix error</button>
       </div>
       <form class="ai-input" onSubmit={(e) => { e.preventDefault(); send(input()); }}>
         {/* Deliberately NOT `disabled` while streaming: a disabled control receives no
