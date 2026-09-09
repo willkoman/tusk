@@ -427,6 +427,17 @@ function App() {
       return { disabled: true, title: `File import isn't supported for ${driverLabel("mssql")} yet — use the SQL editor or a bulk-load tool` };
     return allowed ? {} : { disabled: true, title: reason };
   };
+  /**
+   * The same gate for the sidebar header's Import button, which used to be disabled
+   * by the transaction freeze alone — a read-only or SQL Server connection let the
+   * user walk the whole wizard before the backend refused. Read from JSX attributes,
+   * so it must stay a plain accessor (a spread would not track).
+   */
+  const sidebarImportGate = () =>
+    importGate(
+      !pEnforced() || canCreateSchema() || schema().length > 0,
+      "Requires CREATE somewhere in this database",
+    );
   // Disable an item this engine cannot express (constraint ALTERs on DuckDB, CREATE
   // DATABASE on SQLite, renaming a constraint anywhere but Postgres, …). Spread AFTER
   // gate(); `what` completes "<engine> can't <what>".
@@ -5134,10 +5145,8 @@ function App() {
                     worse than a disabled button that names the reason. */}
                 <button
                   class="icon"
-                  {...(() => {
-                    const g = importGate(!pEnforced() || canCreateSchema() || schema().length > 0, "Requires CREATE somewhere in this database");
-                    return { title: g.title ?? "Import data", disabled: !!g.disabled };
-                  })()}
+                  title={sidebarImportGate().title ?? "Import data"}
+                  disabled={!!sidebarImportGate().disabled}
                   onClick={() => openImport(null)}
                 ><Icon name="download" /></button>
                 <button class="icon" title={metadataFrozen() ? "Refresh deferred until transaction ends" : "Refresh"} disabled={schemaLoading() || metadataFrozen()} onClick={() => loadSchema()}>{schemaLoading() ? <span class="spinner-sm" /> : <Icon name="refresh" />}</button>
