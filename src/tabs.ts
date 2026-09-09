@@ -66,7 +66,7 @@ export function interruptedResult(
   return {
     done: true,
     incomplete: reason,
-    status: `${result.rows.length} rows loaded · ${reason} — re-run the query for the full result`,
+    status: `${result.rows.length} rows loaded. ${reason}. Re-run for the full result.`,
   };
 }
 

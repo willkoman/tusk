@@ -272,11 +272,11 @@ export function ImportDialog(props: {
                         onChange={(e) => { set({ customDelimiter: e.currentTarget.value }); void reparse(); }} />
                     </label>
                   </Show>
-                  <label title="Blank turns quoting off entirely — every delimiter and quote byte is literal field content.">Quote
+                  <label title="Blank disables quoting; all bytes are literal data.">Quote
                     <input class="export-narrow" maxLength={1} placeholder="none" value={options().quoteChar}
                       onChange={(e) => { set({ quoteChar: e.currentTarget.value }); void reparse(); }} />
                   </label>
-                  <label title="Backslash-style escape inside a quoted field. Blank uses RFC 4180 doubled quotes; it must differ from both the quote character and the delimiter.">Escape
+                  <label title="Escapes quotes inside a field; blank uses doubled quotes. Must differ from the quote character and the delimiter.">Escape
                     <input class="export-narrow" maxLength={1} placeholder="none" value={options().escapeChar}
                       onChange={(e) => { set({ escapeChar: e.currentTarget.value }); void reparse(); }} />
                   </label>
@@ -532,8 +532,8 @@ export function ImportDialog(props: {
                 </Show>
                 <Show when={s().createdOutsideTransaction}>
                   <div>
-                    MySQL commits DDL immediately, so <b>{table()}</b> was created as a separate,
-                    already-committed step before the rows were loaded in one transaction.
+                    MySQL commits DDL immediately. <b>{table()}</b> was created and committed
+                    before the rows loaded in one transaction.
                   </div>
                 </Show>
                 <Show when={s().warnings.length}>

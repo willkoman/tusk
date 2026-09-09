@@ -85,7 +85,7 @@ export function ShortcutsPane(props: {
                     <span class="shortcuts-title">{a.title}</span>
                     <Show when={capturing() === a.id && conflict()}>
                       <span class="shortcuts-conflict">
-                        bound to “{titleOf(conflict()!.other)}” — press again to replace
+                        bound to “{titleOf(conflict()!.other)}”; press again to replace
                       </span>
                     </Show>
                     <button
@@ -94,7 +94,7 @@ export function ShortcutsPane(props: {
                       on:keydown={(e: KeyboardEvent) => capturing() === a.id && onCaptureKey(e, a.id)}
                       onBlur={() => capturing() === a.id && stopCapture()}
                       onClick={() => { setCapturing(a.id); setConflict(null); }}
-                      title="Click, then press the new shortcut (Esc cancels, Backspace clears)"
+                      title="Click, then press a shortcut. Esc cancels, Backspace clears."
                     >
                       {capturing() === a.id ? "press keys…" : key() ? displayKey(key()) : "unbound"}
                     </button>

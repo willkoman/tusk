@@ -48,8 +48,8 @@ export function SshHostKeyDialog(props: {
       }
     >
       <p class="ssh-hostkey-lead">
-        Tusk has not connected to this host before. Confirm the fingerprint matches the server.
-        Accepting the wrong key hands your session to whoever answered.
+        Tusk has not connected to this host before. Trust the key only if the fingerprint
+        matches the server.
       </p>
       <div class="ssh-hostkey-fp">
         <div class="ssh-hostkey-alg">{props.prompt.algorithm}</div>
@@ -57,8 +57,8 @@ export function SshHostKeyDialog(props: {
       </div>
       <p class="ssh-hostkey-note">
         On the server, <code>ssh-keygen -lf /etc/ssh/ssh_host_{"<type>"}_key.pub</code> prints the
-        same value. Trusting records it in Tusk's SSH trust store; your{" "}
-        <code>~/.ssh/known_hosts</code> is read but never modified.
+        same value. Trusting records it in Tusk's SSH trust store.{" "}
+        <code>~/.ssh/known_hosts</code> is read, never modified.
       </p>
     </Dialog>
   );

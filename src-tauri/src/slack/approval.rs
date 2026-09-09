@@ -98,7 +98,7 @@ impl ApprovalStore {
             .fold(0usize, |n, old| n.saturating_add(proposal_bytes(old)));
         if map.len() >= PROPOSAL_CAP || current_bytes.saturating_add(bytes) > PROPOSAL_BYTE_CAP {
             return Err(crate::db::AppError::new(
-                "too many Slack proposals are awaiting approval; approve/reject one or wait for expiry",
+                "too many Slack proposals are awaiting approval. Approve or reject one, or wait for expiry.",
             ));
         }
         map.insert(p.id.clone(), p);

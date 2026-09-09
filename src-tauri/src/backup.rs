@@ -188,7 +188,7 @@ impl RestoreOptions {
     fn validate(&self) -> Result<(), AppError> {
         if self.single_transaction && !self.stop_on_error {
             return Err(AppError::new(
-                "continue-on-error cannot be combined with a single transaction — the first failure aborts the whole unit",
+                "continue-on-error cannot be combined with a single transaction. Turn one of them off.",
             ));
         }
         Ok(())
@@ -686,7 +686,7 @@ async fn backup_inner(
     }
     if tables.len() + views.len() + functions.len() > MAX_BACKUP_OBJECTS {
         return Err(AppError::new(
-            "this selection exceeds the 50000-object backup limit — back up fewer schemas at a time",
+            "this selection exceeds the 50000-object backup limit. Back up fewer schemas at a time.",
         ));
     }
     if tables.is_empty() && views.is_empty() && functions.is_empty() {
@@ -807,7 +807,7 @@ async fn backup_inner(
     let wrap = opts.single_transaction && caps.transactional_ddl;
     if opts.single_transaction && !caps.transactional_ddl {
         warnings.push(format!(
-            "{} does not have transactional DDL — the dump is not wrapped in a transaction",
+            "{} does not have transactional DDL. The dump is not wrapped in a transaction.",
             caps.kind
         ));
         out.put("-- note: this engine has no transactional DDL; the dump is not wrapped.\n\n")
@@ -1126,7 +1126,7 @@ async fn backup_inner(
                 rows: rows_total,
                 bytes: out.bytes,
             });
-            out.put("-- foreign keys (after all data, so cycles restore cleanly)\n")
+            out.put("-- foreign keys (restored after all data)\n")
                 .await?;
             for alter in &fk_alters {
                 out.stmt(alter).await?;
@@ -1665,7 +1665,7 @@ pub async fn run_restore(
     }
     if opts.single_transaction && !caps.transactional_ddl {
         return Err(AppError::new(format!(
-            "{} has no transactional DDL — restore cannot run as a single transaction",
+            "{} has no transactional DDL. Restore cannot run as a single transaction.",
             caps.kind
         )));
     }
@@ -1711,7 +1711,7 @@ pub async fn run_restore(
         if clean {
             backend.run_single("COMMIT", 1, false).await.map_err(|e| {
                 AppError::new(format!(
-                    "restore commit acknowledgement failed; the outcome is unknown — verify database state before retrying ({})",
+                    "restore commit acknowledgement failed and the outcome is unknown. Verify database state before retrying ({}).",
                     e.message
                 ))
             })?;
@@ -1890,7 +1890,7 @@ async fn restore_stream(
                     // never replay it; surface the break instead.
                     if backend.is_closed() {
                         return Err(AppError::new(format!(
-                            "connection dropped during restore at statement {index} (line {line}); execution outcome is unknown — verify database state before retrying ({})",
+                            "connection dropped during restore at statement {index} (line {line}) and the outcome is unknown. Verify database state before retrying ({}).",
                             e.message
                         )));
                     }

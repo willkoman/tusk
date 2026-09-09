@@ -105,7 +105,7 @@ export function ExportDialog(props: {
     setDdlNote("");
     setDdlForTable("");
     if (!on || !props.onFetchCreateSql) {
-      if (on) setDdlNote("Using a generated all-text CREATE — the result is not a plain table.");
+      if (on) setDdlNote("Source is not a plain table. Using a generated all-text CREATE.");
       return;
     }
     const requestedFor = opts().sql.table;
@@ -116,10 +116,10 @@ export function ExportDialog(props: {
         setOpts({ ...opts(), sql: { ...opts().sql, createSql: ddl } });
         setDdlForTable(requestedFor);
       } else {
-        setDdlNote("Using a generated all-text CREATE — the result is not a plain table.");
+        setDdlNote("Source is not a plain table. Using a generated all-text CREATE.");
       }
     } catch {
-      setDdlNote("Could not read the table DDL — using a generated all-text CREATE.");
+      setDdlNote("Could not read the table DDL. Using a generated all-text CREATE.");
     }
   }
 
@@ -131,7 +131,7 @@ export function ExportDialog(props: {
     if (sql.createSql && name !== ddlForTable()) {
       sql.createSql = "";
       setDdlForTable("");
-      setDdlNote("Renaming the table drops the reconstructed DDL — using a generated all-text CREATE.");
+      setDdlNote("Renaming the table drops the reconstructed DDL. Using a generated all-text CREATE.");
     }
     setOpts({ ...opts(), sql });
   }
@@ -324,8 +324,8 @@ export function ExportDialog(props: {
           </div>
           <Show when={scope() === "selection"}>
             <div class="export-note">
-              Selection exports the stored rows, exactly like Loaded rows: unsaved edits and
-              new rows you have not applied yet are not included.
+              Exports the stored rows, like Loaded rows. Unapplied edits and new rows are
+              not included.
             </div>
           </Show>
         </section>

@@ -111,7 +111,7 @@ function plainSelectList(masked: string, selectEnd: number, listEnd: number): { 
     const item = raw.trim();
     const m = PLAIN_ITEM.exec(item);
     if (!m)
-      return { ok: false, reason: "only plain column selects are editable (no expressions or aliases)", qualifiers };
+      return { ok: false, reason: "Only plain column selects are editable (no expressions or aliases)", qualifiers };
     if (m[1]) qualifiers.push(m[1]);
   }
   return { ok: true, qualifiers };
@@ -175,12 +175,12 @@ export function editTarget(
   const resolve = (ref: string) =>
     activeSchema != null ? tableByRef(idx, ref, activeSchema) : tableByRefUnique(idx, ref);
   const base = stripTrailingSemi(baseQuery);
-  if (!base) return { ok: false, reason: "results from a script — run a single SELECT to edit" };
+  if (!base) return { ok: false, reason: "Script results are not editable. Run a single SELECT." };
   // Plain SELECT only — WITH/TABLE/VALUES results can't be safely mapped back to rows.
   if (!wrappableQuery(base, dialect))
-    return { ok: false, reason: "only SELECT results are editable" };
+    return { ok: false, reason: "Only SELECT results are editable" };
   const { spans, stmts } = lex(base, dialect as SqlEngine);
-  if (stmts.length > 1) return { ok: false, reason: "results from a script — run a single SELECT to edit" };
+  if (stmts.length > 1) return { ok: false, reason: "Script results are not editable. Run a single SELECT." };
   // keepDquote: quoted identifiers are names the alias map must see (strings stay masked).
   const masked = maskNonCode(base, spans, 0, base.length, true);
   // Reject words only in SQL code, never inside any identifier quote style (a column
@@ -190,31 +190,31 @@ export function editTarget(
     (s) => " ".repeat(s.length),
   );
   const m = REJECT.exec(keywordText);
-  if (m) return { ok: false, reason: `${m[1].toLowerCase().replace(/\s+/g, " ")} queries aren't editable` };
-  if (/\bfrom\s*\(/i.test(keywordText)) return { ok: false, reason: "derived-table queries aren't editable" };
+  if (m) return { ok: false, reason: `${m[1].toUpperCase().replace(/\s+/g, " ")} queries are not editable` };
+  if (/\bfrom\s*\(/i.test(keywordText)) return { ok: false, reason: "Derived-table queries are not editable" };
   const functionSource = /\bfrom\s+[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?\s*\(/i;
-  if (functionSource.test(keywordText)) return { ok: false, reason: "table-function queries aren't editable" };
-  if (hasCommaJoin(masked)) return { ok: false, reason: "comma-join queries aren't editable" };
+  if (functionSource.test(keywordText)) return { ok: false, reason: "Table-function queries are not editable" };
+  if (hasCommaJoin(masked)) return { ok: false, reason: "Comma-join queries are not editable" };
 
   const tokens = topTokens(masked);
   const select = tokens.find((token) => token.kind === "word");
   if (!select || select.text.toLowerCase() !== "select")
-    return { ok: false, reason: "only SELECT results are editable" };
+    return { ok: false, reason: "Only SELECT results are editable" };
   const fromAt = tokens.findIndex((token) => token.kind === "word" && token.text.toLowerCase() === "from");
-  if (fromAt < 0) return { ok: false, reason: "no table detected in the query" };
+  if (fromAt < 0) return { ok: false, reason: "No table detected in the query" };
   const from = tokens[fromAt];
   const endWords = new Set(["where", "group", "having", "order", "limit", "offset", "fetch", "for", "union", "intersect", "except", "window", "qualify", "returning"]);
   const sourceEnd = tokens.slice(fromAt + 1).find((token) => token.kind === "word" && endWords.has(token.text.toLowerCase()))?.from ?? masked.length;
   const sourceTokens = tokens.filter((token) => token.from >= from.to && token.from < sourceEnd);
   if (sourceTokens.some((token) => token.kind === "comma"))
-    return { ok: false, reason: "comma-join queries aren't editable" };
+    return { ok: false, reason: "Comma-join queries are not editable" };
   const source = masked.slice(from.to, sourceEnd).trim();
-  if (source.startsWith("(")) return { ok: false, reason: "derived-table queries aren't editable" };
+  if (source.startsWith("(")) return { ok: false, reason: "Derived-table queries are not editable" };
   const sourceMatch = TABLE_SOURCE.exec(source);
   if (!sourceMatch) {
     const functionHead = new RegExp(`^${IDENT}(?:\\s*\\.\\s*${IDENT})?\\s*\\(`, "i");
-    if (functionHead.test(source)) return { ok: false, reason: "table-function queries aren't editable" };
-    return { ok: false, reason: "only one plain table source is editable" };
+    if (functionHead.test(source)) return { ok: false, reason: "Table-function queries are not editable" };
+    return { ok: false, reason: "Only one plain table source is editable" };
   }
 
   const sl = plainSelectList(masked, select.to, from.from);
@@ -222,18 +222,18 @@ export function editTarget(
 
   const ref = sourceMatch[2] ? `${sourceMatch[1]}.${sourceMatch[2]}` : sourceMatch[1];
   const t = resolve(ref);
-  if (!t) return { ok: false, reason: "table not found, case-colliding, or ambiguous in the schema" };
+  if (!t) return { ok: false, reason: "Table not found, case-colliding, or ambiguous in the schema" };
 
   const effectiveQualifier = sourceMatch[3] ?? sourceMatch[2] ?? sourceMatch[1];
   if (sl.qualifiers.some((qualifier) => !sameQualifier(qualifier, effectiveQualifier)))
-    return { ok: false, reason: "selected-column qualifier doesn't match the target table or alias" };
+    return { ok: false, reason: "Selected-column qualifier does not match the table or alias" };
 
   // Subqueries used only for filtering may remain, but every table ref they contain
   // must resolve to this same physical relation. Never infer identity through an
   // unknown function/CTE or a second table.
   for (const nestedRef of new Set(aliasMap(masked).values())) {
     if (resolve(nestedRef) !== t)
-      return { ok: false, reason: "multi-table or unresolved-source queries aren't editable" };
+      return { ok: false, reason: "Multi-table or unresolved-source queries are not editable" };
   }
   return { ok: true, table: t };
 }
@@ -252,15 +252,15 @@ export type EditPlan =
 
 /** Validate the loaded relation detail + result columns into a concrete edit plan. */
 export function editPlan(detail: RelationDetail, resultColumns: string[], target: Table): EditPlan {
-  if (detail.name !== target.name) return { ok: false, reason: "relation metadata no longer matches the query target" };
-  if (detail.kind !== "table") return { ok: false, reason: `${detail.kind}s aren't editable` };
+  if (detail.name !== target.name) return { ok: false, reason: "Relation metadata no longer matches the query target" };
+  if (detail.kind !== "table") return { ok: false, reason: `${detail.kind}s are not editable` };
   if (hasDuplicateColumns(resultColumns))
-    return { ok: false, reason: "duplicate column names in the result" };
+    return { ok: false, reason: "Duplicate column names in the result" };
   if (new Set(detail.columns.map((c) => c.name.toLowerCase())).size !== detail.columns.length)
-    return { ok: false, reason: "tables with case-colliding column names aren't safely editable" };
+    return { ok: false, reason: "Tables with case-colliding column names are not editable" };
 
   const pk = detail.columns.filter((c) => c.is_pk).map((c) => c.name);
-  if (!pk.length) return { ok: false, reason: `table ${target.name} has no primary key` };
+  if (!pk.length) return { ok: false, reason: `Table ${target.name} has no primary key` };
 
   const colIdx = new Map<string, number>();
   resultColumns.forEach((c, i) => colIdx.set(c.toLowerCase(), i));
@@ -268,7 +268,7 @@ export function editPlan(detail: RelationDetail, resultColumns: string[], target
   for (const p of pk) {
     const i = colIdx.get(p.toLowerCase());
     if (i === undefined)
-      return { ok: false, reason: `primary key column "${p}" isn't in the result` };
+      return { ok: false, reason: `Primary key column "${p}" is not in the result` };
     pkIdx.push(i);
   }
 

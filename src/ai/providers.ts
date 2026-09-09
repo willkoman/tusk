@@ -176,7 +176,7 @@ export const AI_PROVIDERS: ProviderSpec[] = [
       // /v1/chat/completions — OpenAI-shaped (reads Authorization: Bearer).
       return "openai"; // glm, kimi, deepseek, mimo, hy3, …
     },
-    note: "Flat-rate access to open-source coding models. For frontier models through OpenCode, use OpenCode Zen.",
+    note: "Flat-rate access to open-source coding models. Frontier models are in OpenCode Zen.",
   },
   {
     // OpenCode **Zen** (https://opencode.ai/docs/zen/) — the full gateway: frontier labs
@@ -223,7 +223,7 @@ export const AI_PROVIDERS: ProviderSpec[] = [
     },
     // Zen hosts the Gemini shape one segment deeper: {base}/v1/models/{model}:…
     baseForWire: (base, wire) => (wire === "gemini" ? `${base}/v1` : base),
-    note: "One key for frontier and open models. Tusk speaks all four API shapes Zen serves, so every model in your plan is available.",
+    note: "One key for frontier and open models.",
   },
   {
     id: "openrouter",
@@ -262,25 +262,25 @@ export const AI_PROVIDERS: ProviderSpec[] = [
     keyUrl: "",
     needsKey: false,
     models: [], // whatever the user has `ollama pull`ed
-    note: "Runs on your machine — no key, and nothing leaves the box.",
+    note: "Runs on your machine. No key needed.",
   },
   {
     id: "lmstudio",
     label: "LM Studio (local)",
     wire: "openai",
     baseUrl: "http://localhost:1234",
-    baseHint: "http://localhost:1234 (port is configurable)",
+    baseHint: "http://localhost:1234",
     keyUrl: "",
     needsKey: false,
     models: [],
-    note: "Runs on your machine — no key, and nothing leaves the box.",
+    note: "Runs on your machine. No key needed.",
   },
   {
     id: "custom",
     label: "OpenAI-compatible (custom)",
     wire: "openai",
     baseUrl: "",
-    baseHint: "https://your-proxy.example.com  (prefix before /v1)",
+    baseHint: "https://your-proxy.example.com",
     keyUrl: "",
     needsKey: true,
     models: [],

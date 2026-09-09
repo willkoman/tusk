@@ -129,9 +129,9 @@ export function SshSection(props: {
       <Show when={props.state.enabled}>
         <div class="ssh-fields">
           <div class="empty-hint ssh-hint">
-            Tusk opens the tunnel first, then reaches the database at the <b>Host</b> and <b>Port</b>{" "}
-            above <i>as seen from the SSH server</i> — usually <code>localhost</code>. The first
-            connection to a new SSH host asks you to confirm its key fingerprint.
+            The <b>Host</b> and <b>Port</b> above are resolved <i>from the SSH server</i>, usually{" "}
+            <code>localhost</code>. The first connection to a new SSH host asks for fingerprint
+            confirmation.
           </div>
           <div class="field-row host-port">
             <label>
@@ -202,8 +202,8 @@ export function SshSection(props: {
             when={sshNeedsSecret(auth())}
             fallback={
               <div class="empty-hint ssh-hint">
-                Uses the running ssh-agent — <code>$SSH_AUTH_SOCK</code> on macOS and Linux, the
-                OpenSSH agent pipe on Windows. Nothing is stored by Tusk.
+                Uses the running ssh-agent: <code>$SSH_AUTH_SOCK</code> on macOS and Linux, the
+                OpenSSH agent pipe on Windows. Tusk stores nothing.
               </div>
             }
           >

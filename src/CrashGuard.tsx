@@ -57,12 +57,12 @@ function CrashPanel(props: { report: string; prior?: boolean; onContinue: () => 
     const fallback = props.report.slice(0, 1800);
     const body = encodeURIComponent(
       copied
-        ? "Tusk copied the crash report to the clipboard. Please paste it below before sending.\n\n"
+        ? "The crash report is on the clipboard. Paste it below before sending.\n\n"
         : `Crash report (truncated for email):\n\n${fallback}`,
     );
     try {
       await openUrl(`mailto:${SUPPORT_EMAIL}?subject=${subject}&body=${body}`);
-      setStatus(copied ? "Email draft opened; paste the copied report" : "Email draft opened");
+      setStatus(copied ? "Email draft opened. Paste the copied report." : "Email draft opened.");
     } catch {
       setStatus(`Could not open email app. Send report to ${SUPPORT_EMAIL}.`);
     }
@@ -77,11 +77,11 @@ function CrashPanel(props: { report: string; prior?: boolean; onContinue: () => 
           <p>
             {props.prior
               ? "A local crash report was recovered from the previous run."
-              : "The error was contained. You can report it, then try to continue."}
+              : "The error was contained. Report it, or try to continue."}
           </p>
         </div>
         <div class="crash-privacy">
-          Nothing is sent automatically. Tusk does not intentionally collect connection settings, credentials, or query text, but exception messages can contain data. Review details before sending.
+          Nothing is sent automatically. Connection settings, credentials, and query text are never collected intentionally. Exception messages can still contain data. Review the report before sending.
         </div>
         <details>
           <summary>Report details</summary>
@@ -244,21 +244,20 @@ function ConsentGate(props: { onAnswer: (v: "on" | "off") => void }) {
       <section class="crash-card">
         <div class="crash-mark" aria-hidden="true">?</div>
         <div>
-          <h1>Help improve Tusk?</h1>
+          <h1>Crash reports</h1>
           <p>
-            If Tusk ever crashes, it can show the crash details on the next launch with a one-click
-            option to email them to the developer. Nothing is ever sent automatically — you review
-            and send each report yourself.
+            After a crash, Tusk can show the report on the next launch and offer to email it.
+            Sending a report is always a manual step.
           </p>
         </div>
         <div class="crash-privacy">
-          Reports contain the app version, platform, and the error message/stack — which can include
-          fragments of whatever text triggered the error. They never intentionally include connection
-          settings, credentials, or saved queries. You can change this any time in Settings → Privacy.
+          Reports contain the app version, platform, and the error message and stack. Those can include
+          fragments of the text that triggered the error. Connection settings, credentials, and saved
+          queries are never included intentionally. Change this in Settings → Privacy.
         </div>
         <div class="crash-actions">
-          <button class="ghost" onClick={() => props.onAnswer("off")}>No, just recover quietly</button>
-          <button class="run" onClick={() => props.onAnswer("on")}>Yes, offer crash reports</button>
+          <button class="ghost" onClick={() => props.onAnswer("off")}>Turn off</button>
+          <button class="run" onClick={() => props.onAnswer("on")}>Turn on</button>
         </div>
       </section>
     </div>

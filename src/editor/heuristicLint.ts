@@ -25,17 +25,17 @@ import { LINT_DIAGNOSTIC_LIMIT, LINT_STATEMENT_LIMIT, LIVE_ANALYSIS_MAX_CHARS } 
 // quotes are the same failure class (never valid SQL punctuation). Each maps to its
 // replacement; zero-width characters map to removal.
 const UNICODE_ARTIFACTS = new Map<string, { fix: string; what: string }>([
-  ["\u00a0", { fix: " ", what: "non-breaking space" }],
+  ["\u00a0", { fix: " ", what: "Non-breaking space" }],
   ["\u1680", { fix: " ", what: "Unicode space" }],
-  ["\u202f", { fix: " ", what: "narrow no-break space" }],
+  ["\u202f", { fix: " ", what: "Narrow no-break space" }],
   ["\u205f", { fix: " ", what: "Unicode space" }],
-  ["\u3000", { fix: " ", what: "ideographic space" }],
-  ["\u200b", { fix: "", what: "zero-width space" }],
-  ["\ufeff", { fix: "", what: "zero-width BOM" }],
-  ["\u2018", { fix: "'", what: "curly quote" }],
-  ["\u2019", { fix: "'", what: "curly quote" }],
-  ["\u201c", { fix: '"', what: "curly quote" }],
-  ["\u201d", { fix: '"', what: "curly quote" }],
+  ["\u3000", { fix: " ", what: "Ideographic space" }],
+  ["\u200b", { fix: "", what: "Zero-width space" }],
+  ["\ufeff", { fix: "", what: "Zero-width BOM" }],
+  ["\u2018", { fix: "'", what: "Curly quote" }],
+  ["\u2019", { fix: "'", what: "Curly quote" }],
+  ["\u201c", { fix: '"', what: "Curly quote" }],
+  ["\u201d", { fix: '"', what: "Curly quote" }],
 ]);
 for (let cp = 0x2000; cp <= 0x200a; cp++) UNICODE_ARTIFACTS.set(String.fromCharCode(cp), { fix: " ", what: "Unicode space" });
 const ARTIFACT_RE = /[\u00a0\u1680\u2000-\u200b\u202f\u205f\u3000\ufeff\u2018\u2019\u201c\u201d]/g;
@@ -43,10 +43,10 @@ const uPlus = (ch: string) => `U+${ch.charCodeAt(0).toString(16).toUpperCase().p
 
 const artifactMessage = (ch: string, info: { fix: string; what: string }): string =>
   info.fix === " "
-    ? `${info.what} (${uPlus(ch)}) \u2014 looks like a space, but the server reads it as an identifier character (usually a web-page paste)`
+    ? `${info.what} (${uPlus(ch)}). Replace it with a plain space.`
     : info.fix === ""
-      ? `${info.what} (${uPlus(ch)}) \u2014 invisible, but the server still sees it`
-      : `${info.what} (${uPlus(ch)}) \u2014 SQL needs straight quotes`;
+      ? `${info.what} (${uPlus(ch)}). Delete it.`
+      : `${info.what} (${uPlus(ch)}). Use a straight quote.`;
 
 /** Replace every paste artifact in the document's CODE regions (strings and comments
  *  are left alone \u2014 a non-breaking space inside a string literal is data). */
@@ -108,7 +108,7 @@ export function heuristicLintSource() {
           to: base + hit.index + 1,
           severity: "error",
           message: artifactMessage(hit[0], info),
-          actions: [{ name: "fix all in document", apply: (v) => fixAllArtifacts(v) }],
+          actions: [{ name: "Fix all in document", apply: (v) => fixAllArtifacts(v) }],
         })) return out;
       }
 
@@ -120,7 +120,7 @@ export function heuristicLintSource() {
           stack.push(p);
         } else if (c === ")") {
           if (stack.length) stack.pop();
-          else if (add({ from: base + p, to: base + p + 1, severity: "error", message: "unmatched ')'" })) return out;
+          else if (add({ from: base + p, to: base + p + 1, severity: "error", message: "Unmatched ')'" })) return out;
         } else if (c === ",") {
           // Look at what actually follows the comma, span-aware: skip whitespace and
           // comments, but a string/quoted/dollar span IS a value element (the mask
@@ -148,11 +148,11 @@ export function heuristicLintSource() {
             else if (/^[a-zA-Z_]\w*/.exec(doc.slice(q, Math.min(stmt.to, q + 64)))?.[0]?.toUpperCase() === "FROM") trailing = true;
             break;
           }
-          if (trailing && add({ from: dp, to: dp + 1, severity: "warning", message: "trailing comma" })) return out;
+          if (trailing && add({ from: dp, to: dp + 1, severity: "warning", message: "Trailing comma" })) return out;
         }
       }
       for (const openP of stack) {
-        if (add({ from: base + openP, to: base + openP + 1, severity: "warning", message: "unclosed '('" })) return out;
+        if (add({ from: base + openP, to: base + openP + 1, severity: "warning", message: "Unclosed '('" })) return out;
       }
 
       // Top-level comma inside a WHERE/HAVING region: no engine accepts it — the
@@ -175,7 +175,7 @@ export function heuristicLintSource() {
           }
           if (c === ",") {
             if (whereDepths[whereDepths.length - 1] === depth &&
-              add({ from: base + p, to: base + p + 1, severity: "error", message: "',' is not valid between conditions — join them with AND or OR" })) return out;
+              add({ from: base + p, to: base + p + 1, severity: "error", message: "Comma between conditions. Use AND or OR." })) return out;
             p++;
             continue;
           }
@@ -221,7 +221,7 @@ export function heuristicLintSource() {
               from: p0,
               to: p0 + tok.length,
               severity: "error",
-              message: `unknown statement "${tok}"${hint ? ` — did you mean ${hint}?` : ""}`,
+              message: `Unknown statement "${tok}".${hint ? ` Did you mean ${hint}?` : ""}`,
             })) return out;
           }
         }
@@ -235,7 +235,7 @@ export function heuristicLintSource() {
           from: kwStart,
           to: kwStart + du[1].length,
           severity: "warning",
-          message: `${du[1].toUpperCase()} without WHERE — affects every row`,
+          message: `${du[1].toUpperCase()} without WHERE affects every row.`,
         })) return out;
       }
     }

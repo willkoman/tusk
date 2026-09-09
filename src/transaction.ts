@@ -176,9 +176,9 @@ export function transactionHistoryScope(
 }
 
 export function transactionStaleReason(event: TransactionEvent, next: TransactionStatus): string | null {
-  if (next.state === "lost") return "transaction session lost; result provenance is no longer trustworthy";
-  if (event === "rollback" || event === "rollback_to") return "transaction changes were rolled back; rerun before editing";
-  if (event === "commit") return "transaction unit ended; rerun before editing";
+  if (next.state === "lost") return "Transaction session lost; this result may no longer match the database";
+  if (event === "rollback" || event === "rollback_to") return "Transaction changes were rolled back; rerun before editing";
+  if (event === "commit") return "Transaction unit ended; rerun before editing";
   return null;
 }
 
@@ -197,7 +197,7 @@ export function transactionBoundaryStaleReason(
       (event === "commit" || event === "rollback" || event === "rollback_to");
     if (!boundaryAdvanced) return null;
   }
-  return transactionStaleReason(event, next) ?? "transaction ended; rerun before editing";
+  return transactionStaleReason(event, next) ?? "Transaction ended; rerun before editing";
 }
 
 /** Match snapshots older than a proven transaction boundary, including pre-BEGIN rows. */

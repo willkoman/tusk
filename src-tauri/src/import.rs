@@ -161,7 +161,7 @@ impl ImportOptions {
         if let Some(escape) = self.escape_c() {
             if Some(escape) == self.quote_c() {
                 return Err(AppError::new(
-                    "import escape and quote character must differ — leave Escape empty for RFC 4180 doubled quotes",
+                    "import escape and quote character must differ. Leave Escape empty for doubled quotes.",
                 ));
             }
             if escape == delim {
@@ -392,7 +392,7 @@ impl Dialect {
             // items, the manual and `docs/adversarial-hardening.md` all give.
             "mssql" => {
                 return Err(AppError::new(
-                    "file import isn't available on SQL Server yet — use the SQL editor or a bulk-load tool",
+                    "file import isn't available on SQL Server yet. Use the SQL editor or a bulk-load tool.",
                 ))
             }
             _ => return Err(AppError::new("unsupported import dialect")),
@@ -568,7 +568,7 @@ fn shape_row(
     }
     if raw.len() < width && warnings.len() < MAX_WARNINGS {
         warnings.push(format!(
-            "row {row_number} has only {} of {width} fields — the rest import as NULL",
+            "row {row_number} has only {} of {width} fields. The rest import as NULL.",
             raw.len()
         ));
     }
@@ -627,7 +627,7 @@ impl Decoder {
             Err(error) => {
                 if error.error_len().is_some() {
                     return Err(AppError::new(
-                        "import file is not valid UTF-8 — pick the Latin-1 encoding if that is the file's encoding",
+                        "import file is not valid UTF-8. Pick the Latin-1 encoding if the file uses it.",
                     ));
                 }
                 let valid = error.valid_up_to();
@@ -1103,7 +1103,7 @@ fn drain_json(
             // mapping was built from; every row would otherwise import as all-NULL.
             if first && !fields.iter().any(|(k, _)| pinned.iter().any(|p| p == k)) {
                 return Err(AppError::new(
-                    "the file's columns changed since the preview — reopen the import dialog",
+                    "the file's columns changed since the preview. Reopen the import dialog.",
                 ));
             }
             for (key, _) in &fields {
@@ -1112,7 +1112,7 @@ fn drain_json(
                     && warnings.len() < MAX_WARNINGS
                 {
                     warnings.push(format!(
-                        "key {key} appears after the previewed sample and is not imported — reopen the import dialog to map it"
+                        "key {key} appears after the previewed sample and is not imported. Reopen the import dialog to map it."
                     ));
                 }
             }
@@ -1482,7 +1482,7 @@ pub fn preview_file(path: &Path, options: &ImportOptions) -> Result<ImportPrevie
     let mut warnings = outcome.warnings;
     if capped && warnings.len() < MAX_WARNINGS {
         warnings.push(format!(
-            "the sampled rows exceed the {MAX_PREVIEW_BYTES}-byte preview budget — fewer rows are shown"
+            "the sampled rows exceed the {MAX_PREVIEW_BYTES}-byte preview budget. Fewer rows are shown."
         ));
     }
     Ok(ImportPreview {
@@ -1921,9 +1921,9 @@ fn normalize_timestamp(v: &str, dialect: Dialect) -> Result<String, &'static str
         }
     };
     match (dialect, numeric_offset) {
-        (Dialect::MySql, true) => {
-            Err("carries a time-zone offset, which MySQL DATETIME cannot store — convert it to UTC first")
-        }
+        (Dialect::MySql, true) => Err(
+            "carries a time-zone offset that MySQL DATETIME cannot store. Convert it to UTC first.",
+        ),
         (Dialect::MySql, false) => Ok(format!("{date} {time}")),
         _ => Ok(v.to_string()),
     }
@@ -1964,7 +1964,7 @@ impl Session<'_> {
     async fn commit(&mut self) -> Result<(), AppError> {
         self.batch("COMMIT").await.map_err(|e| {
             AppError::new(format!(
-                "import commit acknowledgement failed; transaction outcome is unknown — verify database state before retrying ({})",
+                "import commit acknowledgement failed and the outcome is unknown. Verify database state before retrying ({}).",
                 e.message
             ))
         })
@@ -2093,7 +2093,7 @@ pub async fn run_import(
             !parse_cancel.load(Ordering::Acquire)
         });
         let changed = AppError::new(
-            "the file's columns changed since the preview — reopen the import dialog",
+            "the file's columns changed since the preview. Reopen the import dialog.",
         );
         match outcome {
             Err(error) => {
@@ -2124,7 +2124,7 @@ pub async fn run_import(
         Backend::MySql(mysql) => Session::MySql(Box::new(mysql.pool.get_conn().await.map_err(de)?)),
         Backend::MsSql(_) => {
             return Err(AppError::new(
-                "file import isn't available on SQL Server yet — use the SQL editor or a CSV bulk-load tool",
+                "file import isn't available on SQL Server yet. Use the SQL editor or a bulk-load tool.",
             ))
         }
     };
@@ -2168,13 +2168,13 @@ pub async fn run_import(
             // track — say so instead of swallowing it.
             if let Err(rollback) = session.rollback().await {
                 error.message = format!(
-                    "{}\n(rollback also failed: {} — verify the database state before retrying)",
+                    "{}\n(rollback also failed: {}. Verify database state before retrying.)",
                     error.message, rollback.message
                 );
             }
             if summary.created_outside_transaction {
                 error.message = format!(
-                    "{}\n(MySQL commits DDL immediately, so the new table {} was created before the transaction and still exists — drop it before retrying)",
+                    "{}\n(the new table {} was created outside the transaction and still exists. Drop it before retrying.)",
                     error.message, plan.qualified
                 );
             }
@@ -2219,7 +2219,7 @@ async fn load(
     let tail = plan.insert_tail();
     while let Some(chunk) = rx.recv().await {
         if cancel.load(Ordering::Acquire) {
-            return Err(AppError::new("import cancelled — rolled back"));
+            return Err(AppError::new("import cancelled and rolled back"));
         }
         let chunk = chunk?;
         take_warnings(summary, chunk.warnings);
@@ -2247,7 +2247,7 @@ async fn load(
         });
     }
     if cancel.load(Ordering::Acquire) {
-        return Err(AppError::new("import cancelled — rolled back"));
+        return Err(AppError::new("import cancelled and rolled back"));
     }
     Ok(())
 }
@@ -2272,7 +2272,7 @@ async fn copy_load(
     let outcome = async {
         while let Some(chunk) = rx.recv().await {
             if cancel.load(Ordering::Acquire) {
-                return Err(AppError::new("import cancelled — rolled back"));
+                return Err(AppError::new("import cancelled and rolled back"));
             }
             let chunk = chunk?;
             take_warnings(summary, chunk.warnings);
@@ -2295,7 +2295,7 @@ async fn copy_load(
             });
         }
         if cancel.load(Ordering::Acquire) {
-            return Err(AppError::new("import cancelled — rolled back"));
+            return Err(AppError::new("import cancelled and rolled back"));
         }
         if !buf.is_empty() {
             sink.as_mut().send(Bytes::from(buf)).await?;
@@ -2372,7 +2372,7 @@ pub async fn import_from_file(
     crate::ensure_alive(&mut c).await?;
     c.require_idle("import")?;
     if c.read_only || c.backend.config().read_only {
-        return Err(AppError::new("connection is read-only — import blocked"));
+        return Err(AppError::new("connection is read-only. Import is blocked."));
     }
     c.backend.rollback_cursor().await;
     let cancel = Arc::new(AtomicBool::new(false));

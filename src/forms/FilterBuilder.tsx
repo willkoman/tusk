@@ -226,7 +226,7 @@ function GroupEditor(props: {
         `Index` keys by position and hands the item down as an accessor, so the
         row component survives and only its bound values update.
       */}
-      <Show when={props.group.items.length} fallback={<div class="filter-empty">No conditions — every row matches.</div>}>
+      <Show when={props.group.items.length} fallback={<div class="filter-empty">No conditions. Every row matches.</div>}>
         <Index each={props.group.items}>
           {(item, i) => (
             <div class="filter-item">
@@ -352,7 +352,7 @@ function ValueInputs(props: { cond: Condition; cls: ColumnClass; onValue: (i: nu
         <input
           class="filter-val wide"
           value={val(0)}
-          placeholder="a, b, c — quote values containing commas"
+          placeholder="a, b, c (quote values containing commas)"
           onInput={(e) => props.onValue(0, e.currentTarget.value)}
           aria-label="Values"
         />

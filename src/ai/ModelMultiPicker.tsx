@@ -125,15 +125,15 @@ export function ModelMultiPicker(props: {
           onInput={(e) => setQuery(e.currentTarget.value)}
           onKeyDown={onKey}
         />
-        <button class="ghost" disabled={allShownSelected() || shownCount() === 0} onClick={selectShown} title="Offer every model in the list below">
+        <button class="ghost" disabled={allShownSelected() || shownCount() === 0} onClick={selectShown} title="Offer every model listed">
           {searching() ? "Select matches" : "Select all"}
         </button>
-        <button class="ghost" disabled={props.selected.length === 0} onClick={clearAll} title="Offer every model the provider lists">Clear</button>
+        <button class="ghost" disabled={props.selected.length === 0} onClick={clearAll} title="Clear the selection">Clear</button>
         <button
           class="ghost"
           disabled={props.loading || !!props.refreshBlocked}
           onClick={() => props.onRefresh()}
-          title={props.refreshBlocked || "Fetch the provider's current model list"}
+          title={props.refreshBlocked || "Fetch the provider's model list"}
         >
           {props.loading ? "Refreshing…" : "Refresh"}
         </button>
@@ -144,17 +144,17 @@ export function ModelMultiPicker(props: {
             ? `All ${props.catalog.length} models offered`
             : `${props.selected.length} of ${props.catalog.length} offered`}
           {" · default: "}
-          <Show when={props.defaultModel} fallback={<em>none — ★ a model</em>}>
+          <Show when={props.defaultModel} fallback={<em>none set</em>}>
             <code>{props.defaultModel}</code>
           </Show>
         </span>
         <span class="spacer" />
-        <span>{props.live ? "live catalog" : props.refreshBlocked ? `shipped list — ${props.refreshBlocked}` : "shipped list — Refresh loads the live catalog"}</span>
+        <span>{props.live ? "live catalog" : props.refreshBlocked ? `shipped list; ${props.refreshBlocked}` : "shipped list"}</span>
       </div>
       <Show when={props.error}><div class="error">{props.error}</div></Show>
       <Show when={stale().length}>
         <div class="ai-note">
-          {stale().length} chosen model{stale().length === 1 ? " is" : "s are"} not in the provider's current list and will not be offered: {stale().join(", ")}
+          {stale().length} chosen model{stale().length === 1 ? " is" : "s are"} not in the provider's list: {stale().join(", ")}
         </div>
       </Show>
       <div class="mmp-list" ref={listEl}>
@@ -188,7 +188,7 @@ export function ModelMultiPicker(props: {
                   class="mmp-star"
                   classList={{ on: isDefault(r.model) }}
                   tabIndex={-1}
-                  title={isDefault(r.model) ? "Default model" : "Make this the default model"}
+                  title={isDefault(r.model) ? "Default model" : "Make this the default"}
                   onClick={(e) => { e.stopPropagation(); if (!isDefault(r.model)) props.onDefault(r.model); }}
                 >
                   {isDefault(r.model) ? "★ default" : "☆"}
@@ -213,7 +213,7 @@ export function ModelMultiPicker(props: {
         <div class="mmp-chips">
           <For each={props.selected}>
             {(m) => (
-              <span class="mmp-chip" classList={{ off: stale().includes(m), def: isDefault(m) }} title={isDefault(m) ? `${m} — default` : m}>
+              <span class="mmp-chip" classList={{ off: stale().includes(m), def: isDefault(m) }} title={isDefault(m) ? `${m} (default)` : m}>
                 <Show when={isDefault(m)}><span class="mmp-chip-star">★</span></Show>
                 <span>{m}</span>
                 <button title={`Stop offering ${m}`} onClick={() => toggle(m)}>✕</button>

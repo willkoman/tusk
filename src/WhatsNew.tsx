@@ -149,7 +149,7 @@ export function WhatsNew(props: { requestShow?: Accessor<number> }) {
                 {(rel, i) => (
                   <div class="wn-release">
                     <Show when={i() > 0}>
-                      <div class="wn-relhead">{rel.version}{rel.date ? ` — ${rel.date}` : ""}</div>
+                      <div class="wn-relhead">{rel.version}{rel.date ? `, ${rel.date}` : ""}</div>
                     </Show>
                     <For each={rel.groups}>
                       {(g) => (
@@ -166,12 +166,12 @@ export function WhatsNew(props: { requestShow?: Accessor<number> }) {
               </For>
             </div>
             <div class="upd-actions">
-              <button class="run" onClick={dismiss}>Got it</button>
+              <button class="run" onClick={dismiss}>Close</button>
             </div>
           </div>
         </Show>
         <button class="upd-pill" title="Changes in this update" onClick={() => setOpen((v) => !v)}>
-          ✨ What's new
+          What's new
         </button>
       </div>
     </Show>

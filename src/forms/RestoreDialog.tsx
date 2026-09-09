@@ -162,8 +162,8 @@ export function RestoreDialog(props: {
           <section class="export-sec">
             <div class="export-label">Target</div>
             <div class="export-note">
-              {props.driverKind} · {props.database || "(unnamed database)"} — statements from
-              the file run against this connection.
+              {props.driverKind} · {props.database || "(unnamed database)"}. Statements from the
+              file run against this connection.
             </div>
           </section>
 
@@ -177,7 +177,7 @@ export function RestoreDialog(props: {
               {(f) => (
                 <div class="export-note">
                   {formatBytes(f().bytes)}
-                  <Show when={header()} fallback=" · no Tusk header — replayed as plain SQL">
+                  <Show when={header()} fallback=" · no Tusk header, replayed as plain SQL">
                     {(h) => ` · ${h().engine || "unknown engine"} · ${h().database || "unknown database"} · ${h().content || "unknown content"}${h().generated ? ` · ${h().generated}` : ""}`}
                   </Show>
                 </div>
@@ -191,9 +191,8 @@ export function RestoreDialog(props: {
             </Show>
             <Show when={file()?.metaCommand}>
               <div class="error">
-                This dump contains the psql command <code>{file()!.metaCommand}</code>. Tusk replays SQL, not
-                psql directives, so that line will fail — restore it with <code>psql</code>, or remove the
-                directive from the file first.
+                This dump contains the psql command <code>{file()!.metaCommand}</code>, which will
+                fail here. Restore the file with <code>psql</code>, or remove the directive first.
               </div>
             </Show>
           </section>
@@ -217,7 +216,7 @@ export function RestoreDialog(props: {
             </label>
             <label
               class="export-check"
-              title={canWrap() ? undefined : "MySQL commits DDL implicitly, so a restore cannot be one transaction"}
+              title={canWrap() ? undefined : "MySQL commits DDL implicitly"}
             >
               <input
                 type="checkbox"

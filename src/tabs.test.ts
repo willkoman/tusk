@@ -37,11 +37,11 @@ describe("tab identities", () => {
 
 describe("interruptedResult", () => {
   it("freezes a streaming snapshot as an explicitly incomplete result", () => {
-    const patch = interruptedResult({ rows: [["1"], ["2"]], done: false }, "an import closed the result stream");
+    const patch = interruptedResult({ rows: [["1"], ["2"]], done: false }, "Import closed the result stream");
     expect(patch).toEqual({
       done: true,
-      incomplete: "an import closed the result stream",
-      status: "2 rows loaded · an import closed the result stream — re-run the query for the full result",
+      incomplete: "Import closed the result stream",
+      status: "2 rows loaded. Import closed the result stream. Re-run for the full result.",
     });
   });
 

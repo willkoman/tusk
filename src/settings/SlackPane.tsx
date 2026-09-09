@@ -261,7 +261,7 @@ export function SlackPane(props: {
       const verified = await invoke<SlackConfigInfo>("slack_load_config");
       const persisted = normalizeSlackConfig(verified.config);
       if (!slackConfigMatches(config, persisted)) {
-        throw new Error("Slack settings verification failed: saved values did not reload unchanged");
+        throw new Error("Slack settings did not reload unchanged.");
       }
       setHasBot(verified.hasBotToken);
       setHasApp(verified.hasAppToken);
@@ -284,7 +284,7 @@ export function SlackPane(props: {
     const disabled = await save({ enabled: false });
     setNote(disabled
       ? message
-      : `${message} Disabling could not be verified; the bot is stopped, but the startup setting may still be enabled.`);
+      : `${message} The bot is stopped, but autostart may still be on.`);
   };
 
   const applyEnabled = async (enabled: boolean) => {
@@ -310,14 +310,14 @@ export function SlackPane(props: {
         // repointed here; switching tabs later never redirects it.
         await invoke("slack_start", { connectionId: target });
         if (!(await save({ enabled: true, boundProfileId }))) {
-          await disableAfterRestartFailure("Bot started, but enabling could not be persisted. Bot stopped and remains disabled.");
+          await disableAfterRestartFailure("Could not save the enabled setting. Bot stopped and disabled.");
           return;
         }
         setNote(boundProfileId
           ? "Bot started."
           : target
-            ? "Bot started. This connection isn't saved, so the bot can't start by itself next launch."
-            : "Bot started, but it isn't answering against any connection yet — open one and pick it here.");
+            ? "Bot started. Save this connection as a profile for autostart."
+            : "Bot started. Open a connection and pick it here.");
       } else {
         if (!(await save({ enabled: false }))) {
           patch({ enabled: true });
@@ -348,9 +348,9 @@ export function SlackPane(props: {
       tokensValidated = true;
       if (wasRunning && saved.tokensChanged) {
         await invoke("slack_start", { connectionId: status().connectionId ?? props.activeConnectionId?.() ?? null });
-        setNote(`✅ Tokens valid — workspace “${team}”. Bot restarted with the replacement tokens.`);
+        setNote(`Tokens valid for workspace “${team}”. Bot restarted.`);
       } else {
-        setNote(`✅ Tokens valid — workspace “${team}”.`);
+        setNote(`Tokens valid for workspace “${team}”.`);
       }
     } catch (e) {
       if (wasRunning && saved?.tokensChanged) {
@@ -358,7 +358,7 @@ export function SlackPane(props: {
           ? `❌ ${errMsg(e)} Tokens validated, but the bot could not restart; it was stopped and disabled.`
           : `❌ ${errMsg(e)} Bot stopped because replacement tokens could not be validated.`);
       } else {
-        setNote(`❌ ${errMsg(e)}`);
+        setNote(`Test failed: ${errMsg(e)}`);
       }
     } finally {
       setBusy(false);
@@ -375,12 +375,12 @@ export function SlackPane(props: {
         try {
           await invoke("slack_test");
           await invoke("slack_start", { connectionId: status().connectionId ?? props.activeConnectionId?.() ?? null });
-          setNote("Saved and validated. Bot restarted with the replacement tokens.");
+          setNote("Saved and validated. Bot restarted.");
         } catch (e) {
-          await disableAfterRestartFailure(`Saved, but token restart failed: ${errMsg(e)} Bot stopped and was disabled.`);
+          await disableAfterRestartFailure(`Saved, but the restart failed: ${errMsg(e)} Bot stopped and disabled.`);
         }
       } else {
-        setNote("Saved — non-token changes apply to the running bot on the next question.");
+        setNote("Saved. Changes apply from the next question.");
       }
     }
     setBusy(false);
@@ -403,8 +403,8 @@ export function SlackPane(props: {
         sub: error || (bound
           ? `Answering questions in Slack against ${bound.label}.`
           : s.connectionId
-            ? "Answering questions in Slack. Its Tusk connection is no longer open — pick another below."
-            : "Waiting for a Tusk connection to answer against."),
+            ? "Its connection is closed. Pick another below."
+            : "Waiting for a connection to answer against."),
       };
     }
     if (s.state === "connecting") {
@@ -414,7 +414,7 @@ export function SlackPane(props: {
       return { cls: "wait", title: s.state, sub: error };
     }
     if (error) return { cls: "err", title: "Bot off", sub: error };
-    if (!tokensReady()) return { cls: "off", title: "Bot off", sub: "Add both Slack app tokens below, then switch it on." };
+    if (!tokensReady()) return { cls: "off", title: "Bot off", sub: "Add both Slack app tokens below, then switch on." };
     if (cfg().enabled)
       return {
         cls: "off",
@@ -423,9 +423,9 @@ export function SlackPane(props: {
         // next launch" was a promise the bot could only keep by binding to anything.
         sub: cfg().boundProfileId
           ? "Starts when its saved connection is open."
-          : "Autostart is on, but no saved connection is bound — it can only be started by hand.",
+          : "Autostart is on with no saved connection. Start the bot by hand.",
       };
-    return { cls: "off", title: "Bot off", sub: "Switch on to start answering questions in Slack." };
+    return { cls: "off", title: "Bot off", sub: "Switch on to answer questions in Slack." };
   });
 
   const mirrored = () => mirroredAi(ai());
@@ -443,7 +443,7 @@ export function SlackPane(props: {
           </div>
           <label
             class="slack-switch"
-            title={tokensReady() ? (cfg().enabled ? "Stop the bot" : "Validate the tokens and start the bot") : "Both tokens are required before the bot can start"}
+            title={tokensReady() ? (cfg().enabled ? "Stop the bot" : "Start the bot") : "Both tokens are required"}
           >
             <span>{cfg().enabled ? "On" : "Off"}</span>
             <input
@@ -469,8 +469,8 @@ export function SlackPane(props: {
               <label for="slack-conn">Answers against</label>
               <small>
                 {boundConnection()
-                  ? "Proposals are pinned to this connection; approving one after a change fails closed."
-                  : "This bot's connection is no longer open. Pick one it should answer against."}
+                  ? "Proposals are pinned to this connection."
+                  : "The bot's connection is closed. Pick another."}
               </small>
             </div>
             <select
@@ -492,10 +492,10 @@ export function SlackPane(props: {
                     // A failed save already reported itself; don't claim success over it.
                     if (!saved) return;
                     setNote(boundProfileId
-                      ? "Bot repointed — it applies from the next question."
-                      : "Bot repointed — it applies from the next question. This connection isn't saved, so the bot can't start by itself next launch.");
+                      ? "Bot repointed. Applies from the next question."
+                      : "Bot repointed. Save this connection as a profile for autostart.");
                   })
-                  .catch((err) => setNote(`❌ ${errMsg(err)}`))
+                  .catch((err) => setNote(`Repoint failed: ${errMsg(err)}`))
                   .finally(() => setBusy(false));
               }}
             >
@@ -514,12 +514,11 @@ export function SlackPane(props: {
           <section class="settings-section">
             <header class="settings-section-head">
               <h3 class="settings-section-title">Slack app tokens</h3>
-              <span class="settings-section-sub">stored in your OS keychain, never shown again</span>
+              <span class="settings-section-sub">stored in your OS keychain</span>
             </header>
             <div class="settings-note">
-              Create your own Slack app from the manifest in <code>docs/slack-setup.md</code> (Socket Mode — no server,
-              no public URL), then paste its two tokens here. Questions in Slack become SQL proposals; nothing runs
-              without an Approve click.
+              Create a Slack app from the manifest in <code>docs/slack-setup.md</code>, then paste its two
+              tokens here. Questions become SQL proposals; nothing runs without an Approve click.
             </div>
             <label class="settings-row">
               <span class="settings-label">
@@ -529,7 +528,7 @@ export function SlackPane(props: {
               <input
                 type="password"
                 autocomplete="off"
-                placeholder={hasBot() ? "type to replace" : "xoxb-…"}
+                placeholder={hasBot() ? "Type to replace" : "xoxb-…"}
                 value={botToken()}
                 onInput={(e) => setBotToken(e.currentTarget.value)}
               />
@@ -542,14 +541,14 @@ export function SlackPane(props: {
               <input
                 type="password"
                 autocomplete="off"
-                placeholder={hasApp() ? "type to replace" : "xapp-…"}
+                placeholder={hasApp() ? "Type to replace" : "xapp-…"}
                 value={appToken()}
                 onInput={(e) => setAppToken(e.currentTarget.value)}
               />
             </label>
             <div class="settings-actions">
               <Show when={status().running && typedTokens()}>
-                <span class="settings-hint">Saving replacement tokens restarts the running bot; failed validation stops and disables it.</span>
+                <span class="settings-hint">Saving replacement tokens restarts the bot; failed validation stops it.</span>
               </Show>
               <span class="spacer" />
               <button class="ghost" disabled={busy() || !tokensReady()} onClick={() => void test()}>Test connection</button>
@@ -561,7 +560,7 @@ export function SlackPane(props: {
           <section class="settings-section">
             <header class="settings-section-head">
               <h3 class="settings-section-title">Who can ask</h3>
-              <span class="settings-section-sub">both lists empty = anyone in any channel the bot is in</span>
+              <span class="settings-section-sub">empty lists allow anyone in the bot's channels</span>
             </header>
             <label class="settings-row">
               <span class="settings-label">
@@ -570,7 +569,7 @@ export function SlackPane(props: {
               </span>
               <input
                 type="text"
-                placeholder="any channel"
+                placeholder="Any channel"
                 value={csv(cfg().allowlistChannels)}
                 onChange={(e) => applyPatch({ allowlistChannels: parseCsv(e.currentTarget.value) })}
               />
@@ -582,7 +581,7 @@ export function SlackPane(props: {
               </span>
               <input
                 type="text"
-                placeholder="anyone"
+                placeholder="Anyone"
                 value={csv(cfg().allowlistUsers)}
                 onChange={(e) => applyPatch({ allowlistUsers: parseCsv(e.currentTarget.value) })}
               />
@@ -598,7 +597,7 @@ export function SlackPane(props: {
             <label class="settings-row">
               <span class="settings-label">
                 <span>Rows shown inline</span>
-                <small>Up to this many rows post as a text table (1–100); larger results attach as a file.</small>
+                <small>Rows posted as a text table (1–100); larger results attach as a file.</small>
               </span>
               <input
                 type="number"
@@ -611,7 +610,7 @@ export function SlackPane(props: {
             <label class="settings-row">
               <span class="settings-label">
                 <span>Row cap</span>
-                <small>Hard limit for any answer, including file attachments (100–100,000). Results past it are truncated and say so.</small>
+                <small>Maximum rows in any answer, files included (100–100,000).</small>
               </span>
               <input
                 type="number"
@@ -624,7 +623,7 @@ export function SlackPane(props: {
             <label class="settings-row">
               <span class="settings-label">
                 <span>Query timeout</span>
-                <small>Seconds before the bot gives up (1–600). Postgres queries are cancelled server-side.</small>
+                <small>Seconds before the bot gives up (1–600).</small>
               </span>
               <input
                 type="number"
@@ -637,14 +636,14 @@ export function SlackPane(props: {
             <label class="settings-row">
               <span class="settings-label">
                 <span>Auto-chart date/numeric results</span>
-                <small>Rendered locally, nothing extra leaves your machine. A chart someone explicitly asks for is always drawn.</small>
+                <small>Charts render locally; a requested chart is always drawn.</small>
               </span>
               <input type="checkbox" checked={cfg().chartsEnabled} onChange={(e) => applyPatch({ chartsEnabled: e.currentTarget.checked })} />
             </label>
             <label class="settings-row">
               <span class="settings-label">
                 <span>When asked for a write or DDL</span>
-                <small>Writes never run from Slack. This only picks the reply.</small>
+                <small>Writes never run from Slack.</small>
               </span>
               <select
                 value={cfg().destructivePolicy}
@@ -660,7 +659,7 @@ export function SlackPane(props: {
           <section class="settings-section">
             <header class="settings-section-head">
               <h3 class="settings-section-title">AI</h3>
-              <span class="settings-section-sub">the bot uses the provider and model chosen in Settings → AI</span>
+              <span class="settings-section-sub">mirrors the provider and model from Settings → AI</span>
               <Show when={props.onOpenAi}>
                 <div class="settings-section-actions">
                   <button class="ghost" onClick={() => props.onOpenAi?.()}>Open AI settings</button>
@@ -677,9 +676,9 @@ export function SlackPane(props: {
                   >
                     <Show
                       when={aiSynced()}
-                      fallback={<>Settings → AI now selects <b>{mirrored().provider} / {mirrored().model}</b>. The bot still uses the pair on the right until updated.</>}
+                      fallback={<>Settings → AI now selects <b>{mirrored().provider} / {mirrored().model}</b>. Select Update bot to switch.</>}
                     >
-                      Matches Settings → AI. Change it there and the bot follows on the next save.
+                      Matches Settings → AI.
                     </Show>
                   </Show>
                 </small>
@@ -696,7 +695,7 @@ export function SlackPane(props: {
             <label class="settings-row">
               <span class="settings-label">
                 <span>AI reply max tokens</span>
-                <small>Ceiling for a reply and its SQL (256–128,000, snapped to 256). Too low cuts answers off mid-sentence.</small>
+                <small>Longest reply the model may return (256–128,000, snapped to 256).</small>
               </span>
               <input
                 type="number"
@@ -718,7 +717,7 @@ export function SlackPane(props: {
             <label class="settings-row">
               <span class="settings-label">
                 <span>Share sample rows with AI</span>
-                <small>Sends up to five real rows from relevant tables to the provider with each question. Off by default.</small>
+                <small>Sends up to five real rows from relevant tables to the provider. Off by default.</small>
               </span>
               <input type="checkbox" checked={cfg().shareSamples} onChange={(e) => applyPatch({ shareSamples: e.currentTarget.checked })} />
             </label>

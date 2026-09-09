@@ -749,7 +749,7 @@ async fn authenticate(
                 const PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
                 let agent = AgentClient::connect_named_pipe(PIPE).await.map_err(|e| {
                     AppError::new(format!(
-                        "cannot reach the OpenSSH agent at {PIPE}: {e} — start the `ssh-agent` service, or use password/key authentication"
+                        "cannot reach the OpenSSH agent at {PIPE}: {e}. Start the ssh-agent service, or use password or key authentication."
                     ))
                 })?;
                 agent_authenticate(session, &ssh.user, agent).await
@@ -901,7 +901,7 @@ impl Tunnel {
         }
         if !authenticated {
             return Err(AppError::new(format!(
-                "SSH authentication failed for {}@{}:{} — the server rejected the {} credentials",
+                "SSH authentication failed for {}@{}:{}. The server rejected the {} credentials.",
                 ssh.user, ssh.host, ssh.port, ssh.auth
             )));
         }

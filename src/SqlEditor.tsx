@@ -245,7 +245,7 @@ export function SqlEditor(props: {
       dialectComp.of(dialectExtensions()),
       searchExtensions(),
       themeComp.of(themeFor(p)),
-      placeholder("Write SQL — ⌘/Ctrl+Enter to run (selection or all)"),
+      placeholder("Write SQL. ⌘/Ctrl+Enter runs the selection or all."),
       ...(props.onCursorInfo ? [cursorReadout((i) => props.onCursorInfo!(i))] : []),
       // Rebindable editor-scope actions live in their own compartment so a
       // shortcut change reconfigures live; they sit above the static keymap so

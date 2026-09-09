@@ -370,12 +370,12 @@ export function mappingIssues(
     if (dialect === "sqlite" || dialect === "duckdb")
       issues.push({
         level: "warning",
-        message: "This engine upserts with INSERT OR REPLACE — unmapped columns reset to their default.",
+        message: "INSERT OR REPLACE resets unmapped columns to their default.",
       });
     if (dialect === "mysql")
       issues.push({
         level: "warning",
-        message: "MySQL updates on any duplicate key, not only the columns chosen here.",
+        message: "MySQL updates on any duplicate key in the table.",
       });
   }
   return issues;
