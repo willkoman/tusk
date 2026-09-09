@@ -10,6 +10,7 @@ import { parseClipboardTable, type RowRef } from "./grid/paste";
 import { cellTitle, columnRenders, displayText, type ColumnRender } from "./grid/cellRender";
 import { findMatches, matchAtOrAfter, matchSet, stepMatch, type GridMatch } from "./grid/find";
 import { summarizeSelection, type SelectionSummary } from "./grid/summary";
+import { sampleColumnWidths, AUTO_MAX_W } from "./grid/widths";
 import { slotOffset, startPointerDrag, type PointerDragHandle } from "./dnd";
 
 /** A grid selection offered to Export, bound to the result it was taken from. */
@@ -153,7 +154,10 @@ export function ResultGrid(props: ResultGridProps) {
   /** First display column pinned in place (pointless with a single column). */
   const sticky = createMemo(() => props.view().stickyFirst && displayCols().length > 1);
   const frozenW = () => (sticky() ? colWidth(displayCols()[0]) : 0);
-  const colWidth = (oi: number) => props.view().widths[oi] ?? props.gridStyle().defaultColW;
+  // Widths sampled from the first page of the current result (see `sizeColumns`).
+  // A width the user set by hand always wins; the pref is the last resort.
+  const [autoW, setAutoW] = createSignal<readonly number[]>([]);
+  const colWidth = (oi: number) => props.view().widths[oi] ?? autoW()[oi] ?? props.gridStyle().defaultColW;
   const offsets = createMemo(() => {
     const dc = displayCols();
     const out = new Array(dc.length + 1);
@@ -307,6 +311,35 @@ export function ResultGrid(props: ResultGridProps) {
       });
     }),
   );
+
+  // Size the columns once per result, from the first page that arrives. Every column
+  // at one fixed width truncated timestamps on the default view of any table while
+  // leaving narrow columns half empty.
+  let sizedKey = "";
+  let widthCtx: CanvasRenderingContext2D | null = null;
+  createEffect(() => {
+    const key = resultKey();
+    const cols = props.columns();
+    const rows = props.rows();
+    const style = props.gridStyle();
+    const done = props.done();
+    if (sizedKey === key) return;
+    if (!cols.length || (!rows.length && !done)) {
+      setAutoW([]);
+      return;
+    }
+    if (!widthCtx) widthCtx = document.createElement("canvas").getContext("2d");
+    const ctx = widthCtx;
+    if (!ctx) return;
+    ctx.font = style.font;
+    sizedKey = key;
+    setAutoW(
+      sampleColumnWidths(cols, rows, (s) => ctx.measureText(s).width, {
+        max: Math.max(AUTO_MAX_W, style.defaultColW),
+        fallback: style.defaultColW,
+      }),
+    );
+  });
 
   // New insert rows (from +Row or paste) are appended to the pending insert array and
   // live at the TOP of the virtual space — reveal the first one and put the cursor on
@@ -1244,6 +1277,24 @@ export function ResultGrid(props: ResultGridProps) {
   };
   /** Cell text as painted: booleans keep their word, long values are elided. */
   const shownText = (v: string) => displayText(v).text;
+  /**
+   * The one non-NULL value renderer. The grid body and the record panel must not
+   * disagree: the record panel used to print the driver's raw `f` beside a grid
+   * cell reading `✕ FALSE`.
+   */
+  const renderValue = (v: string, oi: number, elide = true) => {
+    const w = props.isBoolCol(oi) ? boolWord(v) : null;
+    if (w)
+      return (
+        <span class={w === "TRUE" ? "rg-bool rg-true" : "rg-bool rg-false"}>
+          <span class="rg-bool-mark" aria-hidden="true">{w === "TRUE" ? "✓" : "✕"}</span>
+          {w}
+        </span>
+      );
+    // Long values are elided in the DOM, not in the data: copy, export and the
+    // value viewer still see the whole string. The record panel wraps instead.
+    return elide ? <span class="rg-celltext">{shownText(v)}</span> : shownText(v);
+  };
 
   return (
     <div
@@ -1433,17 +1484,7 @@ export function ResultGrid(props: ResultGridProps) {
                           const v = val();
                           if (v === null)
                             return <span class="null">{props.gridStyle().nullStyle === "null" ? "NULL" : props.gridStyle().nullStyle === "dash" ? "—" : ""}</span>;
-                          const w = props.isBoolCol(oi()) ? boolWord(v) : null;
-                          if (w)
-                            return (
-                              <span class={w === "TRUE" ? "rg-bool rg-true" : "rg-bool rg-false"}>
-                                <span class="rg-bool-mark" aria-hidden="true">{w === "TRUE" ? "✓" : "✕"}</span>
-                                {w}
-                              </span>
-                            );
-                          // Long values are elided in the DOM, not in the data: copy,
-                          // export and the value viewer still see the whole string.
-                          return shownText(v);
+                          return renderValue(v, oi());
                         })()}
                       </div>
                     );
@@ -1560,7 +1601,7 @@ export function ResultGrid(props: ResultGridProps) {
                         when={editable()}
                         fallback={
                           <div class="rg-rec-val" classList={{ "rg-num": renderOf(oi).cls === "number" }}>
-                            <Show when={val() !== null} fallback={<span class="null">NULL</span>}>{shownText(val() ?? "")}</Show>
+                            <Show when={val() !== null} fallback={<span class="null">NULL</span>}>{renderValue(val() ?? "", oi, false)}</Show>
                           </div>
                         }
                       >

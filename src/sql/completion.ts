@@ -114,7 +114,7 @@ export function makeSqlCompletion(
       for (const ref of scopeRefs) {
         const t = tableByRef(idx, ref, getActiveSchema());
         if (t) for (const c of t.columns) {
-          inScopeCols.push({ label: c.name, type: "property", detail: `${c.data_type} · ${t.name}`, boost: 80 });
+          inScopeCols.push({ label: c.name, type: "property", detail: `${c.data_type} in ${t.name}`, boost: 80 });
         }
       }
 
@@ -157,7 +157,7 @@ export function makeSqlCompletion(
         const cols = inScopeCols.length
           ? inScopeCols
           : idx.tables.flatMap((t) =>
-              t.columns.map((c) => ({ label: c.name, type: "property", detail: `${c.data_type} · ${t.name}`, boost: 10 } as Completion)),
+              t.columns.map((c) => ({ label: c.name, type: "property", detail: `${c.data_type} in ${t.name}`, boost: 10 } as Completion)),
             );
         // FK-aware JOIN hints: right after ON, propose complete join conditions
         // (`o.user_id = u.id`) from the live FK catalog, ranked above columns.

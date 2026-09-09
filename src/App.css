@@ -641,6 +641,12 @@ body { background: var(--bg); overflow: hidden; }
 .profile-row:focus-within { outline-offset: -2px; }
 /* Inputs already carry an accent border on focus; the ring would double it. */
 input:focus-visible, textarea:focus-visible, select:focus-visible { outline-offset: 1px; }
+/* Focus containers are not controls. The dialog box, the grid's record panel and
+   the menu shells take focus programmatically so the trap and arrow keys work;
+   they must never draw the ring the user reads as "you are here". */
+.modal:focus, .modal:focus-visible,
+.modal-overlay:focus, .modal-overlay:focus-visible,
+.ctx-menu:focus, .ctx-menu:focus-visible { outline: none; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
@@ -756,6 +762,14 @@ input[type="radio"]:checked::after {
   content: ""; position: absolute; inset: 3px; border-radius: 50%; background: #fff;
 }
 input[type="checkbox"]:disabled, input[type="radio"]:disabled { opacity: 0.45; cursor: default; }
+/* Belt: the drawn box keeps one size on every surface. A blanket width/padding
+   rule for a screen's text inputs used to collapse it to a 2px sliver in dialogs
+   and inflate it to 26x28 on the connect card. */
+.connect-card input[type="checkbox"]:not(.switch), .connect-card input[type="radio"],
+.modal input[type="checkbox"]:not(.switch), .modal input[type="radio"],
+.settings-row input[type="checkbox"]:not(.switch), .settings-row input[type="radio"] {
+  width: 15px; height: 15px; min-height: 0; padding: 0;
+}
 
 /* --- chips and badges. --fs-xs / 600 / --r-xs, tinted fill + same-hue text. --- */
 .badge { display: inline-flex; align-items: center; gap: 5px; padding: 2px var(--s2) 2px 7px; border-radius: var(--r-xs); font-size: var(--fs-xs); font-weight: 600; }
@@ -825,7 +839,7 @@ input[type="checkbox"]:disabled, input[type="radio"]:disabled { opacity: 0.45; c
   box-shadow: var(--e2);
 }
 .connect-card label { display: flex; flex-direction: column; gap: var(--s1); font-size: var(--fs-xs); font-weight: 600; color: var(--muted); }
-.connect-card input, .connect-card select { padding: 7px var(--s3); min-height: var(--control-h); }
+.connect-card input:not([type="checkbox"]):not([type="radio"]), .connect-card select { padding: 7px var(--s3); min-height: var(--control-h); }
 .connect-card .field-row { display: grid; gap: var(--s2); }
 .connect-card .field-row.host-port { grid-template-columns: 1fr 92px; }
 .connect-card .field-row.halves { grid-template-columns: 1fr 1fr; }
@@ -835,7 +849,7 @@ input[type="checkbox"]:disabled, input[type="radio"]:disabled { opacity: 0.45; c
 .connect-card .file-row input { flex: 1; min-width: 0; }
 .connect-card .file-row button { margin-top: 0; background: transparent; white-space: nowrap; }
 .connect-card .checkbox { flex-direction: row; align-items: center; gap: var(--s2); font-size: var(--fs-sm); font-weight: 400; color: var(--text); }
-.connect-card .checkbox input { width: auto; }
+.connect-card .checkbox input:not([type="checkbox"]):not([type="radio"]) { width: auto; }
 .connect-card .form-actions .ghost { background: transparent; }
 .connect-card button[type="submit"] {
   margin-top: var(--s2); padding: var(--s2) var(--s3); min-height: 34px;
@@ -1162,11 +1176,24 @@ button.conn-dot.cancellable:hover { background: var(--danger); box-shadow: 0 0 0
 .cm-host .cm-diagnosticAction { background: var(--accent); color: #fff; border-radius: var(--r-xs); padding: 2px 7px; font-size: var(--fs-xs); cursor: pointer; }
 .cm-host .cm-panel.cm-search { background: var(--panel-2); color: var(--text); border-top: 1px solid var(--border); }
 .cm-host .cm-panel.cm-search input, .cm-host .cm-panel.cm-search button { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: var(--r-xs); }
-.cm-host .cm-tooltip { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: var(--r-md); box-shadow: var(--e1); overflow: hidden; }
+/* One overlay surface for every completion/lint popup, whether CodeMirror parents
+   it inside the editor or (SqlField, below) at <body>. */
+.cm-host .cm-tooltip, body > div > .cm-tooltip { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: var(--r-md); box-shadow: var(--e2); overflow: hidden; }
 /* SqlField anchors its completion tooltip to <body> (see SqlField.tsx): inside a
    dialog the tooltip was clipped by the scrolling modal body. CodeMirror wraps it
    in a bare positioned div; that wrapper must clear .modal-overlay (z-index 50). */
 body > div > .cm-tooltip { z-index: 500; }
+/* Completion rows: one mono kind letter in a fixed slot, the detail muted. The
+   CodeMirror default icons are box-drawing glyphs that render as empty squares. */
+.cm-tooltip-autocomplete > ul > li { padding: 2px var(--s2); }
+.cm-tooltip-autocomplete .cm-completionIcon { width: 1.2em; padding-right: 6px; opacity: 1; color: var(--muted); font-family: var(--mono); font-size: 10px; font-weight: 600; text-align: center; }
+.cm-completionIcon-property::after { content: "c"; }
+.cm-completionIcon-class::after { content: "t"; }
+.cm-completionIcon-function::after,
+.cm-completionIcon-method::after { content: "ƒ"; }
+.cm-completionIcon-type::after { content: "T"; }
+.cm-completionIcon-keyword::after { content: "k"; }
+.cm-tooltip-autocomplete .cm-completionDetail { color: var(--muted); font-style: normal; font-size: var(--fs-xs); margin-left: var(--s3); }
 
 /* --- tab strip. Active tab = the editor's own surface + a 2px accent top edge,
        in BOTH polarities (in light the strip is the darker surface, so the old
@@ -1261,7 +1288,9 @@ body > div > .cm-tooltip { z-index: 500; }
 .dnd-source, .tab.dnd-source, .rg-headcell.dnd-source { opacity: 0.35; }
 body.dnd-dragging { cursor: grabbing; }
 body.dnd-dragging * { cursor: grabbing !important; user-select: none !important; }
-.dnd-bar { position: absolute; left: 0; width: 2px; background: var(--accent); border-radius: 1px; z-index: 6; pointer-events: none; transition: transform var(--dur) var(--ease); }
+/* Above the ghost (9999): the ghost tracks the pointer and the bar marks the gap
+   under it, so at the exact moment the bar matters the ghost is on top of it. */
+.dnd-bar { position: absolute; left: 0; width: 2px; background: var(--accent); border-radius: 1px; z-index: 10000; pointer-events: none; box-shadow: 0 0 0 1px var(--bg); transition: transform var(--dur) var(--ease); }
 /* Tab-strip bar spans exactly the tab band (the strip's 4px top padding excluded). */
 .tab-drop { top: var(--s1); bottom: 0; }
 
@@ -1361,6 +1390,10 @@ body.dnd-dragging * { cursor: grabbing !important; user-select: none !important;
 .rg-row { position: absolute; left: 0; }
 .rg-row.odd { background: var(--zebra); }
 .rg-cell { position: absolute; top: 0; height: 100%; padding: 0 var(--s3); display: flex; align-items: center; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: var(--fs-sm); font-family: var(--mono); }
+/* The cell is a flex box, so `text-overflow` on it never reached a bare text
+   node — an over-long value was cut mid-glyph. The text gets its own shrinkable
+   box that carries the ellipsis. */
+.rg-celltext { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rg-cell.sel { background: rgba(var(--accent-rgb), 0.28); }
 .rg-cell.active { outline: 1.5px solid var(--accent); outline-offset: -1.5px; z-index: 1; }
 .rg-bool { font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; line-height: 16px; padding: 0 5px; border-radius: var(--r-xs); }
@@ -1459,7 +1492,7 @@ body.dnd-dragging * { cursor: grabbing !important; user-select: none !important;
 .modal label { display: flex; flex-direction: column; gap: var(--s1); font-size: var(--fs-xs); font-weight: 600; color: var(--muted); }
 .modal input:not([type="checkbox"]):not([type="radio"]), .modal select, .modal textarea { padding: 7px var(--s3); min-height: var(--control-h); }
 .modal .checkbox { flex-direction: row; align-items: center; gap: var(--s2); font-size: var(--fs-sm); font-weight: 400; color: var(--text); }
-.modal .checkbox input { width: auto; }
+.modal .checkbox input:not([type="checkbox"]):not([type="radio"]) { width: auto; }
 
 /* --- form helpers, shared by every dialog --- */
 .field-label { font-size: var(--fs-xs); font-weight: 600; color: var(--muted); }
@@ -1687,8 +1720,13 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
 .ai-section-actions, .settings-section-actions { margin-left: auto; display: flex; gap: 6px; }
 .ai-section-actions button, .settings-section-actions button { font-size: var(--fs-sm); padding: var(--s1) var(--s3); }
 
-/* Accent swatches: one shape, one size, the custom picker as the last swatch. */
-.accent-swatch { width: 20px; height: 20px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; padding: 0; }
+/* Accent swatches: one shape, one size, the custom picker as the last swatch.
+   `flex: none` is load-bearing — the row is narrower than its content, so
+   shrinkable swatches flattened into 10x20 ellipses. */
+.accent-swatch { flex: none; width: 20px; height: 20px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; padding: 0; }
+.settings-inline input[type="color"] { flex: none; width: 20px; height: 20px; border-radius: 50%; padding: 0; overflow: hidden; }
+.settings-inline input[type="color"]::-webkit-color-swatch-wrapper { padding: 0; }
+.settings-inline input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
 .accent-swatch.active { border-color: var(--accent); box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent); }
 .appearance-pane .settings-row select { min-width: 0; }
 .appearance-pane .settings-actions { margin-top: var(--s4); padding-top: var(--s3); border-top: 1px solid var(--border); }
@@ -1797,6 +1835,9 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
 .hist-row.cancelled { box-shadow: inset 2px 0 0 var(--warn); }
 .hist-sql-line { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: var(--fs-xs); }
 .hist-meta { color: var(--muted); font-size: var(--fs-xs); flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.hist-meta + .hist-meta { min-width: 58px; text-align: right; }
+/* Provenance tag for a run that did not come from the editor. */
+.hist-tag { flex-shrink: 0; padding: 0 var(--s1); border-radius: var(--r-xs); background: var(--panel-2); color: var(--muted); font-size: var(--fs-xs); font-weight: 600; max-width: 132px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hist-full { margin: 0 7px; padding: 7px 9px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); font-family: var(--mono); font-size: var(--fs-xs); line-height: 1.45; overflow-x: auto; max-height: 180px; overflow-y: auto; }
 .hist-full code { white-space: pre; }
 .hist-error { margin: var(--s1) 7px 0; color: var(--danger); font-size: var(--fs-xs); }

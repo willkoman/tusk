@@ -116,7 +116,10 @@ export function SettingsDialog(props: {
                 </select>
               </label>
               <label class="settings-row">
-                <span>Default column width</span>
+                <span class="settings-label">
+                  <span>Fallback column width</span>
+                  <small>Columns are sized from their content. This width is used when there is nothing to measure.</small>
+                </span>
                 <input
                   type="number"
                   min="48"

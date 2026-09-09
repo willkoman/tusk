@@ -2,6 +2,7 @@ import { type Accessor, For, Show, createMemo, createSignal } from "solid-js";
 import { Icon } from "../Icons";
 import { highlightSql } from "../ai/sqlHighlight";
 import { type HistoryEntry } from "./store";
+import { historyLabel } from "./format";
 
 // Right-side query-history panel (AiPanel layout pattern). Reverse-chron list
 // with status/duration, substring search, expand-to-full-SQL, and per-entry
@@ -66,9 +67,17 @@ export function HistoryPanel(props: {
             {(e) => (
               <div class="hist-entry" classList={{ open: openId() === e.id }}>
                 <div class="hist-row" onClick={() => setOpenId(openId() === e.id ? null : e.id)}>
-                  <span class="hist-dot" classList={{ ok: e.status === "ok", err: e.status === "error", cancelled: e.status === "cancelled" }} />
-                  <span class="hist-sql-line">{e.sql.split("\n")[0]}</span>
-                  <span class="hist-meta">{fmtMs(e.durationMs)} · {relTime(e.ts)}</span>
+                  <span
+                    class="hist-dot"
+                    classList={{ ok: e.status === "ok", err: e.status === "error", cancelled: e.status === "cancelled" }}
+                    title={e.status === "error" ? "Failed" : e.status === "cancelled" ? "Cancelled" : "Succeeded"}
+                  />
+                  <Show when={historyLabel(e.sql).tag}>
+                    {(tag) => <span class="hist-tag">{tag()}</span>}
+                  </Show>
+                  <span class="hist-sql-line">{historyLabel(e.sql).text}</span>
+                  <span class="hist-meta">{fmtMs(e.durationMs)}</span>
+                  <span class="hist-meta">{relTime(e.ts)}</span>
                 </div>
                 <Show when={openId() === e.id}>
                   <pre class="hist-full"><code><For each={highlightSql(e.sql)}>{(t) => (t.cls ? <span class={t.cls}>{t.text}</span> : t.text)}</For></code></pre>
