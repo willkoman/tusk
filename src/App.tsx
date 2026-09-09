@@ -43,6 +43,7 @@ import { type DialogState } from "./WorkbenchDialogs";
 import { type SettingsTab } from "./settings/SettingsDialog";
 const HelpDialog = lazy(() => import("./help/HelpDialog"));
 import { fontStack } from "./editor/theme";
+import { type SqlEngine } from "./editor/lexer";
 import { ACTIONS, type ActionCtx, type ActionId, type KeyOverrides, canonicalKey, displayKey, effectiveKey, normalizeKeyEvent } from "./actions";
 import { exportOptionsStore, keymapStore, type RememberedExportOptions } from "./store";
 import { historyStore, makeEntryId, type HistoryEntry } from "./history/store";
@@ -79,7 +80,10 @@ import {
   driverMascot,
   findConnection,
   makeConnectionState,
+  mergeRememberedIds,
   nextColorIndex,
+  nextRecoverySlot,
+  recoverySlotKey,
   rememberedProfileIds,
   stepConnection,
   type Capabilities,
@@ -96,9 +100,12 @@ import { KeyedSerialQueue } from "./asyncQueue";
 import {
   IDLE_TRANSACTION,
   INTERRUPTED_TRANSACTION_KEY,
+  INTERRUPTED_TRANSACTION_PREFIX,
   acceptTransactionStatus,
   decodeInterruptedTransaction,
   encodeInterruptedTransaction,
+  evictInterruptedMarkers,
+  interruptedTransactionKey,
   transactionDatabaseAllowed,
   transactionBoundaryStaleReason,
   transactionControlAvailability,
@@ -600,12 +607,48 @@ function App() {
   const activeDatabaseAllowed = () => transactionDatabaseAllowed(transaction(), activeTabId());
   const metadataFrozen = () => transactionOpen(transaction());
 
+  /**
+   * Read (and consume) the interrupted-transaction breadcrumb for ONE destination.
+   * Markers are per connection key now; the single legacy slot is still honoured once,
+   * for the connection it actually named, and removed on the way through.
+   */
+  function takeInterruptedMarker(connectionKey: string) {
+    try {
+      const own = decodeInterruptedTransaction(localStorage.getItem(interruptedTransactionKey(connectionKey)));
+      if (own) return own;
+      const legacy = decodeInterruptedTransaction(localStorage.getItem(INTERRUPTED_TRANSACTION_KEY));
+      if (legacy && legacy.connectionKey === connectionKey.slice(0, 2048)) {
+        localStorage.removeItem(INTERRUPTED_TRANSACTION_KEY);
+        return legacy;
+      }
+    } catch {
+      /* Advisory recovery warning only. */
+    }
+    return null;
+  }
+
   function removeInterruptedMarker(connectionKey: string) {
     try {
-      const marker = decodeInterruptedTransaction(localStorage.getItem(INTERRUPTED_TRANSACTION_KEY));
-      if (!marker || marker.connectionKey === connectionKey.slice(0, 2048)) localStorage.removeItem(INTERRUPTED_TRANSACTION_KEY);
+      localStorage.removeItem(interruptedTransactionKey(connectionKey));
+      const legacy = decodeInterruptedTransaction(localStorage.getItem(INTERRUPTED_TRANSACTION_KEY));
+      if (!legacy || legacy.connectionKey === connectionKey.slice(0, 2048)) localStorage.removeItem(INTERRUPTED_TRANSACTION_KEY);
     } catch {
       /* Recovery marker is advisory; storage failure must not affect transaction control. */
+    }
+  }
+
+  /** Keep the per-connection marker slots bounded by the open-connection ceiling. */
+  function pruneInterruptedMarkers() {
+    try {
+      const entries: { key: string; startedAt: number }[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (!key || !key.startsWith(INTERRUPTED_TRANSACTION_PREFIX)) continue;
+        entries.push({ key, startedAt: decodeInterruptedTransaction(localStorage.getItem(key))?.startedAt ?? 0 });
+      }
+      for (const key of evictInterruptedMarkers(entries, MAX_CONNECTIONS)) localStorage.removeItem(key);
+    } catch {
+      /* Advisory marker only. */
     }
   }
 
@@ -614,7 +657,8 @@ function App() {
     const raw = encodeInterruptedTransaction(c.key, c.target, status, startedAt);
     if (!raw) return;
     try {
-      localStorage.setItem(INTERRUPTED_TRANSACTION_KEY, raw);
+      localStorage.setItem(interruptedTransactionKey(c.key), raw);
+      pruneInterruptedMarkers();
     } catch {
       /* Advisory marker only. */
     }
@@ -1704,6 +1748,9 @@ function App() {
   }
 
   const totalPendingCount = () => tabs().reduce((total, tab) => total + pendingCount(tab.pending), 0);
+  /** Pending grid edits on ONE connection — what a per-connection prompt may discard. */
+  const pendingCountFor = (connectionId: string | null) =>
+    connectionId ? tabsOf(connectionId).reduce((total, tab) => total + pendingCount(tab.pending), 0) : 0;
   /** A database operation is in flight on ANY open connection (window-close gate). */
   const anyConnectionBusy = () =>
     connections().some((e) => {
@@ -1714,6 +1761,15 @@ function App() {
     anyConnectionBusy() || commitBusy() || importBusy() || backupBusy() || restoreBusy();
 
   const [slackStatus, setSlackStatus] = createSignal<SlackStatus>({ running: false, state: "disconnected", error: null });
+  /**
+   * Why a running bot stopped, shown in the workbench. The badge used to be hidden
+   * for `state === "disconnected"`, so the one case that matters most — the bot's
+   * bound connection was closed, which stops it — made the badge VANISH and left the
+   * reason readable only by opening Settings → Slack.
+   */
+  const slackStopped = () => (!slackStatus().running && slackStatus().error ? slackStatus().error! : "");
+  /** The stop reason in the statusbar text, until the user clicks the badge. */
+  const [slackNotice, setSlackNotice] = createSignal("");
   const slackUnlisten: UnlistenFn[] = [];
   const slackHistoryKeys = new Map<string, string>();
   let slackStatusRevision = 0;
@@ -1789,11 +1845,15 @@ function App() {
   };
   /** Re-poll every open connection: a session can end underneath any of them. */
   const refreshTransactionStatus = async () => {
-    if (importBusy() || commitBusy()) return;
     for (const entry of connections()) {
       const c = entry.conn;
       const s = entry.state();
       if (s.running || s.fetchingMore) continue;
+      // Import and grid Commit run their own statements, but only ever on ONE
+      // connection. Testing the global busy signals stopped polling everywhere, so a
+      // session lost on another connection went unnoticed until its next command.
+      if (importBusy() && importOrigin?.connection.id === c.id) continue;
+      if (commitBusy() && commitView()?.origin.connectionId === c.id) continue;
       try {
         const status = await invoke<TransactionStatus>("transaction_status", { connectionId: c.id });
         if (connectionOpen(c)) applyAuthoritativeTransaction(c, status);
@@ -1881,6 +1941,9 @@ function App() {
       const statusUnlisten = await listen<SlackStatus>("slack:status", (e) => {
         slackStatusRevision++;
         setSlackStatus(e.payload);
+        // A bot that stopped on its own (its bound connection went away) must say so
+        // where the user is looking, not only in Settings → Slack.
+        setSlackNotice(!e.payload.running && e.payload.error ? e.payload.error : "");
       });
       if (!appMounted) statusUnlisten(); else slackUnlisten.push(statusUnlisten);
     } catch {
@@ -2068,29 +2131,47 @@ function App() {
     setConnectOpen(true);
   }
 
+  /** The remembered profiles that are not already open — what the offer actually is. */
+  const pendingReopen = () =>
+    reopenable().filter((id) => !connections().some((e) => e.conn.profileId === id));
+
   /**
    * Reconnect the saved profiles that were open last time, in their original order.
    * Profiles that no longer exist, or whose password is not in the keychain, are
    * reported rather than silently skipped — an incomplete restore that looks complete
    * is worse than none.
+   *
+   * Outcomes are accumulated PER PROFILE: `connectProfile` clears `connErr` on entry,
+   * so relying on that shared signal meant profile #2 succeeding erased why #1 failed
+   * and the restore was presented as complete. Anything that did not open stays in the
+   * offer so it can be retried.
    */
   async function reopenLastSession() {
-    const wanted = reopenable();
-    setReopenable([]);
-    const missing: string[] = [];
-    for (const id of wanted) {
+    const wanted = pendingReopen();
+    if (!wanted.length || connecting()) return;
+    const failures: string[] = [];
+    const unopened: string[] = [];
+    for (const [index, id] of wanted.entries()) {
       if (connections().length >= MAX_CONNECTIONS) {
-        missing.push("(connection limit reached)");
+        unopened.push(...wanted.slice(index));
+        failures.push(`connection limit (${MAX_CONNECTIONS}) reached`);
         break;
       }
       const profile = profiles().find((x) => x.id === id);
       if (!profile) {
-        missing.push(id);
+        failures.push(`${id}: that saved connection no longer exists`);
         continue;
       }
-      await connectProfile(id);
+      const before = connections().length;
+      const error = await connectProfile(id);
+      // A host-key prompt resolves without an error and without a connection: it is
+      // still waiting on the user, so keep it in the offer rather than declaring it done.
+      if (connections().length > before) continue;
+      unopened.push(id);
+      failures.push(`${profile.name || id}: ${error || "waiting for confirmation"}`);
     }
-    if (missing.length) setConnErr(`could not reopen: ${missing.join(", ")}`);
+    setReopenable((ids) => ids.filter((id) => !wanted.includes(id) || unopened.includes(id)));
+    setConnErr(failures.length ? `Could not reopen: ${failures.join("; ")}` : "");
     persistLayout();
   }
 
@@ -2109,11 +2190,35 @@ function App() {
   }
 
   /**
+   * `connect`/`connect_profile` register the session in the Rust registry BEFORE the
+   * workbench sets it up. If setup throws before the entry reaches `connections()`
+   * there is no chip and no ✕ for it, so it would hold one of the 16 backend slots
+   * until restart — close it, and release the workbench bookkeeping it did claim.
+   */
+  async function afterConnect(
+    r: ConnectReply,
+    meta: { key: string; legacyKey: string | null; target: string; driver: string; profileId: string | null },
+  ) {
+    try {
+      await registerConnection(r, meta);
+    } catch (e) {
+      if (!entryOf(r.connection_id)) {
+        runtimes.delete(r.connection_id);
+        recoveryKeys.delete(r.connection_id);
+        slackHistoryKeys.delete(r.connection_id);
+        lastTabByConn.delete(r.connection_id);
+        void invoke("disconnect", { connectionId: r.connection_id }).catch(() => {});
+      }
+      throw e;
+    }
+  }
+
+  /**
    * Register a freshly opened session as a new connection entry, restore its tab set
    * and history, and focus it. Existing connections are untouched: their tabs stay in
    * the strip, their streams keep streaming, their transaction bars keep running.
    */
-  async function afterConnect(
+  async function registerConnection(
     r: ConnectReply,
     meta: { key: string; legacyKey: string | null; target: string; driver: string; profileId: string | null },
   ) {
@@ -2143,42 +2248,47 @@ function App() {
     setPersistenceWarning("");
     slackHistoryKeys.set(connected.id, connected.key);
     if (slackHistoryKeys.size > 100) slackHistoryKeys.delete(slackHistoryKeys.keys().next().value!);
-    try {
-      const interrupted = decodeInterruptedTransaction(localStorage.getItem(INTERRUPTED_TRANSACTION_KEY));
-      if (interrupted?.connectionKey === meta.key.slice(0, 2048)) {
-        entry.patch({ transactionWarning: `Previous ${interrupted.mode === "autocommit_off" ? "autocommit-off unit" : "manual transaction"} ${interrupted.transactionId} was interrupted. No active state was restored; verify its outcome.` });
-      }
-    } catch {
-      /* Advisory recovery warning only. */
+    const interrupted = takeInterruptedMarker(meta.key);
+    if (interrupted) {
+      entry.patch({ transactionWarning: `Previous ${interrupted.mode === "autocommit_off" ? "autocommit-off unit" : "manual transaction"} ${interrupted.transactionId} was interrupted. No active state was restored; verify its outcome.` });
     }
 
     // Restore this connection's tabs BEFORE it becomes active, so the workbench never
     // renders a connection with no tab of its own.
+    //
+    // The snapshot slot is per SESSION, not per destination: opening the same profile
+    // twice must not give both sessions the same `tusk.tabs.<key>` entry, or the second
+    // restores the first's tabs (every file open twice) and then overwrites its unsaved
+    // buffers on the next persist. Slot 0 is the bare key, so a single session — and the
+    // legacy migration below — behave exactly as before.
+    const slot = nextRecoverySlot(recoveryKeys.values(), meta.key);
+    const slotKey = recoverySlotKey(meta.key, slot);
     let restoredTabs: Tab[] = [];
     let restoredActive = 0;
-    let recoveryKey = meta.key;
+    let recoveryKey = slotKey;
     if (meta.key) {
-      const current = tabsStore.loadResult(meta.key);
+      const current = tabsStore.loadResult(slotKey);
       let saved = current.ok ? current.value : null;
       if (!current.ok) {
         showPersistenceFailure(current.error);
         // An unreadable existing snapshot is not a failed write: park it aside so
         // this session can persist recovery normally (and disconnect/close aren't
         // blocked forever). Only when even the backup fails do writes stay off.
-        const parked = tabsStore.quarantineResult(meta.key);
+        const parked = tabsStore.quarantineResult(slotKey);
         if (!parked.ok) {
           runtime.recoveryWritable = false;
           showPersistenceFailure(parked.error);
         }
       }
-      // A legacy fallback is valid only when the new key is genuinely absent. A load
-      // failure must not resurrect stale data over an unreadable current snapshot.
-      if (current.ok && current.value === null && meta.legacyKey) {
+      // A legacy fallback is valid only when the new key is genuinely absent, and only
+      // for slot 0 — a second concurrent session must not adopt the first's history. A
+      // load failure must not resurrect stale data over an unreadable current snapshot.
+      if (slot === 0 && current.ok && current.value === null && meta.legacyKey) {
         const legacy = tabsStore.loadResult(meta.legacyKey);
         if (!legacy.ok) showPersistenceFailure(legacy.error);
         else if (legacy.value) {
           saved = legacy.value;
-          const migrated = persistRecoveryTo(runtime, meta.key, legacy.value);
+          const migrated = persistRecoveryTo(runtime, slotKey, legacy.value);
           if (migrated.ok) {
             const removed = tabsStore.removeResult(meta.legacyKey);
             if (!removed.ok) showPersistenceFailure(removed.error);
@@ -2201,10 +2311,13 @@ function App() {
     recoveryKeys.set(connected.id, recoveryKey);
 
     restoring = true;
-    setConnections((cs) => [...cs, entry]);
-    setTabs((ts) => [...ts, ...restoredTabs]);
-    focusConnection(connected.id, restoredTabs[restoredActive]?.id);
-    restoring = false;
+    try {
+      setConnections((cs) => [...cs, entry]);
+      setTabs((ts) => [...ts, ...restoredTabs]);
+      focusConnection(connected.id, restoredTabs[restoredActive]?.id);
+    } finally {
+      restoring = false;
+    }
     // The backend's "active connection" is what a Slack bot binds to by default.
     void invoke("set_active_connection", { connectionId: connected.id }).catch(() => {});
     bindSlackIfUnbound(connected.id);
@@ -2324,8 +2437,10 @@ function App() {
     }
   }
 
-  async function connectProfile(id: string) {
-    if (connecting()) return;
+  /** Connect a saved profile. Returns "" on success, else the failure message — the
+   *  shared `connErr` signal cannot report a batch, since every call clears it. */
+  async function connectProfile(id: string): Promise<string> {
+    if (connecting()) return "another connection attempt is already in progress";
     setConnecting(true);
     setConnErr("");
     try {
@@ -2337,8 +2452,11 @@ function App() {
         const r = await invoke<ConnectReply>("connect_profile", { id });
         await afterConnect(r, { key: `profile:${id}`, legacyKey: null, target, driver: profile?.driver ?? "postgres", profileId: id });
       });
+      return "";
     } catch (e) {
-      setConnErr(errMsg(e));
+      const message = errMsg(e);
+      setConnErr(message);
+      return message;
     } finally {
       setConnecting(false);
     }
@@ -2426,6 +2544,18 @@ function App() {
     if (!entry) return true;
     const c = entry.conn;
     const rt = entry.runtime;
+    const busy = entry.state();
+    // The ✕ on a background chip is one mis-click away from server-cancelling a
+    // long-running query (`disconnect` cancels the armed operation), so refuse while
+    // one is in flight — the same rule window close already applies globally. Cancel
+    // it (the chip's running dot does that) or let it finish first.
+    if (busy.running || busy.fetchingMore || busy.loadingAll) {
+      const message = `Cancel or wait for the ${busy.loadingAll ? "Load all" : busy.fetchingMore ? "page fetch" : "query"} on ${labelOf(connectionId)} before disconnecting it`;
+      const tabId = busy.runningTabId ?? tabsOf(connectionId)[0]?.id;
+      if (tabId) patchResult(tabId, { status: message });
+      setStatus(message);
+      return false;
+    }
     const status = entry.state().transaction;
     if (transactionOpen(status) && !transactionResolved) {
       raiseTransactionResolution(entry, { kind: "disconnect" });
@@ -2489,14 +2619,17 @@ function App() {
         setActiveTabId("");
       }
     }
+    // ACCUMULATE the closed profile: closing A, then B, then C must remember all three,
+    // exactly as closing the window with three open does. Reseeding only from the last
+    // one made the remembered session decay to whichever was closed last.
+    if (entry.conn.profileId) {
+      const closed = entry.conn.profileId;
+      setReopenable((ids) => (ids.includes(closed) ? ids : [...ids, closed].slice(0, MAX_CONNECTIONS)));
+    }
     if (!remaining.length) {
       setHistoryOpen(false);
       setSelected(null);
       setPersistenceWarning("");
-      // Closing the last connection lands on the connect screen: offer back exactly
-      // the profiles that were open (this one included), rather than forgetting the
-      // session because `connections()` is now empty.
-      setReopenable(rememberedProfileIds([entry, ...remaining]));
     }
     rememberOpenConnections();
     return true;
@@ -2507,6 +2640,7 @@ function App() {
     setMenu(null);
     setCellView(null);
     setConfirmClose(null);
+    setConfirmCancelConn(null);
     setConfirmDisconnect(null);
     setConfirmWindowClose(null);
     setTransactionResolution(null);
@@ -2797,7 +2931,11 @@ function App() {
     const c = entry?.conn ?? null;
     const rt = entry?.runtime ?? null;
     if (!c || !rt || entry!.state().running || !sqlToRun.trim()) return false;
-    const event = transactionEvent(sqlToRun);
+    // Classify with the RUN TAB's engine, not the module dialect: MySQL `#` comments,
+    // backticks and T-SQL brackets change where statements and comments end, and this
+    // is the classification that decides commit/rollback boundary staling.
+    const runEngine = connectionKindOf(entry!.state()) as SqlEngine;
+    const event = transactionEvent(sqlToRun, runEngine);
     // Read the RUN TAB's connection transaction, not `transaction()`. They are the
     // same by the active-tab/active-connection invariant, but naming the connection
     // keeps this correct if a future path ever runs a non-focused tab.
@@ -2808,7 +2946,7 @@ function App() {
         : `Database actions are frozen in this tab while ${tabs().find((t) => t.id === runTx().owner)?.title ?? runTx().owner ?? "another tab"} owns the transaction` });
       return false;
     }
-    if (!transactionRecoveryAllowed(runTx(), sqlToRun)) {
+    if (!transactionRecoveryAllowed(runTx(), sqlToRun, runEngine)) {
       patchResult(runTabId, { status: "Transaction failed; ROLLBACK is required before any other database action" });
       return false;
     }
@@ -3105,7 +3243,10 @@ function App() {
       if (!disconnected) return;
       setConnErr(warning);
       setPersistenceWarning(warning);
-      if (intent.kind === "window-close") await closeNativeWindow(true);
+      // NOT forced: the lost connection's own tabs (and their pending edits) are gone
+      // with it, so what `totalPendingCount()` still sees belongs to OTHER connections
+      // and deserves its own confirmation rather than being discarded silently.
+      if (intent.kind === "window-close") await closeNativeWindow();
     } finally {
       if (entryOf(intent.connectionId)) setTransactionResolutionBusy(false);
     }
@@ -3114,15 +3255,32 @@ function App() {
   // Cancel the in-flight query (re-clicking Run): fire a Postgres CancelRequest; the
   // run_query call then errors out and unwinds through executeQuery's finally.
   function cancelQuery() {
-    const c = conn();
-    if (!c || !running() || cancelling()) return;
-    if (caps()?.cancelQuery === false) {
-      patchResult(runningTabId() ?? activeTabId(), { status: "This engine cannot cancel a running query — wait for it to finish" });
+    cancelQueryOn(activeConnectionId(), runningTabId() ?? activeTabId());
+  }
+
+  /**
+   * Cancel the query running on ANY connection, focused or not. The connection strip's
+   * running dot is a cancel button (behind a confirmation), so a long query started on
+   * a background connection does not have to be switched to first.
+   */
+  function cancelQueryOn(connectionId: string | null, fallbackTabId?: string) {
+    const entry = entryOf(connectionId);
+    const s = entry?.state();
+    if (!entry || !s || !s.running || s.cancelling) return;
+    const tabId = s.runningTabId ?? fallbackTabId ?? tabsOf(entry.conn.id)[0]?.id;
+    if (s.caps?.cancelQuery === false) {
+      const message = "This engine cannot cancel a running query — wait for it to finish";
+      if (tabId) patchResult(tabId, { status: message });
+      setStatus(message);
       return;
     }
-    patchConn(c.id, { cancelling: true });
-    void cancelOperation(c.id, runningTabId() ?? activeTabId());
+    if (!tabId) return;
+    patchConn(entry.conn.id, { cancelling: true });
+    void cancelOperation(entry.conn.id, tabId);
   }
+
+  /** Confirmation for cancelling a query from a connection chip (never a bare click). */
+  const [confirmCancelConn, setConfirmCancelConn] = createSignal<string | null>(null);
 
   // Run-target chooser: when Run is hit with the cursor inside one of several statements
   // (and nothing selected), ask whether to run the whole file or just that block.
@@ -4461,9 +4619,12 @@ function App() {
       sidebarOpen: sidebarOpen(), resultsOpen: resultsOpen(),
       // Profile ids only: an ad-hoc session's credentials were typed, never stored,
       // so offering to reopen one could only fail or prompt.
-      openConnections: connections().length
-        ? rememberedProfileIds(connections())
-        : reopenable(),
+      //
+      // Open AND still-pending, merged. Writing only the open set meant the first
+      // connect of a session (a default-connect profile, or one click on the connect
+      // screen) erased every other profile from the remembered list before the user
+      // could accept the offer — the feature destroyed its own data.
+      openConnections: mergeRememberedIds(rememberedProfileIds(connections()), reopenable()),
     });
 
   // Hard safety bounds: no side panel may grow past the point where the editor/main
@@ -4528,8 +4689,20 @@ function App() {
    * The connect screen. It is the whole window when nothing is open, and a modal over
    * the workbench when an existing session opens another connection ("+" in the
    * strip), so connecting never costs you the workspace you are already in.
+   *
+   * The reopen offer lives INSIDE the panel, so it is reachable from the "+" modal
+   * too: the moment one profile connects the fallback branch is gone, and the offer
+   * used to become unreachable while the rest of the session was still pending.
    */
   const connectPanel = () => (
+          <>
+          <Show when={pendingReopen().length > 0}>
+            <div class="reopen-bar">
+              <span>{pendingReopen().length} saved connection{pendingReopen().length === 1 ? "" : "s"} from your last session {pendingReopen().length === 1 ? "is" : "are"} not open.</span>
+              <button class="ghost" disabled={connecting()} onClick={() => void reopenLastSession()}>Reopen last session</button>
+              <button class="icon" title="Forget" onClick={() => { setReopenable([]); persistLayout(); }}>&#10005;</button>
+            </div>
+          </Show>
             <div class="connect-layout">
               <div class="profiles-panel">
                 <div class="panel-title">Connections</div>
@@ -4660,6 +4833,7 @@ function App() {
                 <Show when={connErr()}><div class="error">{connErr()}</div></Show>
               </form>
             </div>
+          </>
   );
 
   return (
@@ -4672,13 +4846,6 @@ function App() {
             <button class="icon" title="Manual (F1)" onClick={() => setHelpOpen(true)}><Icon name="help" /></button>
             <button class="icon" title="Settings" onClick={() => setSettingsOpen("editor")}><Icon name="gear" /></button>
           </div>
-          <Show when={reopenable().length > 0}>
-            <div class="reopen-bar">
-              <span>Last session had {reopenable().length} connection{reopenable().length === 1 ? "" : "s"} open.</span>
-              <button class="ghost" disabled={connecting()} onClick={() => void reopenLastSession()}>Reopen last session</button>
-              <button class="icon" title="Forget" onClick={() => { setReopenable([]); persistLayout(); }}>&#10005;</button>
-            </div>
-          </Show>
           {connectPanel()}
         </div>
       }
@@ -4708,7 +4875,21 @@ function App() {
                     <Show when={connections().length > 1}>
                       <span class="conn-mascot">{driverMascot(kindOf(id))}</span>
                     </Show>
-                    <span class="conn-dot" classList={{ [dot()]: true }} />
+                    {/* The dot is the only place a background connection's state shows,
+                        so when a query is running there it is also the way to cancel it
+                        — behind a confirmation, since it sits inside a click target. */}
+                    <Show
+                      when={dot() === "running" && entry.state().running && !entry.state().cancelling}
+                      fallback={<span class="conn-dot" classList={{ [dot()]: true }} />}
+                    >
+                      <button
+                        class="conn-dot cancellable"
+                        classList={{ [dot()]: true }}
+                        title={`Cancel the query running on ${labelOf(id)}`}
+                        aria-label={`Cancel the query running on ${labelOf(id)}`}
+                        onClick={(e) => { e.stopPropagation(); setConfirmCancelConn(id); }}
+                      />
+                    </Show>
                     <span class="conn-name">{labelOf(id)}</span>
                     <Show when={entry.conn.viaSsh}>
                       <span class="conn-ssh" title="Reached through an SSH tunnel">SSH</span>
@@ -5143,13 +5324,17 @@ function App() {
             </Show>
 
             <footer class="statusbar">
-              <span title={persistenceWarning() || transactionWarning() || undefined}>{persistenceWarning() || transactionWarning() || status()}</span>
-              <Show when={slackStatus().state !== "disconnected"}>
+              <span title={persistenceWarning() || transactionWarning() || slackNotice() || undefined}>{persistenceWarning() || transactionWarning() || slackNotice() || status()}</span>
+              <Show when={slackStatus().running || slackStopped()}>
                 <span
                   class="slack-badge"
-                  title={slackStatus().error ? `Slack: ${slackStatus().state} — ${slackStatus().error}` : `Slack bot ${slackStatus().state}`}
+                  classList={{ stopped: !!slackStopped() }}
+                  title={slackStopped()
+                    ? `Slack: ${slackStopped()} (click to dismiss)`
+                    : slackStatus().error ? `Slack: ${slackStatus().state} — ${slackStatus().error}` : `Slack bot ${slackStatus().state}`}
+                  onClick={() => setSlackNotice("")}
                 >
-                  {slackStatus().state === "connected" ? "🟢" : "🟡"} Slack
+                  {slackStatus().running ? (slackStatus().state === "connected" ? "🟢" : "🟡") : "🔴"} Slack
                 </span>
               </Show>
               <span class="spacer" />
@@ -5170,6 +5355,10 @@ function App() {
               ctx={aiContext}
               sampleRows={aiSampleRows}
               ensureFks={ensureAiFks}
+              // Identity, not just id: a reconnect to the same destination is a
+              // different session with a different schema snapshot.
+              connectionToken={() => (conn() ? `${conn()!.id}#${conn()!.generation}` : "")}
+              connectionName={() => (conn() ? labelOf(conn()!.id) : "no connection")}
               onOpenSettings={() => setSettingsOpen("ai")}
               width={aiW()}
               onInsertSql={(sql) => openGeneratedTab(sql, activeTab().searchSchema, "AI query")}
@@ -5478,6 +5667,17 @@ function App() {
             </Dialog>
           )}
         </Show>
+        <Show when={!!confirmCancelConn() && !!entryOf(confirmCancelConn())?.state().running}>
+          <Dialog title="Cancel running query?" onClose={() => setConfirmCancelConn(null)} width={440}>
+            <p class="confirm-text">
+              Cancel the query running on <b>{labelOf(confirmCancelConn()!)}</b>? Rows already loaded stay on screen, marked incomplete.
+            </p>
+            <div class="form-actions">
+              <button class="ghost" onClick={() => setConfirmCancelConn(null)}>Keep running</button>
+              <button class="btn-danger" onClick={() => { cancelQueryOn(confirmCancelConn()); setConfirmCancelConn(null); }}>Cancel query</button>
+            </div>
+          </Dialog>
+        </Show>
         <Show when={confirmDisconnect()}>
           {(target) => (
             <Dialog title="Disconnect with pending changes?" onClose={() => setConfirmDisconnect(null)} width={460}>
@@ -5522,9 +5722,11 @@ function App() {
                   {intent().kind === "close-tab" ? " closing its tab" : intent().kind === "disconnect" ? " disconnecting" : " closing Tusk"}.
                 </Show>
               </p>
-              <Show when={transaction().state === "lost" && totalPendingCount() > 0}>
+              {/* Scoped to the connection being disconnected: another connection's
+                  pending edits are not discarded here, and get their own prompt. */}
+              <Show when={transaction().state === "lost" && pendingCountFor(intent().connectionId) > 0}>
                 <div class="transaction-resolution-note">
-                  Disconnecting will discard {totalPendingCount()} pending grid change{totalPendingCount() === 1 ? "" : "s"}.
+                  Disconnecting will discard {pendingCountFor(intent().connectionId)} pending grid change{pendingCountFor(intent().connectionId) === 1 ? "" : "s"} on this connection.
                 </div>
               </Show>
               <Show when={transaction().state !== "lost" && ownerPendingCount() > 0}>

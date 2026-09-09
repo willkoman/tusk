@@ -44,6 +44,16 @@ export function AiPanel(props: {
   /** Prime the FK graph before the first send (best-effort; the prompt stays silent
    *  about foreign keys if it never lands, rather than claiming there are none). */
   ensureFks?: () => Promise<void>;
+  /**
+   * Identity of the connection `ctx()` describes — `id#generation`, "" when none.
+   * The panel is docked, not modal, so the connection strip stays clickable while a
+   * conversation is open. Without this the schema, skills and dialect in the system
+   * prompt swapped mid-thread on a chip click, and **Open in editor** dropped SQL
+   * written for one engine into a tab that runs on another.
+   */
+  connectionToken: Accessor<string>;
+  /** Display name of that connection, for the mismatch banner. */
+  connectionName: Accessor<string>;
   /** Open Settings → AI (provider cards, keys, skills). */
   onOpenSettings: () => void;
   /** Docked panel width in px (resizable by the splitter on its left edge). */
@@ -96,6 +106,18 @@ export function AiPanel(props: {
     }
   }
   const [settingsOpen, setSettingsOpen] = createSignal(false);
+  /**
+   * The connection this conversation is about, captured when it started. Everything
+   * in the thread — the schema summary, the skills in scope, the SQL dialect the
+   * model was told to write — belongs to it, so a later chip click must not quietly
+   * re-aim the thread; it tags it instead, and **New chat** re-binds.
+   */
+  const [threadConn, setThreadConn] = createSignal<{ token: string; name: string } | null>(null);
+  /** The workbench moved to another connection since this conversation started. */
+  const connMismatch = () => {
+    const bound = threadConn();
+    return !!bound && bound.token !== props.connectionToken();
+  };
   const [messages, setMessages] = createSignal<ChatMsg[]>([]);
   const [input, setInput] = createSignal("");
   const [streaming, setStreaming] = createSignal(false);
@@ -284,6 +306,10 @@ export function AiPanel(props: {
   async function runTurn(convo: ChatMsg[]) {
     if (streaming()) return;
     if (!hasKey()) { props.onOpenSettings(); return; }
+    if (connMismatch()) return; // the banner offers New chat; never re-aim a live thread
+    // A conversation binds to the connection it starts on and stays there.
+    const boundToken = threadConn()?.token ?? props.connectionToken();
+    if (!threadConn()) setThreadConn({ token: boundToken, name: props.connectionName() });
     pinned = true; // a fresh send always follows the reply
     setMessages([...convo, { role: "assistant", content: "" }]);
     setStreaming(true);
@@ -323,6 +349,13 @@ export function AiPanel(props: {
       }
       // Prime the join graph BEFORE snapshotting ctx — `fks`/`fksKnown` are read off it.
       await props.ensureFks?.().catch(() => { /* best-effort — prompt omits the FK section */ });
+      // `ctx()` is read AFTER that await, so a chip click during it would swap the
+      // whole snapshot (schema, dialect, skills) under a thread already about another
+      // database. Refuse rather than send the wrong context.
+      if (props.connectionToken() !== boundToken) {
+        finishTurn(id, { error: "The active connection changed while preparing the request. Switch back, or start a new chat." });
+        return;
+      }
       const ctx = props.ctx();
       const convoText = convo.map((m) => m.content).join("\n");
       // Ground the model in real data: fetch a few sample rows of the tables most
@@ -352,6 +385,12 @@ export function AiPanel(props: {
         : "";
       if (latest.provider !== c.provider || latestModel !== model || latestWire !== wire || latestBase !== baseUrl) {
         finishTurn(id, { error: "AI provider settings changed while preparing the request. Send again to use the new destination." });
+        return;
+      }
+      // Sample rows are fetched against whatever connection is active; a switch during
+      // that await would attach another database's real values to this prompt.
+      if (props.connectionToken() !== boundToken) {
+        finishTurn(id, { error: "The active connection changed while preparing the request. Switch back, or start a new chat." });
         return;
       }
       await invoke("ai_chat", {
@@ -387,7 +426,7 @@ export function AiPanel(props: {
   }
 
   function send(text: string) {
-    if (!text.trim() || streaming()) return;
+    if (!text.trim() || streaming() || connMismatch()) return;
     // Bail BEFORE clearing the composer — otherwise the no-key path eats the question.
     if (!hasKey()) { props.onOpenSettings(); return; }
     autoRetries = AUTO_RETRY_BUDGET; // a fresh question gets a fresh restart budget
@@ -416,6 +455,7 @@ export function AiPanel(props: {
   function newChat() {
     cancel();
     setMessages([]);
+    setThreadConn(null); // the next question re-binds to whatever is in focus then
   }
 
   // Quick actions seed the chat; the schema/SQL/error already ride in the system prompt.
@@ -505,7 +545,16 @@ export function AiPanel(props: {
                     message that already failed must not spin forever. */}
                 <Show when={m().content || m().error || m().cancelled} fallback={<div class="ai-typing"><span /><span /><span /></div>}>
                   <Show when={m().content}>
-                    <Markdown text={m().content} onInsertSql={props.onInsertSql} />
+                    {/* Open in editor binds the new tab to the ACTIVE connection, so
+                        inserting an answer written for another database would quote and
+                        run it under the wrong engine's rules. */}
+                    <Markdown
+                      text={m().content}
+                      onInsertSql={props.onInsertSql}
+                      insertDisabledReason={connMismatch()
+                        ? `Written for ${threadConn()!.name}; switch back to open it in the editor`
+                        : ""}
+                    />
                   </Show>
                 </Show>
                 <Show when={m().truncated}>
@@ -529,9 +578,21 @@ export function AiPanel(props: {
         </Show>
       </div>
 
+      {/* The thread is about another connection than the one in focus. Tag it rather
+          than silently re-aiming it: the answers above describe a different schema and
+          dialect, so they must not be extended or inserted here. */}
+      <Show when={connMismatch()}>
+        <div class="ai-conn-mismatch">
+          <span>
+            This chat is about <b>{threadConn()!.name}</b>; the workbench is on <b>{props.connectionName()}</b>.
+            Switch back to continue it, or start a new chat.
+          </span>
+          <button class="ghost" onClick={newChat}>New chat</button>
+        </div>
+      </Show>
       <div class="ai-actions">
-        <button class="ghost" disabled={streaming()} onClick={explain}>Explain</button>
-        <button class="ghost" disabled={streaming()} onClick={fixError}>Fix error</button>
+        <button class="ghost" disabled={streaming() || connMismatch()} onClick={explain}>Explain</button>
+        <button class="ghost" disabled={streaming() || connMismatch()} onClick={fixError}>Fix error</button>
       </div>
       <form class="ai-input" onSubmit={(e) => { e.preventDefault(); send(input()); }}>
         {/* Deliberately NOT `disabled` while streaming: a disabled control receives no
@@ -556,7 +617,14 @@ export function AiPanel(props: {
             the app's existing cancel-while-busy style (solid --danger); don't invent one. */}
         <Show
           when={streaming()}
-          fallback={<button class="run" type="submit" disabled={!input().trim()}>Send</button>}
+          fallback={
+            <button
+              class="run"
+              type="submit"
+              disabled={!input().trim() || connMismatch()}
+              title={connMismatch() ? `This chat is about ${threadConn()!.name} — start a new chat to ask about ${props.connectionName()}` : undefined}
+            >Send</button>
+          }
         >
           <button class="run cancel" type="button" title="Stop generating (Esc)" onClick={cancel}>⏹ Stop</button>
         </Show>
