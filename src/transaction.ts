@@ -1,4 +1,4 @@
-import { lex } from "./editor/lexer";
+import { lex, type SqlEngine } from "./editor/lexer";
 
 export type TransactionState = "idle" | "configured" | "active" | "failed" | "lost";
 export type TransactionMode = "none" | "explicit" | "autocommit_off";
@@ -106,8 +106,12 @@ export function transactionFromError(error: unknown): TransactionStatus | null {
   return isTransactionStatus(status) ? status : null;
 }
 
-function statementTransactionEvent(sql: string): TransactionEvent {
-  const parsed = lex(sql);
+// Every classification below lexes, and lexing is engine-specific (MySQL `#`
+// comments and backticks, T-SQL brackets and `GO`, …). `engine` names the connection
+// the SQL will run on; omitting it falls back to the module dialect, which is only
+// ever right for the focused connection.
+function statementTransactionEvent(sql: string, engine?: SqlEngine): TransactionEvent {
+  const parsed = lex(sql, engine);
   const first = parsed.stmts[0];
   if (!first) return "statement";
   let text = first.text.toLowerCase();
@@ -131,8 +135,8 @@ function statementTransactionEvent(sql: string): TransactionEvent {
 }
 
 /** Classify the first transaction boundary anywhere in a script, then other controls. */
-export function transactionEvent(sql: string): TransactionEvent {
-  const events = lex(sql).stmts.map((statement) => statementTransactionEvent(statement.text));
+export function transactionEvent(sql: string, engine?: SqlEngine): TransactionEvent {
+  const events = lex(sql, engine).stmts.map((statement) => statementTransactionEvent(statement.text, engine));
   return events.find((event) => event === "commit" || event === "rollback")
     ?? events.find((event) => event === "rollback_to")
     ?? events.find((event) => event !== "statement")
@@ -140,11 +144,11 @@ export function transactionEvent(sql: string): TransactionEvent {
 }
 
 /** Failed sessions may only send a recovery-first script. Backend remains authoritative. */
-export function transactionRecoveryAllowed(status: TransactionStatus, sql: string): boolean {
+export function transactionRecoveryAllowed(status: TransactionStatus, sql: string, engine?: SqlEngine): boolean {
   if (status.state !== "failed") return true;
-  const first = lex(sql).stmts[0];
+  const first = lex(sql, engine).stmts[0];
   if (!first) return false;
-  const event = statementTransactionEvent(first.text);
+  const event = statementTransactionEvent(first.text, engine);
   return event === "rollback" || event === "rollback_to";
 }
 
@@ -217,8 +221,30 @@ export type InterruptedTransactionMarker = {
   startedAt: number;
 };
 
+/** Pre-multi-connection slot: one marker for the whole app. Read once at connect for
+ *  migration, then removed — never written again. */
 export const INTERRUPTED_TRANSACTION_KEY = "tusk.transaction.interrupted";
+/** One marker per connection key. Several connections can each hold an open unit when
+ *  Tusk is killed, and a single slot kept only the last writer's breadcrumb. */
+export const INTERRUPTED_TRANSACTION_PREFIX = "tusk.transaction.interrupted.";
 export const INTERRUPTED_TRANSACTION_MAX_BYTES = 4096;
+
+export const interruptedTransactionKey = (connectionKey: string): string =>
+  `${INTERRUPTED_TRANSACTION_PREFIX}${connectionKey.slice(0, 2048)}`;
+
+/**
+ * Which marker slots to drop so at most `max` are retained. Oldest first, and an
+ * entry that no longer decodes (startedAt 0) goes before any real one. Markers are
+ * advisory breadcrumbs, so the bound matters more than which one survives.
+ */
+export function evictInterruptedMarkers(
+  entries: readonly { key: string; startedAt: number }[],
+  max: number,
+): string[] {
+  if (entries.length <= max) return [];
+  const sorted = [...entries].sort((a, b) => a.startedAt - b.startedAt || (a.key < b.key ? -1 : 1));
+  return sorted.slice(0, entries.length - max).map((e) => e.key);
+}
 
 export function encodeInterruptedTransaction(
   connectionKey: string,

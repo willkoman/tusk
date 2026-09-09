@@ -308,6 +308,35 @@ export function connectionLimitError(list: readonly unknown[]): string {
     : "";
 }
 
+// --- tab-recovery slots -----------------------------------------------------
+
+/**
+ * Where ONE session's tab snapshot lives. The destination key (`profile:<id>`,
+ * `adhoc:[…]`) is not enough: the same profile can be opened twice, and two live
+ * sessions sharing a snapshot means the second restores the first's tabs (every
+ * file open twice, so saving fails on both) and then overwrites its unsaved buffers
+ * on the next persist — silently, because the write itself succeeds, which also
+ * defeats the dirty-recovery disconnect guard.
+ *
+ * Slot 0 keeps the bare key, so a single session keeps reading and writing exactly
+ * the snapshot every previous version wrote. Only a second concurrent session to the
+ * same destination gets a suffix.
+ */
+export const recoverySlotKey = (key: string, slot: number): string =>
+  slot <= 0 ? key : `${key}#${slot}`;
+
+/**
+ * Lowest recovery slot for `key` not already claimed by an open session. `inUse` is
+ * the set of recovery keys the open connections hold (App's `recoveryKeys` values).
+ */
+export function nextRecoverySlot(inUse: Iterable<string>, key: string): number {
+  const taken = new Set(inUse);
+  for (let slot = 0; slot < MAX_CONNECTIONS; slot++) {
+    if (!taken.has(recoverySlotKey(key, slot))) return slot;
+  }
+  return MAX_CONNECTIONS;
+}
+
 // --- "reopen last session" --------------------------------------------------
 
 /**
@@ -322,6 +351,23 @@ export function rememberedProfileIds(list: readonly { conn: Pick<Connected, "pro
     if (id && !out.includes(id)) out.push(id);
   }
   return out.slice(0, MAX_CONNECTIONS);
+}
+
+/**
+ * Merge the profiles that are open right now with the ones still waiting to be
+ * reopened. Persisting only the open set erased the rest of the remembered session
+ * the moment the first profile connected, which made "Reopen last session" useless
+ * for the multi-connection setup it exists for. Open order first, then the pending
+ * offer, de-duplicated and bounded.
+ */
+export function mergeRememberedIds(open: readonly string[], pending: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const id of [...open, ...pending]) {
+    if (!id || out.includes(id)) continue;
+    out.push(id);
+    if (out.length >= MAX_CONNECTIONS) break;
+  }
+  return out;
 }
 
 /** Bound + de-duplicate a persisted id list before it is offered or reconnected. */
