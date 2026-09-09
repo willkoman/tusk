@@ -655,8 +655,12 @@ async fn disconnect(
     let result = disconnect_registered(&state, &connection_id).await;
     // Closing one connection must not disturb the others, but the Slack bot runs
     // against exactly one — if that is the one going away, stop it loudly instead of
-    // leaving a "connected" badge over a bot that can only answer with errors.
-    slack::on_connection_closed(&app, &connection_id);
+    // leaving a "connected" badge over a bot that can only answer with errors. Only
+    // on a clean disconnect: a failed one leaves the connection open, and a bot
+    // stopped for a session that is still there would be a worse surprise.
+    if result.is_ok() {
+        slack::on_connection_closed(&app, &connection_id);
+    }
     result
 }
 
