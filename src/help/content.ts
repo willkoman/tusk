@@ -2356,7 +2356,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "Every proposal is pinned to the exact Tusk connection, server-reported database, workspace, channel, thread, source message, and requester that created it. The bot answers against exactly one Tusk connection, chosen when it starts and changeable in **Settings ▸ Slack** while several are open; switching tabs in Tusk never redirects it. Approving a proposal after its connection or database changed fails closed, and disconnecting the bound connection stops the bot with a message. Execution uses a fresh read-only backend and does not join or roll back the UI cursor."
+        "md": "Every proposal is pinned to the exact Tusk connection, server-reported database, workspace, channel, thread, source message, and requester that created it. The bot answers against exactly one Tusk connection, chosen when it starts and changeable in **Settings ▸ Slack** while several are open; switching tabs in Tusk never redirects it. Approving a proposal after its connection or database changed fails closed. Disconnecting the bound connection stops the bot, says so in the statusbar, and turns **Start the bot on launch** back off, so it never comes back bound to whichever connection happens to open first — re-enable it and pick a target in **Settings ▸ Slack**. Execution uses a fresh read-only backend and does not join or roll back the UI cursor."
       },
       {
         "k": "list",
@@ -2834,18 +2834,22 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "table",
-        "head": ["State dot", "Means"],
+        "head": ["State", "Dot", "Means"],
         "rows": [
-          ["green", "idle"],
-          ["blue", "a query, page fetch, or *Load all* is running on this connection"],
-          ["accent", "a manual transaction is open on this connection"],
-          ["amber", "the transaction failed — `ROLLBACK` is required before anything else"],
-          ["red", "the transaction session was lost — disconnect and reconnect, then verify the outcome"]
+          ["idle", "filled", "nothing is running and no manual transaction is open"],
+          ["running", "pulsing", "a query, page fetch, or *Load all* is running on this connection"],
+          ["transaction", "hollow ring", "a manual transaction is open on this connection"],
+          ["failed", "warning", "the transaction failed — `ROLLBACK` is required before anything else"],
+          ["lost", "danger", "the transaction session was lost — disconnect and reconnect, then verify the outcome"]
         ]
       },
       {
         "k": "p",
-        "md": "Each connection is independent: its own result cursor, manual transaction and transaction bar, Explorer tree, autocomplete catalog, permissions, [[topic:history|query history]], tab set, and **Cancel**. Running a query on one connection never interrupts a result still streaming on another, and refreshing one Explorer never discards another connection's metadata."
+        "md": "Hover a chip to read its state in words. While a query is running the dot is a button: click it to cancel that connection's query — with a confirmation, and without switching to it first."
+      },
+      {
+        "k": "p",
+        "md": "Each connection is independent: its own result cursor, manual transaction and transaction bar, Explorer tree, autocomplete catalog, permissions, [[topic:history|query history]], tab set, recovered editor buffers, and **Cancel**. Running a query on one connection never interrupts a result still streaming on another, and refreshing one Explorer never discards another connection's metadata. Opening the same saved connection twice gives each session its own tabs, so neither can overwrite the other's unsaved buffers."
       },
       {
         "k": "p",
@@ -2853,7 +2857,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**✕** on a chip disconnects just that connection, with the same guards as always: an open manual transaction must be committed or rolled back first, and pending grid edits applied or discarded. Closing Tusk asks about each open transaction in turn. The other connections are untouched."
+        "md": "**✕** on a chip disconnects just that connection, with the same guards as always: a query still running on it must be cancelled or allowed to finish, an open manual transaction must be committed or rolled back, and pending grid edits applied or discarded. Closing Tusk asks about each open transaction in turn, and never discards another connection's pending edits without asking. The other connections are untouched."
       },
       {
         "k": "keys",
@@ -2866,7 +2870,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "tip",
-        "md": "The connect screen offers **Reopen last session** — the saved connections that were open when you last used Tusk. It never reconnects on its own, and ad-hoc connections typed in without saving are deliberately not remembered."
+        "md": "The connect screen offers **Reopen last session** — the saved connections that were open when you last used Tusk. The offer also appears in the **＋** panel, so connecting one profile first doesn't cost you the rest of the list, and anything that fails to reopen stays in the offer with its reason. It never reconnects on its own, and ad-hoc connections typed in without saving are deliberately not remembered."
       },
       {
         "k": "h",
@@ -2885,7 +2889,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "The footer statusbar shows status text, a **🟢/🟡 Slack** badge while the [[topic:slack|Slack bot]] is connecting or connected (hover for the error), and cursor info: line/column, `Stmt 2/5` in multi-statement buffers, selection character count. **Copy w/ column names** lives in the result toolbar next to Export…, not here — same `copyHeaders` pref as Settings → Grid."
+        "md": "The footer statusbar shows status text, a **🟢/🟡 Slack** badge while the [[topic:slack|Slack bot]] is connecting or connected — turning **🔴** with the reason in the status text if the bot stops on its own, such as when the connection it answers against is disconnected — and cursor info: line/column, `Stmt 2/5` in multi-statement buffers, selection character count. **Copy w/ column names** lives in the result toolbar next to Export…, not here — same `copyHeaders` pref as Settings → Grid."
       },
       {
         "k": "h",
