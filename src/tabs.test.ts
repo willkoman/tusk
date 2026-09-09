@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  EMPTY_GRID_VIEW,
   MAX_TAB_TITLE,
+  carryViewPrefs,
   clampPinSlot,
   cleanTabTitle,
   closeManyTargets,
   filterTabs,
+  gridViewFor,
   interruptedResult,
   makeTab,
   pendingCount,
@@ -136,5 +139,28 @@ describe("filterTabs", () => {
     expect(filterTabs(items, "/work").map((x) => x.label)).toEqual(["orders.sql"]);
     expect(filterTabs(items, "prod").map((x) => x.label)).toEqual(["orders.sql"]);
     expect(filterTabs(items, "nope")).toEqual([]);
+  });
+});
+
+describe("carryViewPrefs", () => {
+  it("keeps panel toggles across a result reset", () => {
+    const prev = { ...gridViewFor(3), filterRowOpen: true, rowNumbers: false, stickyFirst: true, recordOpen: true, findOpen: true };
+    const next = { ...gridViewFor(5), ...carryViewPrefs(prev) };
+    expect(next.order).toEqual([0, 1, 2, 3, 4]);
+    expect(next.filterRowOpen).toBe(true);
+    expect(next.rowNumbers).toBe(false);
+    expect(next.stickyFirst).toBe(true);
+    expect(next.recordOpen).toBe(true);
+    expect(next.findOpen).toBe(true);
+  });
+
+  it("falls back to the defaults when there is no previous view", () => {
+    expect(carryViewPrefs(undefined)).toEqual({
+      filterRowOpen: EMPTY_GRID_VIEW.filterRowOpen,
+      rowNumbers: EMPTY_GRID_VIEW.rowNumbers,
+      stickyFirst: EMPTY_GRID_VIEW.stickyFirst,
+      recordOpen: EMPTY_GRID_VIEW.recordOpen,
+      findOpen: EMPTY_GRID_VIEW.findOpen,
+    });
   });
 });

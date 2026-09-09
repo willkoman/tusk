@@ -89,6 +89,14 @@ export type GridView = {
    */
   filters: FilterTree;
   filterRowOpen: boolean;
+  /** Show the row number in the gutter (off narrows the gutter to a select strip). */
+  rowNumbers: boolean;
+  /** Keep the first displayed column pinned while the body scrolls sideways. */
+  stickyFirst: boolean;
+  /** Record view: the focused row as a name/value list beside the grid. */
+  recordOpen: boolean;
+  /** Find-in-loaded-rows bar above the grid. */
+  findOpen: boolean;
 };
 
 export const EMPTY_GRID_VIEW: GridView = {
@@ -98,11 +106,33 @@ export const EMPTY_GRID_VIEW: GridView = {
   sorts: [],
   filters: EMPTY_FILTER,
   filterRowOpen: false,
+  rowNumbers: true,
+  stickyFirst: false,
+  recordOpen: false,
+  findOpen: false,
 };
 
 /** Fresh grid view sized to a column count (display order 0..n-1). */
 export function gridViewFor(ncols: number): GridView {
   return { ...EMPTY_GRID_VIEW, order: Array.from({ length: ncols }, (_, i) => i) };
+}
+
+/**
+ * The parts of a grid view that are UI preferences rather than result state.
+ * A new query resets widths, order, sorts and filters; these panel toggles are
+ * things the user turned on and expects to still be on after the next run.
+ */
+export function carryViewPrefs(prev: GridView | undefined): Pick<
+  GridView,
+  "filterRowOpen" | "rowNumbers" | "stickyFirst" | "recordOpen" | "findOpen"
+> {
+  return {
+    filterRowOpen: prev?.filterRowOpen ?? EMPTY_GRID_VIEW.filterRowOpen,
+    rowNumbers: prev?.rowNumbers ?? EMPTY_GRID_VIEW.rowNumbers,
+    stickyFirst: prev?.stickyFirst ?? EMPTY_GRID_VIEW.stickyFirst,
+    recordOpen: prev?.recordOpen ?? EMPTY_GRID_VIEW.recordOpen,
+    findOpen: prev?.findOpen ?? EMPTY_GRID_VIEW.findOpen,
+  };
 }
 
 // --- in-grid pending edits (per tab, ephemeral — cleared on epoch bump) ---
