@@ -35,7 +35,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**Click** — connects immediately if embedded or the password is saved; otherwise loads into the form so you can type the password.",
-          "**Right-click** — **Connect**, **Edit**, **Duplicate**, **Set as default** / **Unset default**, **Copy connection string**, **Delete**."
+          "**Right-click** — **Connect**, **Edit**, **Duplicate**, **Set as default** / **Unset default**, **Copy connection string**, **Delete…**. Deleting asks first: it removes the saved connection and its keychain password permanently, and does not touch the database itself."
         ]
       },
       {
@@ -45,7 +45,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "tip",
-        "md": "**Connect on startup**: check the box in the form or right-click → *Set as default*. Exactly one profile holds the flag — setting it clears the others — and Tusk auto-connects on launch."
+        "md": "**Connect on startup**: check the box in the form or right-click → *Set as default*. Exactly one profile holds the flag — setting it clears the others — and Tusk auto-connects on launch. Recovering from an error with **Try to continue** deliberately does not: the profile is offered in the reopen list instead of being connected behind your back."
       },
       {
         "k": "h",
@@ -780,7 +780,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**Disabled** for multi-statement runs, anything that isn't `SELECT`/`WITH`/`TABLE`/`VALUES` (plus DuckDB's `FROM`-first and `PIVOT` reads), on **MySQL and SQL Server** when the result has duplicate column names, and on **SQL Server** for any statement containing `WITH` or `ORDER BY` outside a literal or comment — table hints such as `WITH (NOLOCK)`, window ordering and ordered subqueries included — because T-SQL rejects both inside the derived table the wrap needs.",
+          "**Disabled** for multi-statement runs, anything that isn't `SELECT`/`WITH`/`TABLE`/`VALUES` (plus DuckDB's `FROM`-first and `PIVOT` reads), on **MySQL and SQL Server** when the result has duplicate column names, and on **SQL Server** for any statement containing `WITH` outside a literal or comment (table hints such as `WITH (NOLOCK)` included), or an `ORDER BY` the wrap cannot hoist — window ordering inside `OVER (…)`, an ordered subquery, or an `ORDER BY` paired with `OFFSET`/`FETCH`, whose pagination has to stay inside — because T-SQL rejects both inside the derived table the wrap needs. A plain trailing `ORDER BY` is fine: it moves onto the wrapper, and a grid sort replaces it.",
           "Re-running the *same unedited* query text keeps active rules; edit the text first for a clean result.",
           "A sort/filter re-run resets scroll and selection — the rows underneath changed."
         ]
@@ -1211,7 +1211,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "**SQLite rebuilds instead of altering.** SQLite's `ALTER TABLE` only renames the table, renames a column, adds a column and drops one. Anything else — a type change, a NOT NULL or default change, a key change, a constraint edit, a column reorder, or dropping a column SQLite won't drop in place — makes Tusk generate the documented rebuild: `CREATE` the new shape, `INSERT … SELECT` the rows, `DROP` the original, `RENAME` the replacement into place, then recreate its indexes and triggers. The whole script runs as one transaction, the preview is labelled, and the primary button reads **Rebuild table**. The new shape is built from the table's stored `CREATE` text, so CHECK constraints (names included), column collations, generated columns and `WITHOUT ROWID` / `STRICT` are carried across; the swap runs under `PRAGMA legacy_alter_table` so a table a view or trigger refers to can be rebuilt at all. Tusk refuses a rebuild it cannot do safely and says why: a rename in the same pass (do the rename on its own first), dropping a column an index, constraint or trigger still uses (drop that too), and a stored definition it could not read."
+        "md": "**SQLite rebuilds instead of altering.** SQLite's `ALTER TABLE` only renames the table, renames a column, adds a column and drops one. Anything else — a type change, a NOT NULL or default change, a key change, a constraint edit, a column reorder, or dropping a column SQLite won't drop in place — makes Tusk generate the documented rebuild: `CREATE` the new shape, `INSERT … SELECT` the rows, `DROP` the original, `RENAME` the replacement into place, then recreate its indexes and triggers. The whole script runs as one transaction, the preview is labelled, and the primary button reads **Rebuild table**. The new shape is built from the table's stored `CREATE` text, so CHECK constraints (names included), column collations, generated columns and `WITHOUT ROWID` / `STRICT` are carried across; the swap runs under `PRAGMA legacy_alter_table` so a table a view or trigger refers to can be rebuilt at all. Triggers are replayed verbatim, semicolons in their bodies included. Because dropping the original deletes its rows out from under anything that references them, Tusk switches `PRAGMA foreign_keys` off for the rebuild and back on immediately after — SQLite ignores that pragma inside a transaction, so the two statements run around the rebuild's own transaction, and the dialog note says so. Tusk refuses a rebuild it cannot do safely and says why: a rename in the same pass (do the rename on its own first), dropping a column an index, constraint or trigger still uses (drop that too), and a stored definition it could not read."
       },
       {
         "k": "p",
@@ -1517,7 +1517,7 @@ export const TOPICS: Topic[] = [
           ],
           [
             "**Destination**",
-            "**Choose file…** opens the native save dialog. Nothing runs until a path is set."
+            "**Choose file…** opens the native save dialog. Nothing runs until a path is set. If the picker resolves without ever appearing, Tusk shows you the path it came back with and asks before using it — it never writes to a destination it cannot tell you chose."
           ]
         ]
       },
@@ -2357,7 +2357,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "Every proposal is pinned to the exact Tusk connection, server-reported database, workspace, channel, thread, source message, and requester that created it. The bot answers against exactly one Tusk connection, chosen when it starts and changeable in **Settings ▸ Slack** while several are open; switching tabs in Tusk never redirects it. Approving a proposal after its connection or database changed fails closed. Disconnecting the bound connection stops the bot, says so in the statusbar, and switches the bot's **On/Off** toggle in **Settings ▸ Slack** back off, so it never comes back on the next launch bound to whichever connection happens to open first — switch it on again and pick a target there. Execution uses a fresh read-only backend and does not join or roll back the UI cursor. SQL Server connections are refused outright, at the question and again at approval: it has no session read-only mode, so that backend could not be engine-enforced."
+        "md": "Every proposal is pinned to the exact Tusk connection, server-reported database, workspace, channel, thread, source message, and requester that created it. The bot answers against exactly one Tusk connection, chosen when it starts and changeable in **Settings ▸ Slack** while several are open; switching tabs in Tusk never redirects it. Approving a proposal after its connection or database changed fails closed. Autostart is bound to a **saved** connection: the bot starts by itself only when that connection is open, otherwise it stays stopped and says which connection it is waiting for. It never binds to whichever connection happens to open first, and a connection you have not saved can be picked by hand but never autostarted. Disconnecting the bound connection stops the bot and says so in the statusbar; your settings are left alone, so reopening that connection brings the bot back. Execution uses a fresh read-only backend and does not join or roll back the UI cursor. SQL Server connections are refused outright, at the question and again at approval: it has no session read-only mode, so that backend could not be engine-enforced."
       },
       {
         "k": "list",
@@ -3215,7 +3215,8 @@ export const TOPICS: Topic[] = [
           "**Reach a database through an SSH tunnel.** PostgreSQL, MySQL and SQL Server connections can tunnel: host, port, user, and Password / Private key / SSH agent. The SSH client is built in, and the secret goes to the OS keychain under its own entry. Host keys are checked against `~/.ssh/known_hosts` (read-only) and Tusk's own trust store — an unknown host shows its `SHA256:…` fingerprint before **Trust and connect**, a changed key is refused outright. See [[topic:getting-started|Connections & drivers]].",
           "**Microsoft SQL Server is a connectable driver.** Port 1433, SQL login, keychain password, the usual `sslmode` choices. Results page with `OFFSET`/`FETCH`; the Explorer shows schemas, tables and views with columns, indexes, constraints, triggers, sequences and routines; Copy DDL reconstructs tables from `sys.*` with foreign keys as trailing `ALTER`s. The editor speaks T-SQL — `[bracketed identifiers]`, `N'literals'`, nested block comments, `BEGIN … END` blocks and `GO` batches all lex correctly — and manual transactions use `BEGIN TRANSACTION` / `SAVE TRANSACTION`, verified against `@@TRANCOUNT` and `XACT_STATE()`. ERD, in-grid editing, export, backup and restore all work.",
           "**What SQL Server doesn't do yet.** File import, the Explorer's DDL builders (no T-SQL builders yet), the Slack bot (Tusk can't open an engine-enforced read-only session there) and Explain (T-SQL has no `EXPLAIN`) are all refused with the reason. Table Copy DDL needs SQL Server 2017 or later — on an older server it refuses rather than emitting a script with the keys silently missing; stored view/procedure/function text still works there.",
-          "**Table editing on every engine that can express it.** *Create table…* covers types, NOT NULL, defaults, single or composite keys, unique, check and each engine's auto-numbering; foreign keys get a searchable picker instead of a typed name. *Modify table…* now reorders columns, adds UNIQUE/CHECK/FK constraints, drops each kind with that engine's own action, and refuses clearly on an empty or duplicate name, a nullable primary key or a generated column. **SQLite rebuilds** — create, `INSERT … SELECT`, drop, rename, recreate indexes and triggers, in one transaction, with the button reading **Rebuild table**. The Explorer's DDL menu is live on PostgreSQL, DuckDB, MySQL and SQLite, each action offered only where the engine has it, and the Explorer now reports real indexes, constraints and triggers on all of them. See [[topic:sidebar|Schema explorer & DDL]]."
+          "**Table editing on every engine that can express it.** *Create table…* covers types, NOT NULL, defaults, single or composite keys, unique, check and each engine's auto-numbering; foreign keys get a searchable picker instead of a typed name. *Modify table…* now reorders columns, adds UNIQUE/CHECK/FK constraints, drops each kind with that engine's own action, and refuses clearly on an empty or duplicate name, a nullable primary key or a generated column. **SQLite rebuilds** — create, `INSERT … SELECT`, drop, rename, recreate indexes and triggers, in one transaction, with the button reading **Rebuild table**. The Explorer's DDL menu is live on PostgreSQL, DuckDB, MySQL and SQLite, each action offered only where the engine has it, and the Explorer now reports real indexes, constraints and triggers on all of them. See [[topic:sidebar|Schema explorer & DDL]].",
+          "**Fewer ways to lose something you didn't choose.** Deleting a saved connection asks first — it takes the keychain password with it. **Try to continue** after an error no longer connects your connect-on-startup profile behind your back. A file picker that resolves without ever appearing is confirmed rather than written to. The Slack bot's autostart binds to one **saved** connection: it waits for that connection instead of latching onto whichever opens first, and disconnecting no longer rewrites the setting. On SQL Server, a query ending in `ORDER BY` can be sorted and filtered again — the ordering moves onto the wrapper instead of disabling both buttons."
         ]
       },
       {
