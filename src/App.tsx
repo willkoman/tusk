@@ -2114,7 +2114,12 @@ function App() {
     const statusRevision = slackStatusRevision;
     void invoke<SlackStatus>("slack_status")
       .then((current) => {
-        if (appMounted && slackStatusRevision === statusRevision) setSlackStatus(current);
+        if (!appMounted || slackStatusRevision !== statusRevision) return;
+        setSlackStatus(current);
+        // The armed-but-waiting status is published during Rust setup, BEFORE this
+        // listener exists, so the snapshot is the only place it can reach the
+        // statusbar — otherwise autostart waits in silence until Settings is opened.
+        setSlackNotice(!current.running && current.error ? current.error : "");
       })
       .catch(() => {});
   });
@@ -4291,7 +4296,7 @@ function App() {
       if (embedded) applyAuthoritativeTransaction(c, embedded, "statement", before);
       // The dialog stays open with the message, but the status bar still carried the
       // PREVIOUS action's `OK` — a failed edit must never read as a successful one.
-      if (origin.tabId && originCurrent(origin)) patchResult(origin.tabId, { status: "failed — see the dialog" });
+      if (origin.tabId && originCurrent(origin)) patchResult(origin.tabId, { status: "failed" });
       return { ok: false, error: message };
     } finally {
       if (fkGuard) {

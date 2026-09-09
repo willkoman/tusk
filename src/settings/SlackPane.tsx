@@ -313,7 +313,11 @@ export function SlackPane(props: {
           await disableAfterRestartFailure("Bot started, but enabling could not be persisted. Bot stopped and remains disabled.");
           return;
         }
-        setNote("Bot started.");
+        setNote(boundProfileId
+          ? "Bot started."
+          : target
+            ? "Bot started. This connection isn't saved, so the bot can't start by itself next launch."
+            : "Bot started, but it isn't answering against any connection yet — open one and pick it here.");
       } else {
         if (!(await save({ enabled: false }))) {
           patch({ enabled: true });
@@ -484,9 +488,13 @@ export function SlackPane(props: {
                   // Repointing also re-arms autostart at the new target, so the next
                   // launch waits for the connection the bot is actually answering on.
                   .then(() => save({ boundProfileId }, false))
-                  .then(() => setNote(boundProfileId
-                    ? "Bot repointed — it applies from the next question."
-                    : "Bot repointed — it applies from the next question. This connection isn't saved, so the bot can't start by itself next launch."))
+                  .then((saved) => {
+                    // A failed save already reported itself; don't claim success over it.
+                    if (!saved) return;
+                    setNote(boundProfileId
+                      ? "Bot repointed — it applies from the next question."
+                      : "Bot repointed — it applies from the next question. This connection isn't saved, so the bot can't start by itself next launch.");
+                  })
                   .catch((err) => setNote(`❌ ${errMsg(err)}`))
                   .finally(() => setBusy(false));
               }}
