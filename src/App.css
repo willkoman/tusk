@@ -1201,13 +1201,18 @@ body > div > .cm-tooltip { z-index: 500; }
 /* Completion rows: one mono kind letter in a fixed slot, the detail muted. The
    CodeMirror default icons are box-drawing glyphs that render as empty squares. */
 .cm-tooltip-autocomplete > ul > li { padding: 2px var(--s2); }
-.cm-tooltip-autocomplete .cm-completionIcon { width: 1.2em; padding-right: 6px; opacity: 1; color: var(--muted); font-family: var(--mono); font-size: 10px; font-weight: 600; text-align: center; }
-.cm-completionIcon-property::after { content: "c"; }
-.cm-completionIcon-class::after { content: "t"; }
-.cm-completionIcon-function::after,
-.cm-completionIcon-method::after { content: "ƒ"; }
-.cm-completionIcon-type::after { content: "T"; }
-.cm-completionIcon-keyword::after { content: "k"; }
+.cm-tooltip-autocomplete ul .cm-completionIcon { width: 1.2em; padding-right: 6px; opacity: 1; color: var(--muted); font-family: var(--mono); font-size: 10px; font-weight: 600; text-align: center; }
+/* CodeMirror scopes its own icon glyphs under the generated theme class, so these
+   need the same reach: the default `property` glyph is a box-drawing square that
+   renders as an empty box on Windows. */
+.cm-tooltip-autocomplete ul .cm-completionIcon-property::after { content: "c"; }
+.cm-tooltip-autocomplete ul .cm-completionIcon-class::after { content: "t"; }
+.cm-tooltip-autocomplete ul .cm-completionIcon-namespace::after { content: "s"; }
+.cm-tooltip-autocomplete ul .cm-completionIcon-function::after,
+.cm-tooltip-autocomplete ul .cm-completionIcon-method::after { content: "ƒ"; }
+.cm-tooltip-autocomplete ul .cm-completionIcon-type::after { content: "T"; }
+.cm-tooltip-autocomplete ul .cm-completionIcon-keyword::after { content: "k"; }
+.cm-tooltip-autocomplete ul .cm-completionIcon-text::after { content: "•"; }
 .cm-tooltip-autocomplete .cm-completionDetail { color: var(--muted); font-style: normal; font-size: var(--fs-xs); margin-left: var(--s3); }
 
 /* --- tab strip. Active tab = the editor's own surface + a 2px accent top edge,

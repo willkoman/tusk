@@ -788,6 +788,7 @@ export const TOPICS: Topic[] = [
         "items": [
           "Both axes virtualize: only the visible rows and columns are in the DOM.",
           "Values are text straight from the driver. A zero-row result still shows its headers.",
+          "Columns open at the width of the first page of their content, between 64 and 360 px. Drag an edge to resize, double-click it to autofit.",
           "Column widths, order, hidden columns, sorts, and filters are per-tab view state."
         ]
       },
@@ -1372,7 +1373,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**DDL & relationships…** opens the DDL and FK graph viewer; **Schema diagram…** opens the whole-schema ERD. See [[topic:erd|the relationship viewer]].",
-          "**Truncate…** and **Drop…** always confirm, with a `CASCADE` checkbox. Truncate adds `RESTART IDENTITY`. They sit last in every menu, behind a wider rule.",
+          "**Truncate…** and **Drop…** always confirm, with a `CASCADE` checkbox and the table name typed to confirm. Truncate adds `RESTART IDENTITY`. They sit last in every menu, behind a wider rule.",
           "A bold entry opens a submenu: hover it, or press [[kbd:ArrowRight]]; [[kbd:ArrowLeft]] or [[kbd:Escape]] closes it.",
           "The header **＋** is selection-aware, offering *New column / index / constraint on X…* before *New table*, *New schema* and *New database*."
         ]
@@ -2646,7 +2647,7 @@ export const TOPICS: Topic[] = [
         "items": [
           "**Recorded** — anything launched from the editor: Run, run-selection, panel re-runs, and multi-statement scripts as one entry.",
           "**Recorded** — [[topic:grid-editing|grid Commit/Apply]] scripts, with transaction work carrying a leading id and event marker.",
-          "**Recorded with a marker** — `-- [Slack] asked by <user>` for approved bot runs, `-- [Explorer]` for sidebar DDL, `-- [Export] <format> → <path>` for a full-query file export.",
+          "**Recorded with a marker** — `-- [Slack] asked by <user>` for approved bot runs, `-- [Explorer]` for sidebar DDL, `-- [Export] <format> → <path>` for a full-query file export. The list shows the marker as a short tag and the statement beside it; the stored SQL keeps the whole comment, so Insert, Open in tab and Re-run replay the entry exactly.",
           "**Not recorded** — grid sort/filter re-streams. Only the original base query is kept.",
           "For a streamed read the row count is the first fetched page — see [[topic:results|Results & streaming]]."
         ]
@@ -3134,7 +3135,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "A saved connection can be tagged **Development**, **Staging** or **Production** on the connect form. The tag is metadata: it never reaches the driver."
+        "md": "A connection can be tagged **Development**, **Staging** or **Production** on the connect form. The tag applies to the session whether or not you save the profile. It is metadata: it never reaches the driver."
       },
       {
         "k": "list",
@@ -3264,7 +3265,7 @@ export const TOPICS: Topic[] = [
           ],
           [
             "**Grid**",
-            "Row density (Normal / Compact, combined with the Appearance density: 28/22 px or 24/18 px), zebra striping, NULL display, default column width (48–900), copy with column names."
+            "Row density (Normal / Compact, combined with the Appearance density: 28/22 px or 24/18 px), zebra striping, NULL display, fallback column width (48–900, used only when a column has nothing to measure), copy with column names."
           ],
           [
             "**Plans**",
@@ -3573,11 +3574,14 @@ export const TOPICS: Topic[] = [
           "**Visible keyboard focus** on every control, in every theme.",
           "**A running query dims and labels the previous result**, disables the toolbar acting on it, and shows a live timer.",
           "**Drop and Truncate state what goes** — kind, name, rows, size — and a table, schema or database needs its name typed.",
-          "**Environment tags** mark a saved connection Development, Staging or Production on its chip, tabs, statusbar and confirmations.",
+          "**Environment tags** mark a connection Development, Staging or Production on its chip, tabs, statusbar and confirmations.",
           "**Long Explorer menus group into submenus** — Generate, Copy, Data — with the destructive actions last. See [[topic:sidebar|Schema explorer]].",
           "**Plan heat is a node's share of the plan total**, on a slate-to-amber ramp, and the status bar reads the plan. See [[topic:plans|EXPLAIN plans]].",
           "**The parameter prompt lays out two columns**, and Run waits until every parameter has a value, NULL, or raw.",
-          "**Connect on startup opens once per launch**, never again on an error recovery or a window reload."
+          "**Connect on startup opens once per launch**, never again on an error recovery or a window reload.",
+          "**Result columns open at the width of their content**, bounded, with an ellipsis when a value still does not fit.",
+          "**Query history shows the statement**, with provenance as a short tag rather than an internal transaction id.",
+          "**Truncate needs the table name typed**, like Drop."
         ]
       },
       {
