@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { detectParams, substituteParams, type ParamValue } from "./params";
+import { detectParams, missingParams, substituteParams, type Param, type ParamValue } from "./params";
 import { setSqlDialect } from "./ident";
 
 afterEach(() => setSqlDialect("postgres"));
@@ -83,5 +83,28 @@ describe("substituteParams", () => {
 
   it("does not touch lookalikes inside strings", () => {
     expect(substituteParams("SELECT '$1' WHERE a = $1", { $1: v("x") })).toBe("SELECT '$1' WHERE a = 'x'");
+  });
+});
+
+describe("missingParams", () => {
+  const params: Param[] = [
+    { name: "$1", kind: "positional" },
+    { name: ":cc", kind: "named" },
+  ];
+
+  it("blocks a blank value, and only a blank one", () => {
+    // The defect: an empty box substituted as '' and previewed `id > ''` as runnable.
+    expect(missingParams(params, { $1: v(""), ":cc": v("US") })).toEqual(["$1"]);
+    expect(missingParams(params, { $1: v("   "), ":cc": v("US") })).toEqual(["$1"]);
+    expect(missingParams(params, { $1: v("7"), ":cc": v("US") })).toEqual([]);
+  });
+
+  it("counts NULL as answered, and never blocks raw", () => {
+    expect(missingParams(params, { $1: v("", { isNull: true }), ":cc": v("US") })).toEqual([]);
+    expect(missingParams(params, { $1: v("", { raw: true }), ":cc": v("US") })).toEqual([]);
+  });
+
+  it("treats an unknown param as unanswered", () => {
+    expect(missingParams(params, { $1: v("7") })).toEqual([":cc"]);
   });
 });
