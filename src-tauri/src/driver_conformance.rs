@@ -370,7 +370,14 @@ async fn filter_where_battery(b: &mut Backend, eng: &Eng) {
     let text_cast = |col: &str| match eng.name {
         "mysql" => format!("CAST({col} AS CHAR)"),
         "sqlite" => format!("CAST({col} AS TEXT)"),
+        // T-SQL has no `::` cast operator.
+        "mssql" => format!("CAST({col} AS VARCHAR(MAX))"),
         _ => format!("{col}::text"),
+    };
+    // Mirrors `lit()` in src/sql/ident.ts: every SQL Server string literal is `N'…'`.
+    let text = |literal: &str| match eng.name {
+        "mssql" => format!("N{literal}"),
+        _ => literal.to_string(),
     };
     let bool_is = |col: &str, want: bool| match eng.name {
         "postgres" | "duckdb" => format!("{col} IS {}", if want { "TRUE" } else { "FALSE" }),
@@ -378,20 +385,24 @@ async fn filter_where_battery(b: &mut Backend, eng: &Eng) {
     };
 
     exec(b, &format!("DROP TABLE IF EXISTS {}", q("filt_t"))).await;
+    // `BOOLEAN` is not a T-SQL type and `TRUE`/`FALSE` are not T-SQL literals, so the
+    // fixture uses the engine's own spelling (`bit`, `1`/`0` there).
     exec(
         b,
         &format!(
-            "CREATE TABLE {} (id INTEGER, name VARCHAR(40), qty DECIMAL(10,2), flag BOOLEAN)",
-            q("filt_t")
+            "CREATE TABLE {} (id INTEGER, name VARCHAR(40), qty DECIMAL(10,2), flag {})",
+            q("filt_t"),
+            eng.bool_type
         ),
     )
     .await;
+    let (yes, no) = (eng.bool_true, eng.bool_false);
     exec(
         b,
         &format!(
-            "INSERT INTO {} VALUES (1, 'Alpha', 10.00, TRUE), (2, 'beta', 20.50, FALSE), \
-             (3, '50% off', 30.00, TRUE), (4, 'a_b', NULL, NULL), (5, 'o''brien', 5.00, FALSE), \
-             (6, '', 0.00, TRUE), (7, 'axb', 1.00, FALSE), (8, 'b!c', 2.00, FALSE)",
+            "INSERT INTO {} VALUES (1, 'Alpha', 10.00, {yes}), (2, 'beta', 20.50, {no}), \
+             (3, '50% off', 30.00, {yes}), (4, 'a_b', NULL, NULL), (5, 'o''brien', 5.00, {no}), \
+             (6, '', 0.00, {yes}), (7, 'axb', 1.00, {no}), (8, 'b!c', 2.00, {no})",
             q("filt_t")
         ),
     )
@@ -399,20 +410,20 @@ async fn filter_where_battery(b: &mut Backend, eng: &Eng) {
 
     let cases: Vec<(String, Vec<&str>)> = vec![
         // contains — case-insensitive on every engine, ESCAPE always declared
-        (ci(&text_cast(&name), "'%alph%'", esc), vec!["1"]),
+        (ci(&text_cast(&name), &text("'%alph%'"), esc), vec!["1"]),
         // starts with, `%` in the user's text escaped (matches literally, not as a wildcard)
-        (ci(&text_cast(&name), "'50!%%'", esc), vec!["3"]),
+        (ci(&text_cast(&name), &text("'50!%%'"), esc), vec!["3"]),
         // contains, `_` escaped: 'a_b' matches, 'axb' must not
-        (ci(&text_cast(&name), "'%a!_b%'", esc), vec!["4"]),
+        (ci(&text_cast(&name), &text("'%a!_b%'"), esc), vec!["4"]),
         // contains, an escape character in the user's own text is escaped with itself
-        (ci(&text_cast(&name), "'%b!!c%'", esc), vec!["8"]),
+        (ci(&text_cast(&name), &text("'%b!!c%'"), esc), vec!["8"]),
         // like — raw pattern, the wildcards are the user's
         (
-            format!("{} LIKE '%b%'", text_cast(&name)),
+            format!("{} LIKE {}", text_cast(&name), text("'%b%'")),
             vec!["2", "4", "5", "7", "8"],
         ),
         // every LIKE comparison is done on the text form of the column
-        (ci(&text_cast(&qty), "'%20%'", esc), vec!["2"]),
+        (ci(&text_cast(&qty), &text("'%20%'"), esc), vec!["2"]),
         // typed comparisons: unquoted numeric literal against a numeric column
         (format!("{qty} BETWEEN 5 AND 20.5"), vec!["1", "2", "5"]),
         (
@@ -434,8 +445,8 @@ async fn filter_where_battery(b: &mut Backend, eng: &Eng) {
         (bool_is(&flag, true), vec!["1", "3", "6"]),
         (bool_is(&flag, false), vec!["2", "5", "7", "8"]),
         // is empty + a quote-carrying literal — both on the text form
-        (format!("{} = ''", text_cast(&name)), vec!["6"]),
-        (format!("{name} = 'o''brien'"), vec!["5"]),
+        (format!("{} = {}", text_cast(&name), text("''")), vec!["6"]),
+        (format!("{name} = {}", text("'o''brien'")), vec!["5"]),
         // AND of an OR group — the shape the builder emits for nested groups
         (
             format!("({id} = 1 OR {id} = 2) AND {}", bool_is(&flag, true)),
@@ -1630,6 +1641,48 @@ async fn import_battery(b: &mut Backend, eng: &Eng) {
     let q = |n: &str| (eng.quote)(n);
     let table = format!("{}.{}", q(eng.schema), q("imp_t"));
     let cancel = Arc::new(AtomicBool::new(false));
+
+    // SQL Server has no import path yet. Pin the REFUSAL (the manual, the Explorer
+    // tooltip and the hardening notes all say so) instead of running a battery that
+    // asserts support the driver does not have.
+    if eng.name == "mssql" {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unsupported.csv");
+        std::fs::write(&path, "id\n1\n").unwrap();
+        let mut options: ImportOptions = serde_json::from_str(r#"{"format":"csv"}"#).unwrap();
+        options.source_columns = vec!["id".to_string()];
+        let error = run_import(
+            b,
+            &ImportRequest {
+                path: path.to_string_lossy().to_string(),
+                options,
+                target: ImportTarget {
+                    schema: eng.schema.to_string(),
+                    table: "imp_t".to_string(),
+                    create: true,
+                    truncate: false,
+                    conflict: "error".to_string(),
+                    key_columns: Vec::new(),
+                    columns: vec![ImportColumn {
+                        source: 0,
+                        target: "id".into(),
+                        kind: "integer".into(),
+                        empty_as_null: true,
+                    }],
+                },
+            },
+            &cancel,
+            |_| {},
+        )
+        .await
+        .expect_err("import is refused on SQL Server");
+        assert!(
+            error.message.contains("SQL Server"),
+            "[mssql] import refusal must name the engine: {}",
+            error.message
+        );
+        return;
+    }
 
     let dir = tempfile::tempdir().unwrap();
     let write = |name: &str, body: &str| {

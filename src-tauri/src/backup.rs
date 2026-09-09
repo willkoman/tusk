@@ -600,6 +600,11 @@ async fn backup_inner(
     let dialect = SqlDialect::parse(caps.kind)?;
     let is_pg = matches!(backend, Backend::Pg(_));
     let is_mysql = matches!(backend, Backend::MySql(_));
+    // SQL Server's reconstruction already emits foreign keys as trailing
+    // `ALTER TABLE … ADD CONSTRAINT` lines, in the same shape PostgreSQL's does — so
+    // they can be deferred past all data and a cycle restores. Only SQLite and DuckDB
+    // truly cannot add one with ALTER TABLE.
+    let deferrable_fks = is_pg || is_mysql || matches!(backend, Backend::MsSql(_));
 
     let tree = backend.build_tree().await?;
     let database = tree.database.clone();
@@ -805,7 +810,7 @@ async fn backup_inner(
         .await?;
         out.stmt("PRAGMA foreign_keys = OFF").await?;
     }
-    if !cyclic.is_empty() && !is_pg && !is_mysql {
+    if !cyclic.is_empty() && !deferrable_fks {
         warnings.push(format!(
             "foreign key cycle among {} — {} cannot add a foreign key with ALTER TABLE, \
              so these tables are emitted in catalog order and the dump may not restore \
@@ -872,6 +877,15 @@ async fn backup_inner(
                         "CREATE DATABASE IF NOT EXISTS {}",
                         ident_for(schema, dialect)
                     )
+                } else if dialect == SqlDialect::MsSql {
+                    // T-SQL has no `CREATE SCHEMA IF NOT EXISTS`, and `CREATE SCHEMA`
+                    // must be the first statement of its batch — hence the guarded
+                    // `EXEC`, which is the documented idiom.
+                    format!(
+                        "IF SCHEMA_ID('{}') IS NULL EXEC('CREATE SCHEMA {}')",
+                        schema.replace('\'', "''"),
+                        ident_for(schema, dialect).replace('\'', "''")
+                    )
                 } else {
                     format!("CREATE SCHEMA IF NOT EXISTS {}", ident_for(schema, dialect))
                 };
@@ -914,7 +928,7 @@ async fn backup_inner(
             }
             match backend.relation_ddl(&t.kind, &t.schema, &t.name).await {
                 Ok(ddl) => {
-                    let (main, fks) = if is_pg {
+                    let (main, fks) = if is_pg || matches!(backend, Backend::MsSql(_)) {
                         split_fk_alters(&ddl)
                     } else if is_mysql {
                         split_mysql_fk_alters(

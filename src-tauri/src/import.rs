@@ -388,6 +388,13 @@ impl Dialect {
             "duckdb" => Self::DuckDb,
             "sqlite" => Self::Sqlite,
             "mysql" => Self::MySql,
+            // Named explicitly: this is the reason the Explorer's disabled import
+            // items, the manual and `docs/adversarial-hardening.md` all give.
+            "mssql" => {
+                return Err(AppError::new(
+                    "file import isn't available on SQL Server yet — use the SQL editor or a bulk-load tool",
+                ))
+            }
             _ => return Err(AppError::new("unsupported import dialect")),
         })
     }
