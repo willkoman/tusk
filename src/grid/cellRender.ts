@@ -117,6 +117,29 @@ function jsonByValues(rows: readonly (readonly (string | null)[])[], col: number
   return seen > 0;
 }
 
+/** ISO-8601 date, or date + time with an optional fraction and offset. Deliberately
+ *  strict: a false positive would right-pad and re-badge a plain text column. */
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+const TIMESTAMP = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?([+-]\d{2}(:?\d{2})?|Z)?$/;
+
+/** "date" / "timestamp" when EVERY sampled non-NULL value is one; null otherwise. */
+function datetimeByValues(
+  rows: readonly (readonly (string | null)[])[],
+  col: number,
+  probe: number,
+): "date" | "timestamp" | null {
+  let seen = 0;
+  let anyTime = false;
+  for (const row of rows) {
+    const v = row?.[col];
+    if (v === null || v === undefined) continue;
+    if (TIMESTAMP.test(v)) anyTime = true;
+    else if (!DATE_ONLY.test(v)) return null;
+    if (++seen >= probe) break;
+  }
+  return seen > 0 ? (anyTime ? "timestamp" : "date") : null;
+}
+
 /**
  * Render class + header badge for every result column.
  *
@@ -150,6 +173,10 @@ export function columnRenders(
       return { cls: "number", badge: "num", badgeTitle: "numeric values", inferred: true };
     if (jsonByValues(sample, i, 20))
       return { cls: "json", badge: "json", badgeTitle: "JSON values", inferred: true };
-    return { cls: "text", badge: "", badgeTitle: "", inferred: true };
+    const stamp = datetimeByValues(sample, i, 20);
+    if (stamp) return { cls: "datetime", badge: stamp, badgeTitle: `${stamp} values`, inferred: true };
+    // Every header in a row carries a badge, or none of them do. A half-badged
+    // header row reads as a rendering fault rather than as "this one is untyped".
+    return { cls: "text", badge: "text", badgeTitle: "text values", inferred: true };
   });
 }

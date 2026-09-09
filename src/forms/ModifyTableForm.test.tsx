@@ -90,11 +90,11 @@ describe("ModifyTableForm — constraint drops", () => {
     const v = open();
     const row = () => v.rowFor("orders_note_chk");
     expect(row().classList.contains("row-dropped")).toBe(false);
-    expect(v.labels().some((l) => l.includes("Constraints · 1 to drop"))).toBe(false);
+    expect(v.labels().some((l) => l.includes("Constraints (1 to drop)"))).toBe(false);
 
     fireEvent.click(v.button(row(), "Drop"));
     expect(row().classList.contains("row-dropped")).toBe(true);
-    expect(v.labels()).toContain("Constraints · 1 to drop");
+    expect(v.labels()).toContain("Constraints (1 to drop)");
     expect(v.summary()).toBe("Drops 1 constraint");
 
     // Keep undoes it completely: no pending state, no count, no footer line.
@@ -113,8 +113,8 @@ describe("ModifyTableForm — constraint drops", () => {
     fireEvent.click(v.button(v.rowFor("orders_note_idx"), "Drop"));
     fireEvent.click(v.button(v.rowFor("orders_note_chk"), "Drop"));
     fireEvent.click(v.button(v.rowFor("orders_note_uq"), "Drop"));
-    expect(v.labels()).toContain("Indexes · 1 to drop");
-    expect(v.labels()).toContain("Constraints · 2 to drop");
+    expect(v.labels()).toContain("Indexes (1 to drop)");
+    expect(v.labels()).toContain("Constraints (2 to drop)");
     expect(v.summary()).toBe("Drops 1 index, 2 constraints");
   });
 

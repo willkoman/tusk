@@ -66,10 +66,11 @@ describe("tab titles", () => {
     expect(cleanTabTitle("x".repeat(400))).toHaveLength(MAX_TAB_TITLE);
   });
 
-  it("shortens a pinned tab's label without an ellipsis", () => {
-    expect(shortTabLabel("orders.sql")).toBe("orde");
+  it("shortens a pinned tab's label and marks the cut", () => {
+    expect(shortTabLabel("orders.sql")).toBe("orders");
+    expect(shortTabLabel("Daily rollup")).toBe("Daily…");
     expect(shortTabLabel("etl")).toBe("etl");
-    expect(shortTabLabel("Nightly rollup", 6)).toBe("Nightl");
+    expect(shortTabLabel("Nightly rollup", 6)).toBe("Nightl…");
   });
 });
 

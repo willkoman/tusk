@@ -106,7 +106,7 @@ export function TabSwitcher(props: {
                         onClick={() => { props.onClose(); props.onPick(it.id); }}
                       >
                         <span class="ts-mark" data-color={it.color || undefined} />
-                        <Show when={it.pinned}><span class="ts-badge" title="Pinned">PIN</span></Show>
+                        <Show when={it.pinned}><span class="ts-badge" title="Pinned">Pinned</span></Show>
                         <span class="ts-name">{it.label}</span>
                         <Show when={it.detail}><span class="ts-path">{it.detail}</span></Show>
                         <Show when={it.dirty}><span class="ts-dirty" title="Unsaved changes">●</span></Show>

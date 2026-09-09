@@ -59,11 +59,33 @@ export function syncViewport(viaEvent = false): void {
   if (!viaEvent) browserWindow.dispatchEvent(new Event("resize"));
 }
 
+/**
+ * A DPI change rescales the layout viewport without a `resize` event on some
+ * WebView builds. `(resolution: Ndppx)` only matches the ratio it was built for,
+ * so the watch is re-armed against the new ratio after every change.
+ */
+function watchPixelRatio(): void {
+  if (!browserWindow?.matchMedia) return;
+  let query: MediaQueryList;
+  try {
+    query = browserWindow.matchMedia(`(resolution: ${browserWindow.devicePixelRatio}dppx)`);
+  } catch {
+    return; // `resolution` unsupported; the ResizeObserver still drives the signal
+  }
+  const onChange = () => {
+    syncViewport();
+    watchPixelRatio();
+  };
+  if (query.addEventListener) query.addEventListener("change", onChange, { once: true });
+  else query.addListener?.(onChange);
+}
+
 function observe(): void {
   if (observing || !browserWindow) return;
   observing = true;
   browserWindow.addEventListener("resize", () => syncViewport(true));
   browserWindow.addEventListener("orientationchange", () => syncViewport(true));
+  watchPixelRatio();
   if (typeof ResizeObserver !== "undefined" && browserWindow.document?.documentElement) {
     new ResizeObserver(() => syncViewport()).observe(browserWindow.document.documentElement);
   }
@@ -82,3 +104,60 @@ export function viewport(): ViewportSize {
 
 export const viewportW = (): number => viewport().w;
 export const viewportH = (): number => viewport().h;
+
+// --- startup layout nudge --------------------------------------------------
+//
+// Some machines show the first frame laid out at the pre-show window bounds and
+// keep it until the user drags the window edge — the WebView never reports the
+// settle, so neither the `resize` event nor the ResizeObserver fires. The nudge
+// performs that drag: grow the native window by one pixel and put it back on the
+// next frame. It runs once per process, is skipped while maximized or full
+// screen (where a resize would leave the window restored), and can only ever end
+// with a `syncViewport()`.
+
+/** Whether the one-pixel nudge should run. Pure so the guards are testable. */
+export function shouldNudge(state: { maximized: boolean; fullscreen?: boolean; done: boolean }): boolean {
+  return !state.done && !state.maximized && !state.fullscreen;
+}
+
+let nudgeDone = false;
+
+/** Test seam: forget that the nudge ran. */
+export function resetNudgeForTests(): void {
+  nudgeDone = false;
+}
+
+const nextFrame = (): Promise<void> =>
+  new Promise((resolve) => {
+    if (!browserWindow?.requestAnimationFrame) resolve();
+    else browserWindow.requestAnimationFrame(() => resolve());
+  });
+
+/**
+ * Settle the window layout after first paint. Never throws, never blocks
+ * startup, and is a no-op outside Tauri (tests, a plain browser).
+ */
+export async function nudgeWindowLayout(): Promise<void> {
+  if (nudgeDone || !browserWindow) return;
+  nudgeDone = true;
+  try {
+    await nextFrame();
+    await nextFrame();
+    const [{ getCurrentWindow }, { PhysicalSize }] = await Promise.all([
+      import("@tauri-apps/api/window"),
+      import("@tauri-apps/api/dpi"),
+    ]);
+    const win = getCurrentWindow();
+    const [maximized, fullscreen] = await Promise.all([win.isMaximized(), win.isFullscreen()]);
+    if (shouldNudge({ maximized, fullscreen, done: false })) {
+      const size = await win.innerSize();
+      await win.setSize(new PhysicalSize(size.width + 1, size.height));
+      await nextFrame();
+      await win.setSize(new PhysicalSize(size.width, size.height));
+      await nextFrame();
+    }
+  } catch {
+    /* no Tauri window (tests/browser) or the call failed — the sync below still runs */
+  }
+  syncViewport();
+}

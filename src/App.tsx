@@ -29,7 +29,7 @@ import { TabSwitcher, type TabSwitcherItem } from "./TabSwitcher";
 import { densityTokens, gridRowH, normalizeDensity, rootFontSize } from "./appearance";
 // --- end ui/customize imports ---
 // --- ui/p0-layout: live viewport + panel bounds (see src/viewport.ts) ---
-import { syncViewport, viewportH, viewportW } from "./viewport";
+import { nudgeWindowLayout, syncViewport, viewportH, viewportW } from "./viewport";
 import {
   AI_DOCK_CAP,
   HISTORY_DOCK_CAP,
@@ -2292,6 +2292,9 @@ function App() {
     // The WebView can still finish its first layout at the pre-show window bounds
     // and settle without reporting a `resize`, so re-read after the first paint.
     requestAnimationFrame(() => syncViewport());
+    // Belt for the machines where that settle never arrives at all: one native
+    // one-pixel resize after first paint, once per process. See `viewport.ts`.
+    void nudgeWindowLayout();
     // Load profiles + auto-connect FIRST — the core startup path must not depend on
     // the Slack event bridge (a rejected listen() would otherwise abort onMount and
     // leave the connect screen empty).
@@ -2795,6 +2798,10 @@ function App() {
       const submittedHost = host();
       const submittedUser = user();
       const submittedDatabase = dbname();
+      // The tag is offered on the form, so it must hold for this session whether or
+      // not the user saves a profile: a connect-and-go into production still gets the
+      // red rail, the Prod badge and the loud confirmation titles.
+      const submittedEnvironment = environment();
       const isFile = submittedDriver === "duckdb" || submittedDriver === "sqlite";
       const networkPort = Number(port());
       if (!isFile && (!Number.isInteger(networkPort) || networkPort < 1 || networkPort > 65535)) {
@@ -2837,7 +2844,7 @@ function App() {
         : submittedDatabase || submittedHost;
       await connectWithHostKeyPrompt(async () => {
         const r = await invoke<ConnectReply>("connect", { config });
-        await afterConnect(r, { key: submittedKey, legacyKey: submittedLegacyKey, target: submittedTarget, origin: isFile ? "" : submittedHost, driver: submittedDriver, profileId: null });
+        await afterConnect(r, { key: submittedKey, legacyKey: submittedLegacyKey, target: submittedTarget, origin: isFile ? "" : submittedHost, environment: submittedEnvironment, driver: submittedDriver, profileId: null });
       });
     } catch (e) {
       setConnErr(errMsg(e));
@@ -4872,7 +4879,7 @@ function App() {
             ? [{ sep: true as const }, { label: "DDL & relationships…", icon: "fileCode" as const, onClick: () => openDdlGraph(s!, n.name, "table") }]
             : []),
           { sep: "danger" },
-          { label: dcaps().truncate ? "Truncate…" : "Delete all rows…", icon: "eraser", danger: true, ...gate(canTruncate(s!, n.name), `Requires TRUNCATE or ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: dcaps().truncate ? "Truncate table" : "Delete all rows", subtitle: `${s}.${n.name}`, primaryLabel: dcaps().truncate ? "Truncate" : "Delete all rows", lead: "Every row goes. The table and its structure stay.", facts: dangerFacts("Table", s, n.name), showCascade: dcaps().truncateOptions, showRestartIdentity: dcaps().truncateOptions, build: (o) => ddl.truncate(s!, n.name, o) }) },
+          { label: dcaps().truncate ? "Truncate…" : "Delete all rows…", icon: "eraser", danger: true, ...gate(canTruncate(s!, n.name), `Requires TRUNCATE or ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: dcaps().truncate ? "Truncate table" : "Delete all rows", subtitle: `${s}.${n.name}`, primaryLabel: dcaps().truncate ? "Truncate" : "Delete all rows", lead: "Every row goes. The table and its structure stay.", facts: dangerFacts("Table", s, n.name), confirmName: n.name, showCascade: dcaps().truncateOptions, showRestartIdentity: dcaps().truncateOptions, build: (o) => ddl.truncate(s!, n.name, o) }) },
           { label: "Drop…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop table", subtitle: `${s}.${n.name}`, primaryLabel: "Drop table", lead: "The table and every row in it go. This cannot be undone.", facts: dangerFacts("Table", s, n.name), confirmName: n.name, showCascade: true, build: (o) => ddl.dropRelation("table", s!, n.name, o.cascade) }) },
         );
         break;
@@ -5093,11 +5100,11 @@ function App() {
   const explainMenuItems = (): MenuItem[] => [
     { label: "Explain", icon: "eye", disabled: !activeDatabaseAllowed(), onClick: () => runAction("explain") },
     {
-      label: "Explain Analyze (runs the statement)",
+      label: "Explain Analyze: runs the statement",
       icon: "play",
       disabled: caps()?.explainAnalyze === false || conn()?.readOnly || !activeDatabaseAllowed(),
       title: caps()?.explainAnalyze === false ? "Not supported by this engine"
-        : conn()?.readOnly ? "Connection is read-only (EXPLAIN ANALYZE executes the statement)"
+        : conn()?.readOnly ? "EXPLAIN ANALYZE executes the statement. This connection is read-only."
         : !activeDatabaseAllowed() ? "This tab does not own the transaction" : undefined,
       onClick: () => runAction("explainAnalyze"),
     },
@@ -5730,6 +5737,25 @@ function App() {
                         beginRename(t.id);
                       }}
                       onAuxClick={(e) => { if (e.button === 1) closeTab(t.id); }}
+                      // Roving tabstop: Tab reaches the strip once, arrows walk it.
+                      // Before this the ✕ was the only focusable thing on a tab.
+                      role="tab"
+                      aria-selected={t.id === activeTabId()}
+                      tabindex={t.id === activeTabId() ? 0 : -1}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          switchTab(t.id);
+                          return;
+                        }
+                        if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+                        e.preventDefault();
+                        const strip = (e.currentTarget as HTMLElement).parentElement;
+                        const all = strip ? [...strip.querySelectorAll<HTMLElement>(".tab")] : [];
+                        const at = all.indexOf(e.currentTarget as HTMLElement);
+                        const to = all[at + (e.key === "ArrowRight" ? 1 : -1)];
+                        to?.focus();
+                      }}
                       onContextMenu={(e) => {
                         e.preventDefault();
                         const scoped = (label: string) => (connections().length > 1 ? `${label} on this connection` : label);
@@ -6276,7 +6302,7 @@ function App() {
         <Show when={confirmAnalyze()}>
           <Dialog title="Explain Analyze" titleBadge={prodBadge()} size="sm" noAutoFocus onClose={() => setConfirmAnalyze(null)}>
             <div class="confirm-note">
-              This statement modifies data, and Explain Analyze runs it to measure it.
+              Explain Analyze runs this statement. It modifies data.
             </div>
             <div class="form-actions">
               <button class="ghost" onClick={() => setConfirmAnalyze(null)}>Cancel</button>

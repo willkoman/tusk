@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { blockText, buildIndex, markRuns, search, splitSections, stripInline } from "./search";
+import { blockText, buildIndex, markRuns, previewLead, search, splitSections, stripInline } from "./search";
 import type { Topic } from "./types";
 
 const topic: Topic = {
@@ -82,5 +82,28 @@ describe("markRuns", () => {
     const runs = markRuns("abcdef", [[1, 3], [2, 4]]);
     expect(runs.map((r) => r.text).join("")).toBe("abcdef");
     expect(runs.filter((r) => r.hit).map((r) => r.text).join("")).toBe("bcd");
+  });
+});
+
+describe("previewLead", () => {
+  it("keeps a short first sentence whole", () => {
+    expect(previewLead("Pages of 1,000 rows stream in. More follows.")).toBe("Pages of 1,000 rows stream in.");
+  });
+
+  it("cuts a long lead at a word boundary", () => {
+    const long = "Read-only (block writes & DDL) is enforced in layers — see Safety & guarantees for the list";
+    const out = previewLead(long);
+    expect(out.endsWith("…")).toBe(true);
+    expect(out.length).toBeLessThanOrEqual(66);
+    expect(long.startsWith(out.slice(0, -1))).toBe(true);
+  });
+
+  it("leaves no trailing punctuation before the ellipsis", () => {
+    expect(previewLead("Each profile shows mascot, name, and target — user@host:port/dbname, and more here")).not.toMatch(/[ ,;—-]…$/);
+  });
+
+  it("handles an empty preview", () => {
+    expect(previewLead("")).toBe("");
+    expect(previewLead("   ")).toBe("");
   });
 });

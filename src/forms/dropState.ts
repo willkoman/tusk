@@ -30,9 +30,9 @@ export const droppedNames = (set: DropSet, order: readonly string[]): string[] =
 export const dropCount = (set: DropSet, order: readonly string[]): number =>
   droppedNames(set, order).length;
 
-/** `"Constraints"` → `"Constraints · 2 to drop"`. */
+/** `"Constraints"` → `"Constraints (2 to drop)"`. */
 export const sectionLabel = (label: string, count: number): string =>
-  count > 0 ? `${label} · ${count} to drop` : label;
+  count > 0 ? `${label} (${count} to drop)` : label;
 
 /** Everything a single Apply would destroy, by kind. */
 export type DropTally = {

@@ -270,9 +270,11 @@ export function cleanTabTitle(raw: string): string {
  * characters. Pinned tabs are recognised by position and colour, so the strip
  * spends as little width on them as it can and keeps the full name in a tooltip.
  */
-export function shortTabLabel(label: string, max = 4): string {
+export function shortTabLabel(label: string, max = 6): string {
   const stem = label.replace(/\.[A-Za-z0-9]{1,8}$/, "").trim() || label.trim();
-  return stem.length <= max ? stem : stem.slice(0, max);
+  // The ellipsis is the point: a bare `Dail` reads as a rendering bug rather
+  // than as the deliberately shortened form of "Daily rollup".
+  return stem.length <= max ? stem : `${stem.slice(0, max).trimEnd()}…`;
 }
 
 /** How many tabs at the head of the strip are pinned (the invariant's boundary). */

@@ -12,7 +12,7 @@ import { TOPICS } from "./content";
 import { DEMOS } from "./demos";
 import { renderInline, type InlineCtx } from "./inline";
 import { GROUPS, flatOrder } from "./nav";
-import { buildIndex, markRuns, search, splitSections, type SearchHit } from "./search";
+import { buildIndex, markRuns, previewLead, search, splitSections, type SearchHit } from "./search";
 import type { Block } from "./types";
 
 // Default export so App can lazy() this module — the KB content is ~170 KB of
@@ -174,7 +174,7 @@ export default function HelpDialog(props: {
                           <span class="kb-secchev">{isOpen(s.id) ? "▾" : "▸"}</span>
                           <span class="kb-sectitle">{s.title}</span>
                           <Show when={!isOpen(s.id)}>
-                            <span class="kb-secpreview">{s.preview}</span>
+                            <span class="kb-secpreview">{previewLead(s.preview)}</span>
                           </Show>
                         </button>
                         <Show when={isOpen(s.id)}>
@@ -187,10 +187,10 @@ export default function HelpDialog(props: {
                   </For>
                   <footer class="kb-prevnext">
                     <Show when={prevNext().prev} fallback={<span />}>
-                      {(p) => <button class="ghost" onClick={() => goto(p().id)}>← {p().title}</button>}
+                      {(p) => <button class="ghost" onClick={() => goto(p().id)}><Icon name="chevronLeft" />{p().title}</button>}
                     </Show>
                     <Show when={prevNext().next} fallback={<span />}>
-                      {(n) => <button class="ghost" onClick={() => goto(n().id)}>{n().title} →</button>}
+                      {(n) => <button class="ghost" onClick={() => goto(n().id)}>{n().title}<Icon name="chevronRight" /></button>}
                     </Show>
                   </footer>
                 </article>

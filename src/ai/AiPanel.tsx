@@ -550,7 +550,7 @@ export function AiPanel(props: {
       <div class="ai-messages" ref={msgEl} onScroll={onMsgScroll}>
         <Show when={messages().length === 0}>
           <div class="ai-empty">
-            <span>Proposed SQL never runs on its own.</span>
+            <span>Ask about this database.</span>
             <div class="ai-examples">
               <For each={starters()}>
                 {(q) => <button class="ai-example" disabled={connMismatch()} onClick={() => send(q)}>{q}</button>}

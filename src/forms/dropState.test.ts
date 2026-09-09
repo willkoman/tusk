@@ -63,8 +63,8 @@ describe("section label", () => {
     expect(sectionLabel("Constraints", 0)).toBe("Constraints");
   });
   it("counts the pending drops", () => {
-    expect(sectionLabel("Constraints", 2)).toBe("Constraints · 2 to drop");
-    expect(sectionLabel("Indexes", 1)).toBe("Indexes · 1 to drop");
+    expect(sectionLabel("Constraints", 2)).toBe("Constraints (2 to drop)");
+    expect(sectionLabel("Indexes", 1)).toBe("Indexes (1 to drop)");
   });
 });
 

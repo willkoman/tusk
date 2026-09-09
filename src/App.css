@@ -1141,6 +1141,7 @@ button.conn-dot.cancellable:hover { background: var(--danger); box-shadow: 0 0 0
 .tw-row:hover .tw-flag { background: var(--bg); }
 /* Numeric details (object/column counts) render as a subtle pill badge. */
 .tw-detail.is-count { flex-shrink: 0; background: var(--panel-2); color: var(--muted); border-radius: var(--r-pill); padding: 1px 7px; min-width: 20px; text-align: center; font-family: inherit; font-variant-numeric: tabular-nums; }
+.tw-detail.tw-detail-more { margin-left: 0; padding-left: var(--s2); }
 .tw-row:hover .tw-detail.is-count { background: var(--border); }
 .tw-row.selected .tw-detail.is-count { background: var(--bg); color: var(--text); }
 .empty-hint { padding: var(--s3); color: var(--muted); font-size: var(--fs-sm); }
@@ -1252,7 +1253,7 @@ body > div > .cm-tooltip { z-index: 500; }
 
 /* Pinned tabs: a fixed compact group at the left of the strip. */
 .tab.pinned { max-width: none; padding-left: var(--s2); padding-right: var(--s2); gap: var(--s1); }
-.tab.pinned .tab-title { max-width: 46px; }
+.tab.pinned .tab-title { max-width: 64px; }
 .tab.pin-edge { margin-right: 7px; }
 /* The group divider is drawn on the last pinned tab so it survives reordering. */
 .tab.pin-edge::after { content: ""; position: absolute; right: -4px; top: 5px; bottom: 5px; width: 1px; background: var(--border); }
@@ -1926,7 +1927,7 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
 .slack-status.wait .slack-dot { background: var(--warn); }
 .slack-status.err .slack-dot { background: var(--warn); }
 /* The one toggle switch in the app. Accent when on — green is an outcome, not a state. */
-.slack-switch { display: inline-flex; align-items: center; gap: var(--s2); font-size: var(--fs-sm); color: var(--muted); cursor: pointer; flex-shrink: 0; }
+label.slack-switch { display: inline-flex; flex-direction: row; align-items: center; gap: var(--s2); font-size: var(--fs-sm); font-weight: 400; color: var(--muted); cursor: pointer; flex-shrink: 0; }
 .slack-switch input.switch { width: 34px; height: 18px; margin: 0; appearance: none; -webkit-appearance: none; border-radius: var(--r-pill); background: var(--border); position: relative; cursor: pointer; border: none; transition: background var(--dur); }
 .slack-switch input.switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--text); transition: transform var(--dur); }
 .slack-switch input.switch:checked { background: var(--accent); }
@@ -2264,11 +2265,13 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
 .kb-navscroll { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: var(--s3); }
 .kb-group { display: flex; flex-direction: column; gap: 1px; }
 .kb-grouplabel { font-size: var(--fs-xs); font-weight: 600; color: var(--muted); padding: 0 var(--s2) 3px; }
-.kb-navitem { display: flex; align-items: center; gap: var(--s2); padding: 5px var(--s2); border: none; background: none; border-radius: var(--r-sm); cursor: pointer; text-align: left; color: var(--text); font: inherit; }
+.kb-navitem { display: flex; align-items: flex-start; gap: var(--s2); padding: 5px var(--s2); border: none; background: none; border-radius: var(--r-sm); cursor: pointer; text-align: left; color: var(--text); font: inherit; }
 .kb-navitem:hover { background: var(--accent-soft); }
 .kb-navitem.active { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
-.kb-navitem svg { width: 13px; height: 13px; flex: none; opacity: 0.75; }
-.kb-navtitle { font-size: var(--fs-sm); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kb-navitem svg { width: 13px; height: 13px; flex: none; opacity: 0.75; margin-top: 2px; }
+/* Two lines rather than a truncated one: "Keyboard shortcuts & command palette"
+   has to read as its own name in the rail. */
+.kb-navtitle { font-size: var(--fs-sm); font-weight: 500; min-width: 0; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-height: var(--lh-tight); }
 .kb-pane { flex: 1; min-width: 0; overflow-y: auto; padding: 2px var(--s3) 18px 2px; }
 .kb-tophead { display: flex; align-items: flex-start; gap: var(--s3); justify-content: space-between; margin-bottom: var(--s3); }
 .kb-blurb { color: var(--muted); font-size: var(--fs-sm); margin-top: 2px; }
@@ -2492,7 +2495,9 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
    backing is a ::before inside the cell's OWN stacking context (the inline
    z-index creates one), so the selection, dirty and match tints still compose
    over it instead of being replaced by an opaque background. */
-.rg-cell.rg-pinned, .rg-headcell.rg-pinned { box-shadow: 1px 0 0 var(--border); }
+/* The pinned column needs a hard edge AND a cast shadow: a 1px border alone left
+   it reading as a misaligned column rather than as one held in place. */
+.rg-cell.rg-pinned, .rg-headcell.rg-pinned { box-shadow: 2px 0 0 var(--border-hover); }
 .rg-cell.rg-pinned::before, .rg-headcell.rg-pinned::before {
   content: "";
   position: absolute;

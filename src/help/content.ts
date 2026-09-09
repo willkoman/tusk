@@ -2753,7 +2753,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "The chips show the live binding. Some actions ship unbound and stay reachable from the palette and toolbars."
+        "md": "The chips show the live binding. An unbound action stays reachable from the palette and the toolbars."
       },
       {
         "k": "keys",
@@ -2772,7 +2772,7 @@ export const TOPICS: Topic[] = [
           },
           {
             "action": "explainAnalyze",
-            "does": "EXPLAIN ANALYZE — executes the statement"
+            "does": "EXPLAIN ANALYZE. Executes the statement"
           },
           {
             "action": "cancelQuery",
@@ -2930,7 +2930,7 @@ export const TOPICS: Topic[] = [
           "[[kbd:Backspace]] / [[kbd:Delete]] — unbind the action.",
           "Bare modifiers and unmodified printable keys are rejected.",
           "A chord another action owns shows *press again to replace*; a second press unbinds the other action.",
-          "Overridden rows get **⟲ Reset to default**; **Reset all** clears every override. Only diffs persist in `tusk.keys`, with `null` meaning explicitly unbound."
+          "Overridden rows get **⟲ Reset to default**. **Reset all** clears every override."
         ]
       },
       {

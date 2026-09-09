@@ -190,9 +190,9 @@ export function SettingsDialog(props: {
                 />
               </label>
               <div class="settings-note">
-                When on, a crash shows its details with copy and email actions. When off, Tusk
-                recovers quietly and clears prior reports. Nothing is sent automatically, and reports
-                exclude connection settings, credentials, and saved queries.
+                On: a crash shows its details with copy and email actions. Off: Tusk recovers
+                quietly and clears prior reports. Reports exclude connection settings, credentials
+                and saved queries.
               </div>
               <div class="settings-note">
                 The AI tab's sample-row toggle controls whether real values reach your AI provider.

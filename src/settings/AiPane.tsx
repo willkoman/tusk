@@ -439,7 +439,6 @@ export function AiPane(props: { database: string }) {
       <section class="ai-section">
         <header class="ai-section-head">
           <h3 class="ai-section-title">Assistant</h3>
-          <span class="ai-section-sub">applies to every provider</span>
         </header>
 
         <label class="settings-row">

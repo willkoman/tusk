@@ -15,6 +15,10 @@ const PAD = 32;
  *  readable, so fit stops there and the canvas pans instead. A diagram meant to be
  *  a map of a whole schema passes MIN_K and keeps shrinking to fit. */
 export const READABLE_FIT = 1;
+/** Fit floor for a small diagram that must be seen whole. A neighborhood is three
+ *  columns wide by construction and did not fit a 100% floor, so it opened with the
+ *  two neighbour columns cut at the canvas edges. Text shrinks; nothing is hidden. */
+export const COMPACT_FIT = 0.6;
 
 /**
  * Scale-to-fit a content bbox in a viewport, clamped to `[minScale, 1]`: fit never

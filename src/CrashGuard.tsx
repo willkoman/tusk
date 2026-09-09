@@ -248,14 +248,14 @@ function ConsentGate(props: { onAnswer: (v: "on" | "off") => void }) {
         <div>
           <h1>Crash reports</h1>
           <p>
-            After a crash, Tusk can show the report on the next launch and offer to email it.
-            Sending a report is always a manual step.
+            After a crash, Tusk shows the report on the next launch with copy and email
+            actions. Sending it is a manual step.
           </p>
         </div>
         <div class="crash-privacy">
-          Reports contain the app version, platform, and the error message and stack. Those can include
-          fragments of the text that triggered the error. Connection settings, credentials, and saved
-          queries are never included intentionally. Change this in Settings → Privacy.
+          Reports carry the app version, platform, error message and stack, which can include
+          fragments of the text that triggered the error. Connection settings, credentials and
+          saved queries are excluded. Change this in Settings → Privacy.
         </div>
         <div class="crash-actions">
           <button class="ghost" onClick={() => props.onAnswer("off")}>Turn off</button>

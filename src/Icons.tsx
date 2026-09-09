@@ -84,7 +84,8 @@ export type IconName =
   | "minus"
   | "more"
   | "chevronDown"
-  | "chevronRight";
+  | "chevronRight"
+  | "chevronLeft";
 
 export function Icon(props: { name: IconName }): JSX.Element {
   switch (props.name) {
@@ -174,6 +175,8 @@ export function Icon(props: { name: IconName }): JSX.Element {
       return svg("currentColor", <path d="m6 9 6 6 6-6" />);
     case "chevronRight":
       return svg("currentColor", <path d="m9 6 6 6-6 6" />);
+    case "chevronLeft":
+      return svg("currentColor", <path d="m15 6-6 6 6 6" />);
     case "panelBottom":
       return svg("currentColor", <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M3 14h18" /></>);
     case "eyeOff":

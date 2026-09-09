@@ -34,7 +34,7 @@ export type Section = {
   id: string | null;
   title: string | null;
   blocks: Block[];
-  /** First paragraph, plain — shown as the collapsed-row preview. */
+  /** First paragraph, plain. `previewLead` shortens it for the collapsed row. */
   preview: string;
 };
 
@@ -177,4 +177,21 @@ export function markRuns(text: string, ranges: [number, number][]): { text: stri
   }
   if (pos < text.length) out.push({ text: text.slice(pos), hit: false });
   return out;
+}
+
+/**
+ * The collapsed accordion row's preview line: the first sentence, cut at a word
+ * boundary. A raw first paragraph clipped by CSS left half a word and an em-dash
+ * aside sitting in the header as permanent chrome.
+ */
+export function previewLead(text: string, max = 64): string {
+  const body = text.trim();
+  if (!body) return "";
+  const sentence = /^(.*?[.:!?])(?:\s|$)/.exec(body);
+  const lead = sentence ? sentence[1] : body;
+  if (lead.length <= max) return lead;
+  const cut = lead.slice(0, max);
+  const space = cut.lastIndexOf(" ");
+  const kept = space > max * 0.5 ? cut.slice(0, space) : cut;
+  return `${kept.replace(/[\s,;:.—-]+$/, "")}…`;
 }

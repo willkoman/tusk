@@ -515,7 +515,6 @@ export function SlackPane(props: {
           <section class="settings-section">
             <header class="settings-section-head">
               <h3 class="settings-section-title">Slack app tokens</h3>
-              <span class="settings-section-sub">stored in your OS keychain</span>
             </header>
             <div class="settings-note">
               Create a Slack app from the manifest in <code>docs/slack-setup.md</code>, then paste its two
@@ -561,12 +560,12 @@ export function SlackPane(props: {
           <section class="settings-section">
             <header class="settings-section-head">
               <h3 class="settings-section-title">Who can ask</h3>
-              <span class="settings-section-sub">empty lists allow anyone in the bot's channels</span>
             </header>
+            <div class="settings-note">An empty list allows anyone in the bot's channels.</div>
             <label class="settings-row">
               <span class="settings-label">
                 <span>Allowed channels</span>
-                <small>Channel or DM IDs (<code>C…</code> / <code>D…</code>), comma-separated.</small>
+                <small>Comma-separated channel or DM IDs. They start with <code>C</code> or <code>D</code>.</small>
               </span>
               <input
                 type="text"
@@ -578,7 +577,7 @@ export function SlackPane(props: {
             <label class="settings-row">
               <span class="settings-label">
                 <span>Allowed users</span>
-                <small>Slack member IDs (<code>U…</code>), comma-separated.</small>
+                <small>Comma-separated Slack member IDs. They start with <code>U</code>.</small>
               </span>
               <input
                 type="text"
@@ -593,7 +592,6 @@ export function SlackPane(props: {
           <section class="settings-section">
             <header class="settings-section-head">
               <h3 class="settings-section-title">Answers</h3>
-              <span class="settings-section-sub">how results come back to Slack</span>
             </header>
             <label class="settings-row">
               <span class="settings-label">
@@ -660,7 +658,6 @@ export function SlackPane(props: {
           <section class="settings-section">
             <header class="settings-section-head">
               <h3 class="settings-section-title">AI</h3>
-              <span class="settings-section-sub">mirrors the provider and model from Settings → AI</span>
               <Show when={props.onOpenAi}>
                 <div class="settings-section-actions">
                   <button class="ghost" onClick={() => props.onOpenAi?.()}>Open AI settings</button>

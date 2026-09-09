@@ -88,7 +88,23 @@ describe("columnRenders", () => {
   it("keeps a column with one non-numeric value on text", () => {
     const out = columnRenders(["n"], [["1"], ["oops"]], noTypes, noBools);
     expect(out[0].cls).toBe("text");
-    expect(out[0].badge).toBe("");
+    expect(out[0].badge).toBe("text");
+  });
+
+  it("badges every column, so a header row is never half-badged", () => {
+    const out = columnRenders(
+      ["id", "memo", "placed_at", "day"],
+      [["1", "hi", "2026-09-09 20:22:03.527887+00", "2026-09-09"]],
+      noTypes,
+      noBools,
+    );
+    expect(out.map((r) => r.badge)).toEqual(["num", "text", "timestamp", "date"]);
+    expect(out.every((r) => r.inferred)).toBe(true);
+  });
+
+  it("does not read a near-miss as a timestamp", () => {
+    const out = columnRenders(["c"], [["2026-09-09"], ["not a date"]], noTypes, noBools);
+    expect(out[0].badge).toBe("text");
   });
 
   it("infers JSON only when every sampled value is JSON", () => {
