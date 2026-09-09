@@ -178,13 +178,24 @@ pub fn on_connection_closed(app: &AppHandle, connection_id: &str) {
     // events (an empty "disconnected" followed by the real one) let a listener that
     // coalesces show the blank one and hide why the bot stopped.
     teardown(app);
-    runtime.set_status(
-        "disconnected",
-        Some(
-            "Slack bot stopped: the Tusk connection it was answering against was disconnected."
-                .to_string(),
-        ),
-    );
+    // Disarm autostart too. Left `enabled: true` on disk, the bot came back on the next
+    // launch bound to whichever connection opened first — a different database than the
+    // one it was answering against, chosen by nobody. Re-enable it (and pick a target)
+    // in Settings → Slack. Best-effort: a config write failure must not swallow the
+    // status the workbench needs to show.
+    let disarmed = config::load(app)
+        .ok()
+        .filter(|cfg| cfg.enabled)
+        .is_some_and(|mut cfg| {
+            config::disarm_autostart(&mut cfg);
+            config::save(app, &cfg).is_ok()
+        });
+    let reason = if disarmed {
+        "Slack bot stopped: the Tusk connection it was answering against was disconnected. Autostart is now off — re-enable it and pick a connection in Settings → Slack."
+    } else {
+        "Slack bot stopped: the Tusk connection it was answering against was disconnected."
+    };
+    runtime.set_status("disconnected", Some(reason.to_string()));
     let _ = app.emit("slack:status", runtime.status_info());
 }
 

@@ -88,7 +88,7 @@ function Prose(props: { text: string }) {
   );
 }
 
-function CodeBlock(props: { lang: string; code: string; onInsert: (sql: string) => void }) {
+function CodeBlock(props: { lang: string; code: string; onInsert: (sql: string) => void; insertDisabledReason?: string }) {
   const lang = () => props.lang || "sql";
   const runnable = () => /sql/i.test(props.lang) || props.lang === "";
   return (
@@ -98,7 +98,14 @@ function CodeBlock(props: { lang: string; code: string; onInsert: (sql: string) 
         <span class="spacer" />
         <button class="ai-code-btn" onClick={() => void clipWrite(props.code)}>Copy</button>
         <Show when={runnable() && props.code.trim()}>
-          <button class="ai-code-btn primary" onClick={() => props.onInsert(props.code)}>▶ Open in editor</button>
+          {/* Copy always works; opening in the editor targets a live connection, so it
+              is refused (with the reason) when the caller says this SQL is not for it. */}
+          <button
+            class="ai-code-btn primary"
+            disabled={!!props.insertDisabledReason}
+            title={props.insertDisabledReason || undefined}
+            onClick={() => { if (!props.insertDisabledReason) props.onInsert(props.code); }}
+          >▶ Open in editor</button>
         </Show>
       </div>
       <pre class="ai-code-body"><code><Show when={runnable()} fallback={props.code}><For each={highlightSql(props.code)}>{(t) => <span class={t.cls}>{t.text}</span>}</For></Show></code></pre>
@@ -106,11 +113,13 @@ function CodeBlock(props: { lang: string; code: string; onInsert: (sql: string) 
   );
 }
 
-export function Markdown(props: { text: string; onInsertSql: (sql: string) => void }) {
+export function Markdown(props: { text: string; onInsertSql: (sql: string) => void; insertDisabledReason?: string }) {
   return (
     <div class="md">
       <For each={parseBlocks(props.text)}>
-        {(b) => (b.type === "code" ? <CodeBlock lang={b.lang} code={b.code} onInsert={props.onInsertSql} /> : <Prose text={b.text} />)}
+        {(b) => (b.type === "code"
+          ? <CodeBlock lang={b.lang} code={b.code} onInsert={props.onInsertSql} insertDisabledReason={props.insertDisabledReason} />
+          : <Prose text={b.text} />)}
       </For>
     </div>
   );

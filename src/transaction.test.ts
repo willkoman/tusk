@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   IDLE_TRANSACTION,
+  INTERRUPTED_TRANSACTION_PREFIX,
   acceptTransactionStatus,
   decodeInterruptedTransaction,
   encodeInterruptedTransaction,
+  evictInterruptedMarkers,
+  interruptedTransactionKey,
   transactionDatabaseAllowed,
   transactionBoundaryStaleReason,
   transactionControlAvailability,
@@ -106,5 +109,44 @@ describe("transaction state", () => {
     });
     expect(decodeInterruptedTransaction(JSON.stringify({ ...active(), connectionKey: "profile:main" }))).toBeNull();
     expect(decodeInterruptedTransaction("x".repeat(4097))).toBeNull();
+  });
+});
+
+describe("engine-aware classification", () => {
+  it("uses the named engine's lexical rules, not the module dialect", () => {
+    // MySQL treats `#` as a line comment; PostgreSQL does not, so the same text is
+    // one statement under MySQL and a `#`-prefixed statement under Postgres.
+    expect(transactionEvent("# a note\nCOMMIT", "mysql")).toBe("commit");
+    // A backtick-quoted identifier is a string on MySQL — a `;` inside it must not
+    // split the statement and expose a bare COMMIT that isn't one.
+    expect(transactionEvent("SELECT `a;COMMIT` FROM t", "mysql")).toBe("statement");
+    // T-SQL brackets do the same job on SQL Server.
+    expect(transactionEvent("SELECT [a;ROLLBACK] FROM t", "mssql")).toBe("statement");
+    expect(transactionEvent("BEGIN TRANSACTION", "mssql")).toBe("begin");
+    // Recovery gating reads the same lexer, so it must take the engine too.
+    const failed: TransactionStatus = { ...active(3), state: "failed", health: "recovery_required" };
+    expect(transactionRecoveryAllowed(failed, "# note\nROLLBACK", "mysql")).toBe(true);
+    expect(transactionRecoveryAllowed(failed, "SELECT `x;ROLLBACK`", "mysql")).toBe(false);
+  });
+});
+
+describe("interrupted-transaction markers", () => {
+  it("gives every connection key its own slot", () => {
+    expect(interruptedTransactionKey("profile:a")).toBe(`${INTERRUPTED_TRANSACTION_PREFIX}profile:a`);
+    expect(interruptedTransactionKey("profile:a")).not.toBe(interruptedTransactionKey("profile:b"));
+    expect(interruptedTransactionKey("x".repeat(4000)).length)
+      .toBe(INTERRUPTED_TRANSACTION_PREFIX.length + 2048);
+  });
+
+  it("evicts the oldest markers first, and undecodable ones before any real one", () => {
+    const entries = [
+      { key: "k.new", startedAt: 300 },
+      { key: "k.old", startedAt: 100 },
+      { key: "k.broken", startedAt: 0 },
+      { key: "k.mid", startedAt: 200 },
+    ];
+    expect(evictInterruptedMarkers(entries, 4)).toEqual([]);
+    expect(evictInterruptedMarkers(entries, 2)).toEqual(["k.broken", "k.old"]);
+    expect(evictInterruptedMarkers(entries, 0)).toHaveLength(4);
   });
 });

@@ -11,8 +11,11 @@ import {
   connectionMatches,
   findConnection,
   makeConnectionState,
+  mergeRememberedIds,
   nextColorIndex,
+  nextRecoverySlot,
   patchConnection,
+  recoverySlotKey,
   rememberedProfileIds,
   removeConnection,
   sanitizeRememberedIds,
@@ -174,5 +177,52 @@ describe("remembered sessions", () => {
     expect(sanitizeRememberedIds(["p1", "p1", 7, "", null, "p2"])).toEqual(["p1", "p2"]);
     expect(sanitizeRememberedIds(["x".repeat(201), "ok"])).toEqual(["ok"]);
     expect(sanitizeRememberedIds(Array.from({ length: 100 }, (_, i) => `p${i}`))).toHaveLength(MAX_CONNECTIONS);
+  });
+});
+
+describe("tab-recovery slots", () => {
+  it("gives the first session the bare key and never lets two share one", () => {
+    // Slot 0 must stay byte-identical to the pre-multi-connection key, so a single
+    // session keeps reading and writing the snapshot every earlier version wrote.
+    expect(recoverySlotKey("profile:p1", 0)).toBe("profile:p1");
+    expect(recoverySlotKey("profile:p1", 1)).toBe("profile:p1#1");
+
+    const inUse: string[] = [];
+    // Open the SAME profile three times: each session must claim its own slot.
+    for (const expected of ["profile:p1", "profile:p1#1", "profile:p1#2"]) {
+      const slot = nextRecoverySlot(inUse, "profile:p1");
+      const key = recoverySlotKey("profile:p1", slot);
+      expect(key).toBe(expected);
+      expect(inUse).not.toContain(key);
+      inUse.push(key);
+    }
+    expect(new Set(inUse).size).toBe(inUse.length);
+
+    // Another destination is unaffected, and a closed session frees its slot.
+    expect(recoverySlotKey("profile:p2", nextRecoverySlot(inUse, "profile:p2"))).toBe("profile:p2");
+    inUse.splice(1, 1); // close the second session
+    expect(nextRecoverySlot(inUse, "profile:p1")).toBe(1);
+  });
+
+  it("stops handing out slots past the open-connection ceiling", () => {
+    const inUse = Array.from({ length: MAX_CONNECTIONS }, (_, i) => recoverySlotKey("k", i));
+    expect(nextRecoverySlot(inUse, "k")).toBe(MAX_CONNECTIONS);
+  });
+});
+
+describe("merging the remembered session", () => {
+  it("keeps profiles still waiting to be reopened when one connects", () => {
+    // The bug: connecting A wrote ["a"] and erased B and C before the offer could be
+    // accepted, so the remembered session destroyed itself on the first connect.
+    expect(mergeRememberedIds(["a"], ["b", "c"])).toEqual(["a", "b", "c"]);
+    expect(mergeRememberedIds([], ["a", "b"])).toEqual(["a", "b"]);
+    expect(mergeRememberedIds(["a", "b"], [])).toEqual(["a", "b"]);
+  });
+
+  it("de-duplicates across both lists and stays bounded", () => {
+    expect(mergeRememberedIds(["a", "b"], ["b", "c", "a"])).toEqual(["a", "b", "c"]);
+    expect(mergeRememberedIds(["", "a"], [""])).toEqual(["a"]);
+    const many = Array.from({ length: 40 }, (_, i) => `p${i}`);
+    expect(mergeRememberedIds(many, ["extra"])).toHaveLength(MAX_CONNECTIONS);
   });
 });

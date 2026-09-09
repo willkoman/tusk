@@ -154,6 +154,10 @@ export function SlackPane(props: {
         const stop = await listen<SlackStatus>("slack:status", (e) => {
           statusRevision++;
           setStatus(e.payload);
+          // The backend turns autostart off when the bot's bound connection goes away
+          // (it must not come back bound to whichever session opens first). Mirror that
+          // here, or an open pane keeps showing the switch as On over a stopped bot.
+          if (!e.payload.running && e.payload.error && cfg().enabled) setCfg({ ...cfg(), enabled: false });
         });
         if (!mounted) {
           stop();
