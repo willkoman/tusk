@@ -1043,18 +1043,35 @@ function App() {
   }
 
   /** Close every tab matching the predicate, skipping dirty ones (reported). */
-  function closeTabsWhere(pred: (t: Tab, i: number, arr: Tab[]) => boolean) {
-    const all = tabs();
-    const targets = all.filter((t, i) => pred(t, i, all));
-    const kept = targets.filter((t) => t.dirty || pendingCount(t.pending) > 0 || (running() && runningTabId() === t.id));
+  /** Is a query in flight on THIS tab? Asked of the tab's OWN connection: another
+   *  connection running a query says nothing about whether this tab can close. */
+  const tabIsRunning = (tabId: string) => {
+    const st = stateOf(tabs().find((t) => t.id === tabId)?.connectionId);
+    return !!st?.running && st.runningTabId === tabId;
+  };
+
+  /**
+   * Close every tab of ONE connection matching the predicate, skipping dirty, pending
+   * or running ones (reported). Scoped to a connection because the strip is shared:
+   * "Close others" from a tab must not reach into another connection's tabs. The
+   * running guard consults each tab's own connection, never the focused one's.
+   */
+  function closeTabsWhere(connectionId: string, pred: (t: Tab, i: number, arr: Tab[]) => boolean) {
+    const owned = tabsOf(connectionId);
+    const targets = owned.filter((t, i) => pred(t, i, owned));
+    const busy = (t: Tab) => {
+      const st = stateOf(t.connectionId);
+      return !!st?.running && st.runningTabId === t.id;
+    };
+    const kept = targets.filter((t) => t.dirty || pendingCount(t.pending) > 0 || busy(t));
     for (const t of targets) {
-      if (!t.dirty && !pendingCount(t.pending) && (!running() || runningTabId() !== t.id)) removeTab(t.id);
+      if (!t.dirty && !pendingCount(t.pending) && !busy(t)) removeTab(t.id);
     }
     if (kept.length) setStatus(`kept ${kept.length} tab${kept.length > 1 ? "s" : ""} with unsaved, pending, or running work`);
   }
 
   function removeTab(id: string) {
-    if (running() && runningTabId() === id) {
+    if (tabIsRunning(id)) {
       patchResult(id, { status: "Cancel or wait for this query before closing its owner tab" });
       return;
     }
@@ -1095,7 +1112,7 @@ function App() {
   function closeTab(id: string) {
     const t = tabs().find((x) => x.id === id);
     if (!t) return;
-    if (running() && runningTabId() === id) {
+    if (tabIsRunning(id)) {
       patchResult(id, { status: "Cancel or wait for this query before closing its owner tab" });
       return;
     }
@@ -4796,8 +4813,8 @@ function App() {
                             { label: "Rename…", icon: "edit", onClick: () => setRenameTab({ id: t.id, title: t.title }) },
                             { sep: true },
                             { label: "Close", icon: "close", onClick: () => closeTab(t.id) },
-                            { label: "Close others", icon: "close", onClick: () => closeTabsWhere((x) => x.id !== t.id) },
-                            { label: "Close tabs to the right", icon: "close", onClick: () => closeTabsWhere((_x, i, arr) => i > arr.findIndex((y) => y.id === t.id)) },
+                            { label: connections().length > 1 ? "Close others on this connection" : "Close others", icon: "close", onClick: () => closeTabsWhere(t.connectionId, (x) => x.id !== t.id) },
+                            { label: "Close tabs to the right", icon: "close", onClick: () => closeTabsWhere(t.connectionId, (_x, i, arr) => i > arr.findIndex((y) => y.id === t.id)) },
                           ],
                         });
                       }}
@@ -5124,7 +5141,10 @@ function App() {
                  }
                  const source = tabs().find((t) => t.id === prompt.tabId);
                 patchTab(prompt.tabId, { paramValues: { ...source?.paramValues, ...values } });
-                setActiveTabId(prompt.tabId);
+                // switchTab, not setActiveTabId: the run must land with the tab's OWN
+                // connection focused, or executeQuery would resolve the wrong dialect
+                // and the wrong runtime for it.
+                switchTab(prompt.tabId);
                 setParamPrompt(null);
                 prompt.onRun(substituted);
               }}
