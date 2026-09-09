@@ -103,12 +103,47 @@ describe("existing helpers", () => {
       "SELECT * FROM (SELECT * FROM t\n) AS _tusk WHERE LOWER(CAST([id] AS VARCHAR(MAX))) LIKE LOWER(N'%abc%') ESCAPE '!' ORDER BY 2 DESC",
     );
     expect(wrappableQuery("SELECT * FROM t")).toBe(true);
-    // T-SQL rejects WITH and a bare ORDER BY inside a derived table.
+    // T-SQL rejects WITH inside a derived table.
     expect(wrappableQuery("WITH recent AS (SELECT * FROM t) SELECT * FROM recent")).toBe(false);
-    expect(wrappableQuery("SELECT * FROM t ORDER BY id")).toBe(false);
     // Those words only matter as real code.
     expect(wrappableQuery("SELECT 'order by' AS x FROM t")).toBe(true);
     expect(wrappableQuery("SELECT [order by] FROM t")).toBe(true);
+  });
+
+  // Previously ANY ordered SQL Server query was unfilterable: the wrap put the ORDER BY
+  // inside the derived table, which T-SQL rejects, so the button was disabled — and the
+  // tooltip told the user to add the very clause that had disabled it.
+  it("mssql lifts a trailing ORDER BY out of the derived table", () => {
+    setSqlDialect("mssql");
+    expect(wrappableQuery("SELECT * FROM dbo.books ORDER BY id")).toBe(true);
+    // With no grid sort the base ordering becomes the wrapper's, after the WHERE.
+    expect(wrapQuery("SELECT * FROM dbo.books ORDER BY id;", [], FILTERS, COLS, "mssql")).toBe(
+      "SELECT * FROM (SELECT * FROM dbo.books\n) AS _tusk WHERE LOWER(CAST([id] AS VARCHAR(MAX))) LIKE LOWER(N'%abc%') ESCAPE '!' ORDER BY id",
+    );
+    // A grid sort is the explicit intent and replaces it.
+    expect(wrapQuery("SELECT * FROM dbo.books ORDER BY id DESC", SORTS, NONE, COLS, "mssql")).toBe(
+      "SELECT * FROM (SELECT * FROM dbo.books\n) AS _tusk ORDER BY 2 DESC",
+    );
+    // Multi-key ordering travels as one clause.
+    expect(wrapQuery("SELECT * FROM t ORDER BY a ASC, b DESC", [], NONE, COLS, "mssql")).toBe(
+      "SELECT * FROM (SELECT * FROM t\n) AS _tusk ORDER BY a ASC, b DESC",
+    );
+    // Only on SQL Server: every other engine nests an ORDER BY happily.
+    expect(wrapQuery("SELECT * FROM t ORDER BY a", [], NONE, COLS, "postgres")).toBe(
+      "SELECT * FROM (SELECT * FROM t ORDER BY a\n) AS _tusk",
+    );
+  });
+
+  it("mssql still refuses an ordering the wrap cannot hoist", () => {
+    setSqlDialect("mssql");
+    // OFFSET/FETCH pagination has to stay inside: filtering before it would change which
+    // rows the page holds. T-SQL accepts an ordered subquery once OFFSET is there.
+    expect(wrappableQuery("SELECT * FROM t ORDER BY id OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY")).toBe(false);
+    // Window ordering and ordered subqueries are not top level and are not hoisted.
+    expect(wrappableQuery("SELECT ROW_NUMBER() OVER (ORDER BY id) AS n FROM t")).toBe(false);
+    expect(wrappableQuery("SELECT * FROM (SELECT TOP 5 * FROM t ORDER BY id) x")).toBe(false);
+    // A CTE still blocks the wrap even with a liftable trailing clause.
+    expect(wrappableQuery("WITH r AS (SELECT * FROM t) SELECT * FROM r ORDER BY id")).toBe(false);
   });
 });
 

@@ -46,6 +46,7 @@ import { fontStack } from "./editor/theme";
 import { type SqlEngine } from "./editor/lexer";
 import { ACTIONS, type ActionCtx, type ActionId, type KeyOverrides, canonicalKey, displayKey, effectiveKey, normalizeKeyEvent } from "./actions";
 import { exportOptionsStore, keymapStore, type RememberedExportOptions } from "./store";
+import { consumeCrashRecovery } from "./CrashGuard";
 import { historyStore, makeEntryId, type HistoryEntry } from "./history/store";
 import { detectParams, type Param, type ParamValue } from "./sql/params";
 import { type FkEdge } from "./sql/fk";
@@ -1439,10 +1440,11 @@ function App() {
     if (!canServerSortFilter()) {
       if (activeTab().result.incomplete) return "this result is incomplete and its query can't be re-run with ORDER BY — re-run it to sort";
       if (!activeTab().result.done) return "this query can't be re-run with ORDER BY — load all rows first to sort in memory";
-      // SQL Server can't wrap a WITH-led or already-ordered statement as a derived
-      // table, so say that instead of blaming the in-memory sort limit.
+      // SQL Server can't wrap a CTE-led statement, or one whose ordering the wrap can't
+      // hoist, as a derived table. Say that instead of blaming the in-memory sort limit —
+      // and never tell the user to add the ORDER BY that disabled the button.
       if (connectionKind() === "mssql" && !mssqlWrappable(activeTab().result.baseQuery))
-        return "SQL Server can't sort this result: it wraps the query as a derived table, which rejects a WITH-led or already-ordered statement — add ORDER BY to the query itself";
+        return "SQL Server can't sort this result: sorting re-runs the query inside a derived table, which T-SQL won't accept for a WITH-led statement, for window or subquery ordering, or for an ORDER BY with OFFSET/FETCH — a plain trailing ORDER BY is fine";
       return "this result can't be sorted: the query isn't a single re-runnable SELECT and it exceeds the in-memory sort limit";
     }
     return "";
@@ -2024,7 +2026,12 @@ function App() {
     const remembered = (savedLayout.openConnections ?? []).filter((id) => profiles().some((p) => p.id === id));
     const def = profiles().find((p) => p.default_connect);
     setReopenable(remembered.filter((id) => id !== def?.id));
-    if (def) connectProfile(def.id);
+    // "Try to continue" after a crash remounts the app, which re-runs this. Recovering
+    // from an error must never open a database session by itself — offer the profile in
+    // the reopen list instead of connecting to it.
+    const recovered = consumeCrashRecovery();
+    if (recovered && def) setReopenable(remembered.includes(def.id) ? remembered : [def.id, ...remembered]);
+    if (def && !recovered) connectProfile(def.id);
     // Slack bot status (statusbar badge) + audit trail: every Slack-approved query
     // lands in the normal per-connection history with a [Slack] marker comment.
     // Best-effort — a failed listen must never break the app.
@@ -2596,13 +2603,27 @@ function App() {
     }
   }
 
+  /**
+   * Deleting a saved connection also drops its keychain password and cannot be undone,
+   * so the trash icon and the context-menu item only ASK — `deleteProfile` is what the
+   * confirmation runs. Rendered in the shared tail, because the profile list lives on
+   * the connect screen as well as in the "Open another connection" modal.
+   */
+  const [confirmDeleteProfile, setConfirmDeleteProfile] = createSignal<Profile | null>(null);
+  const askDeleteProfile = (p: Profile) => {
+    setMenu(null);
+    setConfirmDeleteProfile(p);
+  };
+
   async function deleteProfile(id: string) {
+    setConfirmDeleteProfile(null);
     try {
       await invoke("delete_profile", { id });
       if (editingId() === id) newProfile();
       await loadProfiles();
     } catch (e) {
       console.error(e);
+      setConnErr(errMsg(e));
     }
   }
 
@@ -4782,7 +4803,7 @@ function App() {
         { sep: true },
         { label: "Copy connection string", icon: "copy", onClick: () => copyText(connString(p), "copied connection string") },
         { sep: true },
-        { label: "Delete", icon: "trash", danger: true, onClick: () => deleteProfile(p.id) },
+        { label: "Delete…", icon: "trash", danger: true, onClick: () => askDeleteProfile(p) },
       ],
     });
   }
@@ -4902,7 +4923,7 @@ function App() {
                           <span class="profile-go"><Icon name="play" /></span>
                         </div>
                         <button class="icon" title="Edit" onClick={() => editProfile(p)}><Icon name="edit" /></button>
-                        <button class="icon" title="Delete" onClick={() => deleteProfile(p.id)}><Icon name="trash" /></button>
+                        <button class="icon" title="Delete saved connection…" onClick={() => askDeleteProfile(p)}><Icon name="trash" /></button>
                       </div>
                     )}
                   </For>
@@ -5514,15 +5535,28 @@ function App() {
             </Show>
 
             <footer class="statusbar">
-              <span title={persistenceWarning() || transactionWarning() || slackNotice() || undefined}>{persistenceWarning() || transactionWarning() || slackNotice() || status()}</span>
+              {/* The run status (row counts included) keeps its own slot: a Slack notice
+                  used to occupy it, so `N rows` vanished until the notice was cleared —
+                  and it could only be cleared from the small badge further along. */}
+              <span title={persistenceWarning() || transactionWarning() || undefined}>{persistenceWarning() || transactionWarning() || status()}</span>
+              <Show when={slackNotice()}>
+                <button
+                  class="status-notice"
+                  title="Dismiss this notice"
+                  aria-label={`Dismiss Slack notice: ${slackNotice()}`}
+                  onClick={() => setSlackNotice("")}
+                >
+                  <span class="status-notice-text">{slackNotice()}</span>
+                  <span class="status-notice-x" aria-hidden="true">✕</span>
+                </button>
+              </Show>
               <Show when={slackStatus().running || slackStopped()}>
                 <span
                   class="slack-badge"
                   classList={{ stopped: !!slackStopped() }}
                   title={slackStopped()
-                    ? `Slack: ${slackStopped()} (click to dismiss)`
+                    ? `Slack: ${slackStopped()}`
                     : slackStatus().error ? `Slack: ${slackStatus().state} — ${slackStatus().error}` : `Slack bot ${slackStatus().state}`}
-                  onClick={() => setSlackNotice("")}
                 >
                   {slackStatus().running ? (slackStatus().state === "connected" ? "🟢" : "🟡") : "🔴"} Slack
                 </span>
@@ -6028,6 +6062,25 @@ function App() {
               }
             }}
           />
+        )}
+      </Show>
+
+      {/* Deleting a saved connection is permanent and takes its keychain password with
+          it, so it is always confirmed. Shared tail: the profile list appears on the
+          connect screen AND inside the "Open another connection" modal. */}
+      <Show when={confirmDeleteProfile()}>
+        {(p) => (
+          <Dialog title="Delete saved connection?" onClose={() => setConfirmDeleteProfile(null)} width={460}>
+            <p class="confirm-text">
+              Delete <b>{p().name || p().dbname || p().host}</b> from your saved connections?
+              {p().save_password ? " Its saved password is removed from the OS keychain too." : ""} This
+              can't be undone. Open sessions and the databases themselves are not affected.
+            </p>
+            <div class="form-actions">
+              <button class="ghost" onClick={() => setConfirmDeleteProfile(null)}>Keep it</button>
+              <button class="btn-danger" onClick={() => void deleteProfile(p().id)}>Delete connection</button>
+            </div>
+          </Dialog>
         )}
       </Show>
 

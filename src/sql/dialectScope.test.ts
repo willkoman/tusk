@@ -104,10 +104,11 @@ describe("grid SQL is built for the owning tab's connection", () => {
   it("editability is judged under the owning connection's dialect", () => {
     setSqlDialect("postgres");
     const idx = makeIndexer()([{ schema: "public", name: "users", columns: [{ name: "id", data_type: "int" }] }]);
-    // T-SQL cannot nest an ORDER BY in a derived table, so this result is not
-    // re-runnable there and must not be offered as editable — while the identical
-    // query on a PostgreSQL connection is.
-    const q = "SELECT * FROM public.users ORDER BY id";
+    // T-SQL cannot nest an ORDER BY in a derived table. A plain trailing one is lifted
+    // onto the wrap instead, but OFFSET/FETCH pagination has to stay inside — so this
+    // result is not re-runnable there and must not be offered as editable, while the
+    // identical query on a PostgreSQL connection is.
+    const q = "SELECT * FROM public.users ORDER BY id OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY";
     expect(editTarget(q, idx, null, "postgres")).toMatchObject({ ok: true });
     expect(editTarget(q, idx, null, "mssql")).toMatchObject({ ok: false });
     // The default still follows the active connection, for call sites with no tab.

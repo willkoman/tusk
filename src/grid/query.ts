@@ -36,14 +36,59 @@ export function stripTrailingSemi(q: string, dialect: string = sqlDialect()): st
 }
 
 /**
+ * A top-level `ORDER BY` that runs to the end of `inner`, split off from the body it
+ * orders. T-SQL forbids a bare `ORDER BY` inside a derived table, so the wrapper lifts
+ * that clause out and re-applies it to the wrap instead of refusing to filter every
+ * ordered query.
+ *
+ * Returns null when there is nothing liftable: no top-level `ORDER BY`, more than one,
+ * one that is not the trailing clause, or one carrying `OFFSET`/`FETCH` — that pagination
+ * has to stay INSIDE the derived table (filtering before it would change which rows the
+ * page holds), and T-SQL accepts an ordered subquery once it is present anyway.
+ * `ORDER BY` inside parentheses (a subquery, an `OVER (…)` window) is not top level and
+ * never counts.
+ */
+export function mssqlOrderTail(inner: string): { body: string; order: string } | null {
+  const { spans } = lex(inner, "mssql");
+  const masked = maskNonCode(inner, spans, 0, inner.length);
+  let depth = 0;
+  const tops: number[] = [];
+  for (let i = 0; i < masked.length; i++) {
+    const c = masked[i];
+    if (c === "(") depth++;
+    else if (c === ")") depth = Math.max(0, depth - 1);
+    else if (depth === 0 && (c === "o" || c === "O")) {
+      const m = /^order\s+by(?=\W|$)/i.exec(masked.slice(i));
+      if (m && (i === 0 || /\W/.test(masked[i - 1]))) {
+        tops.push(i);
+        i += m[0].length - 1;
+      }
+    }
+  }
+  if (tops.length !== 1) return null;
+  const at = tops[0];
+  if (/(^|\W)(offset|fetch)(\W|$)/i.test(masked.slice(at))) return null;
+  return { body: inner.slice(0, at).trimEnd(), order: inner.slice(at).trim() };
+}
+
+/**
  * T-SQL forbids both `WITH` and a bare `ORDER BY` inside a derived table, so a CTE-led
- * or already-ordered statement cannot be wrapped for grid sort/filter there. Reported
- * as "not wrappable" rather than emitted and left for SQL Server to reject.
+ * statement cannot be wrapped for grid sort/filter there. A trailing top-level
+ * `ORDER BY` is not a refusal any more — `wrapQuery` lifts it onto the wrapper (see
+ * `mssqlOrderTail`); only an ordering the wrap cannot hoist still blocks the wrap.
  */
 export function mssqlWrappable(inner: string): boolean {
   const { spans } = lex(inner, "mssql");
   const masked = maskNonCode(inner, spans, 0, inner.length);
-  return !/(^|\W)with\s/i.test(masked) && !/(^|\W)order\s+by(\W|$)/i.test(masked);
+  if (/(^|\W)with\s/i.test(masked)) return false;
+  if (!/(^|\W)order\s+by(\W|$)/i.test(masked)) return true;
+  const lifted = mssqlOrderTail(inner);
+  if (!lifted) return false;
+  // Conservative, as before: window ordering (`OVER (ORDER BY …)`) and ordered
+  // subqueries stay a refusal. Only a statement whose ONLY ordering is the trailing
+  // top-level clause can be wrapped, because only that one is hoisted out.
+  const rest = lex(lifted.body, "mssql");
+  return !/(^|\W)order\s+by(\W|$)/i.test(maskNonCode(lifted.body, rest.spans, 0, lifted.body.length));
 }
 
 /**
@@ -92,7 +137,12 @@ export function wrapQuery(
   classOf?: (column: string) => ColumnClass,
 ): string {
   if (!wrappableQuery(base, dialect)) throw new Error("query cannot be safely wrapped for grid sorting or filtering");
-  const inner = stripTrailingSemi(base, dialect);
+  const stripped = stripTrailingSemi(base, dialect);
+  // T-SQL rejects a bare ORDER BY inside a derived table, so the base query's trailing
+  // ordering moves onto the wrapper — where it still orders the result the user sees,
+  // and where a grid sort simply replaces it.
+  const lifted = dialect === "mssql" ? mssqlOrderTail(stripped) : null;
+  const inner = lifted?.body ?? stripped;
   // `renderWhere` reaches `ident`/`lit` implicitly, which read the ACTIVE connection's
   // dialect — pin the owning one, per the rule in `sql/ident.ts`.
   const where = withDialect(dialect, () => renderWhere(filters, { columns, dialect, classOf }));
@@ -105,5 +155,6 @@ export function wrapQuery(
   let sql = `SELECT * FROM (${inner}\n) AS _tusk`;
   if (where) sql += ` WHERE ${where}`;
   if (order) sql += ` ORDER BY ${order}`;
+  else if (lifted) sql += ` ${lifted.order}`;
   return sql;
 }

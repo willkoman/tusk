@@ -128,6 +128,20 @@ function CapturedCrash(props: { source: string; reason: unknown; prior?: boolean
   return <CrashPanel report={report()} prior={props.prior} onContinue={props.onContinue} />;
 }
 
+// "Try to continue" resets the ErrorBoundary, which REMOUNTS the whole app: `onMount`
+// runs again, and with it the connect-on-startup profile. Crash recovery must not open a
+// database session on its own — with a `default_connect` profile pointing at production,
+// that is a session the user never asked for. The flag is session-only (a real relaunch
+// still auto-connects) and App's `onMount` consumes it.
+let recovering = false;
+
+/** True once, when the app is remounting because the user chose "Try to continue". */
+export function consumeCrashRecovery(): boolean {
+  const was = recovering;
+  recovering = false;
+  return was;
+}
+
 export function CrashGuard(props: { children: JSX.Element }) {
   const [unexpected, setUnexpected] = createSignal<{ source: string; reason: unknown; prior?: boolean } | null>(null);
   // Prior-run report held until consent is known ("unset" defers to the prompt's answer).
@@ -136,6 +150,8 @@ export function CrashGuard(props: { children: JSX.Element }) {
   const clear = (after?: () => void) => {
     setUnexpected(null);
     void invoke("crash_report_clear").catch(() => undefined);
+    // Only a reset REMOUNTS the app; dismissing a prior-run report leaves it running.
+    if (after) recovering = true;
     after?.();
   };
 

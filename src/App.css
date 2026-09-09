@@ -786,7 +786,14 @@ button.conn-dot.cancellable:hover { background: var(--danger); box-shadow: 0 0 0
 .slack-badge { white-space: nowrap; flex-shrink: 0; cursor: default; }
 /* A bot that stopped on its own (its bound connection went away) stays visible and
    says so, instead of the badge disappearing with the reason. */
-.slack-badge.stopped { color: var(--danger); font-weight: 600; cursor: pointer; }
+.slack-badge.stopped { color: var(--danger); font-weight: 600; cursor: default; }
+/* A dismissible status-bar notice. It sits BESIDE the run status rather than replacing
+   it (the row count must stay readable) and the whole chip is the dismiss target. */
+.status-notice { display: inline-flex; align-items: center; gap: 8px; max-width: 46%; min-width: 0; padding: 2px 8px; font: inherit; color: var(--danger); background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px; cursor: pointer; }
+.status-notice:hover { border-color: var(--danger); }
+.status-notice-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.status-notice-x { flex-shrink: 0; opacity: 0.65; }
+.status-notice:hover .status-notice-x { opacity: 1; }
 .status-elapsed { display: inline-flex; align-items: center; gap: 5px; font-variant-numeric: tabular-nums; }
 .status-elapsed svg { width: 12px; height: 12px; opacity: 0.7; }
 .streaming { display: inline-flex; align-items: center; gap: 6px; color: var(--accent-2); }
