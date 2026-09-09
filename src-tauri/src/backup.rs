@@ -600,6 +600,11 @@ async fn backup_inner(
     let dialect = SqlDialect::parse(caps.kind)?;
     let is_pg = matches!(backend, Backend::Pg(_));
     let is_mysql = matches!(backend, Backend::MySql(_));
+    // SQL Server's reconstruction already emits foreign keys as trailing
+    // `ALTER TABLE … ADD CONSTRAINT` lines, in the same shape PostgreSQL's does — so
+    // they can be deferred past all data and a cycle restores. Only SQLite and DuckDB
+    // truly cannot add one with ALTER TABLE.
+    let deferrable_fks = is_pg || is_mysql || matches!(backend, Backend::MsSql(_));
 
     let tree = backend.build_tree().await?;
     let database = tree.database.clone();
@@ -805,7 +810,7 @@ async fn backup_inner(
         .await?;
         out.stmt("PRAGMA foreign_keys = OFF").await?;
     }
-    if !cyclic.is_empty() && !is_pg && !is_mysql {
+    if !cyclic.is_empty() && !deferrable_fks {
         warnings.push(format!(
             "foreign key cycle among {} — {} cannot add a foreign key with ALTER TABLE, \
              so these tables are emitted in catalog order and the dump may not restore \
@@ -872,6 +877,15 @@ async fn backup_inner(
                         "CREATE DATABASE IF NOT EXISTS {}",
                         ident_for(schema, dialect)
                     )
+                } else if dialect == SqlDialect::MsSql {
+                    // T-SQL has no `CREATE SCHEMA IF NOT EXISTS`, and `CREATE SCHEMA`
+                    // must be the first statement of its batch — hence the guarded
+                    // `EXEC`, which is the documented idiom.
+                    format!(
+                        "IF SCHEMA_ID('{}') IS NULL EXEC('CREATE SCHEMA {}')",
+                        schema.replace('\'', "''"),
+                        ident_for(schema, dialect).replace('\'', "''")
+                    )
                 } else {
                     format!("CREATE SCHEMA IF NOT EXISTS {}", ident_for(schema, dialect))
                 };
@@ -914,7 +928,7 @@ async fn backup_inner(
             }
             match backend.relation_ddl(&t.kind, &t.schema, &t.name).await {
                 Ok(ddl) => {
-                    let (main, fks) = if is_pg {
+                    let (main, fks) = if is_pg || matches!(backend, Backend::MsSql(_)) {
                         split_fk_alters(&ddl)
                     } else if is_mysql {
                         split_mysql_fk_alters(
@@ -953,12 +967,19 @@ async fn backup_inner(
             if t.kind == "view" {
                 continue;
             }
-            let columns = data_columns(backend, &t.schema, &t.name, is_pg).await?;
+            let columns = data_columns(backend, &t.schema, &t.name, is_pg, dialect).await?;
             if columns.is_empty() {
                 tables_done += 1;
                 continue;
             }
             let binary_cols: Vec<bool> = columns.iter().map(|c| c.binary).collect();
+            // SQL Server refuses an explicit value for an IDENTITY column (error 544)
+            // unless IDENTITY_INSERT is on for that table, so the dump's INSERTs are
+            // bracketed with it — the values round-trip instead of being renumbered.
+            // Only one table may have it on at a time, hence per-table ON/OFF.
+            let identity_insert = (dialect == SqlDialect::MsSql
+                && columns.iter().any(|c| c.identity))
+            .then(|| qual(&t.schema, &t.name, dialect, caps.schemas));
             let columns: Vec<String> = columns.into_iter().map(|c| c.name).collect();
             progress(BackupProgress {
                 phase: "data",
@@ -990,6 +1011,10 @@ async fn backup_inner(
                 )
                 .await?;
             } else {
+                if let Some(target) = &identity_insert {
+                    out.stmt(&format!("SET IDENTITY_INSERT {target} ON"))
+                        .await?;
+                }
                 insert_table(
                     backend,
                     &mut out,
@@ -1007,6 +1032,10 @@ async fn backup_inner(
                     &format!("{}.{}", t.schema, t.name),
                 )
                 .await?;
+                if let Some(target) = &identity_insert {
+                    out.stmt(&format!("SET IDENTITY_INSERT {target} OFF"))
+                        .await?;
+                }
             }
             tables_done += 1;
         }
@@ -1209,10 +1238,19 @@ struct DataColumn {
     /// Declared as a binary type, so the driver's reversible `\x…` hex rendering
     /// must go back in as a native blob literal rather than as text.
     binary: bool,
+    /// An auto-assigned identity column. On SQL Server its values only restore inside
+    /// `SET IDENTITY_INSERT … ON`; every other engine accepts an explicit value.
+    identity: bool,
 }
 
-fn is_binary_type(data_type: &str) -> bool {
+fn is_binary_type(data_type: &str, dialect: SqlDialect) -> bool {
     let t = data_type.trim().to_ascii_lowercase();
+    // T-SQL `bit` is a boolean, not a bit string: `mssql_value` renders it
+    // `true`/`false`, which is not `\x…` hex, so classifying it binary only worked by
+    // accident (SQL Server happens to cast N'true' to bit).
+    if t == "bit" && dialect == SqlDialect::MsSql {
+        return false;
+    }
     t.contains("blob")
         || t.starts_with("binary")
         || t.starts_with("varbinary")
@@ -1227,6 +1265,7 @@ async fn data_columns(
     schema: &str,
     name: &str,
     is_pg: bool,
+    dialect: SqlDialect,
 ) -> Result<Vec<DataColumn>, AppError> {
     if is_pg {
         // PostgreSQL data goes through COPY, which round-trips bytea itself.
@@ -1248,6 +1287,7 @@ async fn data_columns(
             .map(|name| DataColumn {
                 name,
                 binary: false,
+                identity: false,
             })
             .collect());
     }
@@ -1258,7 +1298,8 @@ async fn data_columns(
             d.columns
                 .into_iter()
                 .map(|c| DataColumn {
-                    binary: is_binary_type(&c.data_type),
+                    binary: is_binary_type(&c.data_type, dialect),
+                    identity: c.identity,
                     name: c.name,
                 })
                 .collect()
@@ -2018,8 +2059,13 @@ mod tests {
             None
         );
         assert_eq!(binary_literal(&None, SqlDialect::Sqlite).unwrap(), None);
-        assert!(is_binary_type("BLOB") && is_binary_type("varbinary(16)"));
-        assert!(!is_binary_type("text") && !is_binary_type("integer"));
+        let sqlite = SqlDialect::Sqlite;
+        assert!(is_binary_type("BLOB", sqlite) && is_binary_type("varbinary(16)", sqlite));
+        assert!(!is_binary_type("text", sqlite) && !is_binary_type("integer", sqlite));
+        // SQLite/MySQL `bit` is a bit string rendered as hex; T-SQL `bit` is a boolean
+        // rendered `true`/`false`, so it must take the ordinary literal path.
+        assert!(is_binary_type("bit", sqlite));
+        assert!(!is_binary_type("bit", SqlDialect::MsSql));
     }
 
     // --- embedded round-trip suite ------------------------------------------

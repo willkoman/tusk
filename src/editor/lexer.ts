@@ -94,12 +94,58 @@ function goLineEnd(doc: string, start: number): number {
   while (i < n && space(doc.charCodeAt(i))) i++;
   while (i < n && doc.charCodeAt(i) >= 48 && doc.charCodeAt(i) <= 57) i++;
   while (i < n && space(doc.charCodeAt(i))) i++;
-  if (i + 1 < n && doc.charCodeAt(i) === DASH && doc.charCodeAt(i + 1) === DASH) {
-    while (i < n && doc.charCodeAt(i) !== NL) i++;
+  // A trailing comment still leaves `GO` alone on its line (mirrors script.rs).
+  const lineComment = () => {
+    if (i + 1 < n && doc.charCodeAt(i) === DASH && doc.charCodeAt(i + 1) === DASH) {
+      while (i < n && doc.charCodeAt(i) !== NL) i++;
+    }
+  };
+  if (i + 1 < n && doc.charCodeAt(i) === SLASH && doc.charCodeAt(i + 1) === STAR) {
+    const end = blockCommentEnd(doc, i, true);
+    if (end < 0) return -1; // unterminated: not a batch separator
+    i = end;
+    while (i < n && space(doc.charCodeAt(i))) i++;
+    lineComment();
+  } else {
+    lineComment();
   }
   if (i < n && doc.charCodeAt(i) === CR) i++;
   if (i >= n) return n;
   return doc.charCodeAt(i) === NL ? i + 1 : -1;
+}
+
+/** Index just past the terminator that closes the block comment at `start`, or -1. */
+function blockCommentEnd(doc: string, start: number, nests: boolean): number {
+  const n = doc.length;
+  let i = start + 2;
+  let depth = 1;
+  while (i + 1 < n) {
+    if (doc.charCodeAt(i) === STAR && doc.charCodeAt(i + 1) === SLASH) {
+      i += 2;
+      if (--depth === 0) return i;
+      continue;
+    }
+    if (nests && doc.charCodeAt(i) === SLASH && doc.charCodeAt(i + 1) === STAR) {
+      i += 2;
+      depth++;
+      continue;
+    }
+    i++;
+  }
+  return -1;
+}
+
+/**
+ * The next identifier word at or after `i`, lowercased — whitespace skipped only.
+ * Mirrors `script.rs::peek_word`; it decides whether a `BEGIN` opens a T-SQL block
+ * or a transaction.
+ */
+function peekWord(doc: string, i: number): string {
+  const n = doc.length;
+  while (i < n && /\s/.test(doc[i])) i++;
+  const start = i;
+  while (i < n && isWord(doc.charCodeAt(i))) i++;
+  return doc.slice(start, i).toLowerCase();
 }
 
 export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine): LexResult {
@@ -112,6 +158,11 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
   let i = 0;
   let codeStart = 0;
   let stmtStart = 0;
+  // T-SQL statement-block nesting (`BEGIN … END`, `BEGIN TRY`/`BEGIN CATCH`,
+  // `CASE … END`). A `;` inside a block is not a statement boundary — T-SQL has no
+  // dollar quoting, so without this a procedure body is shredded into fragments.
+  // `BEGIN TRAN[SACTION]` / `BEGIN DISTRIBUTED TRAN` open a transaction, not a block.
+  let blockDepth = 0;
 
   const pushCode = (to: number) => {
     if (to > codeStart) spans.push({ from: codeStart, to, kind: "code" });
@@ -160,6 +211,7 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
         i = end;
         codeStart = end;
         stmtStart = end;
+        blockDepth = 0;
         continue;
       }
     }
@@ -266,8 +318,21 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
       i++;
       continue;
     }
-    // statement terminator
-    if (cc === SEMI) {
+    // T-SQL statement blocks. Consumed as whole words so `BEGIN`/`END`/`CASE` inside
+    // an identifier (`ended`), a bracket, a string or a comment never counts.
+    if (mssql && isAlphaOrUnderscore(cc)) {
+      const start = i;
+      while (i < n && isWord(doc.charCodeAt(i))) i++;
+      const word = doc.slice(start, i).toLowerCase();
+      if (word === "case") blockDepth++;
+      else if (word === "begin") {
+        const next = peekWord(doc, i);
+        if (next !== "tran" && next !== "transaction" && next !== "distributed") blockDepth++;
+      } else if (word === "end") blockDepth = Math.max(0, blockDepth - 1);
+      continue;
+    }
+    // statement terminator (inside a T-SQL block it is part of the statement)
+    if (cc === SEMI && blockDepth === 0) {
       i++;
       pushCode(i); // include the ';' in the trailing code span
       pushStmt(stmtStart, i);

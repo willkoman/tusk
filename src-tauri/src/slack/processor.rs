@@ -408,6 +408,9 @@ async fn generate_proposal(
         crate::ensure_alive(&mut c).await?;
         c.require_idle("Slack metadata")?;
         let caps = c.backend.capabilities();
+        // Refuse before the (slow) AI call, so an unsupported engine says so instead of
+        // proposing a query that could never be approved.
+        slack_engine_supported(script::TransactionEngine::for_kind(caps.kind))?;
         let perms = c
             .backend
             .permissions()
@@ -572,7 +575,7 @@ async fn generate_proposal(
     // Safety gate: exactly one read-only statement, no mutation keywords anywhere
     // (masked scan — catches writable CTEs / smuggled DDL / row locks). The same
     // gate re-runs at execution time; the AI's SQL is never trusted.
-    validate_read_only(&sql)?;
+    validate_read_only(&sql, script::TransactionEngine::for_kind(&dialect))?;
     Ok(Proposal::Sql {
         explanation,
         sql,
@@ -596,7 +599,11 @@ const MUTATION_WORDS: [&str; 15] = [
 
 /// Blank out string literals, quoted identifiers, comments, and dollar-quoted
 /// bodies so keyword scanning can't be fooled by values like 'DROP TABLE…'.
-fn mask_sql(sql: &str) -> String {
+/// Engine-aware: SQL Server nests block comments and quotes identifiers with
+/// `[brackets]`, MySQL adds `#` comments — masking any of those with the wrong rules
+/// either hides real code from the scan or invents keywords that are only a column name.
+fn mask_sql(sql: &str, engine: script::TransactionEngine) -> String {
+    let mssql = engine == script::TransactionEngine::MsSql;
     let b = sql.as_bytes();
     let n = b.len();
     let mut out = vec![b' '; n];
@@ -610,7 +617,14 @@ fn mask_sql(sql: &str) -> String {
             }
             continue;
         }
-        // block comment
+        // MySQL `#` comment to end of line
+        if c == b'#' && engine == script::TransactionEngine::MySql {
+            while i < n && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // block comment (T-SQL nests them; the other engines do not)
         if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
             let executable = i + 2 < n && b[i + 2] == b'!'
                 || i + 3 < n && b[i + 2].eq_ignore_ascii_case(&b'm') && b[i + 3] == b'!';
@@ -621,15 +635,51 @@ fn mask_sql(sql: &str) -> String {
                 out[i + 1] = b'*';
                 out[i + 2] = b'!';
             }
+            let mut depth = 1usize;
             i += 2;
-            while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
+            while i + 1 < n {
+                if b[i] == b'*' && b[i + 1] == b'/' {
+                    i += 2;
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                if mssql && b[i] == b'/' && b[i + 1] == b'*' {
+                    i += 2;
+                    depth += 1;
+                    continue;
+                }
                 i += 1;
             }
-            i = (i + 2).min(n);
+            if depth > 0 {
+                i = n;
+            }
+            continue;
+        }
+        // SQL Server `[bracket]` identifier (`]]` escapes `]`). Like the other quoted
+        // identifier forms it becomes opaque `q` markers: `SELECT [insert] FROM [Update]`
+        // is a plain read, and a `'` inside a bracket must not open a phantom string.
+        if mssql && c == b'[' {
+            out[i] = b'q';
+            i += 1;
+            while i < n {
+                if b[i] == b']' {
+                    if i + 1 < n && b[i + 1] == b']' {
+                        i += 2;
+                        continue;
+                    }
+                    out[i] = b'q';
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
             continue;
         }
         // quoted string / identifier (with doubled-quote escapes)
-        if c == b'\'' || c == b'"' || c == b'`' {
+        if c == b'\'' || c == b'"' || (c == b'`' && !mssql) {
             let q = c;
             if q != b'\'' {
                 // Quoted function names are rejected by the function policy. Keep
@@ -653,8 +703,9 @@ fn mask_sql(sql: &str) -> String {
             }
             continue;
         }
-        // dollar-quoted body ($tag$ … $tag$; $1 is a param, not a tag)
-        if c == b'$' {
+        // dollar-quoted body ($tag$ … $tag$; $1 is a param, not a tag). T-SQL has no
+        // dollar quoting — treating a `$…$` region as opaque there would hide real code.
+        if c == b'$' && !mssql {
             if let Some(tag_end) = dollar_tag_end(b, i) {
                 let tag = &b[i..tag_end];
                 let mut j = tag_end;
@@ -680,33 +731,71 @@ fn dollar_tag_end(b: &[u8], i: usize) -> Option<usize> {
     (j < n && b[j] == b'$' && (j == i + 1 || !b[i + 1].is_ascii_digit())).then_some(j + 1)
 }
 
-/// The first mutation keyword found anywhere in the (masked) statement, if any.
-/// (`FOR UPDATE` row locks are caught by "update"; `FOR SHARE` checked separately.)
-pub(crate) fn find_mutation_word(sql: &str) -> Option<&'static str> {
-    let masked = mask_sql(sql);
+/// The first mutation keyword found anywhere in the (masked) statement, if any, using
+/// the engine's lexical rules. (`FOR UPDATE` row locks are caught by "update";
+/// `FOR SHARE` is checked separately.) `allow_show_create` exempts the `CREATE` of
+/// MySQL's `SHOW CREATE …` — a read whose own syntax carries a mutation keyword — and
+/// nothing else: a second mutation word still fails.
+pub(crate) fn find_mutation_word_for(
+    sql: &str,
+    engine: script::TransactionEngine,
+    allow_show_create: bool,
+) -> Option<&'static str> {
+    let masked = mask_sql(sql, engine);
     let mut previous = "";
+    let mut index = 0usize;
     for token in masked.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
-        if let Some(w) = MUTATION_WORDS.iter().find(|w| **w == token) {
-            return Some(w);
+        if token.is_empty() {
+            continue;
         }
-        if previous == "for" && token == "share" {
-            return Some("share");
+        let exempt = allow_show_create && index == 1 && previous == "show" && token == "create";
+        if !exempt {
+            if let Some(w) = MUTATION_WORDS.iter().find(|w| **w == token) {
+                return Some(w);
+            }
+            if previous == "for" && token == "share" {
+                return Some("share");
+            }
         }
-        if !token.is_empty() {
-            previous = token;
-        }
+        previous = token;
+        index += 1;
     }
     None
 }
 
 /// A statement that can be wrapped as a derived table `SELECT * FROM (<it>) …`.
 /// `is_read_only_stmt` also admits SHOW/EXPLAIN, which are read-only but CANNOT be a
-/// subquery — Slack wraps every query in a LIMIT subselect, so those must be rejected
-/// at the gate (else execution fails with a confusing parser error).
-fn is_wrappable_read(sql: &str) -> bool {
-    let t = script::effective_start(sql).to_ascii_lowercase();
+/// subquery — Slack wraps every query in a row-capped subselect, so those must be
+/// rejected at the gate (else execution fails with a confusing parser error).
+/// T-SQL additionally rejects `WITH` and a bare `ORDER BY` inside a derived table —
+/// the same rule `mssqlWrappable` applies to the grid's sort/filter wrap.
+fn is_wrappable_read(sql: &str, engine: script::TransactionEngine) -> bool {
+    let t = script::effective_start_for(sql, engine).to_ascii_lowercase();
     let first: String = t.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+    if engine == script::TransactionEngine::MsSql {
+        // `WITH`-led statements are excluded by the SELECT-only head check.
+        if first != "select" {
+            return false;
+        }
+        let masked = mask_sql(sql, engine).to_ascii_lowercase();
+        let words: Vec<&str> = masked
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .collect();
+        return !words.windows(2).any(|w| w == ["order", "by"]);
+    }
     matches!(first.as_str(), "select" | "with" | "table" | "values")
+}
+
+/// The row-capped wrapper Slack runs an approved query through. T-SQL has no `LIMIT`;
+/// it caps with `TOP` instead. `cap + 1` rows are read so truncation is detectable.
+/// Newlines around the inner SQL so a trailing `-- line comment` in the query can't
+/// swallow the closing paren or the cap.
+pub(crate) fn wrap_capped(sql: &str, cap: usize, engine: script::TransactionEngine) -> String {
+    if engine == script::TransactionEngine::MsSql {
+        return format!("SELECT TOP {} * FROM (\n{sql}\n) AS _tusk", cap + 1);
+    }
+    format!("SELECT * FROM (\n{sql}\n) AS _tusk LIMIT {}", cap + 1)
 }
 
 /// Functions admitted from Slack. Unknown/schema-qualified routines are rejected:
@@ -920,8 +1009,8 @@ const PAREN_SYNTAX_WORDS: &[&str] = &[
     "within",
 ];
 
-fn unsafe_select_function(sql: &str) -> Option<String> {
-    let masked = mask_sql(sql);
+fn unsafe_select_function(sql: &str, engine: script::TransactionEngine) -> Option<String> {
+    let masked = mask_sql(sql, engine);
     let b = masked.as_bytes();
     for open in 0..b.len() {
         if b[open] != b'(' {
@@ -956,8 +1045,23 @@ fn unsafe_select_function(sql: &str) -> Option<String> {
     None
 }
 
-fn validate_read_only(sql: &str) -> Result<(), AppError> {
-    let items = script::split(sql);
+/// SQL Server is refused at both the question and the approval gate: `read_only = true`
+/// buys PostgreSQL `default_transaction_read_only`, DuckDB `AccessMode::ReadOnly`,
+/// SQLite `SQLITE_OPEN_READ_ONLY` and MySQL `SET SESSION TRANSACTION READ ONLY`, but
+/// nothing on MSSQL — its isolated backend would be enforced by SQL classification
+/// alone, which is not the "engine-enforced read-only" guarantee this path documents.
+fn slack_engine_supported(engine: script::TransactionEngine) -> Result<(), AppError> {
+    if engine == script::TransactionEngine::MsSql {
+        return Err(AppError::new(
+            "Slack queries aren't available on SQL Server yet: Tusk can't open an engine-enforced read-only session there, and it won't run one on classification alone. Use the Tusk editor.",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_read_only(sql: &str, engine: script::TransactionEngine) -> Result<(), AppError> {
+    slack_engine_supported(engine)?;
+    let items = script::parse_for_engine(sql, engine)?;
     let single = match items.as_slice() {
         [script::Item::Sql(s)] => s.trim().to_string(),
         _ => {
@@ -966,22 +1070,22 @@ fn validate_read_only(sql: &str) -> Result<(), AppError> {
             ))
         }
     };
-    if !crate::is_read_only_stmt(&single) || !is_wrappable_read(&single) {
+    if !crate::is_read_only_stmt(&single, engine) || !is_wrappable_read(&single, engine) {
         return Err(AppError::new(
             "I can only run read-only SELECT queries from Slack (no EXPLAIN/SHOW/DDL). Open the query in Tusk to run it.",
         ));
     }
-    if mask_sql(&single).contains("/*!") {
+    if mask_sql(&single, engine).contains("/*!") {
         return Err(AppError::new(
             "blocked: MySQL/MariaDB executable comments are not allowed in Slack queries",
         ));
     }
-    if let Some(w) = find_mutation_word(&single) {
+    if let Some(w) = find_mutation_word_for(&single, engine, false) {
         return Err(AppError::new(format!(
             "blocked: the statement contains `{w}` — Slack only runs read-only SELECTs (no DML/DDL, no writable CTEs, no row locks). Run it in the Tusk editor instead.",
         )));
     }
-    if let Some(routine) = unsafe_select_function(&single) {
+    if let Some(routine) = unsafe_select_function(&single, engine) {
         return Err(AppError::new(format!(
             "blocked: {routine} is outside Slack's conservative read-only function policy. Run it in the Tusk editor instead.",
         )));
@@ -1247,6 +1351,7 @@ async fn handle_interaction(
         &prop.sql,
         &prop.connection_id,
         &prop.database,
+        &prop.dialect,
         cancel,
     )
     .await;
@@ -1333,21 +1438,23 @@ async fn handle_interaction(
 }
 
 /// Execute an approved query on a fresh engine-enforced read-only connection:
-/// LIMIT-capped, buffered, and never routed through the shared UI cursor. PostgreSQL
+/// row-capped, buffered, and never routed through the shared UI cursor. PostgreSQL
 /// timeout is preemptive; other engines report their weaker cancellation guarantees.
+/// Engines with no server-side read-only enforcement (SQL Server) are refused here.
 async fn run_proposal(
     app: &AppHandle,
     cfg: &SlackConfig,
     sql: &str,
     expected_connection_id: &str,
     expected_database: &str,
+    expected_dialect: &str,
     session_cancel: &CancellationToken,
 ) -> Result<SlackQueryResult, AppError> {
-    validate_read_only(sql)?;
+    let expected_engine = script::TransactionEngine::for_kind(expected_dialect);
+    validate_read_only(sql, expected_engine)?;
     let cap = cfg.max_rows_file;
-    // Newlines around the inner SQL so a trailing `-- line comment` in the query can't
-    // swallow the closing paren / LIMIT. `sql` is already `;`-trimmed by the caller.
-    let wrapped = format!("SELECT * FROM (\n{sql}\n) AS _tusk LIMIT {}", cap + 1);
+    // `sql` is already `;`-trimmed by the caller.
+    let wrapped = wrap_capped(sql, cap, expected_engine);
 
     let (conn_id, conn) = bound_connection(app)?;
     if conn_id != expected_connection_id {
@@ -1367,6 +1474,14 @@ async fn run_proposal(
         let mut isolated_cfg = c.backend.config().clone();
         isolated_cfg.read_only = true;
         let kind = c.backend.capabilities().kind;
+        // The live connection must still be the engine the proposal was validated and
+        // wrapped for — and one Tusk can open read-only at the engine level.
+        if kind != expected_dialect {
+            return Err(AppError::new(
+                "the active Tusk connection uses a different driver than this proposal — ask the question again before approving",
+            ));
+        }
+        slack_engine_supported(script::TransactionEngine::for_kind(kind))?;
         if matches!(kind, "duckdb" | "sqlite")
             && (isolated_cfg.path.as_deref().unwrap_or("").trim().is_empty()
                 || matches!(isolated_cfg.path.as_deref(), Some(":memory:")))
@@ -1861,7 +1976,9 @@ async fn attach(
 /// executed query (schema qualifier and quoting dropped, filename-safe chars only),
 /// so a thread with several exports doesn't collect identically-named `result.csv`s.
 fn export_label(sql: &str) -> String {
-    let lower = mask_sql(sql).to_ascii_lowercase();
+    // Cosmetic (attachment filename): PostgreSQL rules are close enough for every
+    // engine, and a mis-parse falls back to "result".
+    let lower = mask_sql(sql, script::TransactionEngine::Postgres).to_ascii_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
     let candidate = words
         .windows(2)
@@ -1934,6 +2051,12 @@ fn attachment_preflight(
 mod tests {
     use super::*;
 
+    /// The gate as it runs against a PostgreSQL connection. Engine-specific behaviour
+    /// (SQL Server's refusal, its `TOP` wrap) has its own cases below.
+    fn validate_read_only(sql: &str) -> Result<(), AppError> {
+        super::validate_read_only(sql, script::TransactionEngine::Postgres)
+    }
+
     #[test]
     fn plain_selects_pass() {
         for q in [
@@ -1994,6 +2117,96 @@ mod tests {
         assert!(validate_read_only("SELECT /* delete everything */ 1").is_ok());
         // …but real keywords outside masked regions still trip it.
         assert!(validate_read_only("SELECT $tag$x$tag$ FROM t; DELETE FROM t").is_err());
+    }
+
+    #[test]
+    fn sql_server_is_refused_until_it_can_be_engine_enforced_read_only() {
+        // `read_only = true` gives PG/DuckDB/SQLite/MySQL a server-side guarantee; on
+        // SQL Server it gives nothing, so Slack must not run there on classification
+        // alone — the gate, not the wrap, is what keeps that promise honest.
+        let error = super::validate_read_only("SELECT 1", script::TransactionEngine::MsSql)
+            .expect_err("SQL Server is refused");
+        assert!(error.message.contains("SQL Server"), "{}", error.message);
+        assert!(super::slack_engine_supported(script::TransactionEngine::Postgres).is_ok());
+        assert!(super::slack_engine_supported(script::TransactionEngine::MySql).is_ok());
+    }
+
+    #[test]
+    fn capped_wrap_is_per_engine() {
+        // T-SQL has no LIMIT: every approved query used to die on "Incorrect syntax
+        // near 'LIMIT'".
+        let mssql = wrap_capped("SELECT a FROM t", 100, script::TransactionEngine::MsSql);
+        assert!(mssql.starts_with("SELECT TOP 101 * FROM ("), "{mssql}");
+        assert!(!mssql.contains("LIMIT"), "{mssql}");
+        let pg = wrap_capped("SELECT a FROM t", 100, script::TransactionEngine::Postgres);
+        assert!(pg.ends_with(") AS _tusk LIMIT 101"), "{pg}");
+        // A derived table on T-SQL rejects WITH and a bare ORDER BY, so the gate must
+        // refuse those shapes rather than emit SQL the server won't parse.
+        let mssql_engine = script::TransactionEngine::MsSql;
+        assert!(is_wrappable_read("SELECT a FROM t", mssql_engine));
+        assert!(!is_wrappable_read(
+            "SELECT a FROM t ORDER BY a",
+            mssql_engine
+        ));
+        assert!(!is_wrappable_read(
+            "SELECT a FROM t\nORDER\nBY a",
+            mssql_engine
+        ));
+        assert!(!is_wrappable_read(
+            "WITH c AS (SELECT 1 AS a) SELECT * FROM c",
+            mssql_engine
+        ));
+        // The inner ORDER BY of a window function is inside parens but still refused —
+        // conservative, and the message points at the Tusk editor.
+        assert!(is_wrappable_read(
+            "WITH c AS (SELECT 1 AS a) SELECT * FROM c",
+            script::TransactionEngine::Postgres
+        ));
+    }
+
+    #[test]
+    fn bracket_identifiers_are_names_not_keywords() {
+        // `SELECT [insert] FROM [dbo].[Update]` is a plain read; the mutation scan used
+        // to see `insert`/`update` and blame the user for DML that isn't there.
+        assert!(find_mutation_word_for(
+            "SELECT [insert], [delete] FROM [dbo].[Update]",
+            script::TransactionEngine::MsSql,
+            false
+        )
+        .is_none());
+        // A `'` inside a bracket must not open a phantom string that hides real code.
+        assert_eq!(
+            find_mutation_word_for(
+                "SELECT [a'b] FROM t; DROP TABLE u",
+                script::TransactionEngine::MsSql,
+                false
+            ),
+            Some("drop")
+        );
+        // Nested comments hide nothing from the scan either.
+        assert_eq!(
+            find_mutation_word_for(
+                "/*/* */ SELECT 1 */ DROP TABLE u",
+                script::TransactionEngine::MsSql,
+                false
+            ),
+            Some("drop")
+        );
+        // MySQL's SHOW CREATE is the only exemption, and only for that one word.
+        assert!(find_mutation_word_for(
+            "SHOW CREATE TABLE t",
+            script::TransactionEngine::MySql,
+            true
+        )
+        .is_none());
+        assert_eq!(
+            find_mutation_word_for(
+                "SHOW CREATE TABLE t; DROP TABLE u",
+                script::TransactionEngine::MySql,
+                true
+            ),
+            Some("drop")
+        );
     }
 
     #[test]

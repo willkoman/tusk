@@ -608,6 +608,19 @@ impl Backend {
         }
     }
 
+    /// True when the tracked manual transaction is gone but the SESSION is still
+    /// usable: SQL Server unwinds the whole unit for a deadlock victim and for most
+    /// errors under `XACT_ABORT ON`, over a perfectly live socket. That is "the unit
+    /// ended", not "the connection dropped" — the UI returns to Idle and reports the
+    /// statement's own error instead of telling the user to reconnect.
+    pub fn manual_unit_ended(&self) -> bool {
+        match self {
+            Backend::MsSql(mssql) => mssql.manual_lost && !mssql.is_dead(),
+            // The other drivers report loss only through a dead/closed session.
+            _ => false,
+        }
+    }
+
     /// True when a tracked manual session no longer has a physical transaction to own.
     /// Callers must only use this while `TransactionStatus::owns_session()` is true.
     pub fn manual_session_ended(&self) -> bool {
@@ -917,7 +930,7 @@ impl Backend {
         let enforce_read_only = read_only || self.config().read_only;
         if enforce_read_only
             && items.iter().any(|item| match item {
-                script::Item::Sql(sql) => !crate::is_read_only_stmt(sql),
+                script::Item::Sql(sql) => !crate::is_read_only_stmt(sql, self.engine()),
                 script::Item::Copy { .. } => true,
             })
         {
@@ -956,10 +969,10 @@ impl Backend {
         page: u32,
         cursorable: bool,
     ) -> Result<QueryOutcome, AppError> {
-        if script::effective_start(trimmed).starts_with('\\') {
+        if script::effective_start_for(trimmed, self.engine()).starts_with('\\') {
             return Err(AppError::new("psql meta-commands are not supported"));
         }
-        if self.config().read_only && !crate::is_read_only_stmt(trimmed) {
+        if self.config().read_only && !crate::is_read_only_stmt(trimmed, self.engine()) {
             return Err(AppError::new(
                 "connection is read-only — writes and side effects are blocked",
             ));
@@ -987,10 +1000,10 @@ impl Backend {
         // Same driver-level guards as `run_single`: the command layer already
         // enforces these, but the manual-transaction path must not be the one
         // route with a single enforcement layer.
-        if script::effective_start(trimmed).starts_with('\\') {
+        if script::effective_start_for(trimmed, self.engine()).starts_with('\\') {
             return Err(AppError::new("psql meta-commands are not supported"));
         }
-        if self.config().read_only && !crate::is_read_only_stmt(trimmed) {
+        if self.config().read_only && !crate::is_read_only_stmt(trimmed, self.engine()) {
             return Err(AppError::new(
                 "connection is read-only — writes and side effects are blocked",
             ));
@@ -3571,6 +3584,11 @@ pub struct MsSqlConn {
     manual_lost: bool,
     /// SQL Server reported `XACT_STATE() = -1`: the transaction can only be rolled back.
     doomed: bool,
+    /// `STRING_AGG(…) WITHIN GROUP` exists (SQL Server 2017 / major version 14+). The
+    /// index/constraint catalog queries are built on it; on an older server they error,
+    /// and every call site swallows that — which silently produced a `CREATE TABLE` with
+    /// no PRIMARY KEY, UNIQUE, CHECK or FK. The DDL path refuses instead.
+    string_agg: bool,
     /// Owns the SSH session for this connection; dropping it closes the tunnel.
     tunnel: Option<crate::ssh::Tunnel>,
 }
@@ -3578,6 +3596,45 @@ pub struct MsSqlConn {
 fn mssql_err(error: tiberius::error::Error) -> AppError {
     // tiberius' Display for a server token is already the SQL Server message text.
     AppError::new(error.to_string())
+}
+
+/// A tiberius failure plus whether it means the TDS session itself is gone. Classifying
+/// by the error VARIANT (not by two `Display` prefixes) is what keeps `is_dead` — and
+/// therefore reconnect and manual-transaction loss — working across a tiberius wording
+/// change; a server-reported SQL error leaves the session perfectly usable.
+struct MsSqlFailure {
+    error: AppError,
+    transport: bool,
+}
+
+impl From<tiberius::error::Error> for MsSqlFailure {
+    fn from(error: tiberius::error::Error) -> Self {
+        use tiberius::error::Error as E;
+        let transport = matches!(
+            error,
+            E::Io { .. }
+                | E::Protocol(_)
+                | E::Encoding(_)
+                | E::Tls(_)
+                | E::Utf8
+                | E::Utf16
+                | E::Routing { .. }
+        );
+        Self {
+            error: mssql_err(error),
+            transport,
+        }
+    }
+}
+
+impl From<AppError> for MsSqlFailure {
+    fn from(error: AppError) -> Self {
+        // Tusk's own errors (budget overruns, value decoding) never mean a lost socket.
+        Self {
+            error,
+            transport: false,
+        }
+    }
 }
 
 /// `[bracket]` identifier quoting (`]` doubles), the T-SQL form Tusk emits everywhere.
@@ -3652,29 +3709,31 @@ fn mssql_value(data: &tiberius::ColumnData<'static>) -> Result<Option<String>, A
 async fn mssql_collect(
     mut stream: tiberius::QueryStream<'_>,
     limits: db::TextLimits,
-) -> Result<TextRows, AppError> {
+) -> Result<TextRows, MsSqlFailure> {
     use futures_util::TryStreamExt;
 
-    let columns: Vec<String> = match stream.columns().await.map_err(mssql_err)? {
+    let columns: Vec<String> = match stream.columns().await? {
         Some(columns) => columns.iter().map(|c| c.name().to_string()).collect(),
         None => Vec::new(),
     };
     let mut budget = db::TextBudget::new(&columns, limits)?;
     let mut rows: Vec<Vec<Option<String>>> = Vec::new();
-    while let Some(item) = stream.try_next().await.map_err(mssql_err)? {
+    while let Some(item) = stream.try_next().await? {
         if item
             .as_metadata()
             .is_some_and(|meta| meta.result_index() > 0)
         {
             return Err(AppError::new(
                 "database returned multiple result sets where one was expected",
-            ));
+            )
+            .into());
         }
         let Some(row) = item.into_row() else { continue };
         if row.result_index() > 0 {
             return Err(AppError::new(
                 "database returned multiple result sets where one was expected",
-            ));
+            )
+            .into());
         }
         let mut out = Vec::with_capacity(columns.len());
         for (_column, data) in row.cells() {
@@ -3715,7 +3774,7 @@ impl MsSqlConn {
         let client = Self::open_client(&dial)
             .await
             .map_err(|e| crate::ssh::explain_db_failure(tunnel.as_ref(), e))?;
-        let conn = MsSqlConn {
+        let mut conn = MsSqlConn {
             client: tokio::sync::Mutex::new(client),
             config: config.clone(),
             stream_sql: None,
@@ -3724,6 +3783,7 @@ impl MsSqlConn {
             dead: std::sync::atomic::AtomicBool::new(false),
             manual_lost: false,
             doomed: false,
+            string_agg: true,
             tunnel,
         };
         let version = conn
@@ -3736,6 +3796,13 @@ impl MsSqlConn {
             .and_then(|(_c, rows)| rows.into_iter().next())
             .and_then(|row| row.into_iter().next().flatten())
             .unwrap_or_else(|| "unknown".to_string());
+        // `14.0` is SQL Server 2017, the first with STRING_AGG. An unreadable version
+        // keeps the modern path: the catalog queries then fail loudly on their own.
+        conn.string_agg = version
+            .split('.')
+            .next()
+            .and_then(|major| major.parse::<u32>().ok())
+            .is_none_or(|major| major >= 14);
         Ok((
             Backend::MsSql(Box::new(conn)),
             format!("SQL Server {version}"),
@@ -3792,34 +3859,24 @@ impl MsSqlConn {
     }
 
     /// Latch transport-level failures so `ensure_alive` re-dials instead of replaying
-    /// commands over a dead socket. Server-reported SQL errors leave the session usable.
-    fn note_error(&self, error: &AppError) -> AppError {
-        // Only tiberius' I/O and protocol errors qualify: a server-reported SQL error
-        // ("Token error: …") leaves the session perfectly usable, and treating one as a
-        // lost connection would wrongly declare an owned manual transaction lost.
-        // Matching is on the two `Display` prefixes because either can surface from
-        // inside `mssql_collect` as well as from the initial request.
-        const TRANSPORT_PREFIXES: [&str; 2] = [
-            "An error occurred during the attempt of performing I/O",
-            "Protocol error",
-        ];
-        if TRANSPORT_PREFIXES
-            .iter()
-            .any(|prefix| error.message.starts_with(prefix))
-        {
+    /// commands over a dead socket. Server-reported SQL errors leave the session usable,
+    /// so they must not latch — that would wrongly declare an owned manual transaction
+    /// lost. `MsSqlFailure` carries the classification from the tiberius error variant.
+    fn note_failure(&self, failure: MsSqlFailure) -> AppError {
+        if failure.transport {
             self.dead.store(true, Ordering::Release);
         }
-        AppError::new(error.message.clone())
+        failure.error
     }
 
     async fn run_text(&self, sql: &str, limits: db::TextLimits) -> Result<TextRows, AppError> {
         let mut client = self.client.lock().await;
         let result = async {
-            let stream = client.simple_query(sql).await.map_err(mssql_err)?;
+            let stream = client.simple_query(sql).await?;
             mssql_collect(stream, limits).await
         }
         .await;
-        result.map_err(|error| self.note_error(&error))
+        result.map_err(|failure| self.note_failure(failure))
     }
 
     async fn query_text(&self, sql: &str, limits: db::TextLimits) -> Result<TextRows, AppError> {
@@ -3838,11 +3895,11 @@ impl MsSqlConn {
         let result = async {
             let bound: Vec<&dyn tiberius::ToSql> =
                 params.iter().map(|p| p as &dyn tiberius::ToSql).collect();
-            let stream = client.query(sql, &bound).await.map_err(mssql_err)?;
+            let stream = client.query(sql, &bound).await?;
             mssql_collect(stream, limits).await
         }
         .await;
-        result.map_err(|error| self.note_error(&error))
+        result.map_err(|failure| self.note_failure(failure))
     }
 
     /// Rows touched by the previous statement on this session. `@@ROWCOUNT` is session
@@ -3888,7 +3945,15 @@ impl MsSqlConn {
         if manual {
             // Probe even when the statement failed: that is exactly when SQL Server may
             // have doomed (XACT_STATE = -1) or already unwound the transaction.
-            self.verify_manual(true).await?;
+            if let Err(status) = self.verify_manual(true).await {
+                // The statement's own error stays PRIMARY. Reporting only the
+                // transaction status hid "Transaction (Process ID 55) was deadlocked…"
+                // behind a generic "connection dropped" message.
+                return Err(match outcome {
+                    Err(error) => AppError::new(format!("{} — {}", error.message, status.message)),
+                    Ok(_) => status,
+                });
+            }
         }
         outcome
     }
@@ -3918,7 +3983,21 @@ impl MsSqlConn {
                 note: None,
             });
         }
-        let (columns, rows) = self.run_text(trimmed, db::USER_TEXT_LIMITS).await?;
+        let buffered = cursorable && paging == script::MsSqlPaging::Buffered;
+        let (columns, rows) = self
+            .run_text(trimmed, db::USER_TEXT_LIMITS)
+            .await
+            .map_err(|error| {
+                // A statement Tusk can't page is read whole under the result budget, so
+                // the budget error must say WHY there was no paging and what fixes it.
+                if buffered && error.message.contains("limit") {
+                    return AppError::new(format!(
+                        "{} — SQL Server can't page this statement shape (TOP, its own OFFSET/FETCH, FOR XML/JSON, OPTION, or an unordered set operation), so it was read in one page. Add a top-level ORDER BY, or narrow the query.",
+                        error.message
+                    ));
+                }
+                error
+            })?;
         if columns.is_empty() {
             let message = if script::is_ddl(trimmed) {
                 "OK".to_string()
@@ -3937,7 +4016,7 @@ impl MsSqlConn {
             // A statement Tusk cannot page safely (TOP, its own OFFSET/FETCH,
             // FOR XML/JSON, OPTION, or an unordered set operation) is read once
             // under the result budget instead of being silently truncated.
-            note: (cursorable && paging == script::MsSqlPaging::Buffered).then(|| {
+            note: buffered.then(|| {
                 "read in one page — SQL Server can't page this statement shape".to_string()
             }),
         })
@@ -4000,10 +4079,16 @@ impl MsSqlConn {
         self.doomed = xact_state == -1;
         if expect_active && trancount == 0 {
             self.manual_lost = true;
+            // The SESSION is fine — only the unit is gone (deadlock victim, an error
+            // under XACT_ABORT ON, a procedure that committed on Tusk's behalf).
+            // `manual_unit_ended` reads this state and the UI returns to Idle.
             return Err(AppError::new(
-                "SQL Server ended the manual transaction unexpectedly; reconnect required",
+                "SQL Server ended the transaction; the connection is still open — start a new transaction and verify what was applied",
             ));
         }
+        // The server confirmed the tracked state, so any earlier loss is resolved: a
+        // new transaction on this session must not inherit it.
+        self.manual_lost = false;
         Ok(())
     }
 
@@ -4054,48 +4139,88 @@ impl MsSqlConn {
     }
 
     /// One app-owned transaction around an ordinary multi-statement script. Each item
-    /// runs as its own TDS batch, so batch-leading DDL (`CREATE VIEW`, `CREATE PROCEDURE`)
-    /// still works. `XACT_ABORT ON` makes any runtime error abort the whole unit instead
-    /// of leaving earlier statements committed, and is restored afterwards because it is
-    /// session state the user's own SQL would otherwise inherit.
+    /// runs as its own TDS batch, so a batch-leading `CREATE VIEW`/`CREATE PROCEDURE`
+    /// still works (the splitter keeps a `BEGIN … END` body in one item). `XACT_ABORT ON`
+    /// makes any runtime error abort the whole unit instead of leaving earlier statements
+    /// committed, and the session's ORIGINAL setting is restored afterwards — a session
+    /// that arrived with it ON (login trigger, ANSI defaults) must not silently lose it.
     async fn run_script(&self, items: &[script::Item]) -> Result<String, AppError> {
+        // `@@OPTIONS & 16384` is the XACT_ABORT bit.
+        let was_on = self
+            .run_text("SELECT @@OPTIONS & 16384", db::CATALOG_TEXT_LIMITS)
+            .await
+            .ok()
+            .and_then(|(_c, rows)| rows.into_iter().next())
+            .and_then(|row| row.into_iter().next().flatten())
+            .map(|value| value.trim() != "0")
+            .unwrap_or(false);
         self.run_text("SET XACT_ABORT ON", db::CATALOG_TEXT_LIMITS)
             .await?;
         let outcome = self.run_script_inner(items).await;
-        let _ = self
-            .run_text("SET XACT_ABORT OFF", db::CATALOG_TEXT_LIMITS)
-            .await;
+        if !was_on {
+            let _ = self
+                .run_text("SET XACT_ABORT OFF", db::CATALOG_TEXT_LIMITS)
+                .await;
+        }
         outcome
     }
 
     async fn run_script_inner(&self, items: &[script::Item]) -> Result<String, AppError> {
+        // A leaked outer transaction (a commit that failed and could not be rolled
+        // back) would otherwise nest silently, and this wrapper's COMMIT would only
+        // decrement @@TRANCOUNT instead of committing.
+        let (_c, open) = self
+            .run_text("SELECT @@TRANCOUNT", db::CATALOG_TEXT_LIMITS)
+            .await?;
+        let trancount = open
+            .first()
+            .map(|row| dcell(row, 0))
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        if trancount > 0 {
+            return Err(AppError::new(
+                "a SQL Server transaction is already open on this session; commit or roll it back before running a script",
+            ));
+        }
         self.run_text("BEGIN TRANSACTION", db::CATALOG_TEXT_LIMITS)
             .await?;
         let mut stmts = 0u64;
+        let mut affected = 0u64;
         for item in items {
             let script::Item::Sql(sql) = item else {
                 continue;
             };
-            if let Err(error) = self.run_text(sql.trim(), db::USER_TEXT_LIMITS).await {
-                let _ = self
-                    .run_text(
-                        "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
-                        db::CATALOG_TEXT_LIMITS,
-                    )
-                    .await;
-                return Err(AppError::new(format!(
-                    "{} — at statement {} ({})",
-                    error.message,
-                    stmts + 1,
-                    sql.lines()
-                        .next()
-                        .unwrap_or("")
-                        .chars()
-                        .take(70)
-                        .collect::<String>()
-                )));
-            }
+            let result = self.run_text(sql.trim(), db::USER_TEXT_LIMITS).await;
+            let columns = match result {
+                Ok((columns, _rows)) => columns,
+                Err(error) => {
+                    let _ = self
+                        .run_text(
+                            "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
+                            db::CATALOG_TEXT_LIMITS,
+                        )
+                        .await;
+                    return Err(AppError::new(format!(
+                        "{} — at statement {} ({})",
+                        error.message,
+                        stmts + 1,
+                        sql.lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(70)
+                            .collect::<String>()
+                    )));
+                }
+            };
             stmts += 1;
+            // `@@ROWCOUNT` is session state that survives the batch boundary, so this
+            // reads the count the user's statement produced. Only statements that
+            // returned no result set count as "affected"; DDL and reads contribute
+            // nothing. Best-effort — a failed probe just omits its statement.
+            if columns.is_empty() && !script::is_ddl(sql) {
+                affected = affected.saturating_add(self.last_rowcount().await.unwrap_or(0));
+            }
         }
         self.run_text("COMMIT TRANSACTION", db::CATALOG_TEXT_LIMITS)
             .await
@@ -4105,7 +4230,9 @@ impl MsSqlConn {
                     error.message
                 ))
             })?;
-        Ok(format!("OK — {stmts} statements run, 0 rows copied"))
+        Ok(format!(
+            "OK — {stmts} statements run, {affected} rows affected"
+        ))
     }
 
     /// Result-column types without executing anything: `sys.dm_exec_describe_first_result_set`
@@ -4125,12 +4252,27 @@ impl MsSqlConn {
             .collect()
     }
 
-    async fn object_id(&self, schema: &str, name: &str) -> Result<i64, AppError> {
+    /// Resolve `schema.name` to an object id. `types` restricts `sys.objects.type` so a
+    /// procedure or a constraint of the same name can't resolve as a relation and hand
+    /// `table_detail` an empty-but-successful answer instead of "no such relation".
+    async fn object_id_of(
+        &self,
+        schema: &str,
+        name: &str,
+        types: &[&str],
+    ) -> Result<i64, AppError> {
+        let filter = types
+            .iter()
+            .map(|t| format!("'{t}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let (_columns, rows) = self
             .query_params(
-                "SELECT o.object_id FROM sys.objects o \
-                 JOIN sys.schemas s ON s.schema_id = o.schema_id \
-                 WHERE s.name = @P1 AND o.name = @P2",
+                &format!(
+                    "SELECT o.object_id FROM sys.objects o \
+                     JOIN sys.schemas s ON s.schema_id = o.schema_id \
+                     WHERE s.name = @P1 AND o.name = @P2 AND o.type IN ({filter})"
+                ),
                 &[schema, name],
                 db::CATALOG_TEXT_LIMITS,
             )
@@ -4140,11 +4282,36 @@ impl MsSqlConn {
             .ok_or_else(|| AppError::new(format!("no such relation: {schema}.{name}")))
     }
 
+    /// Tables and views only.
+    async fn object_id(&self, schema: &str, name: &str) -> Result<i64, AppError> {
+        self.object_id_of(schema, name, &["U", "V"]).await
+    }
+
     async fn build_tree(&self) -> Result<tree::DbTree, AppError> {
         let (_c, schema_rows) = self
             .query_text(MSSQL_SCHEMAS, db::CATALOG_TEXT_LIMITS)
             .await?;
         let (_c2, rel_rows) = self.query_text(MSSQL_RELS, db::CATALOG_TEXT_LIMITS).await?;
+        // Row/size estimates come from a DMV that needs VIEW DATABASE STATE. A
+        // least-privilege login has SELECT but not that, and losing the estimates must
+        // not cost it the whole sidebar — so this is a separate best-effort query.
+        let estimates: std::collections::HashMap<String, (Option<i64>, Option<i64>)> = self
+            .query_text(MSSQL_REL_STATS, db::CATALOG_TEXT_LIMITS)
+            .await
+            .map(|(_c, rows)| {
+                rows.iter()
+                    .map(|row| {
+                        (
+                            dcell(row, 0),
+                            (
+                                row.get(1).and_then(|v| v.as_deref()?.parse().ok()),
+                                row.get(2).and_then(|v| v.as_deref()?.parse().ok()),
+                            ),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let (_c3, seq_rows) = self.query_text(MSSQL_SEQS, db::CATALOG_TEXT_LIMITS).await?;
         let (_c4, func_rows) = self
             .query_text(MSSQL_ROUTINES, db::CATALOG_TEXT_LIMITS)
@@ -4185,18 +4352,19 @@ impl MsSqlConn {
                 continue;
             };
             let is_view = dcell(row, 2).eq_ignore_ascii_case("VIEW");
+            let estimate = estimates
+                .get(&dcell(row, 3))
+                .copied()
+                .unwrap_or((None, None));
             let stub = tree::RelStub {
                 name: dcell(row, 1),
                 kind: if is_view { "view" } else { "table" }.to_string(),
-                comment: row.get(5).cloned().flatten(),
-                rows: row
-                    .get(3)
-                    .and_then(|v| v.as_deref())
-                    .and_then(|v| v.parse().ok()),
-                size: row
-                    .get(4)
-                    .and_then(|v| v.as_deref())
-                    .and_then(|v| v.parse::<i64>().ok())
+                comment: row.get(4).cloned().flatten(),
+                rows: estimate.0,
+                // Views have no storage of their own.
+                size: (!is_view)
+                    .then_some(estimate.1)
+                    .flatten()
                     .map(mssql_pretty_kb),
             };
             if is_view {
@@ -4349,7 +4517,9 @@ impl MsSqlConn {
     }
 
     async fn relation_ddl(&self, kind: &str, schema: &str, name: &str) -> Result<String, AppError> {
-        let oid = self.object_id(schema, name).await?;
+        let oid = self
+            .object_id_of(schema, name, mssql_object_types(kind))
+            .await?;
         if kind != "table" {
             // Views, procedures, functions and triggers keep their original text.
             let (_c, rows) = self
@@ -4365,6 +4535,14 @@ impl MsSqlConn {
                 ));
             }
             return Err(AppError::new("no stored DDL for this object"));
+        }
+        // Constraints and indexes come from STRING_AGG queries whose failure every call
+        // site swallows. Emitting a CREATE TABLE with silently missing keys is worse
+        // than refusing: backups restore against it.
+        if !self.string_agg {
+            return Err(AppError::new(
+                "Tusk can't reconstruct table DDL on SQL Server 2016 or earlier: its catalog queries need STRING_AGG (SQL Server 2017+), and without it the script would silently omit primary keys, unique/check constraints and foreign keys",
+            ));
         }
         let qualified = format!("{}.{}", mssql_ident(schema), mssql_ident(name));
         let (_c, column_rows) = self
@@ -4433,6 +4611,22 @@ impl MsSqlConn {
     }
 }
 
+/// `sys.objects.type` codes a DDL request may resolve to, per Tusk object kind.
+fn mssql_object_types(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "table" => &["U"],
+        "view" | "matview" => &["V"],
+        "sequence" => &["SO"],
+        "procedure" => &["P", "PC"],
+        "function" | "aggregate" | "table function" => &["FN", "IF", "TF", "FS", "FT", "AF"],
+        "trigger" => &["TR"],
+        // Unknown kind: any object that can carry stored DDL.
+        _ => &[
+            "U", "V", "P", "PC", "FN", "IF", "TF", "FS", "FT", "AF", "TR", "SO",
+        ],
+    }
+}
+
 /// Pretty-print a size given in KiB, mirroring `pg_size_pretty`'s shape.
 fn mssql_pretty_kb(kb: i64) -> String {
     let kb = kb.max(0) as f64;
@@ -4458,21 +4652,23 @@ const MSSQL_SCHEMAS: &str = "SELECT s.name FROM sys.schemas s \
 
 const MSSQL_RELS: &str = "SELECT sch.name, o.name, \
        CASE WHEN o.type = 'V' THEN 'VIEW' ELSE 'BASE TABLE' END, \
-       CAST(ps.row_count AS varchar(32)), \
-       CASE WHEN o.type = 'V' THEN NULL ELSE CAST(ps.total_kb AS varchar(32)) END, \
+       CAST(o.object_id AS varchar(32)), \
        CAST(ep.value AS nvarchar(max)) \
      FROM sys.objects o \
      JOIN sys.schemas sch ON sch.schema_id = o.schema_id \
-     LEFT JOIN (SELECT object_id, \
-                       SUM(CASE WHEN index_id IN (0,1) THEN row_count ELSE 0 END) AS row_count, \
-                       SUM(used_page_count) * 8 AS total_kb \
-                FROM sys.dm_db_partition_stats GROUP BY object_id) ps \
-            ON ps.object_id = o.object_id \
      LEFT JOIN sys.extended_properties ep \
             ON ep.class = 1 AND ep.major_id = o.object_id AND ep.minor_id = 0 \
            AND ep.name = 'MS_Description' \
      WHERE o.type IN ('U','V') AND o.is_ms_shipped = 0 AND sch.schema_id < 16384 \
      ORDER BY sch.name, o.name";
+
+// Row/size estimates. `sys.dm_db_partition_stats` needs VIEW DATABASE STATE, which a
+// least-privilege login may not have — kept out of MSSQL_RELS so failing it costs only
+// the estimates, not the sidebar (mirrors PostgreSQL's optional reltuples/size columns).
+const MSSQL_REL_STATS: &str = "SELECT CAST(object_id AS varchar(32)), \
+       CAST(SUM(CASE WHEN index_id IN (0,1) THEN row_count ELSE 0 END) AS varchar(32)), \
+       CAST(SUM(used_page_count) * 8 AS varchar(32)) \
+     FROM sys.dm_db_partition_stats GROUP BY object_id";
 
 const MSSQL_SEQS: &str = "SELECT sch.name, sq.name FROM sys.sequences sq \
      JOIN sys.schemas sch ON sch.schema_id = sq.schema_id ORDER BY sch.name, sq.name";
@@ -4770,6 +4966,16 @@ impl ConnState {
         if self.transaction.state == TransactionState::Active {
             self.transaction.state = TransactionState::Failed;
             self.transaction.health = TransactionHealth::RecoveryRequired;
+            self.transaction.revision = self.transaction.revision.saturating_add(1);
+        }
+    }
+
+    /// The server ended the tracked unit but the session is alive (SQL Server deadlock
+    /// victim / `XACT_ABORT` unwind). The transaction is over — not lost — so the tab
+    /// returns to Idle and the user can simply start a new one.
+    pub fn end_transaction_server_unwound(&mut self) {
+        if self.transaction.owns_session() {
+            self.finish_transaction();
             self.transaction.revision = self.transaction.revision.saturating_add(1);
         }
     }

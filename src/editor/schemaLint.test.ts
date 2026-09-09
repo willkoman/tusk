@@ -144,4 +144,26 @@ describe("schemaDiagnostics — false-positive guards", () => {
     expect(msgs("SELECT public.my_proc(1) FROM users")).toEqual([]);
     expect(msgs("SELECT other_catalog.mystery_fn(1) FROM users")).toEqual([]); // unknown schema → skip
   });
+
+  it("T-SQL [bracket] refs resolve instead of reading as unknown names", () => {
+    // `ident()` emits brackets on SQL Server, so Tusk's own generated SQL looks like
+    // this. Schema/table names inside brackets must not be flagged as identifiers.
+    const mssqlIdx = buildIndex(TABLES.map((t) => ({ ...t, schema: "dbo" })));
+    const lint = (sql: string) => {
+      const { spans, stmts } = lex(sql, "mssql");
+      return schemaDiagnostics(sql, spans, stmts, mssqlIdx, FUNCS, "dbo").map((d) => d.message);
+    };
+    expect(lint("SELECT [id], [email] FROM [dbo].[users]")).toEqual([]);
+    expect(lint("SELECT [u].[email] FROM [dbo].[users] [u]")).toEqual([]);
+    expect(lint("SELECT id FROM [users]")).toEqual([]);
+    // A fully quoted qualified ref resolves too — stripping used to mangle it into
+    // `public"."users` and report every one of them as an unknown table.
+    const pg = (sql: string) => {
+      const { spans, stmts } = lex(sql, "postgres");
+      return schemaDiagnostics(sql, spans, stmts, IDX, FUNCS).map((d) => d.message);
+    };
+    expect(pg('SELECT id FROM "public"."users"')).toEqual([]);
+    // Real unknowns are still reported through the bracket form.
+    expect(lint("SELECT id FROM [dbo].[userz]")[0]).toContain("unknown table");
+  });
 });

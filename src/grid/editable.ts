@@ -24,7 +24,10 @@ const REJECT = /\b(join|group\s+by|distinct|union|intersect|except|having|return
 // else (functions, arithmetic, CASE, literals, `expr AS id`) could collide with
 // a table column name and make the commit's PK WHERE clause target the WRONG
 // ROW — so it must reject, never guess.
-const IDENT = `(?:"(?:[^"]|"")+"|\`(?:[^\`]|\`\`)+\`|[A-Za-z_]\\w*)`;
+// T-SQL `[bracket]` names are included: `ident()` emits them on SQL Server, so the
+// Explorer's own `SELECT * FROM [dbo].[users]` scaffold must be recognised here or
+// every SQL Server result is silently uneditable.
+const IDENT = `(?:"(?:[^"]|"")+"|\`(?:[^\`]|\`\`)+\`|\\[(?:[^\\]]|\\]\\])+\\]|[A-Za-z_]\\w*)`;
 const PLAIN_ITEM = new RegExp(`^(?:(${IDENT})\\s*\\.\\s*)?(${IDENT}|\\*)$`);
 const TABLE_SOURCE = new RegExp(
   `^(${IDENT})(?:\\s*\\.\\s*(${IDENT}))?(?:\\s+(?:AS\\s+)?(${IDENT}))?$`,
@@ -33,23 +36,35 @@ const TABLE_SOURCE = new RegExp(
 
 type TopToken = { kind: "word" | "comma"; text: string; from: number; to: number };
 
+/**
+ * If `sql[i]` opens a quoted identifier (`"x"`, `` `x` ``, T-SQL `[x]`), the index just
+ * past it; otherwise -1. Doubled delimiters escape one. Brackets matter because SQL
+ * Server's own generated queries use them, and `[a,b]` must not read as two items.
+ */
+function skipQuotedIdent(sql: string, i: number): number {
+  const open = sql[i];
+  if (open !== '"' && open !== "`" && open !== "[") return -1;
+  const close = open === "[" ? "]" : open;
+  i++;
+  while (i < sql.length) {
+    if (sql[i] === close) {
+      if (sql[i + 1] === close) { i += 2; continue; }
+      return i + 1;
+    }
+    i++;
+  }
+  return i;
+}
+
 /** Bare top-level words/commas, skipping quoted identifiers and nested expressions. */
 function topTokens(sql: string): TopToken[] {
   const out: TopToken[] = [];
   let depth = 0;
   for (let i = 0; i < sql.length;) {
     const ch = sql[i];
-    if (ch === '"' || ch === "`") {
-      const q = ch;
-      i++;
-      while (i < sql.length) {
-        if (sql[i] === q) {
-          if (sql[i + 1] === q) { i += 2; continue; }
-          i++;
-          break;
-        }
-        i++;
-      }
+    const quoted = skipQuotedIdent(sql, i);
+    if (quoted >= 0) {
+      i = quoted;
       continue;
     }
     if (ch === "(") { depth++; i++; continue; }
@@ -71,16 +86,9 @@ function splitItems(list: string): string[] {
   const out: string[] = [];
   let start = 0;
   for (let i = 0; i < list.length; i++) {
-    const q = list[i] === '"' || list[i] === "`" ? list[i] : null;
-    if (q) {
-      i++;
-      while (i < list.length) {
-        if (list[i] === q) {
-          if (list[i + 1] === q) { i += 2; continue; }
-          break;
-        }
-        i++;
-      }
+    const quoted = skipQuotedIdent(list, i);
+    if (quoted >= 0) {
+      i = quoted - 1; // the for-loop's i++ lands just past the closing delimiter
     } else if (list[i] === ",") {
       out.push(list.slice(start, i));
       start = i + 1;
@@ -126,17 +134,9 @@ function hasCommaJoin(sql: string): boolean {
   let depth = 0;
   for (let i = 0; i < sql.length;) {
     const ch = sql[i];
-    if (ch === '"' || ch === "`") {
-      const q = ch;
-      i++;
-      while (i < sql.length) {
-        if (sql[i] === q) {
-          if (sql[i + 1] === q) { i += 2; continue; }
-          i++;
-          break;
-        }
-        i++;
-      }
+    const quoted = skipQuotedIdent(sql, i);
+    if (quoted >= 0) {
+      i = quoted;
       continue;
     }
     if (ch === "(") { depth++; i++; continue; }
@@ -183,8 +183,12 @@ export function editTarget(
   if (stmts.length > 1) return { ok: false, reason: "results from a script — run a single SELECT to edit" };
   // keepDquote: quoted identifiers are names the alias map must see (strings stay masked).
   const masked = maskNonCode(base, spans, 0, base.length, true);
-  // Reject words only in SQL code, not inside either identifier quote style.
-  const keywordText = masked.replace(/"(?:[^"]|"")*"|`(?:[^`]|``)*`/g, (s) => " ".repeat(s.length));
+  // Reject words only in SQL code, never inside any identifier quote style (a column
+  // named `[union]` or `"join"` is a name, not a set operation).
+  const keywordText = masked.replace(
+    /"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[(?:[^\]]|\]\])*\]/g,
+    (s) => " ".repeat(s.length),
+  );
   const m = REJECT.exec(keywordText);
   if (m) return { ok: false, reason: `${m[1].toLowerCase().replace(/\s+/g, " ")} queries aren't editable` };
   if (/\bfrom\s*\(/i.test(keywordText)) return { ok: false, reason: "derived-table queries aren't editable" };

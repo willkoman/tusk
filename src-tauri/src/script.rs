@@ -85,9 +85,24 @@ fn mssql_go_line(b: &[u8], start: usize) -> Option<(usize, bool)> {
     while i < n && space(b[i]) {
         i += 1;
     }
+    // A trailing comment still leaves `GO` alone on its line. Both forms are skipped:
+    // `GO /* end of batch */` that fails this test reaches the server as SQL and
+    // fails with "Could not find stored procedure 'GO'".
     if i + 1 < n && b[i] == b'-' && b[i + 1] == b'-' {
         while i < n && b[i] != b'\n' {
             i += 1;
+        }
+    } else if i + 1 < n && b[i] == b'/' && b[i + 1] == b'*' {
+        // An unterminated block comment is not a batch separator: leave the text to
+        // the ordinary comment scanner.
+        i = block_comment_end_at(b, i, true)?;
+        while i < n && space(b[i]) {
+            i += 1;
+        }
+        if i + 1 < n && b[i] == b'-' && b[i + 1] == b'-' {
+            while i < n && b[i] != b'\n' {
+                i += 1;
+            }
         }
     }
     if i < n && b[i] == b'\r' {
@@ -110,6 +125,7 @@ pub fn parse_for_engine(script: &str, engine: TransactionEngine) -> Result<Vec<I
 
 /// Lenient splitter used by editor-only classification paths. Execution paths must
 /// use `parse`, which reports unsupported psql commands and malformed COPY blocks.
+#[cfg(test)]
 pub fn split(script: &str) -> Vec<Item> {
     split_impl(script, false, TransactionEngine::Postgres).unwrap_or_default()
 }
@@ -143,6 +159,19 @@ fn split_impl(
     split_core(script, checked, engine, false).map(|out| out.items)
 }
 
+/// The next identifier word at or after `i`, lowercased. Only whitespace is skipped —
+/// the block classifier below needs the word that immediately follows `BEGIN`.
+fn peek_word(b: &[u8], mut i: usize) -> String {
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let start = i;
+    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+        i += 1;
+    }
+    String::from_utf8_lossy(&b[start..i]).to_ascii_lowercase()
+}
+
 fn split_core(
     script: &str,
     checked: bool,
@@ -152,6 +181,12 @@ fn split_core(
     let b = script.as_bytes();
     let n = b.len();
     let mut i = 0usize;
+    // T-SQL statement-block nesting (`BEGIN … END`, `BEGIN TRY`/`BEGIN CATCH`,
+    // `CASE … END`). T-SQL has no dollar quoting, so without this a stored
+    // procedure body is shredded at its own semicolons and every piece is a
+    // syntax error. `BEGIN TRAN[SACTION]` / `BEGIN DISTRIBUTED TRAN` open a
+    // transaction, not a block, and must NOT raise the depth.
+    let mut block_depth = 0usize;
     let mut items: Vec<Item> = Vec::new();
     let mut starts: Vec<usize> = Vec::new();
     // Byte offset where the statement currently accumulating in `cur` began.
@@ -174,8 +209,13 @@ fn split_core(
                 let stmt = flush(std::mem::take(&mut cur)).trim().to_string();
                 if !stmt.is_empty() {
                     items.push(Item::Sql(stmt));
+                    if stream {
+                        starts.push(stmt_start);
+                    }
                 }
                 i = next;
+                stmt_start = i;
+                block_depth = 0;
                 continue;
             }
         }
@@ -421,7 +461,36 @@ fn split_core(
             i += 1;
             continue;
         }
+        // T-SQL statement blocks. Consumed as whole words so `BEGIN`/`END`/`CASE`
+        // inside an identifier (`ended`) or a bracket/string never counts.
+        if engine == TransactionEngine::MsSql && (c.is_ascii_alphabetic() || c == b'_') {
+            let start = i;
+            while i < n && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let word = String::from_utf8_lossy(&b[start..i]).to_ascii_lowercase();
+            match word.as_str() {
+                "case" => block_depth += 1,
+                "begin" => {
+                    let next = peek_word(b, i);
+                    // BEGIN TRAN[SACTION] / BEGIN DISTRIBUTED TRAN[SACTION] start a
+                    // transaction; everything else (incl. BEGIN TRY/CATCH) is a block.
+                    if !matches!(next.as_str(), "tran" | "transaction" | "distributed") {
+                        block_depth += 1;
+                    }
+                }
+                "end" => block_depth = block_depth.saturating_sub(1),
+                _ => {}
+            }
+            cur.extend_from_slice(&b[start..i]);
+            continue;
+        }
         // statement terminator
+        if c == b';' && block_depth > 0 {
+            cur.push(c);
+            i += 1;
+            continue;
+        }
         if c == b';' {
             i += 1;
             let this_start = stmt_start;
@@ -521,8 +590,49 @@ fn split_core(
     })
 }
 
+/// Byte index just past the `*/` that closes the block comment starting at `s[0..2]`,
+/// or `None` when it never closes. `nests` mirrors T-SQL, where `/*` inside a block
+/// comment opens a nested one.
+fn block_comment_end(s: &str, nests: bool) -> Option<usize> {
+    block_comment_end_at(s.as_bytes(), 0, nests)
+}
+
+/// `block_comment_end` over a byte slice: the index just past the `*/` closing the
+/// comment that starts at `start`.
+fn block_comment_end_at(b: &[u8], start: usize, nests: bool) -> Option<usize> {
+    let mut i = start + 2;
+    let mut depth = 1usize;
+    while i + 1 < b.len() {
+        if b[i] == b'*' && b[i + 1] == b'/' {
+            i += 2;
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+            continue;
+        }
+        if nests && b[i] == b'/' && b[i + 1] == b'*' {
+            i += 2;
+            depth += 1;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Skip leading whitespace and comment lines, returning the SQL that follows.
 pub fn effective_start(s: &str) -> &str {
+    effective_start_for(s, TransactionEngine::Postgres)
+}
+
+/// `effective_start` with the connected engine's comment rules. SQL Server NESTS block
+/// comments, so `/*/* */ SELECT 1 */ DROP TABLE t` is one comment plus a DROP there
+/// while a non-nesting scan reads it as a SELECT — classifying by the wrong text is how
+/// a write slips past the read-only guard on the one engine with no server-side
+/// enforcement.
+pub fn effective_start_for(s: &str, engine: TransactionEngine) -> &str {
+    let nests = engine == TransactionEngine::MsSql;
     let mut rest = s.trim_start();
     loop {
         if let Some(r) = rest.strip_prefix("--") {
@@ -530,9 +640,9 @@ pub fn effective_start(s: &str) -> &str {
                 Some(nl) => rest = r[nl + 1..].trim_start(),
                 None => return "",
             }
-        } else if let Some(r) = rest.strip_prefix("/*") {
-            match r.find("*/") {
-                Some(end) => rest = r[end + 2..].trim_start(),
+        } else if rest.starts_with("/*") {
+            match block_comment_end(rest, nests) {
+                Some(end) => rest = rest[end..].trim_start(),
                 None => return "",
             }
         } else {
@@ -555,7 +665,12 @@ fn is_read(sql: &str) -> bool {
 
 /// First alphabetic word after comments/whitespace, lowercased.
 fn first_word(sql: &str) -> String {
-    effective_start(sql)
+    first_word_for(sql, TransactionEngine::Postgres)
+}
+
+/// `first_word` with the engine's comment rules (T-SQL nests block comments).
+pub fn first_word_for(sql: &str, engine: TransactionEngine) -> String {
+    effective_start_for(sql, engine)
         .chars()
         .take_while(|c| c.is_ascii_alphabetic())
         .collect::<String>()
@@ -591,6 +706,20 @@ pub enum TransactionEngine {
     MsSql,
 }
 
+impl TransactionEngine {
+    /// The engine behind a `Capabilities::kind` string. An unknown kind falls back to
+    /// PostgreSQL's rules.
+    pub fn for_kind(kind: &str) -> Self {
+        match kind {
+            "duckdb" => TransactionEngine::DuckDb,
+            "sqlite" => TransactionEngine::Sqlite,
+            "mysql" => TransactionEngine::MySql,
+            "mssql" => TransactionEngine::MsSql,
+            _ => TransactionEngine::Postgres,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionAction {
     Begin,
@@ -612,7 +741,7 @@ fn statement_words(sql: &str) -> Vec<String> {
 /// `brackets` matters for SQL Server, where `SAVE TRANSACTION [a;b]` names a savepoint.
 fn statement_words_for(sql: &str, engine: TransactionEngine) -> Vec<String> {
     let brackets = engine == TransactionEngine::MsSql;
-    let b = effective_start(sql).as_bytes();
+    let b = effective_start_for(sql, engine).as_bytes();
     let mut words = Vec::new();
     let mut i = 0usize;
     while i < b.len() {
@@ -643,18 +772,37 @@ fn statement_words_for(sql: &str, engine: TransactionEngine) -> Vec<String> {
             }
             continue;
         }
-        if b[i] == b'#' {
+        // `#` is a comment only on MySQL; on SQL Server it starts a temp-table name.
+        if b[i] == b'#' && engine == TransactionEngine::MySql {
             while i < b.len() && b[i] != b'\n' {
                 i += 1;
             }
             continue;
         }
         if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+            let mut depth = 1usize;
             i += 2;
-            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+            while i + 1 < b.len() {
+                if b[i] == b'*' && b[i + 1] == b'/' {
+                    i += 2;
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                // T-SQL nests block comments: a classifier that stops at the first
+                // `*/` would read commented-out text as a real transaction command.
+                if brackets && b[i] == b'/' && b[i + 1] == b'*' {
+                    i += 2;
+                    depth += 1;
+                    continue;
+                }
                 i += 1;
             }
-            i = (i + 2).min(b.len());
+            if depth > 0 {
+                i = b.len();
+            }
             continue;
         }
         if b[i] == b'\'' {
@@ -1024,6 +1172,11 @@ pub fn preflight_transactions(
     // Known only for a transaction begun within this script. Existing active sessions
     // may have run prior commands, so PostgreSQL remains server-authoritative there.
     let mut postgres_work_seen = (state == TransactionState::Idle).then_some(false);
+    // T-SQL names its transactions (`BEGIN TRAN work`), and `ROLLBACK TRAN work` then
+    // ends the whole unit rather than rolling back to a savepoint of that name. Known
+    // only for a transaction begun inside this script; an already-active one stays
+    // server-authoritative.
+    let mut unit_name: Option<String> = None;
     let mut actions = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
         if engine == TransactionEngine::MySql
@@ -1034,10 +1187,24 @@ pub fn preflight_transactions(
                 index + 1
             )));
         }
-        let action = match item {
+        let mut action = match item {
             Item::Sql(sql) => transaction_action_for(sql, engine)?,
             Item::Copy { .. } => None,
         };
+        // Resolve T-SQL's ambiguous `ROLLBACK TRAN <name>`: the name is a savepoint's
+        // or the transaction's own. A named transaction rollback ends the unit.
+        if engine == TransactionEngine::MsSql && action == Some(TransactionAction::RollbackTo) {
+            let name = transaction_savepoint_name(item, TransactionAction::RollbackTo, engine)
+                .unwrap_or_default();
+            let is_savepoint = savepoints.iter().any(|saved| saved == &name);
+            if !is_savepoint && unit_name.as_deref() == Some(name.as_str()) {
+                action = Some(TransactionAction::Rollback);
+            } else if !is_savepoint && !unknown_existing_savepoints {
+                return Err(AppError::new(format!(
+                    "ROLLBACK TRANSACTION `{name}` names neither the current transaction nor a savepoint"
+                )));
+            }
+        }
         if state == TransactionState::Lost {
             return Err(AppError::new(
                 "manual transaction session was lost; disconnect and reconnect",
@@ -1064,7 +1231,7 @@ pub fn preflight_transactions(
         }
         if engine == TransactionEngine::MySql
             && state != TransactionState::Idle
-            && matches!(item, Item::Sql(sql) if action.is_none() && matches!(first_word(sql).as_str(), "call" | "execute" | "xa"))
+            && matches!(item, Item::Sql(sql) if action.is_none() && matches!(first_word_for(sql, engine).as_str(), "call" | "execute" | "xa"))
         {
             return Err(AppError::new(format!(
                 "statement {} can end or replace a MySQL transaction indirectly and is blocked inside a manual transaction",
@@ -1075,7 +1242,7 @@ pub fn preflight_transactions(
         // and USE cannot run inside a transaction at all.
         if engine == TransactionEngine::MsSql
             && state != TransactionState::Idle
-            && matches!(item, Item::Sql(sql) if action.is_none() && matches!(first_word(sql).as_str(), "use" | "exec" | "execute"))
+            && matches!(item, Item::Sql(sql) if action.is_none() && matches!(first_word_for(sql, engine).as_str(), "use" | "exec" | "execute"))
         {
             return Err(AppError::new(format!(
                 "statement {} can end or replace a SQL Server transaction indirectly and is blocked inside a manual transaction",
@@ -1093,6 +1260,13 @@ pub fn preflight_transactions(
                     savepoints.clear();
                     unknown_existing_savepoints = false;
                     postgres_work_seen = Some(false);
+                    if engine == TransactionEngine::MsSql {
+                        // BEGIN TRAN[SACTION] [<name>]
+                        unit_name = match item {
+                            Item::Sql(sql) => statement_words_for(sql, engine).get(2).cloned(),
+                            Item::Copy { .. } => None,
+                        };
+                    }
                 } else {
                     return Err(AppError::new(
                         "nested BEGIN/START TRANSACTION is not allowed",
@@ -1105,6 +1279,7 @@ pub fn preflight_transactions(
                         "COMMIT requires a healthy active transaction; use ROLLBACK to recover a failed transaction",
                     ));
                 }
+                unit_name = None;
                 if mode == TransactionMode::AutocommitOff {
                     state = TransactionState::Active;
                     savepoints.clear();
@@ -1121,6 +1296,7 @@ pub fn preflight_transactions(
                 if !matches!(state, TransactionState::Active | TransactionState::Failed) {
                     return Err(AppError::new("no active transaction to finish"));
                 }
+                unit_name = None;
                 if mode == TransactionMode::AutocommitOff {
                     state = TransactionState::Active;
                     savepoints.clear();
@@ -1373,7 +1549,12 @@ pub fn contains_mysql_executable_comment(sql: &str) -> bool {
     false
 }
 
-fn scan_code_words(sql: &str, mut visit: impl FnMut(&[u8], usize) -> bool) -> bool {
+fn scan_code_words(
+    sql: &str,
+    engine: TransactionEngine,
+    mut visit: impl FnMut(&[u8], usize) -> bool,
+) -> bool {
+    let mssql = engine == TransactionEngine::MsSql;
     let b = sql.as_bytes();
     let mut i = 0usize;
     let mut depth = 0usize;
@@ -1385,12 +1566,59 @@ fn scan_code_words(sql: &str, mut visit: impl FnMut(&[u8], usize) -> bool) -> bo
             }
             continue;
         }
-        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+        if b[i] == b'#' && engine == TransactionEngine::MySql {
+            i += 1;
+            while i < b.len() && b[i] != b'\n' {
                 i += 1;
             }
-            i = (i + 2).min(b.len());
+            continue;
+        }
+        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+            let mut comment = 1usize;
+            i += 2;
+            while i + 1 < b.len() {
+                if b[i] == b'*' && b[i + 1] == b'/' {
+                    i += 2;
+                    comment -= 1;
+                    if comment == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                // T-SQL nests block comments.
+                if mssql && b[i] == b'/' && b[i + 1] == b'*' {
+                    i += 2;
+                    comment += 1;
+                    continue;
+                }
+                i += 1;
+            }
+            if comment > 0 {
+                i = b.len();
+            }
+            continue;
+        }
+        // SQL Server `[bracket]` identifier. Kept VISIBLE like a double-quoted one, so
+        // `[set_config](…)` cannot bypass a guard that scans for a bare word.
+        if mssql && b[i] == b'[' {
+            i += 1;
+            let mut ident = Vec::new();
+            while i < b.len() {
+                if b[i] == b']' {
+                    i += 1;
+                    if i < b.len() && b[i] == b']' {
+                        ident.push(b']');
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                ident.push(b[i]);
+                i += 1;
+            }
+            if visit(&ident, depth) {
+                return true;
+            }
             continue;
         }
         if b[i] == b'\'' {
@@ -1408,7 +1636,7 @@ fn scan_code_words(sql: &str, mut visit: impl FnMut(&[u8], usize) -> bool) -> bo
             }
             continue;
         }
-        if b[i] == b'$' {
+        if b[i] == b'$' && !mssql {
             if let Some(end) = dollar_tag_end(b, i) {
                 let delim = &b[i..=end];
                 i = end + 1;
@@ -1464,7 +1692,14 @@ fn scan_code_words(sql: &str, mut visit: impl FnMut(&[u8], usize) -> bool) -> bo
 /// Find an identifier-like word outside strings/comments/dollar bodies. Double-quoted
 /// identifiers remain visible so `pg_catalog."set_config"(...)` cannot bypass a guard.
 pub fn contains_code_word(sql: &str, needle: &str) -> bool {
-    scan_code_words(sql, |word, _| word.eq_ignore_ascii_case(needle.as_bytes()))
+    contains_code_word_for(sql, needle, TransactionEngine::Postgres)
+}
+
+/// `contains_code_word` with the engine's comment/identifier rules.
+pub fn contains_code_word_for(sql: &str, needle: &str, engine: TransactionEngine) -> bool {
+    scan_code_words(sql, engine, |word, _| {
+        word.eq_ignore_ascii_case(needle.as_bytes())
+    })
 }
 
 /// The shape of a `WITH`-led statement: `main` is the lowercased keyword of the statement
@@ -1893,7 +2128,10 @@ pub enum MsSqlPaging {
 }
 
 pub fn mssql_paging(sql: &str) -> MsSqlPaging {
-    let Some(tokens) = shape_tokens(effective_start(sql), TransactionEngine::MsSql) else {
+    let Some(tokens) = shape_tokens(
+        effective_start_for(sql, TransactionEngine::MsSql),
+        TransactionEngine::MsSql,
+    ) else {
         return MsSqlPaging::Buffered;
     };
     let mut depth = 0usize;
@@ -1937,14 +2175,14 @@ pub fn mssql_paging(sql: &str) -> MsSqlPaging {
 }
 
 pub fn with_shape(sql: &str, engine: TransactionEngine) -> Option<WithShape> {
-    let tokens = shape_tokens(effective_start(sql), engine)?;
+    let tokens = shape_tokens(effective_start_for(sql, engine), engine)?;
     parse_with_tokens(&tokens, 0)
 }
 
 /// True when an unquoted `INTO` occurs at the statement's outer query level.
 /// Used to keep `SELECT … INTO` off both cursor and no-confirm execution paths.
 pub fn has_top_level_into(sql: &str, engine: TransactionEngine) -> bool {
-    shape_tokens(effective_start(sql), engine)
+    shape_tokens(effective_start_for(sql, engine), engine)
         .is_none_or(|tokens| top_level_shape_word(&tokens, "into"))
 }
 
@@ -1953,7 +2191,7 @@ fn is_copy_from_stdin(sql: &str) -> bool {
         return false;
     }
     let mut saw_from = false;
-    scan_code_words(sql, |word, depth| {
+    scan_code_words(sql, TransactionEngine::Postgres, |word, depth| {
         if depth != 0 {
             return false;
         }
@@ -2310,9 +2548,118 @@ mod tests {
             .message
             .contains("repeat count"));
 
+        // `GO` followed by a block comment is still a batch separator (it used to reach
+        // the server as SQL: "Could not find stored procedure 'GO'").
+        let commented =
+            parse_for_engine("SELECT 1\nGO /* end of batch */\nSELECT 2\n", mssql).unwrap();
+        assert_eq!(sql_of(&commented), vec!["SELECT 1", "SELECT 2"]);
+        let both = parse_for_engine("SELECT 1\nGO /* x */ -- y\nSELECT 2\n", mssql).unwrap();
+        assert_eq!(sql_of(&both), vec!["SELECT 1", "SELECT 2"]);
+        // An unterminated comment after GO is not a separator; the text stays SQL.
+        let unterminated = parse_for_engine("SELECT 1\nGO /* never closed\n", mssql).unwrap();
+        assert_eq!(unterminated.len(), 1);
+
         // `N'…'` is an ordinary string; `$` is not a dollar-quote opener in T-SQL.
         let literals = parse_for_engine("SELECT N'a;b', $100; SELECT 2;", mssql).unwrap();
         assert_eq!(sql_of(&literals), vec!["SELECT N'a;b', $100", "SELECT 2"]);
+    }
+
+    /// Identical fixtures live in `src/editor/lexer.test.ts` — the two lexers must
+    /// agree on where a T-SQL statement ends.
+    #[test]
+    fn tsql_statement_blocks_are_not_split_at_their_own_semicolons() {
+        let mssql = TransactionEngine::MsSql;
+        let sql_of = |items: &[Item]| {
+            items
+                .iter()
+                .map(|item| match item {
+                    Item::Sql(sql) => sql.clone(),
+                    Item::Copy { stmt, .. } => stmt.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // A procedure body is ONE statement, not three syntax errors.
+        let proc = parse_for_engine(
+            "CREATE PROCEDURE dbo.p AS\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND",
+            mssql,
+        )
+        .unwrap();
+        assert_eq!(proc.len(), 1, "{:?}", sql_of(&proc));
+        // TRY/CATCH and nested IF blocks.
+        let try_catch = parse_for_engine(
+            "BEGIN TRY\n  SELECT 1;\n  IF 1=1 BEGIN SELECT 2; END\nEND TRY\nBEGIN CATCH\n  SELECT ERROR_MESSAGE();\nEND CATCH",
+            mssql,
+        )
+        .unwrap();
+        assert_eq!(try_catch.len(), 1, "{:?}", sql_of(&try_catch));
+        // CASE … END is a block too, but balances within the statement.
+        let case = parse_for_engine(
+            "SELECT CASE WHEN a = 1 THEN 'x' ELSE 'y' END FROM t; SELECT 2",
+            mssql,
+        )
+        .unwrap();
+        assert_eq!(case.len(), 2, "{:?}", sql_of(&case));
+        // `BEGIN TRAN[SACTION]` opens a transaction, not a block: the `;` still splits.
+        let tran = parse_for_engine("BEGIN TRANSACTION; SELECT 1; COMMIT", mssql).unwrap();
+        assert_eq!(
+            sql_of(&tran),
+            vec!["BEGIN TRANSACTION", "SELECT 1", "COMMIT"]
+        );
+        let distributed =
+            parse_for_engine("BEGIN DISTRIBUTED TRAN; SELECT 1; COMMIT", mssql).unwrap();
+        assert_eq!(distributed.len(), 3, "{:?}", sql_of(&distributed));
+        // `ended` is an identifier, not the END keyword.
+        let identifier = parse_for_engine("SELECT ended FROM t; SELECT 2", mssql).unwrap();
+        assert_eq!(identifier.len(), 2);
+        // BEGIN/END inside a bracket, string or comment never counts.
+        let quoted = parse_for_engine(
+            "SELECT [begin], 'begin', /* begin */ 1 FROM t; SELECT 2",
+            mssql,
+        )
+        .unwrap();
+        assert_eq!(quoted.len(), 2, "{:?}", sql_of(&quoted));
+        // GO closes an unbalanced block rather than gluing the rest of the file to it.
+        let after_go = parse_for_engine("BEGIN\n SELECT 1;\nGO\nSELECT 2;", mssql).unwrap();
+        assert_eq!(after_go.len(), 2, "{:?}", sql_of(&after_go));
+        // Other engines are untouched: `BEGIN` there is transaction control.
+        let pg = parse_for_engine("BEGIN; SELECT 1; COMMIT;", TransactionEngine::Postgres).unwrap();
+        assert_eq!(pg.len(), 3);
+    }
+
+    #[test]
+    fn tsql_named_transaction_rollback_ends_the_unit() {
+        let mssql = TransactionEngine::MsSql;
+        let idle = TransactionStatus::default();
+        // `ROLLBACK TRAN work` after `BEGIN TRAN work` ends the whole transaction; it
+        // used to be classified as a savepoint rollback and refused by preflight.
+        let named = parse_for_engine(
+            "BEGIN TRANSACTION work; SELECT 1; ROLLBACK TRANSACTION work;",
+            mssql,
+        )
+        .unwrap();
+        assert_eq!(
+            preflight_transactions(&named, mssql, &idle).unwrap(),
+            vec![
+                Some(TransactionAction::Begin),
+                None,
+                Some(TransactionAction::Rollback),
+            ]
+        );
+        // A savepoint of the same shape still rolls back to the savepoint.
+        let savepoint = parse_for_engine(
+            "BEGIN TRAN work; SAVE TRAN s; ROLLBACK TRAN s; COMMIT;",
+            mssql,
+        )
+        .unwrap();
+        assert_eq!(
+            preflight_transactions(&savepoint, mssql, &idle).unwrap()[2],
+            Some(TransactionAction::RollbackTo)
+        );
+        // A name that is neither says so, instead of "unknown savepoint".
+        let neither = parse_for_engine("BEGIN TRAN work; ROLLBACK TRAN other;", mssql).unwrap();
+        let error = preflight_transactions(&neither, mssql, &idle).unwrap_err();
+        assert!(error.message.contains("names neither"), "{}", error.message);
     }
 
     #[test]
