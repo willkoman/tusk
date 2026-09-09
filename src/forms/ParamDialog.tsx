@@ -1,10 +1,11 @@
-import { For, Show, createMemo, createSignal } from "solid-js";
+import { For, Show, createMemo, createSignal, createUniqueId } from "solid-js";
 import { Dialog, SqlPreview } from "../Dialog";
-import { substituteParams, type Param, type ParamValue } from "../sql/params";
+import { missingParams, substituteParams, type Param, type ParamValue } from "../sql/params";
 
-// Pre-run parameter prompt: one row per detected `$n` / `%s` / `:name` with a value
-// input, NULL toggle, and raw (unquoted) toggle; live preview of the
-// substituted SQL. Values are remembered per tab by the caller.
+// Pre-run parameter prompt: one row per detected `$n` / `%s` / `:name` — name in
+// its own column, then the value with NULL and raw as inline toggles — plus a live
+// preview of the substituted SQL. Values are remembered per tab by the caller.
+// Run stays disabled while any value is blank: the preview would show `id > ''`.
 
 export function ParamDialog(props: {
   sql: string;
@@ -27,7 +28,13 @@ export function ParamDialog(props: {
     return text.length <= limit ? text : `${text.slice(0, limit)}\n-- preview truncated; full SQL will run`;
   });
 
-  const run = () => props.onRun(values(), preview());
+  const missing = createMemo(() => missingParams(props.params, values()));
+  const uid = createUniqueId();
+
+  const run = () => {
+    if (missing().length) return;
+    props.onRun(values(), preview());
+  };
 
   return (
     <Dialog
@@ -40,7 +47,15 @@ export function ParamDialog(props: {
           <SqlPreview sql={previewText()} />
           <div class="form-actions">
             <button type="button" class="ghost" onClick={props.onClose}>Cancel</button>
-            <button type="button" class="run" onClick={run}>Run</button>
+            <button
+              type="button"
+              class="run"
+              disabled={missing().length > 0}
+              title={missing().length ? `Needs a value or NULL: ${missing().join(", ")}` : undefined}
+              onClick={run}
+            >
+              Run
+            </button>
           </div>
         </>
       }
@@ -49,26 +64,32 @@ export function ParamDialog(props: {
           <For each={props.params}>
             {(p, i) => (
               <div class="param-row">
-                <span class="param-name">{p.name}</span>
-                <input
-                  value={values()[p.name].value}
-                  disabled={values()[p.name].isNull}
-                  ref={(el) => { if (i() === 0) setTimeout(() => { el.focus(); el.select(); }); }}
-                  onInput={(e) => patch(p.name, { value: e.currentTarget.value })}
-                  placeholder={values()[p.name].isNull ? "NULL" : "value"}
-                />
-                <label class="checkbox param-flag" title="Send SQL NULL">
-                  <input type="checkbox" checked={values()[p.name].isNull} onChange={(e) => patch(p.name, { isNull: e.currentTarget.checked })} />
-                  NULL
-                </label>
-                <label class="checkbox param-flag" title="Insert verbatim, unquoted">
-                  <input type="checkbox" checked={values()[p.name].raw} disabled={values()[p.name].isNull} onChange={(e) => patch(p.name, { raw: e.currentTarget.checked })} />
-                  raw
-                </label>
+                <label class="param-name" for={`${uid}-${i()}`}>{p.name}</label>
+                <div class="param-value">
+                  <input
+                    id={`${uid}-${i()}`}
+                    value={values()[p.name].value}
+                    disabled={values()[p.name].isNull}
+                    ref={(el) => { if (i() === 0) setTimeout(() => { el.focus(); el.select(); }); }}
+                    onInput={(e) => patch(p.name, { value: e.currentTarget.value })}
+                    placeholder={values()[p.name].isNull ? "NULL" : "value"}
+                  />
+                  <label class="checkbox param-flag" title="Send SQL NULL">
+                    <input type="checkbox" checked={values()[p.name].isNull} onChange={(e) => patch(p.name, { isNull: e.currentTarget.checked })} />
+                    NULL
+                  </label>
+                  <label class="checkbox param-flag" title="Inserted unquoted, exactly as typed">
+                    <input type="checkbox" checked={values()[p.name].raw} disabled={values()[p.name].isNull} onChange={(e) => patch(p.name, { raw: e.currentTarget.checked })} />
+                    raw
+                  </label>
+                </div>
               </div>
             )}
           </For>
         </div>
+        <Show when={missing().length}>
+          <div class="field-hint">Every parameter needs a value, NULL, or raw.</div>
+        </Show>
         <Show when={props.params.some((p) => p.name.startsWith("%s #"))}>
           <div class="import-info">
             <code>%s</code> values are quoted. For PostgreSQL <code>ANY(%s)</code>, enter <code>{`{1,2}`}</code>, or tick raw and enter <code>ARRAY[1,2]</code>.

@@ -101,6 +101,7 @@ import {
 } from "./forms/SshSection";
 import { SshHostKeyDialog, type SshHostKeyPrompt } from "./forms/SshHostKeyDialog";
 import { detectPlan } from "./plan/detect";
+import { planSummary } from "./plan/summary";
 import { explainSql, analyzeExecutesWrite, isSingleExplainStatement, explainUnsupported } from "./plan/explainSql";
 import { Dialog, SqlPreview } from "./Dialog";
 import { Icon } from "./Icons";
@@ -123,6 +124,7 @@ import {
   nextRecoverySlot,
   recoverySlotKey,
   rememberedProfileIds,
+  shouldAutoConnect,
   stepConnection,
   type Capabilities,
   type ConnectionState,
@@ -332,6 +334,14 @@ const EMPTY_FUNCS: ReadonlySet<string> = new Set<string>();
 const EMPTY_FK_EDGES: FkEdge[] = [];
 const EMPTY_DETAILS: Record<string, RelationDetail> = {};
 const EMPTY_HISTORY: HistoryEntry[] = [];
+
+/**
+ * Connect-on-startup fires once per app process, not once per mount. A crash-guard
+ * "Try to continue" and a Vite HMR update both remount `App` and re-run `onMount`;
+ * both used to open the `default_connect` profile again, which on a production
+ * default is a session the user never asked for. Module scope outlives the mount.
+ */
+let startupAutoConnectDone = false;
 
 function App() {
   // --- open connections -----------------------------------------------------
@@ -686,7 +696,7 @@ function App() {
    * untracked.
    */
   const connectionLabelKey = createMemo(() =>
-    connections().map((e) => `${e.conn.id}\u0000${e.state().tree?.database ?? ""}\u0000${e.conn.target} ${e.conn.origin}`).join("\u0001"));
+    connections().map((e) => `${e.conn.id}\u0000${e.state().tree?.database ?? ""}\u0000${e.conn.target}\u0000${e.conn.origin}`).join("\u0001"));
   const connectionLabelMap = createMemo(
     on(connectionLabelKey, () => connectionLabels(connections().map((e) => e.state()))),
   );
@@ -904,15 +914,15 @@ function App() {
     }
     const origin = captureOrigin();
     const valid = () => originCurrent(origin, true);
-    setMenuState({
-      ...next,
-      scope: originKey(origin),
-      items: next.items.map((item) => {
-        if ("sep" in item) return item;
-        const itemValid = item.valid;
-        return { ...item, valid: () => valid() && (itemValid?.() ?? true) };
-      }),
-    });
+    // Submenu leaves carry the same origin check as top-level ones: a group is
+    // only a container, so validity is stamped on the item that actually runs.
+    const stamp = (item: MenuItem): MenuItem => {
+      if ("sep" in item) return item;
+      if ("items" in item) return { ...item, items: item.items.map(stamp) };
+      const itemValid = item.valid;
+      return { ...item, valid: () => valid() && (itemValid?.() ?? true) };
+    };
+    setMenuState({ ...next, scope: originKey(origin), items: next.items.map(stamp) });
   };
   const setActiveDialog = (state: DialogState | null, origin = captureOrigin()) =>
     setDialogBinding(state ? { state, origin } : null);
@@ -2297,8 +2307,13 @@ function App() {
     // from an error must never open a database session by itself — offer the profile in
     // the reopen list instead of connecting to it.
     const recovered = consumeCrashRecovery();
-    if (recovered && def) setReopenable(remembered.includes(def.id) ? remembered : [def.id, ...remembered]);
-    if (def && !recovered) connectProfile(def.id);
+    // Module-level, so it survives the remount it exists to catch (HMR, crash-guard
+    // reset). A real relaunch starts a new module instance and connects again.
+    const firstMount = !startupAutoConnectDone;
+    startupAutoConnectDone = true;
+    const autoConnect = shouldAutoConnect({ hasDefault: !!def, firstMount, recovering: recovered });
+    if (def && !autoConnect) setReopenable(remembered.includes(def.id) ? remembered : [def.id, ...remembered]);
+    if (def && autoConnect) connectProfile(def.id);
     // Slack bot status (statusbar badge) + audit trail: every Slack-approved query
     // lands in the normal per-connection history with a [Slack] marker comment.
     // Best-effort — a failed listen must never break the app.
@@ -4821,10 +4836,29 @@ function App() {
         items.push(
           { label: "Select 100 rows", icon: "play", onClick: () => runTableLimit(s!, n.name, 100) },
           { label: "Select all rows", icon: "play", onClick: () => runTable(s!, n.name) },
-          { label: "Filter rows…", icon: "search", onClick: () => void filterTable(s!, n.name) },
           { sep: true },
-          { label: "Export table…", icon: "export", onClick: () => void openTableExport(s!, n.name) },
-          { label: "Import data into table…", icon: "import", ...importGate(canInsert(s!, n.name), `Requires INSERT on ${n.name}`), onClick: () => openImport({ schema: s!, name: n.name }) },
+          // Three groups carry what used to be a 23-item wall. Each leaf keeps its
+          // own gate and its own disabled reason.
+          {
+            label: "Generate",
+            icon: "code",
+            items: [
+              { label: "SELECT", icon: "code", onClick: () => generate(n, "select") },
+              { label: "INSERT", icon: "code", onClick: () => generate(n, "insert") },
+              { label: "UPDATE", icon: "code", onClick: () => generate(n, "update") },
+            ],
+          },
+          { label: "Copy", icon: "copy", items: [copyName, copyQual, ...copyDdl] },
+          {
+            label: "Data",
+            icon: "table",
+            items: [
+              { label: "Export table…", icon: "export", onClick: () => void openTableExport(s!, n.name) },
+              { label: "Import data into table…", icon: "import", ...importGate(canInsert(s!, n.name), `Requires INSERT on ${n.name}`), onClick: () => openImport({ schema: s!, name: n.name }) },
+              { label: "Backup table…", icon: "archive", onClick: () => openBackup({ scope: "tables", schemas: [], tables: [{ schema: s!, name: n.name }], suggestedName: n.name }) },
+              { label: "Filter rows…", icon: "search", onClick: () => void filterTable(s!, n.name) },
+            ],
+          },
           { sep: true },
           { label: "Modify table…", icon: "edit", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openModify(n) },
           { label: "Add column…", icon: "plus", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "addColumn", ctx: n }) },
@@ -4834,19 +4868,9 @@ function App() {
           { label: "Rename…", icon: "edit", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename table ${n.name}`, current: n.name, build: (nn) => ddl.renameRelation("table", s!, n.name, nn) }) },
           { label: "Duplicate…", icon: "duplicate", ...gate(canCreateInSchema(s!), `Requires CREATE on schema ${s}`), onClick: () => setActiveDialog({ kind: "duplicate", title: `Duplicate ${n.name}`, defaultName: `${n.name}_copy`, build: (nn, wd) => ddl.duplicateTable(s!, n.name, nn, wd) }) },
           { label: "Edit comment…", icon: "comment", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), ...engineCan(dcaps().comments !== "none", "comment on a table"), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.commentOnTable(s!, n.name, t) }) },
-          { sep: true },
-          { label: "Backup table…", icon: "archive", onClick: () => openBackup({ scope: "tables", schemas: [], tables: [{ schema: s!, name: n.name }], suggestedName: n.name }) },
-          { sep: true },
-          { label: "Generate SELECT", icon: "code", onClick: () => generate(n, "select") },
-          { label: "Generate INSERT", icon: "code", onClick: () => generate(n, "insert") },
-          { label: "Generate UPDATE", icon: "code", onClick: () => generate(n, "update") },
-          { sep: true },
           ...(caps()?.ddl !== false || caps()?.relationships !== false
-            ? [{ label: "DDL & relationships…", icon: "fileCode" as const, onClick: () => openDdlGraph(s!, n.name, "table") }]
+            ? [{ sep: true as const }, { label: "DDL & relationships…", icon: "fileCode" as const, onClick: () => openDdlGraph(s!, n.name, "table") }]
             : []),
-          ...copyDdl,
-          copyName,
-          copyQual,
           { sep: "danger" },
           { label: dcaps().truncate ? "Truncate…" : "Delete all rows…", icon: "eraser", danger: true, ...gate(canTruncate(s!, n.name), `Requires TRUNCATE or ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: dcaps().truncate ? "Truncate table" : "Delete all rows", subtitle: `${s}.${n.name}`, primaryLabel: dcaps().truncate ? "Truncate" : "Delete all rows", lead: "Every row goes. The table and its structure stay.", facts: dangerFacts("Table", s, n.name), showCascade: dcaps().truncateOptions, showRestartIdentity: dcaps().truncateOptions, build: (o) => ddl.truncate(s!, n.name, o) }) },
           { label: "Drop…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop table", subtitle: `${s}.${n.name}`, primaryLabel: "Drop table", lead: "The table and every row in it go. This cannot be undone.", facts: dangerFacts("Table", s, n.name), confirmName: n.name, showCascade: true, build: (o) => ddl.dropRelation("table", s!, n.name, o.cascade) }) },
@@ -4857,11 +4881,20 @@ function App() {
         const kw = n.kind;
         items.push(
           { label: "Select all rows", icon: "play", onClick: () => runTable(s!, n.name) },
-          { label: "Filter rows…", icon: "search", onClick: () => void filterTable(s!, n.name) },
-          { label: "Export…", icon: "export", onClick: () => void openTableExport(s!, n.name, kw) },
+          { sep: true },
+          { label: "Copy", icon: "copy", items: [copyName, copyQual, ...copyDdl] },
+          {
+            label: "Data",
+            icon: "table",
+            items: [
+              { label: "Export…", icon: "export", onClick: () => void openTableExport(s!, n.name, kw) },
+              { label: "Filter rows…", icon: "search", onClick: () => void filterTable(s!, n.name) },
+            ],
+          },
         );
         if (kw === "matview")
           items.push(
+            { sep: true },
             { label: "Refresh", icon: "refresh", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => runDDLToast(ddl.refreshMatview(s!, n.name, false)) },
             { label: "Refresh concurrently", icon: "refresh", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => runDDLToast(ddl.refreshMatview(s!, n.name, true)) },
           );
@@ -4869,14 +4902,11 @@ function App() {
           { sep: true },
           { label: "Rename…", icon: "edit", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "rename", title: `Rename ${n.name}`, current: n.name, build: (nn) => ddl.renameRelation(kw, s!, n.name, nn) }) },
           { label: "Edit comment…", icon: "comment", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), ...engineCan(dcaps().comments === "standard", "comment on a view"), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.comment(`${kw === "matview" ? "MATERIALIZED VIEW" : "VIEW"} ${qual}`, t) }) },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: kw === "matview" ? "Drop materialized view" : "Drop view", subtitle: `${s}.${n.name}`, primaryLabel: kw === "matview" ? "Drop materialized view" : "Drop view", lead: "The definition goes. This cannot be undone.", facts: dangerFacts(kw === "matview" ? "Materialized view" : "View", s, n.name), showCascade: true, build: (o) => ddl.dropRelation(kw, s!, n.name, o.cascade) }) },
-          { sep: true },
           ...(caps()?.ddl !== false || caps()?.relationships !== false
-            ? [{ label: "DDL & relationships…", icon: "fileCode" as const, onClick: () => openDdlGraph(s!, n.name, kw) }]
+            ? [{ sep: true as const }, { label: "DDL & relationships…", icon: "fileCode" as const, onClick: () => openDdlGraph(s!, n.name, kw) }]
             : []),
-          ...copyDdl,
-          copyName,
-          copyQual,
+          { sep: "danger" },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: kw === "matview" ? "Drop materialized view" : "Drop view", subtitle: `${s}.${n.name}`, primaryLabel: kw === "matview" ? "Drop materialized view" : "Drop view", lead: "The definition goes. This cannot be undone.", facts: dangerFacts(kw === "matview" ? "Materialized view" : "View", s, n.name), showCascade: true, build: (o) => ddl.dropRelation(kw, s!, n.name, o.cascade) }) },
         );
         break;
       }
@@ -4888,10 +4918,9 @@ function App() {
           // MySQL has no COMMENT ON: a column comment there restates the whole column
           // definition, so the builder needs the column as the catalog reports it.
           { label: "Edit comment…", icon: "comment", ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), ...engineCan(dcaps().comments !== "none", "comment on a column"), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: c.comment ?? "", build: (t) => ddl.commentOnColumn(s!, n.table!, { name: c.name, type: c.data_type, nullable: c.nullable, default: c.default ?? "", identity: c.identity }, t) }) },
-          { sep: true },
-          { label: "Drop column…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop column", subtitle: `${s}.${n.table}.${n.name}`, primaryLabel: "Drop column", lead: "The column and its data go from every row.", facts: { kind: "Column", name: `${s}.${n.table}.${n.name}` }, showCascade: true, build: (o) => ddl.dropColumn(s!, n.table!, n.name, o.cascade) }) },
-          { sep: true },
           copyName,
+          { sep: "danger" },
+          { label: "Drop column…", icon: "trash", danger: true, ...gate(ownsTable(s!, n.table!), `Requires ownership of ${n.table}`), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop column", subtitle: `${s}.${n.table}.${n.name}`, primaryLabel: "Drop column", lead: "The column and its data go from every row.", facts: { kind: "Column", name: `${s}.${n.table}.${n.name}` }, showCascade: true, build: (o) => ddl.dropColumn(s!, n.table!, n.name, o.cascade) }) },
         );
         break;
       }
@@ -4906,10 +4935,18 @@ function App() {
             ? [{ label: "Schema diagram…", icon: "link" as const, onClick: () => openDdlGraph(n.name, null, "table") }, { sep: true as const }]
             : []),
           { label: "Create table…", icon: "plus", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => setActiveDialog({ kind: "createTable", schema: n.name, tables: schema() }) },
-          { label: "Import file as new table…", icon: "import", ...importGate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => openImport({ schema: n.name, name: "" }) },
-          { label: "Export tables…", icon: "export", onClick: () => openTablesExport(n.name) },
           { label: "Rename…", icon: "edit", ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), ...engineCan(dcaps().renameSchema, "rename a schema"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename schema ${n.name}`, current: n.name, build: (nn) => ddl.renameSchema(n.name, nn) }) },
-          { sep: true },
+          {
+            label: "Data",
+            icon: "table",
+            items: [
+              { label: "Import file as new table…", icon: "import", ...importGate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => openImport({ schema: n.name, name: "" }) },
+              { label: "Export tables…", icon: "export", onClick: () => openTablesExport(n.name) },
+              { label: "Backup schema…", icon: "archive", onClick: () => openBackup({ scope: "schemas", schemas: [n.name], tables: [], suggestedName: n.name }) },
+            ],
+          },
+          copyName,
+          { sep: "danger" },
           {
             label: dropsDatabase ? "Drop database…" : "Drop…",
             icon: "trash",
@@ -4932,10 +4969,6 @@ function App() {
                 build: (o) => (dropsDatabase ? ddl.dropDatabase(n.name) : ddl.dropSchema(n.name, o.cascade)),
               }),
           },
-          { sep: true },
-          { label: "Backup schema…", icon: "archive", onClick: () => openBackup({ scope: "schemas", schemas: [n.name], tables: [], suggestedName: n.name }) },
-          { sep: true },
-          copyName,
         );
         break;
       }
@@ -4943,53 +4976,58 @@ function App() {
         const cur = tree()?.database === n.name;
         items.push(
           { label: "Create schema…", icon: "plus", ...gate(canCreateSchema(), "Requires CREATE on the database"), ...engineCan(dcaps().createSchema, "create a schema"), onClick: () => setActiveDialog({ kind: "createSchema" }) },
-          { label: "Import file as new table…", icon: "import", ...importGate(!pEnforced() || canCreateSchema() || schema().length > 0, "Requires CREATE somewhere in this database"), onClick: () => openImport(null) },
-          { label: "Export tables…", icon: "export", onClick: () => openTablesExport(null) },
-
+          {
+            label: "Data",
+            icon: "table",
+            items: [
+              { label: "Import file as new table…", icon: "import", ...importGate(!pEnforced() || canCreateSchema() || schema().length > 0, "Requires CREATE somewhere in this database"), onClick: () => openImport(null) },
+              { label: "Export tables…", icon: "export", onClick: () => openTablesExport(null) },
+              // Backup/restore run against the CONNECTED database — offer them only there.
+              { label: "Backup database…", icon: "archive", disabled: !cur, title: cur ? undefined : "Connect to this database to back it up", onClick: () => openBackup({ scope: "database", schemas: [], tables: [], suggestedName: n.name }) },
+              { label: "Restore from file…", icon: "fileCode", disabled: !cur || !!conn()?.readOnly, title: !cur ? "Connect to this database to restore into it" : conn()?.readOnly ? "Connection is read-only" : undefined, onClick: () => { setMenu(null); if (!rejectFrozenExplorer()) openRestore(); } },
+            ],
+          },
+          copyName,
+          { sep: "danger" },
           // Same gate() as every other Explorer DDL item (manual-transaction freeze,
           // read-only, driver support) — DROP DATABASE least of all may skip the freeze.
           { label: "Drop database…", icon: "trash", danger: true, ...gate(!pEnforced() || isSuper(), "Requires database ownership (or superuser)"), ...engineCan(dcaps().dropDatabase, "drop a database from here"), ...(cur ? { disabled: true, title: "Can't drop the connected database" } : {}), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop database", subtitle: n.name, primaryLabel: "Drop database", lead: "Every schema, table and row in this database goes. This cannot be undone.", facts: { kind: "Database", name: n.name }, confirmName: n.name, build: () => ddl.dropDatabase(n.name) }) },
-          { sep: true },
-          // Backup/restore run against the CONNECTED database — offer them only there.
-          { label: "Backup database…", icon: "archive", disabled: !cur, title: cur ? undefined : "Connect to this database to back it up", onClick: () => openBackup({ scope: "database", schemas: [], tables: [], suggestedName: n.name }) },
-          { label: "Restore from file…", icon: "fileCode", disabled: !cur || !!conn()?.readOnly, title: !cur ? "Connect to this database to restore into it" : conn()?.readOnly ? "Connection is read-only" : undefined, onClick: () => { setMenu(null); if (!rejectFrozenExplorer()) openRestore(); } },
-          { sep: true },
-          copyName,
         );
         break;
       }
       case "index":
         items.push(
           { label: "Rename…", icon: "edit", ...gate(true, ""), ...engineCan(dcaps().renameIndex, "rename an index"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename index ${n.name}`, current: n.name, build: (nn) => ddl.renameIndex(s!, n.name, nn, n.table) }) },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop index", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop index", facts: { kind: "Index", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropIndex(s!, n.name, o.cascade, n.table) }) },
-          { sep: true },
           copyName,
+          { sep: "danger" },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop index", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop index", facts: { kind: "Index", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropIndex(s!, n.name, o.cascade, n.table) }) },
         );
         break;
       case "constraint":
         items.push(
           { label: "Rename…", icon: "edit", ...gate(true, ""), ...engineCan(dcaps().renameConstraint, "rename a constraint"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename constraint ${n.name}`, current: n.name, build: (nn) => ddl.renameConstraint(s!, n.table!, n.name, nn) }) },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), ...engineCan(dcaps().dropConstraint !== "none", "drop a constraint with ALTER TABLE"), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop constraint", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop constraint", facts: { kind: "Constraint", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropConstraint(s!, n.table!, n.name, o.cascade, constraintKindOf(s!, n.table!, n.name)) }) },
-          { sep: true },
           copyName,
+          { sep: "danger" },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), ...engineCan(dcaps().dropConstraint !== "none", "drop a constraint with ALTER TABLE"), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop constraint", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop constraint", facts: { kind: "Constraint", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropConstraint(s!, n.table!, n.name, o.cascade, constraintKindOf(s!, n.table!, n.name)) }) },
         );
         break;
       case "sequence":
         items.push(
           { label: "Restart… (edit value)", icon: "refresh", ...gate(true, ""), ...engineCan(dcaps().alterSequence, "restart a sequence"), onClick: () => editAsSql(ddl.alterSequenceRestart(s!, n.name, "1")) },
           { label: "Rename…", icon: "edit", ...gate(true, ""), ...engineCan(dcaps().renameSequence, "rename a sequence"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename sequence ${n.name}`, current: n.name, build: (nn) => ddl.renameSequence(s!, n.name, nn) }) },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop sequence", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop sequence", facts: { kind: "Sequence", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropSequence(s!, n.name, o.cascade) }) },
           { sep: true },
           ...copyDdl,
           copyName,
+          { sep: "danger" },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop sequence", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop sequence", facts: { kind: "Sequence", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropSequence(s!, n.name, o.cascade) }) },
         );
         break;
       case "function":
         items.push(
-          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop function", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop function", facts: { kind: "Function", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropFunction(s!, n.name, o.cascade) }) },
-          { sep: true },
           ...copyDdl,
           copyName,
+          { sep: "danger" },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop function", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop function", facts: { kind: "Function", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropFunction(s!, n.name, o.cascade) }) },
         );
         break;
       case "trigger": {
@@ -4998,9 +5036,9 @@ function App() {
         items.push(
           { label: "Copy DDL", icon: "fileCode", onClick: () => copyText(def.endsWith(";") ? def : def + ";", "copied DDL") },
           { label: "Copy DDL to editor", icon: "fileCode", onClick: () => editAsSql(def) },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop trigger", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop trigger", facts: { kind: "Trigger", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropTrigger(s!, n.table!, n.name, o.cascade) }) },
-          { sep: true },
           copyName,
+          { sep: "danger" },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop trigger", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop trigger", facts: { kind: "Trigger", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropTrigger(s!, n.table!, n.name, o.cascade) }) },
         );
         break;
       }
@@ -6072,7 +6110,12 @@ function App() {
                 classList={{ running: running() }}
                 title={persistenceWarning() || transactionWarning() || undefined}
               >
-                {running() ? `Running ${fmtDur(runMs())}` : (persistenceWarning() || transactionWarning() || status())}
+                {running()
+                  ? `Running ${fmtDur(runMs())}`
+                  : (persistenceWarning()
+                    || transactionWarning()
+                    // A plan arrives as one row; the row count says nothing about it.
+                    || (resultsOpen() && planMemo() && resultView() === "plan" ? planSummary(planMemo()!) : status()))}
               </span>
               <Show when={slackNotice()}>
                 <button

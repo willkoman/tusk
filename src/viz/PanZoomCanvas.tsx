@@ -1,5 +1,5 @@
 import { type JSX, onCleanup, onMount } from "solid-js";
-import { createPanZoom, type BBox, type PanZoom } from "./panzoom";
+import { createPanZoom, READABLE_FIT, type BBox, type PanZoom } from "./panzoom";
 
 // Shared pan/zoom shell: a clipping viewport with a transformed inner canvas —
 // one absolutely-positioned SVG (edges, sized to the content bbox) underneath
@@ -12,6 +12,9 @@ export function PanZoomCanvas(props: {
   bbox: BBox;
   /** Re-fit when this key changes (new plan / new graph / scope switch). */
   fitKey: string;
+  /** Floor for fit-to-content. Defaults to 100%: card text stays readable and
+   *  oversized content pans. An overview diagram may pass a smaller floor. */
+  minFit?: number;
   children: JSX.Element;
   /** Exposes the pan/zoom instance (for external fit/zoom buttons if needed). */
   ref?: (pz: PanZoom) => void;
@@ -22,7 +25,7 @@ export function PanZoomCanvas(props: {
   props.ref?.(pz);
 
   const doFit = () => {
-    if (viewport) pz.fit(props.bbox, viewport.clientWidth, viewport.clientHeight);
+    if (viewport) pz.fit(props.bbox, viewport.clientWidth, viewport.clientHeight, props.minFit ?? READABLE_FIT);
   };
 
   onMount(() => {

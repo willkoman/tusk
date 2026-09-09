@@ -23,7 +23,7 @@ export const TOPICS: Topic[] = [
         "items": [
           "**Reopen last session** relists the profiles open at last quit, in order. One click; never automatic.",
           "Ad-hoc connections typed without saving are not listed.",
-          "A *Connect on startup* profile still connects on launch."
+          "A *Connect on startup* profile connects once per launch. After an error recovery or a window reload it is offered here instead."
         ]
       },
       {
@@ -581,8 +581,10 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**NULL** checkbox — sends SQL `NULL`.",
-          "**raw** checkbox — inserts the text verbatim, for numbers and expressions. Unchecked values become quoted literals.",
+          "One row per parameter: name, value box, then the **NULL** and **raw** toggles.",
+          "**NULL** — sends SQL `NULL`.",
+          "**raw** — inserts the text verbatim, for numbers and expressions. Unchecked values become quoted literals.",
+          "**Run** stays disabled until every parameter has a value, NULL, or raw.",
           "Detection is lexer-masked: placeholders inside strings, comments and dollar-quoted bodies are ignored, and `::type` casts never match."
         ]
       },
@@ -1326,43 +1328,43 @@ export const TOPICS: Topic[] = [
         "rows": [
           [
             "Table",
-            "Select 100 rows · Select all rows · Filter rows… · Export table… · Import data into table… · **Modify table…** · Add column… · Add index… · Add constraint… · Rename… · Duplicate… · Edit comment… · Truncate… · Drop… · Backup table… · Generate SELECT/INSERT/UPDATE · DDL & relationships… · Copy DDL / Copy DDL to editor · Copy name / Copy qualified name"
+            "Select 100 rows · Select all rows · **Generate** (SELECT / INSERT / UPDATE) · **Copy** (name / qualified name / DDL / DDL to editor) · **Data** (Export table… / Import data into table… / Backup table… / Filter rows…) · **Modify table…** · Add column… · Add index… · Add constraint… · Rename… · Duplicate… · Edit comment… · DDL & relationships… · Truncate… · Drop…"
           ],
           [
             "View / matview",
-            "As for a table, without the column-level actions, plus matview **Refresh** / **Refresh concurrently**"
+            "Select all rows · **Copy** · **Data** (Export… / Filter rows…) · matview **Refresh** / **Refresh concurrently** · Rename… · Edit comment… · DDL & relationships… · Drop…"
           ],
           [
             "Column",
-            "Edit column… · Rename… · Edit comment… · Drop column… · Copy name"
+            "Edit column… · Rename… · Edit comment… · Copy name · Drop column…"
           ],
           [
             "Index",
-            "Rename… · Drop… · Copy name"
+            "Rename… · Copy name · Drop…"
           ],
           [
             "Constraint",
-            "Rename… · Drop… · Copy name"
+            "Rename… · Copy name · Drop…"
           ],
           [
             "Sequence",
-            "Restart… · Rename… · Drop… · Copy DDL / Copy DDL to editor · Copy name"
+            "Restart… · Rename… · Copy DDL / Copy DDL to editor · Copy name · Drop…"
           ],
           [
             "Function",
-            "Drop… · Copy DDL / Copy DDL to editor · Copy name"
+            "Copy DDL / Copy DDL to editor · Copy name · Drop…"
           ],
           [
             "Trigger",
-            "Copy DDL / Copy DDL to editor · Drop… · Copy name"
+            "Copy DDL / Copy DDL to editor · Copy name · Drop…"
           ],
           [
             "Schema",
-            "Schema diagram… · Create table… · Import file as new table… · Export tables… · Rename… · Drop… (on MySQL this reads **Drop database…** and refuses the connected one) · Backup schema… · Copy name"
+            "Schema diagram… · Create table… · Rename… · **Data** (Import file as new table… / Export tables… / Backup schema…) · Copy name · Drop… (on MySQL this reads **Drop database…** and refuses the connected one)"
           ],
           [
             "Database",
-            "Create schema… · Import file as new table… · Export tables… · Drop… (not the connected database) · Backup database… · Restore from file… · Copy name"
+            "Create schema… · **Data** (Import file as new table… / Export tables… / Backup database… / Restore from file…) · Copy name · Drop database… (not the connected one)"
           ]
         ]
       },
@@ -1370,7 +1372,8 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**DDL & relationships…** opens the DDL and FK graph viewer; **Schema diagram…** opens the whole-schema ERD. See [[topic:erd|the relationship viewer]].",
-          "**Truncate…** and **Drop…** always confirm, with a `CASCADE` checkbox. Truncate adds `RESTART IDENTITY`.",
+          "**Truncate…** and **Drop…** always confirm, with a `CASCADE` checkbox. Truncate adds `RESTART IDENTITY`. They sit last in every menu, behind a wider rule.",
+          "A bold entry opens a submenu: hover it, or press [[kbd:ArrowRight]]; [[kbd:ArrowLeft]] or [[kbd:Escape]] closes it.",
           "The header **＋** is selection-aware, offering *New column / index / constraint on X…* before *New table*, *New schema* and *New database*."
         ]
       },
@@ -1900,6 +1903,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "A parsed plan adds a **Plan / Grid** toggle to the [[topic:results|result toolbar]]. Plan is the default, Grid is the raw engine output.",
+          "In Plan view the grid-only toolbar controls are hidden and the status bar reads the plan — `7 nodes, total cost 174`.",
           "SQLite's bytecode `EXPLAIN` and MySQL's tabular `EXPLAIN` stay in the grid with no toggle."
         ]
       },
@@ -1920,13 +1924,14 @@ export const TOPICS: Topic[] = [
           "The header strip shows the engine badge, planning and execution totals, and an **estimates only** marker where there are no measurements.",
           "**Click a card** — dock a details panel with self cost, self time, and every parsed property.",
           "**▾ / ▸ N** — collapse or expand a subtree; the badge counts hidden nodes.",
-          "**Drag** to pan, **wheel** to zoom, **double-click the background** to fit the tree."
+          "**Drag** to pan, **wheel** to zoom, **double-click the background** to fit the tree. Fit never shrinks cards below full size — a large plan pans instead."
         ]
       },
       {
         "k": "list",
         "items": [
-          "Heat coloring paints each card on a cold-to-hot ramp, scaled so mid-cost nodes stay visible.",
+          "Heat is a node's **share of the plan total**: self cost over the root's total cost, self time over total execution time. Rows compare against the widest node.",
+          "The header states the metric in use. The ramp runs slate → amber; red is reserved for destructive actions.",
           "Metric fallback is cost → time → rows. DuckDB has no cost numbers, so it uses time or rows."
         ]
       },
@@ -1999,7 +2004,8 @@ export const TOPICS: Topic[] = [
         "items": [
           "**DDL & relationships…** — right-click a table, view, or matview in the [[topic:sidebar|sidebar]]. Opens in Neighborhood scope, centered on it.",
           "**Schema diagram…** — right-click a schema node for the Whole schema ERD. The DDL pane starts collapsed; click a table card to load its DDL.",
-          "The DDL pane auto-collapses to a thin `DDL` rail in schema scope and expands in Neighborhood scope; the rail's chevron overrides either way.",
+          "The DDL pane auto-collapses to a thin `DDL` rail in schema scope and expands in Neighborhood scope; the rail's chevron overrides either way. Long lines wrap.",
+          "Fit stops at full size in Neighborhood scope, so card text stays readable; Whole schema keeps fitting to the canvas.",
           "Postgres DDL is reconstructed from the catalogs; other engines use native sources. Caveats in [[topic:sidebar|the sidebar topic]]."
         ]
       },
@@ -3567,7 +3573,11 @@ export const TOPICS: Topic[] = [
           "**Visible keyboard focus** on every control, in every theme.",
           "**A running query dims and labels the previous result**, disables the toolbar acting on it, and shows a live timer.",
           "**Drop and Truncate state what goes** — kind, name, rows, size — and a table, schema or database needs its name typed.",
-          "**Environment tags** mark a saved connection Development, Staging or Production on its chip, tabs, statusbar and confirmations."
+          "**Environment tags** mark a saved connection Development, Staging or Production on its chip, tabs, statusbar and confirmations.",
+          "**Long Explorer menus group into submenus** — Generate, Copy, Data — with the destructive actions last. See [[topic:sidebar|Schema explorer]].",
+          "**Plan heat is a node's share of the plan total**, on a slate-to-amber ramp, and the status bar reads the plan. See [[topic:plans|EXPLAIN plans]].",
+          "**The parameter prompt lays out two columns**, and Run waits until every parameter has a value, NULL, or raw.",
+          "**Connect on startup opens once per launch**, never again on an error recovery or a window reload."
         ]
       },
       {

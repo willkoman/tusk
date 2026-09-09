@@ -59,6 +59,21 @@ export function detectParams(sqlText: string): Param[] {
 }
 
 /**
+ * The params that still need input: not NULL, not raw, and blank. A blank value
+ * substitutes as `''`, and the prompt used to preview `id > ''` as runnable SQL
+ * with Run enabled — so Run reads this instead of trusting the preview. `raw` is
+ * the deliberate escape hatch and is never blocked.
+ */
+export function missingParams(params: readonly Param[], values: Record<string, ParamValue>): string[] {
+  return params
+    .filter((p) => {
+      const v = values[p.name];
+      return !v || (!v.isNull && !v.raw && v.value.trim() === "");
+    })
+    .map((p) => p.name);
+}
+
+/**
  * Replace every occurrence of each param with its value: SQL NULL, raw text
  * (numbers/expressions), or a safely-quoted literal via `lit` (dialect-aware).
  * Spans are replaced right-to-left so positions stay valid. Params without a

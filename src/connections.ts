@@ -399,6 +399,19 @@ export function mergeRememberedIds(open: readonly string[], pending: readonly st
   return out;
 }
 
+/**
+ * Whether startup may open the `default_connect` profile by itself.
+ *
+ * Connect-on-startup belongs to a launch, not to a mount. `App` remounts on a
+ * crash-guard reset and on an HMR update, and each remount used to open the
+ * default profile again — with a production default, a session nobody asked
+ * for. Only the process's first mount connects; every later one offers the
+ * profile in the reopen list instead.
+ */
+export function shouldAutoConnect(o: { hasDefault: boolean; firstMount: boolean; recovering: boolean }): boolean {
+  return o.hasDefault && o.firstMount && !o.recovering;
+}
+
 /** Bound + de-duplicate a persisted id list before it is offered or reconnected. */
 export function sanitizeRememberedIds(raw: unknown): string[] {
   if (!Array.isArray(raw)) return [];

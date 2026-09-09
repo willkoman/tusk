@@ -19,6 +19,7 @@ import {
   rememberedProfileIds,
   removeConnection,
   sanitizeRememberedIds,
+  shouldAutoConnect,
   stepConnection,
   upsertConnection,
   type Connected,
@@ -238,5 +239,15 @@ describe("merging the remembered session", () => {
     expect(mergeRememberedIds(["", "a"], [""])).toEqual(["a"]);
     const many = Array.from({ length: 40 }, (_, i) => `p${i}`);
     expect(mergeRememberedIds(many, ["extra"])).toHaveLength(MAX_CONNECTIONS);
+  });
+});
+
+describe("connect on startup", () => {
+  it("connects the default profile only on the process's first mount", () => {
+    expect(shouldAutoConnect({ hasDefault: true, firstMount: true, recovering: false })).toBe(true);
+    // A remount (HMR, crash-guard reset) must never open a session by itself.
+    expect(shouldAutoConnect({ hasDefault: true, firstMount: false, recovering: false })).toBe(false);
+    expect(shouldAutoConnect({ hasDefault: true, firstMount: true, recovering: true })).toBe(false);
+    expect(shouldAutoConnect({ hasDefault: false, firstMount: true, recovering: false })).toBe(false);
   });
 });
