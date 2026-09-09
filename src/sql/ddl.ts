@@ -27,13 +27,32 @@ export type ColumnSpec = {
    *  MySQL `AUTO_INCREMENT`, SQLite `INTEGER PRIMARY KEY AUTOINCREMENT`, DuckDB a
    *  `DEFAULT nextval('…')` over a sequence created by `createTable`. */
   identity?: boolean;
+  /** A generated column's whole clause, verbatim from the catalog
+   *  (`GENERATED ALWAYS AS (a + b) STORED`). It replaces the default/PK/UNIQUE part of
+   *  the definition: a generated column has no default and cannot be assigned. */
+  generated?: string;
+  /** MySQL `ON UPDATE CURRENT_TIMESTAMP(…)` — part of the column definition, so a
+   *  MODIFY that omits it silently removes the auto-update behaviour. */
+  onUpdate?: string;
 };
 
+// Whether the connected MySQL session runs with NO_BACKSLASH_ESCAPES. The backend reads
+// `@@session.sql_mode` once at connect and reports it in the driver capabilities; App
+// sets this alongside the SQL dialect. There is no literal form that is correct under
+// both modes, so this has to be known rather than guessed.
+let mysqlNoBackslashEscapes = false;
+export function setMysqlNoBackslashEscapes(on: boolean) {
+  mysqlNoBackslashEscapes = on;
+}
+
 /** MySQL's inline COMMENT option takes a plain string literal token, so the hex form
- *  `lit()` uses for MySQL values (`_utf8mb4 X'…'`) is not accepted there. Quotes and
- *  backslashes are both doubled, which is safe with or without NO_BACKSLASH_ESCAPES. */
+ *  `lit()` uses for MySQL values (`_utf8mb4 X'…'`) is not accepted there. Quotes are
+ *  always doubled; backslashes are doubled ONLY when the session treats them as escape
+ *  characters — doubling under NO_BACKSLASH_ESCAPES would store two of them, and not
+ *  doubling under the default mode turns `\n` in a comment into a newline. */
 export function mysqlTextLiteral(s: string): string {
-  return `'${s.replace(/\\/g, "\\\\").replace(/'/g, "''")}'`;
+  const escaped = mysqlNoBackslashEscapes ? s : s.replace(/\\/g, "\\\\");
+  return `'${escaped.replace(/'/g, "''")}'`;
 }
 
 /** Comment text as a literal for the active dialect's COMMENT syntax. */
@@ -51,10 +70,19 @@ export function columnDef(c: ColumnSpec, caps: DdlCaps = ddlCaps(), inlinePk = t
 
   if (caps.dialect === "mysql") {
     // MySQL's column_definition grammar is order-sensitive:
-    // data_type [NOT NULL|NULL] [DEFAULT …] [AUTO_INCREMENT] [UNIQUE] [PRIMARY KEY] [COMMENT …]
+    // data_type [NOT NULL|NULL] [DEFAULT …] [ON UPDATE …] [AUTO_INCREMENT] [UNIQUE]
+    // [PRIMARY KEY] [COMMENT …]
     if (c.collate?.trim()) parts.push(`COLLATE ${c.collate.trim()}`);
+    if (c.generated?.trim()) {
+      // A generated column takes its expression instead of DEFAULT/AUTO_INCREMENT.
+      parts.push(c.generated.trim());
+      if (!c.nullable) parts.push("NOT NULL");
+      if (c.comment?.trim()) parts.push(`COMMENT ${mysqlTextLiteral(c.comment.trim())}`);
+      return parts.join(" ");
+    }
     if (!c.nullable || pk || c.identity) parts.push("NOT NULL");
     if (def) parts.push(`DEFAULT ${def}`);
+    if (c.onUpdate?.trim()) parts.push(c.onUpdate.trim());
     if (c.identity) parts.push("AUTO_INCREMENT");
     if (c.unique && !pk) parts.push("UNIQUE");
     if (pk) parts.push("PRIMARY KEY");
@@ -64,6 +92,14 @@ export function columnDef(c: ColumnSpec, caps: DdlCaps = ddlCaps(), inlinePk = t
   }
 
   if (caps.dialect === "sqlite") {
+    if (c.generated?.trim()) {
+      // Generated columns carry their expression, never a default or a key.
+      if (c.collate?.trim()) parts.push(`COLLATE ${c.collate.trim()}`);
+      parts.push(c.generated.trim());
+      if (!c.nullable) parts.push("NOT NULL");
+      if (c.check?.trim()) parts.push(`CHECK (${c.check.trim()})`);
+      return parts.join(" ");
+    }
     // The rowid alias: only `INTEGER PRIMARY KEY [AUTOINCREMENT]` auto-numbers.
     if (c.identity && pk) {
       parts[1] = "INTEGER";
@@ -155,6 +191,15 @@ export function editColumn(
   const caps = ddlCaps();
   const q = qualify(schema, table);
   const stmts: string[] = [];
+
+  if (caps.changeType === "rebuild") {
+    // SQLite's ALTER TABLE has no ALTER COLUMN at all: the only edit expressible here
+    // is the rename. Everything else needs the Modify-table rebuild, so emit nothing
+    // for it rather than SQL the engine cannot parse (the dialog says as much).
+    if (e.newName && e.newName.trim() && e.newName !== col)
+      stmts.push(`ALTER TABLE ${q} RENAME COLUMN ${ident(col)} TO ${ident(e.newName.trim())}`);
+    return stmts.join(";\n");
+  }
 
   if (caps.changeType === "modify") {
     // MySQL: one MODIFY carries type + nullability + default + comment together.
@@ -253,6 +298,24 @@ export type TableConstraintSpec = {
 
 export type MySqlTableOptions = { engine?: string; charset?: string; collation?: string };
 
+/** MySQL's ENGINE / CHARSET / COLLATE take a bare grammar token. */
+const OPTION_TOKEN = /^[A-Za-z0-9_]+$/;
+
+/** Problems with the MySQL table options, for the Create-table dialog. */
+export function validateTableOptions(o: MySqlTableOptions | undefined): DdlProblem[] {
+  if (!o) return [];
+  const out: DdlProblem[] = [];
+  for (const [label, v] of [
+    ["Engine", o.engine],
+    ["Charset", o.charset],
+    ["Collation", o.collation],
+  ] as const) {
+    if (v && v.trim() && !OPTION_TOKEN.test(v.trim()))
+      out.push({ level: "error", message: `${label} must be a plain name (letters, digits and _).` });
+  }
+  return out;
+}
+
 export type CreateTableSpec = {
   schema: string;
   name: string;
@@ -267,6 +330,9 @@ export type CreateTableSpec = {
    *  the SQLite rebuild to carry the table's existing constraints across unchanged. */
   rawConstraints?: string[];
   options?: MySqlTableOptions;
+  /** Verbatim table options appended after the closing paren — SQLite's
+   *  `WITHOUT ROWID` / `STRICT`, carried across by a rebuild. */
+  rawOptions?: string;
 };
 
 export function createTable(t: CreateTableSpec): string {
@@ -303,15 +369,20 @@ export function createTable(t: CreateTableSpec): string {
   let create = `CREATE ${temp}TABLE ${ine}${q} (\n${lines.join(",\n")}\n)`;
 
   if (caps.tableOptions && t.options) {
+    // ENGINE/CHARSET/COLLATE are bare grammar tokens, not identifiers or literals —
+    // there is nothing to quote, so anything that isn't a plain token is dropped here
+    // rather than interpolated. `validateTableOptions` reports it in the dialog.
     const opts: string[] = [];
-    if (t.options.engine?.trim()) opts.push(`ENGINE=${t.options.engine.trim()}`);
-    if (t.options.charset?.trim()) opts.push(`DEFAULT CHARSET=${t.options.charset.trim()}`);
-    if (t.options.collation?.trim()) opts.push(`COLLATE=${t.options.collation.trim()}`);
+    const tok = (v: string | undefined) => (v && OPTION_TOKEN.test(v.trim()) ? v.trim() : "");
+    if (tok(t.options.engine)) opts.push(`ENGINE=${tok(t.options.engine)}`);
+    if (tok(t.options.charset)) opts.push(`DEFAULT CHARSET=${tok(t.options.charset)}`);
+    if (tok(t.options.collation)) opts.push(`COLLATE=${tok(t.options.collation)}`);
     if (t.comment?.trim()) opts.push(`COMMENT=${mysqlTextLiteral(t.comment.trim())}`);
     if (opts.length) create += " " + opts.join(" ");
   } else if (caps.comments === "inline" && t.comment?.trim()) {
     create += ` COMMENT=${mysqlTextLiteral(t.comment.trim())}`;
   }
+  if (t.rawOptions?.trim()) create += ` ${t.rawOptions.trim()}`;
 
   if (caps.comments === "standard") {
     if (t.comment?.trim()) post.push(`COMMENT ON TABLE ${q} IS ${commentLit(t.comment.trim(), caps)}`);
@@ -338,16 +409,26 @@ export type RebuildSpec = {
   /** Full `CREATE INDEX …` statements to replay after the swap (the originals go
    *  away with the dropped table). */
   indexes?: string[];
+  /** Full `CREATE TRIGGER …` statements to replay — a table's triggers are dropped
+   *  with it, and SQLite keeps their whole text in `sqlite_master`. */
+  triggers?: string[];
+  /** `WITHOUT ROWID` / `STRICT`, carried onto the rebuilt table. */
+  tableOptions?: string;
 };
 
 /** SQLite's documented table rebuild: create the new shape, copy the rows, drop the
- *  original, rename the replacement into its place, then recreate its indexes. Used
- *  for every change SQLite's ALTER TABLE cannot express (type changes, NOT NULL,
- *  defaults, constraints, dropping a key column).
+ *  original, rename the replacement into its place, then recreate its indexes and
+ *  triggers. Used for every change SQLite's ALTER TABLE cannot express (type changes,
+ *  NOT NULL, defaults, constraints, dropping a key column, reordering columns).
  *
  *  Runs inside the app-owned transaction, so it is all-or-nothing. Tusk does not turn
  *  on `PRAGMA foreign_keys` (SQLite's default is off and the pragma is a no-op inside
- *  a transaction), so the intermediate DROP cannot trip foreign-key enforcement. */
+ *  a transaction), so the intermediate DROP cannot trip foreign-key enforcement.
+ *
+ *  `PRAGMA legacy_alter_table` wraps the swap, exactly as SQLite's own 12-step recipe
+ *  prescribes: since 3.25 a plain `RENAME TO` re-parses every entry in `sqlite_schema`,
+ *  so with a view or another table's trigger mentioning the just-dropped original the
+ *  rename aborts with "error in view …: no such table" and the whole edit rolls back. */
 export function rebuildTable(s: RebuildSpec): string {
   const src = qualify(s.schema, s.table);
   const tmpName = `${s.table}${REBUILD_SUFFIX}`;
@@ -363,18 +444,23 @@ export function rebuildTable(s: RebuildSpec): string {
     checks: s.checks,
     foreignKeys: s.foreignKeys,
     rawConstraints: s.constraintClauses,
+    rawOptions: s.tableOptions,
   });
 
-  const copied = cols.filter((c) => c.source);
+  // A generated column has no stored value to copy — SQLite recomputes it.
+  const copied = cols.filter((c) => c.source && !c.spec.generated?.trim());
   const stmts: string[] = [create];
   if (copied.length)
     stmts.push(
       `INSERT INTO ${tmp} (${copied.map((c) => ident(c.spec.name)).join(", ")})\n` +
         `SELECT ${copied.map((c) => ident(c.source!)).join(", ")} FROM ${src}`,
     );
+  stmts.push(`PRAGMA legacy_alter_table=1`);
   stmts.push(`DROP TABLE ${src}`);
   stmts.push(`ALTER TABLE ${tmp} RENAME TO ${ident(finalName)}`);
+  stmts.push(`PRAGMA legacy_alter_table=0`);
   for (const ix of s.indexes ?? []) if (ix.trim()) stmts.push(ix.trim().replace(/;\s*$/, ""));
+  for (const tg of s.triggers ?? []) if (tg.trim()) stmts.push(tg.trim().replace(/;\s*$/, ""));
   // The banner is a leading COMMENT, not a statement — joining it with `;` would put
   // the separator inside the comment line. `script.rs`'s `effective_start` skips
   // leading comments, so the script still classifies as CREATE TABLE.
@@ -401,6 +487,19 @@ export type DiffColumn = {
   origPk: boolean;
   dropped: boolean;
   identity?: boolean;
+  /** Carried across a rebuild verbatim — the catalog is the only place they exist. */
+  collate?: string;
+  check?: string;
+  generated?: string;
+  onUpdate?: string;
+};
+
+/** One existing object that a rebuild has to recreate, with the columns it names. An
+ *  empty `columns` list means "unknown", never "none". */
+export type Dependent = {
+  name: string;
+  kind: "index" | "constraint" | "trigger";
+  columns: string[];
 };
 export type TableDiffSpec = {
   schema: string;
@@ -425,6 +524,18 @@ export type TableDiffSpec = {
   /** Existing table-constraint clauses (UNIQUE/CHECK/FOREIGN KEY, NOT the primary key —
    *  that comes from the column list) that must survive a SQLite rebuild. */
   keepConstraints?: string[];
+  /** Full `CREATE TRIGGER …` statements to replay after a SQLite rebuild. */
+  keepTriggers?: string[];
+  /** Verbatim table options a rebuild must keep (SQLite `WITHOUT ROWID` / `STRICT`). */
+  tableOptions?: string;
+  /** The original column order, to detect a reorder (only a rebuild can express one). */
+  origOrder?: string[];
+  /** The SURVIVING indexes/constraints/triggers and the columns they name. A rebuild
+   *  recreates these verbatim, so a dropped or renamed column they reference has to be
+   *  refused rather than emitted as a script that fails half-way. */
+  dependents?: Dependent[];
+  /** False when the engine stores its definition as text and Tusk could not read it. */
+  definitionRead?: boolean;
 };
 
 const specOf = (r: DiffColumn): ColumnSpec => ({
@@ -434,16 +545,61 @@ const specOf = (r: DiffColumn): ColumnSpec => ({
   default: r.default,
   comment: r.comment,
   identity: r.identity ?? r.orig?.identity,
+  collate: r.collate,
+  check: r.check,
+  generated: r.generated,
+  onUpdate: r.onUpdate,
 });
 
+/** The indexes a dialog may offer to drop on their own: one that BACKS a constraint is
+ *  the constraint's, and dropping it twice (once per list) fails the second time — on
+ *  MySQL after the first drop has already committed. */
+export function droppableIndexes<T extends { name: string }>(
+  indexes: T[],
+  constraints: { name: string }[],
+): T[] {
+  const backed = new Set(constraints.map((c) => c.name));
+  return indexes.filter((ix) => !backed.has(ix.name));
+}
+
+/** Columns covered by a unique index, taken from the index's key-column DATA. An index
+ *  whose columns are unknown contributes nothing: guessing them by scanning the rendered
+ *  `def` for a column name matches every name that is a substring of another. */
+export function uniqueIndexColumns(indexes: { unique: boolean; columns?: string[] }[]): string[] {
+  return indexes.filter((ix) => ix.unique).flatMap((ix) => ix.columns ?? []);
+}
+
+/** Does this SQL text name that identifier? A whole-token match (quotes and dots are
+ *  not identifier characters, so `"col"` and `t.col` both count) — deliberately NOT a
+ *  substring test, which would match `user` inside `user_id`. Used to decide whether a
+ *  recreated trigger still depends on a column the diff is about to drop, so a false
+ *  positive costs a refusal and a false negative costs a broken script. */
+export function mentionsIdentifier(sql: string, name: string): boolean {
+  if (!name) return false;
+  const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^A-Za-z0-9_$])${esc}([^A-Za-z0-9_$]|$)`, "i").test(sql);
+}
+
+/** Case-insensitive name membership (every engine that rebuilds folds case). */
+const namesInclude = (names: string[], name: string) =>
+  names.some((n) => n.toLowerCase() === name.toLowerCase());
+
+/** Original names of the columns the diff drops. */
+const droppedNames = (s: TableDiffSpec): string[] =>
+  s.columns.filter((r) => r.orig && r.dropped).map((r) => r.orig!.name);
+
 /** True when SQLite cannot express this diff with plain ALTER TABLE actions. */
-export function needsRebuild(s: TableDiffSpec): boolean {
-  if (!ddlCaps().rebuild) return false;
+export function needsRebuild(s: TableDiffSpec, caps: DdlCaps = ddlCaps()): boolean {
+  if (!caps.rebuild) return false;
+  const dropped = droppedNames(s);
   for (const r of s.columns) {
     if (!r.orig) continue;
     if (r.dropped) {
-      // 3.35+ drops a plain column; a key/indexed column still needs the rebuild.
+      // 3.35+ drops a plain column, but refuses one that is indexed, part of a UNIQUE
+      // or a foreign key, or named by a partial index / CHECK / generated expression —
+      // all of which show up as a dependent naming the column.
       if (r.origPk) return true;
+      if (s.dependents?.some((d) => namesInclude(d.columns, r.orig!.name))) return true;
       continue;
     }
     if (r.type.trim() && r.type.trim() !== r.orig.type) return true;
@@ -451,11 +607,75 @@ export function needsRebuild(s: TableDiffSpec): boolean {
     if (r.default.trim() !== r.orig.default.trim()) return true;
     if (r.isPk !== r.origPk) return true;
   }
+  // A reorder is expressible ONLY as a rebuild (and only on SQLite): the new table is
+  // created with the columns in the edited order.
+  if (s.origOrder?.length) {
+    const kept = s.columns
+      .filter((r) => r.orig && !r.dropped)
+      .map((r) => r.orig!.name);
+    const before = s.origOrder.filter((n) => !namesInclude(dropped, n));
+    if (kept.length !== before.length || kept.some((n, i) => n !== before[i])) return true;
+  }
   if (s.dropConstraints.length) return true;
   if (s.addUniques?.some((u) => u.columns.length)) return true;
   if (s.addChecks?.some((c) => c.expr.trim())) return true;
   if (s.addForeignKeys?.some((f) => f.columns.length)) return true;
   return false;
+}
+
+/** Diffs the builders must refuse rather than emit. Errors block the dialog's Apply.
+ *
+ *  Two families:
+ *  - a generated column cannot be restated by any engine's in-place ALTER (MySQL's
+ *    MODIFY would drop or corrupt the expression);
+ *  - a SQLite rebuild recreates the table from what Tusk can SEE, so it must refuse
+ *    anything it would silently destroy or emit against a stale name. */
+export function tableDiffProblems(s: TableDiffSpec, caps: DdlCaps = ddlCaps()): DdlProblem[] {
+  const out: DdlProblem[] = [];
+  for (const r of s.columns) {
+    if (!r.orig || !r.generated?.trim() || r.dropped) continue;
+    const changed =
+      (r.type.trim() && r.type.trim() !== r.orig.type) ||
+      r.nullable !== r.orig.nullable ||
+      r.default.trim() !== r.orig.default.trim() ||
+      r.comment !== r.orig.comment ||
+      r.isPk !== r.origPk;
+    if (changed)
+      out.push({
+        level: "error",
+        message: `"${r.orig.name}" is a generated column (${r.generated.trim()}). ${caps.label} can't rewrite one from here — drop and re-add it, or edit it as SQL.`,
+      });
+  }
+  if (!caps.rebuild || !needsRebuild(s, caps)) return out;
+
+  if (s.definitionRead === false)
+    out.push({
+      level: "error",
+      message:
+        "Tusk couldn't read this table's stored CREATE statement, so a rebuild could drop CHECK constraints, collations or generated columns it never saw. Edit the table as SQL instead.",
+    });
+
+  // The rebuild replays index, constraint and trigger text captured BEFORE the edit, so
+  // a rename in the same pass would replay it against names that no longer exist.
+  const renamed = s.columns.filter((r) => r.orig && !r.dropped && r.name.trim() && r.name.trim() !== r.orig.name);
+  const tableRenamed = !!s.newName.trim() && s.newName.trim() !== s.table;
+  if (renamed.length || tableRenamed)
+    out.push({
+      level: "error",
+      message: `${caps.label} has to rebuild the table for these changes, and the rebuild recreates the indexes, constraints and triggers as they are written today — so a ${
+        tableRenamed ? "table" : "column"
+      } rename can't go in the same pass. Apply the rename on its own first.`,
+    });
+
+  const dropped = droppedNames(s);
+  for (const d of s.dependents ?? [])
+    for (const c of d.columns)
+      if (namesInclude(dropped, c))
+        out.push({
+          level: "error",
+          message: `Column "${c}" is used by ${d.kind} "${d.name}", which the rebuild recreates unchanged. Drop ${d.name} too (tick it above) to drop the column.`,
+        });
+  return out;
 }
 
 /** Drop one existing constraint, per engine. Returns [] where the engine has no
@@ -487,7 +707,7 @@ function dropConstraintStatements(q: string, name: string, kind: string | undefi
  *  documented table rebuild instead (see `rebuildTable`). */
 export function tableDiff(s: TableDiffSpec): string {
   const caps = ddlCaps();
-  if (caps.rebuild && needsRebuild(s)) {
+  if (caps.rebuild && needsRebuild(s, caps)) {
     return rebuildTable({
       schema: s.schema,
       table: s.table,
@@ -503,6 +723,8 @@ export function tableDiff(s: TableDiffSpec): string {
       foreignKeys: s.addForeignKeys,
       constraintClauses: s.keepConstraints,
       indexes: s.keepIndexes,
+      triggers: s.keepTriggers,
+      tableOptions: s.tableOptions,
     });
   }
 
@@ -544,6 +766,12 @@ export function tableDiff(s: TableDiffSpec): string {
   }
   stmts.push(...renames);
 
+  // Indexes and constraints go BEFORE the column drops: an engine refuses to drop a
+  // column an index still covers, so the two only work in this order.
+  for (const ix of s.dropIndexes) stmts.push(dropIndex(s.schema, ix, false, s.table));
+  for (const c of s.dropConstraints)
+    stmts.push(...dropConstraintStatements(q, c, s.constraintKinds?.[c], caps));
+
   for (const r of s.columns) if (r.orig && r.dropped) stmts.push(`ALTER TABLE ${q} DROP COLUMN ${ident(r.orig.name)}`);
 
   for (const r of s.columns) {
@@ -567,10 +795,6 @@ export function tableDiff(s: TableDiffSpec): string {
     }
     if (newPk.length) stmts.push(`ALTER TABLE ${q} ADD PRIMARY KEY (${newPk.map(ident).join(", ")})`);
   }
-
-  for (const ix of s.dropIndexes) stmts.push(dropIndex(s.schema, ix, false, s.table));
-  for (const c of s.dropConstraints)
-    stmts.push(...dropConstraintStatements(q, c, s.constraintKinds?.[c], caps));
 
   if (caps.addConstraint) {
     for (const u of s.addUniques ?? [])
@@ -610,8 +834,12 @@ export function dropRelation(kind: string, schema: string, name: string, cascade
   return `DROP ${RELATION_KEYWORD[kind] ?? "TABLE"} ${q}${cascadeSuffix(cascade, caps)}`;
 }
 
+/** DROP SCHEMA. On an engine with no schema layer (MySQL) a schema IS a database, so
+ *  this emits the honest `DROP DATABASE` — the Explorer labels and guards it as one. */
 export function dropSchema(name: string, cascade: boolean): string {
-  return `DROP SCHEMA ${ident(name)}${cascadeSuffix(cascade)}`;
+  const caps = ddlCaps();
+  if (caps.dropSchema === "database") return dropDatabase(name);
+  return `DROP SCHEMA ${ident(name)}${cascadeSuffix(cascade, caps)}`;
 }
 
 /** DROP DATABASE — must run as a single statement (cannot be in a transaction). */
@@ -819,14 +1047,45 @@ export function alterSequenceRestart(schema: string, name: string, value: string
 
 export type DdlProblem = { level: "error" | "warning"; message: string };
 
+/** One column row as the dialogs model it. `primaryKey` is the CreateTable spelling and
+ *  `isPk` the ModifyTable one — both are read, so the nullable-PK check runs from both
+ *  dialogs (it silently never ran from Modify before). */
+export type ValidatedColumn = {
+  name: string;
+  type: string;
+  nullable: boolean;
+  primaryKey?: boolean;
+  isPk?: boolean;
+  dropped?: boolean;
+  default?: string;
+  check?: string;
+  comment?: string;
+  unique?: boolean;
+  identity?: boolean;
+};
+
+/** A never-touched trailing row in the Create-table builder: no name and nothing else
+ *  filled in. `createTable` drops these from the emitted SQL, so validation must ignore
+ *  them too — otherwise the dialog opens already reporting "Every column needs a name."
+ *  and blanks its own preview. */
+export function isPlaceholderColumn(c: ValidatedColumn): boolean {
+  return (
+    !c.name.trim() &&
+    !(c.default ?? "").trim() &&
+    !(c.check ?? "").trim() &&
+    !(c.comment ?? "").trim() &&
+    !c.primaryKey &&
+    !c.isPk &&
+    !c.unique &&
+    !c.identity
+  );
+}
+
 /** Shared column-list validation for the create/modify dialogs. Errors block the run;
  *  warnings are advisory. Identifiers are always quoted on the way out, so the only
  *  name rules that matter are "not empty" and "not a duplicate" — case-insensitively
- *  where the engine folds unquoted names. */
-export function validateColumns(
-  cols: { name: string; type: string; nullable: boolean; primaryKey?: boolean; dropped?: boolean }[],
-  caps: DdlCaps = ddlCaps(),
-): DdlProblem[] {
+ *  where two names differing in case are the same column to the engine. */
+export function validateColumns(cols: ValidatedColumn[], caps: DdlCaps = ddlCaps()): DdlProblem[] {
   const out: DdlProblem[] = [];
   const live = cols.filter((c) => !c.dropped);
   const seen = new Map<string, string>();
@@ -844,11 +1103,11 @@ export function validateColumns(
         message:
           prior === name
             ? `Duplicate column name "${name}".`
-            : `Column names "${prior}" and "${name}" collide (this engine folds unquoted names).`,
+            : `Column names "${prior}" and "${name}" collide (${caps.label} compares identifiers case-insensitively).`,
       });
     } else seen.set(key, name);
     if (!c.type.trim()) out.push({ level: "error", message: `Column "${name}" needs a type.` });
-    if (c.primaryKey && c.nullable)
+    if ((c.primaryKey ?? c.isPk) && c.nullable && !caps.nullablePrimaryKey)
       out.push({ level: "error", message: `Primary-key column "${name}" cannot be nullable.` });
   }
   if (!live.length) out.push({ level: "error", message: "A table needs at least one column." });

@@ -2,7 +2,15 @@ import { createMemo, createSignal, For, Show } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { Dialog, DialogFooter } from "../Dialog";
 import { SqlField } from "../SqlField";
-import { createTable, scriptNote, validateColumns, type ColumnSpec, type FkSpec } from "../sql/ddl";
+import {
+  createTable,
+  isPlaceholderColumn,
+  scriptNote,
+  validateColumns,
+  validateTableOptions,
+  type ColumnSpec,
+  type FkSpec,
+} from "../sql/ddl";
 import { ddlCaps } from "../sql/ddlCaps";
 import { emptyFk, fkSpecOf, FkEditor, type FkDraft, type RefColumn, type RefTable } from "./FkEditor";
 
@@ -101,8 +109,15 @@ export function CreateTableForm(props: {
   const colNames = () => cols.filter((c) => c.name.trim()).map((c) => c.name.trim());
   const localCols = () => cols.filter((c) => c.name.trim()).map((c) => ({ name: c.name.trim(), data_type: c.type }));
 
+  const tableOptions = createMemo(() =>
+    caps.tableOptions ? { engine: engine(), charset: charset(), collation: collation() } : undefined,
+  );
+
   const problems = createMemo(() => {
-    const out = validateColumns(cols, caps);
+    // The dialog opens with an empty spare row; it is not a mistake until the user
+    // puts something in it (and `createTable` drops it from the SQL either way).
+    const out = validateColumns(cols.filter((c) => !isPlaceholderColumn(c)), caps);
+    out.push(...validateTableOptions(tableOptions()));
     if (!name().trim()) out.unshift({ level: "error" as const, message: "The table needs a name." });
     const identityCols = cols.filter((c) => c.identity);
     if (identityCols.length > 1) out.push({ level: "error" as const, message: "Only one column can auto-number." });
@@ -130,7 +145,7 @@ export function CreateTableForm(props: {
           temporary: temporary(),
           comment: comment(),
           foreignKeys: foreignKeys(),
-          options: caps.tableOptions ? { engine: engine(), charset: charset(), collation: collation() } : undefined,
+          options: tableOptions(),
         }),
   );
   const note = createMemo(() => (sql() ? scriptNote(sql(), caps) : ""));

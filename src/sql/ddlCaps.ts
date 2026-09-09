@@ -20,6 +20,13 @@ export type TypeChange =
   | "modify" // MySQL: MODIFY COLUMN c <full definition>
   | "rebuild"; // SQLite: no ALTER form at all — rebuild the table
 
+/** What "drop this schema node" actually means on the engine.
+ *  - `"schema"` — a real schema inside the database (PostgreSQL, DuckDB).
+ *  - `"database"` — the engine has no schema layer: a schema IS a database, so the
+ *    drop destroys a whole database and must be labelled and guarded as one (MySQL).
+ *  - `false` — no schema drop at all (SQLite: main/temp/attached only). */
+export type SchemaDrop = "schema" | "database" | false;
+
 /** How an existing constraint is dropped. */
 export type ConstraintDrop =
   | "constraint" // ALTER TABLE … DROP CONSTRAINT name
@@ -35,8 +42,14 @@ export type DdlCaps = {
   multiActionAlter: boolean;
   /** DDL takes part in the surrounding transaction (MySQL implicitly commits each one). */
   transactionalDdl: boolean;
-  /** Unquoted identifiers fold case, so duplicate-name checks are case-insensitive. */
+  /** Two names differing only in case are the SAME column on this engine, so the
+   *  duplicate-name check must fold case. This is about the engine's identifier
+   *  EQUALITY rule, not about unquoted folding: Tusk always quotes, so PostgreSQL's
+   *  `"Id"` and `"id"` are two distinct, legal columns there. */
   foldsCase: boolean;
+  /** The engine tolerates NULLs in a PRIMARY KEY column (SQLite's documented legacy
+   *  quirk for non-rowid keys); everywhere else a nullable PK is an error. */
+  nullablePrimaryKey: boolean;
 
   // --- CREATE TABLE surface ---
   ifNotExists: boolean;
@@ -74,6 +87,10 @@ export type DdlCaps = {
   // --- objects ---
   schemas: boolean;
   createSchema: boolean;
+  /** Dropping a schema node: a real schema, a whole database, or not at all. NEVER
+   *  derive this from `createSchema` — on MySQL a schema is a database, so the drop
+   *  is a `DROP DATABASE` and needs the connected-database guard. */
+  dropSchema: SchemaDrop;
   renameSchema: boolean;
   createDatabase: boolean;
   dropDatabase: boolean;
@@ -110,7 +127,9 @@ const POSTGRES: DdlCaps = {
   label: "PostgreSQL",
   multiActionAlter: true,
   transactionalDdl: true,
-  foldsCase: true,
+  // Quoted identifiers are case-SENSITIVE on PostgreSQL and Tusk always quotes.
+  foldsCase: false,
+  nullablePrimaryKey: false,
   ifNotExists: true,
   temporary: true,
   inlineCheck: true,
@@ -136,6 +155,7 @@ const POSTGRES: DdlCaps = {
   onUpdateAction: true,
   schemas: true,
   createSchema: true,
+  dropSchema: "schema",
   renameSchema: true,
   createDatabase: true,
   dropDatabase: true,
@@ -165,6 +185,8 @@ const DUCKDB: DdlCaps = {
   ...POSTGRES,
   dialect: "duckdb",
   label: "DuckDB",
+  // DuckDB identifiers are case-INSENSITIVE even when quoted.
+  foldsCase: true,
   multiActionAlter: false,
   inlineForeignKey: true,
   identity: "sequence",
@@ -199,6 +221,7 @@ const MYSQL: DdlCaps = {
   multiActionAlter: true,
   transactionalDdl: false,
   foldsCase: true,
+  nullablePrimaryKey: false,
   ifNotExists: true,
   temporary: true,
   inlineCheck: true,
@@ -224,6 +247,8 @@ const MYSQL: DdlCaps = {
   onUpdateAction: true,
   schemas: true,
   createSchema: true,
+  // MySQL has no schema layer: `DROP SCHEMA` IS `DROP DATABASE`.
+  dropSchema: "database",
   renameSchema: false,
   createDatabase: true,
   dropDatabase: true,
@@ -256,6 +281,9 @@ const SQLITE: DdlCaps = {
   multiActionAlter: false,
   transactionalDdl: true,
   foldsCase: true,
+  // SQLite only enforces NOT NULL on a PK for the INTEGER rowid alias and WITHOUT
+  // ROWID tables; a plain `TEXT PRIMARY KEY` legitimately accepts NULLs.
+  nullablePrimaryKey: true,
   ifNotExists: true,
   temporary: true,
   inlineCheck: true,
@@ -281,6 +309,7 @@ const SQLITE: DdlCaps = {
   onUpdateAction: true,
   schemas: true, // main / temp / attached: qualification works, CREATE SCHEMA does not
   createSchema: false,
+  dropSchema: false,
   renameSchema: false,
   createDatabase: false,
   dropDatabase: false,
