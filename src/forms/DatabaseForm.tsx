@@ -25,30 +25,37 @@ export function DatabaseForm(props: {
   };
 
   return (
-    <Dialog title="Create database" onClose={props.onClose}>
+    <Dialog
+      title="Create database"
+      size="md"
+      onClose={props.onClose}
+      onEnter={apply}
+      footer={
+        <DialogFooter
+          sql={sql()}
+          error={error()}
+          busy={busy()}
+          disabled={!sql()}
+          primaryLabel="Create database"
+          onPrimary={apply}
+          onEditAsSql={() => props.onEditAsSql(sql())}
+          onCancel={props.onClose}
+        />
+      }
+    >
       <label>
-        Name
-        <input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="database_name" autofocus />
+        Name<span class="req">*</span>
+        <input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="database_name" />
       </label>
       <label>
-        Owner (optional)
+        Owner
         <input value={owner()} onInput={(e) => setOwner(e.currentTarget.value)} placeholder="role" />
       </label>
       <label>
-        Encoding (optional)
+        Encoding
         <input value={encoding()} onInput={(e) => setEncoding(e.currentTarget.value)} placeholder="UTF8" />
       </label>
-      <div class="import-info">Runs as a single statement (CREATE DATABASE cannot run in a transaction).</div>
-      <DialogFooter
-        sql={sql()}
-        error={error()}
-        busy={busy()}
-        disabled={!sql()}
-        primaryLabel="Create database"
-        onPrimary={apply}
-        onEditAsSql={() => props.onEditAsSql(sql())}
-        onCancel={props.onClose}
-      />
+      <div class="import-info">Runs as a single statement, outside any transaction.</div>
     </Dialog>
   );
 }

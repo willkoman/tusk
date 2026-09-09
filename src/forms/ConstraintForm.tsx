@@ -59,7 +59,24 @@ export function ConstraintForm(props: {
   };
 
   return (
-    <Dialog title={`Add constraint · ${props.ctx.name}`} onClose={props.onClose} width={520}>
+    <Dialog
+      title="Add constraint"
+      subtitle={`${props.ctx.schema}.${props.ctx.name}`}
+      size="md"
+      onClose={props.onClose}
+      footer={
+        <DialogFooter
+          sql={sql() ?? ""}
+          error={error()}
+          busy={busy()}
+          disabled={!sql()}
+          primaryLabel="Add constraint"
+          onPrimary={apply}
+          onEditAsSql={() => props.onEditAsSql(sql()!)}
+          onCancel={props.onClose}
+        />
+      }
+    >
       <label>
         Type
         <select value={ctype()} onChange={(e) => setCtype(e.currentTarget.value as CType)}>
@@ -71,8 +88,9 @@ export function ConstraintForm(props: {
       </label>
       <Show when={ctype() === "unique" || ctype() === "check"}>
         <label>
-          Name (optional)
+          Name
           <input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="constraint_name" />
+          <small class="field-hint">Leave blank to let the server name it.</small>
         </label>
       </Show>
 
@@ -107,19 +125,8 @@ export function ConstraintForm(props: {
       </Show>
 
       <Show when={!caps.addConstraint}>
-        <div class="warn-note">{caps.label} can't add constraints with ALTER TABLE — define them in CREATE TABLE.</div>
+        <div class="warn-note">{caps.label} adds constraints in CREATE TABLE only.</div>
       </Show>
-
-      <DialogFooter
-        sql={sql() ?? ""}
-        error={error()}
-        busy={busy()}
-        disabled={!sql()}
-        primaryLabel="Add constraint"
-        onPrimary={apply}
-        onEditAsSql={() => props.onEditAsSql(sql()!)}
-        onCancel={props.onClose}
-      />
     </Dialog>
   );
 }

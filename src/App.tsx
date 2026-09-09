@@ -5773,7 +5773,7 @@ function App() {
 
         <Show when={renameTab()}>
           {(rt) => (
-            <Dialog title="Rename tab" width={380} onClose={() => setRenameTab(null)}>
+            <Dialog title="Rename tab" size="sm" onClose={() => setRenameTab(null)}>
               <form
                 onSubmit={(e) => {
                   e.preventDefault();
@@ -5800,7 +5800,7 @@ function App() {
         </Show>
 
         <Show when={confirmAnalyze()}>
-          <Dialog title="Explain Analyze" width={440} onClose={() => setConfirmAnalyze(null)}>
+          <Dialog title="Explain Analyze" size="sm" noAutoFocus onClose={() => setConfirmAnalyze(null)}>
             <div class="confirm-note">
               EXPLAIN ANALYZE <b>executes</b> the statement to measure it — and this statement modifies data. Run it?
             </div>
@@ -5931,28 +5931,38 @@ function App() {
         </Show>
         <Show when={commitView()}>
           {(cv) => (
-            <Dialog title={activeOwnsTransaction() ? "Apply changes" : "Commit changes"} width={620} onClose={closeCommit} dismissable={!commitBusy()}>
+            <Dialog
+              title={activeOwnsTransaction() ? "Apply changes" : "Commit changes"}
+              size="lg"
+              noAutoFocus
+              onClose={closeCommit}
+              dismissable={!commitBusy()}
+              footer={
+                <>
+                  <SqlPreview sql={cv().script.map((s) => s + ";").join("\n")} />
+                  <Show when={commitErr()}>
+                    <div class="error">{commitErr()}</div>
+                  </Show>
+                  <div class="form-actions">
+                    <button class="ghost" disabled={commitBusy()} onClick={closeCommit}>Cancel</button>
+                    <button class="run" disabled={commitBusy()} onClick={() => void doCommit()}>
+                      {commitBusy() ? "Applying…" : activeOwnsTransaction() ? "Apply" : "Commit"}
+                    </button>
+                  </div>
+                </>
+              }
+            >
               <p class="confirm-text">
                 {activeOwnsTransaction()
                   ? `${cv().script.length} statement${cv().script.length === 1 ? "" : "s"} will run inside ${transaction().id}. The outer transaction remains open.`
-                  : `${cv().script.length} statement${cv().script.length === 1 ? "" : "s"} will run in one transaction (rolled back wholesale on failure).`}
+                  : `${cv().script.length} statement${cv().script.length === 1 ? "" : "s"} will run in one transaction. A failure rolls back all of them.`}
               </p>
-              <SqlPreview sql={cv().script.map((s) => s + ";").join("\n")} />
-              <Show when={commitErr()}>
-                <div class="error">{commitErr()}</div>
-              </Show>
-              <div class="form-actions">
-                <button class="ghost" disabled={commitBusy()} onClick={closeCommit}>Cancel</button>
-                <button class="run" disabled={commitBusy()} onClick={() => void doCommit()}>
-                  {commitBusy() ? "Applying…" : activeOwnsTransaction() ? "Apply" : "Commit"}
-                </button>
-              </div>
             </Dialog>
           )}
         </Show>
         <Show when={confirmDiscard()}>
           {(cd) => (
-            <Dialog title="Discard pending changes?" width={420} onClose={() => setConfirmDiscard(null)}>
+            <Dialog title="Discard pending changes?" size="sm" noAutoFocus onClose={() => setConfirmDiscard(null)}>
               <p class="confirm-text">
                 This discards {cd().count} uncommitted change{cd().count === 1 ? "" : "s"} in the result grid.
               </p>
@@ -5969,7 +5979,7 @@ function App() {
         </Show>
         <Show when={confirmClose()}>
           {(cc) => (
-            <Dialog title="Uncommitted changes" onClose={() => setConfirmClose(null)} width={460}>
+            <Dialog title="Uncommitted changes" size="sm" noAutoFocus onClose={() => setConfirmClose(null)}>
               <p class="confirm-text">
                 “{tabs().find((t) => t.id === cc().tabId)?.title}” has
                 {cc().dirty ? " unsaved editor changes" : ""}
@@ -5999,7 +6009,7 @@ function App() {
           )}
         </Show>
         <Show when={!!confirmCancelConn() && !!entryOf(confirmCancelConn())?.state().running}>
-          <Dialog title="Cancel running query?" onClose={() => setConfirmCancelConn(null)} width={440}>
+          <Dialog title="Cancel running query?" size="sm" noAutoFocus onClose={() => setConfirmCancelConn(null)}>
             <p class="confirm-text">
               Cancel the query running on <b>{labelOf(confirmCancelConn()!)}</b>? Rows already loaded stay on screen, marked incomplete.
             </p>
@@ -6011,7 +6021,7 @@ function App() {
         </Show>
         <Show when={confirmDisconnect()}>
           {(target) => (
-            <Dialog title="Disconnect with pending changes?" onClose={() => setConfirmDisconnect(null)} width={460}>
+            <Dialog title="Disconnect with pending changes?" size="sm" noAutoFocus onClose={() => setConfirmDisconnect(null)}>
               <p class="confirm-text">
                 Disconnecting <b>{labelOf(target().connectionId)}</b> discards {target().count} uncommitted grid change{target().count === 1 ? "" : "s"} on it. Editor buffers remain saved in this workspace.
               </p>
@@ -6024,7 +6034,7 @@ function App() {
         </Show>
         <Show when={confirmWindowClose()}>
           {(count) => (
-            <Dialog title="Close with pending changes?" onClose={() => setConfirmWindowClose(null)} width={460}>
+            <Dialog title="Close with pending changes?" size="sm" noAutoFocus onClose={() => setConfirmWindowClose(null)}>
               <p class="confirm-text">
                 Closing Tusk discards {count()} uncommitted grid change{count() === 1 ? "" : "s"}. Editor buffers have been saved to workspace recovery.
               </p>
@@ -6041,7 +6051,8 @@ function App() {
               title={transaction().state === "lost" ? "Transaction session lost" : "Resolve transaction first"}
               onClose={() => setTransactionResolution(null)}
               dismissable={!transactionResolutionBusy()}
-              width={520}
+              size="md"
+              noAutoFocus
             >
               <p class="confirm-text">
                 <Show
@@ -6122,7 +6133,7 @@ function App() {
       {/* The connect screen as a modal, so opening another connection never costs you
           the workspace you are already in. */}
       <Show when={connectOpen() && connections().length > 0}>
-        <Dialog title="Open another connection" width={980} onClose={() => setConnectOpen(false)}>
+        <Dialog title="Open another connection" size="xl" onClose={() => setConnectOpen(false)}>
           {connectPanel()}
         </Dialog>
       </Show>
@@ -6178,7 +6189,7 @@ function App() {
           the destination rather than writing to it. */}
       <Show when={confirmPickedPath()}>
         {(p) => (
-          <Dialog title="Use this file?" onClose={() => settlePickedPath(false)} width={520}>
+          <Dialog title="Use this file?" size="md" noAutoFocus onClose={() => settlePickedPath(false)}>
             <p class="confirm-text">
               Tusk could not confirm the file picker appeared, so this may be a default
               location rather than your choice:
@@ -6197,7 +6208,7 @@ function App() {
           connect screen AND inside the "Open another connection" modal. */}
       <Show when={confirmDeleteProfile()}>
         {(p) => (
-          <Dialog title="Delete saved connection?" onClose={() => setConfirmDeleteProfile(null)} width={460}>
+          <Dialog title="Delete saved connection?" size="sm" noAutoFocus onClose={() => setConfirmDeleteProfile(null)}>
             <p class="confirm-text">
               Delete <b>{p().name || p().dbname || p().host}</b> from your saved connections?
               {p().save_password ? " Its saved password is removed from the OS keychain too." : ""} This
@@ -6262,7 +6273,7 @@ function App() {
       </Show>
       <Show when={cellView()}>
         {(cv) => (
-          <Dialog title={`Value · ${cv().col}`} onClose={() => setCellView(null)} width={520}>
+          <Dialog title="Value" subtitle={cv().col} size="md" noAutoFocus onClose={() => setCellView(null)}>
             <Show when={cv().val !== null} fallback={<div class="null" style={{ padding: "8px 0" }}>NULL</div>}>
               <pre class="value-view">{cv().val}</pre>
             </Show>

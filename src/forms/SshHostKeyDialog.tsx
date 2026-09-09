@@ -29,11 +29,27 @@ export function SshHostKeyDialog(props: {
     }
   };
   return (
-    <Dialog title="Unknown SSH host key" onClose={props.onCancel} dismissable={!busy()} width={520}>
+    <Dialog
+      title="Unknown SSH host key"
+      subtitle={`${props.prompt.host}:${props.prompt.port}`}
+      size="md"
+      onClose={props.onCancel}
+      dismissable={!busy()}
+      noAutoFocus
+      footer={
+        <div class="form-actions">
+          <button type="button" class="ghost" onClick={props.onCancel} disabled={busy()}>
+            Cancel
+          </button>
+          <button type="button" class="run" onClick={trust} disabled={busy()}>
+            {busy() ? "Connecting…" : "Trust and connect"}
+          </button>
+        </div>
+      }
+    >
       <p class="ssh-hostkey-lead">
-        Tusk has not connected to <b>{props.prompt.host}:{props.prompt.port}</b> before. Confirm
-        this fingerprint matches the server before trusting it — accepting the wrong key hands
-        your session to whoever answered.
+        Tusk has not connected to this host before. Confirm the fingerprint matches the server.
+        Accepting the wrong key hands your session to whoever answered.
       </p>
       <div class="ssh-hostkey-fp">
         <div class="ssh-hostkey-alg">{props.prompt.algorithm}</div>
@@ -44,14 +60,6 @@ export function SshHostKeyDialog(props: {
         same value. Trusting records it in Tusk's SSH trust store; your{" "}
         <code>~/.ssh/known_hosts</code> is read but never modified.
       </p>
-      <div class="form-actions">
-        <button type="button" class="ghost" onClick={props.onCancel} disabled={busy()}>
-          Cancel
-        </button>
-        <button type="button" onClick={trust} disabled={busy()}>
-          {busy() ? "Connecting…" : "Trust and connect"}
-        </button>
-      </div>
     </Dialog>
   );
 }

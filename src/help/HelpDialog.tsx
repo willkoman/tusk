@@ -81,7 +81,7 @@ export default function HelpDialog(props: {
   });
 
   return (
-    <Dialog title="Tusk manual" class="modal-tall" width={980} onClose={props.onClose}>
+    <Dialog title="Tusk manual" class="modal-tall" size="xl" onClose={props.onClose}>
       <div class="kb-body">
         <nav class="kb-nav">
           <div class="kb-searchwrap">

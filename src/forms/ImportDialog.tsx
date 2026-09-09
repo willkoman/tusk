@@ -222,8 +222,9 @@ export function ImportDialog(props: {
     return Math.min(100, Math.round((p.bytesRead / p.totalBytes) * 100));
   };
 
+  // Three wizard steps each own their action row, so the footer stays in the body.
   return (
-    <Dialog title="Import data" onClose={props.onClose} width={720} dismissable={!busy()}>
+    <Dialog title="Import data" size="lg" onClose={props.onClose} dismissable={!busy()}>
       <div class="import-steps">
         <For each={["source", "mapping", "run"] as Step[]}>
           {(s, i) => (
@@ -322,7 +323,7 @@ export function ImportDialog(props: {
             {(p) => (
               <section class="export-sec">
                 <div class="export-label">
-                  Preview — {p().columns.length} columns, {p().rows.length} row{p().rows.length === 1 ? "" : "s"} parsed
+                  Preview: {p().columns.length} columns, {p().rows.length} row{p().rows.length === 1 ? "" : "s"} parsed
                   {p().truncated ? " (more follow)" : ""}
                   {p().rows.length > PREVIEW_ROWS_SHOWN ? `, showing ${PREVIEW_ROWS_SHOWN} rows` : ""}
                   {p().columns.length > PREVIEW_COLUMNS ? `, showing ${PREVIEW_COLUMNS} columns` : ""}

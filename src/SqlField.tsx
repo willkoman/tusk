@@ -1,5 +1,5 @@
 import { onMount, onCleanup, createEffect } from "solid-js";
-import { EditorView, keymap, placeholder } from "@codemirror/view";
+import { EditorView, keymap, placeholder, tooltips } from "@codemirror/view";
 import { EditorState } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { sql } from "@codemirror/lang-sql";
@@ -57,6 +57,10 @@ export function SqlField(props: {
         history(),
         sql({ dialect: spec().cm, upperCaseKeywords: false }),
         autocompletion({ override: [source], defaultKeymap: false, icons: true }),
+        // The field lives inside a modal that scrolls and clips its own overflow, so a
+        // tooltip anchored in that stacking context is cut off or painted under the next
+        // row. Anchor it to the document instead (`.cm-tooltip` sits above `.modal`).
+        tooltips({ parent: document.body, position: "fixed" }),
         keymap.of([
           { key: "Tab", run: acceptCompletion },
           { key: "Enter", run: () => true }, // single-line — swallow newline

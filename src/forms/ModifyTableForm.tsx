@@ -15,6 +15,18 @@ import {
 } from "../sql/ddl";
 import { ddlCaps } from "../sql/ddlCaps";
 import type { Column, NodeDescriptor, RelationDetail } from "../Tree";
+import { ConfirmDialog } from "./ConfirmDialog";
+import {
+  dropLines,
+  dropSummary,
+  droppedNames,
+  isDropped,
+  sectionLabel,
+  setDropped,
+  tallyTotal,
+  type DropSet,
+  type DropTally,
+} from "./dropState";
 import { emptyFk, fkSpecOf, FkEditor, type FkDraft, type RefColumn, type RefTable } from "./FkEditor";
 
 type Row = {
@@ -107,14 +119,15 @@ export function ModifyTableForm(props: {
   const [tableName, setTableName] = createSignal(table);
   const [tableSchema, setTableSchema] = createSignal(schema);
   const [tableComment, setTableComment] = createSignal(props.detail.comment ?? "");
-  const [dropIdx, setDropIdx] = createSignal<Record<string, boolean>>({});
-  const [dropCon, setDropCon] = createSignal<Record<string, boolean>>({});
+  const [dropIdx, setDropIdx] = createSignal<DropSet>({});
+  const [dropCon, setDropCon] = createSignal<DropSet>({});
   const [uniques, setUniques] = createStore<UniqueDraft[]>([]);
   const [checks, setChecks] = createStore<CheckDraft[]>([]);
   const [fks, setFks] = createStore<(FkDraft & { uid: number })[]>([]);
   const [showAdd, setShowAdd] = createSignal(false);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
+  const [confirming, setConfirming] = createSignal(false);
 
   const colNames = () => cols.filter((r) => !r.dropped && r.name.trim()).map((r) => r.name.trim());
   const localCols = () =>
@@ -144,7 +157,7 @@ export function ModifyTableForm(props: {
   // keeping (constraint-backed indexes come back with the recreated CREATE TABLE).
   const keepIndexes = createMemo(() =>
     shownIndexes()
-      .filter((ix) => !ix.primary && !dropIdx()[ix.name] && ix.def.trim())
+      .filter((ix) => !ix.primary && !isDropped(dropIdx(), ix.name) && ix.def.trim())
       .map((ix) => ix.def),
   );
   // Constraints the rebuilt CREATE TABLE must carry across verbatim. The primary key is
@@ -152,7 +165,7 @@ export function ModifyTableForm(props: {
   // silently lost when the original table is dropped.
   const keepConstraints = createMemo(() =>
     props.detail.constraints
-      .filter((c) => c.kind !== "primary_key" && !dropCon()[c.name] && c.def.trim())
+      .filter((c) => c.kind !== "primary_key" && !isDropped(dropCon(), c.name) && c.def.trim())
       .map((c) => c.def),
   );
   // SQLite stores a trigger's whole CREATE text and the DROP takes the table's triggers
@@ -164,10 +177,10 @@ export function ModifyTableForm(props: {
   // dropping or renaming one of those columns must be refused, not emitted.
   const dependents = createMemo<Dependent[]>(() => [
     ...shownIndexes()
-      .filter((ix) => !ix.primary && !dropIdx()[ix.name])
+      .filter((ix) => !ix.primary && !isDropped(dropIdx(), ix.name))
       .map((ix) => ({ name: ix.name, kind: "index" as const, columns: ix.columns ?? [] })),
     ...props.detail.constraints
-      .filter((c) => c.kind !== "primary_key" && !dropCon()[c.name])
+      .filter((c) => c.kind !== "primary_key" && !isDropped(dropCon(), c.name))
       .map((c) => ({ name: c.name, kind: "constraint" as const, columns: c.columns ?? [] })),
     ...props.detail.triggers.map((t) => ({
       name: t.name,
@@ -175,6 +188,21 @@ export function ModifyTableForm(props: {
       columns: props.detail.columns.map((c) => c.name).filter((n) => mentionsIdentifier(t.def, n)),
     })),
   ]);
+
+  const indexNames = createMemo(() => shownIndexes().map((ix) => ix.name));
+  const constraintNames = createMemo(() => props.detail.constraints.map((c) => c.name));
+  const droppedIndexes = createMemo(() => droppedNames(dropIdx(), indexNames()));
+  const droppedConstraints = createMemo(() => droppedNames(dropCon(), constraintNames()));
+  const droppedColumns = createMemo(() =>
+    cols.filter((r) => r.dropped && r.orig).map((r) => r.orig!.name),
+  );
+  /** Every object one Apply would destroy — the section counts, the footer line and
+   *  the confirmation all read this one tally. */
+  const tally = createMemo<DropTally>(() => ({
+    columns: droppedColumns(),
+    indexes: droppedIndexes(),
+    constraints: droppedConstraints(),
+  }));
 
   const spec = createMemo(() => ({
     schema,
@@ -200,8 +228,8 @@ export function ModifyTableForm(props: {
       generated: r.generated,
       onUpdate: r.onUpdate,
     })),
-    dropIndexes: shownIndexes().filter((ix) => dropIdx()[ix.name]).map((ix) => ix.name),
-    dropConstraints: props.detail.constraints.filter((c) => dropCon()[c.name]).map((c) => c.name),
+    dropIndexes: droppedIndexes(),
+    dropConstraints: droppedConstraints(),
     constraintKinds: constraintKinds(),
     addUniques: uniques.filter((u) => u.columns.length).map((u) => ({ name: u.name, columns: u.columns })),
     addChecks: checks.filter((c) => c.expr.trim()).map((c) => ({ name: c.name, expr: c.expr })),
@@ -229,27 +257,51 @@ export function ModifyTableForm(props: {
     if (!sql()) return "";
     const base = scriptNote(sql(), caps);
     if (!rebuilding()) return base;
-    const trg = props.detail.triggers.length
-      ? ` Its triggers (${props.detail.triggers.map((t) => t.name).join(", ")}) are dropped with the table and recreated afterwards.`
-      : "";
-    return `SQLite can't change this in place, so Tusk rebuilds the table (create → copy → drop → rename): the columns, their CHECK/COLLATE/generated clauses, the primary key, the table options and the constraints and indexes listed above are all recreated.${trg} Dropping the original would orphan any row that references it, and SQLite ignores PRAGMA foreign_keys inside a transaction — so Tusk switches foreign-key enforcement off just for this run and back on straight after. ${base}`;
+    return `Tusk rebuilds the table: create, copy, drop, rename. Columns, primary key, table options and every constraint, index and trigger kept above are recreated; foreign-key enforcement is off for the run. ${base}`;
   });
 
   const toggleUniqueCol = (i: number, c: string) =>
     setUniques(i, "columns", (cs) => (cs.includes(c) ? cs.filter((x) => x !== c) : [...cs, c]));
 
-  const apply = async () => {
-    if (!sql()) return;
+  const run = async (script: string) => {
     setBusy(true);
     setError("");
-    const r = await props.onRun(sql());
+    const r = await props.onRun(script);
     setBusy(false);
     if (r.ok) props.onClose();
     else setError(r.error ?? "failed");
+    return r;
+  };
+  /** A drop is irreversible once applied, so Apply stops for a confirmation that
+   *  names every object. Without a pending drop it runs straight away. */
+  const apply = () => {
+    if (!sql()) return;
+    if (tallyTotal(tally())) setConfirming(true);
+    else void run(sql());
   };
 
   return (
-    <Dialog title={`Modify table · ${table}`} onClose={props.onClose} width={Math.min(window.innerWidth - 80, 1100)}>
+    <>
+    <Dialog
+      title="Modify table"
+      subtitle={`${schema}.${table}`}
+      size="xl"
+      onClose={props.onClose}
+      footer={
+        <DialogFooter
+          sql={sql()}
+          error={error()}
+          busy={busy()}
+          disabled={!sql()}
+          summary={dropSummary(tally())}
+          primaryLabel={rebuilding() ? "Rebuild table" : "Apply changes"}
+          primaryDanger={tallyTotal(tally()) > 0}
+          onPrimary={apply}
+          onEditAsSql={() => props.onEditAsSql(sql())}
+          onCancel={props.onClose}
+        />
+      }
+    >
       <div class="modify-head">
         <label>Table name<input value={tableName()} onInput={(e) => setTableName(e.currentTarget.value)} /></label>
         <Show when={caps.comments !== "none"}>
@@ -265,7 +317,7 @@ export function ModifyTableForm(props: {
         </Show>
       </div>
 
-      <div class="field-label">Columns</div>
+      <div class="field-label">{sectionLabel("Columns", droppedColumns().length)}</div>
       <div class="col-builder modify-cols">
         <div class="col-builder-head modify-row">
           <span class="cb-move" />
@@ -275,7 +327,7 @@ export function ModifyTableForm(props: {
           <span class="cb-flag">PK</span>
           <span>Default</span>
           <span>Comment</span>
-          <span class="cb-x" />
+          <span class="cb-x">Action</span>
         </div>
         <For each={cols}>
           {(c, i) => (
@@ -306,9 +358,18 @@ export function ModifyTableForm(props: {
                 onInput={(e) => setCols(i(), "comment", e.currentTarget.value)}
                 placeholder={caps.comments === "none" ? `no comments on ${caps.label}` : "(none)"}
               />
-              <button class="icon cb-x" title={c.orig ? (c.dropped ? "Keep" : "Drop column") : "Remove"} onClick={() => removeRow(i())}>
-                {c.orig && c.dropped ? "↺" : "✕"}
-              </button>
+              {/* Columns, indexes and constraints all drop the same way: a named
+                  button that flips the row into a reversible "will be dropped" state. */}
+              <span class="cb-x">
+                <Show
+                  when={c.orig && c.dropped}
+                  fallback={
+                    <button class="btn-drop" onClick={() => removeRow(i())}>{c.orig ? "Drop" : "Remove"}</button>
+                  }
+                >
+                  <button class="btn-keep" onClick={() => removeRow(i())}>Keep</button>
+                </Show>
+              </span>
             </div>
           )}
         </For>
@@ -316,43 +377,54 @@ export function ModifyTableForm(props: {
       </div>
 
       <Show when={shownIndexes().length}>
-        <div class="field-label">Indexes</div>
+        <div class="field-label">{sectionLabel("Indexes", droppedIndexes().length)}</div>
         <div class="drop-list">
           <For each={shownIndexes()}>
             {(ix) => (
-              <label class="checkbox drop-row" classList={{ "row-dropped": dropIdx()[ix.name] }}>
-                <input
-                  type="checkbox"
-                  disabled={ix.primary}
-                  checked={!!dropIdx()[ix.name]}
-                  onChange={(e) => setDropIdx({ ...dropIdx(), [ix.name]: e.currentTarget.checked })}
-                />
+              <div class="drop-row" classList={{ "row-dropped": isDropped(dropIdx(), ix.name) }}>
                 <span class="mono">{ix.name}</span>
-                <span class="muted-hint">{ix.primary ? "pk (managed above)" : ix.unique ? "unique" : "drop"}</span>
-              </label>
+                <span class="muted-hint">{ix.primary ? "primary key" : ix.unique ? "unique" : "index"}</span>
+                <Show
+                  when={!ix.primary}
+                  fallback={<span class="drop-locked">Managed in Columns</span>}
+                >
+                  <Show
+                    when={isDropped(dropIdx(), ix.name)}
+                    fallback={
+                      <button class="btn-drop" onClick={() => setDropIdx(setDropped(dropIdx(), ix.name, true))}>Drop</button>
+                    }
+                  >
+                    <button class="btn-keep" onClick={() => setDropIdx(setDropped(dropIdx(), ix.name, false))}>Keep</button>
+                  </Show>
+                </Show>
+              </div>
             )}
           </For>
         </div>
       </Show>
 
       <Show when={props.detail.constraints.length}>
-        <div class="field-label">Constraints</div>
+        <div class="field-label">{sectionLabel("Constraints", droppedConstraints().length)}</div>
         <div class="drop-list">
           <For each={props.detail.constraints}>
             {(c) => (
-              <label class="checkbox drop-row" classList={{ "row-dropped": dropCon()[c.name] }}>
-                <input
-                  type="checkbox"
-                  disabled={caps.dropConstraint === "none" && !caps.rebuild}
-                  checked={!!dropCon()[c.name]}
-                  onChange={(e) => setDropCon({ ...dropCon(), [c.name]: e.currentTarget.checked })}
-                />
+              <div class="drop-row" classList={{ "row-dropped": isDropped(dropCon(), c.name) }}>
                 <span class="mono">{c.name}</span>
-                <span class="muted-hint">
-                  {c.kind.replace("_", " ")}
-                  {caps.dropConstraint === "none" && !caps.rebuild ? ` · ${caps.label} can't drop this via ALTER` : ""}
-                </span>
-              </label>
+                <span class="muted-hint">{c.kind.replace("_", " ")}</span>
+                <Show
+                  when={caps.dropConstraint !== "none" || caps.rebuild}
+                  fallback={<span class="drop-locked">No constraint drop on {caps.label}</span>}
+                >
+                  <Show
+                    when={isDropped(dropCon(), c.name)}
+                    fallback={
+                      <button class="btn-drop" onClick={() => setDropCon(setDropped(dropCon(), c.name, true))}>Drop</button>
+                    }
+                  >
+                    <button class="btn-keep" onClick={() => setDropCon(setDropped(dropCon(), c.name, false))}>Keep</button>
+                  </Show>
+                </Show>
+              </div>
             )}
           </For>
         </div>
@@ -423,21 +495,28 @@ export function ModifyTableForm(props: {
       </Show>
 
       <Show when={errors().length}>
-        <div class="error">{errors()[0].message}</div>
+        <div class="field-error">{errors()[0].message}</div>
       </Show>
       <Show when={note()}>
         <div class="muted-hint script-note">{note()}</div>
       </Show>
-      <DialogFooter
-        sql={sql()}
-        error={error()}
-        busy={busy()}
-        disabled={!sql()}
-        primaryLabel={rebuilding() ? "Rebuild table" : "Apply changes"}
-        onPrimary={apply}
-        onEditAsSql={() => props.onEditAsSql(sql())}
-        onCancel={props.onClose}
-      />
     </Dialog>
+    <Show when={confirming()}>
+      <ConfirmDialog
+        title="Apply changes?"
+        subtitle={`${schema}.${table}`}
+        lead="These objects are dropped and cannot be recovered."
+        lines={dropLines(tally())}
+        primaryLabel={rebuilding() ? "Rebuild table" : "Apply changes"}
+        build={() => sql()}
+        onClose={() => setConfirming(false)}
+        onRun={(script) => run(script)}
+        onEditAsSql={(script) => {
+          setConfirming(false);
+          props.onEditAsSql(script);
+        }}
+      />
+    </Show>
+    </>
   );
 }

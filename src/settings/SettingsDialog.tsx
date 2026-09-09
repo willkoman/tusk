@@ -1,5 +1,5 @@
 import { type Accessor, For, Match, Show, Switch, createSignal } from "solid-js";
-import { Dialog } from "../Dialog";
+import { Dialog, type DialogSize } from "../Dialog";
 import { type EditorPrefs } from "../editor/types";
 import { type DialectId } from "../sql/dialects";
 import { THEMES } from "../themes";
@@ -47,12 +47,12 @@ export function SettingsDialog(props: {
   const [tab, setTab] = createSignal<SettingsTab>(props.initialTab ?? "editor");
   const p = props.prefs;
 
-  // The AI tab holds provider cards and a Markdown skill editor; 680px starves both.
-  // Every other tab is label+control rows and reads better narrow.
-  const width = () => (tab() === "ai" ? 900 : 680);
+  // The AI tab holds provider cards and a Markdown skill editor; the lg tier starves
+  // both. Every other tab is label+control rows and reads better narrow.
+  const size = (): DialogSize => (tab() === "ai" ? "xl" : "lg");
 
   return (
-    <Dialog title="Settings" width={width()} onClose={props.onClose}>
+    <Dialog title="Settings" size={size()} noAutoFocus onClose={props.onClose}>
       <div class="settings-body">
         <div class="settings-rail">
           <For each={TABS}>

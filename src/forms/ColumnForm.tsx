@@ -39,33 +39,42 @@ export function ColumnForm(props: {
   };
 
   return (
-    <Dialog title={`Add column · ${props.ctx.name}`} onClose={props.onClose}>
+    <Dialog
+      title="Add column"
+      subtitle={`${props.ctx.schema}.${props.ctx.name}`}
+      size="md"
+      onClose={props.onClose}
+      onEnter={apply}
+      footer={
+        <DialogFooter
+          sql={sql()}
+          error={error()}
+          busy={busy()}
+          disabled={!sql()}
+          primaryLabel="Add column"
+          onPrimary={apply}
+          onEditAsSql={() => props.onEditAsSql(sql())}
+          onCancel={props.onClose}
+        />
+      }
+    >
       <label>
-        Name
-        <input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="column_name" autofocus />
+        Name<span class="req">*</span>
+        <input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="column_name" />
       </label>
       <label>
-        Type
+        Type<span class="req">*</span>
         <SqlField value={type()} typesOnly onChange={setType} placeholder="text" />
       </label>
       <label>
-        Default (SQL expression)
+        Default
         <SqlField value={def()} onChange={setDef} placeholder="e.g. now(), 0, 'active'" />
+        <small class="field-hint">A SQL expression.</small>
       </label>
       <label class="checkbox">
         <input type="checkbox" checked={nullable()} onChange={(e) => setNullable(e.currentTarget.checked)} />
         Nullable
       </label>
-      <DialogFooter
-        sql={sql()}
-        error={error()}
-        busy={busy()}
-        disabled={!sql()}
-        primaryLabel="Add column"
-        onPrimary={apply}
-        onEditAsSql={() => props.onEditAsSql(sql())}
-        onCancel={props.onClose}
-      />
     </Dialog>
   );
 }

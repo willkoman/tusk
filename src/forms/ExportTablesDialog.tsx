@@ -117,7 +117,36 @@ export function ExportTablesDialog(props: {
   }
 
   return (
-    <Dialog title={props.title} onClose={props.onClose} width={640} dismissable={!busy()}>
+    <Dialog
+      title={props.title}
+      size="lg"
+      onClose={props.onClose}
+      dismissable={!busy()}
+      footer={
+        <>
+          <Show when={err()}><div class="error">{err()}</div></Show>
+          <div class="form-actions">
+            <Show
+              when={busy()}
+              fallback={
+                <>
+                  <button class="ghost" onClick={props.onClose}>Close</button>
+                  <button class="run" onClick={() => void run()}>Export…</button>
+                </>
+              }
+            >
+              <span class="busy-label">
+                <span class="spinner-sm" />
+                Exporting {props.progress()?.index ?? 0}/{props.progress()?.total ?? chosen().length}
+                {props.progress()?.table ? ` — ${props.progress()!.table}` : ""}
+              </span>
+              <span class="spacer" />
+              <button class="ghost" onClick={() => void cancelRun()}>Cancel</button>
+            </Show>
+          </div>
+        </>
+      }
+    >
       <fieldset class="export-grid export-fieldset" disabled={busy()}>
         <section class="export-sec">
           <div class="export-label">
@@ -201,27 +230,6 @@ export function ExportTablesDialog(props: {
           )}
         </Show>
       </fieldset>
-
-      <Show when={err()}><div class="error">{err()}</div></Show>
-      <div class="form-actions">
-        <Show
-          when={busy()}
-          fallback={
-            <>
-              <button class="ghost" onClick={props.onClose}>Close</button>
-              <button class="run" onClick={() => void run()}>Export…</button>
-            </>
-          }
-        >
-          <span class="busy-label">
-            <span class="spinner-sm" />
-            Exporting {props.progress()?.index ?? 0}/{props.progress()?.total ?? chosen().length}
-            {props.progress()?.table ? ` — ${props.progress()!.table}` : ""}
-          </span>
-          <span class="spacer" />
-          <button class="ghost" onClick={() => void cancelRun()}>Cancel</button>
-        </Show>
-      </div>
     </Dialog>
   );
 }

@@ -114,7 +114,38 @@ export function RestoreDialog(props: {
   }
 
   return (
-    <Dialog title="Restore from file" onClose={props.onClose} width={620} dismissable={!busy()}>
+    <Dialog
+      title="Restore from file"
+      size="lg"
+      onClose={props.onClose}
+      dismissable={!busy()}
+      footer={
+        <>
+          <Show when={err()}><div class="error">{err()}</div></Show>
+          <div class="form-actions">
+            <Show
+              when={busy()}
+              fallback={
+                <>
+                  <button class="ghost" onClick={props.onClose}>Close</button>
+                  <button
+                    class="run"
+                    disabled={!file() || !!file()?.tooLarge}
+                    onClick={() => void run()}
+                  >
+                    {result() ? "Restore again" : "Restore"}
+                  </button>
+                </>
+              }
+            >
+              <span class="busy-label"><span class="spinner-sm" />Restoring…</span>
+              <span class="spacer" />
+              <button class="ghost" onClick={() => props.onCancel()}>Cancel restore</button>
+            </Show>
+          </div>
+        </>
+      }
+    >
       <Show
         when={!busy()}
         fallback={
@@ -194,9 +225,9 @@ export function RestoreDialog(props: {
                 disabled={!canWrap() || !opts().stopOnError}
                 onChange={(e) => set({ singleTransaction: e.currentTarget.checked })}
               />
-              Run everything in one transaction (rolled back on failure)
+              Run everything in one transaction
               <Show when={!canWrap()}>
-                <span class="export-note"> — not available on {props.driverKind}</span>
+                <span class="export-note">Not available on {props.driverKind}.</span>
               </Show>
             </label>
           </section>
@@ -218,29 +249,6 @@ export function RestoreDialog(props: {
           </Show>
         </fieldset>
       </Show>
-
-      <Show when={err()}><div class="error">{err()}</div></Show>
-      <div class="form-actions">
-        <Show
-          when={busy()}
-          fallback={
-            <>
-              <button class="ghost" onClick={props.onClose}>Close</button>
-              <button
-                class="run"
-                disabled={!file() || !!file()?.tooLarge}
-                onClick={() => void run()}
-              >
-                {result() ? "Restore again" : "Restore"}
-              </button>
-            </>
-          }
-        >
-          <span class="busy-label"><span class="spinner-sm" />Restoring…</span>
-          <span class="spacer" />
-          <button class="ghost" onClick={() => props.onCancel()}>Cancel restore</button>
-        </Show>
-      </div>
     </Dialog>
   );
 }
