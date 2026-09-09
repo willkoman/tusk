@@ -1551,6 +1551,69 @@ async fn backup_restore_battery(b: &mut Backend, eng: &Eng) {
         exec(b, "DROP SCHEMA tusk_bk CASCADE").await;
     }
 
+    // SQL Server only: an IDENTITY column refuses an explicit value (error 544) unless
+    // IDENTITY_INSERT is on, so the dump must bracket the table's data with it —
+    // otherwise the restore of every identity table fails.
+    if eng.name == "mssql" {
+        let ident = format!("{}.{}", q(eng.schema), q("bk_ident"));
+        reset(b, &[format!("DROP TABLE IF EXISTS {ident}")]).await;
+        exec(
+            b,
+            &format!(
+                "CREATE TABLE {ident} (id INTEGER IDENTITY(1,1) PRIMARY KEY, label VARCHAR(20))"
+            ),
+        )
+        .await;
+        exec(b, &format!("INSERT INTO {ident} (label) VALUES ('a')")).await;
+        exec(b, &format!("INSERT INTO {ident} (label) VALUES ('b')")).await;
+        let ident_options = crate::backup::BackupOptions {
+            scope: "tables".into(),
+            schemas: Vec::new(),
+            tables: vec![crate::backup::QualifiedName {
+                schema: eng.schema.to_string(),
+                name: "bk_ident".into(),
+            }],
+            content: "all".into(),
+            include_drop: true,
+            single_transaction: false,
+        };
+        crate::backup::run_backup(b, "conformance", &ident_options, &p, &flag, &mut |_| {})
+            .await
+            .unwrap_or_else(|e| panic!("[mssql] identity backup: {}", e.message));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("SET IDENTITY_INSERT") && text.contains("ON;") && text.contains("OFF;"),
+            "[mssql] identity data block is bracketed:\n{text}"
+        );
+        reset(b, &[format!("DROP TABLE IF EXISTS {ident}")]).await;
+        let restored = crate::backup::run_restore(
+            b,
+            eng.engine,
+            &p,
+            &crate::backup::RestoreOptions {
+                stop_on_error: true,
+                single_transaction: false,
+            },
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .await
+        .unwrap_or_else(|e| panic!("[mssql] identity restore: {}", e.message));
+        assert_eq!(
+            restored.statements_failed, 0,
+            "[mssql] identity restore errors: {:?}",
+            restored.first_error
+        );
+        let rows = all(b, &format!("SELECT id, label FROM {ident} ORDER BY id")).await;
+        assert_eq!(rows.len(), 2, "[mssql] identity rows restored");
+        assert_eq!(
+            cell(&rows[0], 0).as_deref(),
+            Some("1"),
+            "[mssql] identity values round-trip instead of being renumbered"
+        );
+        reset(b, &[format!("DROP TABLE IF EXISTS {ident}")]).await;
+    }
+
     let _ = std::fs::remove_file(&path);
     reset(b, &reset_sql).await;
 }
@@ -2177,12 +2240,38 @@ async fn readonly_mssql_blocks_writes() {
         "CREATE TABLE tusk_ro_probe (a int)",
         "INSERT INTO tusk_ro_probe VALUES (1)",
         "SELECT * INTO tusk_ro_probe2 FROM sys.objects",
+        // SQL Server NESTS block comments: the server sees only the DROP/DELETE, while
+        // a non-nesting classifier read a SELECT/SHOW — and the `SHOW` head used to skip
+        // the mutation scan entirely. This engine has no server-side read-only mode, so
+        // the client guard IS the enforcement.
+        "/*/* */ SHOW 1 */ DROP TABLE tusk_ro_probe",
+        "/*/* */ SELECT 1 */ DELETE FROM tusk_ro_probe",
+        "/* outer /* inner */ still comment */ TRUNCATE TABLE tusk_ro_probe",
     ] {
         assert!(
             b.run_single(write, 100, false).await.is_err(),
             "read-only mssql must reject: {write}"
         );
     }
+    // …while a read whose column names merely LOOK like keywords still runs.
+    b.run_single(
+        "SELECT 1 AS [insert], 2 AS [delete], 3 AS [Update]",
+        100,
+        true,
+    )
+    .await
+    .expect("bracketed identifiers are names, not keywords");
+    // The read-only connection must not have created anything above.
+    let probes = all(
+        &mut b,
+        "SELECT COUNT(*) FROM sys.objects WHERE name LIKE 'tusk_ro_probe%'",
+    )
+    .await;
+    assert_eq!(
+        cell(&probes[0], 0).as_deref(),
+        Some("0"),
+        "no write reached the server"
+    );
 }
 
 // --- Postgres permission model (Epic 2): effective privileges of a limited role ---
@@ -2650,6 +2739,7 @@ async fn transaction_battery(cfg: &ConnectionConfig, eng: &Eng) {
 
 #[test]
 fn is_read_only_stmt_classification() {
+    let pg = TransactionEngine::Postgres;
     for s in [
         "SELECT 1",
         "  with x as (select 1) select * from x",
@@ -2658,7 +2748,7 @@ fn is_read_only_stmt_classification() {
         "TABLE t",
         "VALUES (1)",
     ] {
-        assert!(crate::is_read_only_stmt(s), "{s:?} should be read-only");
+        assert!(crate::is_read_only_stmt(s, pg), "{s:?} should be read-only");
     }
     for s in [
         "INSERT INTO t VALUES (1)",
@@ -2674,13 +2764,58 @@ fn is_read_only_stmt_classification() {
         "SELECT pg_catalog.\"set_config\"('default_transaction_read_only', 'off', false)",
     ] {
         assert!(
-            !crate::is_read_only_stmt(s),
+            !crate::is_read_only_stmt(s, pg),
             "{s:?} should NOT be read-only"
         );
     }
     assert!(crate::is_read_only_stmt(
-        "SELECT 'set_config' AS harmless -- EXPLAIN ANALYZE"
+        "SELECT 'set_config' AS harmless -- EXPLAIN ANALYZE",
+        pg
     ));
+}
+
+#[test]
+fn is_read_only_stmt_is_engine_aware() {
+    let pg = TransactionEngine::Postgres;
+    let mssql = TransactionEngine::MsSql;
+    let mysql = TransactionEngine::MySql;
+    // SQL Server nests block comments, so the server sees only the DROP. Classifying by
+    // PostgreSQL's non-nesting rules read a `SHOW`, and the `show` short-circuit then
+    // skipped the mutation scan entirely — arbitrary DDL on a read-only connection.
+    for s in [
+        "/*/* */ SHOW 1 */ DROP TABLE dbo.victim",
+        "/*/* */ SELECT 1 */ DELETE FROM dbo.victim",
+        "/* outer /* inner */ still comment */ TRUNCATE TABLE dbo.victim",
+    ] {
+        assert!(
+            !crate::is_read_only_stmt(s, mssql),
+            "{s:?} must be blocked on SQL Server"
+        );
+    }
+    // …and the `SHOW` exemption is gone everywhere it was never justified.
+    assert!(!crate::is_read_only_stmt("SHOW 1; DROP TABLE t", pg));
+    assert!(!crate::is_read_only_stmt(
+        "SHOW /* */ tables /* */ ; DROP TABLE t",
+        pg
+    ));
+    // MySQL's SHOW CREATE is the one read whose own syntax carries a mutation word.
+    assert!(crate::is_read_only_stmt("SHOW CREATE TABLE t", mysql));
+    assert!(!crate::is_read_only_stmt("SHOW CREATE TABLE t", pg));
+    assert!(!crate::is_read_only_stmt(
+        "SHOW CREATE TABLE t /* DROP TABLE u */; DROP TABLE u",
+        mysql
+    ));
+    // `[bracket]` identifiers are names, not keywords: a legitimate read survives, and
+    // a `'` inside one cannot open a phantom string that hides following code.
+    assert!(crate::is_read_only_stmt(
+        "SELECT [insert], [delete] FROM [dbo].[Update]",
+        mssql
+    ));
+    assert!(!crate::is_read_only_stmt(
+        "SELECT [a'b] FROM t; DROP TABLE u",
+        mssql
+    ));
+    assert!(!crate::is_read_only_stmt("SELECT [set_config](1)", mssql));
 }
 
 #[tokio::test]

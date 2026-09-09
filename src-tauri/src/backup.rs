@@ -877,12 +877,19 @@ async fn backup_inner(
             if t.kind == "view" {
                 continue;
             }
-            let columns = data_columns(backend, &t.schema, &t.name, is_pg).await?;
+            let columns = data_columns(backend, &t.schema, &t.name, is_pg, dialect).await?;
             if columns.is_empty() {
                 tables_done += 1;
                 continue;
             }
             let binary_cols: Vec<bool> = columns.iter().map(|c| c.binary).collect();
+            // SQL Server refuses an explicit value for an IDENTITY column (error 544)
+            // unless IDENTITY_INSERT is on for that table, so the dump's INSERTs are
+            // bracketed with it — the values round-trip instead of being renumbered.
+            // Only one table may have it on at a time, hence per-table ON/OFF.
+            let identity_insert = (dialect == SqlDialect::MsSql
+                && columns.iter().any(|c| c.identity))
+            .then(|| qual(&t.schema, &t.name, dialect, caps.schemas));
             let columns: Vec<String> = columns.into_iter().map(|c| c.name).collect();
             progress(BackupProgress {
                 phase: "data",
@@ -914,6 +921,10 @@ async fn backup_inner(
                 )
                 .await?;
             } else {
+                if let Some(target) = &identity_insert {
+                    out.stmt(&format!("SET IDENTITY_INSERT {target} ON"))
+                        .await?;
+                }
                 insert_table(
                     backend,
                     &mut out,
@@ -931,6 +942,10 @@ async fn backup_inner(
                     &format!("{}.{}", t.schema, t.name),
                 )
                 .await?;
+                if let Some(target) = &identity_insert {
+                    out.stmt(&format!("SET IDENTITY_INSERT {target} OFF"))
+                        .await?;
+                }
             }
             tables_done += 1;
         }
@@ -1063,10 +1078,19 @@ struct DataColumn {
     /// Declared as a binary type, so the driver's reversible `\x…` hex rendering
     /// must go back in as a native blob literal rather than as text.
     binary: bool,
+    /// An auto-assigned identity column. On SQL Server its values only restore inside
+    /// `SET IDENTITY_INSERT … ON`; every other engine accepts an explicit value.
+    identity: bool,
 }
 
-fn is_binary_type(data_type: &str) -> bool {
+fn is_binary_type(data_type: &str, dialect: SqlDialect) -> bool {
     let t = data_type.trim().to_ascii_lowercase();
+    // T-SQL `bit` is a boolean, not a bit string: `mssql_value` renders it
+    // `true`/`false`, which is not `\x…` hex, so classifying it binary only worked by
+    // accident (SQL Server happens to cast N'true' to bit).
+    if t == "bit" && dialect == SqlDialect::MsSql {
+        return false;
+    }
     t.contains("blob")
         || t.starts_with("binary")
         || t.starts_with("varbinary")
@@ -1081,6 +1105,7 @@ async fn data_columns(
     schema: &str,
     name: &str,
     is_pg: bool,
+    dialect: SqlDialect,
 ) -> Result<Vec<DataColumn>, AppError> {
     if is_pg {
         // PostgreSQL data goes through COPY, which round-trips bytea itself.
@@ -1102,6 +1127,7 @@ async fn data_columns(
             .map(|name| DataColumn {
                 name,
                 binary: false,
+                identity: false,
             })
             .collect());
     }
@@ -1112,7 +1138,8 @@ async fn data_columns(
             d.columns
                 .into_iter()
                 .map(|c| DataColumn {
-                    binary: is_binary_type(&c.data_type),
+                    binary: is_binary_type(&c.data_type, dialect),
+                    identity: c.identity,
                     name: c.name,
                 })
                 .collect()
@@ -1764,8 +1791,13 @@ mod tests {
             None
         );
         assert_eq!(binary_literal(&None, SqlDialect::Sqlite).unwrap(), None);
-        assert!(is_binary_type("BLOB") && is_binary_type("varbinary(16)"));
-        assert!(!is_binary_type("text") && !is_binary_type("integer"));
+        let sqlite = SqlDialect::Sqlite;
+        assert!(is_binary_type("BLOB", sqlite) && is_binary_type("varbinary(16)", sqlite));
+        assert!(!is_binary_type("text", sqlite) && !is_binary_type("integer", sqlite));
+        // SQLite/MySQL `bit` is a bit string rendered as hex; T-SQL `bit` is a boolean
+        // rendered `true`/`false`, so it must take the ordinary literal path.
+        assert!(is_binary_type("bit", sqlite));
+        assert!(!is_binary_type("bit", SqlDialect::MsSql));
     }
 
     // --- embedded round-trip suite ------------------------------------------

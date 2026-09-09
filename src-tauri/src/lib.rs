@@ -336,7 +336,7 @@ pub(crate) fn is_cursorable(sql: &str, engine: script::TransactionEngine) -> boo
     let read_head = |w: &str| {
         matches!(w, "select" | "table" | "values") || (duck && matches!(w, "from" | "pivot"))
     };
-    let w = first_sql_word(sql);
+    let w = first_sql_word(sql, engine);
     match w.as_str() {
         // `WITH … UPDATE/INSERT/DELETE/MERGE` is a write wearing a read's first word:
         // `DECLARE … CURSOR FOR` it is a syntax error, and a data-modifying CTE cannot
@@ -349,23 +349,34 @@ pub(crate) fn is_cursorable(sql: &str, engine: script::TransactionEngine) -> boo
     }
 }
 
-/// Statements allowed on a read-only connection.
-pub(crate) fn is_read_only_stmt(sql: &str) -> bool {
-    let first = first_sql_word(sql);
+/// Statements allowed on a read-only connection. Engine-aware: SQL Server nests block
+/// comments and quotes identifiers with brackets, so classifying its SQL by
+/// PostgreSQL's lexical rules reads a different statement than the server executes.
+pub(crate) fn is_read_only_stmt(sql: &str, engine: script::TransactionEngine) -> bool {
+    let first = first_sql_word(sql, engine);
     let allowed = matches!(
         first.as_str(),
         "select" | "with" | "show" | "explain" | "table" | "values" | "from" | "pivot"
     );
-    allowed
-        && !script::contains_code_word(sql, "set_config")
-        && !(first == "explain"
-            && (script::contains_code_word(sql, "analyze")
-                || script::contains_code_word(sql, "analyse")))
-        && (first == "show" || slack::processor::find_mutation_word(sql).is_none())
+    if !allowed
+        || script::contains_code_word_for(sql, "set_config", engine)
+        || (first == "explain"
+            && (script::contains_code_word_for(sql, "analyze", engine)
+                || script::contains_code_word_for(sql, "analyse", engine)))
+    {
+        return false;
+    }
+    // The mutation scan ALWAYS runs. It used to be skipped entirely for a leading
+    // `SHOW`, which let `/*/* */ SHOW 1 */ DROP TABLE t` through on SQL Server (its
+    // nested comments hide the SHOW from the server, and it is the one engine with no
+    // server-side read-only enforcement). Only MySQL's `SHOW CREATE …` — a read whose
+    // own syntax carries a mutation keyword — is exempt, and only for that one word.
+    let allow_show_create = engine == script::TransactionEngine::MySql && first == "show";
+    slack::processor::find_mutation_word_for(sql, engine, allow_show_create).is_none()
 }
 
-fn first_sql_word(sql: &str) -> String {
-    script::effective_start(sql)
+fn first_sql_word(sql: &str, engine: script::TransactionEngine) -> String {
+    script::effective_start_for(sql, engine)
         .chars()
         .take_while(|c| c.is_ascii_alphabetic())
         .flat_map(char::to_lowercase)
@@ -684,7 +695,7 @@ async fn run_query(
     if c.read_only
         && items.iter().zip(&actions).any(|(item, action)| match item {
             script::Item::Sql(sql) => {
-                (action.is_none() && !is_read_only_stmt(sql.trim()))
+                (action.is_none() && !is_read_only_stmt(sql.trim(), c.transaction_engine()))
                     || transaction_requests_write(sql, *action)
             }
             script::Item::Copy { .. } => true,
@@ -712,6 +723,17 @@ async fn run_query(
             outcome,
             transaction: c.transaction.clone(),
         }),
+        // The server ended the transaction over a live connection (SQL Server deadlock
+        // victim / XACT_ABORT unwind). Nothing is lost and nothing needs reconnecting:
+        // report the statement's own error and return the tab to Idle.
+        Err(e)
+            if !c.backend.is_closed()
+                && c.transaction.owns_session()
+                && c.backend.manual_unit_ended() =>
+        {
+            c.end_transaction_server_unwound();
+            Err(e.with_transaction(c.transaction.clone()))
+        }
         // Never replay a statement after it reached the server. Even read-only SQL may
         // call volatile functions or external systems, so its effects are ambiguous.
         // `ensure_alive` reconnects before the user's next explicit run instead.
@@ -749,7 +771,7 @@ async fn exec_items(
     if c.read_only
         && items.iter().zip(actions).any(|(item, action)| match item {
             script::Item::Sql(sql) => {
-                (action.is_none() && !is_read_only_stmt(sql.trim()))
+                (action.is_none() && !is_read_only_stmt(sql.trim(), c.transaction_engine()))
                     || transaction_requests_write(sql, *action)
             }
             script::Item::Copy { .. } => true,
@@ -961,7 +983,13 @@ async fn fetch_more(
             })
         }
         Err(error) => {
-            if c.backend.is_closed()
+            if !c.backend.is_closed()
+                && c.transaction.owns_session()
+                && c.backend.manual_unit_ended()
+            {
+                // The unit ended on a live session (see `manual_unit_ended`).
+                c.end_transaction_server_unwound();
+            } else if c.backend.is_closed()
                 || (c.transaction.owns_session() && c.backend.manual_session_ended())
             {
                 c.mark_transaction_lost();
@@ -1171,6 +1199,11 @@ mod bind_param_tests {
         ConnectionConfig, TransactionStatus, MAX_IPC_CELL_BYTES, MAX_SQL_BYTES,
     };
     use crate::{driver, script};
+
+    /// The read-only guard as it runs against a PostgreSQL connection.
+    fn is_read_only_stmt_pg(sql: &str) -> bool {
+        is_read_only_stmt(sql, script::TransactionEngine::Postgres)
+    }
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -1202,11 +1235,11 @@ mod bind_param_tests {
         let duck = script::TransactionEngine::DuckDb;
         let mysql = script::TransactionEngine::MySql;
         assert!(is_cursorable("-- heading\nSELECT 1", pg));
-        assert!(is_read_only_stmt(
+        assert!(is_read_only_stmt_pg(
             "/* heading */ WITH x AS (SELECT 1) SELECT * FROM x"
         ));
         assert!(!is_cursorable("selection FROM t", pg));
-        assert!(!is_read_only_stmt("showcase"));
+        assert!(!is_read_only_stmt_pg("showcase"));
         // WITH streams only when the statement it feeds is a read.
         assert!(is_cursorable("WITH x AS (SELECT 1) SELECT * FROM x", pg));
         assert!(is_cursorable(
@@ -1258,20 +1291,22 @@ mod bind_param_tests {
             "WITH x AS (SELECT 1) SELECT * INTO archived FROM x",
             pg
         ));
-        assert!(is_read_only_stmt("FROM events"));
-        assert!(!is_read_only_stmt("frombulate"));
+        assert!(is_read_only_stmt_pg("FROM events"));
+        assert!(!is_read_only_stmt_pg("frombulate"));
     }
 
     #[test]
     fn readonly_guard_rejects_writable_ctes_and_row_locks() {
-        assert!(!is_read_only_stmt(
+        assert!(!is_read_only_stmt_pg(
             "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"
         ));
-        assert!(!is_read_only_stmt("SELECT * FROM t FOR UPDATE"));
-        assert!(!is_read_only_stmt("SELECT * FROM t FOR SHARE"));
-        assert!(!is_read_only_stmt("SELECT * FROM t FOR\nSHARE"));
-        assert!(!is_read_only_stmt("SELECT * FROM t INTO OUTFILE '/tmp/x'"));
-        assert!(is_read_only_stmt("SELECT 'delete' AS word -- update"));
+        assert!(!is_read_only_stmt_pg("SELECT * FROM t FOR UPDATE"));
+        assert!(!is_read_only_stmt_pg("SELECT * FROM t FOR SHARE"));
+        assert!(!is_read_only_stmt_pg("SELECT * FROM t FOR\nSHARE"));
+        assert!(!is_read_only_stmt_pg(
+            "SELECT * FROM t INTO OUTFILE '/tmp/x'"
+        ));
+        assert!(is_read_only_stmt_pg("SELECT 'delete' AS word -- update"));
     }
 
     #[test]
@@ -1893,7 +1928,7 @@ async fn export_to_file(
             }
         };
         let engine = c.transaction_engine();
-        if !is_read_only_stmt(&export_sql) || !is_cursorable(&export_sql, engine) {
+        if !is_read_only_stmt(&export_sql, engine) || !is_cursorable(&export_sql, engine) {
             return Err(AppError::new(
                 "export can re-run exactly one read-only result query",
             ));
