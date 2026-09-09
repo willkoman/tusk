@@ -107,7 +107,7 @@ export function ModelPicker(props: {
     <div class="mp">
       <button
         class="mp-btn"
-        title="Model — click or type to search"
+        title="Click or type to search models"
         onClick={() => { setOpen((v) => !v); queueMicrotask(() => inputEl?.focus()); }}
       >
         <span class="mp-btn-model">{props.current.model || "Select a model"}</span>
@@ -121,7 +121,7 @@ export function ModelPicker(props: {
           <input
             ref={inputEl}
             class="mp-search"
-            placeholder="Search models…  (try “ant opus”, “gpt-5”, “oss”)"
+            placeholder="Search models…"
             value={query()}
             onInput={(e) => setQuery(e.currentTarget.value)}
             onKeyDown={onKey}

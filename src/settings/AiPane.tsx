@@ -38,7 +38,7 @@ export function AiPane(props: { database: string }) {
     const next = normalizeAiConfig({ ...cfg(), ...patch });
     if (!aiStore.save(next)) {
       setCfg({ ...next, shareSamples: false });
-      setConfigError("Could not save AI settings. Sample sharing remains off unless its privacy choice is stored successfully.");
+      setConfigError("Could not save AI settings. Sample sharing stays off.");
       return false;
     }
     // aiStore synchronously publishes its canonical value (including models[provider]);
@@ -143,7 +143,7 @@ export function AiPane(props: { database: string }) {
   async function testProvider(pid: AiProvider) {
     const spec = providerInfo(pid);
     if (!originApproved(cfg(), pid)) {
-      patchProbe(pid, { ok: false, note: "Approve the custom API origin before testing it." });
+      patchProbe(pid, { ok: false, note: "Approve the custom API origin first." });
       return;
     }
     const base = resolveBaseUrl(pid, approvedBaseOverride(cfg(), pid));
@@ -163,7 +163,7 @@ export function AiPane(props: { database: string }) {
       patchProbe(pid, {
         testing: false,
         ok: true,
-        note: `${spec.needsKey ? "Authenticated; " : ""}${list.length} models available`,
+        note: `${spec.needsKey ? "Authenticated. " : ""}${list.length} models available.`,
       });
     } catch (e) {
       if (probeCurrent(pid, generation)) patchProbe(pid, { testing: false, ok: false, note: errMsg(e) });
@@ -175,7 +175,7 @@ export function AiPane(props: { database: string }) {
     if (!k) return;
     const override = cfg().baseUrls[pid] ?? "";
     if (!originApproved(cfg(), pid)) {
-      patchProbe(pid, { note: "Approve the custom API origin before saving a key for it.", ok: false });
+      patchProbe(pid, { note: "Approve the custom API origin first.", ok: false });
       return;
     }
     const baseUrl = resolveBaseUrl(pid, approvedBaseOverride(cfg(), pid));
@@ -291,8 +291,8 @@ export function AiPane(props: { database: string }) {
           <span class="ai-section-sub">{configured()} set up</span>
         </header>
         <div class="settings-note">
-          Open a provider to connect it and choose its models. Set up several and switch
-          between them from the chat header. Keys live in your OS keychain and never reach the web view.
+          Open a provider to connect it and choose its models. Switch providers from the
+          chat header. Keys live in your OS keychain.
         </div>
         <Show when={configError()}><div class="error">{configError()}</div></Show>
 
@@ -324,12 +324,12 @@ export function AiPane(props: { database: string }) {
                       <label class="settings-row">
                         <span class="settings-label">
                           <span>API key</span>
-                          <small>{probe()[p.id]?.hasKey ? "Saved in your OS keychain. Paste a new key to replace it." : "Stored in your OS keychain, never shown again."}</small>
+                          <small>{probe()[p.id]?.hasKey ? "Paste a new key to replace the saved one." : "Stored in your OS keychain."}</small>
                         </span>
                         <span class="settings-inline">
                           <input
                             type="password"
-                            placeholder={probe()[p.id]?.hasKey ? "type to replace" : "paste key"}
+                            placeholder={probe()[p.id]?.hasKey ? "Type to replace" : "Paste key"}
                             value={keyInput()[p.id] ?? ""}
                             onInput={(e) => setKeyInput((m) => ({ ...m, [p.id]: e.currentTarget.value }))}
                             onKeyDown={(e) => { if (e.key === "Enter" && (keyInput()[p.id] ?? "").trim()) void saveKey(p.id); }}
@@ -342,7 +342,7 @@ export function AiPane(props: { database: string }) {
                     <label class="settings-row">
                       <span class="settings-label">
                         <span>API base</span>
-                        <small>{p.id === "custom" ? "Required — the prefix before /v1." : "Optional — leave blank for the provider's own endpoint."}</small>
+                        <small>{p.id === "custom" ? "Required. The prefix before /v1." : "Leave blank to use the provider's endpoint."}</small>
                       </span>
                       <input
                         placeholder={p.baseHint}
@@ -356,7 +356,7 @@ export function AiPane(props: { database: string }) {
                         <span class="settings-label">
                           <span>Allow custom origin</span>
                           <small>
-                            <code>{endpointOrigin(cfg().baseUrls[p.id] ?? "") ?? "invalid URL"}</code> — your key, prompts, schema and any shared sample rows go here.
+                            Your key, prompts, schema, and any shared sample rows go to <code>{endpointOrigin(cfg().baseUrls[p.id] ?? "") ?? "invalid URL"}</code>.
                           </small>
                         </span>
                         <input
@@ -368,7 +368,7 @@ export function AiPane(props: { database: string }) {
                             if (e.currentTarget.checked && origin) next[p.id] = origin;
                             else delete next[p.id];
                             if (e.currentTarget.checked && !origin) {
-                              setConfigError("Enter a valid HTTP(S) API base before approving its origin.");
+                              setConfigError("Enter a valid HTTP(S) API base first.");
                               return;
                             }
                             if (!setConfig({ approvedOrigins: next })) {
@@ -380,7 +380,7 @@ export function AiPane(props: { database: string }) {
                       </label>
                     </Show>
                     <Show when={isKeyless(p.id)}>
-                      <div class="ai-note">Keyless endpoints are accepted only on localhost or a loopback IP.</div>
+                      <div class="ai-note">Keyless endpoints must be on localhost or a loopback IP.</div>
                     </Show>
 
                     <div class="ai-card-actions">
@@ -397,7 +397,6 @@ export function AiPane(props: { database: string }) {
                     </div>
                     <Show when={probe()[p.id]?.note}>
                       <div classList={{ "ai-note": probe()[p.id]?.ok !== false, error: probe()[p.id]?.ok === false }}>
-                        {probe()[p.id]?.ok === true ? "✅ " : probe()[p.id]?.ok === false ? "❌ " : ""}
                         {probe()[p.id]?.note}
                       </div>
                     </Show>
@@ -405,7 +404,7 @@ export function AiPane(props: { database: string }) {
                     {/* ---- Models: the one place a model is chosen for this provider ---- */}
                     <div class="ai-card-group">
                       Models
-                      <small>Tick the models the chat picker and Slack should offer; ★ marks the default. Nothing ticked = every model listed.</small>
+                      <small>Ticked models appear in the pickers; ★ marks the default. Nothing ticked offers all.</small>
                     </div>
                     <ModelMultiPicker
                       catalog={catalogFor(p.id)}
@@ -446,7 +445,7 @@ export function AiPane(props: { database: string }) {
         <label class="settings-row">
           <span class="settings-label">
             <span>Share sample rows with the model</span>
-            <small>Sends a few rows from relevant tables so answers fit your real data. Real values leave your machine. Off by default.</small>
+            <small>Sends real rows from relevant tables to the provider. Off by default.</small>
           </span>
           <input
             type="checkbox"
@@ -462,7 +461,7 @@ export function AiPane(props: { database: string }) {
         <label class="settings-row">
           <span class="settings-label">
             <span>Reply max tokens</span>
-            <small>Upper bound on a reply's length (256–128,000). Too low cuts replies and their SQL off mid-sentence; the provider may cap it lower.</small>
+            <small>Longest reply the model may return (256–128,000).</small>
           </span>
           <input
             type="number"
@@ -498,9 +497,8 @@ export function AiPane(props: { database: string }) {
           </div>
         </header>
         <div class="settings-note">
-          Instructions you write once and the assistant follows every time — house definitions,
-          naming conventions, which tables to prefer. <b>Workspace</b> skills apply everywhere;
-          <b> database</b> skills only on a matching database.
+          Instructions the assistant follows on every question. <b>Workspace</b> skills apply
+          everywhere;<b> database</b> skills only on a matching database.
         </div>
 
       <Show when={skillNote()}><div class="ai-note">{skillNote()}</div></Show>
@@ -508,7 +506,7 @@ export function AiPane(props: { database: string }) {
       <div class="ai-skills">
         <Show when={skills().length === 0}>
           <div class="ai-empty-box">
-            No skills yet. A skill is just Markdown — <b>New skill</b> to write one, or
+            No skills yet. Select <b>New skill</b> to write one, or
             <b> Import…</b> an existing <code>.md</code> file.
           </div>
         </Show>
@@ -546,7 +544,7 @@ export function AiPane(props: { database: string }) {
             </label>
             <label class="settings-row">
               <span>Description</span>
-              <input value={sk().description} onInput={(e) => setEditing({ ...sk(), description: e.currentTarget.value })} placeholder="One line — shown in this list, and to the model" />
+              <input value={sk().description} onInput={(e) => setEditing({ ...sk(), description: e.currentTarget.value })} placeholder="One line shown here and to the model" />
             </label>
             <label class="settings-row">
               <span>Scope</span>
@@ -560,9 +558,9 @@ export function AiPane(props: { database: string }) {
                   setEditing({ ...sk(), scope, database: scope === "database" ? (sk().database || props.database) : "" });
                 }}
               >
-                <option value="workspace">Workspace — every connection</option>
+                <option value="workspace">Workspace (every connection)</option>
                 <option value="database" disabled={!props.database && !sk().database}>
-                  {props.database ? `This database — ${props.database}` : "One database (connect first)"}
+                  {props.database ? `This database (${props.database})` : "One database (connect first)"}
                 </option>
               </select>
             </label>
@@ -582,7 +580,7 @@ export function AiPane(props: { database: string }) {
                 </span>
               </div>
             </Show>
-            <div class="ai-skill-bodylabel">Instructions (Markdown) — this text is what reaches the model.</div>
+            <div class="ai-skill-bodylabel">Instructions (Markdown). Sent to the model as written.</div>
             <textarea
               class="ai-skill-body"
               rows={16}

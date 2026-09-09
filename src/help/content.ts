@@ -2123,7 +2123,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "Sample sharing is **off by default** and fails closed if its preference cannot be saved. It is re-checked after sample loading, immediately before the request, so revoking it mid-flight discards the rows. Tick **Share sample data with the model** in the panel's ⚙ drawer to opt in. Slack has its own default-off sample setting; neither path sends real cell values without that explicit consent."
+        "md": "Sample sharing is **off by default** and fails closed if its preference cannot be saved. It is re-checked after sample loading, immediately before the request, so revoking it mid-flight discards the rows. Tick **Share sample rows with the model** in the panel's ⚙ drawer to opt in. Slack has its own default-off sample setting; neither path sends real cell values without that explicit consent."
       },
       {
         "k": "h",
@@ -2151,7 +2151,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Replies stream token-by-token (SSE parsed in Rust, relayed over a Tauri channel) and render as markdown with syntax-highlighted fenced ```sql blocks. Each SQL (or untagged) block gets **Copy** and **▶ Open in editor** — the latter opens a **new tab** titled *AI query* with your active schema attached; it never overwrites your buffer and never runs. Running is always your keystroke."
+        "md": "Replies stream token-by-token (SSE parsed in Rust, relayed over a Tauri channel) and render as markdown with syntax-highlighted fenced ```sql blocks. Each SQL (or untagged) block gets **Copy** and **Open in editor** — the latter opens a **new tab** titled *AI query* with your active schema attached; it never overwrites your buffer and never runs. Running is always your keystroke."
       },
       {
         "k": "h",
@@ -3089,8 +3089,8 @@ export const TOPICS: Topic[] = [
         "ordered": true,
         "items": [
           "**Engine-level** — Postgres gets `SET default_transaction_read_only = on`; file-backed DuckDB opens with `AccessMode::ReadOnly`; SQLite with `SQLITE_OPEN_READ_ONLY`; MySQL applies `SET SESSION TRANSACTION READ ONLY` on every pooled connection; SQL Server has no session-level equivalent, so there the uniform client guard below is the whole enforcement — and that guard reads T-SQL's nested comments and `[bracket]` names the way the server does, so commented-out text can't disguise a write.",
-          "**Statement classification** — read forms and non-writable manual transaction control pass; writes, writable transaction modes, DDL, and `COPY` reject before execution with *\"connection is read-only — writes and DDL are blocked\"*.",
-          "**UI gating** — mutating sidebar items disable with a *\"Connection is read-only\"* tooltip; [[topic:grid-editing|in-grid editing]] refuses to start (the grid menu shows *\"connection is read-only\"*); imports are blocked by the backend (*\"connection is read-only — import blocked\"*)."
+          "**Statement classification** — read forms and non-writable manual transaction control pass; writes, writable transaction modes, DDL, and `COPY` reject before execution with *\"connection is read-only. Writes and DDL are blocked.\"*.",
+          "**UI gating** — mutating sidebar items disable with a *\"Connection is read-only\"* tooltip; [[topic:grid-editing|in-grid editing]] refuses to start (the grid menu shows *\"connection is read-only\"*); imports are blocked by the backend (*\"connection is read-only. Import is blocked.\"*)."
         ]
       },
       {

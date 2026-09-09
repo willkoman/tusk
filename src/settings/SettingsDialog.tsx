@@ -91,7 +91,7 @@ export function SettingsDialog(props: {
                 <span>Server-side lint (PREPARE-only)</span>
                 <input type="checkbox" checked={p().serverLint} onChange={(e) => props.update({ serverLint: e.currentTarget.checked })} />
               </label>
-              <label class="settings-row" title={props.connected ? "While connected, the dialect follows the driver" : undefined}>
+              <label class="settings-row" title={props.connected ? "The dialect follows the connected driver" : undefined}>
                 <span>SQL dialect{props.connected ? " (follows connection)" : ""}</span>
                 <select
                   disabled={props.connected}
@@ -125,7 +125,7 @@ export function SettingsDialog(props: {
                   <input
                     type="text"
                     list="tusk-font-presets"
-                    placeholder="default (JetBrains Mono)"
+                    placeholder="Default: JetBrains Mono"
                     value={p().fontFamily}
                     onChange={(e) => props.update({ fontFamily: e.currentTarget.value.trim() })}
                   />
@@ -221,7 +221,7 @@ export function SettingsDialog(props: {
                 </select>
               </label>
               <div class="settings-note">
-                The plan view appears automatically when a result is an EXPLAIN output, and via the Explain toolbar action. Raw engine output stays available under the Grid toggle.
+                The plan view opens for EXPLAIN results and from the Explain toolbar action. Raw engine output stays under the Grid toggle.
               </div>
             </Match>
 
@@ -248,15 +248,13 @@ export function SettingsDialog(props: {
                 />
               </label>
               <div class="settings-note">
-                When on, a crash (or a crash recovered from the previous run) shows its details with
-                one-click copy/email actions. When off, Tusk recovers quietly and clears prior-run
-                reports unshown. Nothing is ever transmitted automatically in either mode — sending a
-                report is always an explicit action, and reports never intentionally include connection
-                settings, credentials, or saved queries.
+                When on, a crash shows its details with copy and email actions. When off, Tusk
+                recovers quietly and clears prior reports. Nothing is sent automatically, and reports
+                exclude connection settings, credentials, and saved queries.
               </div>
               <div class="settings-note">
-                Also here: the AI tab's "share sample rows" toggle controls whether real table values
-                are sent to your AI provider, and Slack tokens/AI keys live only in the OS keychain.
+                The AI tab's sample-row toggle controls whether real values reach your AI provider.
+                Slack tokens and AI keys live only in the OS keychain.
               </div>
             </Match>
           </Switch>

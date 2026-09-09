@@ -135,7 +135,7 @@ export function AiPanel(props: {
     const next = normalizeAiConfig({ ...cfg(), ...patch });
     if (!aiStore.save(next)) {
       setCfg({ ...next, shareSamples: false });
-      setConfigError("Could not save AI settings. Sample sharing remains off unless its privacy choice is stored successfully.");
+      setConfigError("Could not save AI settings. Sample sharing stays off.");
       return false;
     }
     // aiStore synchronously publishes its canonical value (including models[provider]);
@@ -334,12 +334,12 @@ export function AiPanel(props: {
         return;
       }
       if (!originApproved(c, c.provider)) {
-        finishTurn(id, { error: `Approve the custom API origin for ${providerInfo(c.provider).label} in AI settings before using it.` });
+        finishTurn(id, { error: `Approve the custom API origin for ${providerInfo(c.provider).label} in AI settings.` });
         return;
       }
       const wire = resolveWire(c.provider, model);
       if (!wire) {
-        finishTurn(id, { error: `${providerInfo(c.provider).label} doesn't serve ${model} on an API shape Tusk supports.` });
+        finishTurn(id, { error: `${providerInfo(c.provider).label} does not serve ${model} on a supported API shape.` });
         return;
       }
       const baseUrl = resolveBaseUrl(c.provider, activeBaseUrl(c), wire);
@@ -488,7 +488,7 @@ export function AiPanel(props: {
       <div class="ai-head">
         <Show
           when={keyed().length > 0}
-          fallback={<button class="ai-setup" onClick={() => props.onOpenSettings()}>✨ Set up a model →</button>}
+          fallback={<button class="ai-setup" onClick={() => props.onOpenSettings()}>Set up a model</button>}
         >
           <ModelPicker
             providers={keyed()}
@@ -509,7 +509,7 @@ export function AiPanel(props: {
           {/* Provider/model/key management lives in Settings → AI now (provider cards,
               Test connection, skills). This drawer keeps only the one control that is a
               per-conversation privacy decision rather than configuration. */}
-          <label class="ai-check" title="Send a few sample rows of relevant tables so the model understands your real data. Real values leave your machine for the provider.">
+          <label class="ai-check" title="Send sample rows to the provider">
             <input
               type="checkbox"
               checked={cfg().shareSamples}
@@ -519,20 +519,20 @@ export function AiPanel(props: {
                 }
               }}
             />
-            Share sample data with the model
+            Share sample rows with the model
           </label>
           <div class="ai-settings-actions">
             <button class="ghost" onClick={() => { setSettingsOpen(false); props.onOpenSettings(); }}>
               Manage providers &amp; skills…
             </button>
           </div>
-          <div class="ai-note">Keys are stored in your OS keychain and used only by the backend — they never reach the web view.</div>
+          <div class="ai-note">Keys are stored in your OS keychain.</div>
         </div>
       </Show>
 
       <div class="ai-messages" ref={msgEl} onScroll={onMsgScroll}>
         <Show when={messages().length === 0}>
-          <div class="ai-empty">Ask about your schema, generate a query, or explain / optimize the SQL in your editor. Proposed SQL stays read-only until you open + run it.</div>
+          <div class="ai-empty">Ask about the schema, generate a query, or explain the SQL in your editor. Proposed SQL never runs on its own.</div>
         </Show>
         {/* Index, not For: streaming replaces the last message OBJECT per delta —
             For keys on identity and would tear down + rebuild the whole bubble's
@@ -552,19 +552,19 @@ export function AiPanel(props: {
                       text={m().content}
                       onInsertSql={props.onInsertSql}
                       insertDisabledReason={connMismatch()
-                        ? `Written for ${threadConn()!.name}; switch back to open it in the editor`
+                        ? `Written for ${threadConn()!.name}. Switch back to open it.`
                         : ""}
                     />
                   </Show>
                 </Show>
                 <Show when={m().truncated}>
-                  <div class="ai-msg-note">✂️ Cut off at the token limit — ask for a shorter answer, or ask it to continue.</div>
+                  <div class="ai-msg-note">Cut off at the token limit. Ask it to continue.</div>
                 </Show>
                 <Show when={m().cancelled}>
-                  <div class="ai-msg-note">⏹ Stopped.</div>
+                  <div class="ai-msg-note">Stopped.</div>
                 </Show>
                 <Show when={m().error}>
-                  {(err) => <div class="ai-msg-error">⚠️ {err()}</div>}
+                  {(err) => <div class="ai-msg-error">{err()}</div>}
                 </Show>
               </Show>
             </div>
@@ -573,7 +573,7 @@ export function AiPanel(props: {
         {/* Retry re-runs the last user message, discarding the dead reply. */}
         <Show when={failedLast()}>
           <div class="ai-retry-row">
-            <button class="ghost" onClick={retry}>↻ Retry</button>
+            <button class="ghost" onClick={retry}>Retry</button>
           </div>
         </Show>
       </div>
@@ -585,7 +585,7 @@ export function AiPanel(props: {
         <div class="ai-conn-mismatch">
           <span>
             This chat is about <b>{threadConn()!.name}</b>; the workbench is on <b>{props.connectionName()}</b>.
-            Switch back to continue it, or start a new chat.
+            Switch back, or start a new chat.
           </span>
           <button class="ghost" onClick={newChat}>New chat</button>
         </div>
@@ -611,7 +611,7 @@ export function AiPanel(props: {
             }
             if (e.key === "Escape" && streaming()) cancel();
           }}
-          placeholder={streaming() ? "…streaming (Esc to stop)" : "Ask the AI… (Shift+Enter = newline)"}
+          placeholder={streaming() ? "Streaming… Esc to stop" : "Ask the AI… Shift+Enter for a newline"}
         />
         {/* Send doubles as Stop while streaming — one button, never both. `run cancel` is
             the app's existing cancel-while-busy style (solid --danger); don't invent one. */}
@@ -622,11 +622,11 @@ export function AiPanel(props: {
               class="run"
               type="submit"
               disabled={!input().trim() || connMismatch()}
-              title={connMismatch() ? `This chat is about ${threadConn()!.name} — start a new chat to ask about ${props.connectionName()}` : undefined}
+              title={connMismatch() ? `Start a new chat to ask about ${props.connectionName()}` : undefined}
             >Send</button>
           }
         >
-          <button class="run cancel" type="button" title="Stop generating (Esc)" onClick={cancel}>⏹ Stop</button>
+          <button class="run cancel" type="button" title="Stop generating (Esc)" onClick={cancel}>Stop</button>
         </Show>
       </form>
     </div>
