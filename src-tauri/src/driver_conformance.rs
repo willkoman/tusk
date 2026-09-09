@@ -3248,37 +3248,96 @@ SELECT "id", "code", "qty" FROM "main"."orders""#,
     }
 }
 
+/// Run a rebuild script the way the app does: split it with Tusk's own engine-aware
+/// splitter, then execute the resulting statements inside one transaction. Anything the
+/// splitter shreds (a trigger body's `;`) or misreads (a bare `END` is COMMIT on SQLite)
+/// shows up here exactly as it does in the workbench.
+fn sqlite_run_split_script(c: &rusqlite::Connection, script: &str) -> Result<(), String> {
+    let items = crate::script::parse_for_engine(script, crate::script::TransactionEngine::Sqlite)
+        .map_err(|e| e.message)?;
+    let stmts: Vec<String> = items
+        .iter()
+        .map(|item| match item {
+            crate::script::Item::Sql(sql) => sql.clone(),
+            crate::script::Item::Copy { stmt, .. } => stmt.clone(),
+        })
+        .collect();
+    assert!(
+        !stmts.iter().any(|s| s.trim().eq_ignore_ascii_case("END")),
+        "the splitter shredded a trigger body into a bare END (SQLite reads that as COMMIT): {stmts:?}"
+    );
+    c.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+    for sql in &stmts {
+        if let Err(e) = c.execute_batch(sql) {
+            let _ = c.execute_batch("ROLLBACK");
+            return Err(format!("{sql} -> {e}"));
+        }
+    }
+    c.execute_batch("COMMIT").map_err(|e| e.to_string())
+}
+
 /// The SQLite rebuild the builders emit runs through `script::run` wrapped in
 /// BEGIN…COMMIT, so the whole create -> copy -> drop -> rename swap must succeed as one
 /// unit AND keep the rows — including while another table holds a foreign key on the
-/// table being rebuilt. (Tusk leaves `PRAGMA foreign_keys` at SQLite's default off, and
-/// the pragma is a no-op inside a transaction anyway, so the intermediate DROP is safe.)
+/// table being rebuilt AND the table carries a trigger whose body contains `;`.
+/// Dropping the original performs an implicit `DELETE FROM`, so with foreign keys
+/// enforced (Tusk's SQLite build does) a child row makes it fail — unless enforcement is
+/// suspended AROUND the transaction, which is what `App.runDDL` does for a rebuild.
+/// `PRAGMA foreign_keys` is a silent no-op inside a transaction, and `defer_foreign_keys`
+/// only moves the same failure to the COMMIT.
 #[test]
 fn sqlite_ddl_rebuild_runs_transactionally() {
     let c = rusqlite::Connection::open_in_memory().unwrap();
     c.execute_batch(
-        r#"CREATE TABLE "t" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "qty" integer);
+        r#"PRAGMA foreign_keys=ON;
+CREATE TABLE "t" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "qty" integer);
 CREATE TABLE "child" ("id" integer, FOREIGN KEY ("id") REFERENCES "t" ("id"));
-INSERT INTO "t" ("qty") VALUES (7);"#,
+CREATE TRIGGER "t_guard" AFTER INSERT ON "t" BEGIN SELECT 1; END;
+INSERT INTO "t" ("qty") VALUES (7);
+INSERT INTO "child" ("id") VALUES (1);"#,
     )
     .unwrap();
-    let script = r#"BEGIN;
-CREATE TABLE "main"."t__tusk_rebuild" (
+    let script = r#"CREATE TABLE "main"."t__tusk_rebuild" (
   "id" integer PRIMARY KEY,
   "qty" bigint NOT NULL DEFAULT 0
 );
 INSERT INTO "main"."t__tusk_rebuild" ("id", "qty")
 SELECT "id", "qty" FROM "main"."t";
+PRAGMA legacy_alter_table=1;
 DROP TABLE "main"."t";
 ALTER TABLE "main"."t__tusk_rebuild" RENAME TO "t";
+PRAGMA legacy_alter_table=0;
 CREATE INDEX "t_qty_idx" ON "t" ("qty");
-COMMIT;"#;
-    c.execute_batch(script)
+CREATE TRIGGER "t_guard" AFTER INSERT ON "t" BEGIN SELECT 1; END"#;
+    // Load-bearing: inside the transaction the DROP orphans `child` and the whole
+    // rebuild rolls back. This is the smoke-test failure ("FOREIGN KEY constraint
+    // failed") reproduced.
+    let unguarded = sqlite_run_split_script(&c, script).expect_err("a referenced parent fails");
+    assert!(
+        unguarded.contains("FOREIGN KEY constraint failed"),
+        "unexpected error: {unguarded}"
+    );
+    // How `App.runDDL` runs it: enforcement suspended by its own IDLE statement on
+    // either side of the transaction.
+    c.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    sqlite_run_split_script(&c, script)
         .expect("SQLite must accept the whole rebuild in one transaction");
+    c.execute_batch("PRAGMA foreign_keys=ON").unwrap();
     let v: i64 = c
         .query_row("SELECT qty FROM t WHERE id = 1", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, 7, "rows survive the rebuild");
+    // The referencing row is still there and still resolves to the rebuilt parent.
+    let kids: i64 = c
+        .query_row("SELECT COUNT(*) FROM child", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(kids, 1);
+    let violations: i64 = c
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0, "no orphaned children after the rebuild");
 }
 
 /// The rebuild has to survive a table that a VIEW and another table's TRIGGER name.
@@ -3311,7 +3370,9 @@ ALTER TABLE "main"."t__tusk_rebuild" RENAME TO "t";
 PRAGMA legacy_alter_table=0;
 CREATE INDEX "t_qty_idx" ON "t" ("qty");
 CREATE TRIGGER "t_log" AFTER INSERT ON "t" BEGIN INSERT INTO "log" VALUES (NEW."qty"); END;"#;
-    c.execute_batch(&format!("BEGIN;\n{rebuild}\nCOMMIT;"))
+    // Split by Tusk's own splitter: the replayed trigger body holds a `;`, and shredding
+    // it leaves a bare `END` that SQLite executes as COMMIT.
+    sqlite_run_split_script(&c, rebuild)
         .expect("the rebuild must survive a dependent view and trigger");
     let v: i64 = c
         .query_row("SELECT qty FROM active WHERE id = 1", [], |r| r.get(0))
@@ -3357,6 +3418,12 @@ async fn sqlite_rebuild_script_runs_through_the_driver() {
     )
     .await;
     exec(&mut b, r#"CREATE VIEW "active" AS SELECT * FROM "t""#).await;
+    exec(&mut b, r#"CREATE TABLE "log" ("n" integer)"#).await;
+    exec(
+        &mut b,
+        r#"CREATE TRIGGER "t_log" AFTER INSERT ON "t" BEGIN INSERT INTO "log" VALUES (NEW."qty"); END"#,
+    )
+    .await;
     exec(&mut b, r#"INSERT INTO "t" ("id", "qty") VALUES (1, 7)"#).await;
     let script = r#"-- SQLite can't ALTER "main"."t" in place — rebuilding it (create → copy → drop → rename).
 CREATE TABLE "main"."t__tusk_rebuild" (
@@ -3368,13 +3435,22 @@ SELECT "id", "qty" FROM "main"."t";
 PRAGMA legacy_alter_table=1;
 DROP TABLE "main"."t";
 ALTER TABLE "main"."t__tusk_rebuild" RENAME TO "t";
-PRAGMA legacy_alter_table=0"#;
-    let items = crate::script::parse(script).expect("the rebuild script parses");
+PRAGMA legacy_alter_table=0;
+CREATE TRIGGER "t_log" AFTER INSERT ON "t" BEGIN INSERT INTO "log" VALUES (NEW."qty"); END"#;
+    // The engine-aware splitter is what execution uses: on SQLite the trigger body's `;`
+    // must not become a boundary, or the trailing `END` runs as COMMIT and the script
+    // dies with "COMMIT requires a healthy active transaction".
+    let items = crate::script::parse_for_engine(script, crate::script::TransactionEngine::Sqlite)
+        .expect("the rebuild script parses");
     b.run_script(&items, false)
         .await
         .expect("the driver must run the whole rebuild as one script");
     let rows = all(&mut b, r#"SELECT "qty" FROM "active""#).await;
     assert_eq!(cell(&rows[0], 0).as_deref(), Some("7"));
+    // The replayed trigger is live on the rebuilt table.
+    exec(&mut b, r#"INSERT INTO "t" ("id", "qty") VALUES (2, 9)"#).await;
+    let logged = all(&mut b, r#"SELECT COUNT(*) FROM "log" WHERE "n" = 9"#).await;
+    assert_eq!(cell(&logged[0], 0).as_deref(), Some("1"));
 }
 
 /// A rebuild must carry across everything only the stored CREATE text knows: table and

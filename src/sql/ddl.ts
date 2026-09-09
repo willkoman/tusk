@@ -13,6 +13,17 @@ import { ddlCaps, type DdlCaps } from "./ddlCaps";
 /** Suffix for the scratch table a SQLite rebuild creates before swapping it in. */
 export const REBUILD_SUFFIX = "__tusk_rebuild";
 
+/**
+ * A script produced by `rebuildTable` — the one DDL shape that must run with SQLite's
+ * foreign-key enforcement suspended, and therefore with `PRAGMA foreign_keys=OFF/ON`
+ * issued as separate IDLE statements around it (the pragma is a silent no-op inside the
+ * transaction the script itself runs in). Recognised by the scratch table's reserved
+ * suffix, which only this builder emits.
+ */
+export function isSqliteRebuild(sql: string, dialect = sqlDialect()): boolean {
+  return dialect === "sqlite" && sql.includes(REBUILD_SUFFIX);
+}
+
 export type ColumnSpec = {
   name: string;
   type: string;
@@ -412,9 +423,17 @@ export type RebuildSpec = {
  *  triggers. Used for every change SQLite's ALTER TABLE cannot express (type changes,
  *  NOT NULL, defaults, constraints, dropping a key column, reordering columns).
  *
- *  Runs inside the app-owned transaction, so it is all-or-nothing. Tusk does not turn
- *  on `PRAGMA foreign_keys` (SQLite's default is off and the pragma is a no-op inside
- *  a transaction), so the intermediate DROP cannot trip foreign-key enforcement.
+ *  Runs inside the app-owned transaction, so it is all-or-nothing. That is also why the
+ *  script itself carries no `PRAGMA foreign_keys`: Tusk's SQLite build enforces foreign
+ *  keys, `DROP TABLE` performs an implicit `DELETE FROM` that orphans a referencing
+ *  child row ("FOREIGN KEY constraint failed"), and neither pragma can fix that from in
+ *  here — `foreign_keys` is a silent no-op inside a transaction, and
+ *  `defer_foreign_keys` only moves the same failure to the COMMIT (renaming the
+ *  replacement in does not decrement the deferred violation counter). Retiring the
+ *  original by rename first does not help either: with foreign keys on, SQLite rewrites
+ *  other tables' `REFERENCES` clauses to follow the rename even under
+ *  `legacy_alter_table`. So `App.runDDL` brackets the whole run with
+ *  `PRAGMA foreign_keys=OFF/ON` as separate idle statements — see `isSqliteRebuild`.
  *
  *  `PRAGMA legacy_alter_table` wraps the swap, exactly as SQLite's own 12-step recipe
  *  prescribes: since 3.25 a plain `RENAME TO` re-parses every entry in `sqlite_schema`,

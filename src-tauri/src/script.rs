@@ -172,6 +172,24 @@ fn peek_word(b: &[u8], mut i: usize) -> String {
     String::from_utf8_lossy(&b[start..i]).to_ascii_lowercase()
 }
 
+/// The head words of a statement spell `CREATE [OR REPLACE] [TEMP|TEMPORARY] TRIGGER`.
+/// Only that shape opens a SQLite trigger body, so nothing else lets a bare `END`
+/// close a block (and, outside a trigger, `END` stays a COMMIT synonym).
+fn sqlite_trigger_head(words: &[String]) -> bool {
+    let mut it = words.iter().map(|w| w.as_str());
+    if it.next() != Some("create") {
+        return false;
+    }
+    for w in it {
+        match w {
+            "or" | "replace" | "temp" | "temporary" => continue,
+            "trigger" => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn split_core(
     script: &str,
     checked: bool,
@@ -186,7 +204,17 @@ fn split_core(
     // procedure body is shredded at its own semicolons and every piece is a
     // syntax error. `BEGIN TRAN[SACTION]` / `BEGIN DISTRIBUTED TRAN` open a
     // transaction, not a block, and must NOT raise the depth.
+    //
+    // SQLite reuses the same counter for `CREATE TRIGGER … BEGIN … END` bodies:
+    // SQLite has no dollar quoting either, so the body's own `;` terminators would
+    // otherwise shred a replayed trigger and leave a bare `END` that
+    // `transaction_action` reads as COMMIT — which is exactly how the table-rebuild
+    // path failed on any table carrying a trigger.
     let mut block_depth = 0usize;
+    // First code words of the statement being accumulated (SQLite only, capped),
+    // and whether they opened a trigger.
+    let mut head: Vec<String> = Vec::new();
+    let mut in_trigger = false;
     let mut items: Vec<Item> = Vec::new();
     let mut starts: Vec<usize> = Vec::new();
     // Byte offset where the statement currently accumulating in `cur` began.
@@ -485,6 +513,29 @@ fn split_core(
             cur.extend_from_slice(&b[start..i]);
             continue;
         }
+        // SQLite trigger bodies. Whole words again, so `END` inside an identifier
+        // (`appended`) or a quoted string never closes the body. `CASE … END` is
+        // counted too: an unpaired `END` in the body would close the block early.
+        if engine == TransactionEngine::Sqlite && (c.is_ascii_alphabetic() || c == b'_') {
+            let start = i;
+            while i < n && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let word = String::from_utf8_lossy(&b[start..i]).to_ascii_lowercase();
+            if !in_trigger && head.len() < 5 {
+                head.push(word.clone());
+                in_trigger = sqlite_trigger_head(&head);
+            }
+            if in_trigger {
+                match word.as_str() {
+                    "begin" | "case" => block_depth += 1,
+                    "end" => block_depth = block_depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            cur.extend_from_slice(&b[start..i]);
+            continue;
+        }
         // statement terminator
         if c == b';' && block_depth > 0 {
             cur.push(c);
@@ -495,6 +546,8 @@ fn split_core(
             i += 1;
             let this_start = stmt_start;
             stmt_start = i;
+            head.clear();
+            in_trigger = false;
             let stmt = flush(std::mem::take(&mut cur)).trim().to_string();
             if stmt.is_empty() {
                 continue;
@@ -2625,6 +2678,89 @@ mod tests {
         // Other engines are untouched: `BEGIN` there is transaction control.
         let pg = parse_for_engine("BEGIN; SELECT 1; COMMIT;", TransactionEngine::Postgres).unwrap();
         assert_eq!(pg.len(), 3);
+    }
+
+    /// Identical fixtures live in `src/editor/lexer.test.ts` — the two lexers must
+    /// agree on where a SQLite trigger body ends.
+    #[test]
+    fn sqlite_trigger_bodies_are_not_split_at_their_own_semicolons() {
+        let sqlite = TransactionEngine::Sqlite;
+        let sql_of = |items: &[Item]| {
+            items
+                .iter()
+                .map(|item| match item {
+                    Item::Sql(sql) => sql.clone(),
+                    Item::Copy { stmt, .. } => stmt.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // The rebuild path replays triggers verbatim: body `;` are not boundaries and
+        // the closing `END` must stay inside the statement (a bare `END` is COMMIT).
+        let trigger = parse_for_engine(
+            "CREATE TRIGGER books_guard AFTER INSERT ON books BEGIN SELECT 1; UPDATE books SET n = 1; END;\nSELECT 2;",
+            sqlite,
+        )
+        .unwrap();
+        assert_eq!(
+            sql_of(&trigger),
+            vec![
+                "CREATE TRIGGER books_guard AFTER INSERT ON books BEGIN SELECT 1; UPDATE books SET n = 1; END",
+                "SELECT 2",
+            ]
+        );
+        assert_eq!(
+            transaction_action_for(&sql_of(&trigger)[0], sqlite).unwrap(),
+            None
+        );
+
+        // TEMP / OR REPLACE headers, and a `CASE … END` inside the body.
+        for head in [
+            "CREATE TEMP TRIGGER t",
+            "CREATE TEMPORARY TRIGGER t",
+            "create trigger t",
+        ] {
+            let sql = format!(
+                "{head} AFTER UPDATE ON x BEGIN SELECT CASE WHEN 1 THEN 2 ELSE 3 END; END; SELECT 9;"
+            );
+            let items = parse_for_engine(&sql, sqlite).unwrap();
+            assert_eq!(items.len(), 2, "{head}: {:?}", sql_of(&items));
+        }
+
+        // A WHEN clause with its own CASE … END, before the body opens.
+        let guarded = parse_for_engine(
+            "CREATE TRIGGER t AFTER INSERT ON x WHEN (CASE WHEN 1 THEN 1 END) = 1 BEGIN DELETE FROM y; END; SELECT 9;",
+            sqlite,
+        )
+        .unwrap();
+        assert_eq!(guarded.len(), 2, "{:?}", sql_of(&guarded));
+
+        // BEGIN/END inside a string, a quoted identifier or a comment never counts.
+        let quoted = parse_for_engine(
+            "CREATE TRIGGER t AFTER INSERT ON x BEGIN INSERT INTO y VALUES ('end;'), (\"end\"), (`end`); -- end\n END; SELECT 9;",
+            sqlite,
+        )
+        .unwrap();
+        assert_eq!(quoted.len(), 2, "{:?}", sql_of(&quoted));
+
+        // Outside a trigger, SQLite `BEGIN`/`END` remain transaction control and the
+        // `;` still splits — `appended` is an identifier, not the END keyword.
+        let txn = parse_for_engine("BEGIN; SELECT appended FROM t; END;", sqlite).unwrap();
+        assert_eq!(sql_of(&txn), vec!["BEGIN", "SELECT appended FROM t", "END"]);
+        assert_eq!(
+            transaction_action_for("END", sqlite).unwrap(),
+            Some(TransactionAction::Commit)
+        );
+        // A non-trigger CREATE never opens a block.
+        let table = parse_for_engine("CREATE TABLE t (a INT); SELECT 1;", sqlite).unwrap();
+        assert_eq!(table.len(), 2, "{:?}", sql_of(&table));
+        // Other engines are untouched: a SQLite-shaped trigger on Postgres still splits.
+        let pg = parse_for_engine(
+            "CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;",
+            TransactionEngine::Postgres,
+        )
+        .unwrap();
+        assert_eq!(pg.len(), 2);
     }
 
     #[test]

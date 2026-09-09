@@ -148,13 +148,29 @@ function peekWord(doc: string, i: number): string {
   return doc.slice(start, i).toLowerCase();
 }
 
+/**
+ * The head words of a statement spell `CREATE [OR REPLACE] [TEMP|TEMPORARY] TRIGGER`.
+ * Mirrors `script.rs::sqlite_trigger_head`: only that shape opens a SQLite trigger
+ * body, so nothing else lets a bare `END` close a block (outside a trigger, SQLite
+ * `END` is a COMMIT synonym).
+ */
+function sqliteTriggerHead(words: string[]): boolean {
+  if (words[0] !== "create") return false;
+  for (const w of words.slice(1)) {
+    if (w === "or" || w === "replace" || w === "temp" || w === "temporary") continue;
+    return w === "trigger";
+  }
+  return false;
+}
+
 export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine): LexResult {
   const n = doc.length;
   const spans: Span[] = [];
   const stmts: Stmt[] = [];
   const mysql = engine === "mysql";
   const mssql = engine === "mssql";
-  const bticks = mysql || engine === "sqlite";
+  const sqlite = engine === "sqlite";
+  const bticks = mysql || sqlite;
   let i = 0;
   let codeStart = 0;
   let stmtStart = 0;
@@ -162,7 +178,12 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
   // `CASE … END`). A `;` inside a block is not a statement boundary — T-SQL has no
   // dollar quoting, so without this a procedure body is shredded into fragments.
   // `BEGIN TRAN[SACTION]` / `BEGIN DISTRIBUTED TRAN` open a transaction, not a block.
+  // SQLite shares the counter for `CREATE TRIGGER … BEGIN … END` bodies.
   let blockDepth = 0;
+  // First code words of the statement being scanned (SQLite only, capped) and
+  // whether they opened a trigger body.
+  let head: string[] = [];
+  let inTrigger = false;
 
   const pushCode = (to: number) => {
     if (to > codeStart) spans.push({ from: codeStart, to, kind: "code" });
@@ -331,6 +352,23 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
       } else if (word === "end") blockDepth = Math.max(0, blockDepth - 1);
       continue;
     }
+    // SQLite `CREATE TRIGGER … BEGIN … END` bodies. Whole words again, so `END`
+    // inside an identifier or a quoted region never closes the body; `CASE … END`
+    // is counted so an unpaired `END` cannot close the block early.
+    if (sqlite && isAlphaOrUnderscore(cc)) {
+      const start = i;
+      while (i < n && isWord(doc.charCodeAt(i))) i++;
+      const word = doc.slice(start, i).toLowerCase();
+      if (!inTrigger && head.length < 5) {
+        head.push(word);
+        inTrigger = sqliteTriggerHead(head);
+      }
+      if (inTrigger) {
+        if (word === "begin" || word === "case") blockDepth++;
+        else if (word === "end") blockDepth = Math.max(0, blockDepth - 1);
+      }
+      continue;
+    }
     // statement terminator (inside a T-SQL block it is part of the statement)
     if (cc === SEMI && blockDepth === 0) {
       i++;
@@ -338,6 +376,8 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
       pushStmt(stmtStart, i);
       codeStart = i;
       stmtStart = i;
+      head = [];
+      inTrigger = false;
       continue;
     }
 

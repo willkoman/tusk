@@ -120,6 +120,48 @@ describe("engine-aware lexing (parity with script.rs split_impl)", () => {
     // Other engines are untouched: BEGIN there is transaction control.
     expect(stmtTexts("BEGIN; SELECT 1; COMMIT;", "postgres")).toHaveLength(3);
   });
+
+  // Same fixtures as script.rs's `sqlite_trigger_bodies_are_not_split_at_their_own_semicolons`.
+  it("sqlite: a `;` inside a CREATE TRIGGER body is not a statement boundary", () => {
+    expect(
+      stmtTexts(
+        "CREATE TRIGGER books_guard AFTER INSERT ON books BEGIN SELECT 1; UPDATE books SET n = 1; END;\nSELECT 2;",
+        "sqlite",
+      ),
+    ).toEqual([
+      "CREATE TRIGGER books_guard AFTER INSERT ON books BEGIN SELECT 1; UPDATE books SET n = 1; END;",
+      "SELECT 2;",
+    ]);
+    // TEMP / OR REPLACE headers, and a CASE … END inside the body.
+    for (const head of ["CREATE TEMP TRIGGER t", "CREATE TEMPORARY TRIGGER t", "create trigger t"]) {
+      expect(
+        stmtTexts(`${head} AFTER UPDATE ON x BEGIN SELECT CASE WHEN 1 THEN 2 ELSE 3 END; END; SELECT 9;`, "sqlite"),
+      ).toHaveLength(2);
+    }
+    // A WHEN clause with its own CASE … END, before the body opens.
+    expect(
+      stmtTexts(
+        "CREATE TRIGGER t AFTER INSERT ON x WHEN (CASE WHEN 1 THEN 1 END) = 1 BEGIN DELETE FROM y; END; SELECT 9;",
+        "sqlite",
+      ),
+    ).toHaveLength(2);
+    // BEGIN/END inside a string, quoted identifier or comment never counts.
+    expect(
+      stmtTexts(
+        "CREATE TRIGGER t AFTER INSERT ON x BEGIN INSERT INTO y VALUES ('end;'), (\"end\"), (`end`); -- end\n END; SELECT 9;",
+        "sqlite",
+      ),
+    ).toHaveLength(2);
+    // Outside a trigger, BEGIN/END stay transaction control and `appended` is a name.
+    expect(stmtTexts("BEGIN; SELECT appended FROM t; END;", "sqlite")).toEqual([
+      "BEGIN;",
+      "SELECT appended FROM t;",
+      "END;",
+    ]);
+    expect(stmtTexts("CREATE TABLE t (a INT); SELECT 1;", "sqlite")).toHaveLength(2);
+    // Other engines are untouched: a SQLite-shaped trigger on Postgres still splits.
+    expect(stmtTexts("CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;", "postgres")).toHaveLength(2);
+  });
 });
 
 describe("statement run target", () => {

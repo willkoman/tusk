@@ -16,6 +16,7 @@ import {
   duplicateTable,
   editColumn,
   isPlaceholderColumn,
+  isSqliteRebuild,
   mentionsIdentifier,
   mysqlTextLiteral,
   needsRebuild,
@@ -459,6 +460,17 @@ describe("sqlite rebuild", () => {
     };
     expect(needsRebuild(s)).toBe(false);
     expect(tableDiff(s)).toBe(`ALTER TABLE "main"."t" RENAME COLUMN "a" TO "b"`);
+  });
+  // `App.runDDL` brackets exactly this script with PRAGMA foreign_keys=OFF/ON as idle
+  // statements — dropping a referenced parent inside the transaction cannot work, and
+  // the pragma is a silent no-op in there.
+  it("is recognisable as the one script that needs foreign keys suspended", () => {
+    setSqlDialect("sqlite");
+    expect(isSqliteRebuild(tableDiff(rebuildSpec()))).toBe(true);
+    expect(isSqliteRebuild(`ALTER TABLE "main"."t" RENAME COLUMN "a" TO "b"`)).toBe(false);
+    // Only on SQLite: no other engine rebuilds, so no other engine may lose enforcement.
+    setSqlDialect("postgres");
+    expect(isSqliteRebuild(`CREATE TABLE "s"."t__tusk_rebuild" ("a" int)`)).toBe(false);
   });
   // Everything below is what the pragmas cannot see: dropping it on a rebuild destroyed
   // the constraint/collation/expression with no error and no warning.

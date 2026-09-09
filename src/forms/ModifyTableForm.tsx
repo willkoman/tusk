@@ -232,7 +232,7 @@ export function ModifyTableForm(props: {
     const trg = props.detail.triggers.length
       ? ` Its triggers (${props.detail.triggers.map((t) => t.name).join(", ")}) are dropped with the table and recreated afterwards.`
       : "";
-    return `SQLite can't change this in place, so Tusk rebuilds the table (create → copy → drop → rename): the columns, their CHECK/COLLATE/generated clauses, the primary key, the table options and the constraints and indexes listed above are all recreated.${trg} ${base}`;
+    return `SQLite can't change this in place, so Tusk rebuilds the table (create → copy → drop → rename): the columns, their CHECK/COLLATE/generated clauses, the primary key, the table options and the constraints and indexes listed above are all recreated.${trg} Dropping the original would orphan any row that references it, and SQLite ignores PRAGMA foreign_keys inside a transaction — so Tusk switches foreign-key enforcement off just for this run and back on straight after. ${base}`;
   });
 
   const toggleUniqueCol = (i: number, c: string) =>

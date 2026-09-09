@@ -4179,6 +4179,33 @@ function App() {
     }, c.key);
     if (origin.tabId) patchResult(origin.tabId, { runErr: "" });
     interruptStream("an Explorer action closed the result stream", c.id);
+    // A SQLite table rebuild DROPs the original, and DROP performs an implicit
+    // `DELETE FROM` that a referencing child row turns into "FOREIGN KEY constraint
+    // failed". `PRAGMA foreign_keys` is a silent no-op inside a transaction and the
+    // rebuild script runs in the app-owned one, so the toggle has to be its own IDLE
+    // statement on either side of it.
+    const fkGuard = ddl.isSqliteRebuild(sqlText);
+    const foreignKeys = async (on: boolean): Promise<string | null> => {
+      try {
+        await invoke("run_query", {
+          connectionId: c.id,
+          ownerId: origin.tabId ?? activeTabId(),
+          sql: `PRAGMA foreign_keys=${on ? "ON" : "OFF"}`,
+          pageSize: PAGE,
+          searchPath: null,
+        });
+        return null;
+      } catch (e) {
+        return errMsg(e);
+      }
+    };
+    if (fkGuard) {
+      const failed = await foreignKeys(false);
+      if (failed) {
+        ddlHistory("error", failed.split("\n")[0]);
+        return { ok: false, error: `could not suspend foreign-key enforcement for the rebuild: ${failed}` };
+      }
+    }
     try {
       const out = await invoke<QueryResult>("run_query", { connectionId: c.id, ownerId: origin.tabId ?? activeTabId(), sql: sqlText, pageSize: PAGE, searchPath: null });
       ddlHistory("ok", null);
@@ -4195,7 +4222,16 @@ function App() {
       ddlHistory("error", message.split("\n")[0]);
       const embedded = transactionFromError(e);
       if (embedded) applyAuthoritativeTransaction(c, embedded, "statement", before);
+      // The dialog stays open with the message, but the status bar still carried the
+      // PREVIOUS action's `OK` — a failed edit must never read as a successful one.
+      if (origin.tabId && originCurrent(origin)) patchResult(origin.tabId, { status: "failed — see the dialog" });
       return { ok: false, error: message };
+    } finally {
+      if (fkGuard) {
+        const failed = await foreignKeys(true);
+        if (failed && origin.tabId && originCurrent(origin))
+          patchResult(origin.tabId, { runErr: `foreign-key enforcement is still off on this connection: ${failed}` });
+      }
     }
   }
 
