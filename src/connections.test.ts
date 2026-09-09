@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   CONNECTION_COLORS,
+  claimFirstMount,
+  resetFirstMountForTests,
   MAX_CONNECTIONS,
   connectionColor,
   connectionDot,
@@ -249,5 +251,22 @@ describe("connect on startup", () => {
     expect(shouldAutoConnect({ hasDefault: true, firstMount: false, recovering: false })).toBe(false);
     expect(shouldAutoConnect({ hasDefault: true, firstMount: true, recovering: true })).toBe(false);
     expect(shouldAutoConnect({ hasDefault: false, firstMount: true, recovering: false })).toBe(false);
+  });
+});
+
+describe("claimFirstMount", () => {
+  it("is true once per process, then false for every later mount", () => {
+    resetFirstMountForTests();
+    expect(claimFirstMount()).toBe(true);
+    expect(claimFirstMount()).toBe(false);
+    expect(claimFirstMount()).toBe(false);
+  });
+
+  it("survives a module-level reset the way an HMR update would not", () => {
+    resetFirstMountForTests();
+    claimFirstMount();
+    // A fresh import of the App module cannot un-claim it: the flag is on globalThis.
+    expect((globalThis as unknown as Record<string, unknown>).__tuskStartupMountDone).toBe(true);
+    expect(shouldAutoConnect({ hasDefault: true, firstMount: claimFirstMount(), recovering: false })).toBe(false);
   });
 });

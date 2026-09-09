@@ -16,8 +16,9 @@ export const AUTO_MIN_W = 64;
 export const AUTO_MAX_W = 360;
 /** Slack around the header text: sort glyph, type badge, padding. */
 export const HEAD_PAD = 46;
-/** Slack around a cell value: cell padding plus the right border. */
-export const CELL_PAD = 20;
+/** Slack around a cell value: cell padding, the right border and sub-pixel rounding.
+ *  Short by even a pixel and the last glyph of a full-width value elides. */
+export const CELL_PAD = 26;
 
 export type SampleOptions = {
   sampleRows?: number;

@@ -65,19 +65,31 @@ export function SettingsDialog(props: {
             <Match when={tab() === "editor"}>
               {/* Font size and line height moved to Appearance → Editor text. */}
               <label class="settings-row">
-                <span>Word wrap</span>
+                <span class="settings-label">
+                  <span>Word wrap</span>
+                  <small>Wrap long lines instead of scrolling sideways.</small>
+                </span>
                 <input type="checkbox" checked={p().wordWrap} onChange={(e) => props.update({ wordWrap: e.currentTarget.checked })} />
               </label>
               <label class="settings-row">
-                <span>Auto-fold large literals</span>
+                <span class="settings-label">
+                  <span>Auto-fold large literals</span>
+                  <small>Collapses long strings and arrays on screen. The query text is unchanged.</small>
+                </span>
                 <input type="checkbox" checked={p().autoFold} onChange={(e) => props.update({ autoFold: e.currentTarget.checked })} />
               </label>
               <label class="settings-row">
-                <span>Check statements against the server</span>
+                <span class="settings-label">
+                  <span>Check statements against the server</span>
+                  <small>Prepares each statement to find errors before you run it.</small>
+                </span>
                 <input type="checkbox" checked={p().serverLint} onChange={(e) => props.update({ serverLint: e.currentTarget.checked })} />
               </label>
               <label class="settings-row" title={props.connected ? "The dialect follows the connected driver" : undefined}>
-                <span>SQL dialect{props.connected ? " (follows connection)" : ""}</span>
+                <span class="settings-label">
+                  <span>SQL dialect</span>
+                  <small>{props.connected ? "Follows the connected driver." : "Used for highlighting and completion until you connect."}</small>
+                </span>
                 <select
                   disabled={props.connected}
                   value={p().dialect}
@@ -97,18 +109,27 @@ export function SettingsDialog(props: {
 
             <Match when={tab() === "grid"}>
               <label class="settings-row">
-                <span>Row density</span>
+                <span class="settings-label">
+                  <span>Row density</span>
+                  <small>Height of a result row.</small>
+                </span>
                 <select value={p().gridDensity} onChange={(e) => props.update({ gridDensity: e.currentTarget.value as EditorPrefs["gridDensity"] })}>
                   <option value="normal">Normal</option>
                   <option value="compact">Compact</option>
                 </select>
               </label>
               <label class="settings-row">
-                <span>Zebra striping</span>
+                <span class="settings-label">
+                  <span>Zebra striping</span>
+                  <small>Tints alternate rows.</small>
+                </span>
                 <input type="checkbox" checked={p().gridZebra} onChange={(e) => props.update({ gridZebra: e.currentTarget.checked })} />
               </label>
               <label class="settings-row">
-                <span>NULL cells show</span>
+                <span class="settings-label">
+                  <span>NULL cells show</span>
+                  <small>What a SQL NULL looks like in the grid.</small>
+                </span>
                 <select value={p().gridNullStyle} onChange={(e) => props.update({ gridNullStyle: e.currentTarget.value as EditorPrefs["gridNullStyle"] })}>
                   <option value="null">NULL</option>
                   <option value="empty">(empty)</option>
@@ -133,7 +154,10 @@ export function SettingsDialog(props: {
                 />
               </label>
               <label class="settings-row">
-                <span>Copy with column names</span>
+                <span class="settings-label">
+                  <span>Copy with column names</span>
+                  <small>Adds a header row to copied cells.</small>
+                </span>
                 <input type="checkbox" checked={p().copyHeaders} onChange={(e) => props.update({ copyHeaders: e.currentTarget.checked })} />
               </label>
             </Match>

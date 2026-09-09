@@ -124,6 +124,7 @@ import {
   nextRecoverySlot,
   recoverySlotKey,
   rememberedProfileIds,
+  claimFirstMount,
   shouldAutoConnect,
   stepConnection,
   type Capabilities,
@@ -334,14 +335,6 @@ const EMPTY_FUNCS: ReadonlySet<string> = new Set<string>();
 const EMPTY_FK_EDGES: FkEdge[] = [];
 const EMPTY_DETAILS: Record<string, RelationDetail> = {};
 const EMPTY_HISTORY: HistoryEntry[] = [];
-
-/**
- * Connect-on-startup fires once per app process, not once per mount. A crash-guard
- * "Try to continue" and a Vite HMR update both remount `App` and re-run `onMount`;
- * both used to open the `default_connect` profile again, which on a production
- * default is a session the user never asked for. Module scope outlives the mount.
- */
-let startupAutoConnectDone = false;
 
 function App() {
   // --- open connections -----------------------------------------------------
@@ -2310,10 +2303,10 @@ function App() {
     // from an error must never open a database session by itself — offer the profile in
     // the reopen list instead of connecting to it.
     const recovered = consumeCrashRecovery();
-    // Module-level, so it survives the remount it exists to catch (HMR, crash-guard
-    // reset). A real relaunch starts a new module instance and connects again.
-    const firstMount = !startupAutoConnectDone;
-    startupAutoConnectDone = true;
+    // `claimFirstMount` keeps the flag on `globalThis`, not in this module: a Vite
+    // HMR update to App.tsx replaces the module, and a module-level flag came back
+    // false and reconnected the production default. See src/connections.ts.
+    const firstMount = claimFirstMount();
     const autoConnect = shouldAutoConnect({ hasDefault: !!def, firstMount, recovering: recovered });
     if (def && !autoConnect) setReopenable(remembered.includes(def.id) ? remembered : [def.id, ...remembered]);
     if (def && autoConnect) connectProfile(def.id);

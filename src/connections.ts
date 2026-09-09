@@ -412,6 +412,29 @@ export function shouldAutoConnect(o: { hasDefault: boolean; firstMount: boolean;
   return o.hasDefault && o.firstMount && !o.recovering;
 }
 
+/**
+ * "Has this PROCESS already run its startup mount?", answered once.
+ *
+ * The flag has to outlive module replacement, not just component remount: it
+ * used to live beside `App`, so a Vite HMR update to `App.tsx` created a fresh
+ * module with the flag back at `false` and the next mount opened the production
+ * default all over again. `globalThis` survives every module swap and is reset
+ * only by a real page load, which is what a relaunch is.
+ */
+const STARTUP_MOUNT_FLAG = "__tuskStartupMountDone";
+
+export function claimFirstMount(): boolean {
+  const g = globalThis as unknown as Record<string, unknown>;
+  const first = g[STARTUP_MOUNT_FLAG] !== true;
+  g[STARTUP_MOUNT_FLAG] = true;
+  return first;
+}
+
+/** Test seam: forget that a startup mount happened. */
+export function resetFirstMountForTests(): void {
+  delete (globalThis as unknown as Record<string, unknown>)[STARTUP_MOUNT_FLAG];
+}
+
 /** Bound + de-duplicate a persisted id list before it is offered or reconnected. */
 export function sanitizeRememberedIds(raw: unknown): string[] {
   if (!Array.isArray(raw)) return [];

@@ -139,7 +139,7 @@ export function ConfirmDialog(props: {
       </Show>
       <Show when={props.confirmName}>
         <label class="type-confirm">
-          Type <b>{props.confirmName}</b> to confirm
+          <span class="type-confirm-ask">Type <b>{props.confirmName}</b> to confirm</span>
           <input
             value={typed()}
             spellcheck={false}

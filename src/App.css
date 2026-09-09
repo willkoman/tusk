@@ -1564,6 +1564,9 @@ button.sql-copy { padding: 1px var(--s2); font-size: var(--fs-xs); border-radius
 .danger-deps { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 2px; font-family: var(--mono); font-size: var(--fs-xs); }
 .danger-lead { font-size: var(--fs-base); line-height: var(--lh-body); color: var(--text); }
 .type-confirm { display: flex; flex-direction: column; gap: var(--s1); }
+/* The ask is one line; `.modal label` would stack "Type", the name and "to confirm". */
+.type-confirm-ask { display: block; font-size: var(--fs-sm); font-weight: 400; color: var(--text); }
+.type-confirm-ask b { font-family: var(--mono); font-weight: 600; }
 .type-confirm input { font-family: var(--mono); }
 .type-confirm input:focus { border-color: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); }
 /* Pending destruction, restated where the primary button is. */
@@ -1850,7 +1853,7 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
    `flex: none` is load-bearing — the row is narrower than its content, so
    shrinkable swatches flattened into 10x20 ellipses. */
 .accent-swatch { flex: none; width: 20px; height: 20px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; padding: 0; }
-.settings-inline input[type="color"] { flex: none; width: 20px; height: 20px; border-radius: 50%; padding: 0; overflow: hidden; }
+.modal .settings-inline input[type="color"], .settings-inline input[type="color"] { box-sizing: border-box; flex: none; width: 20px; height: 20px; min-height: 0; border-radius: 50%; padding: 0; overflow: hidden; }
 .settings-inline input[type="color"]::-webkit-color-swatch-wrapper { padding: 0; }
 .settings-inline input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
 .accent-swatch.active { border-color: var(--accent); box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent); }

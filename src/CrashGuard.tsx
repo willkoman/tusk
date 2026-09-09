@@ -82,7 +82,7 @@ function CrashPanel(props: { report: string; prior?: boolean; onContinue: () => 
           </p>
         </div>
         <div class="crash-privacy">
-          Reports are never sent automatically. Exception messages can contain data. Review the details before sending.
+          Exception messages can contain data. Review the details before sending.
         </div>
         <details>
           <summary>Report details</summary>
