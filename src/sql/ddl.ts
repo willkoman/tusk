@@ -7,7 +7,7 @@
 // declared once in `sql/ddlCaps.ts`, never re-derived from `sqlDialect() === "…"`
 // checks sprinkled through the emitters.
 
-import { ident, qualify, qualifyIn, lit } from "./ident";
+import { ident, qualify, qualifyIn, lit, mysqlNoBackslashEscapes, sqlDialect } from "./ident";
 import { ddlCaps, type DdlCaps } from "./ddlCaps";
 
 /** Suffix for the scratch table a SQLite rebuild creates before swapping it in. */
@@ -36,22 +36,13 @@ export type ColumnSpec = {
   onUpdate?: string;
 };
 
-// Whether the connected MySQL session runs with NO_BACKSLASH_ESCAPES. The backend reads
-// `@@session.sql_mode` once at connect and reports it in the driver capabilities; App
-// sets this alongside the SQL dialect. There is no literal form that is correct under
-// both modes, so this has to be known rather than guessed.
-let mysqlNoBackslashEscapes = false;
-export function setMysqlNoBackslashEscapes(on: boolean) {
-  mysqlNoBackslashEscapes = on;
-}
-
 /** MySQL's inline COMMENT option takes a plain string literal token, so the hex form
  *  `lit()` uses for MySQL values (`_utf8mb4 X'…'`) is not accepted there. Quotes are
  *  always doubled; backslashes are doubled ONLY when the session treats them as escape
  *  characters — doubling under NO_BACKSLASH_ESCAPES would store two of them, and not
  *  doubling under the default mode turns `\n` in a comment into a newline. */
 export function mysqlTextLiteral(s: string): string {
-  const escaped = mysqlNoBackslashEscapes ? s : s.replace(/\\/g, "\\\\");
+  const escaped = mysqlNoBackslashEscapes() ? s : s.replace(/\\/g, "\\\\");
   return `'${escaped.replace(/'/g, "''")}'`;
 }
 
@@ -1127,9 +1118,21 @@ export function scriptNote(sql: string, caps: DdlCaps = ddlCaps()): string {
 
 // Query scaffolds drop the schema prefix when it matches the console's active
 // schema (search_path) — see qualifyIn.
+/**
+ * `SELECT <cols> FROM <relation>` capped at `limit` rows, in the engine's own form.
+ * T-SQL has no `LIMIT`, and its `OFFSET … FETCH` requires an `ORDER BY`, so SQL Server
+ * gets `SELECT TOP (n)` — the only row cap that stands on its own. Everyone else keeps
+ * the trailing `LIMIT`. Quoting comes from the dialect in force, so call this inside
+ * `withDialect(kind, …)` when building for a non-active connection.
+ */
+export function limitedSelect(cols: string, relation: string, limit: number): string {
+  if (sqlDialect() === "mssql") return `SELECT TOP (${limit}) ${cols}\nFROM ${relation}`;
+  return `SELECT ${cols}\nFROM ${relation}\nLIMIT ${limit}`;
+}
+
 export function genSelect(schema: string, table: string, cols: string[], activeSchema?: string | null): string {
   const c = cols.length ? cols.map(ident).join(", ") : "*";
-  return `SELECT ${c}\nFROM ${qualifyIn(schema, table, activeSchema)}\nLIMIT 100`;
+  return limitedSelect(c, qualifyIn(schema, table, activeSchema), 100);
 }
 export function genInsert(schema: string, table: string, cols: string[], activeSchema?: string | null): string {
   const names = cols.length ? cols : ["column"];

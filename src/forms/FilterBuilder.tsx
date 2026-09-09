@@ -22,6 +22,7 @@ import {
   type FilterTree,
 } from "../grid/filterModel";
 import { renderWhere } from "../grid/filterSql";
+import { withDialect } from "../sql/ident";
 
 const CLASS_LABEL: Record<ColumnClass, string> = {
   text: "text",
@@ -86,9 +87,17 @@ export function FilterBuilder(props: {
 
   // One memo carries both outcomes — the generator throws on an ambiguous column
   // name or an over-budget tree, and that message is what the footer shows.
+  // `renderWhere` reaches `ident`/`lit` implicitly, so pin this dialog's dialect
+  // rather than trusting the module global (the ACTIVE connection's) — synchronous,
+  // as `withDialect` requires.
   const rendered = createMemo<{ sql: string; error: string }>(() => {
     try {
-      return { sql: renderWhere(tree(), { columns: props.columns, dialect: props.dialect, classOf: classOf() }), error: "" };
+      return {
+        sql: withDialect(props.dialect, () =>
+          renderWhere(tree(), { columns: props.columns, dialect: props.dialect, classOf: classOf() }),
+        ),
+        error: "",
+      };
     } catch (e) {
       return { sql: "", error: e instanceof Error ? e.message : String(e) };
     }

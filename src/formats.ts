@@ -83,9 +83,9 @@ function markdownCell(v: string | null): string {
 
 /** Grid "Copy as X": the SAME bytes as Export→Clipboard/file for the same rows,
  *  with fixed sane options. One formatter for one user-facing concept — the legacy
- *  toCSV/toTSV/toJSON/toMarkdown helpers below survive only for paste round-trip
- *  tests. Markdown always emits its header (a headerless markdown table isn't
- *  valid markdown). */
+ *  toTSV/toJSON/toSQL/toMarkdown helpers below have no production caller left and
+ *  survive only as vitest coverage of the shared shape/limit validation. Markdown
+ *  always emits its header (a headerless markdown table isn't valid markdown). */
 export function formatForCopy(
   d: Dataset,
   fmt: "tsv" | "csv" | "json" | "md",
@@ -97,15 +97,6 @@ export function formatForCopy(
   opts.delimiter = fmt === "tsv" ? "tab" : "comma";
   opts.header = fmt === "md" ? true : header;
   return formatWithOptions(d, opts, sourceDialect);
-}
-
-export function toCSV(d: Dataset, header = true): string {
-  validateDataset(d);
-  ensureFormatBudget(d, 2);
-  const lines: string[] = [];
-  if (header) lines.push(d.columns.map((c) => quoteCell(c, ",")).join(","));
-  for (const r of d.rows) lines.push(r.map((v) => quoteCell(v, ",")).join(","));
-  return bounded(lines.join("\n"));
 }
 
 export function toTSV(d: Dataset, header = true): string {
@@ -157,29 +148,6 @@ export function toMarkdown(d: Dataset, header = true): string {
   const head = `| ${d.columns.map((c) => c.replace(/\|/g, "\\|")).join(" | ")} |`;
   const sep = `| ${d.columns.map(() => "---").join(" | ")} |`;
   return bounded([head, sep, body].join("\n"));
-}
-
-export const EXPORT_EXT: Record<string, string> = {
-  csv: "csv",
-  tsv: "tsv",
-  json: "json",
-  sql: "sql",
-  markdown: "md",
-};
-
-export function formatDataset(d: Dataset, fmt: string, table: string): string {
-  switch (fmt) {
-    case "tsv":
-      return toTSV(d);
-    case "json":
-      return toJSON(d);
-    case "sql":
-      return toSQL(d, table);
-    case "markdown":
-      return toMarkdown(d);
-    default:
-      return toCSV(d);
-  }
 }
 
 // ---------- options-driven formatting (clipboard export) ----------

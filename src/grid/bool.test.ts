@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isBoolType, boolWord, detectBoolCols, typeBoolCols } from "./bool";
+import { isBoolType, boolWord, boolEditTokens, detectBoolCols, typeBoolCols } from "./bool";
 import type { Column } from "../Tree";
 
 const col = (name: string, data_type: string, nullable = true): Column => ({
@@ -23,6 +23,19 @@ describe("isBoolType", () => {
     expect(isBoolType("tinyint")).toBe(false);
     expect(isBoolType("text")).toBe(false);
     expect(isBoolType("boolean[]")).toBe(false);
+  });
+  it("matches SQL Server's bit, and only on SQL Server", () => {
+    expect(isBoolType("bit", "mssql")).toBe(true);
+    expect(isBoolType("BIT", "mssql")).toBe(true);
+    expect(isBoolType(" bit ", "mssql")).toBe(true);
+    // PostgreSQL `bit`/`bit varying` are bit STRINGS, not booleans.
+    expect(isBoolType("bit", "postgres")).toBe(false);
+    expect(isBoolType("bit", "duckdb")).toBe(false);
+    expect(isBoolType("bit", "sqlite")).toBe(false);
+    expect(isBoolType("bit varying", "mssql")).toBe(false);
+  });
+  it("does not match boolean on SQL Server, which has no such type", () => {
+    expect(isBoolType("boolean", "mssql")).toBe(false);
   });
 });
 
@@ -78,5 +91,31 @@ describe("typeBoolCols", () => {
   });
   it("unknown result columns are not boolean", () => {
     expect(typeBoolCols(["other"], [col("a", "boolean")]).size).toBe(0);
+  });
+  it("picks up SQL Server bit columns under the mssql dialect", () => {
+    const cols = [col("Ok", "bit"), col("n", "int")];
+    expect(typeBoolCols(["ok", "n"], cols, "mssql").has(0)).toBe(true);
+    expect(typeBoolCols(["ok", "n"], cols, "mssql").has(1)).toBe(false);
+    // The same metadata under any other dialect is not boolean.
+    expect(typeBoolCols(["ok", "n"], cols, "postgres").size).toBe(0);
+  });
+});
+
+describe("boolEditTokens", () => {
+  it("commits 1/0 on the engines with no boolean literal", () => {
+    for (const k of ["sqlite", "mysql", "mssql"]) {
+      expect(boolEditTokens(k)).toEqual({ trueVal: "1", falseVal: "0" });
+    }
+  });
+  it("commits true/false on PostgreSQL and DuckDB", () => {
+    for (const k of ["postgres", "duckdb"]) {
+      expect(boolEditTokens(k)).toEqual({ trueVal: "true", falseVal: "false" });
+    }
+  });
+  it("both tokens round-trip through boolWord", () => {
+    expect(boolWord("1")).toBe("TRUE");
+    expect(boolWord("0")).toBe("FALSE");
+    expect(boolWord("true")).toBe("TRUE");
+    expect(boolWord("false")).toBe("FALSE");
   });
 });

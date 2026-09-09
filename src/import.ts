@@ -214,6 +214,7 @@ export function tokenForDeclaredType(declared: string): ImportColumnType {
 /**
  * The engine type an inferred token creates as. PARITY PAIR with `ColumnType::sql` in
  * src-tauri/src/import.rs — the backend is authoritative; this drives the preview only.
+ * (The `mssql` row is the exception: see the note on it.)
  */
 export const SQL_TYPES: Record<string, Record<ImportColumnType, string>> = {
   postgres: {
@@ -251,6 +252,19 @@ export const SQL_TYPES: Record<string, Record<ImportColumnType, string>> = {
     boolean: "TINYINT(1)",
     date: "DATE",
     timestamp: "DATETIME",
+  },
+  // SQL Server has no counterpart in `ColumnType::sql`: import.rs refuses file import on
+  // that engine entirely. The row exists so the type picker can never silently offer
+  // PostgreSQL types through `sqlTypeFor`'s fallback; `nvarchar(max)`/`bit` match the
+  // T-SQL arm of `sql_column_type` in src-tauri/src/export.rs.
+  mssql: {
+    text: "nvarchar(max)",
+    integer: "int",
+    bigint: "bigint",
+    numeric: "decimal(38,10)",
+    boolean: "bit",
+    date: "date",
+    timestamp: "datetime2",
   },
 };
 

@@ -194,7 +194,7 @@ export function ExportTablesDialog(props: {
               <Show when={failures().length}>
                 <div class="export-note">
                   Files written before a failure are kept; a cancel stops the run and the
-                  remaining tables are reported as skipped.
+                  remaining tables are listed as <code>cancelled</code>.
                 </div>
               </Show>
             </section>

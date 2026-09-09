@@ -18,7 +18,7 @@ import { UpdateBadge } from "./UpdateBadge";
 import { WhatsNew } from "./WhatsNew";
 import { wrapQuery, wrappableQuery, stripTrailingSemi, hasDuplicateColumns, hasViewRules, mssqlWrappable } from "./grid/query";
 import { editTarget, editPlan, type EditPlan } from "./grid/editable";
-import { detectBoolCols, typeBoolCols } from "./grid/bool";
+import { boolEditTokens, detectBoolCols, typeBoolCols } from "./grid/bool";
 import { buildCommitScript } from "./grid/editSql";
 import { planPaste, mergePaste, type RowRef } from "./grid/paste";
 import { orderedRows, sortedRowOrder } from "./grid/sort";
@@ -66,7 +66,7 @@ import { detectPlan } from "./plan/detect";
 import { explainSql, analyzeExecutesWrite, isSingleExplainStatement, explainUnsupported } from "./plan/explainSql";
 import { Dialog, SqlPreview } from "./Dialog";
 import { Icon } from "./Icons";
-import { ident, qualify, qualifyIn, setSqlDialect, withDialect } from "./sql/ident";
+import { ident, qualify, qualifyIn, setMysqlNoBackslashEscapes, setSqlDialect, withDialect } from "./sql/ident";
 import {
   DRIVERS,
   MAX_CONNECTIONS,
@@ -93,7 +93,7 @@ import {
   type TableInfo,
 } from "./connections";
 import * as ddl from "./sql/ddl";
-import { setMysqlNoBackslashEscapes } from "./sql/ddl";
+import { limitedSelect } from "./sql/ddl";
 import { ddlCaps, ddlSupported } from "./sql/ddlCaps";
 import { clipWrite, clipRead } from "./clipboard";
 import { slackHistoryKey, type SlackExecuted } from "./slackEvents";
@@ -469,13 +469,22 @@ function App() {
     if (typeof algorithm !== "string" || typeof fingerprint !== "string") return null;
     return { host, port, algorithm, fingerprint };
   };
-  /** Run a connect attempt, and on an unknown host key offer Trust + the same retry. */
+  /**
+   * Run a connect attempt, and on an unknown host key offer Trust + the same retry.
+   *
+   * There is one prompt slot, and "Reopen last session" keeps iterating profiles
+   * while it is up (the rejection is swallowed here, so `connecting()` goes false).
+   * A second unknown host key must therefore NOT overwrite the first: the user is
+   * looking at a fingerprint and about to decide on it. The later prompt is dropped
+   * — its profile stays in the reopen offer, so it can be retried by hand.
+   */
   async function connectWithHostKeyPrompt(attempt: () => Promise<void>) {
     try {
       await attempt();
     } catch (e) {
       const prompt = sshHostKeyOf(e);
       if (!prompt) throw e;
+      if (sshPrompt()) return;
       setSshPrompt({ prompt, retry: attempt });
     }
   }
@@ -838,8 +847,9 @@ function App() {
     closeBackup();
     closeRestore();
     // These are frozen against one connection's result; after a switch their Run
-    // silently fails the origin check, which reads as a dead button.
-    setExportSrc(null);
+    // silently fails the origin check, which reads as a dead button. A run already
+    // in flight is the exception — it owns its progress and Cancel.
+    if (!exportBusy()) setExportSrc(null);
     if (!exportTablesBusy()) { setExportTables(null); setExportTablesProgress(null); }
     if (!importBusy()) { setImportOpen(null); importOrigin = null; }
   }, { defer: true }));
@@ -1309,7 +1319,21 @@ function App() {
 
   // import dialog — multi-step; the backend streams the file from disk, so no file
   // bytes cross the IPC boundary and progress arrives as `import-progress` events.
-  const [importOpen, setImportOpen] = createSignal<{ target: { schema: string; name: string } | null } | null>(null);
+  /**
+   * The dialog stays mounted while a run is in flight, so its catalog is FROZEN at
+   * open time the way `exportSrc` freezes a result: reading `tree()`/`schema()`/
+   * `connectionKind()` live would repaint the other connection's tables under a
+   * failed import that still offers **Back**, while `runImport` keeps sending the
+   * bound connection's id.
+   */
+  const [importOpen, setImportOpen] = createSignal<{
+    target: { schema: string; name: string } | null;
+    dialect: string;
+    supportsSchemas: boolean;
+    schemas: string[];
+    tables: { schema: string; name: string }[];
+    defaultSchema: string;
+  } | null>(null);
   const [importBusy, setImportBusy] = createSignal(false);
   const [importProgress, setImportProgress] = createSignal<ImportProgress | null>(null);
   let importOrigin: { origin: UiOrigin; connection: Connected } | null = null;
@@ -1319,6 +1343,14 @@ function App() {
     { title: string; tables: { schema: string; name: string }[]; selection: { schema: string; name: string }[]; connectionId: string } | null
   >(null);
   const [exportTablesBusy, setExportTablesBusy] = createSignal(false);
+  /**
+   * A single-result export is running (native save dialog open, or the backend
+   * streaming an all-rows re-run). Like `exportTablesBusy` and `importBusy` it keeps
+   * the dialog mounted across an active-connection switch: the dialog owns the run's
+   * progress and its Cancel, and unmounting it mid-run loses both. The snapshot it
+   * works from is frozen, so staying open cannot retarget another connection.
+   */
+  const [exportBusy, setExportBusy] = createSignal(false);
   const [exportTablesProgress, setExportTablesProgress] = createSignal<
     { index: number; total: number; table: string; rows: number; done: boolean } | null
   >(null);
@@ -1497,7 +1529,7 @@ function App() {
   };
   const boolCols = createMemo<Set<number>>(() => {
     const det = editDetail();
-    if (det) return typeBoolCols(editCols(), det.columns);
+    if (det) return typeBoolCols(editCols(), det.columns, connectionKind());
     return detectBoolCols(editCols(), editRows());
   });
   /**
@@ -1520,9 +1552,7 @@ function App() {
     const name = editCols()[oi]?.toLowerCase();
     const col = det.columns.find((c) => c.name.toLowerCase() === name);
     if (!col) return null;
-    // SQLite stores booleans as 0/1 (no native bool); PG/DuckDB accept true/false.
-    const numeric = connectionKind() === "sqlite" || connectionKind() === "mysql";
-    return { trueVal: numeric ? "1" : "true", falseVal: numeric ? "0" : "false", nullable: col.nullable };
+    return { ...boolEditTokens(connectionKind()), nullable: col.nullable };
   };
 
   // Memo (not a plain accessor): activeTab()'s identity changes on every patchTab
@@ -1783,7 +1813,7 @@ function App() {
       return st.running || st.fetchingMore || st.loadingAll;
     });
   const closeOperationBusy = () =>
-    anyConnectionBusy() || commitBusy() || importBusy() || backupBusy() || restoreBusy();
+    anyConnectionBusy() || commitBusy() || importBusy() || exportBusy() || exportTablesBusy() || backupBusy() || restoreBusy();
 
   const [slackStatus, setSlackStatus] = createSignal<SlackStatus>({ running: false, state: "disconnected", error: null });
   /**
@@ -1832,7 +1862,20 @@ function App() {
       : "Unsaved tabs may not survive closing.";
     setPersistenceWarning(`Editor recovery ${failure.operation} failed (${failure.message}). ${consequence}`);
   };
-  const persistRecoveryTo = (rt: ConnRuntime, key: string, data: PersistedTabs, forClose = false) => {
+  /**
+   * `clearOnSuccess` exists because the warning banner is global while saves are
+   * per connection: inside `persistAllRecovery`'s loop, a success on connection B
+   * must not erase the failure just reported for connection A — `onBeforeUnload`
+   * would then block the close with nothing on screen explaining why. The loop
+   * clears the banner itself, once, only when every connection saved.
+   */
+  const persistRecoveryTo = (
+    rt: ConnRuntime,
+    key: string,
+    data: PersistedTabs,
+    forClose = false,
+    clearOnSuccess = true,
+  ) => {
     if (!rt.recoveryWritable) {
       const error: TabsPersistenceFailure = {
         operation: "save",
@@ -1843,8 +1886,9 @@ function App() {
       return { ok: false as const, error };
     }
     const result = forClose ? tabsStore.saveForClose(key, data) : tabsStore.saveResult(key, data);
-    if (result.ok) setPersistenceWarning("");
-    else showPersistenceFailure(result.error);
+    if (result.ok) {
+      if (clearOnSuccess) setPersistenceWarning("");
+    } else showPersistenceFailure(result.error);
     return result;
   };
   /**
@@ -1854,11 +1898,22 @@ function App() {
    */
   const persistAllRecovery = (forClose = false): { unsafeDirty: boolean } => {
     let unsafeDirty = false;
+    let allSaved = true;
     for (const entry of connections()) {
       const snapshot = snapshotConnection(entry);
-      const saved = persistRecoveryTo(entry.runtime, recoveryKeys.get(entry.conn.id) ?? entry.conn.key, snapshot, forClose);
-      if (!saved.ok && snapshot.tabs.some((tab) => tab.dirty)) unsafeDirty = true;
+      const saved = persistRecoveryTo(
+        entry.runtime,
+        recoveryKeys.get(entry.conn.id) ?? entry.conn.key,
+        snapshot,
+        forClose,
+        false,
+      );
+      if (!saved.ok) {
+        allSaved = false;
+        if (snapshot.tabs.some((tab) => tab.dirty)) unsafeDirty = true;
+      }
     }
+    if (allSaved) setPersistenceWarning("");
     return { unsafeDirty };
   };
   const onBeforeUnload = (e: BeforeUnloadEvent) => {
@@ -3573,6 +3628,15 @@ function App() {
   }
 
   async function exportToFile(opts: ExportOptions, scope: ExportScope): Promise<boolean> {
+    setExportBusy(true);
+    try {
+      return await runExportToFile(opts, scope);
+    } finally {
+      setExportBusy(false);
+    }
+  }
+
+  async function runExportToFile(opts: ExportOptions, scope: ExportScope): Promise<boolean> {
     const src = exportSrc();
     if (!src || !originCurrent(src.origin, true)) return false;
     if (scope === "all" && transactionOpen(transaction())) {
@@ -3832,7 +3896,18 @@ function App() {
     importOrigin = { origin: captureOrigin(), connection: c };
     setImportProgress(null);
     setImportBusy(false);
-    setImportOpen({ target });
+    setImportOpen({
+      target,
+      dialect: connectionKind(),
+      supportsSchemas: caps()?.schemas !== false,
+      schemas: tree()?.schemas.map((sc) => sc.name) ?? [],
+      tables: schema().map((t) => ({ schema: t.schema, name: t.name })),
+      defaultSchema:
+        activeTab().searchSchema
+        ?? tree()?.schemas.find((sc) => sc.name === "public")?.name
+        ?? tree()?.schemas[0]?.name
+        ?? "public",
+    });
   }
 
   /** Parse the head of a file in Rust. No connection is involved. */
@@ -3842,8 +3917,11 @@ function App() {
 
   /** Target-table columns for the mapping step (cached tree detail where possible). */
   async function importTargetColumns(schemaName: string, table: string) {
-    const c = conn();
-    if (!c || !table) return [];
+    // The BOUND connection, not the active one: the dialog stays mounted across a
+    // connection switch while a run is in flight, and a same-named table on the
+    // newly focused connection would otherwise hand back its columns.
+    const c = importOrigin?.connection;
+    if (!c || !connectionOpen(c) || !table) return [];
     // `stateOf(c.id)`, not `details()`: after the await the focused connection may be
     // a different one, and a same-named table there would hand back its columns.
     const detailsOf = () => stateOf(c.id)?.details ?? {};
@@ -3866,7 +3944,9 @@ function App() {
   ): Promise<ImportSummary> {
     const binding = importOrigin;
     const c = binding?.connection;
-    if (!binding || !c || !connectionOpen(c) || metadataFrozen()) {
+    // `frozenFor(c.id)`, not `metadataFrozen()`: the freeze that matters belongs to
+    // the BOUND connection, and the active one may have moved on.
+    if (!binding || !c || !connectionOpen(c) || frozenFor(c.id)) {
       throw new Error("connection changed — reopen the import dialog");
     }
     const label = `${target.schema ? `${target.schema}.` : ""}${target.table}`;
@@ -3889,7 +3969,7 @@ function App() {
         error: null,
         schema: target.schema || null,
       }, c.key);
-      if (connectionOpen(c) && !metadataFrozen()) await loadSchema(c);
+      if (connectionOpen(c) && !frozenFor(c.id)) await loadSchema(c);
       return summary;
     } catch (e) {
       const message = errMsg(e);
@@ -4032,7 +4112,8 @@ function App() {
 
   function runTableLimit(schemaName: string, name: string, limit: number) {
     if (rejectFrozenExplorer()) return;
-    const q = withDialect(connectionKind(), () => `SELECT * FROM ${qualifyIn(schemaName, name, schemaName)} LIMIT ${limit}`);
+    // T-SQL has no LIMIT — `limitedSelect` emits `SELECT TOP (n)` on SQL Server.
+    const q = withDialect(connectionKind(), () => limitedSelect("*", qualifyIn(schemaName, name, schemaName), limit));
     openGeneratedTab(q, schemaName, name);
     doRun(q);
   }
@@ -5047,7 +5128,18 @@ function App() {
               <span class="panel-title2">Explorer</span>
               <div class="head-actions">
                 <button class="icon" title="New… (based on selection)" disabled={metadataFrozen()} onClick={(e) => openPlusMenu(e)}><Icon name="plus" /></button>
-                <button class="icon" title="Import data" disabled={metadataFrozen()} onClick={() => openImport(null)}><Icon name="download" /></button>
+                {/* Same gate as the Explorer's three import items: read-only, the
+                    manual-transaction freeze, and import's own engine support —
+                    walking the whole wizard only to be refused by the backend is
+                    worse than a disabled button that names the reason. */}
+                <button
+                  class="icon"
+                  {...(() => {
+                    const g = importGate(!pEnforced() || canCreateSchema() || schema().length > 0, "Requires CREATE somewhere in this database");
+                    return { title: g.title ?? "Import data", disabled: !!g.disabled };
+                  })()}
+                  onClick={() => openImport(null)}
+                ><Icon name="download" /></button>
                 <button class="icon" title={metadataFrozen() ? "Refresh deferred until transaction ends" : "Refresh"} disabled={schemaLoading() || metadataFrozen()} onClick={() => loadSchema()}>{schemaLoading() ? <span class="spinner-sm" /> : <Icon name="refresh" />}</button>
               </div>
             </div>
@@ -5540,11 +5632,11 @@ function App() {
         <Show when={importOpen()}>
           {(open) => (
             <ImportDialog
-              dialect={connectionKind()}
-              supportsSchemas={caps()?.schemas !== false}
-              schemas={tree()?.schemas.map((sc) => sc.name) ?? []}
-              tables={schema().map((t) => ({ schema: t.schema, name: t.name }))}
-              defaultSchema={activeTab().searchSchema ?? tree()?.schemas.find((sc) => sc.name === "public")?.name ?? tree()?.schemas[0]?.name ?? "public"}
+              dialect={open().dialect}
+              supportsSchemas={open().supportsSchemas}
+              schemas={open().schemas}
+              tables={open().tables}
+              defaultSchema={open().defaultSchema}
               initialTarget={open().target}
               onPickFile={async () => {
                 const picked = await openDialog({

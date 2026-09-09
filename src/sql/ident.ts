@@ -17,6 +17,13 @@
 let backtick = false; // true = MySQL identifier quoting
 let bracket = false; // true = SQL Server identifier quoting
 let dialect = "postgres"; // active driver dialect (drives DDL emission quirks)
+// Whether the connected MySQL session runs with NO_BACKSLASH_ESCAPES. The backend reads
+// `@@session.sql_mode` once at connect and reports it in the driver capabilities; App
+// sets this alongside the SQL dialect. There is no literal form that is correct under
+// both modes, so this has to be known rather than guessed. It lives here, beside the
+// dialect, so `withDialect` saves and restores it as well — leaving it behind was a gap
+// in the contract documented above (`sql/ddl.ts`'s `mysqlTextLiteral` reads it).
+let noBackslashEscapes = false;
 
 /** Set identifier quoting + dialect for the connected driver. Call on connect / dialect change. */
 export function setSqlDialect(d: string): void {
@@ -30,6 +37,16 @@ export function sqlDialect(): string {
   return dialect;
 }
 
+/** Record the connected MySQL session's NO_BACKSLASH_ESCAPES mode. Call on connect. */
+export function setMysqlNoBackslashEscapes(on: boolean): void {
+  noBackslashEscapes = on;
+}
+
+/** Whether the dialect currently in force treats backslashes as literal characters. */
+export function mysqlNoBackslashEscapes(): boolean {
+  return noBackslashEscapes;
+}
+
 /**
  * Run `build` with `d` as the identifier/literal dialect, then restore the previous
  * one. This is how SQL for a NON-active connection is generated: the module-level
@@ -40,13 +57,20 @@ export function withDialect<T>(d: string, build: () => T): T {
   const previousDialect = dialect;
   const previousBacktick = backtick;
   const previousBracket = bracket;
+  const previousNoBackslashEscapes = noBackslashEscapes;
   setSqlDialect(d);
+  // Borrowing another connection's dialect means its `sql_mode` is unknown, so fall
+  // back to the default (backslashes ARE escapes) rather than carrying the active
+  // connection's answer into SQL bound for a different server. Borrowing the SAME
+  // dialect is in practice the same connection, so that case keeps what it had.
+  if (d !== previousDialect) noBackslashEscapes = false;
   try {
     return build();
   } finally {
     dialect = previousDialect;
     backtick = previousBacktick;
     bracket = previousBracket;
+    noBackslashEscapes = previousNoBackslashEscapes;
   }
 }
 

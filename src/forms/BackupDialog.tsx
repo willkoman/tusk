@@ -249,8 +249,9 @@ export function BackupDialog(props: {
                 </For>
               </div>
               <div class="export-note">
-                A table selection covers the tables and their rows — views, sequences and
-                routines are only included by a schema or database backup.
+                A table selection covers those tables and their rows, plus — on PostgreSQL —
+                the sequences their <code>serial</code>/identity columns own; views, other
+                sequences and routines need a schema or database backup.
               </div>
             </Show>
           </section>

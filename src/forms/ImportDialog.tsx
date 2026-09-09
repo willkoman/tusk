@@ -30,6 +30,8 @@ type Mode = "existing" | "new";
 const SKIP = "-";
 /** Columns rendered in the preview grid. The mapping table still lists every one. */
 const PREVIEW_COLUMNS = 60;
+/** Rows rendered in the preview grid. The backend parses more (import.rs PREVIEW_ROWS). */
+const PREVIEW_ROWS_SHOWN = 20;
 
 /**
  * Multi-step file import: choose a file and parsing options, review the parsed preview,
@@ -320,15 +322,16 @@ export function ImportDialog(props: {
             {(p) => (
               <section class="export-sec">
                 <div class="export-label">
-                  Preview — {p().columns.length} columns, first {p().rows.length} row{p().rows.length === 1 ? "" : "s"}
+                  Preview — {p().columns.length} columns, {p().rows.length} row{p().rows.length === 1 ? "" : "s"} parsed
                   {p().truncated ? " (more follow)" : ""}
-                  {p().columns.length > PREVIEW_COLUMNS ? `, showing ${PREVIEW_COLUMNS}` : ""}
+                  {p().rows.length > PREVIEW_ROWS_SHOWN ? `, showing ${PREVIEW_ROWS_SHOWN} rows` : ""}
+                  {p().columns.length > PREVIEW_COLUMNS ? `, showing ${PREVIEW_COLUMNS} columns` : ""}
                 </div>
                 <div class="import-preview">
                   <table>
                     <thead><tr><For each={previewColumns(p())}>{(c) => <th>{c}</th>}</For></tr></thead>
                     <tbody>
-                      <For each={p().rows.slice(0, 20)}>
+                      <For each={p().rows.slice(0, PREVIEW_ROWS_SHOWN)}>
                         {(row) => (
                           <tr>
                             <For each={previewColumns(p())}>

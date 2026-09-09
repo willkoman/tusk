@@ -1,5 +1,5 @@
-import { sqlDialect } from "../sql/ident";
-import { lex, maskNonCode } from "../editor/lexer";
+import { sqlDialect, withDialect } from "../sql/ident";
+import { lex, maskNonCode, type SqlEngine } from "../editor/lexer";
 import { isReadStatement } from "../plan/explainSql";
 import { type ColumnClass, type FilterTree } from "./filterModel";
 import { activeConditionCount, renderWhere } from "./filterSql";
@@ -8,12 +8,13 @@ import type { SortKey } from "../tabs";
 // Server-side sort/filter works by wrapping the user's base query as a subquery and
 // re-streaming it. Pure + unit-testable.
 
-function queryShape(q: string): { inner: string; masked: string; safe: boolean } {
+function queryShape(q: string, dialect: string = sqlDialect()): { inner: string; masked: string; safe: boolean } {
   const trimmed = q.trim();
   if (!trimmed) return { inner: "", masked: "", safe: false };
   // The lexer is engine-aware (backticks/`#` comments mask as non-code on
-  // MySQL/SQLite), so no post-hoc backtick patching is needed here.
-  const { spans } = lex(trimmed);
+  // MySQL/SQLite), so no post-hoc backtick patching is needed here. Pass the OWNING
+  // connection's dialect: the module default is the active connection's.
+  const { spans } = lex(trimmed, dialect as SqlEngine);
   const masked = maskNonCode(trimmed, spans, 0, trimmed.length);
   const semis = [...masked.matchAll(/;/g)].map((m) => m.index!);
   if (semis.length > 1) return { inner: trimmed, masked, safe: false };
@@ -29,8 +30,8 @@ function queryShape(q: string): { inner: string; masked: string; safe: boolean }
 }
 
 /** Drop one true trailing statement terminator; semicolons in literals/comments stay intact. */
-export function stripTrailingSemi(q: string): string {
-  const shape = queryShape(q);
+export function stripTrailingSemi(q: string, dialect: string = sqlDialect()): string {
+  const shape = queryShape(q, dialect);
   return shape.safe ? shape.inner : q.trim();
 }
 
@@ -53,7 +54,7 @@ export function mssqlWrappable(inner: string): boolean {
  * worse, accept a shape T-SQL cannot nest).
  */
 export function wrappableQuery(q: string, dialect: string = sqlDialect()): boolean {
-  const shape = queryShape(q);
+  const shape = queryShape(q, dialect);
   // The same structural WITH classifier protects Explain Analyze and backend
   // cursoring, so sorting/filtering cannot re-run a WITH-led write either.
   if (!shape.safe || !isReadStatement(shape.inner, dialect)) return false;
@@ -91,8 +92,10 @@ export function wrapQuery(
   classOf?: (column: string) => ColumnClass,
 ): string {
   if (!wrappableQuery(base, dialect)) throw new Error("query cannot be safely wrapped for grid sorting or filtering");
-  const inner = stripTrailingSemi(base);
-  const where = renderWhere(filters, { columns, dialect, classOf });
+  const inner = stripTrailingSemi(base, dialect);
+  // `renderWhere` reaches `ident`/`lit` implicitly, which read the ACTIVE connection's
+  // dialect — pin the owning one, per the rule in `sql/ident.ts`.
+  const where = withDialect(dialect, () => renderWhere(filters, { columns, dialect, classOf }));
   const order = sorts
     .filter((s) => s.col >= 0 && s.col < columns.length)
     .map((s) => `${s.col + 1} ${s.dir === "desc" ? "DESC" : "ASC"}`)

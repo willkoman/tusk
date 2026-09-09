@@ -131,6 +131,15 @@ describe("declared-type tokens and DDL parity", () => {
     expect(sqlTypeFor("bigint", "sqlite")).toBe("INTEGER");
     expect(sqlTypeFor("text", "duckdb")).toBe("VARCHAR");
   });
+
+  // SQL Server refuses file import (import.rs), so the row is defence in depth: the
+  // picker must never fall back to PostgreSQL types on a T-SQL connection.
+  it("offers T-SQL types on SQL Server, never the PostgreSQL fallback", () => {
+    expect(sqlTypeFor("text", "mssql")).toBe("nvarchar(max)");
+    expect(sqlTypeFor("boolean", "mssql")).toBe("bit");
+    expect(sqlTypeFor("timestamp", "mssql")).toBe("datetime2");
+    expect(sqlTypeFor("integer", "mssql")).not.toBe(sqlTypeFor("integer", "postgres"));
+  });
 });
 
 describe("column mapping", () => {

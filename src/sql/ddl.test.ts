@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { setSqlDialect } from "./ident";
+import { setMysqlNoBackslashEscapes, setSqlDialect } from "./ident";
 import { ddlCaps } from "./ddlCaps";
 import {
   addColumn,
@@ -21,8 +21,9 @@ import {
   needsRebuild,
   renameColumn,
   renameRelation,
+  genSelect,
+  limitedSelect,
   scriptNote,
-  setMysqlNoBackslashEscapes,
   tableDiff,
   tableDiffProblems,
   truncate,
@@ -803,5 +804,28 @@ describe("scriptNote", () => {
     setSqlDialect("mysql");
     expect(scriptNote("A;\nB")).toMatch(/commits each DDL statement/);
     expect(scriptNote("A")).toBe("");
+  });
+});
+
+describe("limitedSelect / genSelect row caps", () => {
+  it("uses a trailing LIMIT on the LIMIT engines", () => {
+    for (const d of ["postgres", "duckdb", "sqlite", "mysql"]) {
+      setSqlDialect(d);
+      expect(limitedSelect("*", "t", 100)).toBe("SELECT *\nFROM t\nLIMIT 100");
+    }
+  });
+  it("uses SELECT TOP (n) on SQL Server, which has no LIMIT", () => {
+    setSqlDialect("mssql");
+    const sql = limitedSelect("*", "[dbo].[t]", 100);
+    expect(sql).toBe("SELECT TOP (100) *\nFROM [dbo].[t]");
+    expect(sql).not.toMatch(/\bLIMIT\b/i);
+  });
+  it("genSelect scaffolds the engine's own cap and quoting", () => {
+    setSqlDialect("postgres");
+    expect(genSelect("public", "users", ["id", "name"])).toBe(
+      'SELECT "id", "name"\nFROM "public"."users"\nLIMIT 100',
+    );
+    setSqlDialect("mssql");
+    expect(genSelect("dbo", "users", ["id"])).toBe("SELECT TOP (100) [id]\nFROM [dbo].[users]");
   });
 });
