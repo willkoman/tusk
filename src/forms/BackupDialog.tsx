@@ -281,9 +281,9 @@ export function BackupDialog(props: {
                 </For>
               </div>
               <div class="export-note">
-                A table selection covers those tables and their rows, plus — on PostgreSQL —
-                the sequences their <code>serial</code>/identity columns own; views, other
-                sequences and routines need a schema or database backup.
+                Covers the selected tables, their rows, and on PostgreSQL the sequences their{" "}
+                <code>serial</code> and identity columns own. Views, other sequences and
+                routines need a schema or database backup.
               </div>
             </Show>
           </section>

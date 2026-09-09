@@ -108,7 +108,7 @@ export function EditColumnForm(props: {
       </label>
       <Show when={caps.changeType === "rebuild"}>
         <div class="warn-note">
-          This dialog only renames the column on {caps.label}. For type, NOT NULL or default, use <b>Modify table…</b>.
+          Only the rename applies on {caps.label}. Use <b>Modify table…</b> for type, NOT NULL or default.
         </div>
       </Show>
       <Show when={note()}>

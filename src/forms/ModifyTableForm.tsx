@@ -257,7 +257,7 @@ export function ModifyTableForm(props: {
     if (!sql()) return "";
     const base = scriptNote(sql(), caps);
     if (!rebuilding()) return base;
-    return `Tusk rebuilds the table: create, copy, drop, rename. Columns, primary key, table options and every constraint, index and trigger kept above are recreated; foreign-key enforcement is off for the run. ${base}`;
+    return `Tusk rebuilds the table: create, copy, drop, rename. Columns, primary key, table options and every kept constraint, index and trigger are recreated. Foreign-key enforcement is off during the run. ${base}`;
   });
 
   const toggleUniqueCol = (i: number, c: string) =>

@@ -138,7 +138,7 @@ export function ExportTablesDialog(props: {
               <span class="busy-label">
                 <span class="spinner-sm" />
                 Exporting {props.progress()?.index ?? 0}/{props.progress()?.total ?? chosen().length}
-                {props.progress()?.table ? ` — ${props.progress()!.table}` : ""}
+                {props.progress()?.table ? ` · ${props.progress()!.table}` : ""}
               </span>
               <span class="spacer" />
               <button class="ghost" onClick={() => void cancelRun()}>Cancel</button>
@@ -202,7 +202,7 @@ export function ExportTablesDialog(props: {
             </Show>
           </div>
           <div class="export-note">
-            One <code>.{FORMAT_EXT[opts().format]}</code> file per table, named <code>schema_table</code>, written into a directory you choose next.
+            One <code>.{FORMAT_EXT[opts().format]}</code> file per table, named <code>schema_table</code>. Choose the directory next.
           </div>
         </section>
 
@@ -222,8 +222,8 @@ export function ExportTablesDialog(props: {
               </ul>
               <Show when={failures().length}>
                 <div class="export-note">
-                  Files written before a failure are kept; a cancel stops the run and the
-                  remaining tables are listed as <code>cancelled</code>.
+                  Files written before a failure are kept. Cancel stops the run and lists the
+                  rest as <code>cancelled</code>.
                 </div>
               </Show>
             </section>
