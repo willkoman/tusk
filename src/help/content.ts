@@ -12,15 +12,19 @@ export const TOPICS: Topic[] = [
     "blocks": [
       {
         "k": "p",
-        "md": "Tusk opens on the **connect screen**: saved connections on the left, a connection form on the right. Postgres is first-class, but the same form connects to DuckDB, SQLite, MySQL, and SQL Server — the mascot on the card, topbar, and OS window title adapts to the driver (🐘 PostgreSQL, 🦆 DuckDB, 🪶 SQLite, 🐬 MySQL, 🧱 SQL Server)."
+        "md": "Tusk opens on the **connect screen**: saved connections left, connection form right. The driver mascot marks the card, topbar, and OS window title (🐘 PostgreSQL, 🦆 DuckDB, 🪶 SQLite, 🐬 MySQL, 🧱 SQL Server)."
       },
       {
         "k": "p",
-        "md": "**Up to 16 connections can be open at once.** Once one is open, the same screen returns as a panel over your workspace — the **＋** at the end of the topbar's connection strip, or [[kbd:Mod-Shift-n]] — so opening another database never costs you the one you are already working in. See [[topic:workspace|Workspace]] for the strip, the per-connection state dots, and how tabs are tied to their connection."
+        "md": "Up to **16 connections** open at once. **＋** at the end of the topbar connection strip, or [[kbd:Mod-Shift-n]], opens the connect screen as a panel — see [[topic:workspace|Workspace]]."
       },
       {
-        "k": "p",
-        "md": "When nothing is connected, the screen offers **Reopen last session**: the saved profiles that were open the last time you used Tusk, reconnected in the order you had them. It is always a click, never automatic — passwords come from the OS keychain, and connections you typed in without saving are not remembered at all. A *Connect on startup* profile still connects on its own as before."
+        "k": "list",
+        "items": [
+          "**Reopen last session** — relists the profiles open at last quit, in their order. One click; never automatic.",
+          "Ad-hoc connections typed without saving are not listed.",
+          "A *Connect on startup* profile still connects on launch."
+        ]
       },
       {
         "k": "h",
@@ -29,23 +33,21 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Each profile in the **Connections** panel shows its mascot, name, and target (`user@host:port/dbname`, or the file path / `:memory:` for embedded drivers), plus a lock icon when a password is stored."
+        "md": "Each profile shows mascot, name, and target — `user@host:port/dbname`, or the file path / `:memory:` for embedded drivers. A lock icon marks a stored password."
       },
       {
         "k": "list",
         "items": [
-          "**Click** — connects immediately if embedded or the password is saved; otherwise loads into the form so you can type the password.",
-          "**Right-click** — **Connect**, **Edit**, **Duplicate**, **Set as default** / **Unset default**, **Copy connection string**, **Delete…**. Deleting asks first: it removes the saved connection and its keychain password permanently, and does not touch the database itself."
+          "**Click** — connects when embedded or the password is saved; otherwise loads the form for the password.",
+          "**Right-click** — Connect, Edit, Duplicate, Set as default / Unset default, Copy connection string, Delete….",
+          "**Delete…** — confirms, then removes the profile and its keychain password. The database is untouched.",
+          "**Set as default** — connects on launch. Exactly one profile holds the flag; setting it clears the others.",
+          "**Try to continue** after a connect error offers the profile in the reopen list instead of connecting it."
         ]
       },
       {
         "k": "p",
-        "md": "*Copy connection string* yields `postgresql://user@host:port/db` (or `mysql://…`) with `?sslmode=` appended when it differs from the default `prefer` — the password is never included. Embedded drivers copy the file path."
-      },
-      {
-        "k": "tip",
-        "kind": "tip",
-        "md": "**Connect on startup**: check the box in the form or right-click → *Set as default*. Exactly one profile holds the flag — setting it clears the others — and Tusk auto-connects on launch. Recovering from an error with **Try to continue** deliberately does not: the profile is offered in the reopen list instead of being connected behind your back."
+        "md": "*Copy connection string* yields `postgresql://user@host:port/db` (or `mysql://…`), with `?sslmode=` appended when it differs from the default `prefer`. The password is excluded; embedded drivers copy the file path."
       },
       {
         "k": "h",
@@ -54,19 +56,21 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "The **Driver** select switches the form."
+        "md": "The **Driver** select switches the form fields."
       },
       {
         "k": "list",
         "items": [
-          "**PostgreSQL / MySQL / SQL Server** — *Host / Port / User / Password / Database / SSL Mode*, plus an optional **SSH tunnel** section for all three; switching driver moves the default port (5432 / 3306 / 1433) and makes *Database* optional away from PostgreSQL. SQL Server takes a SQL login — Windows integrated authentication isn't supported yet.",
-          "**DuckDB / SQLite** — a single **Database file** field with *Browse…*; **leave it blank for a scratch in-memory database**. No password or SSL — *Save password* disappears."
+          "**PostgreSQL / MySQL / SQL Server** — Host, Port, User, Password, Database, SSL Mode, and an optional **SSH tunnel** section.",
+          "Switching driver moves the default port (5432 / 3306 / 1433). *Database* is optional away from PostgreSQL.",
+          "SQL Server takes a SQL login; Windows integrated authentication isn't supported yet.",
+          "**DuckDB / SQLite** — one **Database file** field with *Browse…*; blank means an in-memory database. No password or SSL, so *Save password* disappears."
         ]
       },
       {
         "k": "tip",
         "kind": "tip",
-        "md": "A file-backed **DuckDB** database holds an exclusive OS file lock — Tusk releases the connection when idle and reopens it lazily on your next query, so other processes can grab the file between runs. `:memory:` stays open (closing would lose your data)."
+        "md": "A file-backed **DuckDB** database holds an exclusive OS file lock; Tusk drops the connection when idle and reopens it on the next query, while `:memory:` stays open."
       },
       {
         "k": "h",
@@ -74,13 +78,17 @@ export const TOPICS: Topic[] = [
         "id": "passwords-ssl"
       },
       {
-        "k": "p",
-        "md": "**Save password** puts the password in the **OS keychain** (macOS Keychain / Windows Credential Manager / Secret Service API on Linux), keyed by profile id — `connections.json` holds only metadata, and the password is fetched server-side at connect time, **never sent to the frontend**. Uncheck the box and save to delete the keychain entry."
+        "k": "list",
+        "items": [
+          "**Save password** stores it in the **OS keychain** (macOS Keychain, Windows Credential Manager, Secret Service on Linux), keyed by profile id.",
+          "`connections.json` holds metadata only. The password is read server-side at connect time and never reaches the frontend.",
+          "Uncheck the box and save to delete the keychain entry."
+        ]
       },
       {
         "k": "tip",
         "kind": "warn",
-        "md": "**macOS dev-build caveat:** unsigned `tauri dev` builds re-prompt for keychain access and can invalidate saved passwords across rebuilds (macOS ties keychain items to the code signature). Signed release builds are seamless."
+        "md": "Unsigned `tauri dev` builds on macOS re-prompt for keychain access and can invalidate saved passwords across rebuilds."
       },
       {
         "k": "table",
@@ -99,11 +107,11 @@ export const TOPICS: Topic[] = [
           ],
           [
             "`require`",
-            "Always encrypts, but does **not** verify the certificate or hostname (self-signed certs work)."
+            "Encrypts without verifying the certificate or hostname. Self-signed certs work."
           ],
           [
             "`verify-full`",
-            "Encrypts *and* verifies the certificate chain and hostname — libpq semantics."
+            "Encrypts and verifies the certificate chain and hostname (libpq semantics)."
           ]
         ]
       },
@@ -114,28 +122,29 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**PostgreSQL, MySQL, and SQL Server** connections can go through an SSH tunnel. Tick **Connect through an SSH tunnel** in the form and fill in the SSH *host*, *port* (22 by default), and *user*. The SSH client is built into Tusk — nothing to install, and no `ssh -L` to leave running."
+        "md": "**PostgreSQL, MySQL, and SQL Server** can tunnel over SSH. Tick **Connect through an SSH tunnel**, then fill in the SSH host, port (22 by default), and user."
       },
       {
         "k": "tip",
         "kind": "tip",
-        "md": "The **Host** and **Port** at the top of the form are the database *as the SSH server sees it* — usually `localhost` and `5432`/`3306`. Tusk binds a private loopback port, forwards it over the SSH connection, and points the driver at that port."
+        "md": "**Host** and **Port** at the top of the form are the database as the SSH server sees it — usually `localhost` and `5432`/`3306`."
       },
       {
         "k": "list",
         "items": [
           "**Password** — the SSH login password.",
-          "**Private key** — an OpenSSH or PEM key file (*Browse…* picks one); leave the passphrase blank for an unencrypted key.",
-          "**SSH agent** — uses the running agent: `$SSH_AUTH_SOCK` on macOS and Linux, the OpenSSH agent pipe on Windows. Tusk stores nothing."
+          "**Private key** — an OpenSSH or PEM key file via *Browse…*. Leave the passphrase blank for an unencrypted key.",
+          "**SSH agent** — `$SSH_AUTH_SOCK` on macOS and Linux, the OpenSSH agent pipe on Windows. Nothing is stored."
         ]
       },
       {
-        "k": "p",
-        "md": "**Save … in the OS keychain** stores the SSH password or key passphrase under its own keychain entry, separate from the database password, and it is read server-side at connect time — never sent to the frontend and never written to `connections.json`. The destination rule matches the database password: change the SSH host, port, user, authentication method, or private-key file and Tusk asks you to enter the secret again rather than pointing the old one at a new machine."
-      },
-      {
-        "k": "p",
-        "md": "A tunnelled connection is marked **SSH** next to its name in the topbar and in the Connections list. If the link drops, the next command re-establishes the tunnel before reconnecting."
+        "k": "list",
+        "items": [
+          "**Save … in the OS keychain** puts the SSH password or passphrase in its own entry, read server-side at connect time.",
+          "Changing the SSH host, port, user, auth method, or key file requires entering the secret again.",
+          "A tunnelled connection is marked **SSH** in the topbar and the Connections list.",
+          "If the link drops, the next command re-establishes the tunnel before reconnecting."
+        ]
       },
       {
         "k": "h",
@@ -144,21 +153,44 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Tusk checks the SSH server's host key against your `~/.ssh/known_hosts` — plain, `[host]:port`, comma-lists, `*`/`?` wildcards, `!` negations and hashed (`ssh-keygen -H`) names are all understood — and against its own trust store in the app config directory. `@revoked` is honoured; `@cert-authority` lines are parsed and then skipped, because Tusk does not verify host certificates yet, so a CA-covered bastion still prompts as an unknown host. `known_hosts` is only ever **read**; Tusk does not write to it."
+        "md": "Tusk checks the server's host key against `~/.ssh/known_hosts` and its own trust store in the app config directory. `known_hosts` is only read, never written."
       },
       {
         "k": "list",
         "items": [
-          "**Unknown host** — the connection stops and a dialog shows the key type and `SHA256:…` fingerprint. Compare it against the server (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` prints the same value), then **Trust and connect** records it and retries.",
-          "**Key changed** — refused outright, with no accept button. A host key that changed against a stored one is what a man-in-the-middle looks like; if the change really is legitimate, remove the old entry from `known_hosts` or from `ssh_known_hosts.json` in the app config directory.",
-          "**Key revoked** — a key listed under `@revoked` in `known_hosts` is refused, and is never offered for trust. Two things take precedence over it, so keep the file tidy: a key you have already accepted into Tusk's own trust store is checked first, and `known_hosts` is read in file order, so a plain entry for the same key *above* the `@revoked` line wins.",
-          "**Records unreadable** — if `known_hosts` or the trust store cannot be read, or holds an entry for this host that cannot be parsed, the connection is refused with that reason. Tusk will not offer to trust a key it could not compare against what you already have."
+          "Understood entries: plain, `[host]:port`, comma-lists, `*`/`?` wildcards, `!` negations, hashed (`ssh-keygen -H`) names.",
+          "`@revoked` is honoured. `@cert-authority` lines are parsed then skipped, so a CA-covered bastion prompts as an unknown host."
+        ]
+      },
+      {
+        "k": "table",
+        "head": [
+          "Outcome",
+          "Behaviour"
+        ],
+        "rows": [
+          [
+            "Unknown host",
+            "Dialog shows key type and `SHA256:…` fingerprint; **Trust and connect** records it and retries. `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` prints the same value."
+          ],
+          [
+            "Key changed",
+            "Refused, with no accept button. Remove the old entry from `known_hosts` or `ssh_known_hosts.json`."
+          ],
+          [
+            "Key revoked",
+            "Refused and never offered for trust. Tusk's own trust store is checked first, and `known_hosts` is read in file order, so a plain entry above the `@revoked` line wins."
+          ],
+          [
+            "Records unreadable",
+            "Refused with the reason, including an entry for this host that cannot be parsed."
+          ]
         ]
       },
       {
         "k": "tip",
         "kind": "tip",
-        "md": "`verify-full` works through a tunnel on all three tunnelling drivers: TLS still runs end to end with the real database server, so the certificate is checked against the **Host** you entered rather than against the loopback address the tunnel listens on."
+        "md": "`verify-full` works through a tunnel: TLS runs end to end, so the certificate is checked against the **Host** entered, not the loopback address."
       },
       {
         "k": "h",
@@ -167,15 +199,15 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "The **Read-only (block writes & DDL)** checkbox is enforced in layers — the safest way to point Tusk at production (see [[topic:safety|Safety & guardrails]]):"
+        "md": "**Read-only (block writes & DDL)** is enforced in layers — see [[topic:safety|Safety & guardrails]]."
       },
       {
         "k": "list",
         "items": [
-          "Engine enforcement where the engine has it — `SET default_transaction_read_only = on` on Postgres, `AccessMode::ReadOnly` on file-backed DuckDB, `SQLITE_OPEN_READ_ONLY` on SQLite, `SET SESSION TRANSACTION READ ONLY` on MySQL. SQL Server has no session-level equivalent, so there the client guard below is the whole enforcement",
-          "One uniform, engine-aware client guard rejects writes and DDL before they're sent",
-          "Mutating sidebar items disabled with a *\"Connection is read-only\"* tooltip",
-          "[[topic:grid-editing|In-grid editing]] switches off with the same reason, and file import is blocked in the backend"
+          "Engine enforcement: `SET default_transaction_read_only = on` (Postgres), `AccessMode::ReadOnly` (file-backed DuckDB), `SQLITE_OPEN_READ_ONLY` (SQLite), `SET SESSION TRANSACTION READ ONLY` (MySQL). SQL Server has no session equivalent.",
+          "A uniform engine-aware client guard rejects writes and DDL before they are sent.",
+          "Mutating sidebar items are disabled with a *Connection is read-only* tooltip.",
+          "[[topic:grid-editing|In-grid editing]] switches off and file import is blocked in the backend."
         ]
       },
       {
@@ -185,7 +217,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "On connect, the backend reports a capabilities set and the UI gates on it — the active-schema selector, Import, and Export only appear where they work."
+        "md": "The backend reports a capabilities set on connect. The active-schema selector, Import, and Export appear only where they work."
       },
       {
         "k": "table",
@@ -321,8 +353,12 @@ export const TOPICS: Topic[] = [
         ]
       },
       {
-        "k": "p",
-        "md": "On Postgres, the sidebar also fetches your role's **effective privileges** and disables actions you can't perform (reason in the tooltip); other drivers report `enforced: false` — the server is still the authority. SQLite has no `EXPLAIN ANALYZE`, so that menu item is disabled with a *\"Not supported by this engine\"* tooltip — see [[topic:plans|Plan visualization]] and [[topic:import-export|Import & export]]."
+        "k": "list",
+        "items": [
+          "On Postgres the sidebar fetches the role's **effective privileges** and disables actions it cannot perform, with the reason in the tooltip.",
+          "Other drivers report `enforced: false`; the server remains the authority.",
+          "SQLite has no `EXPLAIN ANALYZE`, so that item carries a *Not supported by this engine* tooltip — see [[topic:plans|Plan visualization]] and [[topic:import-export|Import & export]]."
+        ]
       },
       {
         "k": "h",
@@ -330,25 +366,33 @@ export const TOPICS: Topic[] = [
         "id": "resilience"
       },
       {
-        "k": "p",
-        "md": "Query duration is never capped, but dead-connection detection is: a **10-second connect timeout** plus aggressive TCP keepalives (5s idle, 2s interval, 3 retries, 15s user-timeout) surface a dead Postgres connection in roughly 10–15 seconds. An idle connection can reopen before your next explicit action, but Tusk **never replays** a statement after the server may have seen it. A dropped manual transaction is marked lost rather than reconstructed; reconnect and verify its outcome."
+        "k": "list",
+        "items": [
+          "Query duration is never capped. A 10-second connect timeout plus TCP keepalives (5s idle, 2s interval, 3 retries, 15s user-timeout) surface a dead Postgres link in 10–15 seconds.",
+          "An idle connection reopens before the next explicit action. A statement the server may have seen is never replayed.",
+          "A dropped manual transaction is marked lost, not reconstructed. Reconnect and verify its outcome."
+        ]
       },
       {
         "k": "tip",
         "kind": "warn",
-        "md": "A re-open drops any open streaming cursor: scrolling for more rows shows an explicit *\"connection dropped mid-stream\"* error over the rows you already have — re-run the query for a complete result. Tusk never silently presents a truncated result as done."
+        "md": "A re-open drops any open streaming cursor: scrolling shows a *connection dropped mid-stream* error over the rows already loaded, and the query must be re-run."
       }
     ],
     "icon": "database"
   },
   {
+    "blurb": "Tabs, files, run controls, manual transactions, parameters, and per-tab active schema.",
     "id": "editor",
     "title": "SQL editor, tabs & files",
-    "blurb": "Tabs, files, run controls, manual transactions, parameters, and per-tab active schema.",
     "blocks": [
       {
-        "k": "p",
-        "md": "Every tab owns its SQL buffer, undo history, cursor, fold state, result snapshot, and grid view — but one server cursor per connection means only the last-run tab keeps streaming (see [[topic:results|Results & streaming]]). The tab set (SQL text, dirty state, file bindings, titles, active schema) persists per connection and restores on reconnect; results and pending grid edits don't."
+        "k": "list",
+        "items": [
+          "Each tab owns its SQL buffer, undo history, cursor, fold state, result snapshot, and grid view.",
+          "One server cursor per connection, so only the last-run tab keeps streaming — see [[topic:results|Results & streaming]].",
+          "The tab set persists per connection: SQL text, dirty state, file bindings, titles, active schema. Results and pending grid edits do not."
+        ]
       },
       {
         "k": "h",
@@ -359,17 +403,16 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**Open** — the **＋** button or [[kbd:Mod-t]].",
-          "**Close** — **×**, [[kbd:Mod-w]], or **middle-click**. A dirty tab (● dot) prompts an *Unsaved changes* dialog: **Save** / **Don't save** / **Cancel**. Closing the transaction owner first opens **Resolve transaction first**.",
-          "**Right-click** — **Rename…**, **Close**, **Close others**, **Close tabs to the right**; bulk-close skips dirty tabs and reports how many were kept.",
-          "**Reorder** — drag tabs; a vertical scroll wheel pans an overflowing strip.",
+          "**Close** — **×**, [[kbd:Mod-w]], or middle-click. A dirty tab (● dot) prompts **Save** / **Don't save** / **Cancel**; the transaction owner prompts **Resolve transaction first**.",
+          "**Right-click** — Rename…, Close, Close others, Close tabs to the right. Bulk-close skips dirty tabs and reports how many were kept.",
+          "**Reorder** — drag tabs. A vertical scroll wheel pans an overflowing strip.",
           "Closing the last tab leaves a fresh empty one."
-        ],
-        "ordered": false
+        ]
       },
       {
         "k": "tip",
         "kind": "tip",
-        "md": "Sidebar scaffolds (`SELECT`/`INSERT`/`UPDATE` generators, \"Edit as SQL\") open in a **new tab** with the relation's schema pre-selected — they never clobber what you're writing."
+        "md": "Sidebar scaffolds and *Edit as SQL* open in a new tab with the relation's schema pre-selected."
       },
       {
         "k": "h",
@@ -377,12 +420,12 @@ export const TOPICS: Topic[] = [
         "id": "files"
       },
       {
-        "k": "p",
-        "md": "**Open** ([[kbd:Mod-o]]), **Save** ([[kbd:Mod-s]]), and **Save As** ([[kbd:Mod-Shift-s]]) use native dialogs — Open filters to `.sql`/`.txt`, Save As to `.sql`. Opening an already-open file switches to its tab; a saved tab takes the file's basename as its title (hover for the full path)."
-      },
-      {
-        "k": "p",
-        "md": "When the pane gets narrow, text actions (Open/Save/Save As/Format/Find/Explain) collapse into a **⋯** overflow menu; at the narrowest widths the font-size/wrap icons hide."
+        "k": "list",
+        "items": [
+          "**Open** ([[kbd:Mod-o]]) filters to `.sql`/`.txt`; **Save** ([[kbd:Mod-s]]) and **Save As** ([[kbd:Mod-Shift-s]]) use `.sql`. All three use native dialogs.",
+          "Opening an already-open file switches to its tab. A saved tab takes the file's basename as its title; hover for the full path.",
+          "In a narrow pane, Open/Save/Save As/Format/Find/Explain collapse into a **⋯** menu, and the font-size and wrap icons hide at the narrowest widths."
+        ]
       },
       {
         "k": "h",
@@ -390,20 +433,35 @@ export const TOPICS: Topic[] = [
         "id": "running"
       },
       {
-        "k": "p",
-        "md": "**Run ▶** ([[kbd:Mod-Enter]]) runs the selection — *exactly* the selected text — otherwise the buffer. In flight the button becomes **✕ Cancel** with a live elapsed counter on engines that can cancel; where cancellation is impossible (SQLite, MySQL, SQL Server, DuckDB on Windows) it shows a disabled **Running 0:12** timer instead of a Cancel that can't work. PostgreSQL uses a real server-side `CancelRequest`; a rejected cancel resets the button and reports why rather than sitting on *Cancelling…*."
+        "k": "list",
+        "items": [
+          "**Run ▶** ([[kbd:Mod-Enter]]) runs exactly the selected text, or the whole buffer.",
+          "In flight the button becomes **✕ Cancel** with an elapsed counter. Where cancellation is impossible — SQLite, MySQL, SQL Server, DuckDB on Windows — it shows a disabled **Running 0:12** timer.",
+          "PostgreSQL uses a server-side `CancelRequest`. A rejected cancel resets the button and reports why.",
+          "Each statement gets a **▶ gutter marker**; click it to run that statement, and the marker becomes a spinner pinned to it.",
+          "With several statements the one under the cursor is highlighted and the status bar shows *Stmt N/M*."
+        ]
       },
       {
         "k": "p",
-        "md": "Each statement gets a **▶ gutter marker** — click it to run just that statement (the marker swaps to a spinner, pinned to that statement while it executes). With several statements, the one under your cursor is highlighted and the status bar shows *Stmt N/M*."
+        "md": "Statement splitting is engine-aware and matches execution. Run selection, auto-fold, linting, parameter detection, and grid sort/filter all read the same lexer."
       },
       {
-        "k": "p",
-        "md": "Statement splitting is **engine-aware**, matching execution. On MySQL, `#` comments and `--` without trailing whitespace lex correctly and backslash escapes inside quotes are honored; backtick identifiers are first-class on MySQL and SQLite. On SQL Server, `[bracketed identifiers]` (with `]]` escapes), `N'literals'`, and nested `/* … /* … */ … */` comments hold semicolons inertly, and a line-only `GO` ends the batch **without being sent to the server**, with or without a trailing comment (a `GO 5` repeat count is refused rather than run once). A `;` inside a T-SQL block — `BEGIN … END`, `BEGIN TRY`/`BEGIN CATCH`, `CASE … END` — belongs to the statement, so a `CREATE PROCEDURE` body runs as written instead of being chopped up; `BEGIN TRAN[SACTION]` still opens a transaction, not a block. Everything built on the lexer — Run selection or current statement, auto-fold, linting, parameter detection, and grid sort/filter — reads each engine's SQL the way the server does."
+        "k": "list",
+        "items": [
+          "**MySQL** — `#` comments, `--` without trailing whitespace, backslash escapes inside quotes. Backtick identifiers are first-class on MySQL and SQLite.",
+          "**SQL Server** — `[bracketed identifiers]` with `]]` escapes, `N'literals'`, and nested `/* … /* … */ … */` comments hold semicolons inertly.",
+          "A line-only `GO` ends the batch without being sent to the server, with or without a trailing comment. `GO 5` is refused.",
+          "A `;` inside `BEGIN … END`, `BEGIN TRY`/`BEGIN CATCH`, or `CASE … END` belongs to the statement, so a `CREATE PROCEDURE` body runs whole. `BEGIN TRAN[SACTION]` still opens a transaction."
+        ]
       },
       {
-        "k": "p",
-        "md": "Run with the cursor in a multi-statement buffer and nothing selected, and a **Run…** popover asks **Current block** or **Entire file** (↑↓ to choose, Enter to run, Esc to cancel); [[kbd:Mod-Shift-Enter]] skips the prompt and runs the exact non-blank selection, or the statement under the cursor when nothing is selected. Every base run — success, error, or cancel — lands in [[topic:history|query history]] with its duration (row count on success)."
+        "k": "list",
+        "items": [
+          "With the cursor in a multi-statement buffer and nothing selected, a **Run…** popover asks **Current block** or **Entire file**: ↑↓ to choose, Enter to run, Esc to cancel.",
+          "[[kbd:Mod-Shift-Enter]] skips the prompt and runs the exact non-blank selection, or the statement under the cursor.",
+          "Every base run — success, error, or cancel — lands in [[topic:history|query history]] with its duration, and its row count on success."
+        ]
       },
       {
         "k": "keys",
@@ -456,12 +514,13 @@ export const TOPICS: Topic[] = [
         "id": "scripts"
       },
       {
-        "k": "p",
-        "md": "An ordinary idle multi-statement run with no transaction control uses one **app-owned transaction**. Any failure rolls back prior DML and reports the failing statement. A trailing read stays inside that wrapper, so the UI returns a summary instead of splitting it out for streaming. MySQL DDL and nontransactional tables retain their engine-level rollback limits."
-      },
-      {
-        "k": "p",
-        "md": "Pasted `pg_dump` output works: `COPY … FROM stdin` data blocks (terminated by `\\.`) are fed through `COPY`, even behind a leading `--` comment block."
+        "k": "list",
+        "items": [
+          "An ordinary idle multi-statement run with no transaction control uses one app-owned transaction. A failure rolls back prior DML and names the failing statement.",
+          "A trailing read stays inside that wrapper, so the result is a summary rather than a stream.",
+          "MySQL DDL and nontransactional tables keep their engine-level rollback limits.",
+          "Pasted `pg_dump` output works: `COPY … FROM stdin` blocks terminated by `\\.` are fed through `COPY`, even behind a leading `--` comment block."
+        ]
       },
       {
         "k": "h",
@@ -470,11 +529,23 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Run raw `BEGIN` or `START TRANSACTION`, `COMMIT` or `END`, and `ROLLBACK` or `ABORT` directly. Transaction-control scripts are lifecycle-preflighted and run statement by statement on one owner session — self-contained (`BEGIN; …; COMMIT`) or across separate runs. Savepoint / rollback-to / release work on PostgreSQL, SQLite, and MySQL. PostgreSQL supports `SET TRANSACTION` while active and before work; MySQL supports it before `START TRANSACTION`. DuckDB has neither savepoints nor `SET TRANSACTION`; SQLite has no `SET TRANSACTION`. SQL Server uses its own words — `BEGIN TRANSACTION`/`BEGIN TRAN`, `SAVE TRANSACTION name`, and `ROLLBACK TRANSACTION name` to return to a savepoint — while a bare `BEGIN`/`END` stays a statement block; it has no `RELEASE SAVEPOINT`, and `SET TRANSACTION ISOLATION LEVEL` / `SET IMPLICIT_TRANSACTIONS` are refused because they change the whole session rather than one unit."
+        "md": "Raw `BEGIN` / `START TRANSACTION`, `COMMIT` / `END`, and `ROLLBACK` / `ABORT` run directly. Transaction-control scripts are lifecycle-preflighted and run statement by statement on one owner session, self-contained or across separate runs."
       },
       {
-        "k": "p",
-        "md": "The transaction bar shows mode, id, state, owner tab, and elapsed time. Only the owner can run database work; other tabs stay editable but their queries and session-backed metadata are frozen. The bar offers **Switch to owner**, Commit/Rollback, MySQL next-transaction Start/Clear, and lost-session reconnect actions."
+        "k": "list",
+        "items": [
+          "Savepoint, rollback-to, and release work on PostgreSQL, SQLite, and MySQL.",
+          "`SET TRANSACTION`: PostgreSQL while active and before work; MySQL before `START TRANSACTION`. DuckDB has neither savepoints nor `SET TRANSACTION`; SQLite has no `SET TRANSACTION`.",
+          "SQL Server uses `BEGIN TRANSACTION`/`BEGIN TRAN`, `SAVE TRANSACTION name`, and `ROLLBACK TRANSACTION name`, while a bare `BEGIN`/`END` stays a statement block. It has no `RELEASE SAVEPOINT`, and `SET TRANSACTION ISOLATION LEVEL` / `SET IMPLICIT_TRANSACTIONS` are refused as session-wide."
+        ]
+      },
+      {
+        "k": "list",
+        "items": [
+          "The transaction bar shows mode, id, state, owner tab, and elapsed time.",
+          "Only the owner runs database work. Other tabs stay editable, but their queries and session-backed metadata freeze.",
+          "The bar offers **Switch to owner**, Commit/Rollback, MySQL next-transaction Start/Clear, and lost-session reconnect actions."
+        ]
       },
       {
         "k": "keys",
@@ -490,17 +561,27 @@ export const TOPICS: Topic[] = [
         ]
       },
       {
-        "k": "p",
-        "md": "MySQL `SET autocommit=0` keeps one physical connection pinned. **Commit unit** or **Rollback unit** ends only the current unit; **Commit & enable autocommit** runs `SET autocommit=1`, commits the current unit, and releases the owner session. Recognized implicit-commit DDL is blocked inside a tracked MySQL transaction, but DDL outside it still auto-commits and nontransactional tables cannot be rolled back."
+        "k": "list",
+        "items": [
+          "MySQL `SET autocommit=0` keeps one physical connection pinned.",
+          "**Commit unit** / **Rollback unit** ends only the current unit. **Commit & enable autocommit** runs `SET autocommit=1`, commits, and releases the owner session.",
+          "Recognized implicit-commit DDL is blocked inside a tracked MySQL transaction. DDL outside it still auto-commits, and nontransactional tables cannot be rolled back."
+        ]
       },
       {
         "k": "tip",
         "kind": "warn",
-        "md": "A PostgreSQL statement error or cancellation requires `ROLLBACK` or `ROLLBACK TO` before more work. A dropped or unexpectedly ended owner session becomes **Lost**: Tusk never reconnects or replays it. Disconnect, reconnect, and verify the outcome. Closing the owner tab, disconnecting, or closing Tusk requires resolving a healthy unit first; pending grid changes must be applied or discarded before its outer Commit/Rollback."
+        "md": "A PostgreSQL statement error or cancellation requires `ROLLBACK` or `ROLLBACK TO` before further work."
       },
       {
-        "k": "p",
-        "md": "Results and pending edits carry transaction id + revision provenance. Pre-BEGIN rows must be rerun before editing; commit, rollback, rollback-to, autocommit-unit boundaries, and loss leave affected rows visible but stale until rerun. Query history records scoped transaction-control and grid-Apply markers."
+        "k": "list",
+        "items": [
+          "A dropped or unexpectedly ended owner session becomes **Lost**. It is not reconnected or replayed: disconnect, reconnect, verify the outcome.",
+          "Closing the owner tab, disconnecting, or closing Tusk requires resolving a healthy unit. Pending grid changes must be applied or discarded first.",
+          "Results and pending edits carry transaction id and revision. Pre-`BEGIN` rows must be rerun before editing.",
+          "Commit, rollback, rollback-to, autocommit-unit boundaries, and loss leave affected rows visible but stale until rerun.",
+          "Query history records scoped transaction-control and grid-Apply markers."
+        ]
       },
       {
         "k": "h",
@@ -509,16 +590,20 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Queries with `$1` positional or `:name` named placeholders open a **Query parameters** dialog first: per-parameter value input, a **NULL** checkbox (sends SQL `NULL`), and a **raw** checkbox (inserts text verbatim, for numbers and expressions; unchecked values become safely-quoted literals). A live preview shows the substituted SQL, and values are remembered per tab."
+        "md": "`$1` positional or `:name` named placeholders open a **Query parameters** dialog before the run, with a live preview of the substituted SQL. Values are remembered per tab."
       },
       {
-        "k": "p",
-        "md": "Detection is lexer-masked: placeholders inside strings, comments, and dollar-quoted bodies are ignored, and `::type` casts never match."
+        "k": "list",
+        "items": [
+          "**NULL** checkbox — sends SQL `NULL`.",
+          "**raw** checkbox — inserts the text verbatim, for numbers and expressions. Unchecked values become quoted literals.",
+          "Detection is lexer-masked: placeholders inside strings, comments, and dollar-quoted bodies are ignored, and `::type` casts never match."
+        ]
       },
       {
         "k": "tip",
         "kind": "warn",
-        "md": "Known false positive: array slices with identifier bounds — `arr[i:j]` — can detect `:j` as a parameter. Use the **raw** toggle and enter `:j` verbatim."
+        "md": "Array slices with identifier bounds — `arr[i:j]` — detect `:j` as a parameter; use the **raw** toggle and enter `:j` verbatim."
       },
       {
         "k": "h",
@@ -526,8 +611,12 @@ export const TOPICS: Topic[] = [
         "id": "active-schema"
       },
       {
-        "k": "p",
-        "md": "The toolbar schema selector (default *(default schema)*) sets the tab's **active schema** — per-tab, applied per run: `SET search_path TO <schema>, public` runs before every execution, server-side validation, and scope-all export from that tab. Autocomplete offers its tables unqualified and the schema linter resolves bare names through the same active-schema-then-`public` resolver, so it can never flag a table completion it just offered; the selector hides on engines without a search path."
+        "k": "list",
+        "items": [
+          "The toolbar schema selector, default *(default schema)*, sets the tab's active schema. It hides on engines without a search path.",
+          "`SET search_path TO <schema>, public` runs before every execution, server-side validation, and scope-all export from that tab.",
+          "Autocomplete offers its tables unqualified, and the schema linter resolves bare names through the same active-schema-then-`public` resolver."
+        ]
       },
       {
         "k": "h",
@@ -537,16 +626,15 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**Format** ([[kbd:Shift-Alt-f]], or the toolbar button) — pretty-prints the selection or buffer via `sql-formatter` with uppercased keywords; dollar-quoted bodies (`$tag$ … $tag$`) are restored byte-for-byte, and unparseable SQL is left untouched. Loads lazily on first use.",
+          "**Format** ([[kbd:Shift-Alt-f]] or the toolbar button) — pretty-prints the selection or buffer through `sql-formatter` with uppercased keywords. Dollar-quoted bodies are restored byte-for-byte and unparseable SQL is left untouched. Loads lazily on first use.",
           "**Find & replace** — the toolbar **Find** button or [[kbd:Mod-f]]; the `find` action is rebindable in [[topic:shortcuts|Shortcuts]].",
-          "**Multi-cursor** — multiple selections, plus **Alt-drag** for rectangular (column) selection.",
-          "**Code folding** — a manual fold gutter, plus auto-fold: bracketed lists ≥ 100 items collapse to `…N items…`, single literals ≥ 200 chars to a size placeholder. Display-only — Run, Save, and export always see the full query; click a placeholder or move the cursor into it to expand.",
+          "**Multi-cursor** — multiple selections, plus Alt-drag for rectangular selection.",
+          "**Code folding** — a manual fold gutter plus auto-fold: bracketed lists of 100 or more items collapse to `…N items…`, single literals of 200 or more characters to a size placeholder. Display-only; click a placeholder or move the cursor into it to expand.",
           "**Keyword auto-UPPERCASE** — live at word boundaries, skipping qualified names (`t.select`), quoted identifiers, and open strings.",
-          "**Font size & wrap** — the small/large **A** buttons step the font between 9 and 24 px; the wrap icon toggles word wrap (also the `toggleWrap` action).",
-          "**Right-click menu** — Cut / Copy / Paste / Select all / Toggle comment ([[kbd:Mod-/]]) / Run selection (or Run all).",
-          "**Explain ▾** — wraps one selected statement or the statement under the cursor for the [[topic:plans|plan visualizer]]; multi-statement selections are refused, and *Explain Analyze* is disabled on engines without it and warns before executing a write."
-        ],
-        "ordered": false
+          "**Font size & wrap** — the small and large **A** buttons step the font between 9 and 24 px; the wrap icon toggles word wrap.",
+          "**Right-click menu** — Cut, Copy, Paste, Select all, Toggle comment ([[kbd:Mod-/]]), Run selection or Run all.",
+          "**Explain ▾** — wraps one selected statement or the statement under the cursor for the [[topic:plans|plan visualizer]]. Multi-statement selections are refused; *Explain Analyze* is disabled on engines without it and warns before executing a write."
+        ]
       },
       {
         "k": "p",
@@ -556,13 +644,13 @@ export const TOPICS: Topic[] = [
     "icon": "code"
   },
   {
+    "blurb": "Live-schema completion, FK JOIN hints, three lint layers, keyboard quick-fixes.",
     "id": "editor-intel",
     "title": "Autocomplete, JOIN hints & lint",
-    "blurb": "Live-schema completion, FK JOIN hints, three lint layers, keyboard quick-fixes.",
     "blocks": [
       {
         "k": "p",
-        "md": "The editor reads your **live database**: one `list_schema` query plus a `list_functions` catalog feed both completion and lint. Both refresh whenever the schema reloads, e.g. after [[topic:sidebar|sidebar]] DDL."
+        "md": "One `list_schema` query plus a `list_functions` catalog feed both completion and lint. Both refresh whenever the schema reloads, such as after [[topic:sidebar|sidebar]] DDL."
       },
       {
         "k": "h",
@@ -570,18 +658,22 @@ export const TOPICS: Topic[] = [
         "id": "completion"
       },
       {
-        "k": "p",
-        "md": "Completion offers only what fits the clause before your cursor: tables and schemas after `FROM`, `JOIN`, `INTO`, `UPDATE`, `TABLE`, `USING`; columns after `SELECT`, `WHERE`, `ON`, `HAVING`, `SET`, `GROUP BY`, `ORDER BY`, `VALUES`, `RETURNING`, `AND`/`OR`; statement keywords at statement start. Columns from tables in the current statement's `FROM`/`JOIN` rank first, labeled with type and source table (`integer · orders`) — only when no table resolves does the list fall back to every column in the database."
+        "k": "list",
+        "items": [
+          "Tables and schemas after `FROM`, `JOIN`, `INTO`, `UPDATE`, `TABLE`, `USING`.",
+          "Columns after `SELECT`, `WHERE`, `ON`, `HAVING`, `SET`, `GROUP BY`, `ORDER BY`, `VALUES`, `RETURNING`, `AND`/`OR`.",
+          "Statement keywords at statement start.",
+          "Columns from the current statement's `FROM`/`JOIN` rank first, labeled with type and source table (`integer · orders`). The list falls back to every column in the database only when no table resolves."
+        ]
       },
       {
         "k": "list",
         "items": [
           "**Alias resolution** — `u.` after `FROM users u` lists that table's columns; `schema.` lists its tables; `schema.table.` lists its columns.",
-          "**Bare vs qualified** — tables in `public` or the tab's active schema complete bare (matching `search_path`); others complete as `schema.table`. Tables in the active schema rank above the rest. Completion and schema lint share one resolver, so a bare name that completes is a bare name the linter accepts.",
-          "**Live db functions** — your functions and procedures appear alongside dialect builtins, tagged `db function`; after `CALL`, `EXEC`/`EXECUTE`, or `PERFORM` they jump to the top, tagged `procedure/function`.",
-          "**Accepting** — [[kbd:Tab]] or [[kbd:Enter]] accepts the highlighted entry; with no popup open, Enter is a plain newline."
-        ],
-        "ordered": false
+          "**Bare vs qualified** — tables in `public` or the tab's active schema complete bare; others complete as `schema.table`. Active-schema tables rank higher. Completion and schema lint share one resolver.",
+          "**Live db functions** — functions and procedures appear alongside dialect builtins, tagged `db function`. After `CALL`, `EXEC`/`EXECUTE`, or `PERFORM` they jump to the top, tagged `procedure/function`.",
+          "**Accepting** — [[kbd:Tab]] or [[kbd:Enter]] accepts the highlighted entry. With no popup open, Enter is a plain newline."
+        ]
       },
       {
         "k": "demo",
@@ -591,7 +683,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "tip",
-        "md": "`$` is deliberately not a completion token, so `$tag$` dollar-quote delimiters and `$1` parameters are never offered or clobbered."
+        "md": "`$` is not a completion token, so `$tag$` delimiters and `$1` parameters are never offered or clobbered."
       },
       {
         "k": "h",
@@ -599,8 +691,12 @@ export const TOPICS: Topic[] = [
         "id": "join-hints"
       },
       {
-        "k": "p",
-        "md": "Right after `ON`, the top suggestion (tagged `foreign key`) is a **complete join condition** from the foreign-key catalog — `o.user_id = u.id`, using your aliases, composite keys `AND`-ed into one entry. Hints connect the most recently joined table to the statement's other tables (so you need at least two); FK edges load lazily per schema via `schema_relationships` (active schema + `public`) — the same data behind the [[topic:erd|ERD viewer]]."
+        "k": "list",
+        "items": [
+          "Right after `ON`, the top suggestion (tagged `foreign key`) is a complete join condition from the foreign-key catalog — `o.user_id = u.id`, using the statement's aliases, composite keys `AND`-ed into one entry.",
+          "Hints connect the most recently joined table to the statement's other tables, so at least two are needed.",
+          "FK edges load lazily per schema via `schema_relationships` for the active schema and `public` — the same data behind the [[topic:erd|ERD viewer]]."
+        ]
       },
       {
         "k": "h",
@@ -609,7 +705,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Two client-side layers — heuristic and schema-aware — share one linter pass debounced at **300 ms**; an async server linter runs at **600 ms**. Their squiggles merge in the gutter, but each has a distinct job:"
+        "md": "Two client-side layers, heuristic and schema-aware, share one linter pass debounced at 300 ms. An async server linter runs at 600 ms. Squiggles merge in the gutter."
       },
       {
         "k": "table",
@@ -621,34 +717,31 @@ export const TOPICS: Topic[] = [
         "rows": [
           [
             "Heuristic (offline)",
-            "Unmatched `)`; unclosed `(`; trailing comma; `DELETE`/`UPDATE` without `WHERE` (\"affects every row\"); unknown **leading** keyword (`SELCT` → \"did you mean SELECT?\"); a top-level comma between conditions in `WHERE`/`HAVING` (*',' is not valid between conditions — join them with AND or OR*); invisible paste artifacts in code — non-breaking/zero-width spaces and curly quotes from web pages, named with their code point, with a fix-all quick-fix (inside string literals they're data and stay untouched)",
+            "Unmatched `)`; unclosed `(`; trailing comma; `DELETE`/`UPDATE` without `WHERE`; unknown leading keyword (`SELCT` → \"did you mean SELECT?\"); a top-level comma between conditions in `WHERE`/`HAVING`; invisible paste artifacts in code — non-breaking and zero-width spaces, curly quotes — named with their code point and carrying a fix-all quick-fix",
             "error / warning"
           ],
           [
             "Schema (live catalog)",
-            "Unknown `alias.col` refs; unknown tables after `FROM`/`JOIN`/`UPDATE`/`INTO`; unknown function calls vs the live catalog; unknown bare identifiers and one-edit clause-keyword typos (`FORM` → `FROM`)",
+            "Unknown `alias.col` refs; unknown tables after `FROM`/`JOIN`/`UPDATE`/`INTO`; unknown function calls against the live catalog; unknown bare identifiers; one-edit clause-keyword typos (`FORM` → `FROM`)",
             "warning"
           ],
           [
             "Server (`validate_sql`)",
-            "Parser-grade Postgres diagnostics — the ground truth for syntax, types, and anything the client can't model",
+            "Parser-grade Postgres diagnostics for syntax, types, and anything the client cannot model",
             "error"
           ]
         ]
       },
       {
-        "k": "p",
-        "md": "`WHERE a = 1, b = 2` — an AND typo, invalid in every engine — is squiggled as you type by the offline layer. Legit commas in `IN` lists, row constructors, function arguments, `SET` lists, and nested subqueries are untouched. The offline check matters because the server linter is deliberately paused while a result stream is open, so this class of error had no other detector."
-      },
-      {
         "k": "list",
         "items": [
-          "**Bare identifiers** — checked only in DML (`SELECT`/`INSERT`/`UPDATE`/`DELETE`/`WITH`) where **every** table reference resolved; otherwise only one-edit clause-keyword typos are flagged. Statements with CTEs or derived tables skip the check entirely.",
+          "`WHERE a = 1, b = 2` is squiggled as typed. Commas in `IN` lists, row constructors, function arguments, `SET` lists, and nested subqueries are untouched.",
+          "Inside string literals, paste artifacts are data and stay untouched.",
+          "**Bare identifiers** — checked only in DML (`SELECT`/`INSERT`/`UPDATE`/`DELETE`/`WITH`) where every table reference resolved. Statements with CTEs or derived tables skip the check.",
           "**Grammatical `FROM`s** — `EXTRACT(YEAR FROM x)`, `SUBSTRING`, `POSITION`, `OVERLAY`, `TRIM` are masked before table scanning.",
-          "**Empty function catalog** — the unknown-function check switches off (neither MySQL nor SQL Server can enumerate builtins; a partial list would flag every uncommon function).",
-          "**Half-typed keywords** — `SEL` under the cursor is a prefix of `SELECT` and skipped until you move on."
-        ],
-        "ordered": false
+          "**Empty function catalog** — the unknown-function check switches off. Neither MySQL nor SQL Server can enumerate builtins.",
+          "**Half-typed keywords** — `SEL` under the cursor is a prefix of `SELECT` and is skipped."
+        ]
       },
       {
         "k": "h",
@@ -656,13 +749,17 @@ export const TOPICS: Topic[] = [
         "id": "server-lint"
       },
       {
-        "k": "p",
-        "md": "`validate_sql` only `PREPARE`s each statement (parse + plan) then deallocates — in autocommit, so one failing statement can't poison the next. It skips DDL, `COPY`, and `$1`/`:name` bind-parameter statements (PREPARE can't infer their types), maps Postgres' 1-based error position onto the exact token, and goes silent when disconnected, while a query is **running or streaming**, or when *Server-side lint (PREPARE-only)* is off in Settings — the client layers keep working."
+        "k": "list",
+        "items": [
+          "`validate_sql` only `PREPARE`s each statement, then deallocates, in autocommit.",
+          "It skips DDL, `COPY`, and `$1`/`:name` bind-parameter statements, and maps Postgres' 1-based error position onto the exact token.",
+          "It goes silent when disconnected, while a query is running or streaming, and when *Server-side lint (PREPARE-only)* is off in Settings. The client layers keep working."
+        ]
       },
       {
         "k": "tip",
         "kind": "tip",
-        "md": "The prepareability check is a **skip-list** (known DDL/utility starters skipped, everything else PREPAREd), so a misspelled first keyword like `SELCT …` still reaches the server parser and gets a real diagnostic."
+        "md": "The prepareability check is a skip-list, so a misspelled first keyword like `SELCT …` still reaches the server parser for a real diagnostic."
       },
       {
         "k": "h",
@@ -671,7 +768,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Did-you-mean diagnostics carry a one-keystroke fix (*Replace with \"…\"*) — no mouse hover needed. With the cursor on the squiggle:"
+        "md": "Did-you-mean diagnostics carry a one-keystroke fix, *Replace with \"…\"*. Put the cursor on the squiggle."
       },
       {
         "k": "keys",
@@ -692,19 +789,23 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Matching is Damerau-Levenshtein, plus a candidate starting with what you typed counts as one edit — so `master` suggests `master_id`. See [[topic:shortcuts|Shortcuts]] for run/format/search chords and [[topic:editor|The editor]] for statement splitting."
+        "md": "Matching is Damerau-Levenshtein, and a candidate starting with the typed word counts as one edit, so `master` suggests `master_id`. See [[topic:shortcuts|Shortcuts]] and [[topic:editor|The editor]]."
       }
     ],
     "icon": "sparkle"
   },
   {
+    "blurb": "Streaming pages, virtualized rendering, server-side sort/filter, multi-format copy.",
     "id": "results",
     "title": "The result grid",
-    "blurb": "Streaming pages, virtualized rendering, server-side sort/filter, multi-format copy.",
     "blocks": [
       {
-        "k": "p",
-        "md": "The grid virtualizes both axes — only the visible window of rows *and* columns is in the DOM, so a million-row or 400-column result scrolls like ten rows. Values are text straight from the driver; column widths, order, hidden columns, sorts, and filters are per-tab view state, and a zero-row result still shows its headers."
+        "k": "list",
+        "items": [
+          "Both axes virtualize: only the visible rows and columns are in the DOM.",
+          "Values are text straight from the driver. A zero-row result still shows its headers.",
+          "Column widths, order, hidden columns, sorts, and filters are per-tab view state."
+        ]
       },
       {
         "k": "h",
@@ -712,28 +813,28 @@ export const TOPICS: Topic[] = [
         "id": "streaming"
       },
       {
-        "k": "p",
-        "md": "Reads stream in pages of **1,000 rows** (`PAGE` in `App.tsx`) — a server-side cursor on Postgres, a LIMIT/OFFSET pager on DuckDB/SQLite/MySQL, and `OFFSET … ROWS FETCH NEXT … ROWS ONLY` on SQL Server. There the clause is appended to your statement, so an existing `ORDER BY` is preserved exactly; a statement that can't take it (`TOP`, its own `OFFSET`/`FETCH`, `FOR JSON`/`FOR XML`, `OPTION (…)`, or an unordered `UNION`) is read once under the result limits and labelled *read in one page*."
-      },
-      {
         "k": "list",
         "items": [
+          "Reads stream in pages of 1,000 rows: a server-side cursor on Postgres, a LIMIT/OFFSET pager on DuckDB/SQLite/MySQL, `OFFSET … FETCH NEXT` on SQL Server.",
+          "On SQL Server the clause is appended, so an existing `ORDER BY` is preserved. A statement that cannot take it — `TOP`, its own `OFFSET`/`FETCH`, `FOR JSON`/`FOR XML`, `OPTION (…)`, an unordered `UNION` — is read once and labelled *read in one page*.",
           "**Auto-fetch** — scroll within ~1.5 viewport-heights of the bottom, or move the focused cell within 30 rows of the end.",
           "**`1000+ rows`** — the `+` means the cursor is still open.",
-          "**Load all** (result toolbar) — drains the cursor; the button flips to **Cancel** and yields between pages. Also the `loadAllRows` action: unbound by default, rebindable in Settings → Shortcuts."
+          "**Load all** drains the cursor and flips to **Cancel**. The `loadAllRows` action is unbound by default."
         ]
       },
       {
         "k": "demo",
         "id": "grid-stream",
-        "caption": "Pages of 1,000 rows stream from a server-side cursor as you approach the bottom; Load all drains the rest."
+        "caption": "Pages of 1,000 rows stream from a server-side cursor near the bottom; Load all drains the rest."
       },
       {
         "k": "list",
         "items": [
-          "**While running** — Run becomes **✕ Cancel** with a live elapsed counter (updated every 200 ms); the final duration sits at the right of the result toolbar.",
-          "**One cursor per connection** (`tusk_cur`) — while idle, running in another tab, expanding a relation in the Explorer, refreshing the schema, sidebar DDL, an all-rows export, an import, or the ERD/DDL viewer closes the previous stream. The old tab keeps its rows but is marked **Incomplete result** (toolbar badge + a `N rows loaded · …` status naming what closed it); in-memory sort is off for it and Export lists its loaded rows as incomplete — re-run for the full set. During a manual transaction, other tabs/sidebar database actions are frozen and an owner run closes only its prior stream, not the outer transaction.",
-          "**Dropped mid-stream** — the grid keeps what it has, shows an error banner plus a `streaming stopped — …` status and the same Incomplete badge; re-run to resume."
+          "While running, Run becomes **✕ Cancel** with an elapsed counter. The final duration sits at the right of the result toolbar.",
+          "One cursor per connection. Running in another tab, expanding a relation, refreshing the schema, sidebar DDL, an all-rows export, an import, or the ERD/DDL viewer closes the previous stream.",
+          "The old tab keeps its rows under an **Incomplete result** badge and an `N rows loaded · …` status naming the cause. In-memory sort is off and Export lists its rows as incomplete; re-run for the full set.",
+          "During a manual transaction other tabs and sidebar database actions are frozen, and an owner run closes only its prior stream.",
+          "Dropped mid-stream: the grid keeps its rows and shows an error banner, a `streaming stopped — …` status, and the same badge."
         ]
       },
       {
@@ -744,10 +845,10 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**Resize** — drag the header edge (48–900 px); double-click the edge or *Autofit column* to size to visible content.",
-          "**Reorder** — drag a header label sideways (a 4 px threshold separates a drag from a sort click).",
-          "**Hide** — header right-click → *Hide column*; restore via *Show \"name\"* or *Show all columns*. Display-only: **Export…** is unaffected, but grid copies follow what's displayed.",
-          "All per-tab view state; a fresh query with a different column set resets it."
+          "**Resize** — drag the header edge, 48–900 px. Double-click the edge or *Autofit column* to size to visible content.",
+          "**Reorder** — drag a header label sideways; a 4 px threshold separates a drag from a sort click.",
+          "**Hide** — header right-click → *Hide column*, restored by *Show \"name\"* or *Show all columns*. Export is unaffected; grid copies follow what is displayed.",
+          "A fresh query with a different column set resets this view state."
         ]
       },
       {
@@ -756,33 +857,41 @@ export const TOPICS: Topic[] = [
         "id": "sort-filter"
       },
       {
-        "k": "p",
-        "md": "Once a base result is **fully loaded**, sort gestures reorder rows in memory — no re-run. While rows are still streaming, or whenever a filter is active, the grid re-runs your query wrapped as `SELECT * FROM (<your query>) AS _tusk … ORDER BY <ordinal>` so ordering happens on the server across the whole result. Local ordering compares a column numerically when every loaded value is a number (integers compare exactly at any size), otherwise by display text, with each engine's default NULL placement; use an explicit `ORDER BY` when native date/collation semantics matter. A header click that can't sort (query running, transaction owned elsewhere, or a result that isn't re-runnable and isn't fully loaded) explains why in the status line."
+        "k": "list",
+        "items": [
+          "Once a base result is fully loaded, sort gestures reorder rows in memory.",
+          "While rows stream, or whenever a filter is active, the query re-runs wrapped as `SELECT * FROM (<your query>) AS _tusk … ORDER BY <ordinal>`.",
+          "Local ordering compares numerically when every loaded value is a number, otherwise by display text, with each engine's default NULL placement. Use an explicit `ORDER BY` for native date or collation semantics.",
+          "A header click that cannot sort — query running, transaction owned elsewhere, or a result neither re-runnable nor fully loaded — explains why in the status line."
+        ]
       },
       {
         "k": "list",
         "items": [
-          "**Sort** — click a header to cycle **ascending → descending → none**; [[kbd:Shift]]-click adds to a multi-sort (priority numbers next to the arrows).",
-          "**Quick filter** — *Show filter row* in the header menu puts a box under each header. Each column does a case-insensitive contains match (`ILIKE` on Postgres/DuckDB, `LOWER(CAST(…)) LIKE LOWER(…)` elsewhere), AND-combined, debounced 300 ms. It writes into the same filter the builder edits: typing under an OR root re-roots the filter as an AND so the box can only ever narrow the result. A column carrying builder rules the one-line box cannot show is marked, since an empty box there would otherwise read as \"no filter\".",
-          "**Filter builder** — the toolbar's **Filter** button, [[kbd:Mod-Shift-f]], *Filter by this column…* in the header menu, or the Explorer's *Filter rows…*. See below."
+          "**Sort** — click a header to cycle ascending → descending → none. [[kbd:Shift]]-click adds to a multi-sort, with priority numbers next to the arrows.",
+          "**Quick filter** — *Show filter row* puts a box under each header. Each does a case-insensitive contains match, AND-combined, debounced 300 ms.",
+          "The filter row edits the same filter as the builder: typing under an OR root re-roots it as an AND. A column carrying rules the one-line box cannot show is marked.",
+          "**Filter builder** — the toolbar **Filter** button, [[kbd:Mod-Shift-f]], *Filter by this column…*, or the Explorer's *Filter rows…*."
         ]
       },
       {
         "k": "code",
-        "text": "SELECT * FROM (\n  SELECT * FROM film JOIN inventory USING (film_id)\n) AS _tusk\nWHERE \"title\"::text ILIKE '%dino%' ESCAPE '!'\nORDER BY 3 DESC",
-        "caption": "What a header sort + filter actually re-streams (ORDER BY uses the ordinal to dodge duplicate names)."
+        "caption": "A header sort plus filter re-streams this. ORDER BY uses the ordinal to dodge duplicate names.",
+        "text": "SELECT * FROM (\n  SELECT * FROM film JOIN inventory USING (film_id)\n) AS _tusk\nWHERE \"title\"::text ILIKE '%dino%' ESCAPE '!'\nORDER BY 3 DESC"
       },
       {
         "k": "demo",
         "id": "sort-filter",
-        "caption": "Header clicks and the filter row re-run the query wrapped as a subquery, so ordering and matching happen on the server across the whole result."
+        "caption": "Header clicks and the filter row re-run the query wrapped as a subquery, so the server does the work."
       },
       {
         "k": "list",
         "items": [
-          "**Disabled** for multi-statement runs, anything that isn't `SELECT`/`WITH`/`TABLE`/`VALUES` (plus DuckDB's `FROM`-first and `PIVOT` reads), on **MySQL and SQL Server** when the result has duplicate column names, and on **SQL Server** for any statement containing `WITH` outside a literal or comment (table hints such as `WITH (NOLOCK)` included), or an `ORDER BY` the wrap cannot hoist — window ordering inside `OVER (…)`, an ordered subquery, or an `ORDER BY` paired with `OFFSET`/`FETCH`, whose pagination has to stay inside — because T-SQL rejects both inside the derived table the wrap needs. A plain trailing `ORDER BY` is fine: it moves onto the wrapper, and a grid sort replaces it.",
-          "Re-running the *same unedited* query text keeps active rules; edit the text first for a clean result.",
-          "A sort/filter re-run resets scroll and selection — the rows underneath changed."
+          "Disabled for multi-statement runs and anything that is not `SELECT`/`WITH`/`TABLE`/`VALUES`, plus DuckDB's `FROM`-first and `PIVOT` reads.",
+          "Disabled on MySQL and SQL Server when the result has duplicate column names.",
+          "Disabled on SQL Server for a statement containing `WITH` outside a literal or comment, table hints included, or an `ORDER BY` the wrap cannot hoist — window ordering inside `OVER (…)`, an ordered subquery, or `ORDER BY` paired with `OFFSET`/`FETCH`. A plain trailing `ORDER BY` moves onto the wrapper and a grid sort replaces it.",
+          "Re-running the same unedited query text keeps active rules; edit the text first for a clean result.",
+          "A sort or filter re-run resets scroll and selection."
         ]
       },
       {
@@ -791,8 +900,12 @@ export const TOPICS: Topic[] = [
         "id": "filter-builder"
       },
       {
-        "k": "p",
-        "md": "A filter is a **tree**, not a list: one root group joined by AND or OR, holding conditions and nested groups, so \"A and (B or C)\" and \"(A and B) or C\" are both expressible. A condition is a column, an operator, and its values; the operator menu offers only what the column's class supports, and a badge next to the name says which class Tusk inferred (`text`, `num`, `bool`, `date`, `any`). Types come from the relation's detail when it's loaded — without it every column is `any`, which offers every operator except `is true` / `is false` and casts to text for LIKE-family matching, while `=`, `<`, `between` and `in` still compare against the raw column."
+        "k": "list",
+        "items": [
+          "A filter is a tree: one root group joined by AND or OR, holding conditions and nested groups, so `A and (B or C)` and `(A and B) or C` are both expressible.",
+          "A condition is a column, an operator, and its values. The operator menu offers only what the column's class supports, and a badge names the inferred class (`text`, `num`, `bool`, `date`, `any`).",
+          "Types come from the relation's detail. Without it every column is `any`, which offers every operator except `is true` / `is false` and casts to text for LIKE-family matching, while `=`, `<`, `between` and `in` compare the raw column."
+        ]
       },
       {
         "k": "keys",
@@ -806,23 +919,34 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**Operators** — `=` `≠` `<` `≤` `>` `≥`, `between` / `not between`, `in` / `not in` (comma-separated; quote a value that contains a comma), `like` / `not like` / `ilike` (raw patterns — you own the wildcards), `starts with` / `ends with` / `contains` (case-insensitive; `%` and `_` in your text are escaped, not wildcards), `is null` / `is not null`, `is true` / `is false`, `is empty` (`= ''`).",
-          "**Groups** — **AND** / **OR** per group, *+ Condition* and *+ Group* to extend, and per-row duplicate/remove. A nested group is added with the opposite join, which is the shape you usually want. *+ Group* is offered four levels deep, and a filter may not exceed eight levels or 200 conditions in all.",
-          "**Buttons** — **Apply filter** re-streams the wrapped query, **Clear** empties the tree, **Copy WHERE** copies the clause, and **Open as query** puts the full wrapped `SELECT … WHERE …` into a new tab. [[kbd:Enter]] applies, [[kbd:Escape]] closes."
+          "**Operators** — `=` `≠` `<` `≤` `>` `≥`, `between` / `not between`, `in` / `not in` (comma-separated; quote a value containing a comma), `like` / `not like` / `ilike` (raw patterns), `starts with` / `ends with` / `contains` (case-insensitive, with `%` and `_` escaped), `is null` / `is not null`, `is true` / `is false`, `is empty`.",
+          "**Groups** — AND or OR per group, *+ Condition* and *+ Group*, per-row duplicate and remove. A nested group is added with the opposite join. *+ Group* is offered four levels deep; the limit is eight levels and 200 conditions.",
+          "**Buttons** — **Apply filter** re-streams the wrapped query, **Clear** empties the tree, **Copy WHERE** copies the clause, **Open as query** puts the wrapped `SELECT … WHERE …` into a new tab. [[kbd:Enter]] applies, [[kbd:Escape]] closes."
         ]
       },
       {
-        "k": "p",
-        "md": "The generated SQL is per engine. Identifiers are always quoted and values are always literals — only strictly numeric text is emitted unquoted, and only against a numeric column. `ILIKE` is native on Postgres/DuckDB and becomes `LOWER(col) LIKE LOWER(pattern)` everywhere else, MySQL and SQLite included: their default collations usually ignore case, but a `_bin`/`_cs` column does not, and *contains* has to mean the same thing on every engine. Every LIKE-family comparison is made on the text form of the column, so a `char(n)` never matches on its blank padding. Booleans emit `TRUE`/`FALSE` on Postgres/DuckDB and `1`/`0` on MySQL, SQLite and SQL Server. `%` and `_` you type are escaped with `!` under an explicit `ESCAPE '!'` — never a backslash, which MySQL rejects under `sql_mode=ANSI`."
+        "k": "list",
+        "items": [
+          "Identifiers are always quoted and values always literals. Only strictly numeric text is emitted unquoted, and only against a numeric column.",
+          "`ILIKE` is native on Postgres and DuckDB, and becomes `LOWER(col) LIKE LOWER(pattern)` elsewhere, MySQL and SQLite included.",
+          "Every LIKE-family comparison uses the text form of the column, so a `char(n)` never matches on blank padding.",
+          "Booleans emit `TRUE`/`FALSE` on Postgres and DuckDB, `1`/`0` on MySQL, SQLite and SQL Server.",
+          "Typed `%` and `_` are escaped with `!` under an explicit `ESCAPE '!'`."
+        ]
       },
       {
         "k": "tip",
         "kind": "tip",
-        "md": "`≠` and `not in` exclude NULL rows, exactly as SQL does. To keep them, add an `is null` condition on the same column inside an OR group."
+        "md": "`≠` and `not in` exclude NULL rows; add an `is null` condition on the same column inside an OR group to keep them."
       },
       {
-        "k": "p",
-        "md": "While a filter is active a bar above the grid shows one chip per condition, grouped as the filter is and joined by AND/OR, with an ✕ to drop just that rule, the loaded row count (with a trailing `+` while rows are still streaming), and **Edit…** / **Clear all**. A condition whose column left the result is dropped silently on the next run; a column name that appears twice in the result is refused outright (`filter rejected: …` / `sort/filter rejected: …` in the status line) rather than matching the wrong one. A filter is only recorded once the query it produces actually runs, so a rule that cannot be applied never leaves a chip behind."
+        "k": "list",
+        "items": [
+          "An active filter shows one chip per condition above the grid, grouped as the filter is, each with an ✕, plus the loaded row count, **Edit…**, and **Clear all**.",
+          "A condition whose column left the result is dropped on the next run.",
+          "A column name appearing twice in the result is refused with `filter rejected: …` or `sort/filter rejected: …` in the status line.",
+          "A filter is recorded only once the query it produces runs."
+        ]
       },
       {
         "k": "h",
@@ -831,7 +955,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Click a cell; drag (with edge auto-scroll) or [[kbd:Shift]]-click for a range; the row-number gutter selects rows, a header a whole column, the corner or [[kbd:Mod-a]] everything. Navigation loads more rows as you go:"
+        "md": "Click a cell; drag with edge auto-scroll or [[kbd:Shift]]-click for a range. The gutter selects rows, a header a column, the corner or [[kbd:Mod-a]] everything."
       },
       {
         "k": "keys",
@@ -869,14 +993,15 @@ export const TOPICS: Topic[] = [
       {
         "k": "demo",
         "id": "jump-count",
-        "caption": "Keyboard jumps ride the stream too — moving within 30 rows of the loaded end fetches the next 1,000-row page."
+        "caption": "Keyboard jumps ride the stream: moving within 30 rows of the loaded end fetches the next page."
       },
       {
         "k": "list",
         "items": [
-          "[[kbd:Mod-c]] copies **TSV**; the cell context menu adds **Copy as CSV / JSON / Markdown**, *Copy cell value* (*Copy value (NULL→empty)* on a NULL cell), and *Copy column*.",
-          "Column names are **omitted by default** — tick **Copy w/ column names** in the result toolbar. With headers, JSON becomes an array of objects keyed by column; without, arrays of values.",
-          "Copies read through uncommitted edits and the boolean display mapping — a Postgres `t` or MySQL `1` copies as the displayed `TRUE`/`FALSE`. **Copy as CSV/TSV/JSON/Markdown runs the same formatter as Export**, so clipboard bytes match the file byte-for-byte: an empty string stays quoted (`\"\"`) and distinguishable from `NULL`, JSON keeps the exporter's shape, and Markdown always carries its header row. For files, see [[topic:import-export|Import & export]]."
+          "[[kbd:Mod-c]] copies TSV. The cell context menu adds **Copy as CSV / JSON / Markdown**, *Copy cell value* (*Copy value (NULL→empty)* on a NULL cell), and *Copy column*.",
+          "Column names are omitted unless **Copy w/ column names** is ticked in the result toolbar. With headers, JSON becomes an array of objects; without, arrays of values.",
+          "Copies read through uncommitted edits and the boolean display mapping, so a Postgres `t` copies as `TRUE`.",
+          "Copy as CSV/TSV/JSON/Markdown runs the same formatter as Export, so clipboard bytes match the file. An empty string stays quoted and distinct from `NULL`, and Markdown always carries its header row. For files, see [[topic:import-export|Import & export]]."
         ]
       },
       {
@@ -885,34 +1010,38 @@ export const TOPICS: Topic[] = [
         "id": "values"
       },
       {
-        "k": "p",
-        "md": "NULLs render as a dimmed `NULL`, a dash, or empty, per the *NULL cells show* setting. **View value…** (context menu, double-click on a non-editable grid, or [[kbd:Mod]]+double-click on an editable one) opens the full untruncated cell — always the raw value, never the boolean word."
-      },
-      {
-        "k": "p",
-        "md": "On a recognized `EXPLAIN` result, a **Plan / Grid** toggle appears on the left of the result toolbar — see [[topic:plans|Plan visualization]]."
+        "k": "list",
+        "items": [
+          "NULLs render as a dimmed `NULL`, a dash, or empty, per the *NULL cells show* setting.",
+          "**View value…** — context menu, double-click on a non-editable grid, or [[kbd:Mod]]+double-click on an editable one — opens the full raw cell, never the boolean word.",
+          "A recognized `EXPLAIN` result adds a **Plan / Grid** toggle at the left of the result toolbar — see [[topic:plans|Plan visualization]]."
+        ]
       },
       {
         "k": "tip",
         "kind": "tip",
-        "md": "A single-table `SELECT` with its primary key in the result is editable — double-click, [[kbd:Enter]]/[[kbd:F2]], `+ Row`, paste, and a Commit preview. See [[topic:grid-editing|Editing data in the grid]]."
+        "md": "A single-table `SELECT` carrying its primary key is editable: double-click, [[kbd:Enter]]/[[kbd:F2]], `+ Row`, paste, Commit preview — see [[topic:grid-editing|Editing data in the grid]]."
       }
     ],
     "icon": "table"
   },
   {
+    "blurb": "Edit cells, delete, insert, paste — apply or commit one reviewed script.",
     "id": "grid-editing",
     "title": "Editing data in the grid",
-    "blurb": "Edit cells, delete, insert, paste — apply or commit one reviewed script.",
     "blocks": [
       {
         "k": "p",
-        "md": "Results from a plain single-table `SELECT` are editable: change cells, mark deletes, add rows, paste spreadsheet blocks — all as a **pending overlay** that touches nothing until you preview the script. The result toolbar holds **+ Row**, the pending counter (`✎ N changes`), **Commit…** (or **Apply…** in the transaction owner), and **Discard**."
+        "md": "Results from a plain single-table `SELECT` are editable. Cell edits, delete marks, new rows, and pasted blocks stage as a pending overlay until the script is previewed."
+      },
+      {
+        "k": "p",
+        "md": "The result toolbar holds **+ Row**, the pending counter (`✎ N changes`), **Commit…** (or **Apply…** in the transaction owner), and **Discard**."
       },
       {
         "k": "demo",
         "id": "grid-edit",
-        "caption": "Edit cells, mark deletes, add rows — then preview and Apply or Commit."
+        "caption": "Edit cells, mark deletes, add rows, then preview and Apply or Commit."
       },
       {
         "k": "h",
@@ -921,24 +1050,23 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Tusk maps rows back to the table by primary key, so it offers editing only when that mapping is unambiguous. All must hold:"
+        "md": "Rows map back to the table by primary key. Editing is offered only when all of these hold."
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "**Single plain `SELECT`** — `WITH`, `TABLE`, and `VALUES` reject (*\"only SELECT results are editable\"*); scripts reject (*\"results from a script — run a single SELECT to edit\"*).",
-          "**One table** — any `JOIN`, `GROUP BY`, `DISTINCT`, `UNION`/`INTERSECT`/`EXCEPT`, `HAVING`, or `RETURNING` disqualifies.",
-          "**Plain column references only** (`*`, `t.*`, `col`, `t.col`) — no expressions, functions, `CASE`, literals, or aliases. `SELECT id*2 AS id …` could point the commit's PK `WHERE` at the **wrong row**, so anything ambiguous rejects (*\"only plain column selects are editable (no expressions or aliases)\"*).",
-          "**A table** (not a view or matview) with a **primary key**, every PK column present in the result — else *\"primary key column \\\"x\\\" isn't in the result\"*.",
-          "No **duplicate column names** in the result.",
-          "**An unambiguous table identity** — a bare name that exists in more than one schema is only editable when the tab's active schema resolves it (the same active-schema-then-`public` order the run uses); comma joins, derived tables, table functions, mismatched qualifiers, and case-colliding metadata all reject.",
-          "Connection not **read-only**; on Postgres your role needs at least one of `UPDATE`/`INSERT`/`DELETE` (or ownership). Partial privileges still allow editing — the server enforces per statement at commit."
+          "**A single plain `SELECT`.** `WITH`, `TABLE`, and `VALUES` reject; scripts reject.",
+          "**One table.** Any `JOIN`, `GROUP BY`, `DISTINCT`, `UNION`/`INTERSECT`/`EXCEPT`, `HAVING`, or `RETURNING` disqualifies.",
+          "**Plain column references only** — `*`, `t.*`, `col`, `t.col`. No expressions, functions, `CASE`, literals, or aliases.",
+          "**A table, not a view or matview**, with a primary key, every PK column present in the result.",
+          "**No duplicate column names** in the result.",
+          "**An unambiguous table identity.** A bare name in more than one schema is editable only when the tab's active schema resolves it. Comma joins, derived tables, table functions, mismatched qualifiers, and case-colliding metadata reject.",
+          "**Connection not read-only.** On Postgres the role needs `UPDATE`, `INSERT`, `DELETE`, or ownership; partial privileges still allow editing and the server enforces per statement."
         ]
       },
       {
         "k": "p",
-        "md": "When editing is off, right-click a cell: the disabled **Edit cell** entry tooltips the exact rejection (e.g. *\"multi-table queries aren't editable\"*, *\"table users has no primary key\"*, *\"no write privilege on orders\"*). See [[topic:safety|Safety]] for the wider write gates."
+        "md": "With editing off, right-click a cell: the disabled **Edit cell** entry tooltips the exact reason, such as *multi-table queries aren't editable* or *table users has no primary key*. See [[topic:safety|Safety]]."
       },
       {
         "k": "h",
@@ -946,8 +1074,11 @@ export const TOPICS: Topic[] = [
         "id": "gestures"
       },
       {
-        "k": "p",
-        "md": "Double-click a cell to edit ([[kbd:Mod]]+double-click keeps *View value*); with a cell selected, [[kbd:Enter]] or [[kbd:F2]] also opens the editor. Boolean columns get a **TRUE / FALSE** dropdown (plus `<null>` when nullable) committing the driver's token — `true`/`false` on Postgres and DuckDB, `1`/`0` on SQLite, MySQL and SQL Server (whose boolean is `bit`, and T-SQL has no `TRUE`/`FALSE` literal); re-picking the original value reverts the edit."
+        "k": "list",
+        "items": [
+          "Double-click a cell to edit; [[kbd:Mod]]+double-click keeps *View value*. With a cell selected, [[kbd:Enter]] or [[kbd:F2]] opens the editor.",
+          "Boolean columns get a **TRUE / FALSE** dropdown, plus `<null>` when nullable, committing the driver's token — `true`/`false` on Postgres and DuckDB, `1`/`0` on SQLite, MySQL and SQL Server. Re-picking the original reverts the edit."
+        ]
       },
       {
         "k": "table",
@@ -970,7 +1101,7 @@ export const TOPICS: Topic[] = [
           ],
           [
             "Alt-N",
-            "Set the cell to SQL NULL (while editing)"
+            "Set the cell to SQL NULL"
           ],
           [
             "Delete / Backspace",
@@ -983,8 +1114,12 @@ export const TOPICS: Topic[] = [
         ]
       },
       {
-        "k": "p",
-        "md": "Blur commits like Enter; typing nothing over a `NULL` is **not** an edit, so tabbing through empty cells never turns `NULL` into `''`. Right-click adds **Set NULL** and, on dirty cells, **Revert cell**; dirty cells tint, delete-marked rows strike through, new rows highlight — copy reads the same overlay, so copied text matches what you see."
+        "k": "list",
+        "items": [
+          "Blur commits like Enter. Typing nothing over a `NULL` is not an edit.",
+          "Right-click adds **Set NULL**, and **Revert cell** on dirty cells.",
+          "Dirty cells tint, delete-marked rows strike through, new rows highlight. Copy reads the same overlay."
+        ]
       },
       {
         "k": "h",
@@ -992,12 +1127,13 @@ export const TOPICS: Topic[] = [
         "id": "delete-insert"
       },
       {
-        "k": "p",
-        "md": "Select rows in the row-number gutter and press [[kbd:Delete]] (or right-click → **Delete rows**) to *mark* them; the menu flips to **Undelete rows** when everything selected is marked. Delete only acts on a **row** selection; marking a pending insert removes it outright."
-      },
-      {
-        "k": "p",
-        "md": "**+ Row** (toolbar) or right-click → **Insert row** adds a row, pinned to the **top** of the grid — [[topic:results|loading more rows]] can't disturb it. Untouched cells show a faint *default* and are **omitted from the INSERT**; a fully untouched row commits as `INSERT INTO … DEFAULT VALUES` (MySQL: `INSERT INTO … () VALUES ()`)."
+        "k": "list",
+        "items": [
+          "Select rows in the gutter and press [[kbd:Delete]], or right-click → **Delete rows**, to mark them. The menu flips to **Undelete rows** when everything selected is marked.",
+          "Delete acts only on a row selection. Marking a pending insert removes it outright.",
+          "**+ Row** or right-click → **Insert row** adds a row pinned to the top of the grid, so [[topic:results|loading more rows]] cannot disturb it.",
+          "Untouched cells show a faint *default* and are omitted from the INSERT. A fully untouched row commits as `INSERT INTO … DEFAULT VALUES`, or `INSERT INTO … () VALUES ()` on MySQL."
+        ]
       },
       {
         "k": "h",
@@ -1006,7 +1142,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "[[kbd:Mod-V]] parses the clipboard as a table — tab-delimited when any tab is present, comma otherwise, quoted fields (`\"…\"`, `\"\"` escaping, embedded newlines) honored. Two shapes, chosen automatically:"
+        "md": "[[kbd:Mod-V]] parses the clipboard as a table: tab-delimited when any tab is present, comma otherwise, with quoted fields honored. The shape is chosen automatically."
       },
       {
         "k": "table",
@@ -1018,24 +1154,23 @@ export const TOPICS: Topic[] = [
         "rows": [
           [
             "**Header-mapped**",
-            "First clipboard row names editable table columns (every non-empty header matches) and at least one data row follows",
-            "Each remaining row becomes a **new insert row**, values mapped **by name** — clipboard column order is irrelevant"
+            "First clipboard row names editable table columns and at least one data row follows",
+            "Each remaining row becomes a new insert row, values mapped by name; clipboard column order is irrelevant"
           ],
           [
             "**Positional**",
             "Anything else",
-            "The block writes from the anchor cell, left-to-right across the *visible* columns, top-to-bottom; rows past the end overflow into new insert rows"
+            "The block writes from the anchor cell across the visible columns, top-to-bottom; rows past the end overflow into new insert rows"
           ]
         ]
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "Empty cell → SQL `NULL`; a cell absent because the row is short → omitted (the column keeps its default on INSERT).",
-          "Positional pastes write *visible* columns only; header-mapped matches by name, so hidden columns can receive values. Non-table columns are never written.",
-          "No active cell → the paste anchors at the append region, never overwriting loaded rows.",
-          "For files, use [[topic:import-export|Import]] instead."
+          "Empty cell → SQL `NULL`. A cell absent because the row is short is omitted, so the column keeps its default on INSERT.",
+          "Positional pastes write visible columns only. Header-mapped matches by name, so hidden columns can receive values. Non-table columns are never written.",
+          "With no active cell the paste anchors at the append region.",
+          "For files, use [[topic:import-export|Import]]."
         ]
       },
       {
@@ -1045,22 +1180,21 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**Commit…** / **Apply…** shows the literal script in a preview dialog before anything runs — **UPDATEs, then DELETEs, then INSERTs** (a row both edited and delete-marked only deletes)."
+        "md": "**Commit…** / **Apply…** shows the literal script before anything runs: UPDATEs, then DELETEs, then INSERTs. A row both edited and delete-marked only deletes."
       },
       {
         "k": "code",
-        "text": "UPDATE \"public\".\"users\" SET \"email\" = 'a@b.co' WHERE \"id\" = '42';\nDELETE FROM \"public\".\"users\" WHERE \"id\" = '7';\nINSERT INTO \"public\".\"users\" (\"name\") VALUES ('New');",
-        "caption": "A fully qualified script — app-owned or applied to the outer transaction"
+        "caption": "A fully qualified script — app-owned, or applied to the outer transaction",
+        "text": "UPDATE \"public\".\"users\" SET \"email\" = 'a@b.co' WHERE \"id\" = '42';\nDELETE FROM \"public\".\"users\" WHERE \"id\" = '7';\nINSERT INTO \"public\".\"users\" (\"name\") VALUES ('New');"
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "**Outside a manual transaction:** Commit uses one app-owned transaction; failure rolls it back wholesale, keeps pending edits, and shows the error in the dialog.",
-          "**Inside the owner transaction:** Apply runs in the existing outer unit, clears the pending overlay on success, and leaves the outer transaction open. Use the transaction bar's Commit/Rollback separately. Pending edits must be applied or discarded before that outer unit can end.",
-          "**WHERE clauses use the ORIGINAL loaded values** — edit a primary-key cell and the UPDATE still locates the old row. Composite PKs are AND-ed; a `NULL` original compares with `IS NULL`.",
-          "Statements are fully qualified — the tab's active schema is ignored.",
-          "On success the grid refreshes in place, keeping your [[topic:results|sort and filter]] view."
+          "**Outside a manual transaction** — Commit uses one app-owned transaction. Failure rolls it back wholesale, keeps pending edits, and shows the error in the dialog.",
+          "**Inside the owner transaction** — Apply runs in the existing outer unit, clears the overlay on success, and leaves the transaction open. Pending edits must be applied or discarded before that unit can end.",
+          "WHERE clauses use the original loaded values, so editing a primary-key cell still locates the old row. Composite PKs are AND-ed; a `NULL` original compares with `IS NULL`.",
+          "Statements are fully qualified; the tab's active schema is ignored.",
+          "On success the grid refreshes in place, keeping the [[topic:results|sort and filter]] view."
         ]
       },
       {
@@ -1069,13 +1203,17 @@ export const TOPICS: Topic[] = [
         "id": "lifecycle"
       },
       {
-        "k": "p",
-        "md": "Pending edits are per-tab and index into the loaded snapshot, so scrolling and streaming more rows can't shift them. Anything that **replaces** the rows — re-running the query, a header sort, a column filter — first asks *\"Discard pending changes?\"* with the change count; toolbar **Discard** asks the same, and pending edits are never persisted. Transaction id/revision provenance also matters: pre-BEGIN rows must be rerun before editing, and commit, rollback, rollback-to, autocommit-unit boundaries, or a lost session leave affected rows/pending edits stale until rerun."
+        "k": "list",
+        "items": [
+          "Pending edits are per-tab and index into the loaded snapshot, so scrolling and streaming cannot shift them. They are never persisted.",
+          "Anything that replaces the rows — re-running, a header sort, a column filter — asks *Discard pending changes?* with the change count. Toolbar **Discard** asks the same.",
+          "Pre-`BEGIN` rows must be rerun before editing. Commit, rollback, rollback-to, autocommit-unit boundaries, and a lost session leave affected rows and pending edits stale until rerun."
+        ]
       },
       {
         "k": "tip",
         "kind": "warn",
-        "md": "**No optimistic-concurrency check** — the commit doesn't verify rows still hold the values you loaded; **last write wins**. On hot tables, re-run the SELECT just before committing, or write the UPDATE by hand in the [[topic:editor|editor]]."
+        "md": "There is no optimistic-concurrency check: last write wins, so re-run the SELECT just before committing on hot tables, or write the UPDATE in the [[topic:editor|editor]]."
       }
     ],
     "icon": "edit"
@@ -2376,20 +2514,20 @@ export const TOPICS: Topic[] = [
     "icon": "comment"
   },
   {
+    "blurb": "Per-connection run log — search it, re-run it, reopen with schema.",
     "id": "history",
     "title": "Query history",
-    "blurb": "Per-connection run log — search it, re-run it, reopen with schema.",
     "blocks": [
       {
         "k": "p",
-        "md": "Tusk logs every query you run, per connection — statement text, outcome, duration, row count, and the schema it ran under. Click the clock icon in the topbar (or hit the shortcut) to toggle the right-side **Query history** panel."
+        "md": "Every run is logged per connection: statement text, outcome, duration, row count, and the schema it ran under. The topbar clock icon toggles the right-side **Query history** panel."
       },
       {
         "k": "keys",
         "rows": [
           {
             "action": "openHistory",
-            "does": "Toggle the history panel (only enabled while connected)"
+            "does": "Toggle the history panel (enabled while connected)"
           }
         ]
       },
@@ -2400,22 +2538,22 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "An entry is written when a **user-issued run** finishes — success, error, or cancel. Each stores the exact SQL, a timestamp, elapsed milliseconds, an `ok` / `error` / `cancelled` status, the row count when known (for a streamed read, the first fetched page — see [[topic:results|Results & streaming]]), the first line of any error, and the tab's **active schema** at run time."
+        "md": "An entry is written when a user-issued run finishes — success, error, or cancel. It stores the SQL, a timestamp, elapsed milliseconds, an `ok` / `error` / `cancelled` status, the row count when known, the first line of any error, and the tab's active schema."
       },
       {
         "k": "list",
         "items": [
-          "**Recorded** — anything launched from the editor: Run, run-selection, panel re-runs, multi-statement scripts (one entry).",
-          "**Recorded with a marker** — server work issued outside the editor carries an audit comment on its first line: `-- [Slack] asked by <user>` for approved bot runs, `-- [Explorer]` for sidebar DDL, and `-- [Export] <format> → <path>` for a full-query file export.",
-          "**Not recorded** — grid sort/filter re-streams (internal `wrapped`-mode runs of `SELECT * FROM (…) _tusk`); only the original `base` query is kept.",
-          "**Recorded** — [[topic:grid-editing|grid Commit/Apply]] scripts. Raw transaction controls and work inside a manual unit carry a leading transaction id/revision/event marker."
-        ],
-        "ordered": false
+          "**Recorded** — anything launched from the editor: Run, run-selection, panel re-runs, and multi-statement scripts as one entry.",
+          "**Recorded** — [[topic:grid-editing|grid Commit/Apply]] scripts. Raw transaction controls and work inside a manual unit carry a leading transaction id, revision, and event marker.",
+          "**Recorded with a marker** — `-- [Slack] asked by <user>` for approved bot runs, `-- [Explorer]` for sidebar DDL, `-- [Export] <format> → <path>` for a full-query file export.",
+          "**Not recorded** — grid sort/filter re-streams. Only the original base query is kept.",
+          "For a streamed read the row count is the first fetched page — see [[topic:results|Results & streaming]]."
+        ]
       },
       {
         "k": "tip",
         "kind": "tip",
-        "md": "Re-running the *identical* newest SQL refreshes the top entry in place (new timestamp, duration, status) — no duplicates."
+        "md": "Re-running identical newest SQL refreshes the top entry in place rather than adding a duplicate."
       },
       {
         "k": "h",
@@ -2423,13 +2561,16 @@ export const TOPICS: Topic[] = [
         "id": "storage"
       },
       {
-        "k": "p",
-        "md": "History is **file-backed per connection**: JSON under `<app-config>/history/`, keyed `profile:<id>` for saved profiles or `adhoc:` from host/port/database/user (driver + file path, `:memory:` when blank, for DuckDB/SQLite). Saves are debounced **500 ms** and capped at the newest **500 entries** per connection."
+        "k": "list",
+        "items": [
+          "JSON per connection under `<app-config>/history/`, keyed `profile:<id>` for saved profiles or `adhoc:` from host, port, database and user — driver plus file path for DuckDB and SQLite.",
+          "Saves are debounced 500 ms and capped at the newest 500 entries per connection."
+        ]
       },
       {
         "k": "tip",
         "kind": "warn",
-        "md": "Recording never blocks a query: if the history file can't be written, Tusk silently degrades to in-memory history for the session — queries still run, the log is lost on exit."
+        "md": "If the history file cannot be written, Tusk degrades to in-memory history for the session and the log is lost on exit."
       },
       {
         "k": "h",
@@ -2437,25 +2578,18 @@ export const TOPICS: Topic[] = [
         "id": "reading"
       },
       {
-        "k": "p",
-        "md": "Each row shows a status dot (green `ok`, red `error`, amber `cancelled`), the SQL's first line, the duration (`842ms` / `3.1s`), and a relative timestamp (`12s ago`, `5m ago`, `3h ago`, then a date). Click a row to expand: the full statement renders syntax-highlighted, with the first error line and row count when known."
-      },
-      {
         "k": "list",
         "items": [
-          "**Search** — `Search history…` filters SQL live (case-insensitive substring).",
-          "**Resize** — drag the splitter on the panel's left edge (**240–700 px**)."
-        ],
-        "ordered": false
+          "Each row shows a status dot (green `ok`, red `error`, amber `cancelled`), the SQL's first line, the duration, and a relative timestamp.",
+          "Click a row to expand the full statement, syntax-highlighted, with the first error line and row count when known.",
+          "**Search** — `Search history…` filters SQL live, case-insensitive substring.",
+          "**Resize** — drag the splitter on the panel's left edge, 240–700 px."
+        ]
       },
       {
         "k": "h",
         "text": "Acting on an entry",
         "id": "actions"
-      },
-      {
-        "k": "p",
-        "md": "An expanded entry offers three buttons:"
       },
       {
         "k": "table",
@@ -2466,15 +2600,15 @@ export const TOPICS: Topic[] = [
         "rows": [
           [
             "**Insert**",
-            "Inserts the SQL at the cursor in the active [[topic:editor|editor]] tab — nothing runs."
+            "Inserts the SQL at the cursor in the active [[topic:editor|editor]] tab. Nothing runs."
           ],
           [
             "**Open in tab**",
-            "Opens a new tab titled *History* with the SQL, active schema set to what the query originally ran under."
+            "Opens a new tab titled *History* with the SQL, active schema set to what the query ran under."
           ],
           [
             "**Re-run**",
-            "Runs the SQL through the normal run path immediately — parameter prompts apply; a multi-statement entry re-runs as one script."
+            "Runs the SQL through the normal run path. Parameter prompts apply; a multi-statement entry re-runs as one script."
           ]
         ]
       },
@@ -2484,25 +2618,32 @@ export const TOPICS: Topic[] = [
         "id": "clearing"
       },
       {
-        "k": "p",
-        "md": "The trash icon in the panel header clears the **current connection's** history only — it flips to a `Clear all?` confirm first, so a stray click can't wipe the log. Disconnecting closes the panel and clears the list; it reloads on the next connect (from disk on first load after launch)."
+        "k": "list",
+        "items": [
+          "The trash icon clears the current connection's history only, behind a `Clear all?` confirm.",
+          "Disconnecting closes the panel and clears the list. It reloads on the next connect, from disk on the first load after launch."
+        ]
       },
       {
         "k": "tip",
         "kind": "tip",
-        "md": "[[kbd:Mod-k]] opens the [[topic:shortcuts|command palette]] — find \"Toggle query history\" there; rebind the key in Settings → Shortcuts."
+        "md": "[[kbd:Mod-k]] opens the [[topic:shortcuts|command palette]], where *Toggle query history* is searchable."
       }
     ],
     "icon": "clock"
   },
   {
+    "blurb": "One registry drives shortcuts, palette, and Settings — rebind once, everywhere.",
     "id": "shortcuts",
     "title": "Keyboard shortcuts & command palette",
-    "blurb": "One registry drives shortcuts, palette, and Settings — rebind once, everywhere.",
     "blocks": [
       {
         "k": "p",
-        "md": "Every action — run, format, tabs, panel toggles — lives in one registry (`src/actions.ts`); the global key handler, the editor keymap, **Settings → Shortcuts**, and the [[kbd:Mod-k]] palette all read from it, so a rebind updates everywhere at once. Chords use CodeMirror syntax (`Mod-Shift-Enter`); **Mod** = Cmd on macOS, Ctrl elsewhere."
+        "md": "Every action lives in one registry. The global key handler, the editor keymap, **Settings → Shortcuts**, and the [[kbd:Mod-k]] palette all read from it, so a rebind updates everywhere."
+      },
+      {
+        "k": "p",
+        "md": "Chords use CodeMirror syntax (`Mod-Shift-Enter`). **Mod** is Cmd on macOS, Ctrl elsewhere."
       },
       {
         "k": "h",
@@ -2511,7 +2652,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "The chips below are live — a rebound action shows your chord, not the shipped default. Some actions ship unbound on purpose (Explain, Toggle AI, Load all rows, What's new, …) but stay reachable from the palette and toolbars."
+        "md": "The chips below show the live binding. Some actions ship unbound — Explain, Toggle AI, Load all rows, What's new — and stay reachable from the palette and toolbars."
       },
       {
         "k": "keys",
@@ -2530,11 +2671,11 @@ export const TOPICS: Topic[] = [
           },
           {
             "action": "explainAnalyze",
-            "does": "EXPLAIN ANALYZE — actually executes the statement"
+            "does": "EXPLAIN ANALYZE — executes the statement"
           },
           {
             "action": "cancelQuery",
-            "does": "Cancel the running query (enabled only while one runs)"
+            "does": "Cancel the running query"
           },
           {
             "action": "commitTransaction",
@@ -2606,7 +2747,7 @@ export const TOPICS: Topic[] = [
           },
           {
             "action": "openShortcuts",
-            "does": "Jump straight to Settings → Shortcuts"
+            "does": "Jump to Settings → Shortcuts"
           },
           {
             "action": "openHistory",
@@ -2626,11 +2767,11 @@ export const TOPICS: Topic[] = [
           },
           {
             "action": "toggleResults",
-            "does": "Collapse / restore the results panel (running a query reopens it automatically)"
+            "does": "Collapse / restore the results panel"
           },
           {
             "action": "nextConnection",
-            "does": "Focus the next open connection (enabled only past one)"
+            "does": "Focus the next open connection"
           },
           {
             "action": "prevConnection",
@@ -2644,16 +2785,16 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Actions carry an *enabled* predicate the dispatcher checks before firing; a chord bound to a disabled action is silently ignored."
+        "md": "Every action carries an *enabled* predicate the dispatcher checks first. A chord bound to a disabled action is ignored."
       },
       {
         "k": "list",
         "items": [
-          "**Run** — needs a connection",
-          "**Explain** / **Explain Analyze** — blocked while a query runs; Explain Analyze also needs engine support (SQLite has no `EXPLAIN ANALYZE`)",
-          "**Cancel running query** — only while a query runs",
-          "**Cancel query** and **Open manual** are allowlisted through the window handler, so they fire while a modal dialog is open and while focus is in the editor; Shortcuts-settings keys also work on the connect screen, where the command palette is honestly disabled.",
-          "**Load all rows** / **Export result…** — need a result in the grid"
+          "**Run** — needs a connection.",
+          "**Explain** / **Explain Analyze** — blocked while a query runs. Explain Analyze also needs engine support; SQLite has no `EXPLAIN ANALYZE`.",
+          "**Cancel running query** — only while a query runs.",
+          "**Load all rows** / **Export result…** — need a result in the grid.",
+          "**Cancel query** and **Open manual** fire through the window handler even with a modal open or focus in the editor. Shortcuts-settings keys work on the connect screen; the palette is disabled there."
         ]
       },
       {
@@ -2663,24 +2804,22 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Open **Settings → Shortcuts** (or run **Show keyboard shortcuts** from the palette) — a searchable table grouped by Query, Editor, Tabs, File, View that doubles as the cheat-sheet."
+        "md": "Open **Settings → Shortcuts**, or run **Show keyboard shortcuts** from the palette. It is a searchable table grouped by Query, Editor, Tabs, File, and View."
       },
       {
         "k": "list",
         "items": [
-          "**Rebind** — click the binding chip (*press keys…*), then press the new chord",
-          "[[kbd:Escape]] — cancel the capture",
-          "[[kbd:Backspace]] / [[kbd:Delete]] — unbind the action entirely",
-          "Bare modifiers and unmodified printable keys are rejected — a plain letter must stay typeable"
+          "**Rebind** — click the binding chip (*press keys…*), then press the new chord.",
+          "[[kbd:Escape]] — cancel the capture.",
+          "[[kbd:Backspace]] / [[kbd:Delete]] — unbind the action.",
+          "Bare modifiers and unmodified printable keys are rejected.",
+          "Conflicts share one flat namespace across both scopes. A chord another action owns shows *bound to \"<that action>\" — press again to replace*; a second press unbinds the other action.",
+          "Overridden rows get **⟲ Reset to default**; **Reset all** clears every override. Only diffs persist in `tusk.keys`, with `null` meaning explicitly unbound."
         ]
       },
       {
         "k": "p",
-        "md": "Conflicts share one flat namespace across both scopes: press a chord another action owns and the row shows *bound to \"<that action>\" — press again to replace*; a second press steals it (the other action unbinds). Overridden rows get **⟲ Reset to default**, **Reset all** clears every override, and only diffs persist (localStorage `tusk.keys`, `null` = explicitly unbound) so future default changes flow through to anything untouched."
-      },
-      {
-        "k": "p",
-        "md": "A read-only **Built-in (not rebindable)** section lists the CodeMirror internals: [[kbd:Mod-f]] find/replace in the editor, [[kbd:Mod-z]] undo/redo, [[kbd:Mod-Shift-[]] fold, [[kbd:Tab]] accept-completion / indent."
+        "md": "A read-only **Built-in (not rebindable)** section lists the CodeMirror internals: [[kbd:Mod-f]] find/replace, [[kbd:Mod-z]] undo/redo, [[kbd:Mod-Shift-[]] fold, [[kbd:Tab]] accept-completion / indent."
       },
       {
         "k": "h",
@@ -2689,12 +2828,16 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "[[kbd:Mod-k]] opens the palette: fuzzy subsequence matching over `category + title` (consecutive characters and word-starts score higher, so `rcs` finds *Run selection or current statement*). Navigate with ↑/↓, [[kbd:Enter]] runs, [[kbd:Escape]] closes; every row shows the action's **live** binding chip."
+        "md": "[[kbd:Mod-k]] opens the palette. Matching is fuzzy subsequence over `category + title`, scoring consecutive characters and word-starts higher, so `rcs` finds *Run selection or current statement*."
+      },
+      {
+        "k": "p",
+        "md": "Navigate with ↑/↓, [[kbd:Enter]] runs, [[kbd:Escape]] closes. Every row shows the action's live binding chip."
       },
       {
         "k": "tip",
         "kind": "tip",
-        "md": "Actions whose enabled-check fails are **filtered out of the palette**, not greyed. Can't find *Export result…*? Run a query first."
+        "md": "Actions whose enabled-check fails are filtered out of the palette rather than greyed, so *Export result…* appears only after a query."
       },
       {
         "k": "h",
@@ -2702,12 +2845,13 @@ export const TOPICS: Topic[] = [
         "id": "scopes"
       },
       {
-        "k": "p",
-        "md": "Editor-scoped actions (**Run**, **Run selection or current statement**, **Format SQL**, **Toggle comment**, **Find & replace**) are also bound inside CodeMirror, so they win while you type; the window handler skips anything the editor consumed (`defaultPrevented`). Global actions (tabs, files, panels) dispatch at the window level regardless of focus — so [[kbd:Mod-w]] closes a Tusk tab, not the window."
-      },
-      {
-        "k": "p",
-        "md": "A binding **without Mod or Alt** (`F5`, bare `Enter`) never fires while focus is in an input, textarea, contenteditable, or the SQL editor. The global handler is also inert while the palette is open and before you connect."
+        "k": "list",
+        "items": [
+          "Editor-scoped actions — Run, Run selection or current statement, Format SQL, Toggle comment, Find & replace — are also bound inside CodeMirror and win while typing. The window handler skips anything the editor consumed.",
+          "Global actions (tabs, files, panels) dispatch at the window level regardless of focus, so [[kbd:Mod-w]] closes a Tusk tab, not the window.",
+          "A binding without Mod or Alt (`F5`, bare `Enter`) never fires while focus is in an input, textarea, contenteditable, or the SQL editor.",
+          "The global handler is inert while the palette is open and before connecting."
+        ]
       },
       {
         "k": "h",
@@ -2716,7 +2860,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "The [[topic:results|result grid]] handles its own keyboard — these aren't registry actions and can't be rebound. Editing keys apply only when the result is [[topic:grid-editing|editable]]."
+        "md": "The [[topic:results|result grid]] handles its own keyboard; these are not registry actions and cannot be rebound. Editing keys apply only when the result is [[topic:grid-editing|editable]]."
       },
       {
         "k": "keys",
@@ -2743,7 +2887,7 @@ export const TOPICS: Topic[] = [
           },
           {
             "combo": "Mod-c",
-            "does": "Copy the selection as TSV (headers gated by the *Copy w/ column names* checkbox)"
+            "does": "Copy the selection as TSV (headers gated by *Copy w/ column names*)"
           },
           {
             "combo": "Mod-v",
@@ -2755,7 +2899,7 @@ export const TOPICS: Topic[] = [
           },
           {
             "combo": "Delete / Backspace",
-            "does": "Toggle delete-marks — only when whole rows are selected, so a stray Delete on a cell can't mark rows"
+            "does": "Toggle delete-marks; only when whole rows are selected"
           },
           {
             "combo": "Escape",
@@ -2764,8 +2908,11 @@ export const TOPICS: Topic[] = [
         ]
       },
       {
-        "k": "p",
-        "md": "In the inline cell editor: [[kbd:Enter]] commits and moves down, [[kbd:Tab]] commits and moves right, [[kbd:Escape]] cancels, [[kbd:Alt-n]] sets SQL `NULL`. Arrowing within 30 rows of the loaded end triggers the next streaming fetch."
+        "k": "list",
+        "items": [
+          "In the inline cell editor: [[kbd:Enter]] commits and moves down, [[kbd:Tab]] commits and moves right, [[kbd:Escape]] cancels, [[kbd:Alt-n]] sets SQL `NULL`.",
+          "Arrowing within 30 rows of the loaded end triggers the next streaming fetch."
+        ]
       },
       {
         "k": "h",
@@ -2773,29 +2920,25 @@ export const TOPICS: Topic[] = [
         "id": "editor-keys"
       },
       {
-        "k": "p",
-        "md": "CodeMirror owns a few keys the registry never touches; see [[topic:editor|the editor topic]] for the full editing surface."
-      },
-      {
         "k": "list",
         "items": [
-          "[[kbd:Tab]] — layered: accepts an open completion, else applies a [[topic:editor-intel|lint quick-fix]] under the cursor, else indents",
-          "[[kbd:Enter]] — accepts a completion when the popup is open, otherwise a normal newline",
-          "Quick-fixes — also on [[kbd:Alt-Enter]] and [[kbd:Mod-.]]",
-          "Statement gutter ▶ — runs a statement by mouse; keyboard equivalents are the rebindable **Run** / **Run selection or current statement**"
+          "[[kbd:Tab]] — accepts an open completion, else applies a [[topic:editor-intel|lint quick-fix]] under the cursor, else indents.",
+          "[[kbd:Enter]] — accepts a completion when the popup is open, otherwise a newline.",
+          "Quick-fixes also on [[kbd:Alt-Enter]] and [[kbd:Mod-.]].",
+          "Statement gutter ▶ runs a statement by mouse; the keyboard equivalents are the rebindable **Run** and **Run selection or current statement**. See [[topic:editor|the editor topic]]."
         ]
       }
     ],
     "icon": "bolt"
   },
   {
+    "blurb": "Panels, topbar, Settings dialog, 8 themes, accent/font, built-in updater.",
     "id": "workspace",
     "title": "Workspace, themes & settings",
-    "blurb": "Panels, topbar, Settings dialog, 8 themes, accent/font, built-in updater.",
     "blocks": [
       {
         "k": "p",
-        "md": "One window: a resizable **Explorer** sidebar on the left, a tabbed editor over a results pane, and optional **AI** and **History** panels docked right. Every theme, font, and behavior toggle lives in one flat preferences object in localStorage and applies live — no OK/Cancel anywhere."
+        "md": "One window: a resizable **Explorer** sidebar, a tabbed editor over a results pane, and optional **AI** and **History** panels docked right. Preferences live in one flat localStorage object and apply live."
       },
       {
         "k": "h",
@@ -2805,24 +2948,25 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**Explorer** — drag the sidebar/editor divider (**180–560 px**)",
-          "**Editor height** — the horizontal splitter between editor and results",
-          "**AI panel** ([[topic:ai|AI assistant]]) — **280–760 px**",
-          "**History panel** ([[topic:history|query history]]) — **240–700 px**"
+          "**Explorer** — drag the sidebar/editor divider, 180–560 px.",
+          "**Editor height** — the horizontal splitter between editor and results.",
+          "**AI panel** ([[topic:ai|AI assistant]]) — 280–760 px.",
+          "**History panel** ([[topic:history|query history]]) — 240–700 px.",
+          "All four sizes persist under `tusk.layout`; stale values are clamped on load and on resize."
         ]
-      },
-      {
-        "k": "p",
-        "md": "All four sizes persist under `tusk.layout` and survive a restart; stale values are clamped (the split on load, panel widths by their resize handlers), so they're harmless."
       },
       {
         "k": "demo",
         "id": "panels",
-        "caption": "Drag the dividers to resize the sidebar, editor/results split, and AI/History panels — sizes persist across restarts."
+        "caption": "Drag the dividers to resize the sidebar, the editor/results split, and the AI and History panels."
       },
       {
-        "k": "p",
-        "md": "Editor **tabs persist per connection** (`tusk.tabs.*`): each tab's SQL buffer, file path, title, active schema, and which tab was active return on reconnect. Every open connection's tabs are saved, not just the one you are looking at. **Results are ephemeral** — snapshots, streaming cursors, and pending grid edits never persist; see [[topic:results|Results & streaming]]."
+        "k": "list",
+        "items": [
+          "Editor tabs persist per connection in `tusk.tabs.*`: SQL buffer, file path, title, active schema, and which tab was active.",
+          "Every open connection's tabs are saved, not only the focused one.",
+          "Results are ephemeral — snapshots, cursors, and pending grid edits never persist. See [[topic:results|Results & streaming]]."
+        ]
       },
       {
         "k": "h",
@@ -2831,47 +2975,86 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Up to **16** databases can be open at the same time. The topbar carries one chip per open connection — driver mascot, database name, and a state dot — and **＋** opens the connect screen as a panel over your workspace instead of replacing it. With a single connection open the strip looks as it always did, apart from that **＋** at the end of it."
+        "md": "Up to **16** databases can be open at once. The topbar carries one chip per connection — driver mascot, database name, state dot — and **＋** opens the connect screen as a panel."
       },
       {
         "k": "table",
-        "head": ["State", "Dot", "Means"],
+        "head": [
+          "State",
+          "Dot",
+          "Means"
+        ],
         "rows": [
-          ["idle", "filled", "nothing is running and no manual transaction is open"],
-          ["running", "pulsing", "a query, page fetch, or *Load all* is running on this connection"],
-          ["transaction", "hollow ring", "a manual transaction is open on this connection"],
-          ["failed", "warning", "the transaction failed — `ROLLBACK` is required before anything else"],
-          ["lost", "danger", "the transaction session was lost — disconnect and reconnect, then verify the outcome"]
+          [
+            "idle",
+            "filled",
+            "nothing running, no manual transaction open"
+          ],
+          [
+            "running",
+            "pulsing",
+            "a query, page fetch, or *Load all* is running"
+          ],
+          [
+            "transaction",
+            "hollow ring",
+            "a manual transaction is open"
+          ],
+          [
+            "failed",
+            "warning",
+            "the transaction failed; `ROLLBACK` is required before anything else"
+          ],
+          [
+            "lost",
+            "danger",
+            "the transaction session was lost; disconnect, reconnect, verify the outcome"
+          ]
+        ]
+      },
+      {
+        "k": "list",
+        "items": [
+          "Hover a chip to read its state in words.",
+          "While a query runs the dot is a button: click it to cancel that connection's query, with a confirmation and without switching to it.",
+          "**✕** disconnects one connection. A running query must be cancelled or finish, an open transaction committed or rolled back, and pending grid edits applied or discarded.",
+          "Closing Tusk asks about each open transaction in turn."
         ]
       },
       {
         "k": "p",
-        "md": "Hover a chip to read its state in words. While a query is running the dot is a button: click it to cancel that connection's query — with a confirmation, and without switching to it first."
+        "md": "Each connection carries its own result cursor, manual transaction and bar, Explorer tree, autocomplete catalog, permissions, tab set, recovered buffers, and **Cancel**. Work on one connection never interrupts another's stream or metadata."
       },
       {
-        "k": "p",
-        "md": "Each connection is independent: its own result cursor, manual transaction and transaction bar, Explorer tree, autocomplete catalog, permissions, tab set, recovered editor buffers, and **Cancel**. [[topic:history|Query history]] is the exception — it is scoped to the *destination*, so opening the same profile twice shows one combined history for both sessions. Running a query on one connection never interrupts a result still streaming on another, and refreshing one Explorer never discards another connection's metadata. Opening the same saved connection twice gives each session its own tabs, so neither can overwrite the other's unsaved buffers."
-      },
-      {
-        "k": "p",
-        "md": "**Tabs belong to a connection.** Once more than one is open each tab shows its connection's mascot and a colour rail, and clicking a tab switches to its connection — so the Explorer, the transaction bar and any generated SQL always describe the database that tab actually talks to. New tabs open on the connection in focus, and closing a connection's last tab opens a fresh one on it rather than dropping it out of reach."
-      },
-      {
-        "k": "p",
-        "md": "**✕** on a chip disconnects just that connection, with the same guards as always: a query still running on it must be cancelled or allowed to finish, an open manual transaction must be committed or rolled back, and pending grid edits applied or discarded. Closing Tusk asks about each open transaction in turn, and never discards another connection's pending edits without asking. The other connections are untouched."
+        "k": "list",
+        "items": [
+          "[[topic:history|Query history]] is scoped to the destination, so the same profile opened twice shows one combined history.",
+          "Tabs belong to a connection. Above one connection each tab shows its mascot and colour rail, and clicking a tab switches to that connection.",
+          "New tabs open on the connection in focus. Closing a connection's last tab opens a fresh one on it.",
+          "The same saved connection opened twice gives each session its own tabs."
+        ]
       },
       {
         "k": "keys",
         "rows": [
-          { "action": "nextConnection", "does": "Focus the next open connection (inert while only one is open)" },
-          { "action": "prevConnection", "does": "Focus the previous open connection" },
-          { "action": "newConnection", "does": "Open the connect screen over the workspace to add another connection" }
+          {
+            "action": "nextConnection",
+            "does": "Focus the next open connection"
+          },
+          {
+            "action": "prevConnection",
+            "does": "Focus the previous open connection"
+          },
+          {
+            "action": "newConnection",
+            "does": "Open the connect screen over the workspace"
+          }
         ]
       },
       {
         "k": "tip",
         "kind": "tip",
-        "md": "The connect screen offers **Reopen last session** — the saved connections that were open when you last used Tusk. The offer also appears in the **＋** panel, so connecting one profile first doesn't cost you the rest of the list, and anything that fails to reopen stays in the offer with its reason. It never reconnects on its own, and ad-hoc connections typed in without saving are deliberately not remembered."
+        "md": "**Reopen last session** also appears in the **＋** panel, and anything that fails to reopen stays in the offer with its reason."
       },
       {
         "k": "h",
@@ -2881,16 +3064,20 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**Brand mark** — driver-adaptive mascot (🐘 Postgres, 🦆 DuckDB, 🪶 SQLite, 🐬 MySQL, 🧱 SQL Server; same emoji in the OS window title)",
-          "**Connection chip** — database name, or file basename / `:memory:` for embedded drivers",
-          "Driver label + server version",
-          "**🔒 Read-only** badge when the connection blocks writes and DDL",
-          "Right side: **✨ AI** toggle, history clock, **?** (this manual), Settings gear, **Disconnect**"
+          "**Brand mark** — driver mascot, matching the OS window title.",
+          "**Connection chip** — database name, or file basename / `:memory:` for embedded drivers.",
+          "Driver label and server version.",
+          "**🔒 Read-only** badge when the connection blocks writes and DDL.",
+          "Right side: **✨ AI** toggle, history clock, **?** for this manual, Settings gear, **Disconnect**."
         ]
       },
       {
-        "k": "p",
-        "md": "The footer statusbar shows status text, a **🟢/🟡 Slack** badge while the [[topic:slack|Slack bot]] is connecting or connected — turning **🔴** with the reason in the status text if the bot stops on its own, such as when the connection it answers against is disconnected — and cursor info: line/column, `Stmt 2/5` in multi-statement buffers, selection character count. **Copy w/ column names** lives in the result toolbar next to Export…, not here — same `copyHeaders` pref as Settings → Grid."
+        "k": "list",
+        "items": [
+          "The footer shows status text and cursor info: line/column, `Stmt 2/5` in multi-statement buffers, selection character count.",
+          "A **🟢/🟡 Slack** badge tracks the [[topic:slack|Slack bot]] connecting or connected; it turns **🔴** with the reason in the status text when the bot stops.",
+          "**Copy w/ column names** lives in the result toolbar next to Export…, on the same `copyHeaders` pref as Settings → Grid."
+        ]
       },
       {
         "k": "h",
@@ -2899,7 +3086,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Open with the topbar gear or [[kbd:Mod-,]] (the `openSettings` action). Eight tabs; every control applies immediately:"
+        "md": "Open with the topbar gear or [[kbd:Mod-,]]. Eight tabs; every control applies immediately."
       },
       {
         "k": "table",
@@ -2910,42 +3097,42 @@ export const TOPICS: Topic[] = [
         "rows": [
           [
             "**Editor**",
-            "Font size (9–24), Word wrap, Auto-fold large literals, Server-side lint (PREPARE-only), SQL dialect — the dialect select is **disabled while connected** (it follows the driver)"
+            "Font size (9–24), word wrap, auto-fold large literals, server-side lint, SQL dialect. The dialect select is disabled while connected."
           ],
           [
             "**Appearance**",
-            "Theme, Editor / grid font (free text with presets like JetBrains Mono, Fira Code, Consolas — plus a Reset), Accent color (picker + six swatches)"
+            "Theme, editor/grid font (free text, presets, Reset), accent color (picker plus six swatches)."
           ],
           [
             "**Grid**",
-            "Row density (Normal 28 px / Compact 22 px rows), Zebra striping, NULL cells show (`NULL` / empty / —), Default column width (48–900), Copy with column names"
+            "Row density (Normal 28 px / Compact 22 px), zebra striping, NULL display (`NULL` / empty / —), default column width (48–900), copy with column names."
           ],
           [
             "**Plans**",
-            "Tree orientation (Top-down / Left-to-right), Heat coloring by (Cost / Actual time / Rows / Off), Node detail (Normal / Compact) — see [[topic:plans|EXPLAIN plans]]"
+            "Tree orientation, heat coloring (Cost / Actual time / Rows / Off), node detail — see [[topic:plans|EXPLAIN plans]]."
           ],
           [
             "**AI**",
-            "Provider cards — **Connection** (API key, API base, origin approval, Test connection) and **Models** (one list from the live catalog: tick to offer, ★ for the default) — then **Assistant** (Share sample rows, Reply max tokens 256–128,000) and Skills — see [[topic:ai|AI assistant]]"
+            "Provider cards — Connection (API key, base, origin approval, Test) and Models — then Assistant (share sample rows, reply max tokens 256–128,000) and Skills. See [[topic:ai|AI assistant]]."
           ],
           [
             "**Slack**",
-            "Status card with On/Off switch, then Slack app tokens (Save/Test), Who can ask (allowlists), Answers (row limits, timeout, charts, write policy), and AI (mirrored provider/model, reply max tokens, sample rows) — see [[topic:slack|Slack bot]]"
+            "Status card with On/Off, Slack app tokens, who can ask, answers, and mirrored AI settings — see [[topic:slack|Slack bot]]."
           ],
           [
             "**Shortcuts**",
-            "Rebind every registered action, with conflict detection — see [[topic:shortcuts|Shortcuts & palette]]"
+            "Rebind every registered action, with conflict detection — see [[topic:shortcuts|Shortcuts & palette]]."
           ],
           [
             "**Privacy**",
-            "Crash-report consent — nothing is ever transmitted automatically"
+            "Crash-report consent. Nothing is transmitted automatically."
           ]
         ]
       },
       {
         "k": "tip",
         "kind": "tip",
-        "md": "Preferences store flat in `tusk.prefs`, shallow-merged over defaults on load — updates never wipe your settings, and new prefs arrive with sane defaults."
+        "md": "Preferences store flat in `tusk.prefs` and are shallow-merged over defaults on load, so new prefs arrive with defaults."
       },
       {
         "k": "h",
@@ -2953,12 +3140,14 @@ export const TOPICS: Topic[] = [
         "id": "themes"
       },
       {
-        "k": "p",
-        "md": "Eight built-in themes — dark: **One Dark** (default), **Catppuccin Mocha**, **Dracula**, **Tokyo Night**; light: **One Light**, **Solarized Light**, **GitHub Light**, **Gruvbox Light** — plus **Follow system**. A theme restyles everything at once: UI palette, editor, syntax highlighting in previews and AI code blocks, lint squiggle colors, grid edit tints."
-      },
-      {
-        "k": "p",
-        "md": "**Accent color** tints buttons, selection, and focus states app-wide; **Editor / grid font** sets the monospace face in both editor and grid — applied live as CSS variables. Blank font uses the built-in stack (JetBrains Mono first)."
+        "k": "list",
+        "items": [
+          "Dark themes: **One Dark** (default), **Catppuccin Mocha**, **Dracula**, **Tokyo Night**.",
+          "Light themes: **One Light**, **Solarized Light**, **GitHub Light**, **Gruvbox Light**. Plus **Follow system**.",
+          "A theme restyles the UI palette, editor, syntax highlighting in previews and AI code blocks, lint squiggles, and grid edit tints.",
+          "**Accent color** tints buttons, selection, and focus states app-wide.",
+          "**Editor / grid font** sets the monospace face in both editor and grid. Blank uses the built-in stack, JetBrains Mono first."
+        ]
       },
       {
         "k": "h",
@@ -2968,15 +3157,20 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "Checks GitHub releases ~3 seconds after launch, then every **5 minutes** (and on window focus if an interval was missed)",
-          "**⬆ Update x.y.z** pill appears bottom-right — on both the connect screen and the workspace",
-          "Click it for release notes + **Install & restart**: the signed artifact downloads with a progress bar, installs, relaunches",
-          "Failed checks (offline, dev build, no published release) are completely silent"
+          "Checks GitHub releases ~3 seconds after launch, then every 5 minutes, and on window focus if an interval was missed.",
+          "An **⬆ Update x.y.z** pill appears bottom-right on both the connect screen and the workspace.",
+          "Click it for release notes and **Install & restart**: the signed artifact downloads with a progress bar, installs, relaunches.",
+          "Failed checks — offline, dev build, no published release — are silent."
         ]
       },
       {
-        "k": "p",
-        "md": "The pill is about an update that's **available**; the **What's new** panel is about one that already **installed**. The first launch on a new version pops it bottom-right with every section between the version you were on and this build, read from the changelog bundled into the app — exact for the running build and fully offline. Dismiss it once and it stays gone until the next update; a fresh install sees nothing. *What's new in this version* in the [[topic:shortcuts|command palette]] reopens it any time."
+        "k": "list",
+        "items": [
+          "The **What's new** panel covers an update that already installed. It pops bottom-right on the first launch of a new version.",
+          "It shows every section between the previous version and this build, read from the changelog bundled into the app.",
+          "Dismiss it and it stays gone until the next update. A fresh install sees nothing.",
+          "*What's new in this version* in the [[topic:shortcuts|command palette]] reopens it."
+        ]
       },
       {
         "k": "h",
@@ -2985,7 +3179,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Everything above works without the mouse; rebind any of these in Settings → Shortcuts ([[topic:shortcuts|Shortcuts & palette]])."
+        "md": "Rebind any of these in Settings → Shortcuts ([[topic:shortcuts|Shortcuts & palette]])."
       },
       {
         "k": "keys",
@@ -3012,11 +3206,11 @@ export const TOPICS: Topic[] = [
           },
           {
             "action": "toggleSidebar",
-            "does": "Collapse / restore the Explorer sidebar (the topbar panel buttons do the same)"
+            "does": "Collapse or restore the Explorer sidebar"
           },
           {
             "action": "toggleResults",
-            "does": "Collapse / restore the results panel — collapsed, the editor takes the full column; running a query reopens it"
+            "does": "Collapse or restore the results panel; running a query reopens it"
           },
           {
             "action": "nextConnection",
@@ -3172,31 +3366,29 @@ export const TOPICS: Topic[] = [
     "icon": "lock"
   },
   {
+    "blurb": "Recent release notes, newest first, plus how updates install themselves.",
     "id": "whats-new",
     "title": "What's new",
-    "blurb": "Recent release notes, newest first, plus how updates install themselves.",
     "blocks": [
       {
         "k": "p",
-        "md": "When a newer release is published, an **⬆ Update vX.Y.Z** pill appears bottom-right on both the connect screen and the workspace."
-      },
-      {
-        "k": "p",
-        "md": "After the update installs, the first launch on the new version pops a **What's new** panel in that same bottom-right corner, listing every release between the version you were running and this one — skipped versions included. It reads the changelog bundled into the build, so it is exact and needs no network; dismiss it once and it's gone until the next update, and a fresh install stays quiet. The GitHub release notes are published from the same section, so the story is identical in-app and on the releases page."
+        "md": "An **⬆ Update vX.Y.Z** pill appears bottom-right on both the connect screen and the workspace when a newer release is published."
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "**Check cadence** — the GitHub release manifest is checked ~3 seconds after launch, then every **5 minutes**, plus once when the window regains focus after a full interval.",
-          "**Install** — click the pill for release notes; **Install & restart** downloads the signed bundle with a progress bar and relaunches (Windows: the NSIS installer handles exit/restart).",
-          "**Failed checks stay silent** — offline, dev build, or no published release."
+          "**Check cadence** — the GitHub release manifest is checked ~3 seconds after launch, then every 5 minutes, plus once when the window regains focus after a full interval.",
+          "**Install** — click the pill for release notes; **Install & restart** downloads the signed bundle with a progress bar and relaunches. On Windows the NSIS installer handles exit and restart.",
+          "**Failed checks stay silent** — offline, dev build, or no published release.",
+          "After the update, the first launch on the new version pops a **What's new** panel listing every release since the one previously installed, skipped versions included.",
+          "It reads the changelog bundled into the build, so it needs no network. GitHub publishes its release notes from the same section.",
+          "Dismiss it once and it stays gone until the next update. A fresh install stays quiet."
         ]
       },
       {
         "k": "tip",
         "kind": "tip",
-        "md": "The updater shipped in v0.4.5 — earlier installs can't auto-update. Grab a fresh installer once; every version after keeps itself current."
+        "md": "The updater shipped in v0.4.5, so an earlier install needs a fresh installer once before it can update itself."
       },
       {
         "k": "h",
@@ -3205,18 +3397,17 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "**Open several databases at once.** The topbar carries a strip of connection chips — driver mascot, database name, and a state dot (idle, running, transaction open, recovery required, session lost) — with **＋** to open the connect screen as a panel over your workspace and **✕** to disconnect just one. Up to **16** at a time. Each keeps its own result cursor, manual transaction, Explorer tree, autocomplete catalog, permissions, tabs and Cancel, so a query on one never interrupts a result streaming on another. Editor tabs are tagged with their connection and clicking one switches to it. [[kbd:Mod-Alt-ArrowRight]] / [[kbd:Mod-Alt-ArrowLeft]] move between them, [[kbd:Mod-Shift-n]] opens another. See [[topic:workspace|Workspace]].",
-          "**Reopen last session.** The connect screen — and the **＋** panel — offers the saved connections that were open when you last used Tusk, in order, saying how many are left. Anything that fails to reopen is named with its own reason and stays in the offer. Tusk never reconnects on its own, and ad-hoc connections typed in without saving are deliberately not remembered.",
-          "**Backup and restore, built in.** No `pg_dump`, no `mysqldump`, nothing to install: Tusk writes a plain-SQL dump through the driver it is already connected with, on all five engines. Right-click a database, schema or table for **Backup…**, pick scope and contents, optionally emit `DROP … IF EXISTS` or wrap the file in one transaction, and watch object/row/byte counters with a Cancel that works everywhere. **Restore from file…** replays a dump statement by statement and names the first failure with its statement number and line. PostgreSQL streams `COPY` inside one repeatable-read snapshot; the other engines emit batched `INSERT`s. See [[topic:backup|Backup & restore]].",
-          "**Import is a guided, multi-step flow, and export reaches the Explorer.** *Import data* opens **File → Columns → Run** on PostgreSQL, MySQL, SQLite and DuckDB: configurable delimiter/quote/escape, UTF-8 or Latin-1, skip-N-rows, a NULL placeholder, JSON arrays and NDJSON, **xlsx with a sheet picker**, name-matched column mapping, per-column *empty → NULL*, inferred column types for a new table, and conflict handling (fail / skip / update) in each engine's own form. Everything is parsed in Rust straight from disk. The Explorer gains **Export table…** / **Export tables…**, and the export dialog gains a **Selection** scope, a real reconstructed `CREATE TABLE` for plain-table SQL exports, and per-format memory of your last options. See [[topic:import-export|Import & export]].",
-          "**Build result filters visually.** A **Filter** button ([[kbd:Mod-Shift-f]]), *Filter by this column…* in the header menu, and the Explorer's *Filter rows…* open a tree of AND/OR groups. Twenty-one operators, gated by the column's inferred class, up to eight levels and 200 conditions, with the exact `WHERE` shown as you build it — **Apply filter**, **Copy WHERE**, or **Open as query** into a new tab. Active rules show as chips above the grid, and the per-column filter row feeds the same filter. See [[topic:results|Results grid]].",
-          "**Reach a database through an SSH tunnel.** PostgreSQL, MySQL and SQL Server connections can tunnel: host, port, user, and Password / Private key / SSH agent. The SSH client is built in, and the secret goes to the OS keychain under its own entry. Host keys are checked against `~/.ssh/known_hosts` (read-only) and Tusk's own trust store — an unknown host shows its `SHA256:…` fingerprint before **Trust and connect**, a changed key is refused outright. See [[topic:getting-started|Connections & drivers]].",
-          "**Microsoft SQL Server is a connectable driver.** Port 1433, SQL login, keychain password, the usual `sslmode` choices. Results page with `OFFSET`/`FETCH`; the Explorer shows schemas, tables and views with columns, indexes, constraints, triggers, sequences and routines; Copy DDL reconstructs tables from `sys.*` with foreign keys as trailing `ALTER`s. The editor speaks T-SQL — `[bracketed identifiers]`, `N'literals'`, nested block comments, `BEGIN … END` blocks and `GO` batches all lex correctly — and manual transactions use `BEGIN TRANSACTION` / `SAVE TRANSACTION`, verified against `@@TRANCOUNT` and `XACT_STATE()`. ERD, in-grid editing, export, backup and restore all work.",
-          "**What SQL Server doesn't do yet.** File import, the Explorer's DDL builders (no T-SQL builders yet), the Slack bot (Tusk can't open an engine-enforced read-only session there) and Explain (T-SQL has no `EXPLAIN`) are all refused with the reason. Table Copy DDL needs SQL Server 2017 or later — on an older server it refuses rather than emitting a script with the keys silently missing; stored view/procedure/function text still works there.",
-          "**Table editing on every engine that can express it.** *Create table…* covers types, NOT NULL, defaults, single or composite keys, unique, check and each engine's auto-numbering; foreign keys get a searchable picker instead of a typed name. *Modify table…* now reorders columns, adds UNIQUE/CHECK/FK constraints, drops each kind with that engine's own action, and refuses clearly on an empty or duplicate name, a nullable primary key or a generated column. **SQLite rebuilds** — create, `INSERT … SELECT`, drop, rename, recreate indexes and triggers, in one transaction, with the button reading **Rebuild table**. The Explorer's DDL menu is live on PostgreSQL, DuckDB, MySQL and SQLite, each action offered only where the engine has it, and the Explorer now reports real indexes, constraints and triggers on all of them. See [[topic:sidebar|Schema explorer & DDL]].",
-          "**Fewer ways to lose something you didn't choose.** Deleting a saved connection asks first — it takes the keychain password with it. **Try to continue** after an error no longer connects your connect-on-startup profile behind your back. A file picker that resolves without ever appearing is confirmed rather than written to. The Slack bot's autostart binds to one **saved** connection: it waits for that connection instead of latching onto whichever opens first, and disconnecting no longer rewrites the setting. On SQL Server, a query ending in `ORDER BY` can be sorted and filtered again — the ordering moves onto the wrapper instead of disabling both buttons."
+          "**Open several databases at once.** Up to 16, one topbar chip each — driver mascot, database name, state dot (idle, running, transaction open, recovery required, session lost) — with **＋** to open the connect screen as a panel and **✕** to disconnect one. Each connection keeps its own result cursor, manual transaction, Explorer tree, autocomplete catalog, permissions, tabs and Cancel. Editor tabs are tagged with their connection and clicking one switches to it. [[kbd:Mod-Alt-ArrowRight]] / [[kbd:Mod-Alt-ArrowLeft]] move between them, [[kbd:Mod-Shift-n]] opens another. See [[topic:workspace|Workspace]].",
+          "**Reopen last session.** The connect screen and the **＋** panel offer the saved connections open at last quit, in order. Anything that fails to reopen is named with its reason and stays in the offer. Ad-hoc connections are not remembered.",
+          "**Backup and restore, built in.** Plain-SQL dumps written through the connected driver on all five engines, with no `pg_dump` or `mysqldump` to install. Right-click a database, schema or table for **Backup…**: scope, contents, optional `DROP … IF EXISTS`, single-transaction wrap, live object/row/byte counters, and Cancel. **Restore from file…** replays a dump statement by statement and names the first failure with its statement number and line. PostgreSQL streams `COPY` inside one repeatable-read snapshot; other engines emit batched `INSERT`s. See [[topic:backup|Backup & restore]].",
+          "**Import is a guided flow, and export reaches the Explorer.** *Import data* runs **File → Columns → Run** on PostgreSQL, MySQL, SQLite and DuckDB: configurable delimiter, quote and escape, UTF-8 or Latin-1, skip-N-rows, a NULL placeholder, JSON arrays and NDJSON, xlsx with a sheet picker, name-matched column mapping, per-column *empty → NULL*, inferred types for a new table, and conflict handling (fail / skip / update). Parsing runs in Rust straight from disk. The Explorer gains **Export table…** / **Export tables…**; the export dialog gains a **Selection** scope, a reconstructed `CREATE TABLE` for plain-table SQL exports, and per-format option memory. See [[topic:import-export|Import & export]].",
+          "**Build result filters visually.** A **Filter** button ([[kbd:Mod-Shift-f]]), *Filter by this column…* in the header menu, and the Explorer's *Filter rows…* open a tree of AND/OR groups. Twenty-one operators gated by the column's inferred class, up to eight levels and 200 conditions, with the `WHERE` shown live — then **Apply filter**, **Copy WHERE**, or **Open as query**. Active rules show as chips above the grid. See [[topic:results|Results grid]].",
+          "**Reach a database through an SSH tunnel.** PostgreSQL, MySQL and SQL Server connections tunnel with Password, Private key, or SSH agent; the SSH client is built in and the secret goes to its own OS keychain entry. Host keys are checked against read-only `~/.ssh/known_hosts` and Tusk's own trust store: an unknown host shows its `SHA256:…` fingerprint before **Trust and connect**, a changed key is refused. See [[topic:getting-started|Connections & drivers]].",
+          "**Microsoft SQL Server is a connectable driver.** Port 1433, SQL login, keychain password, the usual `sslmode` choices, results paged with `OFFSET`/`FETCH`. The Explorer shows schemas, tables and views with columns, indexes, constraints, triggers, sequences and routines; Copy DDL reconstructs tables from `sys.*` with foreign keys as trailing `ALTER`s. The editor lexes T-SQL — `[bracketed identifiers]`, `N'literals'`, nested block comments, `BEGIN … END`, `GO` batches — and manual transactions use `BEGIN TRANSACTION` / `SAVE TRANSACTION`, verified against `@@TRANCOUNT` and `XACT_STATE()`. ERD, in-grid editing, export, backup and restore work.",
+          "**Not yet on SQL Server.** File import, the Explorer's DDL builders, the Slack bot and Explain are refused with the reason. Table Copy DDL needs SQL Server 2017 or later; stored view, procedure and function text still works on older servers.",
+          "**Table editing on every engine that can express it.** *Create table…* covers types, NOT NULL, defaults, single or composite keys, unique, check, and each engine's auto-numbering, with a searchable picker for foreign keys. *Modify table…* reorders columns, adds UNIQUE/CHECK/FK constraints, drops each kind with that engine's own action, and refuses an empty or duplicate name, a nullable primary key, or a generated column. SQLite rebuilds the table — create, `INSERT … SELECT`, drop, rename, recreate indexes and triggers — in one transaction, under a **Rebuild table** button. See [[topic:sidebar|Schema explorer & DDL]].",
+          "**Safer defaults.** Deleting a saved connection asks first and takes its keychain password with it. **Try to continue** after an error no longer connects the connect-on-startup profile. A file picker that resolves without appearing is confirmed rather than written to. Slack autostart binds to one saved connection and waits for it. On SQL Server, a query ending in `ORDER BY` can still be sorted and filtered, with the ordering moved onto the wrapper."
         ]
       },
       {
@@ -3226,10 +3417,9 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "**Run selection or current statement now honors the exact selection.** [[kbd:Mod-Shift-Enter]] and the matching command-palette action used to ignore selected text and resolve the whole semicolon-delimited statement under the cursor. Selecting an inner `SELECT` inside `WITH … UPDATE` could therefore run the update; a non-blank selection now always wins, including when selected backwards.",
-          "**Explain and grid reruns fail closed on ambiguous SQL.** Explain refuses multi-statement selections so trailing SQL cannot execute outside its prefix, and the shared CTE classifier now understands complex engine-specific forms and treats `SELECT … INTO` as a write. Explain Analyze confirmation, backend streaming, and grid sort/filter wrapping use the same safety decision."
+          "**Run selection or current statement honors the exact selection.** [[kbd:Mod-Shift-Enter]] and its palette action used to resolve the whole statement under the cursor, so selecting an inner `SELECT` inside `WITH … UPDATE` could run the update. A non-blank selection now wins, including a backwards one.",
+          "**Explain and grid reruns fail closed on ambiguous SQL.** Explain refuses multi-statement selections, and the shared CTE classifier handles engine-specific forms and treats `SELECT … INTO` as a write. Explain Analyze confirmation, backend streaming, and grid sort/filter wrapping share that decision."
         ]
       },
       {
@@ -3239,10 +3429,9 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "**`WITH … UPDATE` / `INSERT` / `DELETE` / `MERGE` now execute correctly.** A statement opening with `WITH` was treated as a streamable read by its first word, so PostgreSQL received it wrapped in a cursor and answered `syntax error at or near \"UPDATE\"`. Tusk now looks at the statement the CTEs feed: a `WITH` ending in `SELECT`/`TABLE`/`VALUES` still streams, one ending in a write runs normally and reports rows affected, and a CTE that is itself a write takes the plain path too.",
-          "**Explain Analyze on a `WITH … UPDATE` now asks first**, like any other write — see [[topic:plans|EXPLAIN plans]]."
+          "**`WITH … UPDATE` / `INSERT` / `DELETE` / `MERGE` execute correctly.** A `WITH` statement was classified by its first word and wrapped in a cursor, drawing `syntax error at or near \"UPDATE\"`. Tusk now classifies by the statement the CTEs feed: one ending in `SELECT`/`TABLE`/`VALUES` streams, one ending in a write reports rows affected, and a write CTE takes the plain path.",
+          "**Explain Analyze on a `WITH … UPDATE` asks first**, like any other write — see [[topic:plans|EXPLAIN plans]]."
         ]
       },
       {
@@ -3252,12 +3441,11 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "**Settings → AI has one model list per provider, and no built-in tiers.** Each provider card is two groups: **Connection** (API key — Enter saves — API base, custom-origin approval, Test connection, Get a key / Remove key) and **Models**, a single searchable list fetched live from the provider when you open the card. A row's **checkbox** decides whether the chat header picker and the Slack bot offer that model; **★** marks the provider's default. The old Default-model dropdown and its \"flagship / balanced / older\" grouping are gone — the list is exactly what the provider serves, in its order. An id the catalog doesn't list can be typed and added. See [[topic:ai|AI assistant]].",
-          "**Sample-row sharing and Reply max tokens** moved into their own **Assistant** group with a one-line explanation each.",
-          "**Settings → Slack is reorganized:** a status card (state, last error, On/Off switch) then Slack app tokens, Who can ask, Answers, and AI, every field with an inline explanation; the AI group says when the bot is behind Settings → AI and offers **Update bot**. See [[topic:slack|Slack bot]].",
-          "**Panning the ERD or dragging a table card no longer selects text** — the schema graph and the EXPLAIN plan canvas are pure pan/drag surfaces now; the DDL pane beside the graph stays selectable.",
+          "**Settings → AI has one model list per provider.** Each card is **Connection** (API key, API base, custom-origin approval, Test connection, Get a key / Remove key) and **Models**, a searchable list fetched live from the provider when the card opens. A row's checkbox decides whether the chat picker and the Slack bot offer that model; **★** marks the default. Tiers and the Default-model dropdown are gone; unlisted ids can be typed in. See [[topic:ai|AI assistant]].",
+          "**Sample-row sharing and Reply max tokens** moved into an **Assistant** group.",
+          "**Settings → Slack is reorganized:** a status card, then Slack app tokens, Who can ask, Answers, and AI. The AI group flags when the bot is behind Settings → AI and offers **Update bot**. See [[topic:slack|Slack bot]].",
+          "**Panning the ERD or the plan canvas no longer selects text.** The DDL pane beside the graph stays selectable.",
           "**Dragging in the Schema Explorer no longer highlights text.**"
         ]
       },
@@ -3268,11 +3456,11 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "**Incomplete results are marked.** Expanding a table in the Explorer, refreshing the schema, sidebar DDL, an all-rows export, an import, the ERD/DDL viewer, or running in another tab closes the one server cursor a streaming result depends on. The affected tab used to report the rows loaded so far as the full result on the next scroll; it now shows an **Incomplete result** badge and a `N rows loaded · …` status naming what closed the stream, in-memory sort is off for it (a header click re-runs with `ORDER BY`), and Export labels its loaded rows as incomplete. The table info needed for in-grid editing is fetched **before** a query runs — fetching it afterwards used to truncate every editable result at the first page.",
-          "**Numeric columns sort by value** in a fully loaded result (integers exactly at any size, decimals and scientific notation as numbers, `NaN` last); a column with any non-numeric value keeps text order. See [[topic:results|Results]].",
-          "**A sort click that can't apply says why** in the status line instead of doing nothing."
+          "**Incomplete results are marked.** Expanding a table, refreshing the schema, sidebar DDL, an all-rows export, an import, the ERD/DDL viewer, or a run in another tab closes the one server cursor a streaming result depends on. That tab now shows an **Incomplete result** badge and a `N rows loaded · …` status naming the cause, in-memory sort is off for it, and Export labels its rows incomplete.",
+          "Table info for in-grid editing is fetched **before** a query runs; fetching it afterwards truncated every editable result at the first page.",
+          "**Numeric columns sort by value** in a fully loaded result — integers exactly at any size, decimals and scientific notation as numbers, `NaN` last. Any non-numeric value keeps text order. See [[topic:results|Results]].",
+          "**A sort click that can't apply says why** in the status line."
         ]
       },
       {
@@ -3282,9 +3470,8 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "SQL pasted from web pages often carries **non-breaking spaces, zero-width characters, or curly quotes** — invisible in the editor, but the server reads a non-breaking space as an *identifier* character (`syntax error at or near \".\"` on a query that looks perfect). The offline linter now squiggles each one with its code point, and one quick-fix ([[kbd:Tab]] / [[kbd:Alt-Enter]] on the squiggle) cleans the whole document. String literals are left alone — there they're data."
+          "SQL pasted from web pages carries **non-breaking spaces, zero-width characters, or curly quotes**, which the server reads as identifier characters. The offline linter squiggles each one with its code point, and one quick-fix ([[kbd:Tab]] / [[kbd:Alt-Enter]]) cleans the whole document. String literals are left alone."
         ]
       },
       {
@@ -3294,9 +3481,8 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "Non-token [[topic:slack|Slack]] settings (sample-row sharing, allowlists, row caps, timeout, charts, write policy, reply max tokens) now **save the moment you change them** — switching Settings tabs no longer silently reverts an edit that hadn't been Saved. The Save button remains for tokens."
+          "Non-token [[topic:slack|Slack]] settings — sample-row sharing, allowlists, row caps, timeout, charts, write policy, reply max tokens — save on change. The Save button remains for tokens."
         ]
       },
       {
@@ -3306,9 +3492,8 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "The **What's-new panel** now appears on the first update that ships it, even for pre-0.9.1 installs, and is summonable from the command palette.",
+          "The **What's-new panel** appears on the first update that ships it, even for pre-0.9.1 installs, and is summonable from the command palette.",
           "**Manual corrections** — twenty-seven fixes across twelve topics, including six factual errors."
         ]
       },
@@ -3319,16 +3504,15 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "Post-update **What's new** panel — bundled changelog, offline, dismiss-once; reopen any time from the command palette.",
-          "**AI reply max tokens** on the desktop (Settings → AI, 256–128,000) — same knob the Slack bot honors.",
+          "Post-update **What's new** panel: bundled changelog, offline, dismiss-once, reopenable from the command palette.",
+          "**AI reply max tokens** on the desktop (Settings → AI, 256–128,000), the same knob the Slack bot honors.",
           "Cancel is honest per engine: a **Running** timer where cancel is impossible (SQLite, MySQL, SQL Server, DuckDB on Windows), a rejected cancel reports why, default [[kbd:Mod-F2]].",
-          "Engine-aware editor lexing (MySQL `#` comments and backslash escapes; backticks on MySQL/SQLite; T-SQL brackets, nested comments and `GO`) and one shared active-schema resolver for completion, lint, and grid editing.",
-          "`WHERE a = 1, b = 2` squiggles instantly — the comma-for-AND typo is caught offline.",
+          "Engine-aware editor lexing — MySQL `#` comments and backslash escapes, backticks on MySQL/SQLite, T-SQL brackets, nested comments and `GO` — and one shared active-schema resolver for completion, lint, and grid editing.",
+          "`WHERE a = 1, b = 2` squiggles instantly.",
           "Grid **Copy as X** is byte-identical to Export; empty strings stay distinct from NULL.",
           "Explorer DDL and full-query exports land in history as `-- [Explorer]` / `-- [Export]`.",
-          "Slack: TSV and SQL-insert exports, attachments named after the queried table, 5 sample tables (desktop parity)."
+          "Slack: TSV and SQL-insert exports, attachments named after the queried table, 5 sample tables."
         ]
       },
       {
@@ -3338,16 +3522,15 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "Manual transactions own one session across runs: owner bar, frozen non-owner tabs, per-engine savepoints/`SET TRANSACTION`, MySQL `SET autocommit=0` — see [[topic:editor|the editor topic]].",
-          "Explicit **AI destination consent**: keys are origin-bound in the keychain; unapproved custom bases fail closed everywhere, including Slack.",
-          "Stricter read-only (writable CTEs, row locks, `SELECT … INTO`, `EXPLAIN ANALYZE`) and no automatic statement replay after a dropped connection.",
-          "Explicit shape/byte budgets across queries, exports, plans, ERD, AI streams, Slack, history, and crash reports.",
-          "Atomic file exports — the destination is replaced only on success; zero rows still produce a valid file.",
-          "Revision-safe tabs, files, and history; sample sharing fails closed when its preference can't be stored.",
-          "Slack approvals are exact single-use capabilities; result exports are requester-only.",
-          "Fixed: window close, cross-tab runs after a multi-page result, a cancel race that could brick the cancel registry."
+          "Manual transactions own one session across runs: owner bar, frozen non-owner tabs, per-engine savepoints and `SET TRANSACTION`, MySQL `SET autocommit=0` — see [[topic:editor|the editor topic]].",
+          "Explicit **AI destination consent**: keys are origin-bound in the keychain, and unapproved custom bases fail closed everywhere, Slack included.",
+          "Stricter read-only — writable CTEs, row locks, `SELECT … INTO`, `EXPLAIN ANALYZE` — and no automatic statement replay after a dropped connection.",
+          "Explicit shape and byte budgets across queries, exports, plans, ERD, AI streams, Slack, history, and crash reports.",
+          "Atomic file exports: the destination is replaced only on success, and zero rows still produce a valid file.",
+          "Revision-safe tabs, files, and history; sample sharing fails closed when its preference cannot be stored.",
+          "Slack approvals are single-use capabilities; result exports are requester-only.",
+          "Fixed: window close, cross-tab runs after a multi-page result, and a cancel race that could brick the cancel registry."
         ]
       },
       {
@@ -3357,16 +3540,15 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "**Ten AI providers, one key each.** Anthropic, OpenAI, Gemini, OpenCode Go, OpenCode Zen, OpenRouter, Groq, Ollama, LM Studio, and a generic OpenAI-compatible entry — each with its own OS-keychain entry. Managed in the new **Settings → AI** tab, with a **Test connection** button that really calls the provider.",
-          "**Skills.** Markdown instructions the assistant follows every time, scoped to your workspace or to one database. Create, edit, import, export. The [[topic:slack|Slack bot]] follows them too. See [[topic:ai|Skills]].",
-          "**Searchable model picker.** Fuzzy, multi-term (`ant opus`), because a router catalogue is hundreds of models.",
-          "**The AI knows your foreign keys.** The join graph now reaches the model as authoritative, instead of it guessing join columns from naming convention.",
-          "**Stop and Retry.** ⏹ Stop (or [[kbd:Escape]]) interrupts the live stream; a reply that dies mid-sentence restarts itself once.",
-          "**Fixed: a failed reply used to look like a finished one.** Provider errors arriving mid-stream were ignored, so the chat went quiet and Slack blamed your question (\"try the desktop app\") for what was really a provider outage.",
-          "**Fixed: dropdown popups were unreadable in every dark theme** — white text on a white native popup. Affected every dropdown in the app, not just the AI panel.",
-          "**Fixed: DuckDB `TIMESTAMPTZ` casts failed on a fresh machine.** The ICU extension is now installed on demand, not merely loaded."
+          "**Ten AI providers, one key each.** Anthropic, OpenAI, Gemini, OpenCode Go, OpenCode Zen, OpenRouter, Groq, Ollama, LM Studio, and a generic OpenAI-compatible entry, each with its own OS-keychain entry. Managed in **Settings → AI**, with a **Test connection** button that calls the provider.",
+          "**Skills.** Markdown instructions the assistant follows every time, scoped to the workspace or one database. Create, edit, import, export. The [[topic:slack|Slack bot]] follows them too. See [[topic:ai|Skills]].",
+          "**Searchable model picker** — fuzzy and multi-term (`ant opus`).",
+          "**The AI knows the foreign keys.** The join graph reaches the model as authoritative instead of guessing from naming convention.",
+          "**Stop and Retry.** ⏹ Stop or [[kbd:Escape]] interrupts the live stream; a reply that dies mid-sentence restarts itself once.",
+          "Fixed: provider errors arriving mid-stream were ignored, so a failed reply looked like a finished one.",
+          "Fixed: native dropdown popups were unreadable in every dark theme.",
+          "Fixed: DuckDB `TIMESTAMPTZ` casts failed on a fresh machine; the ICU extension is now installed on demand, not merely loaded."
         ]
       },
       {
@@ -3378,7 +3560,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**This manual** — topbar `?` or [[kbd:F1]], on both screens: full-text search, grouped topics, collapsible sections, live shortcut chips.",
-          "**Collapsible panels** — hide the Explorer ([[kbd:Mod-b]]) or the results panel ([[kbd:Mod-j]]); running a query reopens the results automatically, and panel sizes clamp to the window so nothing can cover the editor.",
+          "**Collapsible panels** — hide the Explorer ([[kbd:Mod-b]]) or the results panel ([[kbd:Mod-j]]); running a query reopens the results, and panel sizes clamp to the window.",
           "**Connect screen refresh** — driver mascot tiles, paired Host+Port and Database+SSL rows, profile badges (⭐ startup default, `RO` read-only), scrollable profile list."
         ]
       },
@@ -3389,19 +3571,18 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "A **Slack bot hosted inside the desktop app** (Socket Mode — outbound WebSocket only, no server, no public endpoint; bring your own Slack app via the manifest in `docs/slack-setup.md`). Full walkthrough: [[topic:slack|Slack integration]]."
+        "md": "A **Slack bot hosted inside the desktop app** over Socket Mode: outbound WebSocket only, no server or public endpoint, and a Slack app of your own from the manifest in `docs/slack-setup.md`. Full walkthrough: [[topic:slack|Slack integration]]."
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "DM or `@mention` the bot with a question → the AI proposes SQL with **Approve / Reject** buttons. Only the requester can click; proposals expire after 5 minutes.",
-          "Approved queries are **read-only by construction**: one wrappable read, mutation/output/lock scans, executable-comment rejection, a conservative deterministic-function allowlist, a hard row cap, and a fresh engine-enforced read-only backend (which is why SQL Server connections are refused) — layered guards, never prompt-only (see [[topic:safety|Safety]]).",
-          "Results reply in-thread as an inline table, CSV/XLSX attachment, or a **chart rendered fully locally** (plotters → PNG, embedded font — nothing leaves your machine). Ask explicitly (\"as a bar chart, months on x\") and the AI's chart spec controls type, axes, and series; date+numeric results auto-chart too (Settings toggle, default on).",
-          "Every result carries **Export as… CSV / TSV / Excel / JSON / SQL / Markdown** buttons (results cached 15 minutes; requester-only).",
+          "DM or `@mention` the bot with a question; the AI proposes SQL with **Approve / Reject** buttons. Only the requester can click, and proposals expire after 5 minutes.",
+          "Approved queries are read-only by construction: one wrappable read, mutation/output/lock scans, executable-comment rejection, a conservative deterministic-function allowlist, a hard row cap, and a fresh engine-enforced read-only backend. SQL Server connections are refused for that reason. See [[topic:safety|Safety]].",
+          "Results reply in-thread as an inline table, a CSV/XLSX attachment, or a chart rendered locally through plotters with an embedded font. Ask for a shape (\"as a bar chart, months on x\") and the AI's chart spec sets type, axes and series; date+numeric results auto-chart under a Settings toggle, default on.",
+          "Every result carries **Export as… CSV / TSV / Excel / JSON / SQL / Markdown**; results cache for 15 minutes and are requester-only.",
           "Every approved run lands in [[topic:history|query history]] with a `-- [Slack] asked by <user>` marker.",
-          "Configure in **Settings → Slack** — tokens go to the OS keychain; the statusbar shows a live 🟢 Slack badge.",
-          "Fixed: DuckDB `CAST(timestamptz_col AS DATE)` no longer fails with \"Unimplemented type for cast\" — the ICU extension now loads on every connection."
+          "Configure in **Settings → Slack**; tokens go to the OS keychain and the statusbar shows a live 🟢 Slack badge.",
+          "Fixed: DuckDB `CAST(timestamptz_col AS DATE)` failed with \"Unimplemented type for cast\"; the ICU extension now loads on every connection."
         ]
       },
       {
@@ -3411,11 +3592,10 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "**0.6.2** — DuckDB date/time/decimal values render correctly on every path: `DATE`, `TIMESTAMP`, `TIME`, `DECIMAL`, `HUGEINT`, `INTERVAL`, and nested lists/structs format readably instead of raw internals like `Date32(19797)`.",
-          "**0.6.1** — DuckDB `EXPLAIN` / `EXPLAIN ANALYZE` [[topic:plans|plan trees]] show rows, timing, and heat coloring (both JSON shapes parsed; heat falls back cost → time → rows).",
-          "**0.6.0** — [[topic:sidebar|Sidebar]] DDL editing works on **DuckDB**: create/modify/rename/drop tables, column changes, indexes, comments, truncate, schemas, and CTAS duplicate. Actions DuckDB can't do (constraint `ALTER`s, renaming an index/sequence/constraint, `CREATE DATABASE`) are disabled with a tooltip. Update checks moved from every 6 hours to every 5 minutes."
+          "**0.6.2** — DuckDB `DATE`, `TIMESTAMP`, `TIME`, `DECIMAL`, `HUGEINT`, `INTERVAL`, and nested lists/structs render readably instead of raw internals like `Date32(19797)`.",
+          "**0.6.1** — DuckDB `EXPLAIN` / `EXPLAIN ANALYZE` [[topic:plans|plan trees]] show rows, timing, and heat coloring; both JSON shapes parse and heat falls back cost → time → rows.",
+          "**0.6.0** — [[topic:sidebar|Sidebar]] DDL editing on **DuckDB**: create/modify/rename/drop tables, column changes, indexes, comments, truncate, schemas, CTAS duplicate. Unsupported actions are disabled with a tooltip. Update checks moved from every 6 hours to every 5 minutes."
         ]
       },
       {
@@ -3425,10 +3605,9 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "**0.5.1** — DuckDB pinned to the stable **1.4.x** line (registry 1.5 *preview* builds broke even `CURRENT_DATE - INTERVAL`). A file-backed DuckDB releases its exclusive OS lock while idle and re-acquires it on the next command, so other tools can open the file between your queries (`:memory:` stays open — closing would discard its data).",
-          "**0.5.0** — the updater re-checks periodically instead of only at startup; the object tree builds faster on wide MySQL/DuckDB schemas."
+          "**0.5.1** — DuckDB pinned to the stable 1.4.x line. A file-backed DuckDB releases its exclusive OS lock while idle and re-acquires it on the next command; `:memory:` stays open.",
+          "**0.5.0** — the updater re-checks periodically instead of only at startup, and the object tree builds faster on wide MySQL/DuckDB schemas."
         ]
       },
       {
@@ -3437,21 +3616,16 @@ export const TOPICS: Topic[] = [
         "id": "v0-4-x"
       },
       {
-        "k": "p",
-        "md": "The 0.4 series (0.4.0 → 0.4.14) turned the result grid into a data editor and hardened multi-driver behavior."
-      },
-      {
         "k": "list",
-        "ordered": false,
         "items": [
-          "**[[topic:grid-editing|In-grid data editing]]** — single-table SELECTs with the full primary key become editable on every driver; cell edits, delete marks, and new rows stage until **Commit…** previews the UPDATE/DELETE/INSERT script and runs it atomically, or **Apply…** joins an existing owner transaction without committing it. Later releases added **clipboard paste** (TSV/CSV, header-mapped or positional), boolean TRUE/FALSE pills with a dropdown editor, and insert rows pinned to the **top**.",
-          "**Parameter prompts** — `$1` or `:name` parameters open a per-parameter dialog (value, NULL, or raw splice) with live preview; values remembered per tab.",
+          "**[[topic:grid-editing|In-grid data editing]]** — a single-table SELECT with the full primary key becomes editable on every driver. Edits, delete marks and new rows stage until **Commit…** previews the UPDATE/DELETE/INSERT script and runs it atomically, or **Apply…** joins an owner transaction. Later releases added clipboard paste, boolean pills, and insert rows pinned to the top.",
+          "**Parameter prompts** — `$1` or `:name` open a per-parameter dialog (value, NULL, or raw splice) with live preview; values are remembered per tab.",
           "**FK-aware JOIN completion** — after `JOIN orders o ON `, the [[topic:editor-intel|editor]] proposes complete join conditions from the live foreign-key catalog.",
-          "**Enterprise manual transactions** — raw BEGIN/START, COMMIT/END, ROLLBACK/ABORT, savepoints, supported SET TRANSACTION forms, and MySQL autocommit-off mode can own one tab/session across runs, with a transaction bar, frozen non-owner work, grid Apply vs outer Commit, provenance invalidation, and failed/lost recovery.",
-          "**Every-driver parity** — app-owned multi-statement wrappers on all four engines (subject to MySQL DDL/nontransactional-table semantics), per-dialect grid sort/filter SQL for MySQL/SQLite, streaming [[topic:import-export|export]] on every driver, saved profiles for DuckDB/SQLite/MySQL (file path or `:memory:`).",
-          "**AI upgrades** — model pickers list each provider's **live model catalog**, schema context is relevance-ranked instead of silently truncated, and the [[topic:ai|assistant]] can fetch **sample rows** from relevant tables after explicit opt-in (default off).",
-          "**Appearance** — six new themes (Catppuccin Mocha, Dracula, Tokyo Night, Solarized Light, GitHub Light, Gruvbox Light), a refreshed app icon, responsive toolbars, and resizable docked panels with sizes persisted across sessions ([[topic:workspace|Workspace]]).",
-          "**Sidebar QoL** — row estimates and sizes on Postgres tables, trigger listings, *Filter rows…* opens a table with the filter row pre-shown, and reliable double-click-to-run."
+          "**Manual transactions** — raw BEGIN/START, COMMIT/END, ROLLBACK/ABORT, savepoints, supported SET TRANSACTION forms, and MySQL autocommit-off own one tab and session across runs, with a transaction bar, frozen non-owner work, grid Apply vs outer Commit, provenance invalidation, and failed/lost recovery.",
+          "**Every-driver parity** — app-owned multi-statement wrappers on all four engines, per-dialect grid sort/filter SQL for MySQL/SQLite, streaming [[topic:import-export|export]] on every driver, saved profiles for DuckDB/SQLite/MySQL.",
+          "**AI upgrades** — model pickers list each provider's live catalog, schema context is relevance-ranked instead of truncated, and the [[topic:ai|assistant]] can fetch sample rows after explicit opt-in, default off.",
+          "**Appearance** — six new themes, a refreshed app icon, responsive toolbars, and resizable docked panels with persisted sizes ([[topic:workspace|Workspace]]).",
+          "**Sidebar QoL** — row estimates and sizes on Postgres tables, trigger listings, *Filter rows…* opening a table with the filter row shown, and reliable double-click-to-run."
         ]
       },
       {
@@ -3461,13 +3635,12 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "list",
-        "ordered": false,
         "items": [
-          "**[[topic:plans|EXPLAIN plan visualization]]** — pan/zoomable plan tree with per-node cost/rows/time and heat coloring, per-engine parsers, an **Explain ▾** toolbar action; unparseable output falls back to styled text, never a broken tree.",
-          "**[[topic:erd|DDL & relationships viewer]]** — right-click a table for its reconstructed DDL plus a Neighborhood FK graph, or a schema node for the whole-schema ERD (deterministic layout, colored edges, drag-to-reposition).",
-          "**[[topic:history|Query history]]** — every user-issued run (grid sort/filter re-runs excluded) recorded per connection; search, re-run, open in tab; capped at 500 entries.",
-          "**Command palette** ([[kbd:Mod-k]]) and **[[topic:shortcuts|rebindable shortcuts]]** — every action in one registry; Settings → Shortcuts captures new chords with conflict warnings.",
-          "**Settings dialog, light theme, font & accent customization**, and production-grade schema lint (unknown columns, tables, functions, clause-keyword typos — all with did-you-mean quick-fixes)."
+          "**[[topic:plans|EXPLAIN plan visualization]]** — a pan/zoomable plan tree with per-node cost, rows and time, heat coloring, per-engine parsers, and an **Explain ▾** toolbar action. Unparseable output falls back to styled text.",
+          "**[[topic:erd|DDL & relationships viewer]]** — right-click a table for reconstructed DDL plus a Neighborhood FK graph, or a schema node for the whole-schema ERD with deterministic layout, colored edges, and drag-to-reposition.",
+          "**[[topic:history|Query history]]** — every user-issued run recorded per connection, excluding grid sort/filter re-runs; search, re-run, open in tab; capped at 500 entries.",
+          "**Command palette** ([[kbd:Mod-k]]) and **[[topic:shortcuts|rebindable shortcuts]]** — every action in one registry, with conflict warnings when capturing a chord.",
+          "**Settings dialog, light theme, font and accent customization**, plus schema lint for unknown columns, tables, functions and clause-keyword typos, each with a did-you-mean quick-fix."
         ]
       },
       {
@@ -3477,7 +3650,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Everything back to the first Postgres-only builds — run chooser, streaming results, script runner, import/export, connection layer — is documented release-by-release in `CHANGELOG.md` at the repository root."
+        "md": "Everything back to the first Postgres-only builds is documented release-by-release in `CHANGELOG.md` at the repository root."
       }
     ],
     "icon": "star"
