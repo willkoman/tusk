@@ -1646,7 +1646,13 @@ function App() {
   }
 
   const totalPendingCount = () => tabs().reduce((total, tab) => total + pendingCount(tab.pending), 0);
-  const closeOperationBusy = () => transactionControlBusy() || importBusy();
+  /** A database operation is in flight on ANY open connection (window-close gate). */
+  const anyConnectionBusy = () =>
+    connections().some((e) => {
+      const st = e.state();
+      return st.running || st.fetchingMore || st.loadingAll;
+    });
+  const closeOperationBusy = () => anyConnectionBusy() || commitBusy() || importBusy();
 
   const [slackStatus, setSlackStatus] = createSignal<SlackStatus>({ running: false, state: "disconnected", error: null });
   const slackUnlisten: UnlistenFn[] = [];
@@ -3335,7 +3341,7 @@ function App() {
         schema: src.searchSchema ?? null,
       }, key);
     };
-    if (scope === "all") interruptStream("an all-rows export closed the result stream");
+    if (scope === "all") interruptStream("an all-rows export closed the result stream", src.connectionId);
     try {
       const n = await invoke<number>("export_to_file", args);
       exportHistory("ok", n, null);
@@ -3402,7 +3408,7 @@ function App() {
     // not be spent on a call that is going to be rejected anyway.
     if (metadataFrozen())
       throw new Error("backup is frozen while a manual transaction owns the session — commit or roll it back first");
-    interruptStream("a backup closed the result stream");
+    interruptStream("a backup closed the result stream", c.id);
     const t0 = performance.now();
     try {
       const summary = await invoke<BackupSummary>("backup_to_file", backupPayload(c.id, path, opts));
@@ -3441,7 +3447,7 @@ function App() {
       throw new Error("the connection changed since this dialog was opened — close it and start the restore again");
     if (metadataFrozen())
       throw new Error("restore is frozen while a manual transaction owns the session — commit or roll it back first");
-    interruptStream("a restore closed the result stream");
+    interruptStream("a restore closed the result stream", c.id);
     const t0 = performance.now();
     const entry = (status: HistoryEntry["status"], rows: number | null, error: string | null) =>
       recordHistory({
@@ -3574,7 +3580,7 @@ function App() {
     const t0 = performance.now();
     setImportBusy(true);
     setImportProgress(null);
-    interruptStream("an import closed the result stream");
+    interruptStream("an import closed the result stream", c.id);
     try {
       const summary = await invoke<ImportSummary>("import_from_file", {
         connectionId: c.id,
@@ -3624,7 +3630,7 @@ function App() {
     const origin = captureOrigin();
     // The dialog's column list comes from the relation detail — fetch it BEFORE the
     // export opens, never while a stream is live (it rolls the shared cursor back).
-    interruptStream("reading table columns closed the result stream");
+    interruptStream("reading table columns closed the result stream", c.id);
     await loadDetail(schemaName, name, false, c);
     if (!connectionOpen(c) || !originCurrent(origin)) return;
     const detail = details()[relKey(schemaName, name)];
@@ -3673,7 +3679,7 @@ function App() {
     const src = exportTables();
     const c = conn();
     if (!src || !c || c.id !== src.connectionId) throw new Error("connection changed");
-    interruptStream("a table export closed the result stream");
+    interruptStream("a table export closed the result stream", c.id);
     const t0 = performance.now();
     setExportTablesBusy(true);
     try {
@@ -3787,7 +3793,7 @@ function App() {
       schema: null,
     }, c.key);
     if (origin.tabId) patchResult(origin.tabId, { runErr: "" });
-    interruptStream("an Explorer action closed the result stream");
+    interruptStream("an Explorer action closed the result stream", c.id);
     try {
       const out = await invoke<QueryResult>("run_query", { connectionId: c.id, ownerId: origin.tabId ?? activeTabId(), sql: sqlText, pageSize: PAGE, searchPath: null });
       ddlHistory("ok", null);
@@ -3857,7 +3863,7 @@ function App() {
     const c = conn();
     if (!c || rejectFrozenExplorer()) return;
     const origin = captureOrigin();
-    interruptStream("reading object DDL closed the result stream");
+    interruptStream("reading object DDL closed the result stream", c.id);
     try {
       const dd = await invoke<string>("object_ddl", {
         connectionId: c.id,
@@ -5089,7 +5095,7 @@ function App() {
           {(g) => (
             <DdlGraphDialog
               connectionId={g().connectionId}
-              onBeforeMetadata={() => interruptStream("the ERD/DDL viewer closed the result stream")}
+              onBeforeMetadata={() => interruptStream("the ERD/DDL viewer closed the result stream", g().connectionId)}
               schema={g().schema}
               name={g().name}
               kind={g().kind}
@@ -5253,7 +5259,7 @@ function App() {
                 ? async () => {
                   const d = src().ddl!;
                   if (metadataFrozen()) return "";
-                  interruptStream("reading object DDL closed the result stream");
+                  interruptStream("reading object DDL closed the result stream", src().connectionId);
                   return await invoke<string>("object_ddl", { connectionId: src().connectionId, kind: d.kind, schema: d.schema, name: d.name });
                 }
                 : undefined}

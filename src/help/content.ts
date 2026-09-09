@@ -15,6 +15,14 @@ export const TOPICS: Topic[] = [
         "md": "Tusk opens on the **connect screen**: saved connections on the left, a connection form on the right. Postgres is first-class, but the same form connects to DuckDB, SQLite, MySQL, and SQL Server — the mascot on the card, topbar, and OS window title adapts to the driver (🐘 PostgreSQL, 🦆 DuckDB, 🪶 SQLite, 🐬 MySQL, 🧱 SQL Server)."
       },
       {
+        "k": "p",
+        "md": "**Up to 16 connections can be open at once.** Once one is open, the same screen returns as a panel over your workspace — the **＋** at the end of the topbar's connection strip, or [[kbd:Mod-Shift-n]] — so opening another database never costs you the one you are already working in. See [[topic:workspace|Workspace]] for the strip, the per-connection state dots, and how tabs are tied to their connection."
+      },
+      {
+        "k": "p",
+        "md": "When nothing is connected, the screen offers **Reopen last session**: the saved profiles that were open the last time you used Tusk, reconnected in the order you had them. It is always a click, never automatic — passwords come from the OS keychain, and connections you typed in without saving are not remembered at all. A *Connect on startup* profile still connects on its own as before."
+      },
+      {
         "k": "h",
         "text": "Saved profiles",
         "id": "profiles"
@@ -1077,6 +1085,10 @@ export const TOPICS: Topic[] = [
     "title": "Schema explorer & DDL",
     "blurb": "Browse the database tree; run SQL-previewed DDL from right-click menus.",
     "blocks": [
+      {
+        "k": "p",
+        "md": "The Explorer always shows the **connection the focused tab belongs to**. With several connections open, switching connection in the topbar strip (or clicking a tab that belongs to another one) swaps the whole tree, its cached table detail, the permission gating on this menu, and the Refresh state — each connection keeps its own. Refreshing one Explorer never disturbs another connection's tree or a result still streaming on it."
+      },
       {
         "k": "p",
         "md": "Every node in the **Explorer** tree carries a right-click menu of real actions, and DDL forms and drop/truncate confirms preview the **exact SQL** before running (two exceptions: matview *Refresh* runs immediately; sequence *Restart…* drops its statement into your editor). Mutating items are gated by connection mode, driver capability, and (on Postgres) your actual privileges — disabled items say *why* in their tooltip."
@@ -2344,7 +2356,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "Every proposal is pinned to the exact Tusk connection, server-reported database, workspace, channel, thread, source message, and requester that created it. Switching connection or database makes approval fail closed. Execution uses a fresh read-only backend and does not join or roll back the UI cursor."
+        "md": "Every proposal is pinned to the exact Tusk connection, server-reported database, workspace, channel, thread, source message, and requester that created it. The bot answers against exactly one Tusk connection, chosen when it starts and changeable in **Settings ▸ Slack** while several are open; switching tabs in Tusk never redirects it. Approving a proposal after its connection or database changed fails closed, and disconnecting the bound connection stops the bot with a message. Execution uses a fresh read-only backend and does not join or roll back the UI cursor."
       },
       {
         "k": "list",
@@ -2797,7 +2809,52 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Editor **tabs persist per connection** (`tusk.tabs.*`): each tab's SQL buffer, file path, title, active schema, and which tab was active return on reconnect. **Results are ephemeral** — snapshots, streaming cursors, and pending grid edits never persist; see [[topic:results|Results & streaming]]."
+        "md": "Editor **tabs persist per connection** (`tusk.tabs.*`): each tab's SQL buffer, file path, title, active schema, and which tab was active return on reconnect. Every open connection's tabs are saved, not just the one you are looking at. **Results are ephemeral** — snapshots, streaming cursors, and pending grid edits never persist; see [[topic:results|Results & streaming]]."
+      },
+      {
+        "k": "h",
+        "text": "Several connections at once",
+        "id": "connections"
+      },
+      {
+        "k": "p",
+        "md": "Up to **16** databases can be open at the same time. The topbar carries one chip per open connection — driver mascot, database name, and a state dot — and **＋** opens the connect screen as a panel over your workspace instead of replacing it. With a single connection open the strip looks exactly as it always did."
+      },
+      {
+        "k": "table",
+        "head": ["State dot", "Means"],
+        "rows": [
+          ["green", "idle"],
+          ["blue", "a query, page fetch, or *Load all* is running on this connection"],
+          ["accent", "a manual transaction is open on this connection"],
+          ["amber", "the transaction failed — `ROLLBACK` is required before anything else"],
+          ["red", "the transaction session was lost — disconnect and reconnect, then verify the outcome"]
+        ]
+      },
+      {
+        "k": "p",
+        "md": "Each connection is independent: its own result cursor, manual transaction and transaction bar, Explorer tree, autocomplete catalog, permissions, [[topic:history|query history]], tab set, and **Cancel**. Running a query on one connection never interrupts a result still streaming on another, and refreshing one Explorer never discards another connection's metadata."
+      },
+      {
+        "k": "p",
+        "md": "**Tabs belong to a connection.** Once more than one is open each tab shows its connection's mascot and a colour rail, and clicking a tab switches to its connection — so the Explorer, the transaction bar and any generated SQL always describe the database that tab actually talks to. New tabs open on the connection in focus, and closing a connection's last tab opens a fresh one on it rather than dropping it out of reach."
+      },
+      {
+        "k": "p",
+        "md": "**✕** on a chip disconnects just that connection, with the same guards as always: an open manual transaction must be committed or rolled back first, and pending grid edits applied or discarded. Closing Tusk asks about each open transaction in turn. The other connections are untouched."
+      },
+      {
+        "k": "keys",
+        "rows": [
+          { "action": "nextConnection", "does": "Focus the next open connection (inert while only one is open)" },
+          { "action": "prevConnection", "does": "Focus the previous open connection" },
+          { "action": "newConnection", "does": "Open the connect screen over the workspace to add another connection" }
+        ]
+      },
+      {
+        "k": "tip",
+        "kind": "tip",
+        "md": "The connect screen offers **Reopen last session** — the saved connections that were open when you last used Tusk. It never reconnects on its own, and ad-hoc connections typed in without saving are deliberately not remembered."
       },
       {
         "k": "h",
@@ -2943,6 +3000,18 @@ export const TOPICS: Topic[] = [
           {
             "action": "toggleResults",
             "does": "Collapse / restore the results panel — collapsed, the editor takes the full column; running a query reopens it"
+          },
+          {
+            "action": "nextConnection",
+            "does": "Next open connection"
+          },
+          {
+            "action": "prevConnection",
+            "does": "Previous open connection"
+          },
+          {
+            "action": "newConnection",
+            "does": "Open another connection"
           }
         ]
       }

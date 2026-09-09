@@ -4,6 +4,7 @@ This ledger records the guarantees and remaining limits of the input-hardening p
 
 ## Enforced boundaries
 
+- At most 16 database connections may be open at once. The backend refuses a 17th before it dials anything and again under the registry lock, so two racing connects cannot both land; the frontend mirrors the same ceiling and reports it rather than opening the connect screen. Each connection's result cursor, transaction, cancel registration, generations and metadata caches are keyed by connection id, so one connection cannot cancel, interrupt or invalidate another's work. The remembered-session list is bounded at 16 profile ids of 200 characters each on read.
 - Query page sizes are `1..=50,000`; SQL and editor text files cap at 20 MiB. A query page caps at 50,000 rows, 10,000 columns, 2,000,000 cells, 1 MiB per value, and 64 MiB total. Inline IPC tables cap at 200,000 rows under the same column/cell/value/aggregate limits.
 - Catalog reads cap at 100,000 rows; normal metadata keeps the 1 MiB cell/64 MiB aggregate budgets. DDL metadata permits 8 MiB cells but caps at 32 MiB, and reconstructed DDL caps at 20 MiB.
 - Clipboard formatting caps at 200,000 rows, 10,000 columns, 2,000,000 cells, 1,000,000 characters per field, and 64 MiB output. Grid copy adds a stricter 1,000,000-cell/8,388,608-character source gate. One edit action may target at most 100,000 rows.
