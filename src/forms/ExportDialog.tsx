@@ -6,6 +6,7 @@ import {
   defaultExportOptions,
   isDelimited,
   rememberableExportOptions,
+  sanitizeSheetName,
   EXPORT_FORMATS,
   type ExportOptions,
   type ExportScope,
@@ -26,7 +27,7 @@ export function ExportDialog(props: {
   boolCols?: number[];
   onClose: () => void;
   onExportFile: (opts: ExportOptions, scope: ExportScope) => Promise<boolean>;
-  onExportClipboard: (opts: ExportOptions) => Promise<boolean>;
+  onExportClipboard: (opts: ExportOptions, scope: ExportScope) => Promise<boolean>;
   /** Full-query export is blocked while a manual transaction owns the connection. */
   allowAllRows?: boolean;
   /** The grid's current cell/row selection, offered as a third scope when non-empty. */
@@ -44,6 +45,9 @@ export function ExportDialog(props: {
     applyRememberedExportOptions(defaultExportOptions(props.defaultTable), props.remembered?.csv),
   );
   const [ddlNote, setDdlNote] = createSignal("");
+  // The relation the reconstructed DDL belongs to. Renaming Table away from it would
+  // produce a script that creates one table and inserts into another.
+  const [ddlForTable, setDdlForTable] = createSignal("");
   const [scope, setScope] = createSignal<ExportScope>(props.allowAllRows === false ? "loaded" : "all");
   const [dest, setDest] = createSignal<"file" | "clipboard">("file");
   const [cols, setCols] = createSignal<ColState[]>(
@@ -91,6 +95,7 @@ export function ExportDialog(props: {
     base.sql.table = opts().sql.table;
     setOpts(applyRememberedExportOptions(base, props.remembered?.[f]));
     setDdlNote("");
+    setDdlForTable("");
     if (f === "xlsx" && dest() === "clipboard") setDest("file");
   };
 
@@ -98,22 +103,42 @@ export function ExportDialog(props: {
   async function toggleCreate(on: boolean) {
     setOpts({ ...opts(), sql: { ...opts().sql, includeCreate: on, createSql: "" } });
     setDdlNote("");
+    setDdlForTable("");
     if (!on || !props.onFetchCreateSql) {
       if (on) setDdlNote("Using a generated all-text CREATE — the result is not a plain table.");
       return;
     }
+    const requestedFor = opts().sql.table;
     try {
       const ddl = await props.onFetchCreateSql();
-      if (!opts().sql.includeCreate) return;
-      if (ddl) setOpts({ ...opts(), sql: { ...opts().sql, createSql: ddl } });
-      else setDdlNote("Using a generated all-text CREATE — the result is not a plain table.");
+      if (!opts().sql.includeCreate || opts().sql.table !== requestedFor) return;
+      if (ddl) {
+        setOpts({ ...opts(), sql: { ...opts().sql, createSql: ddl } });
+        setDdlForTable(requestedFor);
+      } else {
+        setDdlNote("Using a generated all-text CREATE — the result is not a plain table.");
+      }
     } catch {
       setDdlNote("Could not read the table DDL — using a generated all-text CREATE.");
     }
   }
+
+  /** The reconstructed DDL names its own (schema-qualified) table; the INSERTs use this
+   *  field. Once they disagree the script is unrunnable, so fall back to the synthetic
+   *  CREATE, which is built from the name the user typed. */
+  function setSqlTable(name: string) {
+    const sql = { ...opts().sql, table: name };
+    if (sql.createSql && name !== ddlForTable()) {
+      sql.createSql = "";
+      setDdlForTable("");
+      setDdlNote("Renaming the table drops the reconstructed DDL — using a generated all-text CREATE.");
+    }
+    setOpts({ ...opts(), sql });
+  }
   const pickDest = (d: "file" | "clipboard") => {
     setDest(d);
-    if (d === "clipboard") setScope("loaded");
+    // The clipboard formats in memory, so only the re-run-the-query scope is impossible.
+    if (d === "clipboard" && scope() === "all") setScope("loaded");
   };
 
   async function run() {
@@ -126,7 +151,7 @@ export function ExportDialog(props: {
     props.onRememberOptions?.(opts().format, rememberableExportOptions(opts()));
     try {
       const completed = dest() === "clipboard"
-        ? await props.onExportClipboard(finalOpts())
+        ? await props.onExportClipboard(finalOpts(), scope())
         : await props.onExportFile(finalOpts(), scope());
       if (completed) props.onClose();
     } catch (e) {
@@ -211,7 +236,7 @@ export function ExportDialog(props: {
             <div class="export-label">SQL options</div>
             <div class="export-row">
               <label>Table
-                <input value={opts().sql.table} onInput={(e) => setOpts({ ...opts(), sql: { ...opts().sql, table: e.currentTarget.value } })} />
+                <input value={opts().sql.table} onInput={(e) => setSqlTable(e.currentTarget.value)} />
               </label>
               <label class="export-check"><input type="checkbox" checked={opts().sql.multiRow} onChange={(e) => setOpts({ ...opts(), sql: { ...opts().sql, multiRow: e.currentTarget.checked } })} />Multi-row INSERT</label>
               <label class="export-check"><input type="checkbox" checked={opts().sql.includeCreate} onChange={(e) => void toggleCreate(e.currentTarget.checked)} />Include CREATE TABLE</label>
@@ -225,7 +250,7 @@ export function ExportDialog(props: {
             <div class="export-label">Excel options</div>
             <div class="export-row">
               <label>Sheet name
-                <input value={opts().xlsx.sheetName} onInput={(e) => setOpts({ ...opts(), xlsx: { ...opts().xlsx, sheetName: e.currentTarget.value } })} />
+                <input value={opts().xlsx.sheetName} onInput={(e) => setOpts({ ...opts(), xlsx: { ...opts().xlsx, sheetName: sanitizeSheetName(e.currentTarget.value) } })} />
               </label>
               <label class="export-check"><input type="checkbox" checked={opts().xlsx.headerStyling} onChange={(e) => setOpts({ ...opts(), xlsx: { ...opts().xlsx, headerStyling: e.currentTarget.checked } })} />Bold header</label>
               <label class="export-check"><input type="checkbox" checked={opts().xlsx.autoFilter} onChange={(e) => setOpts({ ...opts(), xlsx: { ...opts().xlsx, autoFilter: e.currentTarget.checked } })} />Auto-filter</label>
@@ -257,8 +282,8 @@ export function ExportDialog(props: {
           <div class="export-label">Source &amp; destination</div>
           <div class="export-row">
             <label>Rows
-              <select value={scope()} onChange={(e) => setScope(e.currentTarget.value as ExportScope)} disabled={dest() === "clipboard"}>
-                <option value="all" disabled={props.allowAllRows === false}>All rows (re-run query)</option>
+              <select value={scope()} onChange={(e) => setScope(e.currentTarget.value as ExportScope)}>
+                <option value="all" disabled={props.allowAllRows === false || dest() === "clipboard"}>All rows (re-run query)</option>
                 <option value="loaded">Loaded rows ({props.loadedRows.length}{props.loadedIncomplete ? ", incomplete" : ""})</option>
                 <Show when={hasSelection()}>
                   <option value="selection">Selection ({selectionRows().length} rows)</option>
@@ -272,6 +297,12 @@ export function ExportDialog(props: {
               </select>
             </label>
           </div>
+          <Show when={scope() === "selection"}>
+            <div class="export-note">
+              Selection exports the stored rows, exactly like Loaded rows: unsaved edits and
+              new rows you have not applied yet are not included.
+            </div>
+          </Show>
         </section>
 
         <Show when={preview()}>

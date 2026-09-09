@@ -1,8 +1,8 @@
 import { sqlDialect } from "../sql/ident";
 import { lex, maskNonCode } from "../editor/lexer";
 import { isReadStatement } from "../plan/explainSql";
-import { hasConditions, toFilterTree, type ColumnClass, type FilterInput } from "./filterModel";
-import { renderWhere } from "./filterSql";
+import { type ColumnClass, type FilterTree } from "./filterModel";
+import { activeConditionCount, renderWhere } from "./filterSql";
 import type { SortKey } from "../tabs";
 
 // Server-side sort/filter works by wrapping the user's base query as a subquery and
@@ -66,35 +66,33 @@ export function hasDuplicateColumns(cols: string[]): boolean {
 }
 
 /**
- * A grid view carries active ordering or a non-empty filter (so a re-run should
- * re-apply it). Accepts the structured filter tree or the legacy flat array.
+ * A grid view carries active ordering or a filter that will actually generate
+ * SQL. Conditions naming a column the result no longer has render as nothing, so
+ * they must not count: a dead rule left over from an earlier result would
+ * otherwise force every re-run through the server wrapper and permanently
+ * disable the in-memory sort.
  */
-export function hasViewRules(sorts: SortKey[], filters: FilterInput): boolean {
-  if (sorts.length > 0) return true;
-  // The legacy flat shape carries its own text, so it needs no column list.
-  if (Array.isArray(filters)) return filters.some((f) => f.text.trim() !== "");
-  return hasConditions(filters);
+export function hasViewRules(sorts: SortKey[], filters: FilterTree, columns: string[]): boolean {
+  return sorts.length > 0 || activeConditionCount(filters, columns) > 0;
 }
 
 /**
  * Wrap `base` with optional WHERE (filters) and ORDER BY (sorts).
  * - ORDER BY uses **ordinal position** (`col+1`) to avoid duplicate-name ambiguity in `SELECT *`.
- * - The WHERE body is rendered by `grid/filterSql.ts` from the structured filter
- *   tree (a legacy flat `Filter[]` is migrated to a root AND of `contains`
- *   conditions first, so its SQL is unchanged).
+ * - The WHERE body is rendered by `grid/filterSql.ts` from the structured filter tree.
  * Returns a single statement with no trailing `;` (streams via the server cursor).
  */
 export function wrapQuery(
   base: string,
   sorts: SortKey[],
-  filters: FilterInput,
+  filters: FilterTree,
   columns: string[],
   dialect: string = "postgres",
   classOf?: (column: string) => ColumnClass,
 ): string {
   if (!wrappableQuery(base, dialect)) throw new Error("query cannot be safely wrapped for grid sorting or filtering");
   const inner = stripTrailingSemi(base);
-  const where = renderWhere(toFilterTree(filters, columns), { columns, dialect, classOf });
+  const where = renderWhere(filters, { columns, dialect, classOf });
   const order = sorts
     .filter((s) => s.col >= 0 && s.col < columns.length)
     .map((s) => `${s.col + 1} ${s.dir === "desc" ? "DESC" : "ASC"}`)

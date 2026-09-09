@@ -184,15 +184,23 @@ impl ExportOptions {
             || self.sql.table.len() > 1_000
             || self.column_indices.len() > 10_000
             || self.bool_cols.len() > 10_000
-            || self.xlsx.sheet_name.is_empty()
             || self.xlsx.sheet_name.chars().count() > 31
-            || self
-                .xlsx
-                .sheet_name
-                .chars()
-                .any(|c| matches!(c, '[' | ']' | ':' | '*' | '?' | '/' | '\\'))
         {
             return Err(AppError::new("export option exceeds its size limit"));
+        }
+        // The sheet name is inert for every other format (like `sql.table`), so an
+        // unsanitized relation name such as `2024/Q1` must not fail a CSV export.
+        if self.format == "xlsx"
+            && (self.xlsx.sheet_name.is_empty()
+                || self
+                    .xlsx
+                    .sheet_name
+                    .chars()
+                    .any(|c| matches!(c, '[' | ']' | ':' | '*' | '?' | '/' | '\\')))
+        {
+            return Err(AppError::new(
+                "an Excel sheet name must be 1-31 characters and cannot contain [ ] : * ? / \\",
+            ));
         }
         if self.format == "sql" && self.sql.table.contains('\0') {
             return Err(AppError::new("SQL export table name contains a zero byte"));
@@ -1420,12 +1428,29 @@ pub async fn export_tables(
         None,
         c.transaction.clone(),
     )?;
+    // SQLite/MySQL have no out-of-band query cancel and DuckDB's is disabled on Windows,
+    // so the engine handle alone left Cancel dead for up to 2,000 tables. A cooperative
+    // flag (the same one backup/restore use) stops the run between tables on every
+    // engine; the engine handle still interrupts the current table where it can.
+    let soft = cancel_registration.soft_cancel_flag();
     c.backend.rollback_cursor().await;
 
     let total = tables.len();
     let mut results: Vec<TableExportResult> = Vec::with_capacity(total);
     let mut used: HashSet<String> = HashSet::new();
     for (index, table) in tables.iter().enumerate() {
+        if soft.load(std::sync::atomic::Ordering::Acquire) {
+            for remaining in tables.iter().skip(index) {
+                results.push(TableExportResult {
+                    schema: remaining.schema.clone(),
+                    name: remaining.name.clone(),
+                    path: String::new(),
+                    rows: 0,
+                    error: "cancelled".to_string(),
+                });
+            }
+            break;
+        }
         let mut stem = table_file_stem(table);
         // Two schemas can sanitize to the same stem; never let one silently clobber
         // the other.
@@ -1463,7 +1488,6 @@ pub async fn export_tables(
         } else {
             run_export_paged(&mut c.backend, &sql, &table_options, &path_string).await
         };
-        let failed = outcome.is_err();
         let result = match outcome {
             Ok(rows) => TableExportResult {
                 schema: table.schema.clone(),
@@ -1491,20 +1515,9 @@ pub async fn export_tables(
             },
         );
         results.push(result);
-        if failed {
-            // A cancel surfaces as the current table's error; stop rather than
-            // hammering the connection with the rest.
-            for remaining in tables.iter().skip(index + 1) {
-                results.push(TableExportResult {
-                    schema: remaining.schema.clone(),
-                    name: remaining.name.clone(),
-                    path: String::new(),
-                    rows: 0,
-                    error: "skipped after an earlier table failed".to_string(),
-                });
-            }
-            break;
-        }
+        // One table failing is reported and the run CONTINUES — the point of a bulk
+        // export is to write everything that can be written. Only a cancel stops it,
+        // and the loop head above is where that is noticed.
     }
     drop(c);
     drop(cancel_registration);
@@ -1524,6 +1537,19 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
+    /// PARITY PAIR with `sanitizeSheetName` in src/export.ts, asserted there by
+    /// "replaces the characters Excel forbids and bounds the length".
+    #[test]
+    fn sheet_names_are_sanitized_not_rejected() {
+        assert_eq!(sanitize_sheet("2024/Q1"), "2024_Q1");
+        assert_eq!(sanitize_sheet(r"a[b]c:d*e?f/g\h"), "a_b_c_d_e_f_g_h");
+        assert_eq!(sanitize_sheet(&"x".repeat(40)), "x".repeat(26));
+        // Every sanitized name must then pass validation for the xlsx format.
+        let mut o = opts(r#"{"format":"xlsx"}"#);
+        o.xlsx.sheet_name = sanitize_sheet("2024/Q1");
+        assert!(o.validate().is_ok());
+    }
+
     #[test]
     fn hostile_export_options_are_rejected() {
         let mut o = opts(r#"{"format":"csv"}"#);
@@ -1535,8 +1561,17 @@ mod tests {
         o.custom_delimiter = "\n".into();
         assert!(o.validate().is_err());
         o.custom_delimiter = ",".into();
+        // The sheet name is inert for a non-xlsx format, exactly like `sql.table`: a
+        // relation named `2024/Q1` must not fail a CSV export.
         o.xlsx.sheet_name = "bad/name".into();
+        assert!(o.validate().is_ok());
+        o.format = "xlsx".into();
         assert!(o.validate().is_err());
+        o.xlsx.sheet_name = String::new();
+        assert!(o.validate().is_err());
+        o.xlsx.sheet_name = sanitize_sheet("bad/name");
+        assert!(o.validate().is_ok());
+        o.format = "csv".into();
 
         // The SQL table option is inert for non-SQL formats, matching the frontend
         // formatter; only SQL output must reject an unrepresentable identifier.

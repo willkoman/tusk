@@ -1,5 +1,3 @@
-use bytes::Bytes;
-use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
 use tokio_postgres::config::SslMode;
 use tokio_postgres::{Client, SimpleQueryMessage};
@@ -295,13 +293,37 @@ pub fn make_tls(cfg: &ConnectionConfig) -> Result<postgres_native_tls::MakeTlsCo
     Ok(postgres_native_tls::MakeTlsConnector::new(connector))
 }
 
-pub async fn open(cfg: &ConnectionConfig) -> Result<(Client, String), AppError> {
+/// Open a PostgreSQL connection, optionally validating TLS against a different name
+/// than the address dialled.
+///
+/// `tls_host` exists for the SSH tunnel: the socket goes to `127.0.0.1:<tunnel port>`
+/// while the TLS peer is still the real server, so `sslmode=verify-full` has to check
+/// the certificate against the configured hostname or it fails every time.
+/// tokio-postgres splits exactly this way — `host` is the name used for TLS
+/// validation, `hostaddr` is the address actually dialled.
+pub async fn open_with_tls_host(
+    cfg: &ConnectionConfig,
+    tls_host: Option<&str>,
+) -> Result<(Client, String), AppError> {
     let ssl_mode = ssl_mode_of(cfg)?;
     let tls = make_tls(cfg)?;
 
     let mut pgcfg = tokio_postgres::Config::new();
+    match tls_host.filter(|name| !name.is_empty()) {
+        Some(name) => {
+            let addr: std::net::IpAddr = cfg.host.parse().map_err(|_| {
+                AppError::new(format!(
+                    "the tunnelled dial address `{}` is not a numeric IP",
+                    cfg.host
+                ))
+            })?;
+            pgcfg.host(name).hostaddr(addr);
+        }
+        None => {
+            pgcfg.host(&cfg.host);
+        }
+    }
     pgcfg
-        .host(&cfg.host)
         .port(cfg.port)
         .user(&cfg.user)
         .password(&cfg.password)
@@ -531,81 +553,6 @@ pub fn pg_string_literal(value: &str) -> Result<String, AppError> {
     }
     out.push('\'');
     Ok(out)
-}
-
-fn csv_field(v: &Option<String>) -> String {
-    match v {
-        None => String::new(),
-        Some(s) => {
-            if s.is_empty()
-                || s.contains(',')
-                || s.contains('"')
-                || s.contains('\n')
-                || s.contains('\r')
-            {
-                format!("\"{}\"", s.replace('"', "\"\""))
-            } else {
-                s.clone()
-            }
-        }
-    }
-}
-
-/// Create a table whose columns are all `text` (for "create table on import").
-pub async fn create_table_text(
-    client: &Client,
-    schema: &str,
-    table: &str,
-    columns: &[String],
-) -> Result<(), AppError> {
-    let cols = columns
-        .iter()
-        .map(|c| format!("{} text", ident(c)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    client
-        .batch_execute(&format!(
-            "CREATE TABLE {}.{} ({cols})",
-            ident(schema),
-            ident(table)
-        ))
-        .await?;
-    Ok(())
-}
-
-/// Bulk-insert rows via COPY ... FROM STDIN (CSV). Returns rows written.
-pub async fn copy_rows(
-    client: &Client,
-    schema: &str,
-    table: &str,
-    columns: &[String],
-    rows: &[Vec<Option<String>>],
-) -> Result<u64, AppError> {
-    let cols = columns
-        .iter()
-        .map(|c| ident(c))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let copy = format!(
-        "COPY {}.{} ({cols}) FROM STDIN WITH (FORMAT csv)",
-        ident(schema),
-        ident(table)
-    );
-    let sink = client.copy_in(&copy).await?;
-    futures_util::pin_mut!(sink);
-    let mut buf = String::new();
-    for row in rows {
-        let line = row.iter().map(csv_field).collect::<Vec<_>>().join(",");
-        buf.push_str(&line);
-        buf.push('\n');
-        if buf.len() >= 64 * 1024 {
-            sink.send(Bytes::from(std::mem::take(&mut buf))).await?;
-        }
-    }
-    if !buf.is_empty() {
-        sink.send(Bytes::from(buf)).await?;
-    }
-    Ok(sink.finish().await?)
 }
 
 #[cfg(test)]

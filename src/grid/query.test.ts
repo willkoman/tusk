@@ -1,30 +1,43 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { hasDuplicateColumns, hasViewRules, stripTrailingSemi, wrapQuery, wrappableQuery } from "./query";
+import { emptyFilter, makeCondition, type FilterTree } from "./filterModel";
 import { setSqlDialect } from "../sql/ident";
 
 afterEach(() => setSqlDialect("postgres"));
 
 const SORTS = [{ col: 1, dir: "desc" as const }];
-const FILTERS = [{ col: 0, text: "abc" }];
 const COLS = ["id", "name"];
+/** The header quick filter: a root AND of one `contains` condition. */
+const quick = (column: string, text: string): FilterTree => ({
+  ...emptyFilter(),
+  items: [makeCondition(column, "contains", [text])],
+});
+const FILTERS = quick("id", "abc");
+const NONE = emptyFilter();
 
 describe("wrapQuery dialects", () => {
   it("postgres/duckdb use ::text ILIKE", () => {
     for (const d of ["postgres", "duckdb"]) {
       const sql = wrapQuery("SELECT * FROM t;", SORTS, FILTERS, COLS, d);
-      expect(sql).toBe(`SELECT * FROM (SELECT * FROM t\n) AS _tusk WHERE "id"::text ILIKE '%abc%' ORDER BY 2 DESC`);
+      expect(sql).toBe(
+        `SELECT * FROM (SELECT * FROM t\n) AS _tusk WHERE "id"::text ILIKE '%abc%' ESCAPE '!' ORDER BY 2 DESC`,
+      );
     }
   });
 
-  it("mysql uses CAST AS CHAR + LIKE with backticks", () => {
+  it("mysql casts to CHAR and folds case explicitly, with backticks", () => {
     setSqlDialect("mysql");
     const sql = wrapQuery("SELECT * FROM t", SORTS, FILTERS, COLS, "mysql");
-    expect(sql).toBe("SELECT * FROM (SELECT * FROM t\n) AS _tusk WHERE CAST(`id` AS CHAR) LIKE _utf8mb4 X'2561626325' ORDER BY 2 DESC");
+    expect(sql).toBe(
+      "SELECT * FROM (SELECT * FROM t\n) AS _tusk WHERE LOWER(CAST(`id` AS CHAR)) LIKE LOWER(_utf8mb4 X'2561626325') ESCAPE '!' ORDER BY 2 DESC",
+    );
   });
 
-  it("sqlite uses CAST AS TEXT + LIKE", () => {
+  it("sqlite casts to TEXT and folds case explicitly", () => {
     const sql = wrapQuery("SELECT * FROM t", SORTS, FILTERS, COLS, "sqlite");
-    expect(sql).toBe(`SELECT * FROM (SELECT * FROM t\n) AS _tusk WHERE CAST("id" AS TEXT) LIKE '%abc%' ORDER BY 2 DESC`);
+    expect(sql).toBe(
+      `SELECT * FROM (SELECT * FROM t\n) AS _tusk WHERE LOWER(CAST("id" AS TEXT)) LIKE LOWER('%abc%') ESCAPE '!' ORDER BY 2 DESC`,
+    );
   });
 
   it("default dialect stays postgres (back-compat)", () => {
@@ -32,17 +45,14 @@ describe("wrapQuery dialects", () => {
   });
 
   it("escapes quotes in the filter text", () => {
-    const sql = wrapQuery("SELECT * FROM t", [], [{ col: 0, text: "o'b" }], COLS, "postgres");
+    const sql = wrapQuery("SELECT * FROM t", [], quick("id", "o'b"), COLS, "postgres");
     expect(sql).toContain("'%o''b%'");
   });
 
   it("rejects duplicate filter targets instead of emitting ambiguous SQL", () => {
-    expect(() => wrapQuery("SELECT 1", [], [{ col: 0, text: "x" }], ["same", "same"], "postgres"))
-      .toThrow(/duplicate/i);
-    expect(() => wrapQuery("SELECT 1", [], [{ col: 0, text: "x" }], ["same", "SAME"], "mysql"))
-      .toThrow(/duplicate/i);
-    expect(() => wrapQuery("SELECT 1", [], [{ col: 0, text: "x" }], ["same", "SAME"], "postgres"))
-      .not.toThrow();
+    expect(() => wrapQuery("SELECT 1", [], quick("same", "x"), ["same", "same"], "postgres")).toThrow(/duplicate/i);
+    expect(() => wrapQuery("SELECT 1", [], quick("same", "x"), ["same", "SAME"], "mysql")).toThrow(/duplicate/i);
+    expect(() => wrapQuery("SELECT 1", [], quick("same", "x"), ["same", "SAME"], "postgres")).not.toThrow();
   });
 });
 
@@ -70,7 +80,7 @@ describe("existing helpers", () => {
     expect(wrappableQuery("WITH x AS (\n  -- note\n  UPDATE t SET a=1 RETURNING *\n) SELECT * FROM x")).toBe(false);
     expect(wrappableQuery("WITH x AS (SELECT 1) UPDATE t SET a=1 RETURNING *")).toBe(false);
     expect(wrappableQuery("WITH x AS (SELECT 1) SELECT * INTO archived FROM x")).toBe(false);
-    expect(wrapQuery("SELECT 1 -- tail", [], [], ["x"])).toContain("-- tail\n) AS _tusk");
+    expect(wrapQuery("SELECT 1 -- tail", [], NONE, ["x"])).toContain("-- tail\n) AS _tusk");
   });
 
   it("mutation words in harmless positions do not kill wrapping", () => {
@@ -90,7 +100,7 @@ describe("existing helpers", () => {
   it("mssql casts to nvarchar and refuses shapes a derived table cannot hold", () => {
     setSqlDialect("mssql");
     expect(wrapQuery("SELECT * FROM t", SORTS, FILTERS, COLS, "mssql")).toBe(
-      "SELECT * FROM (SELECT * FROM t\n) AS _tusk WHERE LOWER(CAST([id] AS VARCHAR(MAX))) LIKE LOWER(N'%abc%') ORDER BY 2 DESC",
+      "SELECT * FROM (SELECT * FROM t\n) AS _tusk WHERE LOWER(CAST([id] AS VARCHAR(MAX))) LIKE LOWER(N'%abc%') ESCAPE '!' ORDER BY 2 DESC",
     );
     expect(wrappableQuery("SELECT * FROM t")).toBe(true);
     // T-SQL rejects WITH and a bare ORDER BY inside a derived table.
@@ -104,13 +114,19 @@ describe("existing helpers", () => {
 
 describe("hasViewRules", () => {
   it("true for any sort", () => {
-    expect(hasViewRules([{ col: 0, dir: "asc" }], [])).toBe(true);
+    expect(hasViewRules([{ col: 0, dir: "asc" }], NONE, COLS)).toBe(true);
   });
-  it("true only for a non-blank filter", () => {
-    expect(hasViewRules([], [{ col: 0, text: "x" }])).toBe(true);
-    expect(hasViewRules([], [{ col: 0, text: "   " }])).toBe(false);
+  it("true only for a filter that will actually generate SQL", () => {
+    expect(hasViewRules([], quick("id", "x"), COLS)).toBe(true);
+    // Incomplete (no value) contributes nothing.
+    expect(hasViewRules([], { ...emptyFilter(), items: [makeCondition("id", "eq", [])] }, COLS)).toBe(false);
+    // A rule naming a column this result no longer has renders as nothing, so it
+    // must not force every re-run through the server wrapper (which would keep
+    // the in-memory sort permanently disabled).
+    expect(hasViewRules([], quick("gone", "x"), COLS)).toBe(false);
+    expect(hasViewRules([], quick("gone", "x"), ["gone"])).toBe(true);
   });
   it("false when empty", () => {
-    expect(hasViewRules([], [])).toBe(false);
+    expect(hasViewRules([], NONE, COLS)).toBe(false);
   });
 });

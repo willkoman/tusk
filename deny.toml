@@ -7,8 +7,12 @@ yanked = "warn"
 unmaintained = "workspace"
 ignore = [
   # RUSTSEC-2023-0071 — the "Marvin Attack" timing sidechannel in the `rsa` crate,
-  # reached through `russh`'s optional `rsa` feature (SSH tunnelling). There is no
-  # fixed version: RustCrypto has listed no safe upgrade since 2023. Dropping the
+  # reached through `russh`'s optional `rsa` feature (SSH tunnelling).
+  #
+  # Re-checked 2026-09-08 against `rsa 0.10.0-rc.18`, the version this lock resolves
+  # (via russh and ssh-key). The advisory still reports "No patch is yet available"
+  # and cargo-deny still reports "No safe upgrade is available!": the 0.10 pre-release
+  # line is affected too, so being ahead of 0.9.x buys nothing here. Dropping the
   # feature would drop `ssh-rsa` host keys and `id_rsa` client keys, which is still
   # what most existing bastions and users have.
   #

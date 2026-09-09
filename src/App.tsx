@@ -11,8 +11,9 @@ import { type CursorInfo, type EditorPrefs, type ServerDiag } from "./editor/typ
 import { prefsStore, tabsStore, layoutStore, type PersistedTabs, type TabsPersistenceFailure } from "./store";
 import { makeTab, basename, gridViewFor, pendingCount, snapshotTabs as recoverySnapshot, type Tab, type ResultSnapshot, type GridView, type SortKey, type PendingEdits } from "./tabs";
 import { FilterBar } from "./grid/FilterBar";
-import { classResolver, emptyFilter, hasConditions, removeNode, type FilterTree } from "./grid/filterModel";
-import { ResultGrid } from "./ResultGrid";
+import { classResolver, conditions, emptyFilter, hasConditions, removeNode, type FilterTree } from "./grid/filterModel";
+import { activeConditionCount } from "./grid/filterSql";
+import { ResultGrid, type SelectionSource } from "./ResultGrid";
 import { UpdateBadge } from "./UpdateBadge";
 import { WhatsNew } from "./WhatsNew";
 import { wrapQuery, wrappableQuery, stripTrailingSemi, hasDuplicateColumns, hasViewRules } from "./grid/query";
@@ -23,7 +24,7 @@ import { planPaste, mergePaste, type RowRef } from "./grid/paste";
 import { orderedRows, sortedRowOrder } from "./grid/sort";
 import { interruptedResult } from "./tabs";
 import { makeIndexer } from "./sql/aliases";
-import { type Dataset, formatWithOptions } from "./formats";
+import { formatWithOptions } from "./formats";
 import { FORMAT_EXT, type ExportOptions, type ExportScope } from "./export";
 import { backupPayload, type BackupOptions, type BackupSummary, type RestoreOptions, type RestoreSummary } from "./backup";
 import { type BackupTarget } from "./forms/BackupDialog";
@@ -662,16 +663,20 @@ function App() {
     if (transactionOpen(next)) {
       persistInterruptedMarker(target, next, startedAt);
       // Surfaces that could act on the wrong state close only when the transaction
-      // belongs to the connection the user is looking at.
+      // belongs to the connection the user is looking at — a transaction opening on a
+      // background connection must not dismiss the dialog you are filling in here.
       if (activeConnectionId() === target.id) {
         setMenuState(null);
         setDdlGraph(null);
         setActiveDialog(null);
+        // Backup/restore need an idle session; an opened transaction has taken it.
+        closeBackup();
+        closeRestore();
         if (importOpen() && !importBusy()) {
           setImportOpen(null);
           importOrigin = null;
         }
-        if (exportTables()) setExportTables(null);
+        if (exportTables() && !exportTablesBusy()) setExportTables(null);
       }
       if (next.state === "lost") {
         entry.patch({ transactionWarning: `Transaction ${next.id ?? "session"} was lost. Its outcome may be unknown; disconnect and reconnect before continuing.` });
@@ -745,8 +750,8 @@ function App() {
     setCellView(null);
     setRunChoice(null);
     setSelected(null);
-    setBackupTarget(null);
-    setRestoreOpen(false);
+    closeBackup();
+    closeRestore();
     if (!importBusy()) { setImportOpen(null); importOrigin = null; }
   }, { defer: true }));
 
@@ -928,8 +933,10 @@ function App() {
   let nativeCloseUnlisten: UnlistenFn | null = null;
   // Snapshot of the result being exported, frozen when the dialog opens so a tab
   // switch while it's open can't redirect the export to a different tab.
-  /** Live grid selection, registered by ResultGrid (Export → Selection scope). */
-  let gridSelection: (() => Dataset | null) | null = null;
+  /** Live grid selection, registered by ResultGrid (Export → Selection scope). Cleared
+   *  on grid unmount; the snapshot carries the tab + result generation it came from, so
+   *  a stale getter can never feed a different result of the same width. */
+  let gridSelection: (() => SelectionSource | null) | null = null;
   const [exportSrc, setExportSrc] = createSignal<
     {
       columns: string[];
@@ -962,6 +969,11 @@ function App() {
       query = wrapped;
     }
     const selection = gridSelection?.() ?? null;
+    const selectionCurrent =
+      !!selection &&
+      selection.tabId === activeTabId() &&
+      selection.generation === tab.result.generation &&
+      selection.columns.length === columns().length;
     // "Include CREATE TABLE" needs a plain source table; reuse the grid's own
     // single-table resolver rather than re-parsing the query here.
     const resolved = editTarget(tab.result.baseQuery, editIndexer(schema()), tab.searchSchema);
@@ -969,7 +981,7 @@ function App() {
     setExportSrc({
       columns: columns(),
       rows: orderedRows(rows(), order),
-      selectionRows: selection && selection.columns.length === columns().length ? selection.rows : [],
+      selectionRows: selectionCurrent ? selection!.rows : [],
       incomplete: tab.result.incomplete,
       ddl: ddlTarget && caps()?.ddl !== false
         ? { schema: ddlTarget.schema, name: ddlTarget.name, kind: "table" }
@@ -1184,6 +1196,7 @@ function App() {
   const [exportTables, setExportTables] = createSignal<
     { title: string; tables: { schema: string; name: string }[]; selection: { schema: string; name: string }[]; connectionId: string } | null
   >(null);
+  const [exportTablesBusy, setExportTablesBusy] = createSignal(false);
   const [exportTablesProgress, setExportTablesProgress] = createSignal<
     { index: number; total: number; table: string; rows: number; done: boolean } | null
   >(null);
@@ -1580,7 +1593,7 @@ function App() {
       if (t) {
         const v = t.gridView;
         const base = t.result.baseQuery;
-        const sqlToRun = hasViewRules(v.sorts, v.filters) ? tryWrapQuery(t, v.sorts, v.filters) : base;
+        const sqlToRun = hasViewRules(v.sorts, v.filters, t.result.columns) ? tryWrapQuery(t, v.sorts, v.filters) : base;
         if (sqlToRun === null) return;
         void executeQuery(sqlToRun, base, "wrapped");
       }
@@ -2435,8 +2448,10 @@ function App() {
       setImportOpen(null);
       importOrigin = null;
     }
-    if (backupTarget() && activeConnectionId() === connectionId) setBackupTarget(null);
-    if (restoreOpen() && activeConnectionId() === connectionId) setRestoreOpen(false);
+    // Backup/restore are bound to a connection generation of their own; close them
+    // through their helpers so the binding is cleared with the dialog.
+    if (backupConnection?.id === connectionId) closeBackup();
+    if (restoreConnection?.id === connectionId) closeRestore();
   }
 
   /** Close the connection the workbench is focused on (topbar Disconnect). */
@@ -3068,7 +3083,7 @@ function App() {
       base !== "" &&
       base === stripTrailingSemi(at.result.baseQuery) &&
       wrappableQuery(base) &&
-      hasViewRules(at.gridView.sorts, at.gridView.filters)
+      hasViewRules(at.gridView.sorts, at.gridView.filters, at.result.columns)
     ) {
       const gv = at.gridView;
       const wrapped = tryWrapQuery(at, gv.sorts, gv.filters);
@@ -3112,23 +3127,33 @@ function App() {
   }
 
   // Re-stream the active tab's result sorted/filtered (server ORDER BY / WHERE).
+  // The view is written ONLY once the run is committed to: persisting chips or a
+  // sort glyph for a rule that never reached the server would leave the grid
+  // claiming a filter the rows don't reflect — and the next plain Run would then
+  // silently wrap with it.
   function onSortFilter(sorts: SortKey[], filters: FilterTree, kind: "sort" | "filter") {
-    const prior = { sorts: activeTab().gridView.sorts, filters: activeTab().gridView.filters };
-    setGridView({ sorts, filters });
     const tab = activeTab();
+    if (running()) {
+      patchResult(tab.id, { status: `${kind} is unavailable while a query is running` });
+      return;
+    }
     if (kind === "sort" && localSortEligible() && !hasConditions(filters)) {
+      setGridView({ sorts, filters });
       patchResult(tab.id, { epoch: tab.result.epoch + 1 });
       return;
     }
     const base = tab.result.baseQuery;
-    if (!activeDatabaseAllowed() || !canServerSortFilter()) return;
-    const sqlToRun = hasViewRules(sorts, filters) ? tryWrapQuery(tab, sorts, filters) : base;
-    if (sqlToRun === null) {
-      // Wrap refused (unwrappable base, duplicate filter names) — no query will
-      // run, so don't leave a sort glyph/filter chip pretending it applied.
-      setGridView(prior);
+    if (!activeDatabaseAllowed() || !canServerSortFilter()) {
+      patchResult(tab.id, {
+        status: `${kind} rejected: ${sortUnavailable() || "this result cannot be re-run with a server-side sort or filter"}`,
+      });
       return;
     }
+    const sqlToRun = hasViewRules(sorts, filters, tab.result.columns) ? tryWrapQuery(tab, sorts, filters) : base;
+    // Wrap refused (unwrappable base, duplicate filter names) — tryWrapQuery has
+    // already reported why; leave the previous view in place.
+    if (sqlToRun === null) return;
+    setGridView({ sorts, filters });
     void executeQuery(sqlToRun, base, "wrapped");
   }
 
@@ -3154,8 +3179,24 @@ function App() {
       prefill,
       // Every callback re-checks the origin: the dialog outlives a tab switch or
       // a new result only as long as it still targets the tab it was opened on.
+      // The RESULT generation is deliberately NOT part of that check — the
+      // Explorer's "Filter rows…" opens the builder while its generated SELECT is
+      // still in flight, so the result the filter lands on is always a later one
+      // than the dialog was opened over. Instead of binding to a generation the
+      // flow cannot satisfy, every apply is re-validated against the LIVE result's
+      // columns and refused when a rule no longer resolves — a stale rule must
+      // never be silently dropped from the WHERE clause.
       onApply: (tree) => {
-        if (originCurrent(origin)) onSortFilter(activeTab().gridView.sorts, tree, "filter");
+        if (!originCurrent(origin)) return;
+        const tab = activeTab();
+        const live = tab.result.columns;
+        if (activeConditionCount(tree, live) !== conditions(tree).length) {
+          patchResult(tab.id, {
+            status: "filter rejected: the result changed and some conditions name columns it no longer has",
+          });
+          return;
+        }
+        onSortFilter(tab.gridView.sorts, tree, "filter");
       },
       onOpenQuery: (tree) => {
         if (!originCurrent(origin)) return;
@@ -3314,6 +3355,24 @@ function App() {
   // the run is recorded in history like every other server execution.
   const [backupTarget, setBackupTarget] = createSignal<BackupTarget | null>(null);
   const [restoreOpen, setRestoreOpen] = createSignal(false);
+  // Both dialogs target a whole CONNECTION, not a tab, so they are bound to the
+  // connection generation they were opened on (the way `exportSrc` is): a
+  // disconnect/reconnect underneath an open dialog must never let its Run button
+  // rewrite a different database.
+  let backupConnection: { id: string; generation: number } | null = null;
+  let restoreConnection: { id: string; generation: number } | null = null;
+  const boundToCurrentConnection = (b: { id: string; generation: number } | null) => {
+    const c = conn();
+    return !!c && !!b && c.id === b.id && c.generation === b.generation;
+  };
+  const closeBackup = () => { backupConnection = null; setBackupTarget(null); };
+  const closeRestore = () => { restoreConnection = null; setRestoreOpen(false); };
+  function openRestore() {
+    const c = conn();
+    if (!c) return;
+    restoreConnection = { id: c.id, generation: c.generation };
+    setRestoreOpen(true);
+  }
 
   const backupCatalog = () =>
     (tree()?.schemas ?? []).map((s) => ({ name: s.name, tables: s.tables.map((t) => t.name) }));
@@ -3321,6 +3380,9 @@ function App() {
   function openBackup(target: BackupTarget) {
     if (rejectFrozenExplorer()) return;
     setMenu(null);
+    const c = conn();
+    if (!c) return;
+    backupConnection = { id: c.id, generation: c.generation };
     setBackupTarget(target);
   }
 
@@ -3333,6 +3395,13 @@ function App() {
   async function runBackup(opts: BackupOptions, path: string): Promise<BackupSummary> {
     const c = conn();
     if (!c) throw new Error("not connected");
+    if (!boundToCurrentConnection(backupConnection))
+      throw new Error("the connection changed since this dialog was opened — close it and start the backup again");
+    // The backend refuses a backup while a manual transaction owns the session.
+    // Check that FIRST: `interruptStream` condemns a healthy cursor, and it must
+    // not be spent on a call that is going to be rejected anyway.
+    if (metadataFrozen())
+      throw new Error("backup is frozen while a manual transaction owns the session — commit or roll it back first");
     interruptStream("a backup closed the result stream");
     const t0 = performance.now();
     try {
@@ -3368,6 +3437,10 @@ function App() {
   async function runRestore(path: string, opts: RestoreOptions): Promise<RestoreSummary> {
     const c = conn();
     if (!c) throw new Error("not connected");
+    if (!boundToCurrentConnection(restoreConnection))
+      throw new Error("the connection changed since this dialog was opened — close it and start the restore again");
+    if (metadataFrozen())
+      throw new Error("restore is frozen while a manual transaction owns the session — commit or roll it back first");
     interruptStream("a restore closed the result stream");
     const t0 = performance.now();
     const entry = (status: HistoryEntry["status"], rows: number | null, error: string | null) =>
@@ -3568,7 +3641,10 @@ function App() {
       origin,
       connectionId: c.id,
       dialect: connectionKind(),
-      ddl: caps()?.ddl !== false ? { schema: schemaName, name, kind } : undefined,
+      // Only a real table's reconstruction is a runnable CREATE ahead of INSERTs: a view
+      // would emit `CREATE VIEW v AS SELECT …` followed by `INSERT INTO v`. Views fall
+      // back to the synthetic all-`text` CREATE, with the dialog's note saying so.
+      ddl: caps()?.ddl !== false && kind === "table" ? { schema: schemaName, name, kind } : undefined,
     });
   }
 
@@ -3599,20 +3675,25 @@ function App() {
     if (!src || !c || c.id !== src.connectionId) throw new Error("connection changed");
     interruptStream("a table export closed the result stream");
     const t0 = performance.now();
-    const results = await invoke<{ schema: string; name: string; path: string; rows: number; error: string }[]>(
-      "export_tables",
-      { connectionId: src.connectionId, tables, options, directory },
-    );
-    const ok = results.filter((r) => !r.error).length;
-    recordHistory({
-      sql: `-- [Export] ${options.format} → ${directory} (${ok}/${results.length} tables)`,
-      durationMs: Math.round(performance.now() - t0),
-      status: ok === results.length ? "ok" : "error",
-      rows: results.reduce((n, r) => n + r.rows, 0),
-      error: results.find((r) => r.error)?.error ?? null,
-      schema: null,
-    }, c.key);
-    return results;
+    setExportTablesBusy(true);
+    try {
+      const results = await invoke<{ schema: string; name: string; path: string; rows: number; error: string }[]>(
+        "export_tables",
+        { connectionId: src.connectionId, tables, options, directory },
+      );
+      const ok = results.filter((r) => !r.error).length;
+      recordHistory({
+        sql: `-- [Export] ${options.format} → ${directory} (${ok}/${results.length} tables)`,
+        durationMs: Math.round(performance.now() - t0),
+        status: ok === results.length ? "ok" : "error",
+        rows: results.reduce((n, r) => n + r.rows, 0),
+        error: results.find((r) => r.error)?.error ?? null,
+        schema: null,
+      }, c.key);
+      return results;
+    } finally {
+      setExportTablesBusy(false);
+    }
   }
 
   function startResize(e: MouseEvent) {
@@ -4033,7 +4114,7 @@ function App() {
             ? [{ label: "Schema diagram…", icon: "link" as const, onClick: () => openDdlGraph(n.name, null, "table") }, { sep: true as const }]
             : []),
           { label: "Create table…", icon: "plus", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => setActiveDialog({ kind: "createTable", schema: n.name, tables: schema() }) },
-          { label: "Import file as new table…", icon: "download", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => openImport(null) },
+          { label: "Import file as new table…", icon: "download", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => openImport({ schema: n.name, name: "" }) },
           { label: "Export tables…", icon: "download", onClick: () => openTablesExport(n.name) },
           { label: "Rename…", icon: "edit", ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), ...engineCan(dcaps().renameSchema, "rename a schema"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename schema ${n.name}`, current: n.name, build: (nn) => ddl.renameSchema(n.name, nn) }) },
           { sep: true },
@@ -4057,7 +4138,7 @@ function App() {
           { sep: true },
           // Backup/restore run against the CONNECTED database — offer them only there.
           { label: "Backup database…", icon: "download", disabled: !cur, title: cur ? undefined : "Connect to this database to back it up", onClick: () => openBackup({ scope: "database", schemas: [], tables: [], suggestedName: n.name }) },
-          { label: "Restore from file…", icon: "fileCode", disabled: !cur || !!conn()?.readOnly, title: !cur ? "Connect to this database to restore into it" : conn()?.readOnly ? "Connection is read-only" : undefined, onClick: () => { setMenu(null); if (!rejectFrozenExplorer()) setRestoreOpen(true); } },
+          { label: "Restore from file…", icon: "fileCode", disabled: !cur || !!conn()?.readOnly, title: !cur ? "Connect to this database to restore into it" : conn()?.readOnly ? "Connection is read-only" : undefined, onClick: () => { setMenu(null); if (!rejectFrozenExplorer()) openRestore(); } },
           { sep: true },
           copyName,
         );
@@ -4184,7 +4265,7 @@ function App() {
         { label: "Find", icon: "search", onClick: () => editorApi()?.openSearch() },
         { sep: true },
         { label: "Backup…", icon: "download", onClick: () => openBackup({ scope: "database", schemas: [], tables: [], suggestedName: tree()?.database || "backup" }) },
-        { label: "Restore from file…", icon: "fileCode", disabled: !!conn()?.readOnly, title: conn()?.readOnly ? "Connection is read-only" : undefined, onClick: () => { setMenu(null); if (!rejectFrozenExplorer()) setRestoreOpen(true); } },
+        { label: "Restore from file…", icon: "fileCode", disabled: !!conn()?.readOnly, title: conn()?.readOnly ? "Connection is read-only" : undefined, onClick: () => { setMenu(null); if (!rejectFrozenExplorer()) openRestore(); } },
         { sep: true },
         ...explainMenuItems(),
       ],
@@ -4614,9 +4695,7 @@ function App() {
               <span class="panel-title2">Explorer</span>
               <div class="head-actions">
                 <button class="icon" title="New… (based on selection)" disabled={metadataFrozen()} onClick={(e) => openPlusMenu(e)}><Icon name="plus" /></button>
-                <Show when={caps()?.bulkCopy !== false}>
-                  <button class="icon" title="Import data" disabled={metadataFrozen()} onClick={() => openImport(null)}><Icon name="download" /></button>
-                </Show>
+                <button class="icon" title="Import data" disabled={metadataFrozen()} onClick={() => openImport(null)}><Icon name="download" /></button>
                 <button class="icon" title={metadataFrozen() ? "Refresh deferred until transaction ends" : "Refresh"} disabled={schemaLoading() || metadataFrozen()} onClick={() => loadSchema()}>{schemaLoading() ? <span class="spinner-sm" /> : <Icon name="refresh" />}</button>
               </div>
             </div>
@@ -5192,7 +5271,7 @@ function App() {
               database={tree()?.database ?? ""}
               catalog={backupCatalog()}
               target={target()}
-              onClose={() => setBackupTarget(null)}
+              onClose={closeBackup}
               onPickPath={pickBackupPath}
               onRun={runBackup}
               onCancel={() => void cancelOperation()}
@@ -5203,7 +5282,7 @@ function App() {
           <RestoreDialog
             driverKind={caps()?.kind ?? "postgres"}
             database={tree()?.database ?? ""}
-            onClose={() => setRestoreOpen(false)}
+            onClose={closeRestore}
             onPickFile={pickRestoreFile}
             onRun={runRestore}
             onCancel={() => void cancelOperation()}

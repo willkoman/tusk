@@ -71,6 +71,8 @@ fn embedded_script<C>(
 pub struct Capabilities {
     pub kind: &'static str,
     pub server_cursor: bool,
+    /// The engine has a server-side bulk-copy protocol (PostgreSQL `COPY`). File import
+    /// works on every engine regardless — this only says which loader path is used.
     pub bulk_copy: bool,
     pub export: bool,
     pub schemas: bool,
@@ -123,8 +125,8 @@ impl Capabilities {
         Self {
             kind: "duckdb",
             server_cursor: false, // paged via LIMIT/OFFSET, not a server cursor
-            bulk_copy: false,     // import not yet abstracted for DuckDB
-            export: true,         // paged export (export::run_export_paged)
+            bulk_copy: false,
+            export: true, // paged export (export::run_export_paged)
             schemas: true,
             search_path: false,
             transactional_ddl: true,
@@ -532,9 +534,15 @@ pub async fn connect(config: &ConnectionConfig) -> Result<(Backend, String), App
         "postgres" => {
             // The tunnel comes up first so a failure names the SSH stage, not the DB.
             let tunnel = crate::ssh::ensure(None, config).await?;
-            let (client, version) = db::open(&crate::ssh::dial_config(config, tunnel.as_ref()))
-                .await
-                .map_err(|e| crate::ssh::explain_db_failure(tunnel.as_ref(), e))?;
+            // Through a tunnel the socket is loopback but the TLS peer is still the
+            // real server, so `verify-full` must check the configured hostname.
+            let tls_host = crate::ssh::tls_host(config, tunnel.as_ref());
+            let (client, version) = db::open_with_tls_host(
+                &crate::ssh::dial_config(config, tunnel.as_ref()),
+                tls_host.as_deref(),
+            )
+            .await
+            .map_err(|e| crate::ssh::explain_db_failure(tunnel.as_ref(), e))?;
             Ok((
                 Backend::Pg(PgConn {
                     client,
@@ -678,10 +686,13 @@ impl Backend {
         match self {
             Backend::Pg(p) => {
                 p.tunnel = crate::ssh::ensure(p.tunnel.take(), &p.config).await?;
-                let (client, _version) =
-                    db::open(&crate::ssh::dial_config(&p.config, p.tunnel.as_ref()))
-                        .await
-                        .map_err(|e| crate::ssh::explain_db_failure(p.tunnel.as_ref(), e))?;
+                let tls_host = crate::ssh::tls_host(&p.config, p.tunnel.as_ref());
+                let (client, _version) = db::open_with_tls_host(
+                    &crate::ssh::dial_config(&p.config, p.tunnel.as_ref()),
+                    tls_host.as_deref(),
+                )
+                .await
+                .map_err(|e| crate::ssh::explain_db_failure(p.tunnel.as_ref(), e))?;
                 p.client = client;
                 p.cursor_name = None;
                 p.cursor_auto_transaction = false;
@@ -733,6 +744,29 @@ impl Backend {
                 p.client.batch_execute(&sql).await.map_err(Into::into)
             }
             _ => Ok(()), // embedded drivers have no per-session search_path
+        }
+    }
+
+    /// Pin one physical session for a long single-threaded run (restore).
+    ///
+    /// Only MySQL needs it: every other backend already owns exactly one connection,
+    /// while MySQL checks one out of the pool per statement and the pool RESETS a
+    /// connection when it is returned. Session state a dump sets up for its own replay
+    /// — `SET FOREIGN_KEY_CHECKS = 0` most obviously — therefore applied to nothing at
+    /// all, and could equally have leaked into a later user query had the reset not
+    /// happened. Callers MUST pair this with `end_bulk_session`.
+    pub async fn begin_bulk_session(&mut self) -> Result<(), AppError> {
+        match self {
+            Backend::MySql(m) => m.begin_bulk().await,
+            _ => Ok(()),
+        }
+    }
+
+    /// Release the pinned session, returning the connection (and its session state) to
+    /// the pool. Infallible by design: it runs on every restore exit path.
+    pub async fn end_bulk_session(&mut self) {
+        if let Backend::MySql(m) = self {
+            m.end_bulk().await;
         }
     }
 
@@ -2356,6 +2390,10 @@ pub struct MySqlConn {
     /// Owns the SSH session for this connection; dropping it closes the tunnel.
     tunnel: Option<crate::ssh::Tunnel>,
     pinned: Option<mysql_async::Conn>,
+    /// One connection held for the duration of a bulk run (restore), so the session
+    /// state a dump sets up survives from statement to statement. Distinct from
+    /// `pinned`, which belongs to the manual-transaction machinery.
+    bulk: Option<mysql_async::Conn>,
     manual_lost: bool,
     autocommit_off: bool,
 }
@@ -2398,6 +2436,11 @@ impl MySqlConn {
                     ssl = ssl
                         .with_danger_accept_invalid_certs(true)
                         .with_danger_skip_domain_validation(true);
+                } else if let Some(name) = crate::ssh::tls_host(config, tunnel.as_ref()) {
+                    // Through a tunnel the socket is loopback while the TLS peer is
+                    // still the real server: verify the certificate against the
+                    // configured hostname, not against 127.0.0.1.
+                    ssl = ssl.with_danger_tls_hostname_override(Some(name));
                 }
                 builder = builder.ssl_opts(Some(ssl));
             }
@@ -2419,11 +2462,26 @@ impl MySqlConn {
                 offset: 0,
                 tunnel,
                 pinned: None,
+                bulk: None,
                 manual_lost: false,
                 autocommit_off: false,
             }),
             format!("MySQL {version}"),
         ))
+    }
+
+    async fn begin_bulk(&mut self) -> Result<(), AppError> {
+        if self.bulk.is_none() {
+            self.bulk = Some(self.pool.get_conn().await.map_err(de)?);
+        }
+        Ok(())
+    }
+
+    /// Drop the bulk connection rather than returning it explicitly: mysql_async resets
+    /// a pooled connection on return, so whatever the dump set on it (FK checks off,
+    /// say) cannot survive into a later user query either way.
+    async fn end_bulk(&mut self) {
+        self.bulk.take();
     }
 
     async fn ensure_pinned(&mut self) -> Result<(), AppError> {
@@ -2724,8 +2782,15 @@ impl MySqlConn {
                 note: None,
             })
         } else {
-            let (columns, rows, affected) =
-                mysql_run_limited(&self.pool, trimmed, db::USER_TEXT_LIMITS).await?;
+            // A bulk run (restore) keeps ONE session so the dump's own `SET`s apply to
+            // the statements that follow them.
+            let (columns, rows, affected) = match self.bulk.as_mut() {
+                Some(conn) => {
+                    mysql_single_statement(trimmed)?;
+                    mysql_run_conn_limited(conn, trimmed, db::USER_TEXT_LIMITS).await?
+                }
+                None => mysql_run_limited(&self.pool, trimmed, db::USER_TEXT_LIMITS).await?,
+            };
             if !columns.is_empty() {
                 Ok(QueryOutcome::Rows {
                     columns,

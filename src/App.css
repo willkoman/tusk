@@ -691,6 +691,9 @@ select option { font-weight: 400; }
 .rg-reorder { position: absolute; top: 0; width: 2px; background: var(--accent); z-index: 6; pointer-events: none; }
 .rg-filter { position: absolute; left: 0; }
 .rg-filter-input { position: absolute; top: 4px; height: 22px; font: inherit; font-size: 11px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 0 6px; box-sizing: border-box; }
+/* A column carrying filter-builder rules the one-line box can't show. */
+.rg-filter-input.has-rules { border-color: var(--accent); border-style: dashed; }
+.rg-filter-input.has-rules::placeholder { color: var(--accent); opacity: 0.9; }
 .rg-gutwrap { position: absolute; left: 0; bottom: 0; overflow: hidden; z-index: 2; background: var(--panel-2); border-right: 1px solid var(--border); }
 .rg-gut { position: relative; }
 .rg-gutnum { position: absolute; left: 0; width: 100%; display: flex; align-items: center; justify-content: flex-end; padding-right: 8px; color: var(--muted); font-size: 11px; font-family: var(--mono); cursor: pointer; box-sizing: border-box; border-bottom: 1px solid var(--border); user-select: none; }

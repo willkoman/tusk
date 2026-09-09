@@ -136,19 +136,21 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Tusk checks the SSH server's host key against your `~/.ssh/known_hosts` — plain, `[host]:port`, comma-list, and hashed (`ssh-keygen -H`) entries all match — and against its own trust store in the app config directory. `known_hosts` is only ever **read**; Tusk does not write to it."
+        "md": "Tusk checks the SSH server's host key against your `~/.ssh/known_hosts` — plain, `[host]:port`, comma-lists, `*`/`?` wildcards, `!` negations, hashed (`ssh-keygen -H`) names and the `@revoked` / `@cert-authority` markers are all understood — and against its own trust store in the app config directory. `known_hosts` is only ever **read**; Tusk does not write to it."
       },
       {
         "k": "list",
         "items": [
           "**Unknown host** — the connection stops and a dialog shows the key type and `SHA256:…` fingerprint. Compare it against the server (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` prints the same value), then **Trust and connect** records it and retries.",
-          "**Key changed** — refused outright, with no accept button. A host key that changed against a stored one is what a man-in-the-middle looks like; if the change really is legitimate, remove the old entry from `known_hosts` or from `ssh_known_hosts.json` in the app config directory."
+          "**Key changed** — refused outright, with no accept button. A host key that changed against a stored one is what a man-in-the-middle looks like; if the change really is legitimate, remove the old entry from `known_hosts` or from `ssh_known_hosts.json` in the app config directory.",
+          "**Key revoked** — a key listed under `@revoked` in `known_hosts` is refused, and is never offered for trust.",
+          "**Records unreadable** — if `known_hosts` or the trust store cannot be read, or holds an entry for this host that cannot be parsed, the connection is refused with that reason. Tusk will not offer to trust a key it could not compare against what you already have."
         ]
       },
       {
         "k": "tip",
-        "kind": "warn",
-        "md": "`verify-full` **SSL Mode** verifies the database certificate against `127.0.0.1` through a tunnel, because that is the address the driver dials. Use `require` over a tunnel unless the certificate is valid for the loopback address — the SSH layer already authenticates and encrypts the hop."
+        "kind": "tip",
+        "md": "`verify-full` works through a tunnel: TLS still runs end to end with the real database server, so the certificate is checked against the **Host** you entered rather than against the loopback address the tunnel listens on."
       },
       {
         "k": "h",
@@ -753,7 +755,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**Sort** — click a header to cycle **ascending → descending → none**; [[kbd:Shift]]-click adds to a multi-sort (priority numbers next to the arrows).",
-          "**Quick filter** — *Show filter row* in the header menu puts a box under each header. Each column does a case-insensitive contains match (`ILIKE '%text%'` on Postgres/DuckDB, `CAST … LIKE` on MySQL/SQLite), AND-combined, debounced 300 ms. It writes into the same filter the builder edits.",
+          "**Quick filter** — *Show filter row* in the header menu puts a box under each header. Each column does a case-insensitive contains match (`ILIKE` on Postgres/DuckDB, `LOWER(CAST(…)) LIKE LOWER(…)` elsewhere), AND-combined, debounced 300 ms. It writes into the same filter the builder edits: typing under an OR root re-roots the filter as an AND so the box can only ever narrow the result. A column carrying builder rules the one-line box cannot show is marked, since an empty box there would otherwise read as \"no filter\".",
           "**Filter builder** — the toolbar's **Filter** button, [[kbd:Mod-Shift-f]], *Filter by this column…* in the header menu, or the Explorer's *Filter rows…*. See below."
         ]
       },
@@ -797,13 +799,13 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**Operators** — `=` `≠` `<` `≤` `>` `≥`, `between` / `not between`, `in` / `not in` (comma-separated; quote a value that contains a comma), `like` / `not like` / `ilike` (raw patterns — you own the wildcards), `starts with` / `ends with` / `contains` (case-insensitive; `%` and `_` in your text are escaped, not wildcards), `is null` / `is not null`, `is true` / `is false`, `is empty` (`= ''`).",
-          "**Groups** — **AND** / **OR** per group, *+ Condition* and *+ Group* to extend, and per-row duplicate/remove. A nested group is added with the opposite join, which is the shape you usually want.",
+          "**Groups** — **AND** / **OR** per group, *+ Condition* and *+ Group* to extend, and per-row duplicate/remove. A nested group is added with the opposite join, which is the shape you usually want. *+ Group* is offered four levels deep, and a filter may not exceed eight levels or 200 conditions in all.",
           "**Buttons** — **Apply filter** re-streams the wrapped query, **Clear** empties the tree, **Copy WHERE** copies the clause, and **Open as query** puts the full wrapped `SELECT … WHERE …` into a new tab. [[kbd:Enter]] applies, [[kbd:Escape]] closes."
         ]
       },
       {
         "k": "p",
-        "md": "The generated SQL is per engine. Identifiers are always quoted and values are always literals — only strictly numeric text is emitted unquoted, and only against a numeric column. `ILIKE` is native on Postgres/DuckDB and becomes `LOWER(col) LIKE LOWER(pattern)` where it isn't; booleans emit `TRUE`/`FALSE` on Postgres/DuckDB and `1`/`0` on MySQL/SQLite; escaped LIKE patterns carry the `ESCAPE` clause each dialect reads correctly."
+        "md": "The generated SQL is per engine. Identifiers are always quoted and values are always literals — only strictly numeric text is emitted unquoted, and only against a numeric column. `ILIKE` is native on Postgres/DuckDB and becomes `LOWER(col) LIKE LOWER(pattern)` everywhere else, MySQL and SQLite included: their default collations usually ignore case, but a `_bin`/`_cs` column does not, and *contains* has to mean the same thing on every engine. Every LIKE-family comparison is made on the text form of the column, so a `char(n)` never matches on its blank padding. Booleans emit `TRUE`/`FALSE` on Postgres/DuckDB and `1`/`0` on MySQL/SQLite. `%` and `_` you type are escaped with `!` under an explicit `ESCAPE '!'` — never a backslash, which MySQL rejects under `sql_mode=ANSI`."
       },
       {
         "k": "tip",
@@ -812,7 +814,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "While a filter is active a bar above the grid shows one chip per condition, grouped as the filter is and joined by AND/OR, with an ✕ to drop just that rule, the row count the server reported, and **Edit…** / **Clear all**. A condition whose column left the result is dropped silently on the next run; a column name that appears twice in the result is refused outright (`filter rejected: …` in the status line) rather than matching the wrong one."
+        "md": "While a filter is active a bar above the grid shows one chip per condition, grouped as the filter is and joined by AND/OR, with an ✕ to drop just that rule, the row count the server reported, and **Edit…** / **Clear all**. A condition whose column left the result is dropped silently on the next run; a column name that appears twice in the result is refused outright (`filter rejected: …` / `sort/filter rejected: …` in the status line) rather than matching the wrong one. A filter is only recorded once the query it produces actually runs, so a rule that cannot be applied never leaves a chip behind."
       },
       {
         "k": "h",
@@ -1274,8 +1276,8 @@ export const TOPICS: Topic[] = [
         "ordered": false,
         "items": [
           "**Columns** — check/uncheck and reorder with the ↑/↓ buttons; keep at least one selected.",
-          "**Preview** — live, from the first 12 rows of the chosen scope (skipped for xlsx).",
-          "**Defaults** — CSV, comma delimiter, quote *as needed*, header row on, NULL as empty, LF line endings, no BOM. Your last-used options are remembered per format; the column selection and table name always come from the result being exported."
+          "**Preview** — live, from the first 12 rows already in memory (the loaded rows, or the selection when that scope is chosen); skipped for xlsx, and empty for an Explorer table export, which has loaded no rows.",
+          "**Defaults** — CSV, comma delimiter, quote *as needed*, header row on, NULL as empty, LF line endings, no BOM. Your last-used formatting options are remembered per format; the column selection, the table name and **Include CREATE TABLE** always come from the result being exported."
         ]
       },
       {
@@ -1295,7 +1297,7 @@ export const TOPICS: Topic[] = [
           ],
           [
             "**SQL inserts**",
-            "`INSERT` statements with a configurable table name; **Multi-row INSERT** batches 1,000 value tuples per statement; **Include CREATE TABLE** prepends the source table's reconstructed DDL (real types, keys and defaults) when the result is a plain table, and otherwise a generated all-`text` `CREATE` with a note saying so."
+            "`INSERT` statements with a configurable table name; **Multi-row INSERT** batches 1,000 value tuples per statement; **Include CREATE TABLE** prepends the source table's reconstructed DDL (real types, keys and defaults) when the result is a plain table, and otherwise a generated all-`text` `CREATE` with a note saying so. Views and materialized views always use the generated form — their real DDL is a `CREATE VIEW`, which nothing can insert into — and renaming **Table** drops the reconstruction too, because that DDL names the original relation."
           ],
           [
             "**Markdown**",
@@ -1303,7 +1305,7 @@ export const TOPICS: Topic[] = [
           ],
           [
             "**Excel (xlsx)**",
-            "File-only. Sheet name (defaults to the table name detected in the query, trimmed to 26 chars), **Bold header**, **Auto-filter**, **Freeze header**. Rows past **1,048,576** roll into additional sheets automatically."
+            "File-only. Sheet name (defaults to the table name detected in the query, trimmed to 26 chars, with the characters Excel forbids — `[ ] : * ? / \\` — replaced by `_`), **Bold header**, **Auto-filter**, **Freeze header**. Rows past **1,048,576** roll into additional sheets automatically."
           ]
         ]
       },
@@ -1321,7 +1323,7 @@ export const TOPICS: Topic[] = [
         "ordered": false,
         "items": [
           "**Loaded rows (N)** — formats what the grid currently holds, in memory.",
-          "**Selection (N rows)** — offered when rows are selected in the grid: the selected rows at full width, in memory. The dialog's own column checkboxes still apply.",
+          "**Selection (N rows)** — offered when rows are selected in the grid: the selected rows at full width, in memory. The dialog's own column checkboxes still apply. Like *Loaded rows* it exports the **stored** values, so unapplied edits and pinned new rows are left out and an exported file never holds rows the database does not have.",
           "**All rows (re-run query)** — re-executes server-side. Postgres streams via a dedicated cursor (`tusk_export_cur`) in **10,000-row batches** (constant memory); DuckDB, SQLite, and MySQL page via `LIMIT`/`OFFSET`, SQL Server via `OFFSET`/`FETCH`. This scope is frozen while a manual transaction owns the session; export Loaded rows instead."
         ]
       },
@@ -1336,7 +1338,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**To** switches between **File** and **Clipboard**; the clipboard uses a TypeScript formatter kept **byte-identical** to the Rust file writer (delimiter, quoting, NULL text, header, column projection, line endings). Clipboard forces the scope to *Loaded rows*; xlsx forces the destination to *File*."
+        "md": "**To** switches between **File** and **Clipboard**; the clipboard uses a TypeScript formatter kept **byte-identical** to the Rust file writer (delimiter, quoting, NULL text, header, column projection, line endings). The clipboard formats in memory, so it takes *Loaded rows* or *Selection* but not *All rows*; xlsx forces the destination to *File*."
       },
       {
         "k": "h",
@@ -1364,15 +1366,15 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "ordered": false,
         "items": [
-          "**Delimited text** — configurable delimiter (comma / tab / semicolon / pipe / custom), quote character, optional backslash-style escape character, **UTF-8** (a BOM is accepted and stripped) or **Latin-1** encoding, **skip N rows** for a preamble above the header, and a **NULL text** placeholder such as `\N`.",
-          "**JSON** — either an array of objects or newline-delimited objects (NDJSON). Keys become columns in first-seen order, nested values are stringified, and a duplicate key is rejected rather than silently dropped.",
-          "**Excel (xlsx)** — the first sheet by default, with a sheet picker when the workbook has more than one.",
-          "**First row is the header** — unchecked gives `col1`, `col2`, … A row with more fields than the header is an error; a short row imports its missing fields as NULL and says so in the warnings."
+          "**Delimited text** — configurable delimiter (comma / tab / semicolon / pipe / custom), quote character (leave it blank to turn quoting off, for a file with a bare double quote inside an unquoted field), optional backslash-style escape character (which must differ from both the quote character and the delimiter), **UTF-8** (a BOM is accepted and stripped) or **Latin-1** encoding, **skip N rows** for a preamble above the header, and a **NULL text** placeholder such as `\\N`. Wholly blank lines are separators, not rows. The encoding choice applies to delimited text only — JSON is always read as UTF-8.",
+          "**JSON** — either an array of objects or newline-delimited objects (NDJSON). Keys become columns in first-seen order, nested values are stringified, and a duplicate key is rejected rather than silently dropped. Columns come from the previewed sample: a key that first appears past it is reported in the run warnings (reopen the dialog to map it), and a file whose keys no longer overlap the preview at all is refused rather than imported as NULLs.",
+          "**Excel (xlsx)** — the first sheet by default, with a sheet picker when the workbook has more than one. A workbook is read whole rather than streamed, so its progress bar tracks rows rather than bytes.",
+          "**First row is the header** — unchecked gives `col1`, `col2`, … A row with more fields than the header is an error; a short row imports its missing fields as NULL and says so in the warnings, both in the preview and in the run summary."
         ]
       },
       {
         "k": "p",
-        "md": "The `CREATE TABLE` (if any), the optional table clear, and every insert batch run in **one transaction**: **Cancel &amp; roll back** (or any error, including a value that doesn't fit its column) undoes everything and names the offending row. PostgreSQL uses `COPY`-grade batching; the other engines use batched multi-row `INSERT`s. On success the sidebar schema refreshes so a new table appears in the tree and autocomplete ([[topic:sidebar|Sidebar]]), and the run lands in [[topic:history|history]] as `-- [Import] …`."
+        "md": "The `CREATE TABLE` (if any), the optional table clear, and every insert batch run in **one transaction**: **Cancel &amp; roll back** (or any error, including a value that doesn't fit its column) undoes everything and names the offending row. PostgreSQL streams a plain load through `COPY … FROM STDIN`; a conflict mode falls back to batched multi-row `INSERT`s, because `COPY` has no `ON CONFLICT`. The other engines always use batched multi-row `INSERT`s. On success the sidebar schema refreshes so a new table appears in the tree and autocomplete ([[topic:sidebar|Sidebar]]), and the run lands in [[topic:history|history]] as `-- [Import] …`."
       },
       {
         "k": "h",
@@ -1384,9 +1386,9 @@ export const TOPICS: Topic[] = [
         "ordered": false,
         "items": [
           "**Existing table** — pick any table Tusk knows (the Explorer's *Import data into table…* pre-selects one). File columns are auto-matched to target columns by name, case- and punctuation-insensitively; anything left over can be pointed at a column by hand or set to **— skip —**, which leaves that column at its database default.",
-          "**New table** — the name is pre-filled from the file name (extension stripped, non-word characters → `_`). Each column's type is **inferred from the sampled values** — integer, bigint, decimal, boolean, date, timestamp, or text — and each one can be overridden before the table is created. The dropdown shows the engine type each token creates as.",
+          "**New table** — the name is pre-filled from the file name (extension stripped, non-word characters → `_`), and an Explorer schema node pre-selects its own schema. Each column's type is **inferred from the sampled values** — integer, bigint, numeric, boolean, date, timestamp, or text — and each one can be overridden before the table is created. The dropdown shows the engine type each token creates as. Inference stays conservative: a value too wide for a 64-bit integer keeps the column `text`, and a column already near the 32-bit limit widens to `bigint`.",
           "**Empty the table first** — clears the table inside the same transaction, so a failure leaves the original rows intact.",
-          "**Empty → NULL** — per column, imports an empty string as NULL. On by default for every non-text column, because an empty string is not a number, date or boolean."
+          "**Empty → NULL** — per column, imports an empty (or whitespace-only) string as NULL. On by default for every non-text column, because a blank is not a number, date or boolean."
         ]
       },
       {
@@ -1413,7 +1415,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "MySQL DDL implicitly commits. Creating a table as part of a MySQL import can therefore leave the empty table behind if the row load then fails — the rows still roll back. The other three engines create and load atomically."
+        "md": "MySQL DDL implicitly commits. A MySQL import that creates its table therefore runs the `CREATE TABLE` **before** the transaction, as a separately committed step, and says so in the summary. The rows still load in one transaction and still roll back on a failure or a cancel — but the empty table stays behind, and the error tells you to drop it. The other three engines create and load atomically."
       },
       {
         "k": "h",
@@ -1422,11 +1424,11 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Right-click a table, view or materialized view for **Export table…** — the same configurator, aimed at that relation's full contents. Right-click a schema or the database for **Export tables…**: tick the tables, choose a format, pick a directory, and get one configured file per table named `schema_table.<ext>`, with per-table progress and a Cancel."
+        "md": "Right-click a table for **Export table…** — the same configurator, aimed at that relation's full contents; on a view or materialized view the item reads **Export…**. Right-click a schema or the database for **Export tables…**: tick the tables, choose a format, pick a directory, and get one configured file per table named `schema_table.<ext>`, with per-table progress and a Cancel that works on every engine. That dialog exposes fewer options than the single-result one, and anything it does not show stays at its default instead of being inherited from your last export."
       },
       {
         "k": "p",
-        "md": "Every file is written atomically. If one table fails, it is reported by name and the files already written are kept — nothing is rolled back on the filesystem."
+        "md": "Every file is written atomically. A table that fails is reported by name and the run continues with the rest; the files already written are kept, and nothing is rolled back on the filesystem. Cancelling stops the run and reports the remaining tables as cancelled."
       },
       {
         "k": "h",
@@ -1517,13 +1519,15 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "A header comment records the Tusk version, engine, database, UTC timestamp and the options used; the restore dialog reads it back. Then, in this order: drops, `CREATE SCHEMA IF NOT EXISTS`, sequences, tables (with their indexes and comments), **data**, views and materialized views, functions and triggers, **every foreign key**, and finally the PostgreSQL sequence positions."
+        "md": "A header comment records the Tusk version, engine, database, UTC timestamp and the options used; the restore dialog reads it back. Then, in this order: drops, `CREATE SCHEMA IF NOT EXISTS`, sequences, tables (with their indexes and comments), **data**, views and materialized views, functions and triggers (PostgreSQL only), the deferred foreign keys, and finally the PostgreSQL sequence positions."
       },
       {
         "k": "list",
         "ordered": false,
         "items": [
-          "**Foreign keys come last, always.** They are lifted out of PostgreSQL's reconstructed DDL and out of MySQL's `SHOW CREATE TABLE` into trailing `ALTER TABLE … ADD CONSTRAINT` statements, so a restore cannot break on table order — including a reference **cycle**, which no ordering can satisfy.",
+          "**Foreign keys come last on PostgreSQL and MySQL.** They are lifted out of PostgreSQL's reconstructed DDL and out of MySQL's `SHOW CREATE TABLE` into trailing `ALTER TABLE … ADD CONSTRAINT` statements, so a restore cannot break on table order — including a reference **cycle**, which no ordering can satisfy.",
+          "**SQLite and DuckDB keep foreign keys inline**, because neither engine can add one with `ALTER TABLE`. A SQLite dump writes `PRAGMA foreign_keys = OFF` ahead of everything else so the replay is not order-sensitive; DuckDB has no equivalent, and a cycle it cannot order around is reported as a warning instead of being written out as if it were fine.",
+          "**Functions, procedures and triggers are reconstructed on PostgreSQL only.** On the other engines the dump says so in a `-- warning:` line and in the result panel, naming what it could not carry, rather than looking complete.",
           "**PostgreSQL data streams through `COPY`.** The dump reads `COPY … TO STDOUT` and writes `COPY … FROM stdin;` blocks terminated by `\\.`, so no table is ever held in memory. A new block starts every 16 MiB.",
           "**Every other engine emits batched multi-row `INSERT`s**, built with the same dialect-aware quoting and literal rules as SQL export, and paged so memory stays flat. Binary columns are written as native blob literals (`X'…'`, `from_hex('…')`), not as text.",
           "**PostgreSQL dumps are snapshot-consistent**: the whole read runs inside one read-only repeatable-read transaction. The other engines page a table at a time, so a dump taken during concurrent writes is not a single point in time — the same caveat as grid paging.",
@@ -1537,7 +1541,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**Choose file…** picks the dump; Tusk reads its size and header first and shows what it is about to replay. A dump taken from a different engine is called out before you run it — its SQL is unlikely to replay cleanly. A file without a Tusk header is fine; it is simply replayed as plain SQL."
+        "md": "**Choose file…** picks the dump; Tusk reads its size and header first and shows what it is about to replay. A dump taken from a different engine is called out before you run it — its SQL is unlikely to replay cleanly. A file without a Tusk header is fine; it is simply replayed as plain SQL. If the header carries a `psql` directive such as `\restrict` (recent `pg_dump` output begins with one), the dialog says so before you start: Tusk replays SQL, not `psql` commands. A byte-order mark left by a Windows editor is ignored."
       },
       {
         "k": "list",

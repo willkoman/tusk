@@ -172,15 +172,27 @@ describe("progress formatting", () => {
       bytesRead: 100,
       firstError: null,
       cancelled: false,
+      singleTransaction: true,
       committed: true,
     };
-    expect(restoreResultLine(base)).toBe("10 statements ran, 25 rows copied");
+    expect(restoreResultLine(base)).toBe("10 statements ran, 25 rows copied, committed");
     expect(restoreResultLine({ ...base, statementsFailed: 2, committed: false })).toBe(
-      "10 statements ran, 2 failed, 25 rows copied, rolled back",
+      "10 statements ran, 2 failed, 25 rows copied, rolled back, nothing applied",
     );
     expect(restoreResultLine({ ...base, cancelled: true, committed: false })).toMatch(/cancelled/);
     expect(restoreResultLine({ ...base, statementsOk: 0, rowsCopied: 0, committed: false })).toBe(
+      "0 statements ran, rolled back, nothing applied",
+    );
+
+    // Without a wrapper there is nothing to commit: statements that ran are durable,
+    // so the line must not imply a rollback that never happened.
+    const loose: RestoreSummary = { ...base, singleTransaction: false, committed: false };
+    expect(restoreResultLine(loose)).toBe("10 statements ran, 25 rows copied");
+    expect(restoreResultLine({ ...loose, statementsOk: 0, rowsCopied: 0 })).toBe(
       "0 statements ran, nothing applied",
+    );
+    expect(restoreResultLine({ ...loose, cancelled: true })).toBe(
+      "10 statements ran, 25 rows copied, cancelled",
     );
   });
 });

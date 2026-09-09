@@ -3,9 +3,12 @@ import { type Dataset, formatForCopy } from "./formats";
 import { clipWrite, clipRead } from "./clipboard";
 import { type MenuItem } from "./ContextMenu";
 import { type GridView, type SortKey, type PendingEdits } from "./tabs";
-import { quickFilterOf, setQuickFilter, type FilterTree } from "./grid/filterModel";
+import { hiddenRuleCount, quickFilterOf, setQuickFilter, type FilterTree } from "./grid/filterModel";
 import { boolWord } from "./grid/bool";
 import { parseClipboardTable, type RowRef } from "./grid/paste";
+
+/** A grid selection offered to Export, bound to the result it was taken from. */
+export type SelectionSource = Dataset & { tabId: string; generation: number };
 
 // Hand-rolled, two-axis-virtualized, read-only result grid. Uses a synchronized-pane
 // layout (header + gutter are transform-translated siblings of the body scroller, NOT
@@ -79,9 +82,12 @@ export type ResultGridProps = {
   onMarkDelete: (rows: RowRef[]) => void;
   onAddRow: () => void;
   /** Hands the workbench a getter for the current selection, so Export can offer it as
-   *  a scope. Returns null when nothing is selected or the selection exceeds the copy
-   *  ceiling (Export "All rows"/"Loaded rows" covers those). */
-  registerSelectionSource?: (get: () => Dataset | null) => void;
+   *  a scope. Returns null when nothing is selected, only uncommitted insert rows are
+   *  selected, or the selection exceeds the copy ceiling (Export "All rows"/"Loaded
+   *  rows" covers those). The snapshot carries the tab + result generation it belongs
+   *  to, and the grid clears the registration on unmount, so a replaced or disposed
+   *  result can never feed a later Export dialog. */
+  registerSelectionSource?: (get: (() => SelectionSource | null) | null) => void;
   /**
    * Paste a parsed clipboard grid. `anchor`/`anchorDisplayIdx`/`displayOrigCols`
    * describe where a positional paste starts; header-mapped pastes ignore them.
@@ -581,6 +587,10 @@ export function ResultGrid(props: ResultGridProps) {
   // The workbench reads the live selection through this getter (Export → Selection).
   // It returns the selected ROWS at full width in ORIGINAL column order, so the export
   // dialog's own column checkboxes and ordering still apply on top.
+  //
+  // Unlike clipboard copy, this reads the IMMUTABLE SNAPSHOT and skips pinned insert
+  // rows: an export writes a file, and a file must not contain values that are not in
+  // the database. That makes Selection and "Loaded rows" agree row for row.
   props.registerSelectionSource?.(() => {
     if (sel().mode === "none") return null;
     const b = selectionBounds();
@@ -588,9 +598,21 @@ export function ResultGrid(props: ResultGridProps) {
     if (b.r1 < b.r0 || !names.length) return null;
     if ((b.r1 - b.r0 + 1) * names.length > MAX_COPY_CELLS) return null;
     const out: (string | null)[][] = [];
-    for (let r = b.r0; r <= b.r1; r++) out.push(names.map((_, oi) => copyVal(r, oi)));
-    return { columns: names.slice(), rows: out };
+    for (let r = b.r0; r <= b.r1; r++) {
+      if (isInsRow(r)) continue;
+      const li = loadedAt(r);
+      out.push(names.map((_, oi) => props.rows()[li]?.[oi] ?? null));
+    }
+    if (!out.length) return null;
+    return {
+      tabId: props.activeTabId(),
+      generation: props.resultGeneration(),
+      columns: names.slice(),
+      rows: out,
+    };
   });
+  // A disposed grid must not keep feeding Export → Selection.
+  onCleanup(() => props.registerSelectionSource?.(null));
 
   async function copySelection(fmt: "tsv" | "csv" | "json" | "md") {
     const tabId = props.activeTabId();
@@ -801,6 +823,10 @@ export function ResultGrid(props: ResultGridProps) {
     }, 300);
   }
   const filterFor = (oi: number) => quickFilterOf(props.view().filters, props.columns()[oi] ?? "");
+  // Builder rules this one-line box cannot represent (another operator, or a rule
+  // nested in a group). Without the marker an empty box reads as "no filter on
+  // this column" while the result is in fact filtered by it.
+  const hiddenRulesFor = (oi: number) => hiddenRuleCount(props.view().filters, props.columns()[oi] ?? "");
 
   onCleanup(() => {
     clearTimeout(filterTimer);
@@ -947,11 +973,16 @@ export function ResultGrid(props: ResultGridProps) {
               <For each={range(visCols().start, visCols().end)}>
                 {(k) => {
                   const oi = () => displayCols()[k];
+                  const hidden = () => hiddenRulesFor(oi());
                   return (
                     <input
                       class="rg-filter-input"
+                      classList={{ "has-rules": hidden() > 0 }}
                       style={{ left: `${offsets()[k]}px`, width: `${colWidth(oi()) - 6}px` }}
-                      placeholder="filter…"
+                      placeholder={hidden() > 0 ? `${hidden()} rule${hidden() === 1 ? "" : "s"} · Edit…` : "filter…"}
+                      title={hidden() > 0
+                        ? `${hidden()} filter rule${hidden() === 1 ? "" : "s"} on this column come from the filter builder — open it to see or change them`
+                        : undefined}
                       value={filterFor(oi())}
                       disabled={!props.canFilter()}
                       onInput={(e) => onFilterInput(oi(), e.currentTarget.value)}

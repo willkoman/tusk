@@ -1,4 +1,4 @@
-import { createMemo, createSignal, For, Show, onMount } from "solid-js";
+import { createMemo, createSignal, For, Index, Show, onMount } from "solid-js";
 import { Dialog, DialogFooter } from "../Dialog";
 import { Icon } from "../Icons";
 import {
@@ -203,26 +203,34 @@ function GroupEditor(props: {
           </button>
         </Show>
       </div>
+      {/*
+        `Index`, never `For`: every tree edit is a pure rebuild, so the edited
+        condition AND each enclosing group come back as NEW objects. `For`
+        reconciles by reference and would therefore dispose and recreate the very
+        input being typed into on each keystroke, losing focus after one character.
+        `Index` keys by position and hands the item down as an accessor, so the
+        row component survives and only its bound values update.
+      */}
       <Show when={props.group.items.length} fallback={<div class="filter-empty">No conditions — every row matches.</div>}>
-        <For each={props.group.items}>
+        <Index each={props.group.items}>
           {(item, i) => (
             <div class="filter-item">
-              <span class="filter-joiner">{i() === 0 ? "" : props.group.op === "and" ? "AND" : "OR"}</span>
+              <span class="filter-joiner">{i === 0 ? "" : props.group.op === "and" ? "AND" : "OR"}</span>
               <Show
-                when={isGroup(item)}
+                when={isGroup(item())}
                 fallback={
                   <ConditionRow
-                    cond={item as Condition}
+                    cond={item() as Condition}
                     columns={props.columns}
                     classOf={props.classOf}
-                    selectRef={props.depth === 0 && i() === 0 ? props.firstRef : undefined}
+                    selectRef={props.depth === 0 && i === 0 ? props.firstRef : undefined}
                     tree={props.tree}
                     onChange={props.onChange}
                   />
                 }
               >
                 <GroupEditor
-                  group={item as FilterGroup}
+                  group={item() as FilterGroup}
                   depth={props.depth + 1}
                   columns={props.columns}
                   classOf={props.classOf}
@@ -232,7 +240,7 @@ function GroupEditor(props: {
               </Show>
             </div>
           )}
-        </For>
+        </Index>
       </Show>
     </div>
   );

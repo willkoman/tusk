@@ -1,12 +1,11 @@
 import { createMemo, createSignal, For, Show } from "solid-js";
 import { Dialog } from "../Dialog";
 import {
-  applyRememberedExportOptions,
-  defaultExportOptions,
   EXPORT_FORMATS,
   FORMAT_EXT,
   isDelimited,
   rememberableExportOptions,
+  tablesExportOptions,
   type ExportOptions,
 } from "../export";
 
@@ -57,7 +56,7 @@ export function ExportTablesDialog(props: {
     new Set((props.initialSelection ?? props.tables).map(key)),
   );
   const [opts, setOpts] = createSignal<ExportOptions>(
-    applyRememberedExportOptions(defaultExportOptions(""), props.remembered.csv),
+    tablesExportOptions("csv", props.remembered),
   );
   const [filter, setFilter] = createSignal("");
   const [busy, setBusy] = createSignal(false);
@@ -82,8 +81,7 @@ export function ExportTablesDialog(props: {
   };
 
   const pickFormat = (format: ExportOptions["format"]) => {
-    const base = { ...defaultExportOptions(""), format };
-    setOpts(applyRememberedExportOptions(base, props.remembered[format]));
+    setOpts(tablesExportOptions(format, props.remembered));
   };
 
   async function run() {
@@ -108,6 +106,15 @@ export function ExportTablesDialog(props: {
   }
 
   const failures = () => (results() ?? []).filter((r) => r.error);
+
+  /** A refused cancel must say so — the button looked dead for up to 2,000 tables. */
+  async function cancelRun() {
+    try {
+      await props.onCancelRun();
+    } catch (e) {
+      setErr(e && typeof e === "object" && "message" in e ? String((e as { message: unknown }).message) : String(e));
+    }
+  }
 
   return (
     <Dialog title={props.title} onClose={props.onClose} width={640} dismissable={!busy()}>
@@ -185,7 +192,10 @@ export function ExportTablesDialog(props: {
                 </For>
               </ul>
               <Show when={failures().length}>
-                <div class="export-note">Files written before the failure were kept.</div>
+                <div class="export-note">
+                  Files written before a failure are kept; a cancel stops the run and the
+                  remaining tables are reported as skipped.
+                </div>
               </Show>
             </section>
           )}
@@ -209,7 +219,7 @@ export function ExportTablesDialog(props: {
             {props.progress()?.table ? ` — ${props.progress()!.table}` : ""}
           </span>
           <span class="spacer" />
-          <button class="ghost" onClick={() => void props.onCancelRun()}>Cancel</button>
+          <button class="ghost" onClick={() => void cancelRun()}>Cancel</button>
         </Show>
       </div>
     </Dialog>

@@ -2245,62 +2245,6 @@ async fn restore_from_file(
     result
 }
 
-#[tauri::command]
-async fn import_rows(
-    state: tauri::State<'_, AppState>,
-    connection_id: String,
-    schema: String,
-    table: String,
-    columns: Vec<String>,
-    rows: Vec<Vec<Option<String>>>,
-    create: bool,
-) -> Result<u64, AppError> {
-    validate_tabular_payload(&columns, &rows)?;
-    let conn = state.get(&connection_id)?;
-    let mut c = lock_conn(&conn).await?;
-    ensure_alive(&mut c).await?;
-    c.require_idle("import")?;
-    if c.read_only {
-        return Err(AppError::new("connection is read-only — import blocked"));
-    }
-    c.backend.rollback_cursor().await;
-    // Run create + copy in one transaction so a cancel (or any error) rolls the whole
-    // import back — no half-created table, no partial rows. Cancellable via the token.
-    let client = c.backend.pg()?;
-    let cancel_registration = state.arm_cancel(
-        &connection_id,
-        c.backend.cancel_handle(),
-        c.backend.config().clone(),
-        None,
-        c.transaction.clone(),
-    )?;
-    let res = async {
-        client.batch_execute("BEGIN").await?;
-        if create {
-            db::create_table_text(client, &schema, &table, &columns).await?;
-        }
-        db::copy_rows(client, &schema, &table, &columns, &rows).await
-    }
-    .await;
-    let result = match res {
-        Ok(n) => {
-            client.batch_execute("COMMIT").await.map_err(|e| {
-                AppError::new(format!(
-                    "import commit acknowledgement failed; transaction outcome is unknown — verify database state before retrying ({e})"
-                ))
-            })?;
-            Ok(n)
-        }
-        Err(e) => {
-            let _ = client.batch_execute("ROLLBACK").await;
-            Err(e)
-        }
-    };
-    drop(c);
-    drop(cancel_registration);
-    result
-}
-
 /// Read a UTF-8 text file by absolute path (the path comes from a native open dialog,
 /// i.e. an explicit user gesture). Used by the editor's Open flow.
 #[tauri::command]
@@ -2741,7 +2685,6 @@ pub fn run() {
             backup_to_file,
             restore_from_file,
             read_backup_header,
-            import_rows,
             import::import_preview,
             import::import_from_file,
             export::export_tables,

@@ -17,7 +17,19 @@ import {
 } from "../backup";
 
 /** What `read_backup_header` reports about the chosen file. */
-export type BackupFileInfo = { path: string; bytes: number; text: string; tooLarge: boolean };
+export type BackupFileInfo = {
+  path: string;
+  bytes: number;
+  text: string;
+  tooLarge: boolean;
+  /**
+   * A psql meta-command found in the dump's header (a backslash directive such
+   * as restrict or connect). Tusk executes SQL, not psql directives, so the
+   * replay would stop at that line: say so before the user starts rather than
+   * after the first statement fails.
+   */
+  metaCommand: string | null;
+};
 
 /**
  * Restore configurator: file picker, pre-flight summary parsed from the dump header,
@@ -145,6 +157,13 @@ export function RestoreDialog(props: {
             </Show>
             <Show when={mismatch()}>
               <div class="error">{mismatch()}</div>
+            </Show>
+            <Show when={file()?.metaCommand}>
+              <div class="error">
+                This dump contains the psql command <code>{file()!.metaCommand}</code>. Tusk replays SQL, not
+                psql directives, so that line will fail — restore it with <code>psql</code>, or remove the
+                directive from the file first.
+              </div>
             </Show>
           </section>
 
