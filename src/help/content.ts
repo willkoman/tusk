@@ -3556,8 +3556,8 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
-        "text": "Unreleased — several databases at once, backups, SSH, SQL Server",
-        "id": "v-unreleased"
+        "text": "v0.10.0 — several databases at once, backups, SSH, SQL Server",
+        "id": "v0-10-0"
       },
       {
         "k": "list",

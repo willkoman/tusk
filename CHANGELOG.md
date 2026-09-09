@@ -2,7 +2,7 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
-## [Unreleased]
+## [0.10.0] - 2026-09-09
 
 ### Added
 - **The results grid now says what kind of data it is showing.** Each header carries a small type badge — the driver's own type where Tusk knows the relation, a dotted badge guessed from the loaded values otherwise. Numeric columns align right on tabular figures so magnitudes line up, booleans render as a glyph plus TRUE/FALSE, and a value over 300 characters is cut in the cell with a hover for its head. JSON and JSONB open pretty-printed in the value viewer. None of this touches the data: copy and export still write the raw driver text.
