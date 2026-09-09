@@ -196,7 +196,7 @@ fn get_key_for_origin(provider: &str, endpoint: &str) -> Result<String, AppError
     let entry = key_entry(provider)?;
     let raw = entry.get_password().map_err(|_| {
         AppError::new(format!(
-            "no API key saved for {provider} — add one in AI settings"
+            "no API key saved for {provider}. Add one in Settings → AI."
         ))
     })?;
     if let Some(stored) = decode_stored_key(raw.clone())? {
@@ -1492,7 +1492,7 @@ pub async fn complete_one_shot(req: &AiRequest) -> Result<Completion, AppError> 
         .ok_or_else(|| AppError::new("AI completion was unexpectedly cancelled"))?;
     if out.text.trim().is_empty() {
         return Err(AppError::new(
-            "the AI returned an empty response (the stream ended before any text arrived)",
+            "the AI returned an empty response. The stream ended before any text arrived.",
         ));
     }
     Ok(out)

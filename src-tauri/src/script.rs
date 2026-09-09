@@ -231,7 +231,7 @@ fn split_core(
             if let Some((next, counted)) = mssql_go_line(b, i) {
                 if checked && counted {
                     return Err(AppError::new(
-                        "GO with a repeat count is not supported; run the batch explicitly",
+                        "GO with a repeat count is not supported. Run the batch explicitly.",
                     ));
                 }
                 let stmt = flush(std::mem::take(&mut cur)).trim().to_string();
@@ -346,7 +346,7 @@ fn split_core(
                     && b[i + 1] == b'\''
                 {
                     return Err(AppError::new(
-                        "MySQL backslash-escaped quotes are ambiguous under NO_BACKSLASH_ESCAPES; use doubled quotes instead",
+                        "MySQL backslash-escaped quotes are ambiguous under NO_BACKSLASH_ESCAPES. Use doubled quotes.",
                     ));
                 }
                 if engine == TransactionEngine::MySql && b[i] == b'\\' && i + 1 < n {
@@ -382,7 +382,7 @@ fn split_core(
                     && b[i + 1] == b'"'
                 {
                     return Err(AppError::new(
-                        "MySQL backslash-escaped quotes are ambiguous under NO_BACKSLASH_ESCAPES; use doubled quotes instead",
+                        "MySQL backslash-escaped quotes are ambiguous under NO_BACKSLASH_ESCAPES. Use doubled quotes.",
                     ));
                 }
                 if engine == TransactionEngine::MySql && b[i] == b'\\' && i + 1 < n {
@@ -419,7 +419,7 @@ fn split_core(
                     && b[i + 1] == b'`'
                 {
                     return Err(AppError::new(
-                        "MySQL backslash-escaped identifier quotes are ambiguous; use doubled backticks instead",
+                        "MySQL backslash-escaped identifier quotes are ambiguous. Use doubled backticks.",
                     ));
                 }
                 if engine == TransactionEngine::MySql && b[i] == b'\\' && i + 1 < n {
@@ -1236,7 +1236,7 @@ pub fn preflight_transactions(
             && item_sql(item).is_some_and(contains_mysql_executable_comment)
         {
             return Err(AppError::new(format!(
-                "statement {} contains a MySQL/MariaDB executable comment, which is blocked because it can hide transaction control",
+                "statement {} contains a MySQL/MariaDB executable comment, which is blocked. Remove the comment and run again.",
                 index + 1
             )));
         }
@@ -1387,7 +1387,7 @@ pub fn preflight_transactions(
                 }
                 if engine == TransactionEngine::MsSql && action == TransactionAction::Release {
                     return Err(AppError::new(
-                        "SQL Server has no RELEASE SAVEPOINT; a savepoint lives until the transaction ends",
+                        "SQL Server has no RELEASE SAVEPOINT. A savepoint lives until the transaction ends.",
                     ));
                 }
                 if state != TransactionState::Active {
@@ -2276,7 +2276,7 @@ fn snippet(item: &Item) -> String {
 pub async fn run(client: &Client, items: &[Item], read_only: bool) -> Result<String, AppError> {
     if has_txn_control(items) {
         return Err(AppError::new(
-            "transaction-control statements are not supported; run the statements as one script without BEGIN/COMMIT",
+            "transaction-control statements are not supported. Run the statements as one script without BEGIN/COMMIT.",
         ));
     }
     let mut stmts = 0u64;
@@ -2287,7 +2287,7 @@ pub async fn run(client: &Client, items: &[Item], read_only: bool) -> Result<Str
             Item::Sql(s) => {
                 if read_only && !is_read(s) {
                     Err(AppError::new(
-                        "connection is read-only — script contains writes",
+                        "connection is read-only. The script contains writes.",
                     ))
                 } else {
                     client.batch_execute(s).await.map_err(AppError::from)
@@ -2295,7 +2295,7 @@ pub async fn run(client: &Client, items: &[Item], read_only: bool) -> Result<Str
             }
             Item::Copy { stmt, data } => {
                 if read_only {
-                    Err(AppError::new("connection is read-only — COPY blocked"))
+                    Err(AppError::new("connection is read-only. COPY is blocked."))
                 } else {
                     copy_in_text(client, stmt, data).await.map(|n| copied += n)
                 }
@@ -2304,7 +2304,7 @@ pub async fn run(client: &Client, items: &[Item], read_only: bool) -> Result<Str
         if let Err(e) = res {
             let _ = client.batch_execute("ROLLBACK").await;
             return Err(AppError::new(format!(
-                "{} — at statement {} ({})",
+                "{} (at statement {}: {})",
                 e.message,
                 stmts + 1,
                 snippet(item)
@@ -2317,7 +2317,7 @@ pub async fn run(client: &Client, items: &[Item], read_only: bool) -> Result<Str
             "commit acknowledgement failed; transaction outcome is unknown — verify database state before retrying ({e})"
         ))
     })?;
-    Ok(format!("OK — {stmts} statements run, {copied} rows copied"))
+    Ok(format!("{stmts} statements run, {copied} rows copied"))
 }
 
 #[cfg(test)]

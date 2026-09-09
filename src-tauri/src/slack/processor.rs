@@ -33,10 +33,10 @@ fn bound_connection(app: &AppHandle) -> Result<(String, crate::Conn), AppError> 
     let id = app
         .state::<SlackRuntime>()
         .bound_connection()
-        .ok_or_else(|| AppError::new("the Slack bot is not answering against any Tusk connection yet — connect a database in Tusk, or pick one in Settings → Slack"))?;
+        .ok_or_else(|| AppError::new("the Slack bot has no Tusk connection yet. Connect a database, or pick one in Settings → Slack."))?;
     let conn = app.state::<crate::AppState>().get(&id).map_err(|_| {
         AppError::new(
-            "the Tusk connection this Slack bot answers against is no longer open — reconnect it, or pick another in Settings → Slack",
+            "the Tusk connection this Slack bot answers against is no longer open. Reconnect it, or pick another in Settings → Slack.",
         )
     })?;
     Ok((id, conn))
@@ -355,7 +355,7 @@ async fn generate_proposal(
 ) -> Result<Proposal, AppError> {
     if cfg.ai_provider.is_empty() || cfg.ai_model.is_empty() {
         return Err(AppError::new(
-            "no AI provider configured for Slack — open Tusk Settings → Slack and save (it mirrors the AI panel's provider/model)",
+            "no AI provider configured for Slack. Open Settings → Slack and save.",
         ));
     }
 
@@ -548,7 +548,7 @@ async fn generate_proposal(
         // refusal, and it needs a fix the user can act on.
         if truncated {
             return Err(AppError::new(format!(
-                "the AI's answer was cut off at the {} token limit before it finished the query — raise “Max tokens” in Settings → Slack, or ask something narrower",
+                "the AI's answer was cut off at the {} token limit. Raise “Max tokens” in Settings → Slack, or ask something narrower.",
                 cfg.ai_max_tokens
             )));
         }
@@ -1053,7 +1053,7 @@ fn unsafe_select_function(sql: &str, engine: script::TransactionEngine) -> Optio
 fn slack_engine_supported(engine: script::TransactionEngine) -> Result<(), AppError> {
     if engine == script::TransactionEngine::MsSql {
         return Err(AppError::new(
-            "Slack queries aren't available on SQL Server yet: Tusk can't open an engine-enforced read-only session there, and it won't run one on classification alone. Use the Tusk editor.",
+            "Slack queries aren't available on SQL Server yet. Use the Tusk editor.",
         ));
     }
     Ok(())
@@ -1082,12 +1082,12 @@ fn validate_read_only(sql: &str, engine: script::TransactionEngine) -> Result<()
     }
     if let Some(w) = find_mutation_word_for(&single, engine, false) {
         return Err(AppError::new(format!(
-            "blocked: the statement contains `{w}` — Slack only runs read-only SELECTs (no DML/DDL, no writable CTEs, no row locks). Run it in the Tusk editor instead.",
+            "blocked: the statement contains `{w}`. Slack only runs read-only SELECTs. Run it in the Tusk editor.",
         )));
     }
     if let Some(routine) = unsafe_select_function(&single, engine) {
         return Err(AppError::new(format!(
-            "blocked: {routine} is outside Slack's conservative read-only function policy. Run it in the Tusk editor instead.",
+            "blocked: {routine} is outside Slack's read-only function policy. Run it in the Tusk editor.",
         )));
     }
     Ok(())
@@ -1292,7 +1292,7 @@ async fn handle_interaction(
                 .post_ephemeral(
                     &channel,
                     &user,
-                    "⏰ This proposal has expired — ask the question again.",
+                    "⏰ This proposal has expired. Ask the question again.",
                 )
                 .await;
             return;
@@ -1459,7 +1459,7 @@ async fn run_proposal(
     let (conn_id, conn) = bound_connection(app)?;
     if conn_id != expected_connection_id {
         return Err(AppError::new(
-            "the Tusk connection the bot answers against changed after this proposal was created — ask the question again before approving",
+            "the Tusk connection changed after this proposal was created. Ask the question again.",
         ));
     }
     let (isolated_cfg, kind) = {
@@ -1468,7 +1468,7 @@ async fn run_proposal(
         c.require_idle("Slack query approval")?;
         if c.backend.database_name().await != expected_database {
             return Err(AppError::new(
-                "the connected database changed after this proposal was created — ask the question again before approving",
+                "the connected database changed after this proposal was created. Ask the question again.",
             ));
         }
         let mut isolated_cfg = c.backend.config().clone();
@@ -1478,7 +1478,7 @@ async fn run_proposal(
         // wrapped for — and one Tusk can open read-only at the engine level.
         if kind != expected_dialect {
             return Err(AppError::new(
-                "the active Tusk connection uses a different driver than this proposal — ask the question again before approving",
+                "the active Tusk connection uses a different driver than this proposal. Ask the question again.",
             ));
         }
         slack_engine_supported(script::TransactionEngine::for_kind(kind))?;
@@ -1487,13 +1487,13 @@ async fn run_proposal(
                 || matches!(isolated_cfg.path.as_deref(), Some(":memory:")))
         {
             return Err(AppError::new(
-                "Slack cannot safely isolate queries against an in-memory embedded database; use the Tusk editor or a file-backed database",
+                "Slack cannot run queries against an in-memory embedded database. Use the Tusk editor or a file-backed database.",
             ));
         }
         if kind == "duckdb" {
             if c.backend.cursor_open() {
                 return Err(AppError::new(
-                    "finish or stop the active DuckDB result stream before approving a Slack query; Tusk will not close the UI cursor",
+                    "finish or stop the active DuckDB result stream before approving a Slack query.",
                 ));
             }
             // DuckDB holds an exclusive file handle even while idle. Releasing an
@@ -1580,8 +1580,8 @@ async fn collect_with_deadline(
             let _ = cancel_handle.clone().cancel(cancel_cfg).await;
             Err(AppError::new(match kind {
                 "postgres" => "Slack session stopped; PostgreSQL cancellation was requested on the isolated query".to_string(),
-                "mysql" | "mssql" => format!("Slack session stopped; Tusk stopped waiting, but the {kind} server may still be finishing the isolated read-only query"),
-                "duckdb" | "sqlite" => format!("Slack session stopped; {kind} execution is synchronous and may run to completion"),
+                "mysql" | "mssql" => format!("Slack session stopped; the {kind} server may still be finishing the query"),
+                "duckdb" | "sqlite" => format!("Slack session stopped; the {kind} query may run to completion"),
                 _ => "Slack session stopped during isolated query execution".to_string(),
             }))
         }
@@ -1590,7 +1590,7 @@ async fn collect_with_deadline(
                 if matches!(kind, "duckdb" | "sqlite") && tokio::time::Instant::now() >= deadline {
                     match value {
                         Ok(_) => Err(AppError::new(format!(
-                            "query exceeded the {timeout_secs}s limit; {kind} execution is synchronous and could not be preempted, but it has now finished"
+                            "query exceeded the {timeout_secs}s limit; it could not be cancelled and has now finished"
                         ))),
                         Err(e) => Err(e),
                     }
@@ -1602,14 +1602,14 @@ async fn collect_with_deadline(
                 let cancel_result = cancel_handle.clone().cancel(cancel_cfg).await;
                 let detail = match kind {
                     "postgres" if cancel_result.is_ok() => "PostgreSQL server cancellation requested",
-                    "mysql" => "Tusk stopped waiting; MySQL may still be finishing the isolated read-only query",
-                    "mssql" => "Tusk stopped waiting; SQL Server may still be finishing the isolated read-only query",
-                    "duckdb" | "sqlite" => "embedded execution is synchronous; timeout cannot preempt work already inside the engine",
+                    "mysql" => "MySQL may still be finishing the query",
+                    "mssql" => "SQL Server may still be finishing the query",
+                    "duckdb" | "sqlite" => "the embedded engine cannot be interrupted mid-query",
                     _ if cancel_result.is_ok() => "cancellation requested",
-                    _ => "cancellation unavailable; the engine may still be finishing the isolated read-only query",
+                    _ => "the engine may still be finishing the query",
                 };
                 Err(AppError::new(format!(
-                    "query timed out after {timeout_secs}s ({detail}) — try a more specific query or raise the timeout in Settings → Slack"
+                    "query timed out after {timeout_secs}s ({detail}). Narrow the query, or raise the timeout in Settings → Slack."
                 )))
             }
         }
@@ -1645,7 +1645,7 @@ async fn handle_export(
                 .post_ephemeral(
                     channel,
                     user,
-                    "⏰ This result has expired — re-run the query to export it.",
+                    "⏰ This result has expired. Re-run the query to export it.",
                 )
                 .await;
             return;
@@ -1762,7 +1762,7 @@ async fn post_result(
     let thread = Some(prop.thread_ts.as_str());
 
     if rows.is_empty() {
-        let text = format!("✅ Query completed in {ms} ms — no rows returned.");
+        let text = format!("✅ Query completed in {ms} ms. No rows returned.");
         let _ = api
             .post_message(
                 &prop.channel,
@@ -1785,7 +1785,7 @@ async fn post_result(
         label: export_label(&prop.sql),
     };
     let Some((result_id, stored)) = runtime.results.insert(binding, columns, rows) else {
-        let text = "Query completed, but the result exceeded Slack's retained-export memory budget. Run a narrower query.";
+        let text = "Query completed, but the result exceeded Slack's export memory budget. Run a narrower query.";
         let _ = api
             .post_message(&prop.channel, text, Some(blocks::status_card(text)), thread)
             .await;
@@ -1815,7 +1815,7 @@ async fn post_result(
             }
             Err(e) => {
                 let note = format!(
-                    "⚠️ Couldn't render the requested chart: {} — posting the data instead.",
+                    "⚠️ Couldn't render the chart: {}. Posting the data instead.",
                     e.message
                 );
                 let _ = api
@@ -2041,7 +2041,7 @@ fn attachment_preflight(
     };
     if expansion.saturating_add(structural) > super::api::ATTACHMENT_BYTE_CAP {
         return Err(AppError::new(
-            "Export could expand beyond Slack's 20 MiB attachment budget; run a narrower query.",
+            "Export could exceed Slack's 20 MiB attachment limit. Run a narrower query.",
         ));
     }
     Ok(())

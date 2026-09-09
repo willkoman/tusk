@@ -259,7 +259,7 @@ impl CancelHandle {
                 {
                     let _ = handle;
                     Err(AppError::new(
-                        "cancel isn't available for DuckDB on Windows — the query will run to completion",
+                        "cancel isn't available for DuckDB on Windows. The query runs to completion.",
                     ))
                 }
                 #[cfg(not(windows))]
@@ -387,9 +387,9 @@ impl DuckConn {
             self.gate_poison_leaks.fetch_add(1, Ordering::Relaxed);
         }
         Some(if self.keep_open {
-            "the in-memory database was discarded (its data is lost) — the next query starts fresh"
+            "the in-memory database was discarded and its data is lost. The next query starts fresh."
         } else {
-            "the connection was discarded — the next query reopens the file (if it stays locked, restart Tusk)"
+            "the connection was discarded. The next query reopens the file; restart Tusk if it stays locked."
         })
     }
 
@@ -399,7 +399,7 @@ impl DuckConn {
     pub(crate) fn quarantine_if_poisoned(&self, err: AppError) -> AppError {
         match self.quarantine_poisoned() {
             Some(hint) => AppError::new(format!(
-                "{} — DuckDB left the connection unusable; {hint}",
+                "{}. DuckDB left the connection unusable: {hint}",
                 err.message
             )),
             None => err,
@@ -447,7 +447,7 @@ impl DuckConn {
     pub(crate) fn parse_check(&self, sql: &str) -> Result<(), AppError> {
         if self.gate_poison_leaks.load(Ordering::Relaxed) >= MAX_DUCK_GATE_POISON_LEAKS {
             return Err(AppError::new(
-                "DuckDB parser safety budget exhausted after repeated parser failures — restart Tusk before running more SQL",
+                "DuckDB parser safety budget exhausted after repeated parser failures. Restart Tusk before running more SQL.",
             ));
         }
         let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
@@ -904,7 +904,7 @@ impl Backend {
     ) -> Result<String, AppError> {
         if script::has_txn_control_for(items, self.engine()) {
             return Err(AppError::new(
-                "transaction-control statements are not supported; run the statements as one script without BEGIN/COMMIT",
+                "transaction-control statements are not supported. Run the statements as one script without BEGIN/COMMIT.",
             ));
         }
         if !matches!(self, Backend::Pg(_))
@@ -926,7 +926,7 @@ impl Backend {
             })
         {
             return Err(AppError::new(
-                "MySQL/MariaDB executable comments are blocked because they can hide transaction control",
+                "MySQL/MariaDB executable comments are blocked. Remove the comment and run again.",
             ));
         }
         let enforce_read_only = read_only || self.config().read_only;
@@ -937,7 +937,7 @@ impl Backend {
             })
         {
             return Err(AppError::new(
-                "connection is read-only — script contains writes or side effects",
+                "connection is read-only. The script contains writes or side effects.",
             ));
         }
         match self {
@@ -976,7 +976,7 @@ impl Backend {
         }
         if self.config().read_only && !crate::is_read_only_stmt(trimmed, self.engine()) {
             return Err(AppError::new(
-                "connection is read-only — writes and side effects are blocked",
+                "connection is read-only. Writes and side effects are blocked.",
             ));
         }
         match self {
@@ -1007,7 +1007,7 @@ impl Backend {
         }
         if self.config().read_only && !crate::is_read_only_stmt(trimmed, self.engine()) {
             return Err(AppError::new(
-                "connection is read-only — writes and side effects are blocked",
+                "connection is read-only. Writes and side effects are blocked.",
             ));
         }
         match self {
@@ -1052,7 +1052,7 @@ impl Backend {
     pub async fn run_manual_copy(&mut self, stmt: &str, data: &str) -> Result<u64, AppError> {
         if self.config().read_only {
             return Err(AppError::new(
-                "connection is read-only — COPY FROM stdin is blocked",
+                "connection is read-only. COPY FROM stdin is blocked.",
             ));
         }
         match self {
@@ -3767,7 +3767,7 @@ impl MsSqlConn {
     ) -> Result<(Backend, String), AppError> {
         if config.user.trim().is_empty() {
             return Err(AppError::new(
-                "SQL Server integrated (Windows) authentication isn't supported yet — enter a SQL login and password",
+                "SQL Server integrated (Windows) authentication isn't supported yet. Enter a SQL login and password.",
             ));
         }
         // The tunnel comes up first so a failure names the SSH stage, not the DB.
@@ -4007,7 +4007,7 @@ impl MsSqlConn {
                 // the budget error must say WHY there was no paging and what fixes it.
                 if buffered && error.message.contains("limit") {
                     return AppError::new(format!(
-                        "{} — SQL Server can't page this statement shape (TOP, its own OFFSET/FETCH, FOR XML/JSON, OPTION, or an unordered set operation), so it was read in one page. Add a top-level ORDER BY, or narrow the query.",
+                        "{}. SQL Server can't page this statement shape (TOP, OFFSET/FETCH, FOR XML/JSON, OPTION, or an unordered set operation), so it was read in one page. Add a top-level ORDER BY, or narrow the query.",
                         error.message
                     ));
                 }
@@ -4032,7 +4032,7 @@ impl MsSqlConn {
             // FOR XML/JSON, OPTION, or an unordered set operation) is read once
             // under the result budget instead of being silently truncated.
             note: buffered.then(|| {
-                "read in one page — SQL Server can't page this statement shape".to_string()
+                "read in one page: SQL Server can't page this statement shape".to_string()
             }),
         })
     }
@@ -4098,7 +4098,7 @@ impl MsSqlConn {
             // under XACT_ABORT ON, a procedure that committed on Tusk's behalf).
             // `manual_unit_ended` reads this state and the UI returns to Idle.
             return Err(AppError::new(
-                "SQL Server ended the transaction; the connection is still open — start a new transaction and verify what was applied",
+                "SQL Server ended the transaction. Start a new transaction and verify what was applied.",
             ));
         }
         // The server confirmed the tracked state, so any earlier loss is resolved: a
@@ -4216,7 +4216,7 @@ impl MsSqlConn {
                         )
                         .await;
                     return Err(AppError::new(format!(
-                        "{} — at statement {} ({})",
+                        "{} (at statement {}: {})",
                         error.message,
                         stmts + 1,
                         sql.lines()
@@ -4245,9 +4245,7 @@ impl MsSqlConn {
                     error.message
                 ))
             })?;
-        Ok(format!(
-            "OK — {stmts} statements run, {affected} rows affected"
-        ))
+        Ok(format!("{stmts} statements run, {affected} rows affected"))
     }
 
     /// Result-column types without executing anything: `sys.dm_exec_describe_first_result_set`
@@ -4560,7 +4558,7 @@ impl MsSqlConn {
         // than refusing: backups restore against it.
         if !self.string_agg {
             return Err(AppError::new(
-                "Tusk can't reconstruct table DDL on SQL Server 2016 or earlier: its catalog queries need STRING_AGG (SQL Server 2017+), and without it the script would silently omit primary keys, unique/check constraints and foreign keys",
+                "Tusk can't reconstruct table DDL on SQL Server 2016 or earlier. It needs STRING_AGG, added in SQL Server 2017.",
             ));
         }
         let qualified = format!("{}.{}", mssql_ident(schema), mssql_ident(name));

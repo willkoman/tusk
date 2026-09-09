@@ -210,12 +210,12 @@ fn prepare(
 ) -> Result<Prepared, AppError> {
     if rows.is_empty() {
         return Err(AppError::new(
-            "nothing to chart — the query returned no rows",
+            "nothing to chart: the query returned no rows",
         ));
     }
     if rows.len() > MAX_POINTS {
         return Err(AppError::new(format!(
-            "too many rows to chart ({} > {MAX_POINTS}) — narrow the query or export a file",
+            "too many rows to chart ({} > {MAX_POINTS}). Narrow the query, or export a file.",
             rows.len()
         )));
     }
@@ -334,11 +334,7 @@ pub fn render_png(
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         render_png_inner(spec, columns, rows)
     }))
-    .unwrap_or_else(|_| {
-        Err(AppError::new(
-            "chart render failed unexpectedly — falling back",
-        ))
-    })
+    .unwrap_or_else(|_| Err(AppError::new("chart render failed")))
 }
 
 fn render_png_inner(
@@ -495,7 +491,7 @@ fn draw_pie(root: &Area, spec: &ChartSpec, p: &Prepared) -> Result<(), AppError>
     let (name, vals) = &p.series[0];
     if p.labels.len() > MAX_PIE_SLICES {
         return Err(AppError::new(format!(
-            "too many slices for a pie chart ({} > {MAX_PIE_SLICES}) — try a bar chart",
+            "too many slices for a pie chart ({} > {MAX_PIE_SLICES}). Try a bar chart.",
             p.labels.len()
         )));
     }
@@ -505,7 +501,7 @@ fn draw_pie(root: &Area, spec: &ChartSpec, p: &Prepared) -> Result<(), AppError>
         let v = v.unwrap_or(0.0);
         if v < 0.0 {
             return Err(AppError::new(
-                "pie charts need non-negative values — try a bar chart",
+                "pie charts need non-negative values. Try a bar chart.",
             ));
         }
         if v > 0.0 {
@@ -514,7 +510,7 @@ fn draw_pie(root: &Area, spec: &ChartSpec, p: &Prepared) -> Result<(), AppError>
         }
     }
     if sizes.is_empty() {
-        return Err(AppError::new("all values are zero — nothing to chart"));
+        return Err(AppError::new("nothing to chart: all values are zero"));
     }
     let total = sizes.iter().try_fold(0.0f64, |sum, value| {
         let next = sum + value;

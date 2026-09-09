@@ -629,7 +629,7 @@ export const TOPICS: Topic[] = [
         "rows": [
           [
             "Heuristic (offline)",
-            "Unmatched `)`; unclosed `(`; trailing comma; `DELETE`/`UPDATE` without `WHERE` (\"affects every row\"); unknown **leading** keyword (`SELCT` → \"did you mean SELECT?\"); a top-level comma between conditions in `WHERE`/`HAVING` (*',' is not valid between conditions — join them with AND or OR*); invisible paste artifacts in code — non-breaking/zero-width spaces and curly quotes from web pages, named with their code point, with a fix-all quick-fix (inside string literals they're data and stay untouched)",
+            "Unmatched `)`; unclosed `(`; trailing comma; `DELETE`/`UPDATE` without `WHERE` (\"affects every row\"); unknown **leading** keyword (`SELCT` → \"Did you mean SELECT?\"); a top-level comma between conditions in `WHERE`/`HAVING` (*Comma between conditions. Use AND or OR.*); invisible paste artifacts in code — non-breaking/zero-width spaces and curly quotes from web pages, named with their code point, with a fix-all quick-fix (inside string literals they're data and stay untouched)",
             "error / warning"
           ],
           [
@@ -740,7 +740,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**While running** — Run becomes **✕ Cancel** with a live elapsed counter (updated every 200 ms); the final duration sits at the right of the result toolbar.",
-          "**One cursor per connection** (`tusk_cur`) — while idle, running in another tab, expanding a relation in the Explorer, refreshing the schema, sidebar DDL, an all-rows export, an import, or the ERD/DDL viewer closes the previous stream. The old tab keeps its rows but is marked **Incomplete result** (toolbar badge + a `N rows loaded · …` status naming what closed it); in-memory sort is off for it and Export lists its loaded rows as incomplete — re-run for the full set. During a manual transaction, other tabs/sidebar database actions are frozen and an owner run closes only its prior stream, not the outer transaction.",
+          "**One cursor per connection** (`tusk_cur`) — while idle, running in another tab, expanding a relation in the Explorer, refreshing the schema, sidebar DDL, an all-rows export, an import, or the ERD/DDL viewer closes the previous stream. The old tab keeps its rows but is marked **Incomplete result** (toolbar badge + a `N rows loaded. …` status naming what closed it); in-memory sort is off for it and Export lists its loaded rows as incomplete — re-run for the full set. During a manual transaction, other tabs/sidebar database actions are frozen and an owner run closes only its prior stream, not the outer transaction.",
           "**Dropped mid-stream** — the grid keeps what it has, shows an error banner plus a `streaming stopped — …` status and the same Incomplete badge; re-run to resume."
         ]
       },
@@ -882,7 +882,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "[[kbd:Mod-c]] copies **TSV**; the cell context menu adds **Copy as CSV / JSON / Markdown**, *Copy cell value* (*Copy value (NULL→empty)* on a NULL cell), and *Copy column*.",
+          "[[kbd:Mod-c]] copies **TSV**; the cell context menu adds **Copy as CSV / JSON / Markdown**, *Copy cell value* (*Copy value (empty for NULL)* on a NULL cell), and *Copy column*.",
           "Column names are **omitted by default** — tick **Copy w/ column names** in the result toolbar. With headers, JSON becomes an array of objects keyed by column; without, arrays of values.",
           "Copies read through uncommitted edits and the boolean display mapping — a Postgres `t` or MySQL `1` copies as the displayed `TRUE`/`FALSE`. **Copy as CSV/TSV/JSON/Markdown runs the same formatter as Export**, so clipboard bytes match the file byte-for-byte: an empty string stays quoted (`\"\"`) and distinguishable from `NULL`, JSON keeps the exporter's shape, and Markdown always carries its header row. For files, see [[topic:import-export|Import & export]]."
         ]
@@ -1619,7 +1619,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**Explain ▾** in the [[topic:editor|editor toolbar]] offers **Explain** and **Explain Analyze (runs the query)** — registry actions (`explain` / `explainAnalyze`), unbound by default; bind them in [[topic:shortcuts|Settings → Shortcuts]] or fire them from the ⌘/Ctrl K command palette. Each takes exactly one selected statement, or the statement under the cursor, and wraps it in the engine's best structured form; a multi-statement selection is refused so trailing SQL can never run outside the `EXPLAIN` prefix:"
+        "md": "**Explain ▾** in the [[topic:editor|editor toolbar]] offers **Explain** and **Explain Analyze (runs the statement)** — registry actions (`explain` / `explainAnalyze`), unbound by default; bind them in [[topic:shortcuts|Settings → Shortcuts]] or fire them from the ⌘/Ctrl K command palette. Each takes exactly one selected statement, or the statement under the cursor, and wraps it in the engine's best structured form; a multi-statement selection is refused so trailing SQL can never run outside the `EXPLAIN` prefix:"
       },
       {
         "k": "table",
@@ -1859,7 +1859,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "tip",
-        "md": "Manual nudges overlay the computed layout (zoom-aware) but are session-scoped: they clear when the schema graph reloads or you hit **Reset layout**. Past **300 tables** a \"large schema\" warning shows in the header — layout still completes (roughly 100ms at 200 tables)."
+        "md": "Manual nudges overlay the computed layout (zoom-aware) but are session-scoped: they clear when the schema graph reloads or you hit **Reset layout**. Past **300 tables** a \"Large schema\" warning shows in the header — layout still completes (roughly 100ms at 200 tables)."
       },
       {
         "k": "h",
@@ -2497,7 +2497,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "The trash icon in the panel header clears the **current connection's** history only — it flips to a `Clear all?` confirm first, so a stray click can't wipe the log. Disconnecting closes the panel and clears the list; it reloads on the next connect (from disk on first load after launch)."
+        "md": "The trash icon in the panel header clears the **current connection's** history only — it flips to a `Clear all` confirm first, so a stray click can't wipe the log. Disconnecting closes the panel and clears the list; it reloads on the next connect (from disk on first load after launch)."
       },
       {
         "k": "tip",

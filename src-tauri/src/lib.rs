@@ -248,7 +248,7 @@ impl AppState {
 
     fn too_many() -> AppError {
         AppError::new(format!(
-            "too many open connections ({MAX_OPEN_CONNECTIONS}) — disconnect one before opening another"
+            "too many open connections ({MAX_OPEN_CONNECTIONS}). Disconnect one before opening another."
         ))
     }
 
@@ -299,7 +299,7 @@ impl AppState {
             }
         }
         Err(AppError::new(
-            "no active database connection in Tusk — connect to a database first",
+            "no active database connection in Tusk. Connect to a database first.",
         ))
     }
 }
@@ -600,7 +600,7 @@ async fn connect_profile(
     };
     if !embedded && p.save_password && password.as_deref().unwrap_or("").is_empty() {
         return Err(AppError::new(
-            "couldn't read the saved password from the keychain (macOS may block keychain access for unsigned dev builds) — reconnect via the form, or re-save the connection",
+            "couldn't read the saved password from the keychain. Reconnect via the form, or save the connection again.",
         ));
     }
     // The SSH secret lives under its own keychain account and is loaded the same way:
@@ -611,7 +611,7 @@ async fn connect_profile(
             let secret = profiles::get_ssh_secret(&id).unwrap_or_default();
             if secret.is_empty() && !matches!(ssh.auth_method(), Ok(ssh::SshAuth::Agent)) {
                 return Err(AppError::new(
-                    "couldn't read the saved SSH secret from the keychain — reconnect via the form, or re-save the connection",
+                    "couldn't read the saved SSH secret from the keychain. Reconnect via the form, or save the connection again.",
                 ));
             }
             ssh.set_secret(secret);
@@ -770,7 +770,7 @@ async fn run_query(
         })
     {
         return Err(
-            AppError::new("connection is read-only — writes and DDL are blocked")
+            AppError::new("connection is read-only. Writes and DDL are blocked.")
                 .with_transaction(c.transaction.clone()),
         );
     }
@@ -811,7 +811,7 @@ async fn run_query(
         {
             c.mark_transaction_lost();
             Err(AppError::new(format!(
-                "connection dropped while the query was running; execution outcome is unknown. Verify database state before retrying. ({})",
+                "connection dropped while the query was running and the outcome is unknown. Verify database state before retrying ({}).",
                 e.message
             ))
             .with_transaction(c.transaction.clone()))
@@ -846,7 +846,7 @@ async fn exec_items(
         })
     {
         return Err(AppError::new(
-            "connection is read-only — writes and DDL are blocked",
+            "connection is read-only. Writes and DDL are blocked.",
         ));
     }
     let manual = c.transaction.owns_session();
@@ -960,7 +960,7 @@ async fn exec_items(
         statements = statements.saturating_add(1);
     }
     Ok(QueryOutcome::Exec {
-        message: format!("OK — {statements} statements run, {copied} rows copied"),
+        message: format!("{statements} statements run, {copied} rows copied"),
     })
 }
 
@@ -989,7 +989,7 @@ async fn fetch_more(
     if was_streaming && !c.backend.cursor_open() {
         c.mark_transaction_lost();
         return Err(AppError::new(
-            "connection dropped mid-stream — the result is incomplete. Re-run the query to load the rest.",
+            "connection dropped mid-stream and the result is incomplete. Re-run the query to load the rest.",
         )
         .with_transaction(c.transaction.clone()));
     }
@@ -2116,7 +2116,7 @@ async fn export_to_file(
             }
             _ => {
                 return Err(AppError::new(
-                    "export streams exactly one SQL query — select one statement",
+                    "export streams exactly one SQL query. Select one statement.",
                 ))
             }
         };
@@ -2253,7 +2253,7 @@ async fn restore_from_file(
     c.require_idle("restore")?;
     if c.read_only {
         return Err(AppError::new(
-            "connection is read-only — restore is blocked",
+            "connection is read-only. Restore is blocked.",
         ));
     }
     c.backend.rollback_cursor().await;

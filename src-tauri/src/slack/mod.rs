@@ -145,7 +145,7 @@ fn require_open(app: &AppHandle, id: &str) -> Result<String, AppError> {
         .map(|_| id.to_string())
         .map_err(|_| {
             AppError::new(
-                "the connection chosen for the Slack bot is no longer open — pick another in Settings → Slack",
+                "the connection chosen for the Slack bot is no longer open. Pick another in Settings → Slack.",
             )
         })
 }
@@ -186,9 +186,9 @@ pub fn on_connection_closed(app: &AppHandle, connection_id: &str) {
     // the bot returns only when that same saved connection is open again.
     let reason = match autostart_label(app) {
         Some(name) => format!(
-            "Slack bot stopped: the Tusk connection it was answering against was disconnected. It starts again when “{name}” is open."
+            "Slack bot stopped: its Tusk connection was disconnected. It starts again when “{name}” is open."
         ),
-        None => "Slack bot stopped: the Tusk connection it was answering against was disconnected. It answers against one saved connection — pick one in Settings → Slack so it can start again by itself.".to_string(),
+        None => "Slack bot stopped: its Tusk connection was disconnected. Pick a saved connection in Settings → Slack so it can start again.".to_string(),
     };
     runtime.set_status("disconnected", Some(reason));
     let _ = app.emit("slack:status", runtime.status_info());
@@ -213,8 +213,11 @@ pub fn autostart_label(app: &AppHandle) -> Option<String> {
 pub fn arm_autostart(app: &AppHandle) {
     let runtime = app.state::<SlackRuntime>();
     let reason = match autostart_label(app) {
-        Some(name) => format!("Slack bot is armed — waiting for connection “{name}” to open."),
-        None => "Slack autostart is on but no saved connection is bound to it — pick one in Settings → Slack.".to_string(),
+        Some(name) => format!("Slack bot is waiting for connection “{name}” to open."),
+        None => {
+            "Slack autostart is on with no saved connection bound. Pick one in Settings → Slack."
+                .to_string()
+        }
     };
     runtime.set_status("disconnected", Some(reason));
     let _ = app.emit("slack:status", runtime.status_info());
@@ -255,12 +258,12 @@ pub async fn start(app: AppHandle, connection_id: Option<String>) -> Result<(), 
 
     // Config is (re)loaded per-event by the consumer, not captured here.
     let tokens = config::bot_token()
-        .ok_or_else(|| AppError::new("no Slack bot token saved — add it in Settings → Slack"))
+        .ok_or_else(|| AppError::new("no Slack bot token saved. Add it in Settings → Slack."))
         .and_then(|bot| {
             config::app_token()
                 .map(|app_token| (bot, app_token))
                 .ok_or_else(|| {
-                    AppError::new("no Slack app-level token saved — add it in Settings → Slack")
+                    AppError::new("no Slack app-level token saved. Add it in Settings → Slack.")
                 })
         });
     let (bot_token, app_token) = match tokens {
@@ -355,7 +358,7 @@ pub async fn start(app: AppHandle, connection_id: Option<String>) -> Result<(), 
                                             my_gen,
                                             &cancel,
                                             "error",
-                                            Some("internal error handling a Slack event (recovered — see last-crash.txt)".to_string()),
+                                            Some("internal error handling a Slack event (recovered; see last-crash.txt)".to_string()),
                                         ) {
                                             let _ = consumer_app.emit("slack:status", runtime.status_info());
                                         }

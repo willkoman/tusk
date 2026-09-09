@@ -459,7 +459,7 @@ pub fn upsert(
         if let Err(password_error) = set_saved_password(&plan.account, secret) {
             if let Err(profile_rollback) = save_all(app, &original) {
                 return Err(AppError::new(format!(
-                    "{}; profile rollback also failed: {}. The saved password was cleared to prevent credential reuse against the wrong destination",
+                    "{}; profile rollback also failed: {}. The saved password was cleared. Enter it again.",
                     password_error.message, profile_rollback.message
                 )));
             }
