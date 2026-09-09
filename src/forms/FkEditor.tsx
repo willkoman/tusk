@@ -1,4 +1,5 @@
-import { createMemo, createSignal, For, Show, createEffect, on } from "solid-js";
+import { createMemo, createSignal, For, Show, createEffect, on, onCleanup } from "solid-js";
+import { Portal } from "solid-js/web";
 import type { FkSpec } from "../sql/ddl";
 import { ddlCaps } from "../sql/ddlCaps";
 
@@ -93,6 +94,24 @@ export function FkEditor(props: {
   const [open, setOpen] = createSignal(false);
   const [refCols, setRefCols] = createSignal<RefColumn[] | null>(null);
   const [loading, setLoading] = createSignal(false);
+  // The list is portalled to the body: inside the dialog it was clipped by the
+  // scrolling modal body and painted under the fields below it.
+  const [anchor, setAnchor] = createSignal({ left: 0, top: 0, width: 0 });
+  let searchEl: HTMLInputElement | undefined;
+  const placeList = () => {
+    const r = searchEl?.getBoundingClientRect();
+    if (r) setAnchor({ left: r.left, top: r.bottom + 2, width: r.width });
+  };
+  createEffect(() => {
+    if (!open()) return;
+    placeList();
+    window.addEventListener("resize", placeList);
+    window.addEventListener("scroll", placeList, true);
+    onCleanup(() => {
+      window.removeEventListener("resize", placeList);
+      window.removeEventListener("scroll", placeList, true);
+    });
+  });
 
   const chosen = () => (props.value.refTable ? `${props.value.refSchema}.${props.value.refTable}` : "");
 
@@ -160,8 +179,9 @@ export function FkEditor(props: {
     <div class="fk-editor">
       <Show when={!props.hideName}>
         <label>
-          Constraint name <span class="muted-hint">(optional — the server names it if blank)</span>
+          Constraint name
           <input value={props.value.name} onInput={(e) => props.onChange({ name: e.currentTarget.value })} placeholder="fk_name" />
+          <small class="field-hint">Leave blank to let the server name it.</small>
         </label>
       </Show>
 
@@ -169,6 +189,7 @@ export function FkEditor(props: {
       <div class="ref-picker">
         <input
           class="ref-search"
+          ref={searchEl}
           value={open() ? search() : chosen()}
           placeholder="search schema.table…"
           onFocus={() => {
@@ -182,37 +203,42 @@ export function FkEditor(props: {
           }}
         />
         <Show when={open()}>
-          <div class="ref-list">
-            <Show when={matches().length} fallback={<div class="ref-empty">no matching table</div>}>
-              <For each={matches()}>
-                {(t) => (
-                  <button
-                    class="ref-item"
-                    classList={{ active: chosen() === `${t.schema}.${t.name}` }}
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      props.onChange({
-                        refSchema: t.schema,
-                        refTable: t.name,
-                        pairs: props.value.pairs.map((p) => ({ ...p, ref: "" })),
-                      });
-                      setOpen(false);
-                    }}
-                  >
-                    <span class="muted-hint">{t.schema}.</span>
-                    {t.name}
-                  </button>
-                )}
-              </For>
-            </Show>
-          </div>
+          <Portal>
+            <div
+              class="ref-list"
+              style={{ left: `${anchor().left}px`, top: `${anchor().top}px`, width: `${anchor().width}px` }}
+            >
+              <Show when={matches().length} fallback={<div class="ref-empty">no matching table</div>}>
+                <For each={matches()}>
+                  {(t) => (
+                    <button
+                      class="ref-item"
+                      classList={{ active: chosen() === `${t.schema}.${t.name}` }}
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        props.onChange({
+                          refSchema: t.schema,
+                          refTable: t.name,
+                          pairs: props.value.pairs.map((p) => ({ ...p, ref: "" })),
+                        });
+                        setOpen(false);
+                      }}
+                    >
+                      <span class="muted-hint">{t.schema}.</span>
+                      {t.name}
+                    </button>
+                  )}
+                </For>
+              </Show>
+            </div>
+          </Portal>
         </Show>
       </div>
 
       <div class="field-label">
         Column pairs
         <Show when={loading()}>
-          <span class="muted-hint"> loading referenced columns…</span>
+          <span class="muted-hint">loading referenced columns…</span>
         </Show>
       </div>
       <div class="fk-pairs">
@@ -251,9 +277,7 @@ export function FkEditor(props: {
       </div>
 
       <Show when={mismatches().length}>
-        <div class="warn-note">
-          Type mismatch (this may still be valid — the engine decides): {mismatches().join(", ")}
-        </div>
+        <div class="warn-note">Type mismatch: {mismatches().join(", ")}</div>
       </Show>
 
       <div class="seg">
