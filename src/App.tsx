@@ -689,9 +689,13 @@ function App() {
     isProduction(activeEnvironment())
       ? <span class="env-badge env-prod" title={ENVIRONMENT_LABELS.prod}>{ENVIRONMENT_BADGES.prod}</span>
       : undefined;
+  /** The rail colour for one connection: its environment's hue when it is
+   *  tagged, otherwise its cycled one. Set inline, so it must resolve here. */
+  const railColor = (colorIndex: number, env: Environment) =>
+    env === "none" ? connectionColor(colorIndex) : `var(--env-${env})`;
   const activeConnColor = () => {
     const e = activeEntry();
-    return e ? connectionColor(e.colorIndex) : undefined;
+    return e ? railColor(e.colorIndex, activeEnvironment()) : undefined;
   };
   /** The first connection holding an open manual transaction (window close scans all). */
   const anyTransactionOpen = () => connections().find((e) => transactionOpen(e.state().transaction)) ?? null;
@@ -5401,7 +5405,7 @@ function App() {
                     role="tab"
                     aria-selected={active()}
                     classList={{ active: active(), multi: railed(), [environmentClass(env())]: env() !== "none" }}
-                    style={railed() ? { "--conn-color": connectionColor(entry.colorIndex) } : undefined}
+                    style={railed() ? { "--conn-color": railColor(entry.colorIndex, env()) } : undefined}
                     title={`${labelOf(id)} (${driverLabel(kindOf(id))}${env() === "none" ? "" : `, ${ENVIRONMENT_LABELS[env()]}`}${entry.conn.viaSsh ? ", over SSH" : ""}): ${connectionDotTitle(dot())}`}
                     onClick={() => focusConnection(id)}
                   >
@@ -5623,7 +5627,7 @@ function App() {
                         // rail, never by dimming — a dimmed tab reads as disabled.
                         [environmentClass(envOf(t.connectionId))]: envOf(t.connectionId) !== "none",
                       }}
-                      style={connections().length > 1 || envOf(t.connectionId) !== "none" ? { "--conn-color": connectionColor(entryOf(t.connectionId)?.colorIndex ?? 0) } : undefined}
+                      style={connections().length > 1 || envOf(t.connectionId) !== "none" ? { "--conn-color": railColor(entryOf(t.connectionId)?.colorIndex ?? 0, envOf(t.connectionId)) } : undefined}
                       title={`${t.filePath ?? tabLabel(t)}${connections().length > 1 ? ` (${labelOf(t.connectionId)})` : ""}${envOf(t.connectionId) === "none" ? "" : ` — ${ENVIRONMENT_LABELS[envOf(t.connectionId)]}`}`}
                       // Press-and-move reorder (src/dnd.ts): the press switches tabs,
                       // and travel past the threshold turns it into a drag whose
