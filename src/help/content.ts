@@ -1515,7 +1515,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**Export…** freezes a snapshot of the result, so switching tabs mid-dialog cannot redirect it.",
-          "**Columns** — check, uncheck and reorder with ↑/↓. At least one must stay selected.",
+          "**Columns** — check, uncheck and reorder with the arrow buttons. At least one must stay selected.",
           "**Preview** — live, from the first 12 rows in memory. Skipped for xlsx.",
           "**Defaults** — CSV, comma delimiter, quote *as needed*, header row on, NULL as empty, LF line endings, no BOM.",
           "Formatting options are remembered per format. Column selection, table name and **Include CREATE TABLE** come from the result being exported."
