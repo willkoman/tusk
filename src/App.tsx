@@ -45,6 +45,7 @@ const HelpDialog = lazy(() => import("./help/HelpDialog"));
 import { fontStack } from "./editor/theme";
 import { type SqlEngine } from "./editor/lexer";
 import { ACTIONS, type ActionCtx, type ActionId, type KeyOverrides, canonicalKey, displayKey, effectiveKey, normalizeKeyEvent } from "./actions";
+import { measureEdges, reorder, slotOffset, startPointerDrag, type PointerDragHandle } from "./dnd";
 import { exportOptionsStore, keymapStore, type RememberedExportOptions } from "./store";
 import { consumeCrashRecovery } from "./CrashGuard";
 import { historyStore, makeEntryId, type HistoryEntry } from "./history/store";
@@ -1152,19 +1153,57 @@ function App() {
 
   // --- tab QoL: rename / close-many / drag-reorder ---
   const [renameTab, setRenameTab] = createSignal<{ id: string; title: string } | null>(null);
-  let dragTabId: string | null = null;
+  // Pointer reorder state (src/dnd.ts). `dragTabId` dims the source in place;
+  // `tabDropSlot` positions the insertion bar. Neither touches the tab model —
+  // `tabs()` only changes on the drop, so a cancelled drag needs no restore and a
+  // running query, the cursor owner, recovery snapshots and each tab's connection
+  // binding are all untouched (they key on tab id, never on strip position).
+  const [dragTabId, setDragTabId] = createSignal<string | null>(null);
+  const [tabDropSlot, setTabDropSlot] = createSignal<number | null>(null);
+  let stripEl: HTMLDivElement | undefined;
+  let tabDrag: PointerDragHandle | null = null;
+  /** Set when a press turned into a drag, so the trailing click doesn't switch tabs. */
+  let tabClickBlocked = false;
 
-  function moveTabTo(dragId: string, targetId: string, before: boolean) {
-    setTabs((ts) => {
-      const from = ts.findIndex((t) => t.id === dragId);
-      let to = ts.findIndex((t) => t.id === targetId);
-      if (from < 0 || to < 0 || from === to) return ts;
-      const next = ts.slice();
-      const [moved] = next.splice(from, 1);
-      to = next.findIndex((t) => t.id === targetId);
-      next.splice(before ? to : to + 1, 0, moved);
-      return next;
+  /** Item boundaries of the rendered tabs, in the strip's content coordinates. */
+  const tabEdges = () =>
+    stripEl ? measureEdges(Array.from(stripEl.querySelectorAll<HTMLElement>(".tab")), stripEl) : [];
+
+  /** Commit a strip reorder: move the tab at `from` into insertion slot `slot`. */
+  function moveTabSlot(from: number, slot: number) {
+    setTabs((ts) => reorder(ts, from, slot) as Tab[]);
+  }
+
+  function startTabDrag(e: PointerEvent, index: number, el: HTMLElement) {
+    tabDrag?.cancel();
+    tabDrag = startPointerDrag({
+      event: e,
+      from: index,
+      source: el,
+      scroller: stripEl!,
+      edges: tabEdges,
+      onStart: () => {
+        tabClickBlocked = true;
+        setDragTabId(tabs()[index]?.id ?? null);
+      },
+      onSlot: setTabDropSlot,
+      onDrop: moveTabSlot,
+      onEnd: () => {
+        tabDrag = null;
+        setDragTabId(null);
+      },
     });
+  }
+
+  /** Alt+Shift+←/→: move the active tab one slot along the strip and keep it in view. */
+  function moveActiveTab(delta: 1 | -1) {
+    const id = activeTabId();
+    setTabs((ts) => {
+      const from = ts.findIndex((t) => t.id === id);
+      if (from < 0) return ts;
+      return reorder(ts, from, from + (delta === 1 ? 2 : -1)) as Tab[];
+    });
+    queueMicrotask(() => stripEl?.querySelector(".tab.active")?.scrollIntoView({ block: "nearest", inline: "nearest" }));
   }
 
   /** Close every tab matching the predicate, skipping dirty ones (reported). */
@@ -2126,6 +2165,8 @@ function App() {
   onCleanup(() => {
     appMounted = false;
     skillsGeneration++;
+    tabDrag?.cancel();
+    tabDrag = null;
     document.removeEventListener("contextmenu", preventNativeContextMenu);
     window.removeEventListener("keydown", onWindowKey);
     window.removeEventListener("resize", clampPanels);
@@ -2165,6 +2206,8 @@ function App() {
       case "toggleResults": toggleResults(); break;
       case "newTab": openNewTab(); break;
       case "closeTab": closeTab(activeTabId()); break;
+      case "moveTabLeft": moveActiveTab(-1); break;
+      case "moveTabRight": moveActiveTab(1); break;
       case "openFile": void openFileDialog(); break;
       case "saveFile": void saveActiveTab(); break;
       case "saveFileAs": void saveAsActiveTab(); break;
@@ -5308,6 +5351,7 @@ function App() {
             <div class="editor-pane" classList={{ full: !resultsOpen() }} style={resultsOpen() ? { height: `${editorH()}px` } : undefined}>
               <div
                 class="tab-strip"
+                ref={(el) => (stripEl = el)}
                 onWheel={(e) => {
                   // Vertical wheel scrolls the horizontal strip when it overflows.
                   const el = e.currentTarget;
@@ -5319,7 +5363,7 @@ function App() {
                 }}
               >
                 <For each={tabs()}>
-                  {(t) => (
+                  {(t, i) => (
                     <div
                       class="tab"
                       classList={{
@@ -5327,20 +5371,29 @@ function App() {
                         "tx-owner": stateOf(t.connectionId)?.transaction.owner === t.id,
                         frozen: transactionOpen(stateOf(t.connectionId)?.transaction ?? IDLE_TRANSACTION) && stateOf(t.connectionId)?.transaction.owner !== t.id,
                         "other-conn": connections().length > 1 && t.connectionId !== activeConnectionId(),
+                        "dnd-source": dragTabId() === t.id,
                       }}
                       style={connections().length > 1 ? { "--conn-color": connectionColor(entryOf(t.connectionId)?.colorIndex ?? 0) } : undefined}
                       title={`${t.filePath ?? t.title}${connections().length > 1 ? ` — ${labelOf(t.connectionId)}` : ""}`}
-                      draggable={true}
-                      onDragStart={() => (dragTabId = t.id)}
-                      onDragOver={(e) => {
-                        e.preventDefault();
-                        if (!dragTabId || dragTabId === t.id) return;
-                        const rect = e.currentTarget.getBoundingClientRect();
-                        const before = e.clientX < rect.left + rect.width / 2;
-                        moveTabTo(dragTabId, t.id, before);
+                      // Press-and-move reorder (src/dnd.ts): the press switches tabs,
+                      // and travel past the threshold turns it into a drag whose
+                      // trailing click must not switch back.
+                      onPointerDown={(e) => {
+                        if (e.button !== 0) return;
+                        if ((e.target as HTMLElement).closest(".tab-close")) return;
+                        tabClickBlocked = false;
+                        switchTab(t.id);
+                        startTabDrag(e, i(), e.currentTarget);
                       }}
-                      onDragEnd={() => (dragTabId = null)}
-                      onClick={() => switchTab(t.id)}
+                      // Cancel the native selection Chromium starts on press, on
+                      // mousedown rather than pointerdown so the ×'s click survives.
+                      onMouseDown={(e) => {
+                        if (e.button === 0 && !(e.target as HTMLElement).closest(".tab-close")) e.preventDefault();
+                      }}
+                      onClick={() => {
+                        if (tabClickBlocked) { tabClickBlocked = false; return; }
+                        switchTab(t.id);
+                      }}
                       onAuxClick={(e) => { if (e.button === 1) closeTab(t.id); }}
                       onContextMenu={(e) => {
                         e.preventDefault();
@@ -5369,6 +5422,11 @@ function App() {
                   )}
                 </For>
                 <button class="tab-new" title="New tab (⌘/Ctrl+T)" onClick={openNewTab}>＋</button>
+                {/* Insertion bar: placed with translateX so it slides between slots
+                    (`.dnd-bar`, 120 ms, disabled under prefers-reduced-motion). */}
+                <Show when={tabDropSlot() != null}>
+                  <div class="tab-drop dnd-bar" style={{ transform: `translateX(${slotOffset(tabEdges(), tabDropSlot()!) - 1}px)` }} />
+                </Show>
               </div>
               <div class="toolbar">
                 <button
@@ -5434,6 +5492,7 @@ function App() {
                 }}
                 onRun={() => doRun()}
                 onRunStatement={(t) => doRun(t)}
+                onMoveTab={moveActiveTab}
                 running={running() && runningTabId() === activeTabId()}
                 tabId={activeTabId()}
                 tables={schema()}

@@ -6,6 +6,7 @@ import { type GridView, type SortKey, type PendingEdits } from "./tabs";
 import { hiddenRuleCount, quickFilterOf, setQuickFilter, type FilterTree } from "./grid/filterModel";
 import { boolWord } from "./grid/bool";
 import { parseClipboardTable, type RowRef } from "./grid/paste";
+import { slotOffset, startPointerDrag, type PointerDragHandle } from "./dnd";
 
 /** A grid selection offered to Export, bound to the result it was taken from. */
 export type SelectionSource = Dataset & { tabId: string; generation: number };
@@ -104,6 +105,11 @@ export function ResultGrid(props: ResultGridProps) {
   const [viewportW, setViewportW] = createSignal(800);
   const [sel, setSel] = createSignal<Sel>(EMPTY_SEL);
   const [reorderTo, setReorderTo] = createSignal<number | null>(null);
+  // ORIGINAL index of the column being dragged (dimmed in place while its ghost
+  // travels). A signal, not a class on the node: the header is virtualized, so the
+  // node under a given display index is recycled as auto-scroll pans the columns.
+  const [dragCol, setDragCol] = createSignal<number | null>(null);
+  let headerDrag: PointerDragHandle | null = null;
 
   const headTop = () => HEAD_H + (props.view().filterRowOpen ? FILTER_H : 0);
   const rowH = () => props.gridStyle().rowH;
@@ -837,35 +843,40 @@ export function ResultGrid(props: ResultGridProps) {
     cancelAnimationFrame(autoRAF);
     window.removeEventListener("mousemove", onDragMove);
     window.removeEventListener("mouseup", endDrag);
-    headerDown = null;
-    window.removeEventListener("mousemove", onHeaderMove);
-    window.removeEventListener("mouseup", onHeaderUp);
+    headerDrag?.cancel();
+    headerDrag = null;
     resizeCleanup?.();
     document.body.style.userSelect = "";
     document.body.style.cursor = "";
   });
 
   // --- resize / autofit / reorder / hide ---
-  function startResize(e: MouseEvent, oi: number) {
-    e.preventDefault();
+  // Pointer events, not mouse: the header cell's own reorder press is a pointerdown,
+  // which fires BEFORE any mousedown — a mousedown-based stopPropagation here would
+  // arrive too late and every resize would also arm a column drag. Selection is
+  // cancelled by the header cell's mousedown handler, which this press bubbles to.
+  function startResize(e: PointerEvent, oi: number) {
+    if (e.button !== 0) return;
     e.stopPropagation();
     const startX = e.clientX,
       startW = colWidth(oi);
     resizeCleanup?.();
     document.body.style.userSelect = "none";
     document.body.style.cursor = "col-resize";
-    const mv = (ev: MouseEvent) =>
+    const mv = (ev: PointerEvent) =>
       props.setView({ widths: { ...props.view().widths, [oi]: Math.max(MIN_COL_W, Math.min(MAX_COL_W, startW + ev.clientX - startX)) } });
     const up = () => {
       document.body.style.userSelect = "";
       document.body.style.cursor = "";
-      window.removeEventListener("mousemove", mv);
-      window.removeEventListener("mouseup", up);
+      window.removeEventListener("pointermove", mv);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
       resizeCleanup = null;
     };
     resizeCleanup = up;
-    window.addEventListener("mousemove", mv);
-    window.addEventListener("mouseup", up);
+    window.addEventListener("pointermove", mv);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
   }
   let measureCtx: CanvasRenderingContext2D | null = null;
   function autofit(oi: number) {
@@ -895,47 +906,40 @@ export function ResultGrid(props: ResultGridProps) {
     remaining.splice(insertAt, 0, movingOi);
     props.setView({ order: [...remaining, ...props.view().hidden] });
   }
-  function insertionIndex(x: number): number {
-    const o = offsets();
-    for (let k = 0; k < o.length - 1; k++) if (x < (o[k] + o[k + 1]) / 2) return k;
-    return o.length - 1;
-  }
 
-  // header label mousedown: distinguish click (sort + select) vs drag (reorder)
-  let headerDown: { dc: number; oi: number; x: number; shift: boolean; moved: boolean } | null = null;
-  function onHeaderDown(e: MouseEvent, dc: number, oi: number) {
+  /**
+   * Header press: one gesture that is a sort click until the pointer travels
+   * DRAG_THRESHOLD px, then becomes a column reorder with the shared ghost and
+   * insertion bar (src/dnd.ts). Only `GridView.order` changes — canonical column
+   * identity (the ORIGINAL index) is never touched, so edits, copies and export
+   * keep addressing the same data. Column edges come from `offsets()`, already in
+   * the body scroller's content coordinates, so the drag and the bar agree even
+   * while auto-scroll pans the header.
+   */
+  function onHeaderDown(e: PointerEvent, dc: number, oi: number) {
     if (e.button !== 0) return;
     focusGrid();
-    headerDown = { dc, oi, x: e.clientX, shift: e.shiftKey, moved: false };
-    window.addEventListener("mousemove", onHeaderMove);
-    window.addEventListener("mouseup", onHeaderUp);
-  }
-  function onHeaderMove(e: MouseEvent) {
-    if (!headerDown) return;
-    if (!headerDown.moved && Math.abs(e.clientX - headerDown.x) > 4) {
-      headerDown.moved = true;
-      document.body.style.userSelect = "none";
-    }
-    if (headerDown.moved) {
-      const b = scroller!.getBoundingClientRect();
-      setReorderTo(insertionIndex(e.clientX - b.left + scroller!.scrollLeft));
-    }
-  }
-  function onHeaderUp() {
-    if (!headerDown) return;
-    if (headerDown.moved) {
-      const to = reorderTo();
-      if (to != null) moveColumn(headerDown.dc, to);
-    } else {
-      const nr = nRows();
-      setSel({ mode: "cols", ar: 0, ac: headerDown.dc, fr: nr - 1, fc: headerDown.dc });
-      cycleSort(headerDown.oi, headerDown.shift);
-    }
-    setReorderTo(null);
-    document.body.style.userSelect = "";
-    headerDown = null;
-    window.removeEventListener("mousemove", onHeaderMove);
-    window.removeEventListener("mouseup", onHeaderUp);
+    const shift = e.shiftKey;
+    headerDrag?.cancel();
+    headerDrag = startPointerDrag({
+      event: e,
+      from: dc,
+      source: e.currentTarget as HTMLElement,
+      scroller: scroller!,
+      edges: () => offsets(),
+      dropZone: () => root,
+      onStart: () => setDragCol(oi),
+      onSlot: (slot) => setReorderTo(slot),
+      onDrop: (from, slot) => moveColumn(from, slot),
+      onEnd: (moved) => {
+        headerDrag = null;
+        setDragCol(null);
+        if (moved) return;
+        const nr = nRows();
+        setSel({ mode: "cols", ar: 0, ac: dc, fr: nr - 1, fc: dc });
+        cycleSort(oi, shift);
+      },
+    });
   }
 
   return (
@@ -953,17 +957,22 @@ export function ResultGrid(props: ResultGridProps) {
               return (
                 <div
                   class="rg-headcell"
-                  classList={{ sel: sel().mode === "cols" && isSel(0, k) }}
+                  classList={{ sel: sel().mode === "cols" && isSel(0, k), "dnd-source": dragCol() === oi() }}
                   style={{ left: `${offsets()[k]}px`, width: `${colWidth(oi())}px`, height: `${HEAD_H}px` }}
                   title={props.columns()[oi()]}
-                  onMouseDown={(e) => onHeaderDown(e, k, oi())}
+                  onPointerDown={(e) => onHeaderDown(e, k, oi())}
+                  // Chromium starts a text selection on press and paints it once the
+                  // drag crosses selectable content. Cancelling the mousedown (not the
+                  // pointerdown) keeps click/dblclick — the resize handle's autofit —
+                  // intact; the resize child's own press bubbles here for the same fix.
+                  onMouseDown={(e) => { if (e.button === 0) e.preventDefault(); }}
                   onContextMenu={(e) => onHeaderContext(e, oi(), k)}
                 >
                   <span class="rg-headname">{props.columns()[oi()]}</span>
                   <Show when={s()}>
                     {(sk) => <span class="rg-sort">{sk().dir === "asc" ? "▲" : "▼"}{props.view().sorts.length > 1 ? sortIndex(oi()) + 1 : ""}</span>}
                   </Show>
-                  <div class="rg-resize" onMouseDown={(e) => startResize(e, oi())} onDblClick={(e) => (e.stopPropagation(), autofit(oi()))} />
+                  <div class="rg-resize" onPointerDown={(e) => startResize(e, oi())} onDblClick={(e) => (e.stopPropagation(), autofit(oi()))} />
                 </div>
               );
             }}
@@ -993,7 +1002,12 @@ export function ResultGrid(props: ResultGridProps) {
             </div>
           </Show>
           <Show when={reorderTo() != null}>
-            <div class="rg-reorder" style={{ left: `${offsets()[reorderTo()!] ?? contentW()}px`, height: `${headTop()}px` }} />
+            {/* translateX (not `left`) so the bar slides between slots; `.dnd-bar`
+                carries the look and the 120 ms transition. */}
+            <div
+              class="rg-reorder dnd-bar"
+              style={{ transform: `translateX(${slotOffset(offsets(), reorderTo()!) - 1}px)`, height: `${headTop()}px` }}
+            />
           </Show>
         </div>
       </div>

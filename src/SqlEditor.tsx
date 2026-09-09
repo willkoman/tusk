@@ -87,6 +87,8 @@ export function SqlEditor(props: {
   onChange: (v: string, tabId: string) => void;
   onRun: () => void;
   onRunStatement?: (text: string) => void;
+  /** Move the active tab one slot along the strip (moveTabLeft/moveTabRight). */
+  onMoveTab?: (delta: 1 | -1) => void;
   /** True while a query launched from THIS tab is in flight (drives the gutter spinner). */
   running?: boolean;
   /** Active editor tab — each tab keeps its own undo/cursor/fold state. */
@@ -208,6 +210,12 @@ export function SqlEditor(props: {
     add("format", () => view && formatDoc(view, true, curDialect(), () => curTabId));
     add("find", () => view && openSearchPanel(view));
     add("toggleComment", () => view && toggleComment(view));
+    // Bound here rather than globally: defaultKeymap owns Shift-Alt-Arrow, and this
+    // compartment sits above it, so the tab move wins while the editor has focus.
+    if (props.onMoveTab) {
+      add("moveTabLeft", () => props.onMoveTab!(-1));
+      add("moveTabRight", () => props.onMoveTab!(1));
+    }
     return keymap.of(bindings);
   };
 

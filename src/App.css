@@ -606,8 +606,8 @@ button.conn-dot.cancellable:hover { background: var(--danger); box-shadow: 0 0 0
 .cm-host .cm-tooltip { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
 
 /* Editor tab strip */
-.tab-strip { display: flex; align-items: stretch; gap: 2px; padding: 4px 6px 0; background: var(--panel); overflow-x: auto; }
-.tab { display: flex; align-items: center; gap: 6px; padding: 4px 8px 4px 11px; max-width: 200px; border: 1px solid transparent; border-bottom: none; border-radius: 7px 7px 0 0; color: var(--muted); cursor: pointer; font-size: 12px; white-space: nowrap; }
+.tab-strip { position: relative; display: flex; align-items: stretch; gap: 2px; padding: 4px 6px 0; background: var(--panel); overflow-x: auto; }
+.tab { display: flex; align-items: center; gap: 6px; padding: 4px 8px 4px 11px; max-width: 200px; border: 1px solid transparent; border-bottom: none; border-radius: 7px 7px 0 0; color: var(--muted); cursor: pointer; font-size: 12px; white-space: nowrap; touch-action: none; }
 .tab:hover { background: var(--panel-2); color: var(--text); }
 .tab.active { background: var(--bg); color: var(--text); border-color: var(--border); }
 .tab.tx-owner { box-shadow: inset 0 2px 0 var(--accent); }
@@ -628,6 +628,26 @@ button.conn-dot.cancellable:hover { background: var(--danger); box-shadow: 0 0 0
 .tab-close:hover { background: var(--border); color: var(--text); opacity: 1; }
 .tab-new { background: transparent; border: none; color: var(--muted); font-size: 15px; padding: 0 8px; cursor: pointer; border-radius: 6px; }
 .tab-new:hover { background: var(--panel-2); color: var(--text); }
+
+/* ---------- Drag to reorder (src/dnd.ts) — editor tabs + result-grid columns ----------
+   One gesture in both places: the pressed element is cloned into a ghost that follows
+   the pointer and is lifted off the surface, the source dims where it still sits, and
+   a 2 px accent bar marks the gap the item will land in. The bar is placed with
+   translateX so it slides between slots; the model only changes on drop. */
+.dnd-ghost { position: fixed; z-index: 9999; pointer-events: none; opacity: 0.92; background: var(--panel-2); color: var(--text); border-radius: 6px; box-shadow: 0 8px 20px rgba(0, 0, 0, 0.38); will-change: transform; }
+/* Two-class forms so the ghost outranks the source's own state rules — .tab.tx-owner
+   owns box-shadow, .tab.other-conn / .tab.frozen own opacity. */
+.dnd-ghost.tab { background: var(--bg); border: 1px solid var(--border); border-radius: 7px 7px 0 0; opacity: 0.92; box-shadow: 0 8px 20px rgba(0, 0, 0, 0.38); }
+.dnd-ghost.rg-headcell { border: 1px solid var(--border); border-radius: 6px; }
+.dnd-ghost .tab-close, .dnd-ghost .rg-resize { display: none; }
+.dnd-source, .tab.dnd-source, .rg-headcell.dnd-source { opacity: 0.35; }
+body.dnd-dragging { cursor: grabbing; }
+body.dnd-dragging * { cursor: grabbing !important; user-select: none !important; }
+.dnd-bar { position: absolute; left: 0; width: 2px; background: var(--accent); border-radius: 1px; z-index: 6; pointer-events: none; transition: transform 120ms ease; }
+@media (prefers-reduced-motion: reduce) { .dnd-bar { transition: none; } }
+/* Tab-strip bar spans exactly the tab band (the strip's 4 px top padding excluded). */
+.tab-drop { top: 4px; bottom: 0; }
+
 .confirm-text { padding: 14px 16px 4px; color: var(--text); font-size: 13px; line-height: 1.5; }
 
 .toolbar { display: flex; align-items: center; gap: 10px; padding: 6px 12px; background: var(--panel); border-bottom: 1px solid var(--border); min-width: 0; }
@@ -686,14 +706,15 @@ button.conn-dot.cancellable:hover { background: var(--danger); box-shadow: 0 0 0
 .rg-corner { position: absolute; top: 0; left: 0; z-index: 4; background: var(--panel-2); border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); cursor: pointer; }
 .rg-headwrap { position: absolute; top: 0; right: 0; overflow: hidden; z-index: 3; background: var(--panel-2); border-bottom: 1px solid var(--border); }
 .rg-head { position: relative; height: 100%; }
-.rg-headcell { position: absolute; top: 0; display: flex; align-items: center; gap: 4px; padding: 0 6px 0 10px; border-right: 1px solid var(--border); font-weight: 600; color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; box-sizing: border-box; overflow: hidden; }
+.rg-headcell { position: absolute; top: 0; display: flex; align-items: center; gap: 4px; padding: 0 6px 0 10px; border-right: 1px solid var(--border); font-weight: 600; color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; box-sizing: border-box; overflow: hidden; touch-action: none; }
 .rg-headcell:hover { background: var(--panel); }
 .rg-headcell.sel { background: rgba(var(--accent-rgb), 0.18); color: var(--text); }
 .rg-headname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .rg-sort { color: var(--accent-2); font-size: 10px; flex-shrink: 0; font-variant-numeric: tabular-nums; }
 .rg-resize { position: absolute; right: 0; top: 0; width: 6px; height: 100%; cursor: col-resize; z-index: 5; }
 .rg-resize:hover { background: var(--accent); }
-.rg-reorder { position: absolute; top: 0; width: 2px; background: var(--accent); z-index: 6; pointer-events: none; }
+/* Column insertion bar — geometry only; the look and the slide live in .dnd-bar. */
+.rg-reorder { top: 0; }
 .rg-filter { position: absolute; left: 0; }
 .rg-filter-input { position: absolute; top: 4px; height: 22px; font: inherit; font-size: 11px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 0 6px; box-sizing: border-box; }
 /* A column carrying filter-builder rules the one-line box can't show. */

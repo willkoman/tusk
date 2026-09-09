@@ -361,7 +361,7 @@ export const TOPICS: Topic[] = [
           "**Open** — the **＋** button or [[kbd:Mod-t]].",
           "**Close** — **×**, [[kbd:Mod-w]], or **middle-click**. A dirty tab (● dot) prompts an *Unsaved changes* dialog: **Save** / **Don't save** / **Cancel**. Closing the transaction owner first opens **Resolve transaction first**.",
           "**Right-click** — **Rename…**, **Close**, **Close others**, **Close tabs to the right**; bulk-close skips dirty tabs and reports how many were kept.",
-          "**Reorder** — drag tabs; a vertical scroll wheel pans an overflowing strip.",
+          "**Reorder** — drag a tab to a new slot, or [[kbd:Alt-Shift-ArrowLeft]] / [[kbd:Alt-Shift-ArrowRight]] to move the active one. A bar marks the landing slot, Escape cancels, dragging near either end scrolls the strip, and a vertical scroll wheel pans it.",
           "Closing the last tab leaves a fresh empty one."
         ],
         "ordered": false
@@ -427,6 +427,14 @@ export const TOPICS: Topic[] = [
           {
             "action": "closeTab",
             "does": "Close tab (dirty tabs confirm)"
+          },
+          {
+            "action": "moveTabLeft",
+            "does": "Move the active tab one slot left"
+          },
+          {
+            "action": "moveTabRight",
+            "does": "Move the active tab one slot right"
           },
           {
             "action": "openFile",
@@ -745,7 +753,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**Resize** — drag the header edge (48–900 px); double-click the edge or *Autofit column* to size to visible content.",
-          "**Reorder** — drag a header label sideways (a 4 px threshold separates a drag from a sort click).",
+          "**Reorder** — drag a header label sideways; a 4 px threshold separates the drag from a sort click, a bar marks the landing slot, dragging near either edge scrolls the grid, and Escape cancels. Display-only: the underlying column order is unchanged.",
           "**Hide** — header right-click → *Hide column*; restore via *Show \"name\"* or *Show all columns*. Display-only: **Export…** is unaffected, but grid copies follow what's displayed.",
           "All per-tab view state; a fresh query with a different column set resets it."
         ]
@@ -2589,6 +2597,14 @@ export const TOPICS: Topic[] = [
             "does": "Close tab (confirms if dirty)"
           },
           {
+            "action": "moveTabLeft",
+            "does": "Move the active tab one slot left"
+          },
+          {
+            "action": "moveTabRight",
+            "does": "Move the active tab one slot right"
+          },
+          {
             "action": "openFile",
             "does": "Open a .sql file into a tab"
           },
@@ -2823,6 +2839,17 @@ export const TOPICS: Topic[] = [
       {
         "k": "p",
         "md": "Editor **tabs persist per connection** (`tusk.tabs.*`): each tab's SQL buffer, file path, title, active schema, and which tab was active return on reconnect. Every open connection's tabs are saved, not just the one you are looking at. **Results are ephemeral** — snapshots, streaming cursors, and pending grid edits never persist; see [[topic:results|Results & streaming]]."
+      },
+      {
+        "k": "p",
+        "md": "Drag a tab to reorder the strip, or move the active tab with the chords below. The order persists with the tab set; a tab keeps its connection, its buffer, and any running query."
+      },
+      {
+        "k": "keys",
+        "rows": [
+          { "action": "moveTabLeft", "does": "Move the active tab one slot left" },
+          { "action": "moveTabRight", "does": "Move the active tab one slot right" }
+        ]
       },
       {
         "k": "h",

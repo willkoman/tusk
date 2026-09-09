@@ -16,6 +16,8 @@ export type ActionId =
   | "toggleComment"
   | "newTab"
   | "closeTab"
+  | "moveTabLeft"
+  | "moveTabRight"
   | "saveFile"
   | "saveFileAs"
   | "openFile"
@@ -93,6 +95,12 @@ export const ACTIONS: readonly ActionDef[] = [
   { id: "toggleResults", title: "Toggle results panel", category: "View", defaultKey: "Mod-j", scope: "global", enabled: (c) => c.connected },
   { id: "newTab", title: "New tab", category: "Tabs", defaultKey: "Mod-t", scope: "global", enabled: (c) => c.connected },
   { id: "closeTab", title: "Close tab", category: "Tabs", defaultKey: "Mod-w", scope: "global", enabled: (c) => c.connected },
+  // Arrow-named so the chord is layout-independent, and "editor" scope because
+  // CodeMirror's defaultKeymap already binds Shift-Alt-Arrow (extend selection by
+  // syntax node) — bound inside the editor these win, and the global handler still
+  // dispatches them when focus is anywhere else.
+  { id: "moveTabLeft", title: "Move tab left", category: "Tabs", defaultKey: "Alt-Shift-ArrowLeft", scope: "editor", enabled: (c) => c.connected },
+  { id: "moveTabRight", title: "Move tab right", category: "Tabs", defaultKey: "Alt-Shift-ArrowRight", scope: "editor", enabled: (c) => c.connected },
   { id: "openFile", title: "Open file…", category: "File", defaultKey: "Mod-o", scope: "global", enabled: (c) => c.connected },
   { id: "saveFile", title: "Save", category: "File", defaultKey: "Mod-s", scope: "global", enabled: (c) => c.connected },
   { id: "saveFileAs", title: "Save as…", category: "File", defaultKey: "Mod-Shift-s", scope: "global", enabled: (c) => c.connected },
