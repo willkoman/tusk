@@ -550,7 +550,8 @@ export function AiPanel(props: {
       <div class="ai-messages" ref={msgEl} onScroll={onMsgScroll}>
         <Show when={messages().length === 0}>
           <div class="ai-empty">
-            <span>Ask about this database.</span>
+            <div class="ai-empty-head">Ask about {props.connectionName()}</div>
+            <div class="ai-empty-hint">Questions carry this database's schema and your enabled skills.</div>
             <div class="ai-examples">
               <For each={starters()}>
                 {(q) => <button class="ai-example" disabled={connMismatch()} onClick={() => send(q)}>{q}</button>}

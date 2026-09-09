@@ -44,12 +44,12 @@ export function SettingsDialog(props: {
   const [tab, setTab] = createSignal<SettingsTab>(props.initialTab ?? "editor");
   const p = props.prefs;
 
-  // The AI tab holds provider cards and a Markdown skill editor; the lg tier starves
-  // both. Every other tab is label+control rows and reads better narrow.
-  const size = (): DialogSize => (tab() === "ai" ? "xl" : "lg");
+  // One tier and one body height for every pane. A per-pane size moved the nav
+  // rail out from under the pointer on every switch; the pane scrolls instead.
+  const size: DialogSize = "lg";
 
   return (
-    <Dialog title="Settings" size={size()} noAutoFocus onClose={props.onClose}>
+    <Dialog title="Settings" size={size} noAutoFocus onClose={props.onClose}>
       <div class="settings-body">
         <div class="settings-rail">
           <For each={TABS}>

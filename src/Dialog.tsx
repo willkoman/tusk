@@ -171,8 +171,10 @@ export function DialogFooter(props: {
   editAsSqlLabel?: string;
   /** Drop the secondary entirely (destructive confirms keep Cancel + primary only). */
   hideEditAsSql?: boolean;
-  /** Extra ghost buttons rendered before Cancel (e.g. Clear / Copy). */
+  /** Extra ghost buttons in the right-hand group, before Cancel (e.g. Clear / Copy). */
   extra?: JSX.Element;
+  /** A DESTRUCTIVE secondary. The only thing that sits apart, on the far left. */
+  destructive?: JSX.Element;
   onCancel: () => void;
 }) {
   return (
@@ -184,15 +186,19 @@ export function DialogFooter(props: {
       <Show when={props.error}>
         <div class="error">{props.error}</div>
       </Show>
-      {/* `.modal .form-actions` right-aligns and pushes a leading ghost (Cancel) left. */}
+      {/* One group, right-aligned, Cancel always the button next to the primary.
+          A destructive secondary — and nothing else — is pulled left. */}
       <div class="form-actions">
-        <button class="ghost" onClick={props.onCancel}>Cancel</button>
+        <Show when={props.destructive}>
+          <div class="form-actions-left">{props.destructive}</div>
+        </Show>
         {props.extra}
         <Show when={props.onEditAsSql && !props.hideEditAsSql}>
           <button class="ghost" disabled={props.disabled} onClick={() => props.onEditAsSql!()}>
             {props.editAsSqlLabel ?? "Edit as SQL"}
           </button>
         </Show>
+        <button class="ghost" onClick={props.onCancel}>Cancel</button>
         <button
           classList={{ run: !props.primaryDanger, "btn-danger": props.primaryDanger }}
           disabled={props.disabled || props.busy}

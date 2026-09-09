@@ -5866,9 +5866,14 @@ function App() {
                       : <><Icon name="close" /> Cancel {fmtDur(runMs())}</>)
                     : transaction().state === "lost" ? "Reconnect required" : !activeDatabaseAllowed() ? "Go to transaction" : <>Run <Icon name="play" /></>}
                 </button>
+                {/* Zones, left to right: run | file | editor … view. `.tb-sep` is the
+                    hairline; the -text/-more/-font variants follow the container tiers
+                    below, so a collapsed zone never leaves a stray divider. */}
+                <span class="tb-sep tb-sep-text" />
                 <button class="ghost tb-text" onClick={openFileDialog}>Open</button>
                 <button class="ghost tb-text" onClick={() => void saveActiveTab()}>Save</button>
                 <button class="ghost tb-text" onClick={() => void saveAsActiveTab()}>Save As</button>
+                <span class="tb-sep tb-sep-text" />
                 <button class="ghost tb-text" onClick={() => editorApi()?.format()}>Format</button>
                 <button class="ghost tb-text" onClick={() => editorApi()?.openSearch()}>Find</button>
                 <button
@@ -5881,6 +5886,7 @@ function App() {
                 >
                   Explain <Icon name="chevronDown" />
                 </button>
+                <span class="tb-sep tb-sep-more" />
                 <button class="ghost tb-more" title="More actions" onClick={openToolbarOverflow}><Icon name="more" /></button>
                 <span class="hint">{displayKey(effectiveKey("run", keys())) || "unbound"} runs selection or all</span>
                 <span class="spacer" />
@@ -5895,6 +5901,7 @@ function App() {
                     <For each={schemaNames()}>{(s) => <option value={s}>{s}</option>}</For>
                   </select>
                 </Show>
+                <span class="tb-sep tb-sep-font" />
                 <button class="icon font-btn" title="Decrease font size" onClick={() => updatePrefs({ fontSize: Math.max(9, prefs().fontSize - 1) })}><span class="az-sm">A</span></button>
                 <button class="icon font-btn" title="Increase font size" onClick={() => updatePrefs({ fontSize: Math.min(24, prefs().fontSize + 1) })}><span class="az-lg">A</span></button>
                 <button class="icon font-btn" title="Toggle word wrap" classList={{ active: prefs().wordWrap }} onClick={() => updatePrefs({ wordWrap: !prefs().wordWrap })}><Icon name="wrap" /></button>
@@ -5932,87 +5939,92 @@ function App() {
                 {/* While a query runs every control here would act on the PREVIOUS
                     result, so the whole bar is inert and the timing is blanked. */}
                 <div class="result-toolbar" classList={{ "is-running": running(), "has-conn": !!conn() }} style={{ "--conn-color": activeConnColor() }}>
-                  <Show when={planMemo()}>
-                    <div class="result-viewtoggle">
-                      <button classList={{ active: resultView() === "plan" }} onClick={() => patchTab(activeTabId(), { resultView: "plan" })}>Plan</button>
-                      <button classList={{ active: resultView() === "grid" }} onClick={() => patchTab(activeTabId(), { resultView: "grid" })}>Grid</button>
-                    </div>
-                  </Show>
-                  <span class="spacer" />
-                  <Show when={!done()}>
-                    <button class="ghost export-btn" disabled={running() || !activeDatabaseAllowed()} onClick={loadAll}>{loadingAll() ? <><span class="spinner-sm" />Cancel</> : "Load all"}</button>
-                    <span class="streaming" classList={{ idle: !(fetchingMore() || loadingAll()) }}>
-                      <Show when={fetchingMore() || loadingAll()} fallback={<><span class="stream-dot" />Idle</>}>
-                        <span class="spinner-sm" />Streaming…
-                      </Show>
-                    </span>
-                    <span class="sb-sep" />
-                  </Show>
-                  <Show when={editCtx().editable || pendingCount(tabPending()) > 0}>
+                  {/* C4 — two zones. Left says what the result IS, right says what you
+                      can do to it, so an appearing badge never slides a button under
+                      the pointer. Nothing crosses the divide. */}
+                  <div class="rt-zone rt-state">
+                    <Show when={planMemo()}>
+                      <div class="result-viewtoggle">
+                        <button classList={{ active: resultView() === "plan" }} onClick={() => patchTab(activeTabId(), { resultView: "plan" })}>Plan</button>
+                        <button classList={{ active: resultView() === "grid" }} onClick={() => patchTab(activeTabId(), { resultView: "grid" })}>Grid</button>
+                      </div>
+                    </Show>
+                    <Show when={!done()}>
+                      <span class="streaming" classList={{ idle: !(fetchingMore() || loadingAll()) }}>
+                        <Show when={fetchingMore() || loadingAll()} fallback={<><span class="stream-dot" />Idle</>}>
+                          <span class="spinner-sm" />Streaming…
+                        </Show>
+                      </span>
+                    </Show>
                     <Show when={pendingCount(tabPending()) > 0}>
                       <span class="sb-pending" title="Unapplied grid changes"><Icon name="edit" /> {pendingCount(tabPending())} change{pendingCount(tabPending()) === 1 ? "" : "s"}</span>
-                      <button class="ghost export-btn sb-commit" onClick={openCommit} disabled={!editCtx().editable || running()} title={editCtx().editable ? "Preview & run the change script" : editCtx().reason}>{activeOwnsTransaction() ? "Apply…" : "Commit…"}</button>
-                      <button class="ghost export-btn" onClick={discardPending} disabled={running()}>Discard</button>
                     </Show>
-                    <Show when={editCtx().editable}>
-                      <button class="ghost export-btn" title="Add a row, committed as INSERT" onClick={onAddRow} disabled={running()}><Icon name="plus" /> Row</button>
+                    <Show when={activeTab().result.incomplete}>
+                      <span class="result-incomplete" title={`${activeTab().result.incomplete}. Re-run the query for the full result.`}>Incomplete result</span>
                     </Show>
-                    <span class="sb-sep" />
-                  </Show>
-                  <Show when={columns().length > 0 && !(planMemo() && resultView() === "plan")}>
-                    <label class="checkbox sb-copyhdr" title="Include a header row when copying">
-                      <input type="checkbox" checked={prefs().copyHeaders} onChange={(e) => updatePrefs({ copyHeaders: e.currentTarget.checked })} disabled={running()} />
-                      Copy with column names
-                    </label>
-                  </Show>
-                  <Show when={activeTab().result.incomplete}>
-                    <span class="result-incomplete" title={`${activeTab().result.incomplete}. Re-run the query for the full result.`}>Incomplete result</span>
-                  </Show>
-                  <Show when={activeTab().result.transactionStale}>
-                    <span class="transaction-result-stale" title={activeTab().result.transactionStale}>Stale transaction result</span>
-                  </Show>
-                  {/* ui/grid-qol: loaded-row find + record view, both grid-local */}
-                  <Show when={columns().length > 0 && !(planMemo() && resultView() === "plan")}>
-                    <span class="sb-sep" />
-                    <button
-                      class="ghost export-btn"
-                      classList={{ "filter-active": gridView().findOpen }}
-                      title={`Find in loaded rows (${displayKey(effectiveKey("findInResults", keys())) || "unbound"})`}
-                      disabled={running()}
-                      onClick={() => setGridView({ findOpen: !gridView().findOpen })}
-                    >
-                      <Icon name="search" /> Find
-                    </button>
-                    <button
-                      class="ghost export-btn"
-                      classList={{ "filter-active": gridView().recordOpen }}
-                      title={`Show the focused row as a field list (${displayKey(effectiveKey("toggleRecordView", keys())) || "unbound"})`}
-                      disabled={running()}
-                      onClick={() => setGridView({ recordOpen: !gridView().recordOpen })}
-                    >
-                      <Icon name="columns" /> Record
-                    </button>
-                  </Show>
-                  <Show when={columns().length > 0 && !(planMemo() && resultView() === "plan")}>
-                    <span class="sb-sep" />
-                    <button
-                      class="ghost export-btn"
-                      classList={{ "filter-active": hasConditions(gridView().filters) }}
-                      disabled={running() || !canFilter()}
-                      title={canFilter() ? "Build a result filter" : sortUnavailable() || "This result can't be filtered"}
-                      onClick={() => openFilterBuilder()}
-                    >
-                      <Icon name="search" /> Filter
-                    </button>
-                  </Show>
-                  <Show when={(lastQuery() || columns().length > 0) && caps()?.export !== false && !(planMemo() && resultView() === "plan")}>
-                    <span class="sb-sep" />
-                    <button class="ghost export-btn" onClick={openExport} disabled={running()}>Export…</button>
-                  </Show>
-                  <Show when={!running()}>
-                    <span class="sb-sep" />
-                    <span class="status-elapsed"><Icon name="clock" /> {elapsed().toLocaleString()} ms</span>
-                  </Show>
+                    <Show when={activeTab().result.transactionStale}>
+                      <span class="transaction-result-stale" title={activeTab().result.transactionStale}>Stale transaction result</span>
+                    </Show>
+                    <Show when={!running()}>
+                      <span class="status-elapsed"><Icon name="clock" /> {elapsed().toLocaleString()} ms</span>
+                    </Show>
+                  </div>
+                  <div class="rt-zone rt-actions">
+                    <Show when={!done()}>
+                      <button class="ghost export-btn" disabled={running() || !activeDatabaseAllowed()} onClick={loadAll}>{loadingAll() ? <><span class="spinner-sm" />Cancel</> : "Load all"}</button>
+                      <span class="sb-sep" />
+                    </Show>
+                    <Show when={editCtx().editable || pendingCount(tabPending()) > 0}>
+                      <Show when={pendingCount(tabPending()) > 0}>
+                        <button class="ghost export-btn sb-commit" onClick={openCommit} disabled={!editCtx().editable || running()} title={editCtx().editable ? "Preview & run the change script" : editCtx().reason}>{activeOwnsTransaction() ? "Apply…" : "Commit…"}</button>
+                        <button class="ghost export-btn" onClick={discardPending} disabled={running()}>Discard</button>
+                      </Show>
+                      <Show when={editCtx().editable}>
+                        <button class="ghost export-btn" title="Add a row, committed as INSERT" onClick={onAddRow} disabled={running()}><Icon name="plus" /> Row</button>
+                      </Show>
+                      <span class="sb-sep" />
+                    </Show>
+                    <Show when={columns().length > 0 && !(planMemo() && resultView() === "plan")}>
+                      <label class="checkbox sb-copyhdr" title="Include a header row when copying">
+                        <input type="checkbox" checked={prefs().copyHeaders} onChange={(e) => updatePrefs({ copyHeaders: e.currentTarget.checked })} disabled={running()} />
+                        Copy with column names
+                      </label>
+                      {/* ui/grid-qol: loaded-row find + record view, both grid-local */}
+                      <span class="sb-sep" />
+                      <button
+                        class="ghost export-btn"
+                        classList={{ "filter-active": gridView().findOpen }}
+                        title={`Find in loaded rows (${displayKey(effectiveKey("findInResults", keys())) || "unbound"})`}
+                        disabled={running()}
+                        onClick={() => setGridView({ findOpen: !gridView().findOpen })}
+                      >
+                        <Icon name="search" /> Find
+                      </button>
+                      <button
+                        class="ghost export-btn"
+                        classList={{ "filter-active": gridView().recordOpen }}
+                        title={`Show the focused row as a field list (${displayKey(effectiveKey("toggleRecordView", keys())) || "unbound"})`}
+                        disabled={running()}
+                        onClick={() => setGridView({ recordOpen: !gridView().recordOpen })}
+                      >
+                        <Icon name="columns" /> Record
+                      </button>
+                      <span class="sb-sep" />
+                      <button
+                        class="ghost export-btn"
+                        classList={{ "filter-active": hasConditions(gridView().filters) }}
+                        disabled={running() || !canFilter()}
+                        title={canFilter() ? "Build a result filter" : sortUnavailable() || "This result can't be filtered"}
+                        onClick={() => openFilterBuilder()}
+                      >
+                        <Icon name="search" /> Filter
+                      </button>
+                    </Show>
+                    <Show when={(lastQuery() || columns().length > 0) && caps()?.export !== false && !(planMemo() && resultView() === "plan")}>
+                      <span class="sb-sep" />
+                      <button class="ghost export-btn" onClick={openExport} disabled={running()}>Export…</button>
+                    </Show>
+                  </div>
                 </div>
               </Show>
               <Show when={runErr()}>
