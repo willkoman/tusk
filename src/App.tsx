@@ -1727,6 +1727,7 @@ function App() {
     return { unsafeDirty };
   };
   const onBeforeUnload = (e: BeforeUnloadEvent) => {
+    persistLayout(); // records which profiles were open, for "Reopen last session"
     const { unsafeDirty } = persistAllRecovery(true);
     if (allowNativeClose || (!anyTransactionOpen() && !unsafeDirty && totalPendingCount() === 0)) return;
     e.preventDefault();
@@ -1768,6 +1769,7 @@ function App() {
           raiseTransactionResolution(open, { kind: "window-close" });
           return;
         }
+        persistLayout(); // records which profiles were open, for "Reopen last session"
         if (persistAllRecovery(true).unsafeDirty) {
           event.preventDefault();
           return;
@@ -2437,6 +2439,10 @@ function App() {
       setHistoryOpen(false);
       setSelected(null);
       setPersistenceWarning("");
+      // Closing the last connection lands on the connect screen: offer back exactly
+      // the profiles that were open (this one included), rather than forgetting the
+      // session because `connections()` is now empty.
+      setReopenable(rememberedProfileIds([entry, ...remaining]));
     }
     rememberOpenConnections();
     return true;
@@ -2959,6 +2965,7 @@ function App() {
       raiseTransactionResolution(open, { kind: "window-close" });
       return false;
     }
+    persistLayout(); // records which profiles were open, for "Reopen last session"
     if (persistAllRecovery(true).unsafeDirty) return false;
     const pending = totalPendingCount();
     if (pending > 0 && !forcePending) {
@@ -4637,7 +4644,7 @@ function App() {
             >&#65291;</button>
           </div>
           <span class="meta">{driverLabel(connectionKind())} {conn()?.version ?? ""}</span>
-          <Show when={conn()!.readOnly}>
+          <Show when={conn()?.readOnly}>
             <span class="badge badge-ro" title="Writes & DDL are blocked"><Icon name="lock" /> Read-only</span>
           </Show>
           <Show when={caps()?.manualTransactions !== false && !transactionOpen(transaction())}>
