@@ -3126,7 +3126,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Two connections reporting the same database name are named by where they connect (`db.internal/postgres`)."
+        "md": "A chip shows the **Name** you typed on the connect form when you gave one, and the database name otherwise. Two connections reporting the same name are separated by where they connect (`db.internal/postgres`)."
       },
       {
         "k": "h",

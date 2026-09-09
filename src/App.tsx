@@ -2598,7 +2598,7 @@ function App() {
    */
   async function afterConnect(
     r: ConnectReply,
-    meta: { key: string; legacyKey: string | null; target: string; origin?: string; environment?: Environment; driver: string; profileId: string | null },
+    meta: { key: string; legacyKey: string | null; target: string; origin?: string; environment?: Environment; name?: string; driver: string; profileId: string | null },
   ) {
     try {
       await registerConnection(r, meta);
@@ -2621,7 +2621,7 @@ function App() {
    */
   async function registerConnection(
     r: ConnectReply,
-    meta: { key: string; legacyKey: string | null; target: string; origin?: string; environment?: Environment; driver: string; profileId: string | null },
+    meta: { key: string; legacyKey: string | null; target: string; origin?: string; environment?: Environment; name?: string; driver: string; profileId: string | null },
   ) {
     const connected: Connected = {
       id: r.connection_id,
@@ -2634,6 +2634,7 @@ function App() {
       target: meta.target,
       origin: meta.origin ?? "",
       environment: meta.environment ?? "none",
+      name: meta.name?.trim() || undefined,
       profileId: meta.profileId,
     };
     const runtime = makeRuntime();
@@ -2795,6 +2796,7 @@ function App() {
       // not the user saves a profile: a connect-and-go into production still gets the
       // red rail, the Prod badge and the loud confirmation titles.
       const submittedEnvironment = environment();
+      const submittedName = name().trim();
       const isFile = submittedDriver === "duckdb" || submittedDriver === "sqlite";
       const networkPort = Number(port());
       if (!isFile && (!Number.isInteger(networkPort) || networkPort < 1 || networkPort > 65535)) {
@@ -2837,7 +2839,7 @@ function App() {
         : submittedDatabase || submittedHost;
       await connectWithHostKeyPrompt(async () => {
         const r = await invoke<ConnectReply>("connect", { config });
-        await afterConnect(r, { key: submittedKey, legacyKey: submittedLegacyKey, target: submittedTarget, origin: isFile ? "" : submittedHost, environment: submittedEnvironment, driver: submittedDriver, profileId: null });
+        await afterConnect(r, { key: submittedKey, legacyKey: submittedLegacyKey, target: submittedTarget, origin: isFile ? "" : submittedHost, environment: submittedEnvironment, name: submittedName, driver: submittedDriver, profileId: null });
       });
     } catch (e) {
       setConnErr(errMsg(e));
@@ -2877,7 +2879,7 @@ function App() {
         : "";
       await connectWithHostKeyPrompt(async () => {
         const r = await invoke<ConnectReply>("connect_profile", { id });
-        await afterConnect(r, { key: `profile:${id}`, legacyKey: null, target, origin, environment: parseEnvironment(profile?.environment), driver: profile?.driver ?? "postgres", profileId: id });
+        await afterConnect(r, { key: `profile:${id}`, legacyKey: null, target, origin, environment: parseEnvironment(profile?.environment), name: profile?.name, driver: profile?.driver ?? "postgres", profileId: id });
       });
       return "";
     } catch (e) {

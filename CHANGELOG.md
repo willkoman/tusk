@@ -74,6 +74,7 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 - **Opening a dialog with the mouse no longer draws a keyboard focus ring.** Settings and every form drew a full accent outline around the whole dialog.
 - **The accent swatches in Settings → Appearance are round again.** They were squeezed into ellipses by the row they sit in.
 - **The environment tag applies to a connection you did not save.** *Development* or *Production* was offered on the connect form but only honoured once the profile was saved.
+- **A connection is called what you named it.** The Name field was kept for the saved profile only; the chip, tabs and status bar showed the database name instead, so several sessions on `postgres` all read `postgres`.
 - **The relationship diagram opens whole.** A neighborhood of three tables opened with the two neighbour columns cut off at the canvas edges.
 - **The tab insertion bar is visible while you drag.** It was painted underneath the drag ghost, which sits on the same spot.
 - **A pinned tab's short label reads as shortened.** "Daily rollup" became `Dail`, which read as a rendering fault.

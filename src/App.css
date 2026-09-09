@@ -1141,7 +1141,10 @@ button.conn-dot.cancellable:hover { background: var(--danger); box-shadow: 0 0 0
 .tw-row:hover .tw-flag { background: var(--bg); }
 /* Numeric details (object/column counts) render as a subtle pill badge. */
 .tw-detail.is-count { flex-shrink: 0; background: var(--panel-2); color: var(--muted); border-radius: var(--r-pill); padding: 1px 7px; min-width: 20px; text-align: center; font-family: inherit; font-variant-numeric: tabular-nums; }
-.tw-detail.tw-detail-more { margin-left: 0; padding-left: var(--s2); }
+/* Row estimate then size. The size never truncates (like the flag slot); the
+   estimate absorbs the shrink, so a narrow sidebar drops a fact rather than
+   showing two half-facts. */
+.tw-detail.tw-detail-more { flex: none; margin-left: 0; padding-left: var(--s2); }
 .tw-row:hover .tw-detail.is-count { background: var(--border); }
 .tw-row.selected .tw-detail.is-count { background: var(--bg); color: var(--text); }
 .empty-hint { padding: var(--s3); color: var(--muted); font-size: var(--fs-sm); }

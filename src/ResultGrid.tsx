@@ -1056,7 +1056,7 @@ export function ResultGrid(props: ResultGridProps) {
     if (props.canFilter()) {
       items.push(
         { label: "Filter by this column…", icon: "search", onClick: () => props.onOpenFilter(props.columns()[oi]) },
-        { label: props.view().filterRowOpen ? "Hide filter row" : "Show filter row", icon: "search", onClick: () => props.setView({ filterRowOpen: !props.view().filterRowOpen }) },
+        { label: props.view().filterRowOpen ? "Hide filter row" : "Show filter row", icon: props.view().filterRowOpen ? "eyeOff" : "eye", onClick: () => props.setView({ filterRowOpen: !props.view().filterRowOpen }) },
       );
     }
     if (props.canSort() || props.canFilter()) items.push({ sep: true });

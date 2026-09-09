@@ -91,8 +91,10 @@ export type Connected = {
   target: string;
   /** Host, or the database file's directory. Only shown when it disambiguates. */
   origin: string;
-  /** Environment tag from the saved profile (`none` for ad-hoc sessions). */
+  /** Environment tag from the connect form or the saved profile. */
   environment: Environment;
+  /** Name the user gave this connection, when they gave one. Wins over `target`. */
+  name?: string;
   /** The session reaches the database through an SSH tunnel. */
   viaSsh: boolean;
   /** Saved profile this session came from, when any (drives "reopen last session"). */
@@ -267,12 +269,14 @@ const DOT_TITLES: Record<ConnectionDot, string> = {
 export const connectionDotTitle = (dot: ConnectionDot): string => DOT_TITLES[dot];
 
 /**
- * Chip label. The server-reported database name is the truth (`tree.database`);
- * before introspection lands, fall back to what the user dialled. A duplicate
+ * Chip label. A name the user typed wins — they named it for a reason, and a
+ * strip of chips all reading `postgres` is the thing naming exists to avoid.
+ * Otherwise the server-reported database name is the truth (`tree.database`),
+ * falling back to what the user dialled before introspection lands. A duplicate
  * label is disambiguated by the caller through `connectionLabels`.
  */
 export const connectionLabel = (state: ConnectionState): string =>
-  state.tree?.database || state.conn.target || driverLabel(connectionKindOf(state));
+  state.conn.name?.trim() || state.tree?.database || state.conn.target || driverLabel(connectionKindOf(state));
 
 /**
  * Labels for the whole strip, with duplicates disambiguated. Two sessions on the

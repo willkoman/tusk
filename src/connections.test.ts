@@ -270,3 +270,27 @@ describe("claimFirstMount", () => {
     expect(shouldAutoConnect({ hasDefault: true, firstMount: claimFirstMount(), recovering: false })).toBe(false);
   });
 });
+
+describe("connectionLabel with a typed name", () => {
+  const base = (over: Record<string, unknown>) =>
+    makeConnectionState(
+      {
+        id: "c1", version: "16", readOnly: false, driver: "postgres", generation: 1,
+        key: "k", target: "postgres", origin: "127.0.0.1", environment: "none",
+        viaSsh: false, profileId: null, ...over,
+      } as never,
+      0,
+    );
+
+  it("prefers the name the user typed", () => {
+    expect(connectionLabel(base({ name: "qa-dev" }))).toBe("qa-dev");
+  });
+
+  it("falls back to the dialled target with no name", () => {
+    expect(connectionLabel(base({}))).toBe("postgres");
+  });
+
+  it("ignores a blank name", () => {
+    expect(connectionLabel(base({ name: "   " }))).toBe("postgres");
+  });
+});
