@@ -653,7 +653,7 @@ export function tableDiffProblems(s: TableDiffSpec, caps: DdlCaps = ddlCaps()): 
     if (changed)
       out.push({
         level: "error",
-        message: `"${r.orig.name}" is a generated column (${r.generated.trim()}). ${caps.label} can't rewrite one from here — drop and re-add it, or edit it as SQL.`,
+        message: `"${r.orig.name}" is a generated column (${r.generated.trim()}). ${caps.label} can't rewrite it here; drop and re-add it, or edit it as SQL.`,
       });
   }
   if (!caps.rebuild || !needsRebuild(s, caps)) return out;
@@ -662,7 +662,7 @@ export function tableDiffProblems(s: TableDiffSpec, caps: DdlCaps = ddlCaps()): 
     out.push({
       level: "error",
       message:
-        "Tusk couldn't read this table's stored CREATE statement, so a rebuild could drop CHECK constraints, collations or generated columns it never saw. Edit the table as SQL instead.",
+        "Tusk couldn't read this table's stored CREATE statement, so a rebuild could drop parts it never saw. Edit the table as SQL instead.",
     });
 
   // The rebuild replays index, constraint and trigger text captured BEFORE the edit, so
@@ -672,9 +672,9 @@ export function tableDiffProblems(s: TableDiffSpec, caps: DdlCaps = ddlCaps()): 
   if (renamed.length || tableRenamed)
     out.push({
       level: "error",
-      message: `${caps.label} has to rebuild the table for these changes, and the rebuild recreates the indexes, constraints and triggers as they are written today — so a ${
+      message: `${caps.label} rebuilds the table for these changes, and the rebuild can't replay a ${
         tableRenamed ? "table" : "column"
-      } rename can't go in the same pass. Apply the rename on its own first.`,
+      } rename in the same pass. Apply the rename on its own first.`,
     });
 
   const dropped = droppedNames(s);
@@ -683,7 +683,7 @@ export function tableDiffProblems(s: TableDiffSpec, caps: DdlCaps = ddlCaps()): 
       if (namesInclude(dropped, c))
         out.push({
           level: "error",
-          message: `Column "${c}" is used by ${d.kind} "${d.name}", which the rebuild recreates unchanged. Drop ${d.name} too (tick it above) to drop the column.`,
+          message: `Column "${c}" is used by ${d.kind} "${d.name}". Tick ${d.name} above to drop it too.`,
         });
   return out;
 }
@@ -1129,8 +1129,8 @@ export function scriptNote(sql: string, caps: DdlCaps = ddlCaps()): string {
   const multi = sql.split("\n").some((l) => l.trim().endsWith(";")) || sql.includes(";\n");
   if (!multi) return "";
   return caps.transactionalDdl
-    ? "Runs as one transaction — if any statement fails, nothing is applied."
-    : `${caps.label} commits each DDL statement as it runs: a failure part-way leaves the earlier statements applied.`;
+    ? "Runs as one transaction. Nothing is applied if a statement fails."
+    : `${caps.label} commits each DDL statement as it runs; a failure leaves earlier statements applied.`;
 }
 
 // --- GENERATE statement scaffolds -------------------------------------------

@@ -71,9 +71,9 @@ export type ActionDef = {
 };
 
 export const ACTIONS: readonly ActionDef[] = [
-  { id: "run", title: "Run (selection or all)", category: "Query", defaultKey: "Mod-Enter", scope: "editor", enabled: (c) => c.connected && c.canRunDatabase },
+  { id: "run", title: "Run selection or all", category: "Query", defaultKey: "Mod-Enter", scope: "editor", enabled: (c) => c.connected && c.canRunDatabase },
   { id: "runStatement", title: "Run selection or current statement", category: "Query", defaultKey: "Mod-Shift-Enter", scope: "editor", enabled: (c) => c.connected && c.canRunDatabase },
-  { id: "explain", title: "Explain (plan)", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.connected && !c.running && c.canRunDatabase },
+  { id: "explain", title: "Explain plan", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.connected && !c.running && c.canRunDatabase },
   { id: "explainAnalyze", title: "Explain Analyze (runs the statement)", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.connected && !c.running && c.canExplainAnalyze && c.canRunDatabase },
   // Bound by default: this is the one action that must stay reachable while dialogs
   // are up (see onWindowKey's allowlist) — shipping it mouse-only undercut that.
@@ -91,7 +91,7 @@ export const ACTIONS: readonly ActionDef[] = [
   { id: "find", title: "Find & replace", category: "Editor", defaultKey: null, scope: "editor" },
   { id: "toggleComment", title: "Toggle comment", category: "Editor", defaultKey: "Mod-/", scope: "editor" },
   { id: "toggleWrap", title: "Toggle word wrap", category: "Editor", defaultKey: null, scope: "global" },
-  { id: "toggleSidebar", title: "Toggle explorer sidebar", category: "View", defaultKey: "Mod-b", scope: "global", enabled: (c) => c.connected },
+  { id: "toggleSidebar", title: "Toggle Explorer sidebar", category: "View", defaultKey: "Mod-b", scope: "global", enabled: (c) => c.connected },
   { id: "toggleResults", title: "Toggle results panel", category: "View", defaultKey: "Mod-j", scope: "global", enabled: (c) => c.connected },
   { id: "newTab", title: "New tab", category: "Tabs", defaultKey: "Mod-t", scope: "global", enabled: (c) => c.connected },
   { id: "closeTab", title: "Close tab", category: "Tabs", defaultKey: "Mod-w", scope: "global", enabled: (c) => c.connected },
