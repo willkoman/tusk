@@ -102,7 +102,10 @@ function shapeTokens(stmt: string, kind?: string | null): ShapeToken[] | null {
   const re = /[\p{L}_][\p{L}\p{N}_$]*|[(),]/gu;
   const asciiWord = /^[A-Za-z_][A-Za-z0-9_]*$/;
   for (const span of spans) {
-    if (span.kind === "dquote" || span.kind === "btick") {
+    // T-SQL `[bracket]` names included — Rust `shape_tokens` emits `Ident` for them,
+    // and this file must mirror `with_shape` exactly (a dropped span made
+    // `WITH [c] AS (…) SELECT * FROM [c]` parse differently on the two sides).
+    if (span.kind === "dquote" || span.kind === "btick" || span.kind === "bracket") {
       tokens.push({ kind: "ident" });
       if (tokens.length > MAX_SHAPE_TOKENS) return null;
       continue;

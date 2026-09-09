@@ -23,13 +23,18 @@ export const EMPTY_INDEX: Index = {
   byBare: new Map(),
 };
 
-/** Decode one quoted or bare identifier. */
+/** Decode one quoted or bare identifier (`"x"`, `` `x` ``, T-SQL `[x]`, or bare). */
 export function strip(id: string): string {
   const s = id.trim();
   if (s.length >= 2 && s[0] === '"' && s[s.length - 1] === '"')
     return s.slice(1, -1).replace(/""/g, '"');
   if (s.length >= 2 && s[0] === "`" && s[s.length - 1] === "`")
     return s.slice(1, -1).replace(/``/g, "`");
+  // `ident()` emits `[x]` on SQL Server, so every query Tusk generates there (Open
+  // table, the SELECT/INSERT/UPDATE scaffolds) is bracketed. Without this branch alias
+  // resolution, schema lint and in-grid editing all silently disengage on that engine.
+  if (s.length >= 2 && s[0] === "[" && s[s.length - 1] === "]")
+    return s.slice(1, -1).replace(/]]/g, "]");
   return s;
 }
 
@@ -84,7 +89,10 @@ export function tableByRefUnique(idx: Index, ref: string): Table | undefined {
   return matches.length === 1 ? matches[0] : undefined;
 }
 
-type IdentifierPart = { value: string; quoted: '"' | "`" | null };
+// `[` is listed as the OPENING delimiter; `]` closes it (and `]]` escapes one). Only
+// `"` implies case-sensitive matching — backticks and brackets name identifiers on
+// engines whose default collation is case-insensitive, so they compare like bare words.
+type IdentifierPart = { value: string; quoted: '"' | "`" | "[" | null };
 
 /** Parse one- or two-part SQL identifier refs without losing quoted dots/case. */
 export function identifierParts(ref: string): IdentifierPart[] | null {
@@ -93,14 +101,16 @@ export function identifierParts(ref: string): IdentifierPart[] | null {
   const ws = () => { while (/\s/.test(ref[i] ?? "")) i++; };
   ws();
   while (i < ref.length) {
-    const quote = ref[i] === '"' || ref[i] === "`" ? ref[i] as '"' | "`" : null;
+    const quote =
+      ref[i] === '"' || ref[i] === "`" || ref[i] === "[" ? (ref[i] as '"' | "`" | "[") : null;
     let value = "";
     if (quote) {
+      const close = quote === "[" ? "]" : quote;
       i++;
       let closed = false;
       while (i < ref.length) {
-        if (ref[i] === quote) {
-          if (ref[i + 1] === quote) { value += quote; i += 2; continue; }
+        if (ref[i] === close) {
+          if (ref[i + 1] === close) { value += close; i += 2; continue; }
           i++;
           closed = true;
           break;
@@ -125,10 +135,11 @@ export function identifierParts(ref: string): IdentifierPart[] | null {
   return parts.length ? parts : null;
 }
 
-// An identifier part: a double/backtick-quoted name or a bare word. A table ref is
-// `ident` or `ident.ident` (schema-qualified) — both parts independently quotable, so
-// `public."customer"`, `"public"."customer"`, and MySQL backticks all work.
-const IDENT = `(?:"(?:[^"]|"")+"|\`(?:[^\`]|\`\`)+\`|[A-Za-z_]\\w*)`;
+// An identifier part: a double/backtick/bracket-quoted name or a bare word. A table ref
+// is `ident` or `ident.ident` (schema-qualified) — both parts independently quotable, so
+// `public."customer"`, `"public"."customer"`, MySQL backticks and T-SQL `[dbo].[t]`
+// all work.
+const IDENT = `(?:"(?:[^"]|"")+"|\`(?:[^\`]|\`\`)+\`|\\[(?:[^\\]]|\\]\\])+\\]|[A-Za-z_]\\w*)`;
 // Keywords that can follow a table ref where an alias would otherwise be — must not be
 // captured as the alias (e.g. `JOIN a ON …`, `FROM a WHERE …`).
 const ALIAS_STOP = `(?:ON|USING|WHERE|GROUP|ORDER|HAVING|LIMIT|OFFSET|FETCH|FOR|WINDOW|QUALIFY|TABLESAMPLE|JOIN|LEFT|RIGHT|INNER|OUTER|CROSS|FULL|NATURAL|UNION|EXCEPT|INTERSECT|AND|OR|SET|RETURNING|VALUES)`;

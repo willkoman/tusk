@@ -83,6 +83,43 @@ describe("engine-aware lexing (parity with script.rs split_impl)", () => {
     // GO means nothing on the other engines.
     expect(stmtTexts("SELECT 1\nGO\nSELECT 2", "postgres")).toEqual(["SELECT 1\nGO\nSELECT 2"]);
   });
+
+  it("mssql: GO followed by a block comment is still a batch separator", () => {
+    expect(stmtTexts("SELECT 1\nGO /* end of batch */\nSELECT 2\n", "mssql")).toEqual([
+      "SELECT 1",
+      "SELECT 2",
+    ]);
+    expect(stmtTexts("SELECT 1\nGO /* x */ -- y\nSELECT 2\n", "mssql")).toEqual(["SELECT 1", "SELECT 2"]);
+    // Unterminated: not a separator, so the text stays part of the statement.
+    expect(stmtTexts("SELECT 1\nGO /* never closed\n", "mssql")).toHaveLength(1);
+  });
+
+  // Same fixtures as script.rs's `tsql_statement_blocks_are_not_split_at_their_own_semicolons`.
+  it("mssql: a `;` inside a T-SQL block is not a statement boundary", () => {
+    expect(stmtTexts("CREATE PROCEDURE dbo.p AS\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND", "mssql")).toHaveLength(1);
+    expect(
+      stmtTexts(
+        "BEGIN TRY\n  SELECT 1;\n  IF 1=1 BEGIN SELECT 2; END\nEND TRY\nBEGIN CATCH\n  SELECT ERROR_MESSAGE();\nEND CATCH",
+        "mssql",
+      ),
+    ).toHaveLength(1);
+    // CASE … END balances within one statement, so the trailing `;` still splits.
+    expect(stmtTexts("SELECT CASE WHEN a = 1 THEN 'x' ELSE 'y' END FROM t; SELECT 2", "mssql")).toHaveLength(2);
+    // BEGIN TRAN[SACTION] opens a transaction, not a block.
+    expect(stmtTexts("BEGIN TRANSACTION; SELECT 1; COMMIT", "mssql")).toEqual([
+      "BEGIN TRANSACTION;",
+      "SELECT 1;",
+      "COMMIT",
+    ]);
+    expect(stmtTexts("BEGIN DISTRIBUTED TRAN; SELECT 1; COMMIT", "mssql")).toHaveLength(3);
+    // `ended` is an identifier; BEGIN/END inside a bracket, string or comment never counts.
+    expect(stmtTexts("SELECT ended FROM t; SELECT 2", "mssql")).toHaveLength(2);
+    expect(stmtTexts("SELECT [begin], 'begin', /* begin */ 1 FROM t; SELECT 2", "mssql")).toHaveLength(2);
+    // GO closes an unbalanced block instead of gluing the rest of the file to it.
+    expect(stmtTexts("BEGIN\n SELECT 1;\nGO\nSELECT 2;", "mssql")).toHaveLength(2);
+    // Other engines are untouched: BEGIN there is transaction control.
+    expect(stmtTexts("BEGIN; SELECT 1; COMMIT;", "postgres")).toHaveLength(3);
+  });
 });
 
 describe("statement run target", () => {

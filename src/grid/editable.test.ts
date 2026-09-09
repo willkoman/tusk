@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { editTarget, editPlan } from "./editable";
 import { buildIndex, type Table } from "../sql/aliases";
+import { setSqlDialect } from "../sql/ident";
 import type { RelationDetail, Column } from "../Tree";
 
 const TABLES: Table[] = [
@@ -8,6 +9,8 @@ const TABLES: Table[] = [
   { schema: "public", name: "orders", columns: [{ name: "id", data_type: "int" }, { name: "user_id", data_type: "int" }] },
 ];
 const IDX = buildIndex(TABLES);
+// The same tables as SQL Server reports them (schema `dbo`).
+const MSSQL_IDX = buildIndex(TABLES.map((t) => ({ ...t, schema: "dbo" })));
 
 const col = (name: string, is_pk = false): Column => ({
   name, data_type: "text", nullable: !is_pk, is_pk, is_fk: false, default: null, comment: null,
@@ -25,6 +28,32 @@ describe("editTarget", () => {
 
   it("accepts aliased + qualified forms and trailing semicolons", () => {
     expect(editTarget('SELECT u.id FROM public."users" u;', IDX).ok).toBe(true);
+  });
+
+  it("accepts the [bracketed] SQL Tusk itself generates on SQL Server", () => {
+    setSqlDialect("mssql");
+    try {
+      // `ident()` emits brackets there, so this is exactly what Explorer → Open table
+      // and the SELECT scaffold produce. It used to be rejected as "not a plain table".
+      for (const q of [
+        "SELECT * FROM [dbo].[users]",
+        "SELECT [id], [email] FROM [dbo].[users]",
+        "SELECT [u].[id] FROM [dbo].[users] [u]",
+        "SELECT u.[id] FROM [users] u",
+      ]) {
+        const r = editTarget(q, MSSQL_IDX, "dbo");
+        expect(r.ok, q).toBe(true);
+        if (r.ok) expect(r.table.name).toBe("users");
+      }
+      // A bracketed name is a NAME: `[union]`/`[join]` must not read as SQL syntax…
+      expect(editTarget("SELECT [union], [join] FROM [dbo].[users]", MSSQL_IDX, "dbo").ok).toBe(true);
+      // …while the real constructs still reject, and a qualifier mismatch still rejects.
+      expect(editTarget("SELECT * FROM [dbo].[users] JOIN [dbo].[orders] ON 1=1", MSSQL_IDX, "dbo")).toMatchObject({ ok: false });
+      expect(editTarget("SELECT [o].[id] FROM [dbo].[users] [u]", MSSQL_IDX, "dbo")).toMatchObject({ ok: false });
+      expect(editTarget("SELECT * FROM [dbo].[users], [dbo].[orders]", MSSQL_IDX, "dbo")).toMatchObject({ ok: false });
+    } finally {
+      setSqlDialect("postgres");
+    }
   });
 
   it("rejects scripts and empty bases", () => {

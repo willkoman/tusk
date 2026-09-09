@@ -39,7 +39,7 @@ export function stripTrailingSemi(q: string): string {
  * or already-ordered statement cannot be wrapped for grid sort/filter there. Reported
  * as "not wrappable" rather than emitted and left for SQL Server to reject.
  */
-function mssqlWrappable(inner: string): boolean {
+export function mssqlWrappable(inner: string): boolean {
   const { spans } = lex(inner, "mssql");
   const masked = maskNonCode(inner, spans, 0, inner.length);
   return !/(^|\W)with\s/i.test(masked) && !/(^|\W)order\s+by(\W|$)/i.test(masked);

@@ -1,6 +1,6 @@
 import { type Diagnostic } from "@codemirror/lint";
 import { type EditorView } from "@codemirror/view";
-import { aliasMap, makeIndexer, strip, tableByRef, type Index, type Table } from "../sql/aliases";
+import { aliasMap, identifierParts, makeIndexer, strip, tableByRef, type Index, type Table } from "../sql/aliases";
 import { ALL_SQL_FUNCTIONS, ALL_SQL_WORDS } from "../sql/dialects";
 import { docString, lexState, maskNonCode, type Span, type Stmt } from "./lexer";
 import { closest, damerau } from "./distance";
@@ -38,7 +38,10 @@ function maskFnKeywordArgs(masked: string): string {
 // tables (whose column sets we can't know) skip it entirely. All diagnostics
 // are warnings — the server linter stays the ground truth when connected.
 
-const IDENT = `(?:"[^"]+"|[A-Za-z_]\\w*)`;
+// T-SQL `[bracket]` names included — `ident()` emits them on SQL Server, so without
+// them every generated/bracketed table ref is invisible here (and to completion's
+// alias resolution, which shares `sql/aliases.ts`).
+const IDENT = `(?:"[^"]+"|\\[(?:[^\\]]|\\]\\])+\\]|[A-Za-z_]\\w*)`;
 const QUALIFIED = /\b([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\b/g;
 const TABLE_POS = new RegExp(`\\b(?:FROM|JOIN|UPDATE|INTO)\\s+(${IDENT}(?:\\.${IDENT})?)`, "gi");
 const CTE_DEF = new RegExp(`(${IDENT})\\s+AS\\s*\\(`, "gi");
@@ -141,10 +144,15 @@ export function schemaDiagnostics(
     let sawTable = false;
     for (const m of tableScan.matchAll(TABLE_POS)) {
       const raw = m[1];
-      const name = strip(raw);
       sawTable = true;
-      if (tableByRef(idx, name, activeSchema)) continue;
-      const parts = name.split(".");
+      // `raw` keeps its quoting: `tableByRef` parses it with the same
+      // `identifierParts` completion uses, so `[dbo].[t]` / `"s"."t"` resolve
+      // exactly as typed. (Stripping first mangled a fully quoted qualified ref
+      // into `s"."t` and reported every one of them as unknown.)
+      if (tableByRef(idx, raw, activeSchema)) continue;
+      const parsed = identifierParts(raw);
+      const parts = parsed ? parsed.map((p) => p.value) : strip(raw).split(".");
+      const name = parts.join(".");
       const bare = parts[parts.length - 1].toLowerCase();
       if (cte.has(bare)) {
         continue; // known CTE — fine, but its columns are opaque (gates check 4 via `cte`)
@@ -236,12 +244,23 @@ export function schemaDiagnostics(
     let prevWord = "";
     let prevEnd = 0;
     let quotes = 0; // running '"' parity — tokens inside quoted identifiers are skipped
+    // T-SQL `[bracket]` names are kept by maskNonCode, so their contents must be
+    // skipped the same way: `FROM [dbo].[users]` must not report `dbo` as an unknown
+    // identifier. `]]` escapes a literal `]` and keeps the name open.
+    let inBracket = false;
     let wm: RegExpExecArray | null;
     while ((wm = WORD.exec(masked))) {
       const tok = wm[0];
       const at = wm.index;
-      for (let i = prevEnd; i < at; i++) if (masked[i] === '"') quotes++;
-      const inQuoted = quotes % 2 === 1;
+      for (let i = prevEnd; i < at; i++) {
+        if (masked[i] === '"') quotes++;
+        else if (masked[i] === "[") inBracket = true;
+        else if (masked[i] === "]") {
+          if (masked[i + 1] === "]") i++;
+          else inBracket = false;
+        }
+      }
+      const inQuoted = quotes % 2 === 1 || inBracket;
       const before = at > 0 ? masked[at - 1] : "";
       let after = at + tok.length;
       while (after < masked.length && /[ \t]/.test(masked[after])) after++;

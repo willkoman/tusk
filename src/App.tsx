@@ -15,7 +15,7 @@ import { classResolver, emptyFilter, hasConditions, removeNode, type FilterTree 
 import { ResultGrid } from "./ResultGrid";
 import { UpdateBadge } from "./UpdateBadge";
 import { WhatsNew } from "./WhatsNew";
-import { wrapQuery, wrappableQuery, stripTrailingSemi, hasDuplicateColumns, hasViewRules } from "./grid/query";
+import { wrapQuery, wrappableQuery, stripTrailingSemi, hasDuplicateColumns, hasViewRules, mssqlWrappable } from "./grid/query";
 import { editTarget, editPlan, type EditPlan } from "./grid/editable";
 import { detectBoolCols, typeBoolCols } from "./grid/bool";
 import { buildCommitScript } from "./grid/editSql";
@@ -335,6 +335,16 @@ function App() {
     // An engine with no row in sql/ddlCaps.ts (SQL Server today) would otherwise fall
     // back to the PostgreSQL builders and emit syntax the server rejects.
     if (!ddlSupported(connectionKind())) return { disabled: true, title: `DDL editing isn't supported for ${driverLabel(connectionKind())} yet` };
+    return allowed ? {} : { disabled: true, title: reason };
+  };
+  // Same read-only / transaction-freeze / privilege gate for the file-import items,
+  // but with import's own engine support (import.rs refuses SQL Server) — `gate()`'s
+  // DDL-builder reason is the wrong explanation for an import action.
+  const importGate = (allowed: boolean, reason: string): { disabled?: boolean; title?: string } => {
+    if (metadataFrozen()) return { disabled: true, title: "Explorer database actions are frozen during a manual transaction" };
+    if (conn()?.readOnly) return { disabled: true, title: "Connection is read-only" };
+    if (connectionKind() === "mssql")
+      return { disabled: true, title: `File import isn't supported for ${driverLabel("mssql")} yet — use the SQL editor or a bulk-load tool` };
     return allowed ? {} : { disabled: true, title: reason };
   };
   // Disable an item this engine cannot express (constraint ALTERs on DuckDB, CREATE
@@ -1100,6 +1110,10 @@ function App() {
     if (!canServerSortFilter()) {
       if (activeTab().result.incomplete) return "this result is incomplete and its query can't be re-run with ORDER BY — re-run it to sort";
       if (!activeTab().result.done) return "this query can't be re-run with ORDER BY — load all rows first to sort in memory";
+      // SQL Server can't wrap a WITH-led or already-ordered statement as a derived
+      // table, so say that instead of blaming the in-memory sort limit.
+      if (connectionKind() === "mssql" && !mssqlWrappable(activeTab().result.baseQuery))
+        return "SQL Server can't sort this result: it wraps the query as a derived table, which rejects a WITH-led or already-ordered statement — add ORDER BY to the query itself";
       return "this result can't be sorted: the query isn't a single re-runnable SELECT and it exceeds the in-memory sort limit";
     }
     return "";
@@ -3597,7 +3611,7 @@ function App() {
           { label: "Filter rows…", icon: "search", onClick: () => void filterTable(s!, n.name) },
           { sep: true },
           { label: "Export table…", icon: "download", onClick: () => void openTableExport(s!, n.name) },
-          { label: "Import data into table…", icon: "download", ...gate(canInsert(s!, n.name), `Requires INSERT on ${n.name}`), onClick: () => openImport({ schema: s!, name: n.name }) },
+          { label: "Import data into table…", icon: "download", ...importGate(canInsert(s!, n.name), `Requires INSERT on ${n.name}`), onClick: () => openImport({ schema: s!, name: n.name }) },
           { sep: true },
           { label: "Modify table…", icon: "edit", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => openModify(n) },
           { label: "Add column…", icon: "plus", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "addColumn", ctx: n }) },
@@ -3674,7 +3688,7 @@ function App() {
             ? [{ label: "Schema diagram…", icon: "link" as const, onClick: () => openDdlGraph(n.name, null, "table") }, { sep: true as const }]
             : []),
           { label: "Create table…", icon: "plus", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => setActiveDialog({ kind: "createTable", schema: n.name, tables: schema() }) },
-          { label: "Import file as new table…", icon: "download", ...gate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => openImport(null) },
+          { label: "Import file as new table…", icon: "download", ...importGate(canCreateInSchema(n.name), `Requires CREATE on schema ${n.name}`), onClick: () => openImport(null) },
           { label: "Export tables…", icon: "download", onClick: () => openTablesExport(n.name) },
           { label: "Rename…", icon: "edit", ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), ...engineCan(dcaps().renameSchema, "rename a schema"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename schema ${n.name}`, current: n.name, build: (nn) => ddl.renameSchema(n.name, nn) }) },
           { sep: true },
@@ -3689,7 +3703,7 @@ function App() {
         const cur = tree()?.database === n.name;
         items.push(
           { label: "Create schema…", icon: "plus", ...gate(canCreateSchema(), "Requires CREATE on the database"), ...engineCan(dcaps().createSchema, "create a schema"), onClick: () => setActiveDialog({ kind: "createSchema" }) },
-          { label: "Import file as new table…", icon: "download", ...gate(!pEnforced() || canCreateSchema() || schema().length > 0, "Requires CREATE somewhere in this database"), onClick: () => openImport(null) },
+          { label: "Import file as new table…", icon: "download", ...importGate(!pEnforced() || canCreateSchema() || schema().length > 0, "Requires CREATE somewhere in this database"), onClick: () => openImport(null) },
           { label: "Export tables…", icon: "download", onClick: () => openTablesExport(null) },
 
           // Same gate() as every other Explorer DDL item (manual-transaction freeze,
@@ -4035,9 +4049,15 @@ function App() {
                         onClick={() => {
                           const previous = driver();
                           setDriver(d.id);
-                          // Only move the port when it still holds another driver's default.
+                          // Move the port only while it still holds SOME driver's default;
+                          // a port the user typed is never overwritten. Comparing against
+                          // the previous driver's default alone left the field at 5432
+                          // when switching from a path-based driver (SQLite/DuckDB have no
+                          // default port, so that comparison was against `undefined`).
                           const defaults: Record<string, number> = { postgres: 5432, mysql: 3306, mssql: 1433 };
-                          if (defaults[d.id] && port() === defaults[previous]) setPort(defaults[d.id]);
+                          const untouched =
+                            port() === defaults[previous] || Object.values(defaults).includes(port());
+                          if (defaults[d.id] && untouched) setPort(defaults[d.id]);
                           if (d.id !== "postgres" && dbname() === "postgres") setDbname("");
                           if (d.id === "postgres" && dbname() === "") setDbname("postgres");
                         }}

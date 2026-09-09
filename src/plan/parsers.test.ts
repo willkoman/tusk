@@ -522,5 +522,10 @@ describe("explainSql", () => {
     expect(isSingleExplainStatement("SELECT ';'; -- trailing comment", "postgres")).toBe(true);
     expect(isSingleExplainStatement("SELECT 1; DELETE FROM t", "postgres")).toBe(false);
     expect(analyzeExecutesWrite("SELECT 1; DELETE FROM t", "postgres")).toBe(true);
+    // T-SQL `[bracket]` names are identifier tokens here exactly as in Rust
+    // `shape_tokens`; dropping the span made a bracketed CTE unparseable (→ "write").
+    expect(analyzeExecutesWrite("WITH [c] AS (SELECT 1) SELECT * FROM [c]", "mssql")).toBe(false);
+    expect(analyzeExecutesWrite("WITH [c] AS (DELETE FROM t) SELECT * FROM [c]", "mssql")).toBe(true);
+    expect(analyzeExecutesWrite("SELECT * FROM [dbo].[t]", "mssql")).toBe(false);
   });
 });
