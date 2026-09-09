@@ -13,9 +13,21 @@ export type Column = {
    *  AUTOINCREMENT rowid, DuckDB `nextval(…)` default). Optional so test fixtures
    *  and older cached payloads stay valid. */
   identity?: boolean;
+  /** SQLite: the column's `COLLATE` token, from the stored CREATE text. */
+  collate?: string | null;
+  /** SQLite: the expression of a column-level `CHECK (…)`. */
+  check?: string | null;
+  /** A generated column's whole clause (`GENERATED ALWAYS AS (…) STORED`). The Modify
+   *  dialog refuses to rewrite one of these — restating a definition without the clause
+   *  drops or breaks the column. */
+  generated?: string | null;
+  /** MySQL `ON UPDATE CURRENT_TIMESTAMP(…)`, which `MODIFY COLUMN` would drop. */
+  on_update?: string | null;
 };
-export type Idx = { name: string; unique: boolean; primary: boolean; def: string };
-export type Con = { name: string; kind: string; def: string };
+/** `columns` is the index's key columns as DATA. Empty = unknown (expression index or
+ *  a driver that can't enumerate them) — never re-derive them from `def`. */
+export type Idx = { name: string; unique: boolean; primary: boolean; def: string; columns?: string[] };
+export type Con = { name: string; kind: string; def: string; columns?: string[] };
 export type RelStub = {
   name: string;
   kind: string;
@@ -40,6 +52,12 @@ export type RelationDetail = {
   indexes: Idx[];
   constraints: Con[];
   triggers: Trg[];
+  /** SQLite `WITHOUT ROWID` / `STRICT`, verbatim; "" elsewhere. A rebuild must keep it. */
+  table_options?: string;
+  /** False when the engine keeps its table definition as text and Tusk could not read
+   *  it (SQLite): the Modify dialog then refuses to rebuild rather than dropping what
+   *  it could not see. Optional so older cached payloads stay valid. */
+  definition_read?: boolean;
 };
 export type Func = { name: string; args: string; returns: string };
 export type SchemaT = {

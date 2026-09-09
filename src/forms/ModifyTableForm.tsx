@@ -2,7 +2,17 @@ import { createMemo, createSignal, For, Show } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { Dialog, DialogFooter } from "../Dialog";
 import { SqlField } from "../SqlField";
-import { needsRebuild, scriptNote, tableDiff, validateColumns, type FkSpec } from "../sql/ddl";
+import {
+  droppableIndexes,
+  mentionsIdentifier,
+  needsRebuild,
+  scriptNote,
+  tableDiff,
+  tableDiffProblems,
+  validateColumns,
+  type Dependent,
+  type FkSpec,
+} from "../sql/ddl";
 import { ddlCaps } from "../sql/ddlCaps";
 import type { Column, NodeDescriptor, RelationDetail } from "../Tree";
 import { emptyFk, fkSpecOf, FkEditor, type FkDraft, type RefColumn, type RefTable } from "./FkEditor";
@@ -19,7 +29,17 @@ type Row = {
   origPk: boolean;
   dropped: boolean;
   identity?: boolean;
+  /** Catalog-only column facts a rebuild must carry across verbatim; the dialog never
+   *  edits them, and a generated column refuses to be rewritten at all. */
+  collate?: string;
+  check?: string;
+  generated?: string;
+  onUpdate?: string;
 };
+
+/** A generated column cannot be restated by MySQL's MODIFY nor recreated from the
+ *  dialog's fields, so its inputs are read-only. */
+const isGenerated = (r: Row) => !!r.generated?.trim();
 
 let uid = 1;
 const fromColumn = (c: Column): Row => ({
@@ -41,6 +61,10 @@ const fromColumn = (c: Column): Row => ({
   origPk: c.is_pk,
   dropped: false,
   identity: c.identity ?? false,
+  collate: c.collate ?? undefined,
+  check: c.check ?? undefined,
+  generated: c.generated ?? undefined,
+  onUpdate: c.on_update ?? undefined,
 });
 const newRow = (): Row => ({
   uid: uid++,
@@ -112,10 +136,16 @@ export function ModifyTableForm(props: {
     );
 
   const constraintKinds = createMemo(() => Object.fromEntries(props.detail.constraints.map((c) => [c.name, c.kind])));
+  // An index that BACKS a constraint is listed once, under Constraints. Ticking it in
+  // both lists emitted two drops for the one object; the second fails, and on MySQL —
+  // where every DDL statement commits as it runs — the first one stays applied.
+  const shownIndexes = createMemo(() => droppableIndexes(props.detail.indexes, props.detail.constraints));
   // Indexes that must be replayed after a SQLite rebuild: the explicit ones the user is
   // keeping (constraint-backed indexes come back with the recreated CREATE TABLE).
   const keepIndexes = createMemo(() =>
-    props.detail.indexes.filter((ix) => !ix.primary && !dropIdx()[ix.name] && ix.def.trim()).map((ix) => ix.def),
+    shownIndexes()
+      .filter((ix) => !ix.primary && !dropIdx()[ix.name] && ix.def.trim())
+      .map((ix) => ix.def),
   );
   // Constraints the rebuilt CREATE TABLE must carry across verbatim. The primary key is
   // excluded because it comes from the column list; everything else would otherwise be
@@ -125,6 +155,26 @@ export function ModifyTableForm(props: {
       .filter((c) => c.kind !== "primary_key" && !dropCon()[c.name] && c.def.trim())
       .map((c) => c.def),
   );
+  // SQLite stores a trigger's whole CREATE text and the DROP takes the table's triggers
+  // with it, so the rebuild replays them instead of asking the user to redo it by hand.
+  const keepTriggers = createMemo(() =>
+    caps.rebuild ? props.detail.triggers.filter((t) => t.def.trim()).map((t) => t.def) : [],
+  );
+  // Everything the rebuild recreates verbatim, with the columns each object names:
+  // dropping or renaming one of those columns must be refused, not emitted.
+  const dependents = createMemo<Dependent[]>(() => [
+    ...shownIndexes()
+      .filter((ix) => !ix.primary && !dropIdx()[ix.name])
+      .map((ix) => ({ name: ix.name, kind: "index" as const, columns: ix.columns ?? [] })),
+    ...props.detail.constraints
+      .filter((c) => c.kind !== "primary_key" && !dropCon()[c.name])
+      .map((c) => ({ name: c.name, kind: "constraint" as const, columns: c.columns ?? [] })),
+    ...props.detail.triggers.map((t) => ({
+      name: t.name,
+      kind: "trigger" as const,
+      columns: props.detail.columns.map((c) => c.name).filter((n) => mentionsIdentifier(t.def, n)),
+    })),
+  ]);
 
   const spec = createMemo(() => ({
     schema,
@@ -145,8 +195,12 @@ export function ModifyTableForm(props: {
       origPk: r.origPk,
       dropped: r.dropped,
       identity: r.identity,
+      collate: r.collate,
+      check: r.check,
+      generated: r.generated,
+      onUpdate: r.onUpdate,
     })),
-    dropIndexes: props.detail.indexes.filter((ix) => dropIdx()[ix.name]).map((ix) => ix.name),
+    dropIndexes: shownIndexes().filter((ix) => dropIdx()[ix.name]).map((ix) => ix.name),
     dropConstraints: props.detail.constraints.filter((c) => dropCon()[c.name]).map((c) => c.name),
     constraintKinds: constraintKinds(),
     addUniques: uniques.filter((u) => u.columns.length).map((u) => ({ name: u.name, columns: u.columns })),
@@ -154,25 +208,31 @@ export function ModifyTableForm(props: {
     addForeignKeys: fks.map(fkSpecOf).filter((f): f is FkSpec => !!f),
     keepIndexes: keepIndexes(),
     keepConstraints: keepConstraints(),
+    keepTriggers: keepTriggers(),
+    tableOptions: props.detail.table_options ?? "",
+    origOrder: props.detail.columns.map((c) => c.name),
+    dependents: dependents(),
+    definitionRead: props.detail.definition_read ?? true,
   }));
 
-  const problems = createMemo(() =>
-    validateColumns(
+  const problems = createMemo(() => [
+    ...validateColumns(
       cols.filter((r) => !r.dropped),
       caps,
     ),
-  );
+    ...tableDiffProblems(spec(), caps),
+  ]);
   const errors = () => problems().filter((p) => p.level === "error");
-  const rebuilding = createMemo(() => needsRebuild(spec()));
+  const rebuilding = createMemo(() => needsRebuild(spec(), caps));
   const sql = createMemo(() => (errors().length ? "" : tableDiff(spec())));
   const note = createMemo(() => {
     if (!sql()) return "";
     const base = scriptNote(sql(), caps);
     if (!rebuilding()) return base;
-    const lost = props.detail.triggers.length
-      ? ` Triggers on this table (${props.detail.triggers.map((t) => t.name).join(", ")}) are dropped with it — recreate them after applying.`
+    const trg = props.detail.triggers.length
+      ? ` Its triggers (${props.detail.triggers.map((t) => t.name).join(", ")}) are dropped with the table and recreated afterwards.`
       : "";
-    return `SQLite can't change this in place, so Tusk rebuilds the table (create → copy → drop → rename): columns, the primary key, and the constraints and indexes listed above are recreated.${lost} ${base}`;
+    return `SQLite can't change this in place, so Tusk rebuilds the table (create → copy → drop → rename): the columns, their CHECK/COLLATE/generated clauses, the primary key, the table options and the constraints and indexes listed above are all recreated.${trg} ${base}`;
   });
 
   const toggleUniqueCol = (i: number, c: string) =>
@@ -220,18 +280,29 @@ export function ModifyTableForm(props: {
         <For each={cols}>
           {(c, i) => (
             <div class="col-builder-row modify-row" classList={{ "row-dropped": c.dropped, "row-new": !c.orig }}>
+              {/* Column order is only expressible where the table can be rebuilt
+                  (SQLite); everywhere else ALTER TABLE has no way to move a column. */}
               <span class="cb-move">
-                <button class="icon" title="Move up" disabled={i() === 0} onClick={() => move(i(), -1)}>↑</button>
-                <button class="icon" title="Move down" disabled={i() === cols.length - 1} onClick={() => move(i(), 1)}>↓</button>
+                <Show when={caps.rebuild}>
+                  <button class="icon" title="Move up" disabled={i() === 0} onClick={() => move(i(), -1)}>↑</button>
+                  <button class="icon" title="Move down" disabled={i() === cols.length - 1} onClick={() => move(i(), 1)}>↓</button>
+                </Show>
               </span>
               <input value={c.name} disabled={c.dropped} onInput={(e) => setCols(i(), "name", e.currentTarget.value)} placeholder="name" />
-              <SqlField value={c.type} typesOnly onChange={(v) => setCols(i(), "type", v)} placeholder="type" />
-              <input class="cb-flag" type="checkbox" disabled={c.dropped} checked={c.nullable} onChange={(e) => setCols(i(), "nullable", e.currentTarget.checked)} />
-              <input class="cb-flag" type="checkbox" disabled={c.dropped} checked={c.isPk} onChange={(e) => setCols(i(), "isPk", e.currentTarget.checked)} />
-              <SqlField value={c.default} columns={colNames()} onChange={(v) => setCols(i(), "default", v)} placeholder="(none)" />
+              <Show when={!isGenerated(c)} fallback={<span class="mono muted-hint">{c.type}</span>}>
+                <SqlField value={c.type} typesOnly onChange={(v) => setCols(i(), "type", v)} placeholder="type" />
+              </Show>
+              <input class="cb-flag" type="checkbox" disabled={c.dropped || isGenerated(c)} checked={c.nullable} onChange={(e) => setCols(i(), "nullable", e.currentTarget.checked)} />
+              <input class="cb-flag" type="checkbox" disabled={c.dropped || isGenerated(c)} checked={c.isPk} onChange={(e) => setCols(i(), "isPk", e.currentTarget.checked)} />
+              <Show
+                when={!isGenerated(c)}
+                fallback={<span class="mono muted-hint" title={c.generated}>generated</span>}
+              >
+                <SqlField value={c.default} columns={colNames()} onChange={(v) => setCols(i(), "default", v)} placeholder="(none)" />
+              </Show>
               <input
                 value={c.comment}
-                disabled={c.dropped || caps.comments === "none"}
+                disabled={c.dropped || isGenerated(c) || caps.comments === "none"}
                 onInput={(e) => setCols(i(), "comment", e.currentTarget.value)}
                 placeholder={caps.comments === "none" ? `no comments on ${caps.label}` : "(none)"}
               />
@@ -244,10 +315,10 @@ export function ModifyTableForm(props: {
         <button class="ghost full" onClick={addRow}>＋ Add column</button>
       </div>
 
-      <Show when={props.detail.indexes.length}>
+      <Show when={shownIndexes().length}>
         <div class="field-label">Indexes</div>
         <div class="drop-list">
-          <For each={props.detail.indexes}>
+          <For each={shownIndexes()}>
             {(ix) => (
               <label class="checkbox drop-row" classList={{ "row-dropped": dropIdx()[ix.name] }}>
                 <input

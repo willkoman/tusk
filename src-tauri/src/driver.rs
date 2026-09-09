@@ -96,6 +96,10 @@ pub struct Capabilities {
     pub transaction_savepoints: bool,
     pub set_transaction: bool,
     pub autocommit_mode: bool,
+    /// MySQL only: the session runs with `NO_BACKSLASH_ESCAPES`, so a backslash inside
+    /// a string literal is an ordinary character. The frontend needs this to escape
+    /// COMMENT text the way the server will read it back.
+    pub no_backslash_escapes: bool,
 }
 
 impl Capabilities {
@@ -119,6 +123,7 @@ impl Capabilities {
             transaction_savepoints: true,
             set_transaction: true,
             autocommit_mode: false,
+            no_backslash_escapes: false,
         }
     }
     pub fn duckdb() -> Self {
@@ -141,6 +146,7 @@ impl Capabilities {
             transaction_savepoints: false,
             set_transaction: false,
             autocommit_mode: false,
+            no_backslash_escapes: false,
         }
     }
     pub fn sqlite() -> Self {
@@ -163,6 +169,7 @@ impl Capabilities {
             transaction_savepoints: true,
             set_transaction: false,
             autocommit_mode: false,
+            no_backslash_escapes: false,
         }
     }
     pub fn mssql() -> Self {
@@ -186,6 +193,7 @@ impl Capabilities {
             transaction_savepoints: true, // SAVE TRANSACTION (no RELEASE)
             set_transaction: false,       // SET TRANSACTION ISOLATION LEVEL is session-wide
             autocommit_mode: false,
+            no_backslash_escapes: false,
         }
     }
     pub fn mysql() -> Self {
@@ -208,6 +216,7 @@ impl Capabilities {
             transaction_savepoints: true,
             set_transaction: true,
             autocommit_mode: true,
+            no_backslash_escapes: false,
         }
     }
 }
@@ -568,7 +577,10 @@ impl Backend {
             Backend::Pg(_) => Capabilities::postgres(),
             Backend::Duck(_) => Capabilities::duckdb(),
             Backend::Sqlite(_) => Capabilities::sqlite(),
-            Backend::MySql(_) => Capabilities::mysql(),
+            Backend::MySql(m) => Capabilities {
+                no_backslash_escapes: m.no_backslash_escapes,
+                ..Capabilities::mysql()
+            },
             Backend::MsSql(_) => Capabilities::mssql(),
         }
     }
@@ -2154,23 +2166,61 @@ fn mysql_default_expr(raw: &str, column_type: &str, extra: &str) -> String {
     if upper.starts_with("B'") || upper.starts_with("X'") || upper.starts_with("0X") {
         return d.to_string();
     }
-    // A numeric column with a numeric default needs no quoting.
+    // A numeric column with a numeric default needs no quoting. Match the BASE type
+    // word, not a prefix of the whole `column_type`: `bigint(20) unsigned` does not
+    // start with "int", which used to quote every integer default but `int`'s.
     let ty = column_type.to_ascii_lowercase();
-    let numeric = [
-        "int", "decimal", "numeric", "float", "double", "real", "bit", "year",
+    let base: String = ty.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+    const NUMERIC: [&str; 14] = [
+        "bit",
+        "tinyint",
+        "smallint",
+        "mediumint",
+        "int",
+        "integer",
+        "bigint",
+        "decimal",
+        "dec",
+        "numeric",
+        "float",
+        "double",
+        "real",
+        "year",
     ];
-    if numeric.iter().any(|k| ty.starts_with(k)) && d.parse::<f64>().is_ok() {
+    if NUMERIC.contains(&base.as_str()) && d.parse::<f64>().is_ok() {
         return d.to_string();
     }
     // Everything else is the literal text of a string/temporal/enum default.
     format!("'{}'", d.replace('\\', "\\\\").replace('\'', "''"))
 }
 
+/// The `ON UPDATE CURRENT_TIMESTAMP[(n)]` clause hidden in `information_schema`'s
+/// `EXTRA`. `MODIFY COLUMN` restates a column's WHOLE definition, so an edit that did
+/// not carry this across removed the auto-update behaviour without saying a word.
+fn mysql_on_update(extra: &str) -> Option<String> {
+    let lower = extra.to_ascii_lowercase();
+    let at = lower.find("on update ")?;
+    // EXTRA puts this last, so the rest of the string is the whole clause value
+    // (`CURRENT_TIMESTAMP` or `CURRENT_TIMESTAMP(3)`).
+    let value = extra[at + "on update ".len()..].trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(format!("ON UPDATE {value}"))
+}
+
 /// One foreign key while its per-column catalog rows are being grouped (SQLite).
 struct FkGroup {
     id: String,
     cols: Vec<String>,
+    /// Raw child column names (unquoted), for matching against the stored DDL.
+    raw_cols: Vec<String>,
     ref_cols: Vec<String>,
+    /// `PRAGMA foreign_key_list` reports `to` as NULL when the child declared
+    /// `REFERENCES parent` with no column list (the parent's primary key is implied).
+    /// The referenced list must then be omitted entirely — `REFERENCES "p" ("")` is
+    /// not valid SQL and poisons a rebuild.
+    implicit_ref: bool,
     ref_table: String,
     actions: String,
 }
@@ -2179,6 +2229,8 @@ struct FkGroup {
 struct MySqlFkGroup {
     name: String,
     cols: Vec<String>,
+    /// Raw (unquoted) child column names, carried as data for the UI.
+    raw_cols: Vec<String>,
     ref_schema: String,
     ref_table: String,
     ref_cols: Vec<String>,
@@ -2186,16 +2238,20 @@ struct MySqlFkGroup {
 
 /// SQLite has no `information_schema`: columns come from `PRAGMA table_info`, keys and
 /// indexes from `PRAGMA index_list`/`index_info`/`foreign_key_list`, and the index DDL
-/// from `sqlite_master`. Constraint `def`s are synthesized as the CLAUSE the table
-/// rebuild can paste straight back into a `CREATE TABLE` (see `rebuildTable` in
-/// `sql/ddl.ts`) — CHECK constraints are the one shape SQLite refuses to enumerate,
-/// so the Modify dialog warns instead of silently dropping them.
+/// from `sqlite_master`. Constraint `def`s are the CLAUSE the table rebuild can paste
+/// straight back into a `CREATE TABLE` (see `rebuildTable` in `sql/ddl.ts`).
+///
+/// The pragmas cannot see CHECK constraints, per-column `COLLATE`, generated columns or
+/// `WITHOUT ROWID` / `STRICT`, and a rebuild that recreated the table without them would
+/// destroy them silently. So the stored `CREATE TABLE` text is parsed as well
+/// (`sqlite_ddl::parse_create_table`) and those parts come across verbatim — table
+/// constraint clauses with their names included. When that text cannot be parsed,
+/// `definition_read` is false and the Modify dialog refuses to rebuild.
 fn sqlite_table_detail(
     conn: &rusqlite::Connection,
     name: &str,
 ) -> Result<tree::RelationDetail, AppError> {
     let q = db::ident(name);
-    // The stored CREATE text is the only place AUTOINCREMENT is visible.
     let stored = sqlite_query(
         conn,
         &format!(
@@ -2206,10 +2262,33 @@ fn sqlite_table_detail(
     .ok()
     .and_then(|(_c, rs)| rs.first().map(|r| dcell(r, 0)))
     .unwrap_or_default();
-    let autoincrement = stored.to_ascii_uppercase().contains("AUTOINCREMENT");
+    let parsed = crate::sqlite_ddl::parse_create_table(&stored);
+    let extras: std::collections::HashMap<&str, &crate::sqlite_ddl::ParsedColumn> = parsed
+        .as_ref()
+        .map(|p| p.columns.iter().map(|c| (c.name.as_str(), c)).collect())
+        .unwrap_or_default();
+    // Only used when the definition could NOT be parsed: a whole-text scan also matches
+    // a column named `autoincrement_seq`, a CHECK expression or a quoted default, so it
+    // is a last resort — never the answer when the real token positions are known.
+    let autoincrement_fallback =
+        parsed.is_none() && stored.to_ascii_uppercase().contains("AUTOINCREMENT");
+    let without_rowid = parsed
+        .as_ref()
+        .is_some_and(|p| p.options.to_ascii_uppercase().contains("WITHOUT"));
 
-    // PRAGMA table_info → (cid, name, type, notnull, dflt_value, pk).
-    let (_c, rows) = sqlite_query(conn, &format!("PRAGMA table_info({q})"))?;
+    // PRAGMA table_xinfo → (cid, name, type, notnull, dflt_value, pk, hidden), where
+    // hidden is 0 for a normal column, 1 for a virtual table's hidden column and 2/3
+    // for a generated one. `table_info` omits generated columns entirely, which left
+    // them out of the sidebar and out of a rebuilt table.
+    let rows: Vec<Vec<Option<String>>> =
+        match sqlite_query(conn, &format!("PRAGMA table_xinfo({q})")) {
+            Ok((_c, rs)) => rs.into_iter().filter(|r| dcell(r, 6) != "1").collect(),
+            Err(_) => sqlite_query(conn, &format!("PRAGMA table_info({q})"))?.1,
+        };
+    let pk_count = rows
+        .iter()
+        .filter(|r| dcell(r, 5) != "0" && !dcell(r, 5).is_empty())
+        .count();
 
     // foreign_key_list → (id, seq, table, from, to, on_update, on_delete, match).
     let fk_rows = sqlite_query(conn, &format!("PRAGMA foreign_key_list({q})"))
@@ -2223,15 +2302,28 @@ fn sqlite_table_detail(
             let is_pk = dcell(r, 5) != "0" && !dcell(r, 5).is_empty();
             let name = dcell(r, 1);
             let data_type = dcell(r, 2);
+            let extra = extras.get(name.as_str()).copied();
+            let autoincrement = extra.map_or(autoincrement_fallback, |e| e.autoincrement);
+            // `PRAGMA table_info` reports notnull=0 for a plain `INTEGER PRIMARY KEY`
+            // (the rowid alias, which can never be NULL) and for a WITHOUT ROWID key
+            // (which SQLite does enforce). Taking that literally reported every such key
+            // as a NULLABLE primary key. Any OTHER primary-key column genuinely can hold
+            // NULLs — SQLite's documented legacy quirk — so it is reported as it is.
+            let never_null = is_pk
+                && (without_rowid || (pk_count == 1 && data_type.eq_ignore_ascii_case("INTEGER")));
             tree::Column {
                 identity: is_pk && autoincrement && data_type.eq_ignore_ascii_case("INTEGER"),
                 is_fk: fk_cols.contains(&name),
-                name,
-                data_type,
-                nullable: dcell(r, 3) != "1",
+                nullable: dcell(r, 3) != "1" && !never_null,
                 is_pk,
                 default: r.get(4).and_then(|v| v.clone()),
                 comment: None, // SQLite has no COMMENT syntax at all
+                collate: extra.and_then(|e| e.collate.clone()),
+                check: extra.and_then(|e| e.check.clone()),
+                generated: extra.and_then(|e| e.generated.clone()),
+                name,
+                data_type,
+                ..Default::default()
             }
         })
         .collect();
@@ -2247,6 +2339,11 @@ fn sqlite_table_detail(
             name: format!("{name}_pk"),
             kind: "primary_key".to_string(),
             def: format!("PRIMARY KEY ({})", pk_cols.join(", ")),
+            columns: columns
+                .iter()
+                .filter(|c| c.is_pk)
+                .map(|c| c.name.clone())
+                .collect(),
         });
     }
 
@@ -2260,11 +2357,20 @@ fn sqlite_table_detail(
         let iname = dcell(r, 1);
         let unique = dcell(r, 2) == "1";
         let origin = dcell(r, 3);
-        let cols: Vec<String> =
-            sqlite_query(conn, &format!("PRAGMA index_info({})", db::ident(&iname)))
-                .map(|(_c, rs)| rs.iter().map(|x| dcell(x, 2)).collect())
-                .unwrap_or_default();
-        if origin == "u" {
+        // index_info's `name` is NULL for an expression key. One unknown entry makes the
+        // whole list unusable — report none rather than a wrong list.
+        let info = sqlite_query(conn, &format!("PRAGMA index_info({})", db::ident(&iname)))
+            .map(|(_c, rs)| rs)
+            .unwrap_or_default();
+        let cols: Vec<String> = if info
+            .iter()
+            .any(|x| x.get(2).map(|v| v.is_none()).unwrap_or(true))
+        {
+            Vec::new()
+        } else {
+            info.iter().map(|x| dcell(x, 2)).collect()
+        };
+        if origin == "u" && !cols.is_empty() {
             constraints.push(tree::Constraint {
                 name: iname.clone(),
                 kind: "unique".to_string(),
@@ -2275,6 +2381,7 @@ fn sqlite_table_detail(
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
+                columns: cols.clone(),
             });
         }
         let def = sqlite_query(
@@ -2292,6 +2399,7 @@ fn sqlite_table_detail(
             unique,
             primary: origin == "pk",
             def,
+            columns: cols,
         });
     }
 
@@ -2305,7 +2413,9 @@ fn sqlite_table_detail(
                 fk_groups.push(FkGroup {
                     id,
                     cols: Vec::new(),
+                    raw_cols: Vec::new(),
                     ref_cols: Vec::new(),
+                    implicit_ref: false,
                     ref_table: dcell(r, 2),
                     actions: String::new(),
                 });
@@ -2313,7 +2423,11 @@ fn sqlite_table_detail(
             }
         };
         entry.cols.push(db::ident(&dcell(r, 3)));
-        entry.ref_cols.push(db::ident(&dcell(r, 4)));
+        entry.raw_cols.push(dcell(r, 3));
+        match r.get(4).and_then(|v| v.clone()) {
+            Some(to) if !to.is_empty() => entry.ref_cols.push(db::ident(&to)),
+            _ => entry.implicit_ref = true,
+        }
         let on_update = dcell(r, 5);
         let on_delete = dcell(r, 6);
         entry.actions = format!(
@@ -2331,16 +2445,22 @@ fn sqlite_table_detail(
         );
     }
     for g in fk_groups {
+        let refs = if g.implicit_ref || g.ref_cols.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", g.ref_cols.join(", "))
+        };
         constraints.push(tree::Constraint {
             name: format!("{name}_fk_{}", g.id),
             kind: "foreign_key".to_string(),
             def: format!(
-                "FOREIGN KEY ({}) REFERENCES {} ({}){}",
+                "FOREIGN KEY ({}) REFERENCES {}{}{}",
                 g.cols.join(", "),
                 db::ident(&g.ref_table),
-                g.ref_cols.join(", "),
+                refs,
                 g.actions
             ),
+            columns: g.raw_cols,
         });
     }
 
@@ -2361,6 +2481,44 @@ fn sqlite_table_detail(
     })
     .unwrap_or_default();
 
+    // Fold in what only the stored definition knows. CHECK constraints are invisible to
+    // every pragma, and a named UNIQUE / FOREIGN KEY clause keeps its name only here
+    // (`PRAGMA index_list` reports `sqlite_autoindex_…`), so a matching parsed clause
+    // replaces the synthesized one and the rebuild recreates the constraint AS WRITTEN.
+    if let Some(p) = parsed.as_ref() {
+        let same = |a: &[String], b: &[String]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| x.eq_ignore_ascii_case(y))
+        };
+        for (i, pc) in p.constraints.iter().enumerate() {
+            match pc.kind {
+                "check" => constraints.push(tree::Constraint {
+                    name: pc
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("{name}_check_{i}")),
+                    kind: "check".to_string(),
+                    def: pc.clause.clone(),
+                    columns: Vec::new(),
+                }),
+                "unique" | "foreign_key" => {
+                    if let Some(c) = constraints
+                        .iter_mut()
+                        .find(|c| c.kind == pc.kind && same(&c.columns, &pc.columns))
+                    {
+                        c.def = pc.clause.clone();
+                        if let Some(n) = pc.name.clone() {
+                            c.name = n;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     Ok(tree::RelationDetail {
         name: name.to_string(),
         kind: "table".to_string(),
@@ -2369,6 +2527,11 @@ fn sqlite_table_detail(
         indexes,
         constraints,
         triggers,
+        table_options: parsed
+            .as_ref()
+            .map(|p| p.options.clone())
+            .unwrap_or_default(),
+        definition_read: parsed.is_some(),
     })
 }
 
@@ -2396,6 +2559,10 @@ pub struct MySqlConn {
     bulk: Option<mysql_async::Conn>,
     manual_lost: bool,
     autocommit_off: bool,
+    /// The server session runs with `NO_BACKSLASH_ESCAPES`. Read once at connect: it
+    /// decides how the frontend escapes text inside a MySQL string literal, and getting
+    /// it wrong silently corrupts every backslash in a COMMENT.
+    no_backslash_escapes: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -2454,6 +2621,15 @@ impl MySqlConn {
             .first()
             .and_then(|r| r.first().cloned().flatten())
             .unwrap_or_else(|| "unknown".to_string());
+        // Tusk never sets sql_mode, so the session inherits the server's. Under
+        // NO_BACKSLASH_ESCAPES a backslash is an ordinary character and doubling it
+        // would store two; without it, NOT doubling turns a Windows path's escape
+        // sequence into a control character.
+        let no_backslash_escapes = mysql_run(&pool, "SELECT @@session.sql_mode")
+            .await
+            .ok()
+            .and_then(|(_c, rs, _a)| rs.first().and_then(|r| r.first().cloned().flatten()))
+            .is_some_and(|m| m.to_ascii_uppercase().contains("NO_BACKSLASH_ESCAPES"));
         Ok((
             Backend::MySql(MySqlConn {
                 pool,
@@ -2465,6 +2641,7 @@ impl MySqlConn {
                 bulk: None,
                 manual_lost: false,
                 autocommit_off: false,
+                no_backslash_escapes,
             }),
             format!("MySQL {version}"),
         ))
@@ -3128,9 +3305,12 @@ async fn mysql_table_detail(
     name: &str,
 ) -> Result<tree::RelationDetail, AppError> {
     // `column_type` (not `data_type`) keeps the length/precision — the Modify dialog's
-    // MODIFY COLUMN restates the definition, so `varchar` alone would truncate it.
+    // MODIFY COLUMN restates the definition, so `varchar` alone would truncate it. For
+    // the same reason `extra` (AUTO_INCREMENT, ON UPDATE CURRENT_TIMESTAMP, the
+    // STORED/VIRTUAL GENERATED marker) and `generation_expression` come along: a MODIFY
+    // that does not restate them DROPS the behaviour or fails outright.
     let q = "SELECT column_name, column_type, is_nullable, column_default, column_key, \
-             COALESCE(extra,''), COALESCE(column_comment,'') \
+             COALESCE(extra,''), COALESCE(column_comment,''), COALESCE(generation_expression,'') \
              FROM information_schema.columns \
              WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position";
     let params = mysql_async::Params::Positional(vec![schema.into(), name.into()]);
@@ -3159,8 +3339,23 @@ async fn mysql_table_detail(
             let comment = dcell(r, 6);
             let column_type = dcell(r, 1);
             let extra = dcell(r, 5);
+            let gen_expr = dcell(r, 7);
+            let lower = extra.to_ascii_lowercase();
+            // A generated column's whole clause, rebuilt from EXTRA + the expression.
+            let generated = if gen_expr.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "GENERATED ALWAYS AS ({gen_expr}) {}",
+                    if lower.contains("stored") {
+                        "STORED"
+                    } else {
+                        "VIRTUAL"
+                    }
+                ))
+            };
             tree::Column {
-                identity: extra.to_ascii_lowercase().contains("auto_increment"),
+                identity: lower.contains("auto_increment"),
                 is_fk: fk_cols.contains(&cname),
                 nullable: dcell(r, 2).eq_ignore_ascii_case("YES"),
                 is_pk: dcell(r, 4) == "PRI",
@@ -3173,8 +3368,11 @@ async fn mysql_table_detail(
                 } else {
                     Some(comment)
                 },
+                on_update: mysql_on_update(&extra),
+                generated,
                 data_type: column_type,
                 name: cname,
+                ..Default::default()
             }
         })
         .collect();
@@ -3203,6 +3401,7 @@ async fn mysql_table_detail(
                     unique,
                     primary: iname == "PRIMARY",
                     def: String::new(),
+                    columns: Vec::new(),
                 });
                 index_cols.push((iname.clone(), Vec::new()));
             }
@@ -3213,6 +3412,7 @@ async fn mysql_table_detail(
     }
     for (ix, (_n, cols)) in indexes.iter_mut().zip(index_cols.iter()) {
         let quoted: Vec<String> = cols.iter().map(|c| db::ident(c)).collect();
+        ix.columns.clone_from(cols);
         ix.def = if ix.primary {
             format!("PRIMARY KEY ({})", quoted.join(", "))
         } else {
@@ -3240,6 +3440,7 @@ async fn mysql_table_detail(
                 if ix.primary { "PRIMARY KEY" } else { "UNIQUE" },
                 quoted.join(", ")
             ),
+            columns: cols.clone(),
         });
     }
     let mut fk_groups: Vec<MySqlFkGroup> = Vec::new();
@@ -3251,6 +3452,7 @@ async fn mysql_table_detail(
                 fk_groups.push(MySqlFkGroup {
                     name: cname,
                     cols: Vec::new(),
+                    raw_cols: Vec::new(),
                     ref_schema: dcell(r, 2),
                     ref_table: dcell(r, 3),
                     ref_cols: Vec::new(),
@@ -3259,6 +3461,7 @@ async fn mysql_table_detail(
             }
         };
         entry.cols.push(db::ident(&dcell(r, 1)));
+        entry.raw_cols.push(dcell(r, 1));
         entry.ref_cols.push(db::ident(&dcell(r, 4)));
     }
     for g in fk_groups {
@@ -3272,6 +3475,7 @@ async fn mysql_table_detail(
                 db::ident(&g.ref_table),
                 g.ref_cols.join(", ")
             ),
+            columns: g.raw_cols,
         });
     }
     let check_sql = "SELECT cc.CONSTRAINT_NAME, cc.CHECK_CLAUSE \
@@ -3293,6 +3497,7 @@ async fn mysql_table_detail(
                 name: dcell(r, 0),
                 kind: "check".to_string(),
                 def: format!("CHECK ({})", dcell(r, 1)),
+                columns: Vec::new(),
             });
         }
     }
@@ -3334,6 +3539,8 @@ async fn mysql_table_detail(
         indexes,
         constraints,
         triggers,
+        table_options: String::new(),
+        definition_read: true,
     })
 }
 
@@ -4039,6 +4246,7 @@ impl MsSqlConn {
                 default: row.get(3).cloned().flatten(),
                 comment: row.get(6).cloned().flatten(),
                 identity: dcell(row, 7) == "1",
+                ..Default::default()
             })
             .collect();
         let (_c2, index_rows) = self
@@ -4061,6 +4269,7 @@ impl MsSqlConn {
                     name: dcell(row, 0),
                     unique,
                     primary,
+                    ..Default::default()
                 }
             })
             .collect();
@@ -4074,6 +4283,7 @@ impl MsSqlConn {
                 name: dcell(row, 0),
                 kind: dcell(row, 1),
                 def: dcell(row, 2),
+                columns: Vec::new(),
             })
             .collect();
         let (_c4, trigger_rows) = self
@@ -4106,6 +4316,8 @@ impl MsSqlConn {
             indexes,
             constraints,
             triggers,
+            table_options: String::new(),
+            definition_read: true,
         })
     }
 
@@ -4866,6 +5078,128 @@ mod tests {
     }
 
     #[test]
+    fn mysql_default_expr_leaves_every_integer_family_unquoted() {
+        // `bigint`/`tinyint`/… do not START with "int", so a prefix match quoted their
+        // defaults and the Modify dialog emitted `DEFAULT '7'` for a numeric column.
+        for ty in [
+            "int",
+            "int(11)",
+            "bigint",
+            "bigint(20) unsigned",
+            "tinyint(1)",
+            "smallint",
+            "mediumint",
+            "decimal(10,2)",
+            "double",
+        ] {
+            assert_eq!(mysql_default_expr("7", ty, ""), "7", "type {ty}");
+        }
+        // Text-ish defaults still become literals, and an expression default is kept.
+        assert_eq!(mysql_default_expr("ab", "varchar(10)", ""), "'ab'");
+        assert_eq!(
+            mysql_default_expr("x", "varchar(10)", "DEFAULT_GENERATED"),
+            "x"
+        );
+        assert_eq!(
+            mysql_default_expr("CURRENT_TIMESTAMP", "timestamp", ""),
+            "CURRENT_TIMESTAMP"
+        );
+    }
+
+    #[test]
+    fn mysql_on_update_comes_out_of_extra() {
+        assert_eq!(
+            mysql_on_update("DEFAULT_GENERATED on update CURRENT_TIMESTAMP").as_deref(),
+            Some("ON UPDATE CURRENT_TIMESTAMP")
+        );
+        assert_eq!(
+            mysql_on_update("on update CURRENT_TIMESTAMP(3)").as_deref(),
+            Some("ON UPDATE CURRENT_TIMESTAMP(3)")
+        );
+        assert!(mysql_on_update("auto_increment").is_none());
+        assert!(mysql_on_update("").is_none());
+    }
+
+    /// The Modify dialog rebuilds a SQLite table from this description, so anything it
+    /// fails to report is destroyed by the rebuild. Pins the four shapes the pragmas
+    /// alone cannot see, plus the FK with no referenced column list.
+    #[test]
+    fn sqlite_detail_reads_checks_collation_generated_and_implicit_fk() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE p(id INTEGER PRIMARY KEY);
+             CREATE TABLE t(
+               id INTEGER PRIMARY KEY,
+               email TEXT COLLATE NOCASE CHECK (email <> ''),
+               qty INT,
+               total INT GENERATED ALWAYS AS (qty * 2) STORED,
+               pid INTEGER REFERENCES p,
+               CONSTRAINT ck_qty CHECK (qty > 0),
+               CONSTRAINT uq_email UNIQUE (email)
+             ) STRICT;
+             CREATE INDEX t_qty_idx ON t(qty);",
+        )
+        .unwrap();
+        let d = sqlite_table_detail(&c, "t").expect("detail");
+        assert!(d.definition_read);
+        assert_eq!(d.table_options, "STRICT");
+
+        let email = d.columns.iter().find(|x| x.name == "email").unwrap();
+        assert_eq!(email.collate.as_deref(), Some("NOCASE"));
+        assert_eq!(email.check.as_deref(), Some("email <> ''"));
+        let total = d.columns.iter().find(|x| x.name == "total").unwrap();
+        assert_eq!(
+            total.generated.as_deref(),
+            Some("GENERATED ALWAYS AS (qty * 2) STORED")
+        );
+        // The rowid alias is reported NOT NULL (PRAGMA table_info says notnull=0).
+        let id = d.columns.iter().find(|x| x.name == "id").unwrap();
+        assert!(!id.nullable && id.is_pk);
+        assert!(!id.identity, "no AUTOINCREMENT keyword on this table");
+
+        // The table-level CHECK is invisible to every pragma; it must come across with
+        // its name so a rebuild can paste it back.
+        let ck = d
+            .constraints
+            .iter()
+            .find(|x| x.kind == "check")
+            .expect("CHECK constraint reported");
+        assert_eq!(ck.name, "ck_qty");
+        assert_eq!(ck.def, "CONSTRAINT ck_qty CHECK (qty > 0)");
+        // A named UNIQUE keeps its name (PRAGMA index_list only knows sqlite_autoindex).
+        let uq = d.constraints.iter().find(|x| x.kind == "unique").unwrap();
+        assert_eq!(uq.name, "uq_email");
+        assert_eq!(uq.def, "CONSTRAINT uq_email UNIQUE (email)");
+        assert_eq!(uq.columns, vec!["email".to_string()]);
+        // `REFERENCES p` with no column list: the referenced list must be OMITTED, not
+        // rendered as `REFERENCES "p" ("")`.
+        let fk = d
+            .constraints
+            .iter()
+            .find(|x| x.kind == "foreign_key")
+            .unwrap();
+        assert_eq!(fk.def, r#"FOREIGN KEY ("pid") REFERENCES "p""#);
+        // Index key columns travel as data, never as text to be scanned.
+        let ix = d.indexes.iter().find(|x| x.name == "t_qty_idx").unwrap();
+        assert_eq!(ix.columns, vec!["qty".to_string()]);
+    }
+
+    /// A column named `autoincrement_seq` used to make every INTEGER key look like an
+    /// AUTOINCREMENT one (the check was a substring scan of the whole CREATE text).
+    #[test]
+    fn sqlite_autoincrement_is_not_a_substring_match() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, autoincrement_seq INT)")
+            .unwrap();
+        let d = sqlite_table_detail(&c, "t").expect("detail");
+        assert!(!d.columns[0].identity);
+        c.execute_batch("CREATE TABLE u(id INTEGER PRIMARY KEY AUTOINCREMENT)")
+            .unwrap();
+        let d2 = sqlite_table_detail(&c, "u").expect("detail");
+        assert!(d2.columns[0].identity);
+    }
+
+    #[test]
     fn mysql_date_rendering_preserves_midnight_timestamp_type() {
         use mysql_async::consts::ColumnType::{MYSQL_TYPE_DATE, MYSQL_TYPE_DATETIME};
 
@@ -5458,6 +5792,7 @@ fn duck_table_detail(
                 nullable: dcell(r, 2).eq_ignore_ascii_case("YES"),
                 default,
                 comment: None,
+                ..Default::default()
             }
         })
         .collect();
@@ -5480,6 +5815,8 @@ fn duck_table_detail(
                 unique: dcell(r, 1) == "true" || dcell(r, 1) == "t",
                 primary: false,
                 def: dcell(r, 2),
+                // duckdb_indexes() reports no key-column list.
+                columns: Vec::new(),
             })
             .collect()
     })
@@ -5510,6 +5847,7 @@ fn duck_table_detail(
                     name: format!("{name}_{}_{i}", kind),
                     kind: kind.to_string(),
                     def: dcell(r, 1),
+                    columns: Vec::new(),
                 }
             })
             .collect()
@@ -5523,6 +5861,9 @@ fn duck_table_detail(
         columns,
         indexes,
         constraints,
+        // DuckDB has no triggers at all.
         triggers: vec![],
+        table_options: String::new(),
+        definition_read: true,
     })
 }

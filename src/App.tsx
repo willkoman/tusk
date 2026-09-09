@@ -89,6 +89,7 @@ import {
   type TableInfo,
 } from "./connections";
 import * as ddl from "./sql/ddl";
+import { setMysqlNoBackslashEscapes } from "./sql/ddl";
 import { ddlCaps, ddlSupported } from "./sql/ddlCaps";
 import { clipWrite, clipRead } from "./clipboard";
 import { slackHistoryKey, type SlackExecuted } from "./slackEvents";
@@ -412,8 +413,15 @@ function App() {
   // Disable an item this engine cannot express (constraint ALTERs on DuckDB, CREATE
   // DATABASE on SQLite, renaming a constraint anywhere but Postgres, …). Spread AFTER
   // gate(); `what` completes "<engine> can't <what>".
-  const engineCan = (supported: boolean, what: string): { disabled?: boolean; title?: string } =>
-    supported ? {} : { disabled: true, title: `${dcaps().label} can't ${what}` };
+  //
+  // It is spread last, so it re-checks the STRONGER reasons itself: a read-only or
+  // transaction-frozen item must keep saying so rather than being relabelled with the
+  // weaker engine message (both stay disabled either way).
+  const engineCan = (supported: boolean, what: string): { disabled?: boolean; title?: string } => {
+    if (supported) return {};
+    const stronger = gate(true, "");
+    return stronger.disabled ? stronger : { disabled: true, title: `${dcaps().label} can't ${what}` };
+  };
   const [host, setHost] = createSignal("localhost");
   const [port, setPort] = createSignal(5432);
   const [user, setUser] = createSignal("");
@@ -834,6 +842,9 @@ function App() {
   // module-level dialect always belongs to the connection on screen. SQL built for a
   // tab/dialog on another connection must pin its own dialect - see `withDialect`.
   createEffect(() => setSqlDialect(conn() ? connectionKind() : activeDialect()));
+  // MySQL string literals in generated DDL (COMMENT text) must escape backslashes the
+  // way the SERVER's sql_mode reads them back; the backend reports it at connect.
+  createEffect(() => setMysqlNoBackslashEscapes(!!conn() && caps()?.noBackslashEscapes === true));
   const [cursorInfo, setCursorInfo] = createSignal<CursorInfo | null>(null);
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   let restoring = false;
@@ -4029,9 +4040,10 @@ function App() {
     // the detail must come from `c`'s own cache rather than the active connection's.
     const d = (stateOf(c.id)?.details ?? {})[relKey(schemaName, table)];
     if (!d) return null;
-    const unique = new Set(
-      d.indexes.filter((ix) => ix.unique).flatMap((ix) => d.columns.filter((col) => ix.def.includes(col.name)).map((col) => col.name)),
-    );
+    // Key columns come from each index's COLUMN LIST, never from its rendered `def`:
+    // "UNIQUE INDEX `uq` (`user_id`)" contains the substrings "id" and "user", so a
+    // def scan marked unrelated columns unique and floated them to the top of the picker.
+    const unique = new Set(ddl.uniqueIndexColumns(d.indexes));
     return d.columns.map((col) => ({
       name: col.name,
       data_type: col.data_type,
@@ -4226,7 +4238,12 @@ function App() {
         );
         break;
       }
-      case "schema":
+      case "schema": {
+        // On MySQL a schema IS a database: dropping this node destroys a whole
+        // database, so it is labelled, confirmed and guarded as a database drop —
+        // including the "can't drop the one you're connected to" guard.
+        const dropsDatabase = dcaps().dropSchema === "database";
+        const droppingCurrentDb = dropsDatabase && tree()?.database === n.name;
         items.push(
           ...(caps()?.relationships !== false
             ? [{ label: "Schema diagram…", icon: "link" as const, onClick: () => openDdlGraph(n.name, null, "table") }, { sep: true as const }]
@@ -4236,13 +4253,29 @@ function App() {
           { label: "Export tables…", icon: "download", onClick: () => openTablesExport(n.name) },
           { label: "Rename…", icon: "edit", ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), ...engineCan(dcaps().renameSchema, "rename a schema"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename schema ${n.name}`, current: n.name, build: (nn) => ddl.renameSchema(n.name, nn) }) },
           { sep: true },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`), ...engineCan(dcaps().createSchema, "drop a schema"), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop schema ${n.name}`, primaryLabel: "Drop schema", showCascade: true, build: (o) => ddl.dropSchema(n.name, o.cascade) }) },
+          {
+            label: dropsDatabase ? (droppingCurrentDb ? "Drop database… (connected)" : "Drop database…") : "Drop…",
+            icon: "trash",
+            danger: true,
+            ...gate(ownsSchema(n.name), `Requires ownership of schema ${n.name}`),
+            ...engineCan(dcaps().dropSchema !== false, dropsDatabase ? "drop a database from here" : "drop a schema"),
+            ...(droppingCurrentDb ? { disabled: true, title: "Can't drop the connected database" } : {}),
+            onClick: () =>
+              setActiveDialog({
+                kind: "confirm",
+                title: dropsDatabase ? `Drop database ${n.name}` : `Drop schema ${n.name}`,
+                primaryLabel: dropsDatabase ? "Drop database" : "Drop schema",
+                showCascade: !dropsDatabase && dcaps().cascade,
+                build: (o) => (dropsDatabase ? ddl.dropDatabase(n.name) : ddl.dropSchema(n.name, o.cascade)),
+              }),
+          },
           { sep: true },
           { label: "Backup schema…", icon: "download", onClick: () => openBackup({ scope: "schemas", schemas: [n.name], tables: [], suggestedName: n.name }) },
           { sep: true },
           copyName,
         );
         break;
+      }
       case "database": {
         const cur = tree()?.database === n.name;
         items.push(

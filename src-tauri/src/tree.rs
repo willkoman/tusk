@@ -7,7 +7,7 @@ const MAX_CATALOG_ROWS: usize = 100_000;
 const MAX_CATALOG_CELL_BYTES: usize = 1024 * 1024;
 const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Default)]
 pub struct Column {
     pub name: String,
     pub data_type: String,
@@ -21,21 +21,39 @@ pub struct Column {
     /// Modify-table diff needs it because MySQL's `MODIFY COLUMN` restates the whole
     /// definition and would otherwise drop AUTO_INCREMENT on any type change.
     pub identity: bool,
+    /// Column-level `COLLATE` (SQLite, from the stored CREATE text). A rebuild that
+    /// omitted it would silently change the column's comparison semantics.
+    pub collate: Option<String>,
+    /// The expression of a column-level `CHECK (...)` (SQLite).
+    pub check: Option<String>,
+    /// A generated column's whole clause — SQLite `GENERATED ALWAYS AS (...) STORED`,
+    /// MySQL the same. Restating a definition without it drops or breaks the column,
+    /// so the Modify dialog refuses to rewrite one of these.
+    pub generated: Option<String>,
+    /// MySQL `ON UPDATE CURRENT_TIMESTAMP(…)`, which `MODIFY COLUMN` would otherwise
+    /// drop because it restates the entire definition.
+    pub on_update: Option<String>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Default)]
 pub struct Index {
     pub name: String,
     pub unique: bool,
     pub primary: bool,
     pub def: String,
+    /// The indexed column names, in key order. EMPTY means "not known" (an expression
+    /// index, or a driver that cannot enumerate them) — never fall back to scanning
+    /// `def` for a column name, which matches any column whose name is a substring.
+    pub columns: Vec<String>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Default)]
 pub struct Constraint {
     pub name: String,
     pub kind: String, // primary_key | foreign_key | unique | check
     pub def: String,
+    /// The constrained column names where the driver knows them (empty otherwise).
+    pub columns: Vec<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -74,6 +92,13 @@ pub struct RelationDetail {
     pub indexes: Vec<Index>,
     pub constraints: Vec<Constraint>,
     pub triggers: Vec<Trigger>,
+    /// Verbatim table options that a rebuild must carry across (SQLite `WITHOUT ROWID`
+    /// / `STRICT`); empty everywhere else.
+    pub table_options: String,
+    /// False when the engine stores its table definition as text and Tusk could NOT
+    /// read it (SQLite). The Modify dialog then refuses to rebuild the table, because
+    /// a rebuild would drop whatever the unreadable text contained.
+    pub definition_read: bool,
 }
 
 #[derive(Serialize)]
@@ -128,6 +153,15 @@ pub fn tables_from_rows(rows: Vec<Vec<Option<String>>>) -> Vec<TableInfo> {
         }
     }
     tables
+}
+
+/// Split a `chr(1)`-joined name list from `string_agg`. A plain comma would be
+/// ambiguous: a quoted identifier may itself contain one.
+fn split_names(s: &str) -> Vec<String> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    s.split('\u{1}').map(|x| x.to_string()).collect()
 }
 
 fn cell(r: &[Option<String>], i: usize) -> String {
@@ -317,7 +351,8 @@ pub async fn table_detail(
         client,
         &format!(
             "SELECT a.attname, format_type(a.atttypid,a.atttypmod), (NOT a.attnotnull), \
-         pg_get_expr(d.adbin,d.adrelid), col_description(a.attrelid,a.attnum) \
+         pg_get_expr(d.adbin,d.adrelid), col_description(a.attrelid,a.attnum), \
+         a.attidentity::text \
          FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum \
          WHERE a.attrelid={oid} AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum"
         ),
@@ -351,6 +386,8 @@ pub async fn table_detail(
             let nm = cell(r, 0);
             let default = r.get(3).and_then(|v| v.clone());
             // Identity columns, plus the older `serial` form (a nextval default).
+            // `attidentity` is a "char" ('' / 'a' / 'd'), so ::text IS correct here —
+            // the never-cast rule is about BOOLEANS, which come back 't'/'f' bare.
             let identity = !cell(r, 5).is_empty()
                 || default
                     .as_deref()
@@ -364,6 +401,7 @@ pub async fn table_detail(
                 default,
                 comment: r.get(4).and_then(|v| v.clone()),
                 identity,
+                ..Default::default()
             }
         })
         .collect();
@@ -372,7 +410,10 @@ pub async fn table_detail(
     let idx_rows = query(
         client,
         &format!(
-            "SELECT ic.relname, i.indisunique, i.indisprimary, pg_get_indexdef(i.indexrelid) \
+            "SELECT ic.relname, i.indisunique, i.indisprimary, pg_get_indexdef(i.indexrelid), \
+         (SELECT string_agg(a.attname, chr(1) ORDER BY k.ord) \
+            FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) \
+            JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum) \
          FROM pg_index i JOIN pg_class ic ON ic.oid=i.indexrelid \
          WHERE i.indrelid={oid} ORDER BY ic.relname"
         ),
@@ -385,11 +426,16 @@ pub async fn table_detail(
             unique: cell(r, 1) == "t",
             primary: cell(r, 2) == "t",
             def: cell(r, 3),
+            columns: split_names(&cell(r, 4)),
         })
         .collect();
 
     let con_rows = query(client, &format!(
-        "SELECT con.conname, con.contype::text, pg_get_constraintdef(con.oid) FROM pg_constraint con \
+        "SELECT con.conname, con.contype::text, pg_get_constraintdef(con.oid), \
+         (SELECT string_agg(a.attname, chr(1) ORDER BY k.ord) \
+            FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) \
+            JOIN pg_attribute a ON a.attrelid=con.conrelid AND a.attnum=k.attnum) \
+         FROM pg_constraint con \
          WHERE con.conrelid={oid} AND con.contype IN ('p','f','u','c') ORDER BY con.contype, con.conname")).await?;
     let kind_of = |c: &str| {
         match c {
@@ -407,6 +453,7 @@ pub async fn table_detail(
             name: cell(r, 0),
             kind: kind_of(&cell(r, 1)),
             def: cell(r, 2),
+            columns: split_names(&cell(r, 3)),
         })
         .collect();
 
@@ -441,6 +488,8 @@ pub async fn table_detail(
         indexes,
         constraints,
         triggers,
+        table_options: String::new(),
+        definition_read: true,
     })
 }
 

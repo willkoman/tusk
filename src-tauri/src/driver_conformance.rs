@@ -2946,8 +2946,10 @@ fn sqlite_ddl_builder_forms_apply() {
 )"#,
         r#"INSERT INTO "main"."orders__tusk_rebuild" ("id", "code", "qty")
 SELECT "id", "code", "qty" FROM "main"."orders""#,
+        r#"PRAGMA legacy_alter_table=1"#,
         r#"DROP TABLE "main"."orders""#,
         r#"ALTER TABLE "main"."orders__tusk_rebuild" RENAME TO "orders""#,
+        r#"PRAGMA legacy_alter_table=0"#,
         r#"CREATE INDEX "orders_qty_idx" ON "orders" ("qty")"#,
         // rename / drop the relation
         r#"ALTER TABLE "main"."orders" RENAME TO "orders2""#,
@@ -2991,6 +2993,135 @@ COMMIT;"#;
         .query_row("SELECT qty FROM t WHERE id = 1", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, 7, "rows survive the rebuild");
+}
+
+/// The rebuild has to survive a table that a VIEW and another table's TRIGGER name.
+/// Since 3.25 `ALTER TABLE … RENAME TO` re-parses every entry in `sqlite_schema`, so
+/// after the intermediate `DROP TABLE` the rename fails with "error in view …: no such
+/// table" and the whole edit rolls back — unless `legacy_alter_table` is on, exactly as
+/// SQLite's own 12-step rebuild recipe prescribes. The script below is byte-for-byte
+/// the one `sqlite rebuild` in `src/sql/ddl.test.ts` asserts the builder emits.
+#[test]
+fn sqlite_rebuild_survives_dependent_view_and_trigger() {
+    let c = rusqlite::Connection::open_in_memory().unwrap();
+    c.execute_batch(
+        r#"CREATE TABLE "t" ("id" integer PRIMARY KEY, "qty" integer);
+CREATE INDEX "t_qty_idx" ON "t" ("qty");
+CREATE VIEW "active" AS SELECT * FROM "t" WHERE qty > 0;
+CREATE TABLE "log" ("n" integer);
+CREATE TRIGGER "t_log" AFTER INSERT ON "t" BEGIN INSERT INTO "log" VALUES (NEW."qty"); END;
+INSERT INTO "t" ("id", "qty") VALUES (1, 7);"#,
+    )
+    .unwrap();
+    let rebuild = r#"CREATE TABLE "main"."t__tusk_rebuild" (
+  "id" integer PRIMARY KEY,
+  "qty" bigint
+);
+INSERT INTO "main"."t__tusk_rebuild" ("id", "qty")
+SELECT "id", "qty" FROM "main"."t";
+PRAGMA legacy_alter_table=1;
+DROP TABLE "main"."t";
+ALTER TABLE "main"."t__tusk_rebuild" RENAME TO "t";
+PRAGMA legacy_alter_table=0;
+CREATE INDEX "t_qty_idx" ON "t" ("qty");
+CREATE TRIGGER "t_log" AFTER INSERT ON "t" BEGIN INSERT INTO "log" VALUES (NEW."qty"); END;"#;
+    c.execute_batch(&format!("BEGIN;\n{rebuild}\nCOMMIT;"))
+        .expect("the rebuild must survive a dependent view and trigger");
+    let v: i64 = c
+        .query_row("SELECT qty FROM active WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 7, "the view still resolves after the swap");
+    // The replayed trigger is live again.
+    c.execute_batch(r#"INSERT INTO "t" ("id", "qty") VALUES (2, 9)"#)
+        .unwrap();
+    let logged: i64 = c
+        .query_row("SELECT COUNT(*) FROM log WHERE n = 9", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(logged, 1, "the recreated trigger fired");
+
+    // And the pragma is load-bearing: the identical script without it fails on the
+    // rename, because the view can no longer be re-parsed.
+    let c2 = rusqlite::Connection::open_in_memory().unwrap();
+    c2.execute_batch(
+        r#"CREATE TABLE "t" ("id" integer PRIMARY KEY, "qty" integer);
+CREATE VIEW "active" AS SELECT * FROM "t" WHERE qty > 0;"#,
+    )
+    .unwrap();
+    let err = c2
+        .execute_batch(&format!(
+            "BEGIN;\n{}\nCOMMIT;",
+            rebuild.replace("PRAGMA legacy_alter_table=1;\n", "")
+        ))
+        .expect_err("without legacy_alter_table the rename must fail");
+    assert!(
+        err.to_string().to_lowercase().contains("no such table"),
+        "unexpected error: {err}"
+    );
+}
+
+/// The rebuild reaches the engine through `Backend::run_script` (the app-owned
+/// transaction wrapper), not through raw `execute_batch` — so the `PRAGMA` statements it
+/// now contains have to survive Tusk's own statement splitting and script runner too.
+#[tokio::test]
+async fn sqlite_rebuild_script_runs_through_the_driver() {
+    let (mut b, _v) = connect(&sqlite_cfg()).await.expect("connect sqlite");
+    exec(
+        &mut b,
+        r#"CREATE TABLE "t" ("id" integer PRIMARY KEY, "qty" integer)"#,
+    )
+    .await;
+    exec(&mut b, r#"CREATE VIEW "active" AS SELECT * FROM "t""#).await;
+    exec(&mut b, r#"INSERT INTO "t" ("id", "qty") VALUES (1, 7)"#).await;
+    let script = r#"-- SQLite can't ALTER "main"."t" in place — rebuilding it (create → copy → drop → rename).
+CREATE TABLE "main"."t__tusk_rebuild" (
+  "id" integer PRIMARY KEY,
+  "qty" bigint
+);
+INSERT INTO "main"."t__tusk_rebuild" ("id", "qty")
+SELECT "id", "qty" FROM "main"."t";
+PRAGMA legacy_alter_table=1;
+DROP TABLE "main"."t";
+ALTER TABLE "main"."t__tusk_rebuild" RENAME TO "t";
+PRAGMA legacy_alter_table=0"#;
+    let items = crate::script::parse(script).expect("the rebuild script parses");
+    b.run_script(&items, false)
+        .await
+        .expect("the driver must run the whole rebuild as one script");
+    let rows = all(&mut b, r#"SELECT "qty" FROM "active""#).await;
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("7"));
+}
+
+/// A rebuild must carry across everything only the stored CREATE text knows: table and
+/// column CHECK constraints, COLLATE, generated columns and `WITHOUT ROWID` / `STRICT`.
+/// The CREATE below is byte-for-byte the one `sqlite rebuild` in `src/sql/ddl.test.ts`
+/// builds from a detail carrying those fields.
+#[test]
+fn sqlite_rebuild_keeps_checks_collation_and_generated_columns() {
+    let c = rusqlite::Connection::open_in_memory().unwrap();
+    c.execute_batch(
+        r#"CREATE TABLE "main"."t__tusk_rebuild" (
+  "id" integer PRIMARY KEY,
+  "email" varchar(80) COLLATE NOCASE CHECK (email <> ''),
+  "total" int GENERATED ALWAYS AS (id * 2) STORED,
+  CONSTRAINT "ck_qty" CHECK (id > 0)
+) WITHOUT ROWID"#,
+    )
+    .expect("SQLite accepts the rebuilt CREATE with every carried-over clause");
+    c.execute_batch(r#"INSERT INTO "main"."t__tusk_rebuild" ("id", "email") VALUES (3, 'A@b')"#)
+        .unwrap();
+    let total: i64 = c
+        .query_row("SELECT total FROM t__tusk_rebuild", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(total, 6, "the generated column still computes");
+    // The carried COLLATE is live too (NOCASE compares case-insensitively).
+    let hits: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM t__tusk_rebuild WHERE email = 'a@B'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(hits, 1, "COLLATE NOCASE survived the rebuild");
 }
 
 /// PostgreSQL forms — mirrors `createTable · postgres`, `addColumn`, `editColumn` and
@@ -3138,34 +3269,96 @@ async fn mysql_column_defaults_round_trip_through_modify() {
         "CREATE TABLE `test`.`defs` (\
          `s` varchar(20) DEFAULT 'ab''c', \
          `n` int DEFAULT 7, \
+         `big` bigint DEFAULT 9, \
+         `tiny` tinyint DEFAULT 1, \
+         `amount` decimal(10,2) DEFAULT 1.50, \
          `d` datetime DEFAULT CURRENT_TIMESTAMP, \
-         `e` varchar(10) DEFAULT 'x\\\\y')",
+         `e` varchar(10) DEFAULT 'x\\\\y', \
+         `u` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, \
+         `g` int GENERATED ALWAYS AS (`n` + 1) STORED)",
     )
     .await;
     let detail = b.table_detail("test", "defs").await.expect("detail");
-    for c in &detail.columns {
+    // A generated column is reported WITH its clause: MODIFY cannot restate it from the
+    // dialog's fields, so the frontend refuses to rewrite it instead of breaking it.
+    let g = detail.columns.iter().find(|c| c.name == "g").unwrap();
+    assert!(
+        g.generated
+            .as_deref()
+            .is_some_and(|x| x.starts_with("GENERATED ALWAYS AS (") && x.ends_with("STORED")),
+        "generated clause: {:?}",
+        g.generated
+    );
+    // ON UPDATE lives in EXTRA, not in the column type — a MODIFY that omits it drops
+    // the auto-update behaviour with no error at all.
+    let u = detail.columns.iter().find(|c| c.name == "u").unwrap();
+    assert_eq!(u.on_update.as_deref(), Some("ON UPDATE CURRENT_TIMESTAMP"));
+
+    for c in detail.columns.iter().filter(|c| c.generated.is_none()) {
         let def = c.default.clone().unwrap_or_default();
         assert!(!def.is_empty(), "column {} lost its default", c.name);
-        // Exactly what `columnDef` emits for MySQL, with the default as reported.
+        // Exactly what `columnDef` emits for MySQL, with the catalog's own values.
         let sql = format!(
-            "ALTER TABLE `test`.`defs` MODIFY COLUMN `{}` {} DEFAULT {}",
-            c.name, c.data_type, def
+            "ALTER TABLE `test`.`defs` MODIFY COLUMN `{}` {}{} DEFAULT {}{}",
+            c.name,
+            c.data_type,
+            if c.nullable { "" } else { " NOT NULL" },
+            def,
+            c.on_update
+                .as_deref()
+                .map(|x| format!(" {x}"))
+                .unwrap_or_default(),
         );
         exec(&mut b, &sql).await;
     }
     let after = b.table_detail("test", "defs").await.expect("detail again");
+    let shape = |d: &crate::tree::RelationDetail| {
+        d.columns
+            .iter()
+            .map(|c| {
+                (
+                    c.name.clone(),
+                    c.default.clone().unwrap_or_default(),
+                    c.on_update.clone().unwrap_or_default(),
+                    c.nullable,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
     assert_eq!(
-        after
-            .columns
-            .iter()
-            .map(|c| c.default.clone().unwrap_or_default())
-            .collect::<Vec<_>>(),
-        detail
-            .columns
-            .iter()
-            .map(|c| c.default.clone().unwrap_or_default())
-            .collect::<Vec<_>>(),
-        "defaults must survive a MODIFY COLUMN round trip unchanged"
+        shape(&after),
+        shape(&detail),
+        "defaults, ON UPDATE and nullability must survive a MODIFY COLUMN round trip"
     );
     exec(&mut b, "DROP TABLE `test`.`defs`").await;
+}
+
+/// PostgreSQL identity columns must be REPORTED as identity: the detection read a
+/// column the query never selected, so `GENERATED … AS IDENTITY` came back false and
+/// only the legacy `serial` (a nextval default) was recognized.
+#[tokio::test]
+async fn postgres_identity_columns_are_detected() {
+    let Some(cfg) = pg_cfg() else {
+        eprintln!("SKIP postgres_identity_columns_are_detected (set TUSK_TEST_PG_PORT)");
+        return;
+    };
+    let (mut b, _v) = connect(&cfg).await.expect("connect pg");
+    exec(&mut b, r#"DROP TABLE IF EXISTS "public"."ids""#).await;
+    exec(
+        &mut b,
+        r#"CREATE TABLE "public"."ids" (
+  "a" bigint GENERATED BY DEFAULT AS IDENTITY,
+  "b" bigint GENERATED ALWAYS AS IDENTITY,
+  "c" serial,
+  "d" bigint
+)"#,
+    )
+    .await;
+    let d = b.table_detail("public", "ids").await.expect("detail");
+    let is_identity = |n: &str| d.columns.iter().find(|c| c.name == n).unwrap().identity;
+    assert!(is_identity("a"), "GENERATED BY DEFAULT AS IDENTITY");
+    assert!(is_identity("b"), "GENERATED ALWAYS AS IDENTITY");
+    assert!(is_identity("c"), "serial (nextval default)");
+    assert!(!is_identity("d"), "a plain column is not identity");
+    exec(&mut b, r#"DROP TABLE "public"."ids""#).await;
 }

@@ -50,6 +50,8 @@ export type Capabilities = {
   transactionSavepoints: boolean;
   setTransaction: boolean;
   autocommitMode: boolean;
+  /** MySQL: the session's sql_mode has NO_BACKSLASH_ESCAPES (drives literal escaping). */
+  noBackslashEscapes?: boolean;
 };
 
 export type ColumnInfo = { name: string; data_type: string };

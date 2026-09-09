@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { setSqlDialect } from "./ident";
+import { ddlCaps } from "./ddlCaps";
 import {
   addColumn,
   commentOnColumn,
@@ -10,15 +11,24 @@ import {
   dropColumn,
   dropConstraint,
   dropIndex,
+  droppableIndexes,
+  dropSchema,
   duplicateTable,
   editColumn,
+  isPlaceholderColumn,
+  mentionsIdentifier,
+  mysqlTextLiteral,
   needsRebuild,
   renameColumn,
   renameRelation,
   scriptNote,
+  setMysqlNoBackslashEscapes,
   tableDiff,
+  tableDiffProblems,
   truncate,
+  uniqueIndexColumns,
   validateColumns,
+  validateTableOptions,
   type DiffColumn,
 } from "./ddl";
 
@@ -430,8 +440,12 @@ describe("sqlite rebuild", () => {
         `);`,
         `INSERT INTO "main"."t__tusk_rebuild" ("id", "qty")`,
         `SELECT "id", "qty" FROM "main"."t";`,
+        // Since 3.25 a plain RENAME TO re-parses every sqlite_schema entry, so a view
+        // or trigger naming the just-dropped original aborts the whole rebuild.
+        `PRAGMA legacy_alter_table=1;`,
         `DROP TABLE "main"."t";`,
         `ALTER TABLE "main"."t__tusk_rebuild" RENAME TO "t";`,
+        `PRAGMA legacy_alter_table=0;`,
         `CREATE INDEX "t_qty_idx" ON "t" ("qty")`,
       ].join("\n"),
     );
@@ -444,6 +458,223 @@ describe("sqlite rebuild", () => {
     };
     expect(needsRebuild(s)).toBe(false);
     expect(tableDiff(s)).toBe(`ALTER TABLE "main"."t" RENAME COLUMN "a" TO "b"`);
+  });
+  // Everything below is what the pragmas cannot see: dropping it on a rebuild destroyed
+  // the constraint/collation/expression with no error and no warning.
+  it("carries CHECK, COLLATE, generated columns, triggers and table options across", () => {
+    setSqlDialect("sqlite");
+    const s = {
+      ...rebuildSpec(),
+      columns: [
+        origCol({
+          orig: { name: "id", type: "integer", nullable: false, default: "", comment: "" },
+          name: "id",
+          type: "integer",
+          nullable: false,
+          isPk: true,
+          origPk: true,
+        }),
+        origCol({
+          orig: { name: "email", type: "text", nullable: true, default: "", comment: "" },
+          name: "email",
+          type: "varchar(80)",
+          nullable: true,
+          collate: "NOCASE",
+          check: "email <> ''",
+        }),
+        origCol({
+          orig: { name: "total", type: "int", nullable: true, default: "", comment: "" },
+          name: "total",
+          type: "int",
+          nullable: true,
+          generated: "GENERATED ALWAYS AS (id * 2) STORED",
+        }),
+      ],
+      keepIndexes: [] as string[],
+      keepConstraints: [`CONSTRAINT "ck_qty" CHECK (qty > 0)`],
+      keepTriggers: [`CREATE TRIGGER "t_ins" AFTER INSERT ON "t" BEGIN SELECT 1; END`],
+      tableOptions: "WITHOUT ROWID",
+    };
+    expect(tableDiff(s)).toBe(
+      [
+        `-- SQLite can't ALTER "main"."t" in place — rebuilding it (create → copy → drop → rename).`,
+        `CREATE TABLE "main"."t__tusk_rebuild" (`,
+        `  "id" integer PRIMARY KEY,`,
+        `  "email" varchar(80) COLLATE NOCASE CHECK (email <> ''),`,
+        `  "total" int GENERATED ALWAYS AS (id * 2) STORED,`,
+        `  CONSTRAINT "ck_qty" CHECK (qty > 0)`,
+        `) WITHOUT ROWID;`,
+        // A generated column has no stored value to copy.
+        `INSERT INTO "main"."t__tusk_rebuild" ("id", "email")`,
+        `SELECT "id", "email" FROM "main"."t";`,
+        `PRAGMA legacy_alter_table=1;`,
+        `DROP TABLE "main"."t";`,
+        `ALTER TABLE "main"."t__tusk_rebuild" RENAME TO "t";`,
+        `PRAGMA legacy_alter_table=0;`,
+        `CREATE TRIGGER "t_ins" AFTER INSERT ON "t" BEGIN SELECT 1; END`,
+      ].join("\n"),
+    );
+  });
+  it("refuses a rename in the same pass as a rebuild", () => {
+    setSqlDialect("sqlite");
+    const renamedTable = { ...rebuildSpec(), newName: "t2" };
+    expect(tableDiffProblems(renamedTable).map((p) => p.message).join(" ")).toMatch(/rename on its own first/);
+    const cols = rebuildSpec().columns;
+    cols[1] = { ...cols[1], name: "amount" };
+    const renamedCol = { ...rebuildSpec(), columns: cols };
+    expect(tableDiffProblems(renamedCol).map((p) => p.message).join(" ")).toMatch(/rename on its own first/);
+    // …but a rename with no rebuild is still fine.
+    expect(tableDiffProblems({ ...rebuildSpec(), newName: "t2", columns: [] })).toEqual([]);
+  });
+  it("refuses a rebuild when the stored definition could not be read", () => {
+    setSqlDialect("sqlite");
+    expect(
+      tableDiffProblems({ ...rebuildSpec(), definitionRead: false }).map((p) => p.message).join(" "),
+    ).toMatch(/couldn't read this table's stored CREATE statement/);
+  });
+  it("dropping an indexed column needs a rebuild, and refuses while the index survives", () => {
+    setSqlDialect("sqlite");
+    const dropQty = {
+      ...rebuildSpec(),
+      columns: [
+        rebuildSpec().columns[0],
+        { ...rebuildSpec().columns[1], type: "integer", dropped: true },
+      ],
+      dependents: [{ name: "t_qty_idx", kind: "index" as const, columns: ["qty"] }],
+    };
+    // SQLite's DROP COLUMN refuses an indexed column outright.
+    expect(needsRebuild(dropQty)).toBe(true);
+    expect(tableDiffProblems(dropQty).map((p) => p.message).join(" ")).toMatch(/used by index "t_qty_idx"/);
+    // With the index ticked for dropping there is no dependency and no rebuild.
+    const withIndexDropped = { ...dropQty, dependents: [], dropIndexes: ["t_qty_idx"] };
+    expect(needsRebuild(withIndexDropped)).toBe(false);
+    expect(tableDiffProblems(withIndexDropped)).toEqual([]);
+    // The index must go BEFORE the column, or the engine refuses the drop.
+    expect(tableDiff(withIndexDropped)).toBe(
+      [`DROP INDEX "main"."t_qty_idx"`, `ALTER TABLE "main"."t" DROP COLUMN "qty"`].join(";\n"),
+    );
+  });
+  it("reordering columns is a rebuild (and only SQLite can express it)", () => {
+    setSqlDialect("sqlite");
+    const s = rebuildSpec();
+    const swapped = {
+      ...s,
+      columns: [
+        { ...s.columns[1], type: "integer" },
+        s.columns[0],
+      ],
+      origOrder: ["id", "qty"],
+    };
+    expect(needsRebuild(swapped)).toBe(true);
+    expect(tableDiff(swapped)).toContain(`INSERT INTO "main"."t__tusk_rebuild" ("qty", "id")`);
+    // Same order = no rebuild.
+    expect(needsRebuild({ ...s, columns: [s.columns[0], { ...s.columns[1], type: "integer" }], origOrder: ["id", "qty"] })).toBe(
+      false,
+    );
+  });
+  it("a constraint-backed index is offered once, under Constraints", () => {
+    const indexes = [{ name: "uq" }, { name: "PRIMARY" }, { name: "plain_idx" }];
+    expect(droppableIndexes(indexes, [{ name: "uq" }, { name: "PRIMARY" }]).map((i) => i.name)).toEqual([
+      "plain_idx",
+    ]);
+  });
+  it("unique key columns come from the index data, not from its def text", () => {
+    expect(
+      uniqueIndexColumns([
+        { unique: true, columns: ["user_id"] },
+        { unique: false, columns: ["created_at"] },
+        // An expression index reports no columns: it contributes none, rather than
+        // every column whose name appears somewhere in the rendered definition.
+        { unique: true, columns: [] },
+      ]),
+    ).toEqual(["user_id"]);
+  });
+  it("mentionsIdentifier matches whole tokens, not substrings", () => {
+    expect(mentionsIdentifier(`CREATE TRIGGER x BEGIN UPDATE t SET a = NEW."qty"; END`, "qty")).toBe(true);
+    expect(mentionsIdentifier(`CREATE TRIGGER x BEGIN UPDATE t SET a = NEW.qty_total; END`, "qty")).toBe(false);
+  });
+});
+
+describe("engine-specific destructive actions", () => {
+  // On MySQL a schema IS a database: `DROP SCHEMA` there destroys the whole database,
+  // so the capability says so and the Explorer labels/guards it as a database drop.
+  it("MySQL has no plain schema drop", () => {
+    expect(ddlCaps("mysql").dropSchema).toBe("database");
+    expect(ddlCaps("postgres").dropSchema).toBe("schema");
+    expect(ddlCaps("duckdb").dropSchema).toBe("schema");
+    expect(ddlCaps("sqlite").dropSchema).toBe(false);
+    setSqlDialect("mysql");
+    expect(dropSchema("app_prod", true)).toBe("DROP DATABASE `app_prod`");
+    setSqlDialect("postgres");
+    expect(dropSchema("s1", true)).toBe(`DROP SCHEMA "s1" CASCADE`);
+  });
+});
+
+describe("generated columns and MySQL's ON UPDATE", () => {
+  // MODIFY COLUMN restates the WHOLE definition: anything the builder does not carry
+  // is dropped by the server without a word.
+  it("MODIFY restates ON UPDATE CURRENT_TIMESTAMP", () => {
+    setSqlDialect("mysql");
+    const out = tableDiff({
+      schema: "test",
+      table: "t",
+      newName: "t",
+      newComment: "",
+      origComment: "",
+      columns: [
+        origCol({
+          orig: { name: "updated_at", type: "timestamp", nullable: false, default: "CURRENT_TIMESTAMP", comment: "" },
+          name: "updated_at",
+          type: "timestamp",
+          nullable: false,
+          default: "CURRENT_TIMESTAMP",
+          comment: "when",
+          onUpdate: "ON UPDATE CURRENT_TIMESTAMP",
+        }),
+      ],
+      dropIndexes: [],
+      dropConstraints: [],
+    });
+    expect(out).toBe(
+      "ALTER TABLE `test`.`t` MODIFY COLUMN `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT 'when'",
+    );
+  });
+  it("refuses to rewrite a generated column", () => {
+    setSqlDialect("mysql");
+    const spec = {
+      schema: "test",
+      table: "t",
+      newName: "t",
+      newComment: "",
+      origComment: "",
+      columns: [
+        origCol({
+          orig: { name: "total", type: "int", nullable: true, default: "", comment: "" },
+          name: "total",
+          type: "bigint",
+          generated: "GENERATED ALWAYS AS (qty * 2) STORED",
+        }),
+      ],
+      dropIndexes: [],
+      dropConstraints: [],
+    };
+    expect(tableDiffProblems(spec).map((p) => p.message).join(" ")).toMatch(/is a generated column/);
+    // Untouched, it emits nothing at all.
+    const untouched = { ...spec, columns: [{ ...spec.columns[0], type: "int" }] };
+    expect(tableDiffProblems(untouched)).toEqual([]);
+    expect(tableDiff(untouched)).toBe("");
+  });
+});
+
+describe("editColumn · sqlite", () => {
+  // SQLite's ALTER TABLE has no ALTER COLUMN at all; the dialog used to preview
+  // `ALTER COLUMN … TYPE …` with Apply enabled, which SQLite cannot even parse.
+  it("emits only the rename", () => {
+    setSqlDialect("sqlite");
+    expect(
+      editColumn("main", "t", "c", { newName: "c2", type: "bigint", notNull: true, setDefault: "0" }),
+    ).toBe(`ALTER TABLE "main"."t" RENAME COLUMN "c" TO "c2"`);
+    expect(editColumn("main", "t", "c", { type: "bigint", notNull: true })).toBe("");
   });
 });
 
@@ -481,25 +712,87 @@ describe("tableDiff · mysql", () => {
 });
 
 describe("validateColumns", () => {
-  it("rejects empty, duplicate (case-folded) and nullable-PK columns", () => {
+  it("rejects empty, untyped and nullable-PK columns", () => {
     setSqlDialect("postgres");
     const problems = validateColumns([
       { name: "", type: "int", nullable: true },
-      { name: "a", type: "int", nullable: true },
-      { name: "A", type: "int", nullable: true },
       { name: "b", type: "", nullable: true },
       { name: "c", type: "int", nullable: true, primaryKey: true },
     ]);
     expect(problems.map((p) => p.message)).toEqual([
       "Every column needs a name.",
-      `Column names "a" and "A" collide (this engine folds unquoted names).`,
       `Column "b" needs a type.`,
       `Primary-key column "c" cannot be nullable.`,
     ]);
   });
+  // Tusk ALWAYS quotes identifiers, and quoted "Id"/"id" are two distinct, legal
+  // PostgreSQL columns — only the engines that compare identifiers case-insensitively
+  // may reject the pair.
+  it("case-folds duplicates only where the engine does", () => {
+    const pair = [
+      { name: "a", type: "int", nullable: true },
+      { name: "A", type: "int", nullable: true },
+    ];
+    setSqlDialect("postgres");
+    expect(validateColumns(pair)).toEqual([]);
+    setSqlDialect("mysql");
+    expect(validateColumns(pair).map((p) => p.message)).toEqual([
+      `Column names "a" and "A" collide (MySQL compares identifiers case-insensitively).`,
+    ]);
+  });
+  // The Modify dialog's rows carry `isPk`, the Create dialog's carry `primaryKey`;
+  // reading only one of them made this check silently dead from Modify.
+  it("reads the Modify dialog's isPk as well as primaryKey", () => {
+    setSqlDialect("postgres");
+    expect(validateColumns([{ name: "c", type: "int", nullable: true, isPk: true }]).map((p) => p.message)).toEqual([
+      `Primary-key column "c" cannot be nullable.`,
+    ]);
+    // SQLite genuinely allows NULLs in a non-INTEGER primary key, so it must not block.
+    setSqlDialect("sqlite");
+    expect(validateColumns([{ name: "c", type: "text", nullable: true, isPk: true }])).toEqual([]);
+  });
   it("accepts a well-formed list", () => {
     setSqlDialect("postgres");
     expect(validateColumns([{ name: "id", type: "bigint", nullable: false, primaryKey: true }])).toEqual([]);
+  });
+  // The Create dialog opens with a spare empty row; `createTable` drops it from the SQL,
+  // so validation must ignore it too instead of blanking the preview on open.
+  it("isPlaceholderColumn ignores the untouched spare row only", () => {
+    expect(isPlaceholderColumn({ name: "", type: "text", nullable: true })).toBe(true);
+    expect(isPlaceholderColumn({ name: "", type: "text", nullable: true, default: "1" })).toBe(false);
+    expect(isPlaceholderColumn({ name: "", type: "text", nullable: true, primaryKey: true })).toBe(false);
+    expect(isPlaceholderColumn({ name: "x", type: "text", nullable: true })).toBe(false);
+  });
+});
+
+describe("MySQL literal escaping", () => {
+  // There is no form that is right under both sql_modes, so the backend reports which
+  // one the session uses. Doubling under NO_BACKSLASH_ESCAPES stores two backslashes;
+  // not doubling under the default mode turns the escape into a control character.
+  it("doubles backslashes only when the session treats them as escapes", () => {
+    setMysqlNoBackslashEscapes(false);
+    expect(mysqlTextLiteral("C:\\new\\it's")).toBe("'C:\\\\new\\\\it''s'");
+    setMysqlNoBackslashEscapes(true);
+    expect(mysqlTextLiteral("C:\\new\\it's")).toBe("'C:\\new\\it''s'");
+    setMysqlNoBackslashEscapes(false);
+  });
+});
+
+describe("MySQL table options", () => {
+  it("validates the option tokens and never interpolates a bad one", () => {
+    setSqlDialect("mysql");
+    expect(validateTableOptions({ engine: "InnoDB", charset: "utf8mb4" })).toEqual([]);
+    expect(validateTableOptions({ engine: "InnoDB' , x=(" }).map((p) => p.message)).toEqual([
+      "Engine must be a plain name (letters, digits and _).",
+    ]);
+    const sql = createTable({
+      schema: "test",
+      name: "t",
+      columns: [{ name: "a", type: "int", nullable: true, default: "" }],
+      options: { engine: "InnoDB' , x=(", charset: "utf8mb4" },
+    });
+    expect(sql).toContain("DEFAULT CHARSET=utf8mb4");
+    expect(sql).not.toContain("ENGINE=");
   });
 });
 

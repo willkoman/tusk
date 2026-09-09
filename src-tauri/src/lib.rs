@@ -14,6 +14,7 @@ mod relgraph;
 mod script;
 mod skills;
 mod slack;
+mod sqlite_ddl;
 mod ssh;
 #[cfg(test)]
 mod ssh_tests;
