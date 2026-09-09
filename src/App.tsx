@@ -1238,9 +1238,10 @@ function App() {
   const resultView = () => (planMemo() ? activeTab().resultView ?? "plan" : "grid");
   // EXPLAIN ANALYZE on a mutating statement → explicit confirm (it executes).
   const [confirmAnalyze, setConfirmAnalyze] = createSignal<{ sql: string; origin: UiOrigin } | null>(null);
-  // Whether this DuckDB build accepts PG-style `EXPLAIN (FORMAT json)` —
-  // probed once at connect time (a probe mid-session could disturb the pager).
-  let duckJsonExplain = false;
+  // Whether this DuckDB build accepts PG-style `EXPLAIN (FORMAT json)` — probed once
+  // per connection at connect time (a probe mid-session could disturb the pager), so
+  // it is a per-connection fact, not a module flag: two DuckDB builds can differ.
+  const duckJsonExplain = () => activeState()?.duckJsonExplain ?? false;
 
   function runExplain(analyze: boolean) {
     if (!activeDatabaseAllowed()) {
@@ -1260,7 +1261,7 @@ function App() {
       setStatus("Explain requires exactly one statement — select a single statement and try again");
       return;
     }
-    const wrapped = explainSql(connectionKind(), analyze, stmt, duckJsonExplain);
+    const wrapped = explainSql(connectionKind(), analyze, stmt, duckJsonExplain());
     if (analyze && analyzeExecutesWrite(stmt, connectionKind())) {
       setConfirmAnalyze({ sql: wrapped, origin: captureOrigin() });
       return;
