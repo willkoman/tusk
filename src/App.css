@@ -158,6 +158,9 @@
          are the "comfortable" fallback before a pref has been applied. --- */
   --row-h: 28px;
   --control-h: 28px;
+  /* Toolbar controls are tighter than form controls: a workbench toolbar is a
+     strip of verbs, not a form. --control-h stays the floor for dialog fields. */
+  --control-h-sm: 24px;
   --tab-h: 26px;
   --tree-row-h: 25px;
   --pad-y: 6px;
@@ -176,6 +179,7 @@
 :root[data-density="compact"] {
   --row-h: 24px;
   --control-h: 24px;
+  --control-h-sm: 22px;
   --tab-h: 22px;
   --tree-row-h: 21px;
   --pad-y: 3px;
@@ -665,8 +669,18 @@ button {
   color: var(--text);
   border-radius: var(--r-sm);
   padding: var(--pad-y) var(--pad-x);
+  /* Icons render as block-level SVG (.tw-svg), so a button that mixes an icon
+     with a label must lay its content out as a row — in normal flow the icon
+     takes a line of its own and the control doubles in height. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   transition: background var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
 }
+/* Buttons that read as rows in a list keep their left edge (the rules below set
+   text-align but not display, so the base's centring would win). */
+.settings-tab, .ai-example, .run-chooser button { justify-content: flex-start; }
 button:hover:not(:disabled) { border-color: var(--border-hover); }
 button:disabled { cursor: default; }
 button:disabled,
@@ -1227,10 +1241,26 @@ body > div > .cm-tooltip { z-index: 500; }
 
 /* --- editor toolbar. Three zones: run + file actions on the left, a flexing
        centre, state and view controls on the right. --- */
-.toolbar { display: flex; align-items: center; gap: var(--s3); padding: 6px var(--s3); background: var(--panel); border-bottom: 1px solid var(--border); min-width: 0; }
+.toolbar { display: flex; align-items: center; gap: var(--s2); padding: var(--s1) var(--s3); background: var(--panel); border-bottom: 1px solid var(--border); min-width: 0; }
+/* One height for every toolbar control — button, icon toggle, select, segmented
+   track — so the strip reads as one row of verbs. Padding is horizontal only;
+   the height token owns the vertical size. Dialog fields keep --control-h. */
+.toolbar > button, .toolbar > select, .toolbar > .result-viewtoggle,
+.result-toolbar > button, .result-toolbar > select, .result-toolbar > .result-viewtoggle {
+  height: var(--control-h-sm);
+  min-height: var(--control-h-sm);
+  line-height: 1;
+  font-size: 12.5px;
+  white-space: nowrap;
+  flex: none;
+}
+/* The segmented track keeps its 2px inset; only the controls lose vertical padding. */
+.toolbar > button, .toolbar > select,
+.result-toolbar > button, .result-toolbar > select { padding-top: 0; padding-bottom: 0; }
+.toolbar > button svg, .result-toolbar > button svg { width: 14px; height: 14px; flex: none; }
 .toolbar .run { min-width: 116px; font-variant-numeric: tabular-nums; }
 .toolbar .hint { color: var(--muted); font-size: var(--fs-xs); white-space: nowrap; }
-.toolbar .icon svg { width: 15px; height: 15px; display: block; }
+.toolbar .icon svg { width: 14px; height: 14px; display: block; }
 .toolbar .tb-text, .toolbar .tb-more { white-space: nowrap; }
 /* The overflow affordance is a real button, so collapsed actions never read as gone. */
 .toolbar .tb-more { display: none; padding: var(--pad-y) var(--s3); background: var(--panel-2); border: 1px solid var(--border); font-weight: 700; }
@@ -1284,7 +1314,7 @@ body.dnd-dragging * { cursor: grabbing !important; user-select: none !important;
 .result-toolbar {
   display: flex; align-items: center; gap: var(--s3); padding: var(--s1) var(--s3);
   background: var(--panel); border-bottom: 1px solid var(--border);
-  color: var(--muted); font-size: var(--fs-sm); min-height: 32px; flex: none;
+  color: var(--muted); font-size: var(--fs-sm); min-height: calc(var(--control-h-sm) + var(--s2)); flex: none;
 }
 /* The connection rail repeats here, so the toolbar acting on a result always
    says which session produced it. */
@@ -1466,6 +1496,9 @@ body.dnd-dragging * { cursor: grabbing !important; user-select: none !important;
 .field-error { font-size: var(--fs-xs); line-height: var(--lh-body); font-weight: 400; color: var(--danger); }
 /* Required marker — only on fields that actually block the primary action. */
 .req { color: var(--danger); margin-left: 2px; }
+/* A label is a flex COLUMN (caption over field), so the caption and its required
+   marker must share one inline box or the asterisk drops to a line of its own. */
+.lbl { display: inline-flex; align-items: baseline; }
 .confirm-text { padding: var(--s3) var(--s4) var(--s1); color: var(--text); font-size: var(--fs-base); line-height: var(--lh-body); }
 .confirm-note { font-size: var(--fs-sm); line-height: var(--lh-body); color: var(--text); }
 .confirm-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 3px; font-size: var(--fs-sm); line-height: var(--lh-body); }
@@ -1506,7 +1539,9 @@ button.btn-drop { background: transparent; color: var(--danger); border: 1px sol
 button.btn-drop:hover:not(:disabled) { background: var(--danger-soft); }
 button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
 .drop-locked { font-size: var(--fs-xs); color: var(--muted); }
-.drop-list { display: flex; flex-direction: column; gap: 2px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); padding: 6px; max-height: 170px; overflow-y: auto; }
+/* `flex: none`: .modal-body is a flex column, and without it a tall dialog
+   squeezes these lists until their rows are clipped instead of scrolling. */
+.drop-list { display: flex; flex-direction: column; gap: 2px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); padding: 6px; max-height: 170px; overflow-y: auto; flex: none; }
 .drop-row { display: flex; align-items: center; gap: var(--s2); padding: 3px 6px; border-radius: var(--r-xs); box-shadow: inset 2px 0 0 transparent; }
 .drop-row > button, .drop-row > .drop-locked { margin-left: auto; }
 .drop-row.row-dropped { box-shadow: inset 2px 0 0 var(--danger); background: var(--danger-soft); }
@@ -1525,28 +1560,118 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
 .sql-field .cm-editor .cm-scroller { line-height: var(--lh-body); overflow-x: auto; }
 .sql-field .cm-editor .cm-gutters { display: none; }
 
-/* --- column builder (create / modify table) --- */
-.col-builder { display: flex; flex-direction: column; gap: 5px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--s2); }
-.col-builder-head, .col-builder-row { display: grid; grid-template-columns: 1.3fr 1.3fr 36px 32px 1.1fr 26px; gap: 6px; align-items: center; }
-.col-builder-head { font-size: var(--fs-xs); font-weight: 600; color: var(--muted); padding: 0 2px; }
-.col-builder-head .cb-flag { text-align: center; }
-.col-builder-head .cb-x { text-align: right; }
-.col-builder-row input:not([type="checkbox"]) { padding: 5px 7px; width: 100%; min-width: 0; min-height: 0; }
-.col-builder-row input[type="checkbox"].cb-flag { justify-self: center; }
-.col-builder-row .cb-x { padding: 2px; }
-.cb-move { display: flex; gap: 1px; }
-.cb-move .icon, .cb-x .icon { padding: 1px 2px; font-size: var(--fs-xs); line-height: 1; }
-.col-builder-row .cb-x { display: flex; gap: 1px; justify-content: flex-end; }
-.col-builder-row.extra-row, .col-builder-head.extra-row { grid-template-columns: 0.8fr 1.4fr 1.2fr; }
-.col-builder-row.extra-row .mono { overflow: hidden; text-overflow: ellipsis; }
-.col-builder-head.create-row, .col-builder-row.create-row { grid-template-columns: 34px 1.1fr 1.2fr 30px 30px 30px 44px 1.2fr 46px; }
+/* --- column builder (Create table / Modify table) ---------------------------
+   A column is a two-line record, not a row of squeezed boxes:
+
+     line 1   order · name · type · flags · actions
+     line 2   Default and Comment, full width, labelled inline
+
+   Both lines are grids with fixed templates, and the head repeats line 1's
+   tracks, so every cell lines up down the dialog. Line 2's cells are always
+   present and go quiet when empty rather than disappearing — a column's comment
+   is a field of the column, not an option hidden behind a disclosure.
+
+   The gap is the same token everywhere on purpose: the head's five tracks and
+   the row's `1fr + actions` outer grid (with line 1 nested in the 1fr) then
+   resolve to identical column edges. --- */
+.col-builder {
+  --cb-gap: var(--s2);
+  --cb-order-w: 34px;
+  --cb-flags-w: 100px;
+  --cb-actions-w: 76px;
+  --cb-label-w: 58px;
+  display: flex; flex-direction: column;
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm);
+  /* .modal-body is a flex column: without this the list is compressed to nothing
+     when the dialog is taller than the window, taking its scrollbar with it. */
+  flex: none;
+}
+.col-builder.create-cols { --cb-flags-w: 190px; --cb-actions-w: 58px; }
+.cb-head, .cb-line1 {
+  display: grid;
+  grid-template-columns: var(--cb-order-w) minmax(140px, 1.05fr) minmax(150px, 1.15fr) var(--cb-flags-w);
+  gap: var(--cb-gap);
+  align-items: center;
+}
+.cb-head {
+  grid-template-columns: var(--cb-order-w) minmax(140px, 1.05fr) minmax(150px, 1.15fr) var(--cb-flags-w) var(--cb-actions-w);
+  padding: var(--s2) var(--s3) 6px;
+  font-size: var(--fs-xs); font-weight: 600; color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.cb-head .cb-head-actions { text-align: right; }
+.cb-col {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--cb-actions-w);
+  grid-template-areas: "line1 actions" "line2 line2";
+  gap: 5px var(--cb-gap);
+  padding: 7px var(--s3);
+  border-top: 1px solid var(--border);
+}
+.cb-col:first-of-type { border-top: 0; }
+.cb-line1 { grid-area: line1; }
+.cb-line2 {
+  grid-area: line2;
+  display: grid; grid-template-columns: 1fr 1fr; gap: var(--cb-gap);
+  padding-left: calc(var(--cb-order-w) + var(--cb-gap));
+}
+.cb-line2.is-solo { grid-template-columns: 1fr; }
+.cb-actions { grid-area: actions; display: flex; align-items: center; justify-content: flex-end; gap: 2px; }
+/* Three attribute matchers, to outrank `.modal input:not(…):not(…)`. One height
+   for the text inputs and the CodeMirror fields beside them. */
+.cb-col input:not([type="checkbox"]):not([type="radio"]) {
+  padding: 5px 7px; width: 100%; min-width: 0; min-height: 30px; height: 30px;
+}
+.cb-order { display: flex; gap: 1px; }
+.cb-order .icon, .cb-actions .icon { padding: 1px 2px; font-size: var(--fs-xs); line-height: 1; }
+/* Flags read as words, not as bare boxes with a distant header. */
+.cb-flags { display: flex; align-items: center; gap: var(--s2); min-width: 0; }
+.col-builder .cb-flag {
+  display: inline-flex; flex-direction: row; align-items: center; gap: 3px; flex: none;
+  font-size: var(--fs-xs); font-weight: 600; color: var(--muted); white-space: nowrap; cursor: pointer;
+}
+.col-builder .cb-flag input { margin: 0; flex: none; }
+.col-builder .cb-flag:hover { color: var(--text); }
+
+/* Line 2: an inline label, then the field. Quiet when empty. */
+.col-builder .cb-sub {
+  display: grid; grid-template-columns: var(--cb-label-w) minmax(0, 1fr);
+  align-items: center; gap: 6px;
+  font-size: var(--fs-xs); font-weight: 600; color: var(--muted); min-width: 0;
+}
+.cb-sub-label { text-align: right; opacity: 0.7; }
+.cb-sub .sql-field, .cb-sub input { background: transparent; border-color: transparent; }
+.cb-sub:hover .sql-field, .cb-sub:hover input,
+.cb-sub:focus-within .sql-field, .cb-sub:focus-within input { border-color: var(--border); }
+.cb-sub.is-set .sql-field, .cb-sub.is-set input { background: var(--bg); border-color: var(--border); }
+.cb-sub.is-set .cb-sub-label { color: var(--text); opacity: 1; }
+
+/* Modify: a cell whose value differs from the catalog is marked, so the diff the
+   footer's SQL describes is visible in the form that produced it. */
+.cb-changed > .sql-field, input.cb-changed, .cb-flag.cb-changed input {
+  border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent-soft);
+}
+.cb-flag.cb-changed { color: var(--accent); }
+.cb-sub.cb-changed .cb-sub-label { color: var(--accent); opacity: 1; }
+
+.col-builder .cb-add { width: 100%; margin: 0; border: 0; border-top: 1px solid var(--border); border-radius: 0 0 var(--r-sm) var(--r-sm); background: transparent; color: var(--muted); }
+.col-builder .cb-add:hover:not(:disabled) { background: var(--panel-2); color: var(--text); }
+
 .modify-head { display: flex; gap: var(--s3); }
 .modify-head label { flex: 1; }
-.modify-cols { max-height: min(48vh, 520px); overflow-y: auto; }
-.col-builder-head.modify-row, .col-builder-row.modify-row { grid-template-columns: 34px 1.1fr 1.2fr 32px 28px 1.3fr 1.1fr 62px; }
-.col-builder-row.row-dropped { opacity: 0.62; box-shadow: inset 2px 0 0 var(--danger); border-radius: var(--r-xs); }
-.col-builder-row.row-dropped input { text-decoration: line-through; }
-.col-builder-row.row-new { background: var(--row-new-soft); border-radius: var(--r-xs); }
+.cb-scroll { max-height: min(46vh, 520px); overflow-y: auto; }
+.cb-col.row-dropped { box-shadow: inset 3px 0 0 var(--danger); background: var(--danger-soft); }
+.cb-col.row-dropped input, .cb-col.row-dropped .cm-content { text-decoration: line-through; }
+.cb-col.row-dropped .cb-sub-label, .cb-col.row-dropped .cb-flag { opacity: 0.75; }
+.cb-col.row-new { box-shadow: inset 3px 0 0 var(--row-new); background: var(--row-new-soft); }
+
+/* The old per-column extra grid still carries CHECK expressions in Create. */
+.col-builder-row.extra-row, .col-builder-head.extra-row {
+  display: grid; grid-template-columns: 0.8fr 2fr; gap: var(--cb-gap, var(--s2)); align-items: center;
+  padding: 6px var(--s3); border-top: 1px solid var(--border);
+}
+.col-builder-row.extra-row:first-of-type { border-top: 0; }
+.col-builder-row.extra-row .mono { overflow: hidden; text-overflow: ellipsis; }
 
 /* --- foreign-key editor (create / modify / constraint dialogs) --- */
 .fk-editor { display: flex; flex-direction: column; gap: var(--s2); }

@@ -1,4 +1,4 @@
-import { batch, createSignal, createMemo, createEffect, on, onMount, onCleanup, For, Show, lazy } from "solid-js";
+import { batch, createSignal, createMemo, createEffect, on, onMount, onCleanup, untrack, For, Show, lazy } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -28,6 +28,18 @@ import {
 import { TabSwitcher, type TabSwitcherItem } from "./TabSwitcher";
 import { densityTokens, gridRowH, normalizeDensity, rootFontSize } from "./appearance";
 // --- end ui/customize imports ---
+// --- ui/p0-layout: live viewport + panel bounds (see src/viewport.ts) ---
+import { syncViewport, viewportH, viewportW } from "./viewport";
+import {
+  AI_DOCK_CAP,
+  HISTORY_DOCK_CAP,
+  clampPanelSizes,
+  defaultEditorHeight,
+  maxEditorHeight,
+  maxSideDockWidth,
+  maxSidebarWidth,
+} from "./panelLimits";
+// --- end ui/p0-layout imports ---
 import { FilterBar } from "./grid/FilterBar";
 import { classResolver, conditions, emptyFilter, hasConditions, removeNode, type FilterTree } from "./grid/filterModel";
 import { activeConditionCount } from "./grid/filterSql";
@@ -962,9 +974,9 @@ function App() {
   const [editorApi, setEditorApi] = createSignal<EditorApi | null>(null);
   // Persisted editor↔results split height, clamped to the current window (a value saved
   // on a taller window must not push the results pane off a shorter one).
-  const editorHDefault = Math.max(300, Math.round((window.innerHeight - 120) * 0.6));
+  const editorHDefault = defaultEditorHeight(viewportH());
   const [editorH, setEditorH] = createSignal(
-    Math.max(80, Math.min(savedLayout.editorH ?? editorHDefault, window.innerHeight - 160)),
+    Math.max(80, Math.min(savedLayout.editorH ?? editorHDefault, maxEditorHeight(viewportH()))),
   );
 
   // editor prefs (persisted) + cursor readout + per-connection buffer key
@@ -2193,12 +2205,25 @@ function App() {
       }
     }
   };
-  const onWindowFocus = () => void refreshTransactionStatus();
+  const onWindowFocus = () => {
+    // A window that changed size while unfocused (snap, another monitor, a DPI
+    // change) may not have reported it; re-read before trusting the last size.
+    syncViewport();
+    void refreshTransactionStatus();
+  };
   let appMounted = true;
+  let nativeResizeUnlisten: UnlistenFn | null = null;
   onMount(async () => {
     transactionTimer = setInterval(() => {
       if (transactionOpen(transaction())) setTransactionNow(Date.now());
     }, 1000);
+    try {
+      // Tauri reports the native window resize even when the WebView does not.
+      const unlistenResized = await getCurrentWindow().onResized(() => syncViewport());
+      if (!appMounted) unlistenResized(); else nativeResizeUnlisten = unlistenResized;
+    } catch {
+      /* window events unavailable; the ResizeObserver still drives the viewport */
+    }
     try {
       const unlistenClose = await getCurrentWindow().onCloseRequested((event) => {
         if (allowNativeClose) return;
@@ -2251,11 +2276,12 @@ function App() {
     // Window-level editor/tab shortcuts (the in-editor keymap owns Mod-Enter/Shift-Alt-f/
     // Mod-f/Tab — no overlap with T/W/S/O). preventDefault so Cmd-W closes the tab, not the window.
     window.addEventListener("keydown", onWindowKey);
-    // Shrinking the window re-clamps every docked panel (see clampPanels).
-    window.addEventListener("resize", clampPanels);
     window.addEventListener("focus", onWindowFocus);
     window.addEventListener("beforeunload", onBeforeUnload);
-    clampPanels();
+    // The viewport signal re-clamps the panels on its own (createEffect above).
+    // The WebView can still finish its first layout at the pre-show window bounds
+    // and settle without reporting a `resize`, so re-read after the first paint.
+    requestAnimationFrame(() => syncViewport());
     // Load profiles + auto-connect FIRST — the core startup path must not depend on
     // the Slack event bridge (a rejected listen() would otherwise abort onMount and
     // leave the connect screen empty).
@@ -2325,13 +2351,13 @@ function App() {
     tabDrag = null;
     document.removeEventListener("contextmenu", preventNativeContextMenu);
     window.removeEventListener("keydown", onWindowKey);
-    window.removeEventListener("resize", clampPanels);
     window.removeEventListener("focus", onWindowFocus);
     window.removeEventListener("beforeunload", onBeforeUnload);
     for (const u of slackUnlisten) u();
     clearTimeout(saveTimer);
     if (transactionTimer) clearInterval(transactionTimer);
     nativeCloseUnlisten?.();
+    nativeResizeUnlisten?.();
     for (const rt of runtimes.values()) {
       for (const timer of rt.runTimers) clearInterval(timer);
       rt.runTimers.clear();
@@ -5141,17 +5167,30 @@ function App() {
 
   // Hard safety bounds: no side panel may grow past the point where the editor/main
   // column disappears, and the editor↔results split always leaves the results pane
-  // reachable. Re-applied on window resize, so shrinking the window can never leave
-  // a panel covering everything (a size saved on a big monitor stays harmless).
-  const maxSidebarW = () => Math.max(180, Math.min(560, window.innerWidth - 420));
-  const maxSideDockW = (cap: number) => Math.max(240, Math.min(cap, window.innerWidth - 480));
-  const maxEditorH = () => Math.max(80, window.innerHeight - 160);
+  // reachable. The bounds are pure functions of the LIVE viewport (src/viewport.ts),
+  // so a size saved on a big monitor stays harmless and a viewport settle the WebView
+  // never announced as a `resize` still re-clamps.
+  const maxSidebarW = () => maxSidebarWidth(viewportW());
+  const maxSideDockW = (cap: number) => maxSideDockWidth(viewportW(), cap);
+  const maxEditorH = () => maxEditorHeight(viewportH());
   function clampPanels() {
-    setSidebarW(Math.min(sidebarW(), maxSidebarW()));
-    setAiW(Math.min(aiW(), maxSideDockW(760)));
-    setHistoryW(Math.min(historyW(), maxSideDockW(700)));
-    setEditorH(Math.min(editorH(), maxEditorH()));
+    const vw = viewportW();
+    const vh = viewportH();
+    untrack(() => {
+      const next = clampPanelSizes(
+        { sidebarW: sidebarW(), aiW: aiW(), historyW: historyW(), editorH: editorH() },
+        vw,
+        vh,
+      );
+      setSidebarW(next.sidebarW);
+      setAiW(next.aiW);
+      setHistoryW(next.historyW);
+      setEditorH(next.editorH);
+    });
   }
+  // Every viewport change re-clamps; the effect replaces the old window `resize`
+  // listener, which missed sizes that arrived without an event.
+  createEffect(clampPanels);
 
   function toggleSidebar() {
     setSidebarOpen((v) => !v);
@@ -5194,8 +5233,8 @@ function App() {
     document.body.style.userSelect = "none";
   }
   const startResizeSidebar = (e: MouseEvent) => startResizeH(e, sidebarW, setSidebarW, 1, 180, maxSidebarW());
-  const startResizeAi = (e: MouseEvent) => startResizeH(e, aiW, setAiW, -1, 280, maxSideDockW(760));
-  const startResizeHistory = (e: MouseEvent) => startResizeH(e, historyW, setHistoryW, -1, 240, maxSideDockW(700));
+  const startResizeAi = (e: MouseEvent) => startResizeH(e, aiW, setAiW, -1, 280, maxSideDockW(AI_DOCK_CAP));
+  const startResizeHistory = (e: MouseEvent) => startResizeH(e, historyW, setHistoryW, -1, 240, maxSideDockW(HISTORY_DOCK_CAP));
 
   /**
    * The connect screen. It is the whole window when nothing is open, and a modal over

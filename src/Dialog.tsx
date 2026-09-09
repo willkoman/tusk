@@ -1,6 +1,7 @@
 import { type JSX, Show, createSignal, onCleanup, onMount } from "solid-js";
 import { Icon } from "./Icons";
 import { dialogWidth, type DialogSize } from "./dialogWidths";
+import { viewportW } from "./viewport";
 
 export type { DialogSize };
 
@@ -33,8 +34,9 @@ export function Dialog(props: {
   let modal: HTMLDivElement | undefined;
   let priorFocus: HTMLElement | null = null;
   const canClose = () => props.dismissable !== false;
-  const [viewport, setViewport] = createSignal(typeof window === "undefined" ? 1280 : window.innerWidth);
-  const width = () => dialogWidth(props.size ?? "sm", viewport());
+  // Width follows the LIVE viewport (src/viewport.ts), not a size read once when the
+  // dialog opened: a window that settles or resizes under an open dialog re-sizes it.
+  const width = () => dialogWidth(props.size ?? "sm", viewportW());
   const visible = (el: HTMLElement) => !el.hasAttribute("hidden") && el.getClientRects().length > 0;
   const focusable = () => modal
     ? [...modal.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [href], [tabindex]:not([tabindex="-1"])')]
@@ -42,9 +44,6 @@ export function Dialog(props: {
     : [];
   onMount(() => {
     priorFocus = document.activeElement as HTMLElement | null;
-    const onResize = () => setViewport(window.innerWidth);
-    window.addEventListener("resize", onResize);
-    onCleanup(() => window.removeEventListener("resize", onResize));
     queueMicrotask(() => {
       if (!modal?.isConnected || modal.contains(document.activeElement)) return;
       // Open on the first field so a form is typeable without reaching for the mouse.

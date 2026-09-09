@@ -48,7 +48,7 @@ export function DuplicateDialog(props: {
       }
     >
       <label>
-        New table name<span class="req">*</span>
+        <span class="lbl">New table name<span class="req">*</span></span>
         <input value={name()} onInput={(e) => setName(e.currentTarget.value)} />
       </label>
       <label class="checkbox">

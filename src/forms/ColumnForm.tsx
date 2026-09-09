@@ -59,11 +59,11 @@ export function ColumnForm(props: {
       }
     >
       <label>
-        Name<span class="req">*</span>
+        <span class="lbl">Name<span class="req">*</span></span>
         <input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="column_name" />
       </label>
       <label>
-        Type<span class="req">*</span>
+        <span class="lbl">Type<span class="req">*</span></span>
         <SqlField value={type()} typesOnly onChange={setType} placeholder="text" />
       </label>
       <label>

@@ -53,6 +53,33 @@ type Row = {
  *  dialog's fields, so its inputs are read-only. */
 const isGenerated = (r: Row) => !!r.generated?.trim();
 
+/** Editable fields whose value the dialog diffs against the catalog. */
+export type ColumnField = "name" | "type" | "nullable" | "default" | "comment" | "isPk";
+
+/**
+ * Whether one field of an existing column now differs from what the catalog
+ * reported. A column the dialog added has no catalog side, so nothing is marked
+ * "changed" on it — the whole row is already marked as new. Pure; tested.
+ */
+export function changed(row: Pick<Row, "orig" | ColumnField | "origPk">, field: ColumnField): boolean {
+  const orig = row.orig;
+  if (!orig) return false;
+  switch (field) {
+    case "name":
+      return row.name !== orig.name;
+    case "type":
+      return row.type !== orig.type;
+    case "nullable":
+      return row.nullable !== orig.nullable;
+    case "default":
+      return (row.default ?? "") !== (orig.default ?? "");
+    case "comment":
+      return (row.comment ?? "") !== (orig.comment ?? "");
+    case "isPk":
+      return row.isPk !== row.origPk;
+  }
+}
+
 let uid = 1;
 const fromColumn = (c: Column): Row => ({
   uid: uid++,
@@ -318,49 +345,74 @@ export function ModifyTableForm(props: {
       </div>
 
       <div class="field-label">{sectionLabel("Columns", droppedColumns().length)}</div>
-      <div class="col-builder modify-cols">
-        <div class="col-builder-head modify-row">
-          <span class="cb-move" />
+      <div class="col-builder cb-scroll">
+        <div class="cb-head">
+          <span />
           <span>Name</span>
           <span>Type</span>
-          <span class="cb-flag">Null</span>
-          <span class="cb-flag">PK</span>
-          <span>Default</span>
-          <span>Comment</span>
-          <span class="cb-x">Action</span>
+          <span>Flags</span>
+          <span class="cb-head-actions">Action</span>
         </div>
         <For each={cols}>
           {(c, i) => (
-            <div class="col-builder-row modify-row" classList={{ "row-dropped": c.dropped, "row-new": !c.orig }}>
-              {/* Column order is only expressible where the table can be rebuilt
-                  (SQLite); everywhere else ALTER TABLE has no way to move a column. */}
-              <span class="cb-move">
-                <Show when={caps.rebuild}>
-                  <button class="icon" title="Move up" disabled={i() === 0} onClick={() => move(i(), -1)}>↑</button>
-                  <button class="icon" title="Move down" disabled={i() === cols.length - 1} onClick={() => move(i(), 1)}>↓</button>
+            <div class="cb-col" classList={{ "row-dropped": c.dropped, "row-new": !c.orig }}>
+              <div class="cb-line1">
+                {/* Column order is only expressible where the table can be rebuilt
+                    (SQLite); everywhere else ALTER TABLE has no way to move a column. */}
+                <span class="cb-order">
+                  <Show when={caps.rebuild}>
+                    <button class="icon" title="Move up" disabled={i() === 0} onClick={() => move(i(), -1)}>↑</button>
+                    <button class="icon" title="Move down" disabled={i() === cols.length - 1} onClick={() => move(i(), 1)}>↓</button>
+                  </Show>
+                </span>
+                <input
+                  value={c.name}
+                  classList={{ "cb-changed": changed(c, "name") }}
+                  disabled={c.dropped}
+                  onInput={(e) => setCols(i(), "name", e.currentTarget.value)}
+                  placeholder="name"
+                />
+                <Show when={!isGenerated(c)} fallback={<span class="mono muted-hint">{c.type}</span>}>
+                  <span classList={{ "cb-changed": changed(c, "type") }}>
+                    <SqlField value={c.type} typesOnly onChange={(v) => setCols(i(), "type", v)} placeholder="type" />
+                  </span>
                 </Show>
-              </span>
-              <input value={c.name} disabled={c.dropped} onInput={(e) => setCols(i(), "name", e.currentTarget.value)} placeholder="name" />
-              <Show when={!isGenerated(c)} fallback={<span class="mono muted-hint">{c.type}</span>}>
-                <SqlField value={c.type} typesOnly onChange={(v) => setCols(i(), "type", v)} placeholder="type" />
-              </Show>
-              <input class="cb-flag" type="checkbox" disabled={c.dropped || isGenerated(c)} checked={c.nullable} onChange={(e) => setCols(i(), "nullable", e.currentTarget.checked)} />
-              <input class="cb-flag" type="checkbox" disabled={c.dropped || isGenerated(c)} checked={c.isPk} onChange={(e) => setCols(i(), "isPk", e.currentTarget.checked)} />
-              <Show
-                when={!isGenerated(c)}
-                fallback={<span class="mono muted-hint" title={c.generated}>generated</span>}
-              >
-                <SqlField value={c.default} columns={colNames()} onChange={(v) => setCols(i(), "default", v)} placeholder="(none)" />
-              </Show>
-              <input
-                value={c.comment}
-                disabled={c.dropped || isGenerated(c) || caps.comments === "none"}
-                onInput={(e) => setCols(i(), "comment", e.currentTarget.value)}
-                placeholder={caps.comments === "none" ? `no comments on ${caps.label}` : "(none)"}
-              />
+                <span class="cb-flags">
+                  <label class="cb-flag" classList={{ "cb-changed": changed(c, "nullable") }} title="Nullable">
+                    <input type="checkbox" disabled={c.dropped || isGenerated(c)} checked={c.nullable} onChange={(e) => setCols(i(), "nullable", e.currentTarget.checked)} />
+                    Null
+                  </label>
+                  <label class="cb-flag" classList={{ "cb-changed": changed(c, "isPk") }} title="Primary key">
+                    <input type="checkbox" disabled={c.dropped || isGenerated(c)} checked={c.isPk} onChange={(e) => setCols(i(), "isPk", e.currentTarget.checked)} />
+                    PK
+                  </label>
+                </span>
+              </div>
+              {/* Line 2 precedes the actions in the DOM so Tab runs
+                  name → type → flags → default → comment. */}
+              <div class="cb-line2">
+                <label class="cb-sub" classList={{ "is-set": !!c.default?.trim(), "cb-changed": changed(c, "default") }}>
+                  <span class="cb-sub-label">Default</span>
+                  <Show
+                    when={!isGenerated(c)}
+                    fallback={<span class="mono muted-hint" title={c.generated}>generated</span>}
+                  >
+                    <SqlField value={c.default} columns={colNames()} onChange={(v) => setCols(i(), "default", v)} placeholder="(none)" />
+                  </Show>
+                </label>
+                <label class="cb-sub" classList={{ "is-set": !!c.comment?.trim(), "cb-changed": changed(c, "comment") }}>
+                  <span class="cb-sub-label">Comment</span>
+                  <input
+                    value={c.comment}
+                    disabled={c.dropped || isGenerated(c) || caps.comments === "none"}
+                    onInput={(e) => setCols(i(), "comment", e.currentTarget.value)}
+                    placeholder={caps.comments === "none" ? `no comments on ${caps.label}` : "(none)"}
+                  />
+                </label>
+              </div>
               {/* Columns, indexes and constraints all drop the same way: a named
                   button that flips the row into a reversible "will be dropped" state. */}
-              <span class="cb-x">
+              <span class="cb-actions">
                 <Show
                   when={c.orig && c.dropped}
                   fallback={
@@ -373,7 +425,7 @@ export function ModifyTableForm(props: {
             </div>
           )}
         </For>
-        <button class="ghost full" onClick={addRow}>＋ Add column</button>
+        <button class="ghost cb-add" onClick={addRow}>＋ Add column</button>
       </div>
 
       <Show when={shownIndexes().length}>
