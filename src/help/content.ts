@@ -1398,6 +1398,7 @@ export const TOPICS: Topic[] = [
         "items": [
           "The preview is the minimal `ALTER` script, ordered so every statement resolves, with the table rename last.",
           "It refuses an empty or duplicate column name, a nullable primary key, or a generated column.",
+          "A column is two lines: name, type and flags on the first; default and comment on the second. A value that differs from the catalog is outlined.",
           "**Drop** on a column, index or constraint row marks it (struck through, **Keep** undoes); the footer counts pending drops and Apply confirms them by name.",
           "Column reordering is offered on SQLite only.",
           "A multi-statement script says underneath how it runs, including when it is not atomic, as on MySQL."
@@ -1423,7 +1424,8 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "Auto-numbering: Postgres identity, MySQL `AUTO_INCREMENT`, SQLite `INTEGER PRIMARY KEY AUTOINCREMENT`, DuckDB a sequence alongside the table.",
-          "An expandable section adds per-column checks and comments, foreign keys, `IF NOT EXISTS`, `TEMPORARY`, and MySQL's engine and charset options."
+          "A column is two lines: name, type and flags on the first; default and comment on the second.",
+          "An expandable section adds per-column checks, foreign keys, `IF NOT EXISTS`, `TEMPORARY`, and MySQL's engine and charset options."
         ]
       },
       {
@@ -3590,7 +3592,8 @@ export const TOPICS: Topic[] = [
           "**Microsoft SQL Server is a connectable driver**: `OFFSET`/`FETCH` paging, a full Explorer tree, Copy DDL from `sys.*`, and T-SQL lexing.",
           "**Not yet on SQL Server** — file import, Explorer DDL builders, the Slack bot, and Explain.",
           "**Table editing on every engine that can express it**, with a searchable FK picker and a SQLite table rebuild. See [[topic:sidebar|Schema explorer & DDL]].",
-          "**Safer defaults** — deleting a saved connection asks first, and Slack autostart binds to one saved connection."
+          "**Safer defaults** — deleting a saved connection asks first, and Slack autostart binds to one saved connection.",
+          "**Tighter toolbars and a roomier column editor** — toolbar controls are one height again, and each column in Create/Modify table gets its own two-line row with a dedicated default and comment."
         ]
       },
       {

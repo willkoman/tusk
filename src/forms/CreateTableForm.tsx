@@ -181,7 +181,7 @@ export function CreateTableForm(props: {
     >
       <div class="modify-head">
         <label>
-          Table name<span class="req">*</span>
+          <span class="lbl">Table name<span class="req">*</span></span>
           <input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="table_name" />
         </label>
         <Show when={caps.comments !== "none"}>
@@ -192,78 +192,100 @@ export function CreateTableForm(props: {
         </Show>
       </div>
 
-      <div class="col-builder">
-        <div class="col-builder-head create-row">
-          <span class="cb-move" />
+      <div class="col-builder create-cols">
+        <div class="cb-head">
+          <span />
           <span>Name</span>
           <span>Type</span>
-          <span class="cb-flag" title="Nullable">Null</span>
-          <span class="cb-flag" title="Primary key">PK</span>
-          <span class="cb-flag" title="Unique">Uq</span>
-          <span class="cb-flag" title={IDENTITY_HINT[caps.identity]}>{IDENTITY_LABEL[caps.identity]}</span>
-          <span>Default</span>
-          <span class="cb-x" />
+          <span>Flags</span>
+          <span class="cb-head-actions">Actions</span>
         </div>
         <For each={cols}>
           {(c, i) => (
-            <div class="col-builder-row create-row">
-              <span class="cb-move">
-                <button class="icon" title="Move up" disabled={i() === 0} onClick={() => move(i(), -1)}>↑</button>
-                <button class="icon" title="Move down" disabled={i() === cols.length - 1} onClick={() => move(i(), 1)}>↓</button>
-              </span>
-              <input value={c.name} onInput={(e) => update(i(), { name: e.currentTarget.value })} placeholder="name" />
-              <SqlField value={c.type} typesOnly onChange={(v) => update(i(), { type: v })} placeholder="type" />
-              <input
-                class="cb-flag"
-                type="checkbox"
-                title="Nullable"
-                checked={c.nullable}
-                onChange={(e) => update(i(), { nullable: e.currentTarget.checked })}
-              />
-              <input
-                class="cb-flag"
-                type="checkbox"
-                title="Primary key"
-                checked={c.primaryKey}
-                onChange={(e) =>
-                  update(i(), { primaryKey: e.currentTarget.checked, nullable: e.currentTarget.checked ? false : c.nullable })
-                }
-              />
-              <input
-                class="cb-flag"
-                type="checkbox"
-                title="Unique"
-                checked={c.unique}
-                onChange={(e) => update(i(), { unique: e.currentTarget.checked })}
-              />
-              <input
-                class="cb-flag"
-                type="checkbox"
-                title={IDENTITY_HINT[caps.identity]}
-                checked={c.identity}
-                onChange={(e) => update(i(), { identity: e.currentTarget.checked })}
-              />
-              <SqlField
-                value={c.default}
-                columns={colNames()}
-                onChange={(v) => update(i(), { default: v })}
-                placeholder="(none)"
-              />
-              <span class="cb-x">
+            <div class="cb-col">
+              {/* Line 1: what the column IS. */}
+              <div class="cb-line1">
+                <span class="cb-order">
+                  <button class="icon" title="Move up" disabled={i() === 0} onClick={() => move(i(), -1)}>↑</button>
+                  <button class="icon" title="Move down" disabled={i() === cols.length - 1} onClick={() => move(i(), 1)}>↓</button>
+                </span>
+                <input value={c.name} onInput={(e) => update(i(), { name: e.currentTarget.value })} placeholder="name" />
+                <SqlField value={c.type} typesOnly onChange={(v) => update(i(), { type: v })} placeholder="type" />
+                <span class="cb-flags">
+                  <label class="cb-flag" title="Nullable">
+                    <input
+                      type="checkbox"
+                      checked={c.nullable}
+                      onChange={(e) => update(i(), { nullable: e.currentTarget.checked })}
+                    />
+                    Null
+                  </label>
+                  <label class="cb-flag" title="Primary key">
+                    <input
+                      type="checkbox"
+                      checked={c.primaryKey}
+                      onChange={(e) =>
+                        update(i(), { primaryKey: e.currentTarget.checked, nullable: e.currentTarget.checked ? false : c.nullable })
+                      }
+                    />
+                    PK
+                  </label>
+                  <label class="cb-flag" title="Unique">
+                    <input
+                      type="checkbox"
+                      checked={c.unique}
+                      onChange={(e) => update(i(), { unique: e.currentTarget.checked })}
+                    />
+                    Uq
+                  </label>
+                  <label class="cb-flag" title={IDENTITY_HINT[caps.identity]}>
+                    <input
+                      type="checkbox"
+                      checked={c.identity}
+                      onChange={(e) => update(i(), { identity: e.currentTarget.checked })}
+                    />
+                    {IDENTITY_LABEL[caps.identity]}
+                  </label>
+                </span>
+              </div>
+              {/* Line 2: the long text. Declared before the actions so Tab runs
+                  name → type → flags → default → comment. */}
+              <div class="cb-line2" classList={{ "is-solo": caps.comments === "none" }}>
+                <label class="cb-sub" classList={{ "is-set": !!c.default?.trim() }}>
+                  <span class="cb-sub-label">Default</span>
+                  <SqlField
+                    value={c.default}
+                    columns={colNames()}
+                    onChange={(v) => update(i(), { default: v })}
+                    placeholder="(none)"
+                  />
+                </label>
+                <Show when={caps.comments !== "none"}>
+                  <label class="cb-sub" classList={{ "is-set": !!c.comment?.trim() }}>
+                    <span class="cb-sub-label">Comment</span>
+                    <input
+                      value={c.comment ?? ""}
+                      onInput={(e) => update(i(), { comment: e.currentTarget.value })}
+                      placeholder="(none)"
+                    />
+                  </label>
+                </Show>
+              </div>
+              <span class="cb-actions">
                 <button class="icon" title="Duplicate column" onClick={() => duplicateRow(i())}>⧉</button>
                 <button class="icon" title="Remove" onClick={() => removeRow(i())}>✕</button>
               </span>
             </div>
           )}
         </For>
-        <button class="ghost full" onClick={addRow}>＋ Add column</button>
+        <button class="ghost cb-add" onClick={addRow}>＋ Add column</button>
       </div>
 
       <button class="ghost full" onClick={() => setShowAdvanced(!showAdvanced())}>
-        {showAdvanced() ? "▾" : "▸"} Checks, comments, foreign keys{caps.tableOptions ? " and table options" : ""}
+        {showAdvanced() ? "▾" : "▸"} Checks, foreign keys{caps.tableOptions ? " and table options" : ""}
       </button>
       <Show when={showAdvanced()}>
-        <div class="field-label">Per-column check and comment</div>
+        <div class="field-label">Per-column check</div>
         <div class="col-builder">
           <For each={cols}>
             {(c, i) => (
@@ -275,13 +297,6 @@ export function CreateTableForm(props: {
                   onChange={(v) => update(i(), { check: v })}
                   placeholder="CHECK expression (none)"
                 />
-                <Show when={caps.comments !== "none"} fallback={<span class="muted-hint">{caps.label} has no comments</span>}>
-                  <input
-                    value={c.comment ?? ""}
-                    onInput={(e) => update(i(), { comment: e.currentTarget.value })}
-                    placeholder="comment (none)"
-                  />
-                </Show>
               </div>
             )}
           </For>

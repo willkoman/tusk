@@ -158,3 +158,51 @@ describe("ModifyTableForm — constraint drops", () => {
     expect(v.onRun).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("ModifyTableForm — the column row", () => {
+  const colFor = (name: string) =>
+    [...document.querySelectorAll<HTMLElement>(".cb-col")].find(
+      (c) => c.querySelector<HTMLInputElement>(".cb-line1 input")?.value === name,
+    )!;
+
+  it("gives every column a default and a comment cell of its own", () => {
+    open();
+    for (const name of ["id", "note"]) {
+      const labels = [...colFor(name).querySelectorAll(".cb-sub-label")].map((e) => e.textContent);
+      expect(labels).toEqual(["Default", "Comment"]);
+    }
+  });
+
+  it("orders the fields name → type → flags → default → comment", () => {
+    open();
+    const fields = [...colFor("note").querySelectorAll("input,button,.sql-field")].map((e) =>
+      e.classList.contains("sql-field") ? "sql" : (e as HTMLInputElement).type || "button",
+    );
+    // The order handle is hidden on PostgreSQL, so the row opens on the name;
+    // the two `sql` slots are the type and the default (CodeMirror fields).
+    expect(fields).toEqual(["text", "sql", "checkbox", "checkbox", "sql", "text", "submit"]);
+    const line2 = colFor("note").querySelector(".cb-line2")!;
+    const actions = colFor("note").querySelector(".cb-actions")!;
+    // Line 2 precedes the actions in the DOM, which is what fixes the Tab order.
+    expect(line2.compareDocumentPosition(actions) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("marks only the cells that differ from the catalog", () => {
+    open();
+    const note = colFor("note");
+    expect(note.querySelectorAll(".cb-changed")).toHaveLength(0);
+    fireEvent.input(note.querySelector(".cb-line1 input")!, { target: { value: "notes" } });
+    const marked = [...colFor("notes").querySelectorAll(".cb-changed")];
+    expect(marked).toHaveLength(1);
+    expect((marked[0] as HTMLInputElement).value).toBe("notes");
+  });
+
+  it("keeps a dropped column readable and reversible", () => {
+    const v = open();
+    const note = colFor("note");
+    fireEvent.click(v.button(note, "Drop"));
+    expect(colFor("note").classList.contains("row-dropped")).toBe(true);
+    fireEvent.click(v.button(colFor("note"), "Keep"));
+    expect(colFor("note").classList.contains("row-dropped")).toBe(false);
+  });
+});

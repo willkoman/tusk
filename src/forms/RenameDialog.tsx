@@ -48,7 +48,7 @@ export function RenameDialog(props: {
       }
     >
       <label>
-        New name<span class="req">*</span>
+        <span class="lbl">New name<span class="req">*</span></span>
         <input value={name()} onInput={(e) => setName(e.currentTarget.value)} />
       </label>
     </Dialog>

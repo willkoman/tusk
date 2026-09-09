@@ -43,7 +43,7 @@ export function SchemaForm(props: {
       }
     >
       <label>
-        Name<span class="req">*</span>
+        <span class="lbl">Name<span class="req">*</span></span>
         <input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="schema_name" />
       </label>
       <label>

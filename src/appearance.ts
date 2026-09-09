@@ -69,6 +69,7 @@ const TOKENS: Record<Density, Record<string, string>> = {
   comfortable: {
     "--row-h": "28px",
     "--control-h": "28px",
+    "--control-h-sm": "24px",
     "--tab-h": "26px",
     "--tree-row-h": "25px",
     "--pad-y": "6px",
@@ -78,6 +79,7 @@ const TOKENS: Record<Density, Record<string, string>> = {
   compact: {
     "--row-h": "24px",
     "--control-h": "24px",
+    "--control-h-sm": "22px",
     "--tab-h": "22px",
     "--tree-row-h": "21px",
     "--pad-y": "3px",
