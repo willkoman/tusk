@@ -8,8 +8,26 @@ import { createSignal, type Accessor } from "solid-js";
 export type Transform = { x: number; y: number; k: number };
 export type BBox = { x: number; y: number; w: number; h: number };
 
-const MIN_K = 0.15;
+export const MIN_K = 0.15;
 const MAX_K = 3;
+const PAD = 32;
+/** Fit floor for diagrams whose cards carry text: under 100% the labels stop being
+ *  readable, so fit stops there and the canvas pans instead. A diagram meant to be
+ *  a map of a whole schema passes MIN_K and keeps shrinking to fit. */
+export const READABLE_FIT = 1;
+
+/**
+ * Scale-to-fit a content bbox in a viewport, clamped to `[minScale, 1]`: fit never
+ * magnifies, and never shrinks past the caller's readable floor. Invalid geometry
+ * falls back to an unscaled, padded origin.
+ */
+export function fitTransform(bbox: BBox, vw: number, vh: number, minScale = READABLE_FIT): Transform {
+  const finite = [bbox.x, bbox.y, bbox.w, bbox.h, vw, vh, minScale].every((n) => Number.isFinite(n));
+  if (!finite || bbox.w <= 0 || bbox.h <= 0 || vw <= 0 || vh <= 0) return { x: PAD, y: PAD, k: 1 };
+  const floor = Math.min(1, Math.max(MIN_K, minScale));
+  const k = Math.min(MAX_K, Math.max(floor, Math.min((vw - PAD * 2) / bbox.w, (vh - PAD * 2) / bbox.h, 1)));
+  return { x: (vw - bbox.w * k) / 2 - bbox.x * k, y: (vh - bbox.h * k) / 2 - bbox.y * k, k };
+}
 
 export type PanZoom = {
   transform: Accessor<Transform>;
@@ -18,8 +36,9 @@ export type PanZoom = {
   onPointerDown: (e: PointerEvent) => void;
   onPointerMove: (e: PointerEvent) => void;
   onPointerUp: (e: PointerEvent) => void;
-  /** Scale-to-fit a content bbox inside a viewport size (with padding). */
-  fit: (bbox: BBox, vw: number, vh: number) => void;
+  /** Scale-to-fit a content bbox inside a viewport size (with padding), never
+   *  below `minScale` — the canvas pans instead of going unreadable. */
+  fit: (bbox: BBox, vw: number, vh: number, minScale?: number) => void;
   zoomBy: (factor: number, cx: number, cy: number) => void;
   reset: () => void;
   dragging: Accessor<boolean>;
@@ -77,22 +96,8 @@ export function createPanZoom(): PanZoom {
         /* already released */
       }
     },
-    fit: (bbox: BBox, vw: number, vh: number) => {
-      const pad = 32;
-      if (
-        !Number.isFinite(bbox.x) || !Number.isFinite(bbox.y) || !Number.isFinite(bbox.w) || !Number.isFinite(bbox.h) ||
-        !Number.isFinite(vw) || !Number.isFinite(vh) || bbox.w <= 0 || bbox.h <= 0 || vw <= 0 || vh <= 0
-      ) {
-        setTransform({ x: pad, y: pad, k: 1 });
-        return;
-      }
-      const k = Math.min(MAX_K, Math.max(MIN_K, Math.min((vw - pad * 2) / bbox.w, (vh - pad * 2) / bbox.h, 1)));
-      setTransform({
-        x: (vw - bbox.w * k) / 2 - bbox.x * k,
-        y: (vh - bbox.h * k) / 2 - bbox.y * k,
-        k,
-      });
-    },
+    fit: (bbox: BBox, vw: number, vh: number, minScale = READABLE_FIT) =>
+      setTransform(fitTransform(bbox, vw, vh, minScale)),
     reset: () => setTransform({ x: 0, y: 0, k: 1 }),
   };
 }

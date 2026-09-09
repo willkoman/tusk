@@ -4,6 +4,7 @@ import { Dialog } from "../Dialog";
 import { Icon } from "../Icons";
 import { highlightSql } from "../ai/sqlHighlight";
 import { PanZoomCanvas } from "../viz/PanZoomCanvas";
+import { MIN_K } from "../viz/panzoom";
 import { type PanZoom } from "../viz/panzoom";
 import { layoutErd, type ErdNode } from "./erdLayout";
 import {
@@ -216,6 +217,9 @@ export function DdlGraphDialog(props: {
   });
 
   // ---- ERD layout ----
+  // Whole-schema scope is a map of up to 600 tables, so its canvas keeps fitting to
+  // the viewport (minFit={MIN_K}); Neighborhood scope stops at 100%, where the card
+  // text is still legible, and pans instead.
   // Validation rejects malformed/oversized values before synchronous layout or
   // DOM rendering. Above the table cap, keep only the count for the empty state.
   const erdTableCount = createMemo(() => {
@@ -567,7 +571,7 @@ export function DdlGraphDialog(props: {
                   }
                 >
                   {(l) => (
-                    <PanZoomCanvas ref={(pz) => (erdPz = pz)} bbox={l().bbox} fitKey={`erd:${center().schema}:${Math.round(l().bbox.w)}x${Math.round(l().bbox.h)}:${ddlCollapsed() ? "c" : "e"}`}>
+                    <PanZoomCanvas ref={(pz) => (erdPz = pz)} minFit={MIN_K} bbox={l().bbox} fitKey={`erd:${center().schema}:${Math.round(l().bbox.w)}x${Math.round(l().bbox.h)}:${ddlCollapsed() ? "c" : "e"}`}>
                       <For each={l().groups}>
                         {(gr, gi) => {
                           const gn = () => groupNudges().get(gi()) ?? { x: 0, y: 0 };
