@@ -104,6 +104,25 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 - **Deleting a saved connection asks first.** One click on the trash icon removed the connection and its keychain password, with no confirmation and no undo.
 - **"Try to continue" after an error no longer opens a database session.** Recovering from a crash re-ran startup, which connected your connect-on-startup profile — for a production default, a session you never asked for. That profile is offered in the reopen list instead.
 - **Tusk never writes to a file the picker didn't actually offer you.** On at least one Windows/WebView2 build the save dialog resolved to a default path in Downloads without ever appearing, so **Save** wrote a file nobody had chosen. Every picker result is now checked — it has to look like a real destination, and the dialog has to have actually taken focus — and anything else is confirmed before it is used rather than written to.
+- **Light themes paint the dialogs' SQL fields in their own colours.** The single-line type, default and expression fields in *Create table*, *Modify table*, *Add index* and *Add constraint* hard-coded One Dark, so on One Light, Solarized Light, GitHub Light and Gruvbox Light a type name sat at 1.6:1 against the field. Every field follows the app theme and switches with it, and the four light palettes are darkened until every token clears 4.5:1 on its own surface.
+- **Neither toolbar runs off the window any more.** Between 1000 and 1055 px wide the editor toolbar kept its named buttons inline, so the schema picker collapsed to `(d…` and the last two controls left the screen; the results toolbar did the same below 980 px. Both fold their labels away before anything can clip, checked at every window width from 640 px up.
+- **The search icon no longer sits on top of the text** in the Explorer's object filter and the manual's search box.
+- **The manual's navigation reads as a list again.** Every entry was centred, so its icon landed anywhere across a 63 px spread.
+- **The column editor keeps its header in view.** *Modify table* scrolled the Name/Type/Flags header away and had a second scroller inside the dialog, which squeezed Indexes and Constraints into a 30 px sliver. One scroller now, with the header pinned — the same model as *Create table*.
+- **Default and Comment are the same kind of control.** Side by side on a column's second line, an unset Default was bare text while an unset Comment was a filled box.
+- **The column type field reads as a picker.** It carries a caret that lists the connected engine's types, and the flags are spelled out — *Unique* and *Identity*, not *Uq* and *Ident*.
+- **An untouched form is not shown as broken.** *Create table* opened with "The table needs a name." in red and *Backup* with "Choose where to write the dump.", before anything had been typed.
+- **Find and Filter are different glyphs.** Both used the magnifier; Filter is a funnel now, in the results toolbar, the filter chip bar and the menus.
+- **The status bar stays one line.** The cursor readout wrapped and grew the bar by 8 px whenever a grid selection was showing.
+- **Settings controls line up.** Selects, text fields, number fields and the accent swatches began at four different left edges and came in two heights.
+- **The Export dialog's option rows line up.** Successive rows in one group started their columns at different x, and every control crowded into the left 40 % of the row.
+- **The filter builder says when a condition is dropped.** A condition with no value contributed nothing to the WHERE clause and disappeared from the preview with nothing on screen to explain it; the row is now marked *not applied*.
+- **The record panel shows a whole column name.** `signup_date` and `credit_limit` were cut.
+- **The results toolbar no longer says "Idle" while a query runs.** It was describing the previous result's row stream, directly above the running pill.
+- **The connection mascot only appears where it can be read.** At 12-14 px on a connection chip and on every tab it was a coloured smudge; it stays on the connect card, the driver tiles, the saved-connection rows and the window title.
+- **The connect card's bottom edge is reachable.** With the "not open" banner showing, the card overflowed the viewport at an edge that could not be scrolled to.
+- **Copy.** *Explain Analyze* is named as an action, not explained; Backup's source is two labelled lines instead of `postgres · accdb`; Import and Backup both say "No file chosen"; Backup's object filter says "Filter objects…", like the Explorer's.
+- **The console is silent again.** The connect form logged an autocomplete warning for each of its inputs, and the settings token fields two more.
 
 ## [0.9.8] - 2026-09-04
 
