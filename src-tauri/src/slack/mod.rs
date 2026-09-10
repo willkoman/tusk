@@ -44,6 +44,12 @@ pub struct StatusInfo {
     /// "disconnected" | "connecting" | "connected"
     pub state: String,
     pub error: Option<String>,
+    /// The bot is stopped on purpose and nothing is broken: autostart is armed and it
+    /// waits for its saved connection, or its bound connection was closed. `error`
+    /// then carries the explanation. The workbench paints this amber (needs
+    /// attention) rather than red (failed) — the two used to be indistinguishable,
+    /// so a bot merely waiting looked like a crashed one.
+    pub waiting: bool,
     /// The ONE Tusk connection this bot answers against. Several connections are open
     /// at once, so "the active connection" is not a stable answer: the binding is
     /// chosen when the bot starts (default: whatever the workbench had focused) and
@@ -58,6 +64,7 @@ impl Default for StatusInfo {
             running: false,
             state: "disconnected".into(),
             error: None,
+            waiting: false,
             connection_id: None,
         }
     }
@@ -70,6 +77,7 @@ impl SlackRuntime {
         s.state = state.to_string();
         s.error = error;
         s.running = running;
+        s.waiting = false;
         // A stopped bot is bound to nothing, and it is cleared under the same lock
         // that publishes `running:false` — otherwise a concurrent bind could leave a
         // stopped bot holding a binding, which would make `on_connection_closed`
@@ -77,6 +85,12 @@ impl SlackRuntime {
         if !running {
             s.connection_id = None;
         }
+    }
+
+    /// Publish "stopped, waiting": a deliberate stop with a reason, not a failure.
+    pub fn set_waiting(&self, reason: String) {
+        self.set_status("disconnected", Some(reason));
+        crate::lock_sync(&self.status).waiting = true;
     }
 
     pub fn status_info(&self) -> StatusInfo {
@@ -188,9 +202,9 @@ pub fn on_connection_closed(app: &AppHandle, connection_id: &str) {
         Some(name) => format!(
             "Slack bot stopped: its Tusk connection was disconnected. It starts again when “{name}” is open."
         ),
-        None => "Slack bot stopped: its Tusk connection was disconnected. Pick a saved connection in Settings → Slack so it can start again.".to_string(),
+        None => "Slack bot stopped: its Tusk connection was disconnected. Click the Slack badge to bind another.".to_string(),
     };
-    runtime.set_status("disconnected", Some(reason));
+    runtime.set_waiting(reason);
     let _ = app.emit("slack:status", runtime.status_info());
 }
 
@@ -215,12 +229,14 @@ pub fn arm_autostart(app: &AppHandle) {
     let reason = match autostart_label(app) {
         Some(name) => format!("Slack bot is waiting for connection “{name}” to open."),
         None => {
-            // Shown in the statusbar AND on the Settings → Slack card itself, so it
-            // states the fact rather than sending the reader where they already are.
-            "Slack autostart is on. Bind a saved connection to the bot.".to_string()
+            // The legacy case: a config written before bindings existed has
+            // `enabled: true` and no profile, so autostart can wait for nothing. Say
+            // where the one-click fix is; "bind a saved connection" alone sent people
+            // into Settings → Slack, where the picker only appeared for a running bot.
+            "Slack autostart is on, but the bot is bound to no connection. Click the Slack badge to bind one.".to_string()
         }
     };
-    runtime.set_status("disconnected", Some(reason));
+    runtime.set_waiting(reason);
     let _ = app.emit("slack:status", runtime.status_info());
 }
 
@@ -413,6 +429,25 @@ pub fn stop(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waiting_is_a_stopped_state_that_any_real_status_clears() {
+        let runtime = SlackRuntime::default();
+        runtime.set_waiting("waiting for X".into());
+        let s = runtime.status_info();
+        assert!(!s.running && s.waiting);
+        assert_eq!(s.state, "disconnected");
+        assert_eq!(s.error.as_deref(), Some("waiting for X"));
+        assert!(s.connection_id.is_none());
+
+        runtime.set_status("connecting", None);
+        let s = runtime.status_info();
+        assert!(s.running && !s.waiting && s.error.is_none());
+
+        runtime.set_status("disconnected", Some("socket failed".into()));
+        let s = runtime.status_info();
+        assert!(!s.running && !s.waiting, "a failure is not a wait");
+    }
 
     #[test]
     fn generations_invalidate_old_sessions() {

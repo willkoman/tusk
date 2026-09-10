@@ -75,6 +75,7 @@ import {
 import { pickOpenPath, pickSavePath, type PickedPath, type PickerOptions } from "./filePicker";
 import { Tree, type DbTree, type RelationDetail, type NodeDescriptor, nodeKey, relKey } from "./Tree";
 import { ContextMenu, type MenuItem, type MenuState } from "./ContextMenu";
+import { bindBot, saveBinding, slackErrMsg, slackTone, startBotBound, stopBot, type SlackStatus } from "./slack/bind";
 import { type DialogState } from "./WorkbenchDialogs";
 import { type DangerFacts } from "./forms/ConfirmDialog";
 import { type SettingsTab } from "./settings/SettingsDialog";
@@ -207,9 +208,7 @@ type UiOrigin = {
   resultEpoch: number;
   transactionRevision: number;
 };
-// Slack bot status mirrors slack::StatusInfo in Rust. `connectionId` is the ONE Tusk
-// connection the bot answers against (null when it is not running / not yet bound).
-type SlackStatus = { running: boolean; state: string; error: string | null; connectionId?: string | null };
+
 
 const PAGE = 1000;
 const MAX_LOCAL_SORT_ROWS = 250_000;
@@ -912,7 +911,7 @@ function App() {
     // Submenu leaves carry the same origin check as top-level ones: a group is
     // only a container, so validity is stamped on the item that actually runs.
     const stamp = (item: MenuItem): MenuItem => {
-      if ("sep" in item) return item;
+      if ("sep" in item || "head" in item) return item;
       if ("items" in item) return { ...item, items: item.items.map(stamp) };
       const itemValid = item.valid;
       return { ...item, valid: () => valid() && (itemValid?.() ?? true) };
@@ -2125,21 +2124,104 @@ function App() {
    * connection opens. An ad-hoc connection has no profile, so it can be bound by hand
    * but never autostarted.
    */
-  const [slackAutostart, setSlackAutostart] = createSignal<{ enabled: boolean; profileId: string | null }>({
+  const [slackAutostart, setSlackAutostart] = createSignal<{ enabled: boolean; profileId: string | null; tokens: boolean }>({
     enabled: false,
     profileId: null,
+    tokens: false,
   });
   async function refreshSlackAutostart() {
     try {
-      const info = await invoke<{ config: { enabled?: boolean; boundProfileId?: string | null } }>("slack_load_config");
+      const info = await invoke<{ config: { enabled?: boolean; boundProfileId?: string | null }; hasBotToken?: boolean; hasAppToken?: boolean }>("slack_load_config");
       setSlackAutostart({
         enabled: info.config?.enabled === true,
         profileId: info.config?.boundProfileId || null,
+        // Both tokens saved = the badge has something to switch on.
+        tokens: info.hasBotToken === true && info.hasAppToken === true,
       });
     } catch {
       // Settings → Slack surfaces config failures; autostart just stays off here.
     }
   }
+  /** The statusbar badge's tone; `off` (configured, idle) is grey. */
+  const slackBadgeTone = () => slackTone(slackStatus());
+  const [slackBusy, setSlackBusy] = createSignal(false);
+  /**
+   * Run one badge-menu action. Success needs no note: the bot publishes its status
+   * and the listener clears the notice. Failure lands in the notice, where the
+   * stop reason would have.
+   */
+  async function slackAction(run: () => Promise<string>) {
+    if (slackBusy()) return;
+    setSlackBusy(true);
+    try {
+      await run();
+    } catch (e) {
+      setSlackNotice(`Slack: ${slackErrMsg(e)}`);
+    } finally {
+      setSlackBusy(false);
+      void refreshSlackAutostart();
+    }
+  }
+  /** The name autostart is armed for, when that profile still exists. */
+  const slackAutostartName = () => {
+    const auto = slackAutostart();
+    return auto.enabled && auto.profileId ? profiles().find((p) => p.id === auto.profileId)?.name ?? null : null;
+  };
+  /**
+   * The Slack badge's menu: state, on/off, the connection it is bound to (pick another
+   * to repoint a running bot, or to start a stopped one against it), and Settings.
+   * Everything Settings → Slack can do to the binding, one click from the statusbar —
+   * a bot armed by a config from before bindings existed used to be fixable only by
+   * finding the pane and switching it Off and On.
+   */
+  const openSlackMenu = (anchor: HTMLElement) => {
+    const r = anchor.getBoundingClientRect();
+    const s = slackStatus();
+    const opts = slackConnectionOptions();
+    const bound = opts.find((o) => o.id === s.connectionId) ?? null;
+    const focusedId = activeConnectionId();
+    const focused = opts.find((o) => o.id === focusedId) ?? null;
+    const tokens = slackAutostart().tokens;
+    const autoName = slackAutostartName();
+    const tone = slackBadgeTone();
+    const head = tone === "on"
+      ? { head: bound ? `Slack bot answers against ${bound.label}` : "Slack bot running, bound to nothing", sub: autoName ? `Autostarts with ${autoName}.` : bound ? "Save the connection as a profile to autostart." : "Pick a connection below." }
+      : tone === "wait" && s.running
+        ? { head: "Slack bot connecting…", sub: s.error ?? undefined }
+        : tone === "wait"
+          ? { head: "Slack bot waiting", sub: s.error ?? undefined }
+          : tone === "stopped"
+            ? { head: "Slack bot stopped", sub: s.error ?? undefined }
+            : { head: "Slack bot off", sub: tokens ? (autoName ? `Autostarts with ${autoName}.` : undefined) : "Add both app tokens in Settings → Slack." };
+    const noTokens = "Add both Slack app tokens in Settings → Slack first";
+    const items: MenuItem[] = [head];
+    if (s.running) {
+      items.push({ label: "Turn bot off", icon: "close", disabled: slackBusy(), onClick: () => void slackAction(() => stopBot(saveBinding)) });
+    } else {
+      items.push({
+        label: focused ? `Turn bot on, bound to ${focused.label}` : "Turn bot on",
+        icon: "play",
+        disabled: slackBusy() || !tokens,
+        title: tokens ? undefined : noTokens,
+        onClick: () => void slackAction(() => startBotBound(focused?.id ?? null, focused?.profileId ?? null, saveBinding)),
+      });
+    }
+    if (opts.length) {
+      items.push({ sep: true }, { head: "Bind to" });
+      for (const o of opts) {
+        const isBound = s.running && o.id === s.connectionId;
+        items.push({
+          label: `${o.mascot} ${o.label}`,
+          icon: isBound ? "check" : undefined,
+          disabled: slackBusy() || !tokens || isBound,
+          title: !tokens ? noTokens : isBound ? "The bot answers against this connection" : o.profileId ? undefined : "Unsaved connection: the bot can answer against it, but autostart needs a saved profile",
+          onClick: () => void slackAction(() => bindBot(s.running, o.id, o.profileId, saveBinding)),
+        });
+      }
+    }
+    items.push({ sep: true }, { label: "Slack settings…", icon: "gear", onClick: () => setSettingsOpen("slack") });
+    setMenu({ x: r.left, y: r.top - 6, items });
+  };
   /** Start (or bind) the Slack bot when the connection it is armed for opens. */
   async function slackAutostartFor(connectionId: string, profileId: string | null) {
     const auto = slackAutostart();
@@ -6198,30 +6280,46 @@ function App() {
                     || (resultsOpen() && planMemo() && resultView() === "plan" ? planSummary(planMemo()!) : status()))}
               </span>
               <Show when={slackNotice()}>
-                <button
-                  class="status-notice"
-                  title={slackNotice()}
-                  aria-label={`Dismiss Slack notice: ${slackNotice()}`}
-                  onClick={() => setSlackNotice("")}
-                >
+                <span class="status-notice" classList={{ danger: slackBadgeTone() === "stopped" }} title={slackNotice()}>
                   <span class="status-notice-text">{slackNotice()}</span>
-                  <span class="status-notice-x" aria-hidden="true"><Icon name="close" /></span>
-                </button>
+                  {/* A waiting bot with a focused connection is one click from bound:
+                      the legacy "armed, bound to nothing" config, or a session that
+                      is not the one autostart waits for. */}
+                  <Show when={slackStatus().waiting && !slackStatus().running && slackAutostart().tokens && activeConnectionId()}>
+                    {(id) => (
+                      <button
+                        class="status-notice-act"
+                        disabled={slackBusy()}
+                        onClick={() => void slackAction(() => startBotBound(id(), connections().find((e) => e.conn.id === id())?.conn.profileId ?? null, saveBinding))}
+                      >
+                        Bind to {labelOf(id())}
+                      </button>
+                    )}
+                  </Show>
+                  <button
+                    class="status-notice-x"
+                    title="Dismiss"
+                    aria-label={`Dismiss Slack notice: ${slackNotice()}`}
+                    onClick={() => setSlackNotice("")}
+                  >
+                    <Icon name="close" />
+                  </button>
+                </span>
               </Show>
-              <Show when={slackStatus().running || slackStopped()}>
-                <span
+              {/* Always present once both tokens are saved, so a stopped bot can be
+                  switched on from here; click for the binding menu. */}
+              <Show when={slackAutostart().tokens || slackStatus().running || slackStopped()}>
+                <button
                   class="slack-badge"
-                  classList={{
-                    stopped: !!slackStopped(),
-                    on: slackStatus().running && slackStatus().state === "connected",
-                    wait: slackStatus().running && slackStatus().state !== "connected",
-                  }}
+                  classList={{ [slackBadgeTone()]: true }}
+                  aria-haspopup="menu"
                   title={slackStopped()
                     ? `Slack: ${slackStopped()}`
-                    : slackStatus().error ? `Slack ${slackStatus().state}: ${slackStatus().error}` : `Slack bot ${slackStatus().state}`}
+                    : slackStatus().error ? `Slack ${slackStatus().state}: ${slackStatus().error}` : slackStatus().running ? `Slack bot ${slackStatus().state}` : "Slack bot off"}
+                  onClick={(e) => openSlackMenu(e.currentTarget)}
                 >
                   <span class="slack-led" aria-hidden="true" />Slack
-                </span>
+                </button>
               </Show>
               <span class="spacer" />
               {/* ui/grid-qol: grid position + aggregates over LOADED rows only */}

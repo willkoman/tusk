@@ -10,88 +10,29 @@
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { activeBaseUrl, aiStore, defaultModel, isKeyless, normalizeMaxTokens, resolveBaseUrl, resolveWire, type AiConfig, type AiProvider } from "../ai/store";
-import { KeyedSerialQueue } from "../asyncQueue";
+import { activeBaseUrl, aiStore, defaultModel, isKeyless, resolveBaseUrl, resolveWire, type AiConfig, type AiProvider } from "../ai/store";
+import {
+  DEFAULT_CONFIG,
+  PersistFailed,
+  normalizeSlackConfig,
+  normalizeSlackMaxTokens,
+  repointBot,
+  slackConfigMatches,
+  slackErrMsg as errMsg,
+  slackIo,
+  slackTone,
+  startBotBound,
+  stopBot,
+  type SlackConfig,
+  type SlackConfigInfo,
+  type SlackConnectionOption,
+  type SlackStatus,
+} from "../slack/bind";
 
-export type SlackConfig = {
-  enabled: boolean;
-  /**
-   * The SAVED connection (profile id) the bot answers against. Autostart waits for this
-   * one and no other: the bot answers against a single connection, so coming up bound to
-   * whichever session opened first pointed it at a database nobody chose. Null means the
-   * bot is bound to an ad-hoc connection (or nothing yet) and cannot start by itself.
-   */
-  boundProfileId: string | null;
-  allowlistChannels: string[];
-  allowlistUsers: string[];
-  maxRowsInline: number;
-  maxRowsFile: number;
-  queryTimeoutSecs: number;
-  chartsEnabled: boolean;
-  shareSamples: boolean;
-  destructivePolicy: string;
-  aiProvider: string;
-  /** Wire protocol, resolved from the TS provider registry at save time. */
-  aiWire: string;
-  aiModel: string;
-  aiBaseUrl: string | null;
-  aiMaxTokens: number;
-  aiAllowNoKey: boolean;
-};
-
-type SlackConfigInfo = { config: SlackConfig; hasBotToken: boolean; hasAppToken: boolean };
-export type SlackStatus = {
-  running: boolean;
-  state: string;
-  error: string | null;
-  /** The ONE Tusk connection the bot answers against (null when not running/bound). */
-  connectionId?: string | null;
-};
-
-/** One open Tusk connection, as offered in the bot's connection picker. `profileId` is
- *  null for an ad-hoc connection — the bot can be pointed at one, but autostart cannot
- *  wait for something that was never saved. */
-export type SlackConnectionOption = { id: string; label: string; mascot: string; profileId: string | null };
-
-export const DEFAULT_CONFIG: SlackConfig = {
-  enabled: false,
-  boundProfileId: null,
-  allowlistChannels: [],
-  allowlistUsers: [],
-  maxRowsInline: 20,
-  maxRowsFile: 10000,
-  queryTimeoutSecs: 30,
-  chartsEnabled: true,
-  shareSamples: false,
-  destructivePolicy: "proposeReadonly",
-  aiProvider: "",
-  aiWire: "",
-  aiModel: "",
-  aiBaseUrl: null,
-  aiMaxTokens: 2048,
-  aiAllowNoKey: false,
-};
-
-const errMsg = (e: unknown): string => (e as { message?: string })?.message ?? String(e);
-
-/** One normalization for every AI surface — see `normalizeMaxTokens` in ai/store.ts. */
-export const normalizeSlackMaxTokens = normalizeMaxTokens;
-
-/** Normalize newly-added privacy/token fields when loading older config documents. */
-export const normalizeSlackConfig = (raw?: Partial<SlackConfig> | null): SlackConfig => ({
-  ...DEFAULT_CONFIG,
-  ...raw,
-  allowlistChannels: Array.isArray(raw?.allowlistChannels) ? raw.allowlistChannels : [],
-  allowlistUsers: Array.isArray(raw?.allowlistUsers) ? raw.allowlistUsers : [],
-  shareSamples: raw?.shareSamples === true,
-  boundProfileId: typeof raw?.boundProfileId === "string" && raw.boundProfileId.trim() ? raw.boundProfileId : null,
-  aiMaxTokens: normalizeSlackMaxTokens(raw?.aiMaxTokens ?? DEFAULT_CONFIG.aiMaxTokens),
-});
-
-export const slackConfigMatches = (expected: SlackConfig, actual: SlackConfig): boolean =>
-  (Object.keys(DEFAULT_CONFIG) as (keyof SlackConfig)[]).every(
-    (key) => JSON.stringify(expected[key]) === JSON.stringify(actual[key]),
-  );
+// The config model and the start/stop/bind sequences live in `src/slack/bind.ts`,
+// shared with the statusbar badge menu; re-exported so existing importers stand.
+export { DEFAULT_CONFIG, normalizeSlackConfig, normalizeSlackMaxTokens, slackConfigMatches };
+export type { SlackConfig, SlackConnectionOption, SlackStatus };
 
 /**
  * What the bot WOULD mirror from the AI config on its next save. Pure so the pane's
@@ -109,11 +50,6 @@ export const slackAiInSync = (cfg: SlackConfig, ai: AiConfig): boolean => {
 };
 
 type SaveResult = { tokensChanged: boolean };
-
-// Module-level so a save still in flight when the pane unmounts (settings tab switch
-// remounts panes) is ordered before the next mount's load — the fresh pane can never
-// read the pre-save file.
-const slackIo = new KeyedSerialQueue<"io">();
 
 const clampInt = (v: string, min: number, max: number, fallback: number) =>
   Math.trunc(Math.max(min, Math.min(max, Number(v) || fallback)));
@@ -168,10 +104,10 @@ export function SlackPane(props: {
         const stop = await listen<SlackStatus>("slack:status", (e) => {
           statusRevision++;
           setStatus(e.payload);
-          // The backend turns autostart off when the bot's bound connection goes away
-          // (it must not come back bound to whichever session opens first). Mirror that
-          // here, or an open pane keeps showing the switch as On over a stopped bot.
-          if (!e.payload.running && e.payload.error && cfg().enabled) setCfg({ ...cfg(), enabled: false });
+          // A bot that FAILED is off, and the switch must say so. A bot that is merely
+          // waiting (its bound connection closed, autostart still armed) keeps
+          // `enabled: true` on disk, so the switch stays On over it — honestly.
+          if (!e.payload.running && e.payload.error && !e.payload.waiting && cfg().enabled) setCfg({ ...cfg(), enabled: false });
         });
         if (!mounted) {
           stop();
@@ -287,49 +223,51 @@ export function SlackPane(props: {
       : `${message} The bot is stopped, but autostart may still be on.`);
   };
 
-  const applyEnabled = async (enabled: boolean) => {
+  /** The pane's persist for the shared sequences: mirrors AI and saves typed tokens. */
+  const persist = (p: Partial<SlackConfig>) => save(p);
+
+  /**
+   * Switch the bot on or off. On binds it to `target` — the picker's choice, else the
+   * connection the workbench has focused — and arms autostart for that connection's
+   * saved profile. The sequence itself is shared with the statusbar badge menu.
+   */
+  const applyEnabled = async (enabled: boolean, target: string | null = props.activeConnectionId?.() ?? null) => {
     patch({ enabled });
     setBusy(true);
     setNote("");
     try {
       if (enabled) {
-        // Persist enabled:FALSE first, then start; only persist enabled:true after a
-        // clean start. So a failed start never leaves enabled:true on disk (which
-        // would autostart the bot on the next launch despite the toggle showing off).
-        const target = props.activeConnectionId?.() ?? null;
-        // Autostart is armed for the SAVED connection behind the binding, so a later
-        // launch waits for that one instead of grabbing whichever opens first.
-        const boundProfileId = profileOf(target);
-        if (!(await save({ enabled: false, boundProfileId }))) {
-          patch({ enabled: false });
-          return;
-        }
-        await invoke("slack_test");
-        // Bind the bot to the connection the workbench has focused. The backend
-        // treats this as the ONE connection it answers against until it is
-        // repointed here; switching tabs later never redirects it.
-        await invoke("slack_start", { connectionId: target });
-        if (!(await save({ enabled: true, boundProfileId }))) {
-          await disableAfterRestartFailure("Could not save the enabled setting. Bot stopped and disabled.");
-          return;
-        }
-        setNote(boundProfileId
-          ? "Bot started."
-          : target
-            ? "Bot started. Save this connection as a profile for autostart."
-            : "Bot started. Open a connection and pick it here.");
+        setNote(await startBotBound(target, profileOf(target), persist));
       } else {
-        if (!(await save({ enabled: false }))) {
-          patch({ enabled: true });
-          return;
-        }
-        await invoke("slack_stop");
-        setNote("Bot stopped.");
+        setNote(await stopBot(persist));
       }
     } catch (e) {
+      if (e instanceof PersistFailed) {
+        // The save reported itself; the switch just goes back to what disk says.
+        patch({ enabled: !enabled });
+        return;
+      }
       setNote(errMsg(e));
       patch({ enabled: false });
       await save({ enabled: false }).catch(() => {}); // ensure disk = disabled
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Point the bot at `id`: repoint while running, start bound to it while stopped. */
+  const bindTo = async (id: string) => {
+    if (!status().running) {
+      await applyEnabled(true, id);
+      return;
+    }
+    setBusy(true);
+    setNote("");
+    try {
+      setNote(await repointBot(id, profileOf(id), persist));
+    } catch (e) {
+      // A failed save already reported itself; don't claim success over it.
+      if (!(e instanceof PersistFailed)) setNote(`Repoint failed: ${errMsg(e)}`);
     } finally {
       setBusy(false);
     }
@@ -413,6 +351,7 @@ export function SlackPane(props: {
     if (s.running) {
       return { cls: "wait", title: s.state, sub: error };
     }
+    if (error && slackTone(s) === "wait") return { cls: "wait", title: "Bot waiting", sub: error };
     if (error) return { cls: "err", title: "Bot off", sub: error };
     if (!tokensReady()) return { cls: "off", title: "Bot off", sub: "Add both Slack app tokens below, then switch on." };
     if (cfg().enabled)
@@ -423,7 +362,7 @@ export function SlackPane(props: {
         // next launch" was a promise the bot could only keep by binding to anything.
         sub: cfg().boundProfileId
           ? "Starts when its saved connection is open."
-          : "Autostart is on with no saved connection. Start the bot by hand.",
+          : "Autostart is on with no saved connection. Bind the bot to one below.",
       };
     return { cls: "off", title: "Bot off", sub: "Switch on to answer questions in Slack." };
   });
@@ -463,45 +402,35 @@ export function SlackPane(props: {
         {/* Which Tusk connection the bot answers against. Several can be open, so this
             is an explicit binding rather than "whichever tab you happen to be on":
             a question asked in Slack must not change database because you switched
-            tabs in the app. Shown only when there is a choice to make. */}
-        <Show when={status().running && (openConnections().length > 1 || (!!status().connectionId && !boundConnection()))}>
+            tabs in the app. While the bot is stopped the same picker STARTS it bound
+            to the choice — it used to appear only for a running bot, which left an
+            armed-but-unbound bot (a config from before bindings existed) with no way
+            in except switching Off and On again. */}
+        <Show when={openConnections().length > 0 && (status().running
+          ? openConnections().length > 1 || (!!status().connectionId && !boundConnection())
+          : tokensReady())}>
           <div class="settings-label slack-conn-row">
             <div>
-              <label for="slack-conn">Answers against</label>
+              <label for="slack-conn">{status().running ? "Answers against" : "Bind to"}</label>
               <small>
-                {boundConnection()
-                  ? "Proposals are pinned to this connection."
-                  : "The bot's connection is closed. Pick another."}
+                {status().running
+                  ? boundConnection()
+                    ? "Proposals are pinned to this connection."
+                    : "The bot's connection is closed. Pick another."
+                  : "Starts the bot against this connection. A saved connection also arms autostart."}
               </small>
             </div>
             <select
               id="slack-conn"
-              value={status().connectionId ?? ""}
+              value={(status().running && status().connectionId) || ""}
               disabled={busy()}
               onChange={(e) => {
                 const id = e.currentTarget.value;
-                if (!id) return;
-                setBusy(true);
-                setNote("");
-                const boundProfileId = profileOf(id);
-                void slackIo
-                  .run("io", () => invoke("slack_set_connection", { connectionId: id }))
-                  // Repointing also re-arms autostart at the new target, so the next
-                  // launch waits for the connection the bot is actually answering on.
-                  .then(() => save({ boundProfileId }, false))
-                  .then((saved) => {
-                    // A failed save already reported itself; don't claim success over it.
-                    if (!saved) return;
-                    setNote(boundProfileId
-                      ? "Bot repointed. Applies from the next question."
-                      : "Bot repointed. Save this connection as a profile for autostart.");
-                  })
-                  .catch((err) => setNote(`Repoint failed: ${errMsg(err)}`))
-                  .finally(() => setBusy(false));
+                if (id) void bindTo(id);
               }}
             >
-              <Show when={!boundConnection()}>
-                <option value="">(connection closed)</option>
+              <Show when={!status().running || !boundConnection()}>
+                <option value="">{status().running ? "(connection closed)" : "Choose a connection…"}</option>
               </Show>
               <For each={openConnections()}>
                 {(c) => <option value={c.id}>{c.mascot} {c.label}</option>}

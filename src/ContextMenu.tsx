@@ -6,16 +6,21 @@ export type MenuAction = { label: string; icon?: IconName; danger?: boolean; dis
 /** One level of nesting: a group that opens its own panel. Groups never nest further. */
 export type MenuGroup = { label: string; icon?: IconName; disabled?: boolean; title?: string; items: MenuItem[] };
 
+/** A heading: a title line with an optional smaller detail line. Not focusable, never runs. */
+export type MenuHead = { head: string; sub?: string };
+
 export type MenuItem =
   /** `sep: "danger"` is the wider rule before a destructive group: extra space
    *  above it, so a mis-aimed click near a benign item cannot land on Drop. */
   | { sep: true | "danger" }
+  | MenuHead
   | MenuAction
   | MenuGroup;
 
 export type MenuState = { x: number; y: number; items: MenuItem[]; scope?: string } | null;
 
 const isSep = (i: MenuItem): i is { sep: true | "danger" } => "sep" in i;
+const isHead = (i: MenuItem): i is MenuHead => "head" in i;
 const isGroup = (i: MenuItem): i is MenuGroup => "items" in i;
 const isDead = (i: MenuAction | MenuGroup) => !!i.disabled || ("valid" in i && i.valid?.() === false);
 
@@ -23,8 +28,8 @@ const isDead = (i: MenuAction | MenuGroup) => !!i.disabled || ("valid" in i && i
 function leaves(items: MenuItem[]): MenuAction[] {
   const out: MenuAction[] = [];
   for (const it of items) {
-    if (isSep(it)) continue;
-    if (isGroup(it)) out.push(...(it.items.filter((x) => !isSep(x) && !isGroup(x)) as MenuAction[]));
+    if (isSep(it) || isHead(it)) continue;
+    if (isGroup(it)) out.push(...(it.items.filter((x) => !isSep(x) && !isHead(x) && !isGroup(x)) as MenuAction[]));
     else out.push(it);
   }
   return out;
@@ -190,6 +195,12 @@ export function ContextMenu(props: {
       <Show when={p.it.key}><span class="ctx-key">{p.it.key}</span></Show>
     </div>
   );
+  const Head = (p: { it: MenuHead }) => (
+    <div class="ctx-head" role="presentation">
+      <span class="ctx-head-title">{p.it.head}</span>
+      <Show when={p.it.sub}><span class="ctx-head-sub">{p.it.sub}</span></Show>
+    </div>
+  );
 
   return (
     <div class="ctx-menu" ref={el} role="menu" aria-label="Actions" tabindex="-1" style={{ left: `${pos().x}px`, top: `${pos().y}px` }} onKeyDown={onMenuKey}>
@@ -197,6 +208,8 @@ export function ContextMenu(props: {
         {(it, i) =>
           isSep(it) ? (
             <div class="ctx-sep" classList={{ "ctx-sep-danger": it.sep === "danger" }} role="separator" />
+          ) : isHead(it) ? (
+            <Head it={it} />
           ) : isGroup(it) ? (
             <div
               class="ctx-item ctx-group"
@@ -234,6 +247,8 @@ export function ContextMenu(props: {
               {(it) =>
                 isSep(it) ? (
                   <div class="ctx-sep" classList={{ "ctx-sep-danger": it.sep === "danger" }} role="separator" />
+                ) : isHead(it) ? (
+                  <Head it={it} />
                 ) : isGroup(it) ? null : (
                   <Row it={it} />
                 )

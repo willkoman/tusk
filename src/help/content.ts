@@ -2442,7 +2442,8 @@ export const TOPICS: Topic[] = [
           "**Two tokens** — a Bot token (`xoxb-…`) and an App-level token (`xapp-…`) with `connections:write`.",
           "**Paste both under Slack app tokens in Settings → Slack.** They go to the OS keychain, never to disk and never echoed back.",
           "**Save tokens** stores them; **Test connection** validates both and names the workspace.",
-          "**The status card** shows Bot off / Connecting… / Bot running with the last error, and an On/Off switch disabled until both tokens exist.",
+          "**The status card** shows Bot off / Bot waiting / Connecting… / Bot running with the last reason, and an On/Off switch disabled until both tokens exist. Amber means stopped on purpose with autostart still armed; red means it failed.",
+          "**Bind to** under the card lists the open connections: pick one to start a stopped bot against it, or to repoint a running one (the row then reads **Answers against**).",
           "**The rest is grouped** into *Who can ask*, *Answers*, and *AI*. Each saves on change.",
           "**AI provider and model** mirror from **Settings → AI** whenever the Slack pane saves; when that has since changed, the section offers **Update bot**."
         ]
@@ -2609,9 +2610,9 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "Every proposal is pinned to the exact connection, database, workspace, channel, thread, source message and requester that created it.",
-          "The bot answers against one connection, chosen when it starts and changeable in **Settings ▸ Slack**. Switching tabs never redirects it.",
+          "The bot answers against one connection, chosen when it starts and changeable from the statusbar **Slack** badge menu or **Settings ▸ Slack**. Switching tabs never redirects it.",
           "Autostart binds to a saved connection and names the one it is waiting for. An unsaved connection can be picked by hand but never autostarted.",
-          "Disconnecting the bound connection stops the bot and says so in the statusbar; reopening it brings the bot back.",
+          "Disconnecting the bound connection stops the bot and says so in the statusbar; reopening it brings the bot back. A bot armed for no connection (a config from before bindings existed) offers **Bind to** the focused connection right in that notice.",
           "SQL Server connections are refused, at the question and again at approval, for lack of a session read-only mode.",
           "Config edits reload per question. Replacing tokens restarts the running bot; restart failure stops and disables it.",
           "DuckDB and SQLite run synchronously, so the timeout cannot preempt a pathological embedded query.",
@@ -3241,7 +3242,7 @@ export const TOPICS: Topic[] = [
           "Driver label and server version, plus a **🔒 Read-only** badge when the connection blocks writes.",
           "Right side: **✨ AI** toggle, history clock, **?** for this manual, Settings gear, **Disconnect**.",
           "The footer shows status text and cursor info: line/column, `Stmt 2/5`, selection character count.",
-          "A **🟢/🟡 Slack** badge tracks the [[topic:slack|Slack bot]], turning **🔴** with the reason when it stops.",
+          "A **Slack** badge sits in the footer once both bot tokens are saved: grey off, amber connecting or waiting, green answering, red failed. Click it for a menu — turn the bot on or off, **Bind to** one of the open connections, or open Settings. See [[topic:slack|Slack bot]].",
           "**Copy w/ column names** lives in the result toolbar, on the same pref as Settings → Grid."
         ]
       },
@@ -3568,6 +3569,21 @@ export const TOPICS: Topic[] = [
         "k": "tip",
         "kind": "tip",
         "md": "The updater shipped in v0.4.5, so an earlier install needs a fresh installer once."
+      },
+      {
+        "k": "h",
+        "text": "Next release — the Slack bot from the statusbar",
+        "id": "next"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**The Slack badge is a menu** — turn the bot on or off, **Bind to** any open connection, or open Settings, without leaving the workbench. It shows whenever both tokens are saved. See [[topic:slack|Slack bot]].",
+          "**A waiting bot offers a one-click Bind** — a bot armed by a config from before connection bindings existed, or one whose connection was closed, shows **Bind to** the focused connection in its statusbar notice.",
+          "**Settings → Slack binds a stopped bot too** — the connection picker now appears while the bot is off, labelled **Bind to**, and starts it against the choice.",
+          "**Waiting is amber, failure is red** — on the badge and the status card alike.",
+          "**Fixed** — the sample-rows checkbox in the AI panel's settings drawer draws at full size."
+        ]
       },
       {
         "k": "h",

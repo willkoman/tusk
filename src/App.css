@@ -1078,18 +1078,26 @@ button.conn-dot.cancellable:hover { background: var(--danger); box-shadow: 0 0 0
 .sb-sep { width: 1px; height: 12px; background: var(--border); flex-shrink: 0; }
 .sb-status { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .sb-status.running { color: var(--accent); }
-.slack-badge { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; flex-shrink: 0; cursor: default; }
+/* The Slack bot badge is a button: click for the binding menu. Grey = off, amber =
+   connecting or waiting (nothing lost), green = answering, red = failed. */
+.slack-badge { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; flex-shrink: 0; cursor: pointer; font: inherit; color: inherit; background: none; border: 0; padding: 0 var(--s1); border-radius: var(--r-xs); }
+.slack-badge:hover { color: var(--text); background: var(--surface-3); }
 .slack-badge .slack-led { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
 .slack-badge.on .slack-led { background: var(--ok); }
 .slack-badge.wait .slack-led { background: var(--warn); }
 .slack-badge.stopped { color: var(--danger); font-weight: 600; }
 .slack-badge.stopped .slack-led { background: var(--danger); }
 /* A dismissible notice sits BESIDE the run status, never replacing it. Amber:
-   something needs attention and nothing has been lost. */
-.status-notice { display: inline-flex; align-items: center; gap: var(--s2); max-width: 46%; min-width: 0; padding: 2px var(--s2); font: inherit; font-size: var(--fs-sm); color: var(--warn); background: var(--warn-soft); border: 1px solid var(--warn); border-radius: var(--r-pill); cursor: pointer; }
-.status-notice:hover { filter: brightness(1.1); }
+   something needs attention and nothing has been lost; red only for a failure. */
+.status-notice { display: inline-flex; align-items: center; gap: var(--s2); max-width: 46%; min-width: 0; padding: 2px var(--s1) 2px var(--s2); font: inherit; font-size: var(--fs-sm); color: var(--warn); background: var(--warn-soft); border: 1px solid var(--warn); border-radius: var(--r-pill); }
+.status-notice.danger { color: var(--danger); background: var(--danger-soft); border-color: var(--danger); }
 .status-notice-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.status-notice-x { flex-shrink: 0; opacity: 0.7; }
+/* The one-click fix inside the notice ("Bind to X") and the dismiss cross. */
+.status-notice-act { flex-shrink: 0; font: inherit; font-size: var(--fs-xs); font-weight: 600; color: inherit; background: var(--panel); border: 1px solid currentColor; border-radius: var(--r-pill); padding: 0 var(--s2); line-height: 16px; cursor: pointer; white-space: nowrap; }
+.status-notice-act:hover:not(:disabled) { filter: brightness(1.1); }
+.status-notice-act:disabled { opacity: 0.6; cursor: default; }
+.status-notice-x { flex-shrink: 0; display: inline-flex; align-items: center; opacity: 0.7; font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; border-radius: 50%; }
+.status-notice-x:hover { opacity: 1; }
 .status-notice:hover .status-notice-x { opacity: 1; }
 .status-elapsed { display: inline-flex; align-items: center; gap: 5px; font-variant-numeric: tabular-nums; }
 .status-elapsed svg { width: 12px; height: 12px; opacity: 0.7; }
@@ -2068,13 +2076,17 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
 .slack-status-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .slack-status-text b { font-size: var(--fs-base); }
 .slack-status-text small { font-size: var(--fs-xs); color: var(--muted); line-height: var(--lh-tight); overflow-wrap: anywhere; }
-.slack-status.err { border-color: var(--warn); }
-.slack-status.err .slack-status-text small { color: var(--warn); }
+/* `wait` = connecting, or stopped on purpose with autostart still armed (amber: needs
+   attention, nothing lost); `err` = the bot failed (red). They used to share amber. */
+.slack-status.wait { border-color: var(--warn); }
+.slack-status.wait .slack-status-text small { color: var(--warn); }
+.slack-status.err { border-color: var(--danger); }
+.slack-status.err .slack-status-text small { color: var(--danger); }
 .slack-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; background: var(--muted); }
 .slack-status.on { border-color: var(--ok); }
 .slack-status.on .slack-dot { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
 .slack-status.wait .slack-dot { background: var(--warn); }
-.slack-status.err .slack-dot { background: var(--warn); }
+.slack-status.err .slack-dot { background: var(--danger); }
 /* The one toggle switch in the app. Accent when on — green is an outcome, not a state. */
 label.slack-switch { display: inline-flex; flex-direction: row; align-items: center; gap: var(--s2); font-size: var(--fs-sm); font-weight: 400; color: var(--muted); cursor: pointer; flex-shrink: 0; }
 .slack-switch input.switch { width: 34px; height: 18px; margin: 0; appearance: none; -webkit-appearance: none; border-radius: var(--r-pill); background: var(--border); position: relative; cursor: pointer; border: none; transition: background var(--dur); }
@@ -2126,7 +2138,9 @@ label.slack-switch { display: inline-flex; flex-direction: row; align-items: cen
 .ai-key-missing { color: var(--muted); font-weight: 400; }
 .ai-settings-actions { display: flex; align-items: center; gap: 6px; }
 .ai-settings label.ai-check { flex-direction: row; align-items: center; gap: 6px; font-weight: 400; font-size: var(--fs-sm); color: var(--text); cursor: pointer; }
-.ai-settings label.ai-check input { padding: 0; width: auto; }
+/* An `appearance: none` box has no intrinsic size, so `width: auto` here collapsed
+   it to a 1px sliver; pin the drawn checkbox size like the other surfaces. */
+.ai-settings label.ai-check input { padding: 0; width: 15px; height: 15px; min-height: 0; }
 .ai-note { font-size: var(--fs-xs); color: var(--muted); line-height: var(--lh-tight); }
 .ai-messages { flex: 1; min-height: 0; overflow-y: auto; padding: var(--s3); display: flex; flex-direction: column; gap: var(--s3); }
 /* Centred in the message list and boxed, so the panel reads as ready rather
@@ -2216,6 +2230,10 @@ label.slack-switch { display: inline-flex; flex-direction: row; align-items: cen
 .ctx-more svg { width: 13px; height: 13px; display: block; stroke: currentColor; }
 .ctx-item:hover .ctx-more { color: inherit; }
 .ctx-sub { z-index: 101; }
+/* A heading row: title + optional detail, never focusable, no hover. */
+.ctx-head { display: flex; flex-direction: column; gap: 1px; padding: var(--s1) var(--s3) var(--s1); max-width: 320px; cursor: default; }
+.ctx-head-title { font-size: var(--fs-xs); font-weight: 600; color: var(--muted); letter-spacing: 0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctx-head-sub { font-size: var(--fs-xs); color: var(--muted); line-height: var(--lh-tight); white-space: normal; overflow-wrap: anywhere; }
 .ctx-sep { height: 1px; background: var(--border); margin: var(--s1) 6px; }
 /* The separator before the destructive group is wider and carries extra space,
    so a mis-aimed click near a benign item cannot land on Drop. */

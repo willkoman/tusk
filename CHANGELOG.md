@@ -2,6 +2,19 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
+## [Unreleased]
+
+### Added
+- **The Slack badge in the statusbar is now a menu.** Click it to turn the bot on or off, to **Bind to** any open connection (a running bot is repointed, a stopped one starts against it), or to open Settings → Slack. The badge shows whenever both bot tokens are saved, not only while the bot runs, so a stopped bot can be switched on from where you are.
+- **A waiting bot offers a one-click Bind.** Someone who configured the bot before connections could be bound has `enabled: true` and no bound connection on disk, so autostart could wait for nothing — and the only way out was switching the bot Off and On in Settings. Now the statusbar notice explains that and offers **Bind to** the focused connection. The same button appears when the bot's connection is closed and a different one is open.
+
+### Changed
+- **Settings → Slack can bind a stopped bot.** The connection picker under the status card used to appear only for a running bot. It now appears while the bot is off too, labelled **Bind to**, and starts the bot against the chosen connection; for a running bot it still reads **Answers against**.
+- **A waiting bot is amber, a failed one is red.** The badge and the status card used to paint "stopped because its connection closed" and "stopped because the socket failed" the same way. Stopped on purpose with autostart still armed is now amber (needs attention, nothing lost) and reads *Bot waiting*; an actual failure is red.
+
+### Fixed
+- **The sample-rows checkbox in the AI panel's settings drawer draws at full size.** The box beside *Share sample rows with the model* under the panel's gear icon rendered as a one-pixel sliver, so its state could not be seen. It is now the same 15px drawn checkbox as everywhere else.
+
 ## [0.10.1] - 2026-09-10
 
 ### Added
