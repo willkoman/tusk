@@ -2,7 +2,7 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
-## [Unreleased]
+## [0.10.2] - 2026-09-10
 
 ### Added
 - **The Slack badge in the statusbar is now a menu.** Click it to turn the bot on or off, to **Bind to** any open connection (a running bot is repointed, a stopped one starts against it), or to open Settings → Slack. The badge shows whenever both bot tokens are saved, not only while the bot runs, so a stopped bot can be switched on from where you are.

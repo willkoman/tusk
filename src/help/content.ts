@@ -3572,8 +3572,8 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
-        "text": "Next release — the Slack bot from the statusbar",
-        "id": "next"
+        "text": "v0.10.2 — the Slack bot from the statusbar",
+        "id": "v0-10-2"
       },
       {
         "k": "list",
