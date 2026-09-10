@@ -2,7 +2,7 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
-## [Unreleased]
+## [0.10.1] - 2026-09-10
 
 ### Added
 - **Select more than one area of a result.** `Ctrl/⌘`-click adds a cell, a gutter row or a header column to the selection, drag with it held to add a rectangle, and `Ctrl/⌘`-click a selected one to take it back out. Every area paints, the status bar counts the distinct cells and aggregates over all of them, delete marks cover every selected row, and Export → Selection covers every selected row too. Copy works when the areas form a rectangle — the same rows or the same columns — and the status line says so when they don't, rather than padding the clipboard with cells you did not select.

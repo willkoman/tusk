@@ -3571,8 +3571,8 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
-        "text": "Unreleased — multi-area selection, fill handle, paste over a selection",
-        "id": "unreleased"
+        "text": "v0.10.1 — multi-area selection, fill handle, paste over a selection",
+        "id": "v0-10-1"
       },
       {
         "k": "list",
