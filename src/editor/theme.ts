@@ -24,9 +24,19 @@ export function fontStack(fontFamily: string): string {
  * ("system" is mapped to a concrete theme by App before it gets here); unknown
  * ids fall back to One Dark.
  */
+/**
+ * The palette half of a theme — chrome + syntax highlighting, no sizing. Used on
+ * its own by the single-line SqlField, which needs the colours but none of the
+ * editor's font/wrap prefs. `theme` arrives already resolved; unknown ids fall
+ * back to One Dark.
+ */
+export function paletteFor(theme: string): Extension {
+  return theme === "light" ? lightTheme : theme === "oneDark" ? oneDark : cmThemes[theme] ?? oneDark;
+}
+
 export function themeFor(prefs: EditorPrefs): Extension {
   return [
-    prefs.theme === "light" ? lightTheme : prefs.theme === "oneDark" ? oneDark : cmThemes[prefs.theme] ?? oneDark,
+    paletteFor(prefs.theme),
     prefs.wordWrap ? EditorView.lineWrapping : [],
     EditorView.theme({
       "&": {

@@ -199,13 +199,15 @@
   --accent-soft-2: rgba(var(--accent-rgb), 0.2);
   --tag-violet: #7c3aed;
   --tag-pink: #db2777;
+  /* Syntax tokens are darkened to 4.5:1 on this polarity's --bg; the CodeMirror
+     palettes in src/editor carry the same values (contrast.test.ts pins both). */
   --tok-kw: #a626a4;
-  --tok-type: #0d9488;
-  --tok-fn: #4078f2;
-  --tok-str: #50a14f;
-  --tok-qid: #c18401;
-  --tok-num: #986801;
-  --tok-com: #a0a1a7;
+  --tok-type: #0b7e74;
+  --tok-fn: #2766f0;
+  --tok-str: #3e7e3e;
+  --tok-qid: #856800;
+  --tok-num: #a35a00;
+  --tok-com: #6f7077;
   --e1: 0 6px 18px rgba(15, 23, 42, 0.10);
   --e2: 0 16px 48px rgba(15, 23, 42, 0.16);
   --edit-dirty: #b45309;
@@ -464,13 +466,13 @@
   --env-prod: #dc322f;
   --env-staging: #b58900;
   --env-dev: #2aa198;
-  --tok-kw: #859900;
-  --tok-type: #b58900;
-  --tok-fn: #268bd2;
-  --tok-str: #2aa198;
-  --tok-qid: #cb4b16;
-  --tok-num: #d33682;
-  --tok-com: #93a1a1;
+  --tok-kw: #687800;
+  --tok-type: #8e6b00;
+  --tok-fn: #2075b2;
+  --tok-str: #217d76;
+  --tok-qid: #c34815;
+  --tok-num: #cd2d7b;
+  --tok-com: #657373;
   --sq-error: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="6" height="3"><path d="m0 2.5 2-1.5h1l2 1.5h1" stroke="%23dc322f" fill="none" stroke-width=".9"/></svg>');
   --sq-warn: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="6" height="3"><path d="m0 2.5 2-1.5h1l2 1.5h1" stroke="%23b58900" fill="none" stroke-width=".9"/></svg>');
   --sq-info: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="6" height="3"><path d="m0 2.5 2-1.5h1l2 1.5h1" stroke="%23657b83" fill="none" stroke-width=".9"/></svg>');
@@ -525,7 +527,7 @@
   --tok-str: #0a3069;
   --tok-qid: #953800;
   --tok-num: #0550ae;
-  --tok-com: #6e7781;
+  --tok-com: #6a727c;
   --sq-error: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="6" height="3"><path d="m0 2.5 2-1.5h1l2 1.5h1" stroke="%23cf222e" fill="none" stroke-width=".9"/></svg>');
   --sq-warn: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="6" height="3"><path d="m0 2.5 2-1.5h1l2 1.5h1" stroke="%239a6700" fill="none" stroke-width=".9"/></svg>');
   --sq-info: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="6" height="3"><path d="m0 2.5 2-1.5h1l2 1.5h1" stroke="%23656d76" fill="none" stroke-width=".9"/></svg>');
@@ -575,12 +577,12 @@
   --env-staging: #b57614;
   --env-dev: #427b58;
   --tok-kw: #9d0006;
-  --tok-type: #b57614;
+  --tok-type: #966211;
   --tok-fn: #076678;
-  --tok-str: #79740e;
+  --tok-str: #74700d;
   --tok-qid: #af3a03;
   --tok-num: #8f3f71;
-  --tok-com: #928374;
+  --tok-com: #786b5e;
   --sq-error: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="6" height="3"><path d="m0 2.5 2-1.5h1l2 1.5h1" stroke="%23cc241d" fill="none" stroke-width=".9"/></svg>');
   --sq-warn: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="6" height="3"><path d="m0 2.5 2-1.5h1l2 1.5h1" stroke="%23b57614" fill="none" stroke-width=".9"/></svg>');
   --sq-info: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="6" height="3"><path d="m0 2.5 2-1.5h1l2 1.5h1" stroke="%237c6f64" fill="none" stroke-width=".9"/></svg>');
@@ -675,7 +677,11 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline-offs
    outrank a live secondary next to it.
    ========================================================================== */
 
-button {
+/* `:where()` keeps the base at specificity 0: a component rule with a single
+   class always outranks it, so a component never has to restate the whole base
+   to change one property. Anything a component must be able to override lives
+   here; state rules (`:hover`, `:disabled`) keep their own specificity below. */
+:where(button) {
   font: inherit;
   cursor: pointer;
   border: 1px solid var(--border);
@@ -692,9 +698,10 @@ button {
   gap: 6px;
   transition: background var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
 }
-/* Buttons that read as rows in a list keep their left edge (the rules below set
-   text-align but not display, so the base's centring would win). */
-.settings-tab, .ai-example, .run-chooser button { justify-content: flex-start; }
+/* A button that reads as a row in a list declares `justify-content: flex-start`
+   in its OWN rule (see .settings-tab, .kb-navitem, .mp-row, …). `text-align`
+   alone does nothing to a flex button, and a central exemption list here went
+   out of date the moment a new list was added. */
 button:hover:not(:disabled) { border-color: var(--border-hover); }
 button:disabled { cursor: default; }
 button:disabled,
@@ -747,10 +754,14 @@ button.btn-danger:hover:not(:disabled) { filter: brightness(1.1); }
 .head-actions { display: flex; gap: 3px; }
 .head-actions .icon { padding: 5px; }
 
-/* --- inputs, selects, textareas --- */
-input:not([type="checkbox"]):not([type="radio"]):not([type="color"]),
-select,
-textarea {
+/* --- inputs, selects, textareas ---
+   `:where()` again: the three `:not()` matchers used to give this rule 0-3-1,
+   which beat every component rule that set a padding or a border on one field
+   (the Explorer filter's icon inset, an unset column Default, the manual's
+   search box). Scoped to 0, a single class is enough to retune one field. --- */
+:where(input:not([type="checkbox"]):not([type="radio"]):not([type="color"])),
+:where(select),
+:where(textarea) {
   font: inherit;
   padding: 6px var(--s3);
   border-radius: var(--r-sm);
@@ -860,7 +871,10 @@ input[type="checkbox"]:disabled, input[type="radio"]:disabled { opacity: 0.45; c
    flat: no dot grid, no radial glows, no gradient submit. Structure carries it.
    ========================================================================== */
 
-.connect-screen { position: relative; height: 100%; display: grid; place-items: center; overflow: auto; padding: var(--s6) 0; background: var(--bg); }
+/* `safe center`: centred while it fits, top-aligned the moment it does not.
+   Plain centring pushed the card's bottom edge past the viewport whenever the
+   "reopen last session" bar was showing, and that overflow is unreachable. */
+.connect-screen { position: relative; height: 100%; display: grid; place-items: safe center; overflow: auto; padding: var(--s6) var(--s4); background: var(--bg); }
 .connect-utils { position: fixed; top: var(--s3); right: var(--s3); display: flex; gap: var(--s1); z-index: 5; }
 .connect-utils .icon { padding: 7px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-sm); }
 .connect-utils .icon:hover { border-color: var(--accent); }
@@ -914,8 +928,11 @@ input[type="checkbox"]:disabled, input[type="radio"]:disabled { opacity: 0.45; c
 .driver-tile:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
 .driver-tile.active { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); color: var(--text); background: var(--panel-2); }
 .driver-tile:disabled { opacity: 0.45; cursor: default; }
-/* Mascots live here and on the connection chip; nowhere else. */
-.driver-tile .dt-mascot { font-size: 17px; line-height: 1.1; }
+/* The mascot only appears where it is big enough to read: the driver tile, the
+   profile avatar, the connect card and the OS window title. At the 12-14px of a
+   connection chip or a tab it was a coloured smudge, and the colour rail and the
+   name already say which session a row belongs to. */
+.driver-tile .dt-mascot { font-size: 22px; line-height: 1.1; }
 .driver-tile .dt-label { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .profiles-panel {
@@ -931,7 +948,7 @@ input[type="checkbox"]:disabled, input[type="radio"]:disabled { opacity: 0.45; c
 .profile-row:hover .icon, .profile-row.active .icon, .profile-row:focus-within .icon { opacity: 0.7; }
 .profile-main { flex: 1; cursor: pointer; min-width: 0; display: flex; align-items: center; gap: 9px; }
 .profile-avatar {
-  width: 30px; height: 30px; flex-shrink: 0; display: grid; place-items: center; font-size: 16px;
+  width: 30px; height: 30px; flex-shrink: 0; display: grid; place-items: center; font-size: 19px;
   border-radius: var(--r-sm); background: var(--panel-2); border: 1px solid var(--border);
 }
 .profile-text { flex: 1; min-width: 0; }
@@ -979,7 +996,10 @@ input[type="checkbox"]:disabled, input[type="radio"]:disabled { opacity: 0.45; c
 .body { flex: 1; display: flex; min-height: 0; }
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .topbar { display: flex; align-items: center; gap: var(--s3); padding: var(--s2) var(--s3); border-bottom: 1px solid var(--border); background: var(--panel); }
-.brand-sm { font-weight: 700; letter-spacing: -0.01em; }
+.brand-sm { font-weight: 700; letter-spacing: -0.01em; flex: none; }
+/* The server version is the one part of the strip allowed to shrink: it wrapped
+   to two lines on a narrow window and grew the whole topbar. */
+.topbar-version { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .topbar-sep { width: 1px; align-self: stretch; margin: var(--s1) 2px; background: var(--border); }
 .topbar .ghost { display: inline-flex; align-items: center; gap: 6px; }
 .topbar .ghost svg { width: 14px; height: 14px; }
@@ -1016,7 +1036,6 @@ input[type="checkbox"]:disabled, input[type="radio"]:disabled { opacity: 0.45; c
 .env-prod { --env-color: var(--env-prod); }
 .env-staging { --env-color: var(--env-staging); }
 .env-dev { --env-color: var(--env-dev); }
-.conn-mascot { flex-shrink: 0; font-size: var(--fs-sm); line-height: 1; }
 .conn-close svg, .tab-close svg, .tab-new svg, .conn-add svg, .tab-overflow svg, .status-notice-x svg { width: 12px; height: 12px; display: block; }
 .sb-pending svg, .toolbar .run svg, .topbar .ghost.tx-start svg, .toolbar .tb-more svg { width: 12px; height: 12px; }
 .conn-close { flex-shrink: 0; padding: 0 2px; border: none; background: none; color: var(--muted); font-size: var(--fs-base); line-height: 1; cursor: pointer; opacity: 0; }
@@ -1052,7 +1071,7 @@ button.conn-dot.cancellable:hover { background: var(--danger); box-shadow: 0 0 0
 
 /* --- status bar. Four slots in fixed order: connection + environment, result
        state, notices, cursor position. --- */
-.statusbar { display: flex; align-items: center; gap: var(--s3); padding: 5px var(--s3); border-top: 1px solid var(--border); background: var(--panel); color: var(--muted); font-size: var(--fs-sm); min-height: 24px; }
+.statusbar { display: flex; align-items: center; flex-wrap: nowrap; gap: var(--s3); padding: 5px var(--s3); border-top: 1px solid var(--border); background: var(--panel); color: var(--muted); font-size: var(--fs-sm); min-height: 24px; }
 .statusbar.has-conn { box-shadow: inset 3px 0 0 var(--conn-color, transparent); }
 .sb-conn { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; max-width: 34%; min-width: 0; }
 .sb-conn-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
@@ -1074,7 +1093,9 @@ button.conn-dot.cancellable:hover { background: var(--danger); box-shadow: 0 0 0
 .status-notice:hover .status-notice-x { opacity: 1; }
 .status-elapsed { display: inline-flex; align-items: center; gap: 5px; font-variant-numeric: tabular-nums; }
 .status-elapsed svg { width: 12px; height: 12px; opacity: 0.7; }
-.cursor-info { font-variant-numeric: tabular-nums; font-size: var(--fs-xs); }
+/* `flex: none` + nowrap: the readout is one line or the bar grows a second one
+   and every panel below it shifts. The status text absorbs the shrink instead. */
+.cursor-info { flex: none; white-space: nowrap; font-variant-numeric: tabular-nums; font-size: var(--fs-xs); }
 .streaming { display: inline-flex; align-items: center; gap: 6px; color: var(--accent-2); }
 .streaming.idle { color: var(--muted); }
 .streaming .stream-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
@@ -1217,11 +1238,13 @@ button.conn-dot.cancellable:hover { background: var(--danger); box-shadow: 0 0 0
 .cm-host .cm-panel.cm-search input, .cm-host .cm-panel.cm-search button { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: var(--r-xs); }
 /* One overlay surface for every completion/lint popup, whether CodeMirror parents
    it inside the editor or (SqlField, below) at <body>. */
-.cm-host .cm-tooltip, body > div > .cm-tooltip { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: var(--r-md); box-shadow: var(--e2); overflow: hidden; }
+.cm-host .cm-tooltip, body > div[class] > .cm-tooltip { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: var(--r-md); box-shadow: var(--e2); overflow: hidden; }
 /* SqlField anchors its completion tooltip to <body> (see SqlField.tsx): inside a
    dialog the tooltip was clipped by the scrolling modal body. CodeMirror wraps it
-   in a bare positioned div; that wrapper must clear .modal-overlay (z-index 50). */
-body > div > .cm-tooltip { z-index: 500; }
+   in a positioned div that carries the theme's generated classes, so the rule
+   above needs `div[class]` to outrank the theme's own `.cm-tooltip`; the wrapper
+   must also clear .modal-overlay (z-index 50). */
+body > div[class] > .cm-tooltip { z-index: 500; }
 /* Completion rows: one mono kind letter in a fixed slot, the detail muted. The
    CodeMirror default icons are box-drawing glyphs that render as empty squares. */
 .cm-tooltip-autocomplete > ul > li { padding: 2px var(--s2); }
@@ -1260,7 +1283,6 @@ body > div > .cm-tooltip { z-index: 500; }
 :root[data-mode="light"] .tab-bar, :root[data-mode="light"] .tab-strip { background: var(--panel-2); }
 :root[data-mode="light"] .tab.active { background: var(--panel); }
 .tab.frozen:not(.active) { opacity: 0.72; }
-.tab-conn { flex-shrink: 0; font-size: var(--fs-xs); line-height: 1; }
 .tab[style*="--conn-color"] { border-bottom: 3px solid var(--conn-color); }
 .tab-tx { padding: 1px var(--s1); border-radius: var(--r-xs); background: var(--accent-soft); color: var(--accent-2); font-size: 9px; font-weight: 700; }
 .tab-title { overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
@@ -1329,13 +1351,17 @@ body > div > .cm-tooltip { z-index: 500; }
 .toolbar .tb-more { padding: var(--pad-y) var(--s3); background: var(--panel-2); border: 1px solid var(--border); font-weight: 700; }
 .toolbar .export-select { max-width: 180px; min-width: 60px; flex: 0 1 auto; text-overflow: ellipsis; }
 /* Responsive tiers keyed to the editor pane's width (a sidebar resize counts),
-   not the window. Thresholds sit low enough that Format/Find survive a side dock. */
-@container editorpane (max-width: 940px) { .toolbar .hint { display: none; } }
-@container editorpane (max-width: 720px) {
+   not the window. Each threshold sits ABOVE the width the tier below it needs:
+   the named buttons alone measure ~780px with the schema select and the view
+   zone, so collapsing them at 720 left a 1000–1055px window band where the
+   toolbar ran off the screen instead of folding into `.tb-more`. Verified by a
+   640→1600px sweep. */
+@container editorpane (max-width: 1180px) { .toolbar .hint { display: none; } }
+@container editorpane (max-width: 860px) {
   .toolbar .tb-text, .toolbar .tb-sep-text { display: none; }
   .toolbar .tb-more, .toolbar .tb-sep-more { display: inline-flex; }
 }
-@container editorpane (max-width: 520px) { .toolbar .font-btn, .toolbar .tb-sep-font { display: none; } }
+@container editorpane (max-width: 420px) { .toolbar .font-btn, .toolbar .tb-sep-font { display: none; } }
 .font-btn { min-width: 26px; display: inline-flex; align-items: center; justify-content: center; }
 .font-btn .az-sm { font-weight: 700; font-size: 10px; line-height: 1; }
 .font-btn .az-lg { font-weight: 700; font-size: var(--fs-md); line-height: 1; }
@@ -1366,7 +1392,9 @@ body.dnd-dragging * { cursor: grabbing !important; user-select: none !important;
    desaturates it, says what it is, and disables everything that acts on it.
    ========================================================================== */
 
-.result { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
+/* Its own container so the toolbar below can collapse against the RESULTS pane
+   (a sidebar or side dock resize counts), the same way `.editor-pane` does. */
+.result { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; container-type: inline-size; container-name: resultpane; }
 /* One error state, boxed and actionable. A bare red sentence with "No results"
    printed under it was two contradictory empty states stacked. */
 .result-error { margin: var(--s3); }
@@ -1406,6 +1434,12 @@ body.dnd-dragging * { cursor: grabbing !important; user-select: none !important;
 .sb-pending { color: var(--edit-dirty); font-weight: 600; white-space: nowrap; }
 .transaction-result-stale { color: var(--warn); font-size: var(--fs-xs); font-weight: 600; white-space: nowrap; }
 .result-incomplete { color: var(--warn); font-size: var(--fs-xs); font-weight: 600; white-space: nowrap; cursor: help; }
+/* Responsive tiers, mirroring the editor toolbar's. First the copy-headers
+   toggle folds away (it is also Settings → Grid → "Copy with column names"),
+   then the action labels, leaving each button's icon and its title. Verified by
+   the same 640→1600px sweep. */
+@container resultpane (max-width: 900px) { .result-toolbar .sb-copyhdr { display: none; } }
+@container resultpane (max-width: 700px) { .result-toolbar .rt-text { display: none; } }
 
 /* --- running: the stale result recedes and is named as stale --- */
 .result.is-running .rg,
@@ -1566,7 +1600,13 @@ body.dnd-dragging * { cursor: grabbing !important; user-select: none !important;
 /* Labels are sentence case and never transformed: a dialog routinely prints an
    identifier, and in a Postgres client case is semantic. */
 .modal label { display: flex; flex-direction: column; gap: var(--s1); font-size: var(--fs-xs); font-weight: 600; color: var(--muted); }
-.modal input:not([type="checkbox"]):not([type="radio"]), .modal select, .modal textarea { padding: 7px var(--s3); min-height: var(--control-h); }
+/* The dialog field size. `:where()` for the same reason as the base rule above:
+   at 0-3-1 this out-specified every per-field rule inside a dialog — the
+   manual's search inset, the export grid's compact rows, the settings track. It
+   still beats the 0-0-0 base, by source order. */
+:where(.modal input:not([type="checkbox"]):not([type="radio"])),
+:where(.modal select),
+:where(.modal textarea) { padding: 7px var(--s3); min-height: var(--control-h); }
 .modal .checkbox { flex-direction: row; align-items: center; gap: var(--s2); font-size: var(--fs-sm); font-weight: 400; color: var(--text); }
 .modal .checkbox input:not([type="checkbox"]):not([type="radio"]) { width: auto; }
 
@@ -1638,11 +1678,23 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
 /* --- SQL-aware field (single-line CodeMirror). The scroller clips, not the
        wrapper: the completion tooltip is portalled to <body> and must not be
        cut off by an ancestor's overflow. --- */
-.sql-field { border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--bg); min-width: 0; }
+.sql-field { display: flex; align-items: stretch; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--bg); min-width: 0; }
 .sql-field:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.sql-field-cm { flex: 1; min-width: 0; }
+/* A constrained field (the column Type) says so: a caret that opens the engine's
+   type list, so the field does not read as free text. */
+.sql-field-caret {
+  flex: none; width: 20px; min-width: 0; padding: 0; border: none; background: transparent;
+  color: var(--muted); display: inline-flex; align-items: center; justify-content: center;
+}
+.sql-field-caret:hover { color: var(--text); }
+.sql-field-caret svg { width: 12px; height: 12px; display: block; }
 .sql-field .cm-editor { background: transparent; max-height: 30px; }
 .sql-field .cm-editor .cm-scroller { line-height: var(--lh-body); overflow-x: auto; }
 .sql-field .cm-editor .cm-gutters { display: none; }
+/* CodeMirror's own placeholder is a hard-coded #888 — 3.1:1 on a light surface.
+   Placeholders are real text here ("(none)", "type"), so they take --muted. */
+.cm-editor .cm-placeholder { color: var(--muted); }
 
 /* --- column builder (Create table / Modify table) ---------------------------
    A column is a two-line record, not a row of squeezed boxes:
@@ -1670,18 +1722,29 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
      when the dialog is taller than the window, taking its scrollbar with it. */
   flex: none;
 }
-.col-builder.create-cols { --cb-flags-w: 190px; --cb-actions-w: 58px; }
+/* Create offers four flags, and each is spelled out: `Uq` / `Ident` were two
+   abbreviations nothing on screen expanded. */
+.col-builder.create-cols { --cb-flags-w: 258px; --cb-actions-w: 58px; }
 .cb-head, .cb-line1 {
   display: grid;
   grid-template-columns: var(--cb-order-w) minmax(140px, 1.05fr) minmax(150px, 1.15fr) var(--cb-flags-w);
   gap: var(--cb-gap);
   align-items: center;
 }
+/* Sticky against `.modal-body`, the dialog's ONE scroller: you tick PK and edit
+   types twelve rows down, and the header has to still be there. Sticky is
+   confined to `.col-builder`, so it releases at the end of the column list. */
 .cb-head {
+  /* `-var(--s4)` cancels .modal-body's padding, so the head pins to the very top
+     of the scrollport and no half-row shows above it. */
+  position: sticky; top: calc(var(--s4) * -1); z-index: 2;
   grid-template-columns: var(--cb-order-w) minmax(140px, 1.05fr) minmax(150px, 1.15fr) var(--cb-flags-w) var(--cb-actions-w);
   padding: var(--s2) var(--s3) 6px;
+  background: var(--bg);
   font-size: var(--fs-xs); font-weight: 600; color: var(--muted);
   border-bottom: 1px solid var(--border);
+  border-radius: var(--r-sm) var(--r-sm) 0 0;
+  box-shadow: 0 1px 0 var(--border);
 }
 .cb-head .cb-head-actions { text-align: right; }
 .cb-col {
@@ -1701,8 +1764,7 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
 }
 .cb-line2.is-solo { grid-template-columns: 1fr; }
 .cb-actions { grid-area: actions; display: flex; align-items: center; justify-content: flex-end; gap: 2px; }
-/* Three attribute matchers, to outrank `.modal input:not(…):not(…)`. One height
-   for the text inputs and the CodeMirror fields beside them. */
+/* One height for the text inputs and the CodeMirror fields beside them. */
 .cb-col input:not([type="checkbox"]):not([type="radio"]) {
   padding: 5px 7px; width: 100%; min-width: 0; min-height: 30px; height: 30px;
 }
@@ -1744,7 +1806,6 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
 
 .modify-head { display: flex; gap: var(--s3); }
 .modify-head label { flex: 1; }
-.cb-scroll { max-height: min(46vh, 520px); overflow-y: auto; }
 .cb-col.row-dropped { box-shadow: inset 3px 0 0 var(--danger); background: var(--danger-soft); }
 .cb-col.row-dropped input, .cb-col.row-dropped .cm-content { text-decoration: line-through; }
 .cb-col.row-dropped .cb-sub-label, .cb-col.row-dropped .cb-flag { opacity: 0.75; }
@@ -1778,10 +1839,19 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
 .export-grid { display: flex; flex-direction: column; gap: var(--s3); padding: var(--s3) var(--s4) var(--s1); max-height: 62vh; overflow-y: auto; }
 .export-sec { display: flex; flex-direction: column; gap: 6px; }
 .export-label { font-size: var(--fs-xs); color: var(--muted); font-weight: 600; }
-.export-row { display: flex; flex-wrap: wrap; gap: var(--s3); align-items: flex-end; }
+/* Three tracks, not a wrapping flex row: successive rows in one group started
+   their controls at different x, so nothing below the first column lined up. */
+.export-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s3); align-items: end; }
+.export-row > * { min-width: 0; }
 .export-row label { display: flex; flex-direction: column; gap: 3px; font-size: var(--fs-xs); color: var(--muted); }
-.export-row select, .export-row input { font-size: var(--fs-sm); background: var(--panel-2); padding: var(--s1) 7px; }
+.export-row select, .export-row input { font-size: var(--fs-sm); background: var(--panel-2); padding: var(--s1) 7px; width: 100%; }
+/* A single-character field keeps its size; only its track is shared. */
+.export-row .export-narrow { width: 52px; }
 .export-narrow { width: 52px; }
+/* A bare control in the grid (the file picker, a checkbox) sits at its track's
+   left edge instead of stretching across it. */
+.export-row > button { justify-self: start; }
+.export-row > .export-note { align-self: center; }
 .export-check { flex-direction: row !important; align-items: center; gap: 6px; color: var(--text) !important; }
 .export-cols { display: flex; flex-direction: column; gap: 2px; max-height: 150px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--r-sm); padding: 6px var(--s2); }
 .export-col { display: flex; align-items: center; gap: 6px; font-size: var(--fs-sm); }
@@ -1841,6 +1911,11 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
 .filter-val { flex: 1 1 120px; min-width: 70px; }
 .filter-val.wide { flex: 2 1 220px; }
 .filter-and, .filter-novalue { flex: none; font-size: var(--fs-xs); color: var(--muted); }
+/* A condition the WHERE clause drops. Amber: nothing is lost, the row just does
+   not count yet. */
+.filter-row-incomplete { box-shadow: inset 2px 0 0 var(--warn); border-radius: var(--r-xs); padding-left: 6px; }
+.filter-dropped { flex: none; font-size: var(--fs-xs); font-weight: 600; color: var(--warn); white-space: nowrap; }
+.filter-note { font-size: var(--fs-xs); color: var(--warn); padding: 2px var(--s1); }
 .filter-class { flex: none; }
 .filter-row .icon { flex: none; padding: 2px; }
 .filter-empty { font-size: var(--fs-xs); color: var(--muted); padding: 2px var(--s1); }
@@ -1857,10 +1932,12 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
    moved the rail out from under the pointer; the pane scrolls instead. */
 .settings-body { display: flex; gap: var(--s3); height: min(520px, 62vh); min-height: 320px; }
 .settings-rail { display: flex; flex-direction: column; gap: 2px; min-width: 132px; flex: none; border-right: 1px solid var(--border); padding-right: var(--s3); overflow-y: auto; }
-.settings-tab { text-align: left; padding: 7px var(--s3); border: none; background: transparent; color: var(--muted); border-radius: var(--r-sm); font: inherit; cursor: pointer; }
+.settings-tab { text-align: left; justify-content: flex-start; padding: 7px var(--s3); border: none; background: transparent; color: var(--muted); border-radius: var(--r-sm); font: inherit; cursor: pointer; }
 .settings-tab:hover { background: var(--panel-2); color: var(--text); }
 .settings-tab.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
-.settings-pane { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; overflow-y: auto; padding-right: var(--s2); }
+/* `scrollbar-gutter: stable`: without it a pane that happens not to scroll puts
+   its control column 10px right of one that does. */
+.settings-pane { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; overflow-y: auto; scrollbar-gutter: stable; padding-right: var(--s2); }
 
 .modal label.settings-row,
 .slack-pane div.settings-row {
@@ -1870,19 +1947,30 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
 }
 .settings-row > :last-child { justify-self: end; }
 .settings-row > span:first-child { min-width: 0; }
-/* Every control in the right column fills it, so the left edges line up. */
+/* Every control in the right column fills it and shares one height, so both
+   edges line up down the pane. A number input, an accent-swatch row and a font
+   field used to start at four different x. */
 .settings-row select,
-.settings-row input[type="text"],
-.settings-row input[type="password"],
-.settings-row input[type="search"] { width: 100%; min-height: var(--control-h); }
-.settings-row input[type="number"] { width: 96px; min-height: var(--control-h); }
+.settings-row input:not([type="checkbox"]):not([type="radio"]):not([type="color"]) {
+  width: 100%;
+  height: calc(var(--control-h) + 4px);
+  min-height: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+}
 .settings-row input[type="color"] { width: 100%; height: 26px; padding: 2px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--bg); }
-.settings-inline { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+/* A row of inline controls starts at the same left edge as the filled ones. */
+.settings-inline { display: flex; align-items: center; justify-content: flex-start; gap: 6px; width: 100%; }
+.settings-inline > input:not([type="checkbox"]):not([type="radio"]):not([type="color"]),
+.settings-inline > select { flex: 1; min-width: 0; }
 .settings-label { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .settings-label > span { display: inline-flex; align-items: center; gap: 6px; }
 .settings-label small { font-size: var(--fs-xs); line-height: var(--lh-tight); color: var(--muted); }
 .settings-label code, .slack-model { font-family: var(--mono); font-size: var(--fs-xs); color: var(--text); background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--r-xs); padding: 0 var(--s1); }
 .slack-model { padding: 3px 7px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A layout-neutral <form> wrapper. A password input outside a form makes every
+   Chromium build log a DOM warning; `display: contents` keeps the row layout. */
+.subform { display: contents; }
 .settings-note { font-size: var(--fs-sm); color: var(--muted); padding: var(--s2) 0; line-height: var(--lh-body); }
 .settings-hint { font-size: var(--fs-xs); color: var(--muted); }
 .settings-actions { display: flex; align-items: center; gap: 6px; padding: 6px 0 2px; }
@@ -1925,7 +2013,7 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
 .ai-cards { display: flex; flex-direction: column; gap: 6px; margin: 6px 0 var(--s3); }
 .ai-card { border: 1px solid var(--border); border-radius: var(--r-md); background: var(--panel-2); overflow: hidden; }
 .ai-card.active { border-color: var(--accent); }
-.ai-card-head { display: flex; align-items: center; gap: var(--s2); width: 100%; padding: var(--s2) var(--s3); background: transparent; border: none; color: var(--text); cursor: pointer; text-align: left; font: inherit; }
+.ai-card-head { display: flex; align-items: center; justify-content: flex-start; gap: var(--s2); width: 100%; padding: var(--s2) var(--s3); background: transparent; border: none; color: var(--text); cursor: pointer; text-align: left; font: inherit; }
 .ai-card-head:hover { background: var(--border); }
 .ai-card-name { display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: var(--fs-base); }
 .ai-card-model { flex: 1; text-align: right; color: var(--muted); font-size: var(--fs-xs); font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2043,7 +2131,7 @@ label.slack-switch { display: inline-flex; flex-direction: row; align-items: cen
 .ai-empty-head b { font-weight: 600; }
 .ai-empty-hint { color: var(--muted); font-size: var(--fs-xs); line-height: var(--lh-tight); }
 .ai-examples { display: flex; flex-direction: column; gap: 6px; margin-top: var(--s1); }
-.ai-example { text-align: left; font: inherit; font-size: var(--fs-sm); padding: 7px var(--s3); border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--panel); color: var(--text); cursor: pointer; }
+.ai-example { text-align: left; justify-content: flex-start; font: inherit; font-size: var(--fs-sm); padding: 7px var(--s3); border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--panel); color: var(--text); cursor: pointer; }
 .ai-example:hover { border-color: var(--accent); }
 .ai-msg { display: flex; flex-direction: column; gap: 5px; }
 .ai-msg-body { white-space: pre-wrap; word-break: break-word; font-size: var(--fs-base); line-height: var(--lh-body); }
@@ -2133,7 +2221,7 @@ label.slack-switch { display: inline-flex; flex-direction: row; align-items: cen
   display: flex; flex-direction: column; gap: 1px;
 }
 .run-chooser-title { font-size: var(--fs-xs); color: var(--muted); padding: 5px var(--s3) 3px; }
-.run-chooser button { text-align: left; background: transparent; border: none; color: var(--text); padding: 6px var(--s3); border-radius: var(--r-xs); font-size: var(--fs-sm); cursor: pointer; width: 100%; min-width: 0; }
+.run-chooser button { text-align: left; justify-content: flex-start; background: transparent; border: none; color: var(--text); padding: 6px var(--s3); border-radius: var(--r-xs); font-size: var(--fs-sm); cursor: pointer; width: 100%; min-width: 0; }
 .run-chooser button:hover, .run-chooser button:focus { background: var(--accent); color: #fff; outline: none; }
 .run-chooser-hint { font-size: 10px; color: var(--muted); padding: var(--s1) var(--s3) 3px; }
 
@@ -2184,7 +2272,7 @@ label.slack-switch { display: inline-flex; flex-direction: row; align-items: cen
 .mp-search:focus { box-shadow: none; }
 .mp-list { max-height: 320px; overflow-y: auto; padding: var(--s1); }
 .mp-group { font-size: var(--fs-xs); font-weight: 600; color: var(--muted); padding: 6px 6px 3px; }
-.mp-row { display: flex; align-items: baseline; gap: var(--s2); width: 100%; text-align: left; font: inherit; background: transparent; border: none; color: var(--text); padding: 5px 7px; border-radius: var(--r-xs); cursor: pointer; }
+.mp-row { display: flex; align-items: baseline; justify-content: flex-start; gap: var(--s2); width: 100%; text-align: left; font: inherit; background: transparent; border: none; color: var(--text); padding: 5px 7px; border-radius: var(--r-xs); cursor: pointer; }
 .mp-row.on { background: var(--accent); color: #fff; }
 .mp-row.on .mp-note, .mp-row.on .mp-prov { color: rgba(255, 255, 255, 0.75); }
 .mp-row.cur .mp-model { font-weight: 600; }
@@ -2203,7 +2291,7 @@ label.slack-switch { display: inline-flex; flex-direction: row; align-items: cen
 .mmp-meta .spacer { flex: 1; }
 .mmp-list { max-height: 260px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--r-sm); padding: 2px; }
 .mmp-meta code, .mmp-add code { font-family: var(--mono); font-size: var(--fs-xs); color: var(--text); }
-.mmp-row { display: flex; align-items: center; gap: var(--s2); width: 100%; padding: 3px 6px 3px var(--s2); color: var(--text); font: inherit; text-align: left; cursor: pointer; border-radius: var(--r-xs); border: none; background: transparent; }
+.mmp-row { display: flex; align-items: center; justify-content: flex-start; gap: var(--s2); width: 100%; padding: 3px 6px 3px var(--s2); color: var(--text); font: inherit; text-align: left; cursor: pointer; border-radius: var(--r-xs); border: none; background: transparent; }
 .mmp-row:hover, .mmp-row.on { background: var(--accent-soft); }
 .mmp-row input[type="checkbox"] { margin: 0; flex-shrink: 0; }
 .mmp-row .mp-model { flex: 1; }
@@ -2334,7 +2422,7 @@ label.slack-switch { display: inline-flex; flex-direction: row; align-items: cen
 .kb-navscroll { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: var(--s3); }
 .kb-group { display: flex; flex-direction: column; gap: 1px; }
 .kb-grouplabel { font-size: var(--fs-xs); font-weight: 600; color: var(--muted); padding: 0 var(--s2) 3px; }
-.kb-navitem { display: flex; align-items: flex-start; gap: var(--s2); padding: 5px var(--s2); border: none; background: none; border-radius: var(--r-sm); cursor: pointer; text-align: left; color: var(--text); font: inherit; }
+.kb-navitem { display: flex; align-items: flex-start; justify-content: flex-start; gap: var(--s2); padding: 5px var(--s2); border: none; background: none; border-radius: var(--r-sm); cursor: pointer; text-align: left; color: var(--text); font: inherit; }
 .kb-navitem:hover { background: var(--accent-soft); }
 .kb-navitem.active { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
 .kb-navitem svg { width: 13px; height: 13px; flex: none; opacity: 0.75; margin-top: 2px; }
@@ -2347,7 +2435,7 @@ label.slack-switch { display: inline-flex; flex-direction: row; align-items: cen
 .kb-expandall { flex: none; font-size: var(--fs-xs); padding: var(--s1) var(--s3); min-width: 0; }
 .kb-sec { border: 1px solid var(--border); border-radius: var(--r-md); margin: var(--s2) 0; overflow: hidden; background: var(--bg); }
 .kb-sec.open { background: transparent; }
-.kb-sechead { display: flex; align-items: baseline; gap: var(--s2); width: 100%; padding: 9px var(--s3); border: none; background: none; cursor: pointer; text-align: left; color: var(--text); font: inherit; }
+.kb-sechead { display: flex; align-items: baseline; justify-content: flex-start; gap: var(--s2); width: 100%; padding: 9px var(--s3); border: none; background: none; cursor: pointer; text-align: left; color: var(--text); font: inherit; }
 .kb-sechead:hover { background: var(--accent-soft); }
 .kb-secchev { flex: none; font-size: 10px; color: var(--muted); width: 10px; }
 .kb-sectitle { flex: none; font-size: var(--fs-base); font-weight: 600; }
@@ -2358,7 +2446,7 @@ label.slack-switch { display: inline-flex; flex-direction: row; align-items: cen
 .kb-sec.flash { animation: kb-flash 1.4s ease-out; }
 .kb-hits { display: flex; flex-direction: column; gap: 6px; max-width: 68ch; }
 .kb-hitcount { font-size: var(--fs-xs); color: var(--muted); margin: 2px 0 var(--s1); }
-.kb-hit { display: flex; flex-direction: column; gap: 3px; padding: var(--s2) 11px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--bg); cursor: pointer; text-align: left; color: var(--text); font: inherit; }
+.kb-hit { display: flex; flex-direction: column; justify-content: flex-start; gap: 3px; padding: var(--s2) 11px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--bg); cursor: pointer; text-align: left; color: var(--text); font: inherit; }
 .kb-hit:hover { border-color: var(--accent); }
 .kb-hitpath { display: flex; align-items: center; gap: 6px; font-size: var(--fs-sm); }
 .kb-hittopic { font-weight: 600; }
@@ -2660,7 +2748,9 @@ label.slack-switch { display: inline-flex; flex-direction: row; align-items: cen
 .rg-rec-body { flex: 1; min-height: 0; overflow: auto; }
 .rg-rec-row {
   display: grid;
-  grid-template-columns: minmax(0, 40%) minmax(0, 1fr);
+  /* The column name is the label of the row: it gets enough of the width to be
+     read, and the value (which is also in the grid) absorbs the rest. */
+  grid-template-columns: minmax(0, 46%) minmax(0, 1fr);
   gap: 8px;
   align-items: center;
   padding: 3px 10px;
@@ -2696,7 +2786,7 @@ label.slack-switch { display: inline-flex; flex-direction: row; align-items: cen
 .value-kind { margin-bottom: 4px; color: var(--muted); font-family: var(--mono); font-size: 10.5px; }
 
 /* Status bar: focused cell and selection aggregates (loaded rows only). */
-.grid-info { display: inline-flex; align-items: center; gap: 10px; color: var(--muted); white-space: nowrap; }
+.grid-info { flex: none; display: inline-flex; align-items: center; gap: 10px; color: var(--muted); white-space: nowrap; }
 .grid-info .gi-pos, .grid-info .gi-size, .grid-info .gi-agg { font-variant-numeric: tabular-nums; }
 .grid-info .gi-agg { font-family: var(--mono); }
 

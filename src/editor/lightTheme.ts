@@ -7,6 +7,11 @@ import { tags as t } from "@lezer/highlight";
 // `oneDark` bundle provides (chrome theme + syntax highlight style) without
 // pulling in another dependency. The surrounding UI flips via the
 // `:root[data-theme="light"]` CSS-variable block in App.css.
+//
+// Every syntax colour is darkened from upstream One Light until it clears 4.5:1
+// on this theme's `--bg` (#f4f6f9) — the editor and the dialogs' SqlFields paint
+// straight onto it, and upstream's golds and greens came in under 3:1 there.
+// `contrast.test.ts` holds the whole set to that bar.
 
 const lightChrome = EditorView.theme(
   {
@@ -17,12 +22,12 @@ const lightChrome = EditorView.theme(
       { backgroundColor: "#d2dcf5" },
     ".cm-activeLine": { backgroundColor: "rgba(56, 58, 66, 0.05)" },
     ".cm-activeLineGutter": { backgroundColor: "rgba(56, 58, 66, 0.07)", color: "#383a42" },
-    ".cm-gutters": { backgroundColor: "transparent", color: "#9d9d9f", border: "none" },
+    ".cm-gutters": { backgroundColor: "transparent", color: "#6f7077", border: "none" },
     ".cm-matchingBracket, &.cm-focused .cm-matchingBracket": {
       backgroundColor: "rgba(64, 120, 242, 0.15)",
       outline: "1px solid rgba(64, 120, 242, 0.4)",
     },
-    ".cm-nonmatchingBracket": { color: "#e45649" },
+    ".cm-nonmatchingBracket": { color: "#d52f20" },
     ".cm-tooltip": { background: "#f4f5f7", border: "1px solid #d4d6da", color: "#383a42" },
     ".cm-tooltip-autocomplete ul li[aria-selected]": { background: "#d2dcf5", color: "#383a42" },
     ".cm-panels": { background: "#f4f5f7", color: "#383a42" },
@@ -32,18 +37,32 @@ const lightChrome = EditorView.theme(
   { dark: false },
 );
 
+/** One Light's palette, darkened to AA on `--bg`. Exported for contrast.test.ts. */
+export const LIGHT_PALETTE = {
+  text: "#383a42",
+  kw: "#a626a4",
+  str: "#3e7e3e",
+  num: "#a35a00",
+  com: "#6f7077",
+  type: "#856800",
+  fn: "#2766f0",
+  atom: "#0177aa",
+  invalid: "#d52f20",
+  gutter: "#6f7077",
+};
+
 const lightHighlight = HighlightStyle.define([
-  { tag: [t.keyword, t.operatorKeyword, t.modifier], color: "#a626a4" },
-  { tag: [t.string, t.special(t.string)], color: "#50a14f" },
-  { tag: [t.number, t.bool, t.null], color: "#986801" },
-  { tag: t.comment, color: "#a0a1a7", fontStyle: "italic" },
-  { tag: [t.typeName, t.className], color: "#c18401" },
-  { tag: [t.function(t.variableName), t.function(t.propertyName)], color: "#4078f2" },
-  { tag: [t.variableName, t.propertyName, t.attributeName], color: "#383a42" },
-  { tag: [t.operator, t.punctuation, t.separator], color: "#383a42" },
-  { tag: t.labelName, color: "#4078f2" },
-  { tag: [t.atom, t.constant(t.name)], color: "#0184bc" },
-  { tag: t.invalid, color: "#e45649" },
+  { tag: [t.keyword, t.operatorKeyword, t.modifier], color: LIGHT_PALETTE.kw },
+  { tag: [t.string, t.special(t.string)], color: LIGHT_PALETTE.str },
+  { tag: [t.number, t.bool, t.null], color: LIGHT_PALETTE.num },
+  { tag: t.comment, color: LIGHT_PALETTE.com, fontStyle: "italic" },
+  { tag: [t.typeName, t.className], color: LIGHT_PALETTE.type },
+  { tag: [t.function(t.variableName), t.function(t.propertyName)], color: LIGHT_PALETTE.fn },
+  { tag: [t.variableName, t.propertyName, t.attributeName], color: LIGHT_PALETTE.text },
+  { tag: [t.operator, t.punctuation, t.separator], color: LIGHT_PALETTE.text },
+  { tag: t.labelName, color: LIGHT_PALETTE.fn },
+  { tag: [t.atom, t.constant(t.name)], color: LIGHT_PALETTE.atom },
+  { tag: t.invalid, color: LIGHT_PALETTE.invalid },
 ]);
 
 export const lightTheme: Extension = [lightChrome, syntaxHighlighting(lightHighlight)];

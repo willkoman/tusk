@@ -38,6 +38,9 @@ const FIND_H = 30;
 const GUTTER_W = 56;
 /** Gutter width with row numbers off — still wide enough to grab a row. */
 const GUTTER_W_SLIM = 22;
+/** Record-view width. The floor is what a column name needs: at 200px the name
+ *  column resolved to ~70px and truncated every identifier past "status". */
+const RECORD_WIDTH = "clamp(248px, 30%, 400px)";
 const MIN_COL_W = 48;
 const MAX_COL_W = 900;
 const ROW_OVERSCAN = 8;
@@ -1056,7 +1059,7 @@ export function ResultGrid(props: ResultGridProps) {
     }
     if (props.canFilter()) {
       items.push(
-        { label: "Filter by this column…", icon: "search", onClick: () => props.onOpenFilter(props.columns()[oi]) },
+        { label: "Filter by this column…", icon: "filter", onClick: () => props.onOpenFilter(props.columns()[oi]) },
         { label: props.view().filterRowOpen ? "Hide filter row" : "Show filter row", icon: props.view().filterRowOpen ? "eyeOff" : "eye", onClick: () => props.setView({ filterRowOpen: !props.view().filterRowOpen }) },
       );
     }
@@ -1304,7 +1307,7 @@ export function ResultGrid(props: ResultGridProps) {
       ref={root}
       tabindex={0}
       onKeyDown={onKeyDown}
-      style={{ "--rg-rec": recordOpen() ? "clamp(200px, 28%, 360px)" : "0px" }}
+      style={{ "--rg-rec": recordOpen() ? RECORD_WIDTH : "0px" }}
     >
       {/* find in loaded rows — a strip above the header, never over it */}
       <Show when={findOpen()}>

@@ -21,7 +21,7 @@ import {
   type FilterOperator,
   type FilterTree,
 } from "../grid/filterModel";
-import { renderWhere } from "../grid/filterSql";
+import { incompleteConditionIds, renderWhere } from "../grid/filterSql";
 import { withDialect } from "../sql/ident";
 
 const CLASS_LABEL: Record<ColumnClass, string> = {
@@ -105,6 +105,24 @@ export function FilterBuilder(props: {
   const where = () => rendered().sql;
   const error = () => rendered().error;
   const preview = () => (where() ? `WHERE ${where()}` : "");
+  // Conditions the WHERE clause drops. They stay in the tree (the user is mid-edit),
+  // but the row says so — a nested group whose only condition is blank disappeared
+  // from the preview with nothing on screen to explain it.
+  const incomplete = createMemo(() => {
+    try {
+      return new Set(
+        withDialect(props.dialect, () =>
+          incompleteConditionIds(tree(), {
+            columns: props.columns,
+            dialect: props.dialect,
+            classOf: classOf(),
+          }),
+        ),
+      );
+    } catch {
+      return new Set<string>();
+    }
+  });
 
   const apply = () => {
     if (error()) return;
@@ -164,7 +182,14 @@ export function FilterBuilder(props: {
             firstRef={(el) => (firstField = el)}
             onChange={setTree}
             tree={tree}
+            incomplete={incomplete()}
           />
+          <Show when={incomplete().size}>
+            <div class="filter-note">
+              {incomplete().size} condition{incomplete().size === 1 ? "" : "s"} without a value
+              {incomplete().size === 1 ? " is" : " are"} left out of the filter.
+            </div>
+          </Show>
         </Show>
       </div>
     </Dialog>
@@ -180,6 +205,8 @@ function GroupEditor(props: {
   firstRef?: (el: HTMLSelectElement) => void;
   tree: () => FilterTree;
   onChange: (tree: FilterTree) => void;
+  /** Condition ids the WHERE clause drops. */
+  incomplete: Set<string>;
 }) {
   const setOp = (op: "and" | "or") => props.onChange(setGroupOp(props.tree(), props.group.id, op));
   const addCondition = () => {
@@ -241,6 +268,7 @@ function GroupEditor(props: {
                     selectRef={props.depth === 0 && i === 0 ? props.firstRef : undefined}
                     tree={props.tree}
                     onChange={props.onChange}
+                    incomplete={props.incomplete.has((item() as Condition).id)}
                   />
                 }
               >
@@ -251,6 +279,7 @@ function GroupEditor(props: {
                   classOf={props.classOf}
                   tree={props.tree}
                   onChange={props.onChange}
+                  incomplete={props.incomplete}
                 />
               </Show>
             </div>
@@ -269,6 +298,8 @@ function ConditionRow(props: {
   selectRef?: (el: HTMLSelectElement) => void;
   tree: () => FilterTree;
   onChange: (tree: FilterTree) => void;
+  /** This condition contributes nothing to the WHERE clause. */
+  incomplete?: boolean;
 }) {
   const cls = () => props.classOf(props.cond.column);
   const ops = () => operatorsFor(cls());
@@ -292,7 +323,7 @@ function ConditionRow(props: {
   };
 
   return (
-    <div class="filter-row">
+    <div class="filter-row" classList={{ "filter-row-incomplete": props.incomplete }}>
       <select
         class="filter-col"
         // A CALLBACK ref, never `ref={props.selectRef}`: Solid compiles a non-literal
@@ -320,6 +351,9 @@ function ConditionRow(props: {
         <For each={ops()}>{(o) => <option value={o.id}>{o.label}</option>}</For>
       </select>
       <ValueInputs cond={props.cond} cls={cls()} onValue={setValue} />
+      <Show when={props.incomplete}>
+        <span class="filter-dropped" title="Left out of the filter">not applied</span>
+      </Show>
       <span class="spacer" />
       <button
         class="icon"

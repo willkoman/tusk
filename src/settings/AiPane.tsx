@@ -322,6 +322,9 @@ export function AiPane(props: { database: string }) {
                     <div class="ai-card-group">Connection</div>
 
                     <Show when={p.needsKey}>
+                      {/* `display: contents` form: a bare password input outside one
+                          makes every Chromium build log a DOM warning. */}
+                      <form class="subform" onSubmit={(e) => e.preventDefault()}>
                       <label class="settings-row">
                         <span class="settings-label">
                           <span>API key</span>
@@ -330,14 +333,16 @@ export function AiPane(props: { database: string }) {
                         <span class="settings-inline">
                           <input
                             type="password"
+                            autocomplete="current-password"
                             placeholder={probe()[p.id]?.hasKey ? "Type to replace" : "Paste key"}
                             value={keyInput()[p.id] ?? ""}
                             onInput={(e) => setKeyInput((m) => ({ ...m, [p.id]: e.currentTarget.value }))}
                             onKeyDown={(e) => { if (e.key === "Enter" && (keyInput()[p.id] ?? "").trim()) void saveKey(p.id); }}
                           />
-                          <button class="run" disabled={!(keyInput()[p.id] ?? "").trim()} onClick={() => void saveKey(p.id)}>Save</button>
+                          <button class="run" type="button" disabled={!(keyInput()[p.id] ?? "").trim()} onClick={() => void saveKey(p.id)}>Save</button>
                         </span>
                       </label>
+                      </form>
                     </Show>
 
                     <label class="settings-row">

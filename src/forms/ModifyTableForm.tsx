@@ -352,7 +352,7 @@ export function ModifyTableForm(props: {
           <span>Name</span>
           <span>Type</span>
           <span>Flags</span>
-          <span class="cb-head-actions">Action</span>
+          <span class="cb-head-actions">Actions</span>
         </div>
         <For each={cols}>
           {(c, i) => (

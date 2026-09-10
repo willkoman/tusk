@@ -29,7 +29,7 @@ export function FilterBar(props: {
   return (
     <Show when={active() > 0}>
       <div class="filter-bar">
-        <span class="filter-bar-label"><Icon name="search" /> Filter</span>
+        <span class="filter-bar-label"><Icon name="filter" /> Filter</span>
         <div class="filter-bar-chips">
           <NodeChips node={props.tree()} top onRemove={props.onRemove} disabled={props.disabled} />
         </div>

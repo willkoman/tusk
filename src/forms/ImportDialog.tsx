@@ -241,7 +241,7 @@ export function ImportDialog(props: {
             <div class="export-label">Source file</div>
             <div class="export-row">
               <button class="ghost" onClick={() => void pickFile()}>Choose file…</button>
-              <span class="import-file">{fileName() || "no file selected"}</span>
+              <span class="import-file">{fileName() || "No file chosen"}</span>
             </div>
           </section>
 

@@ -175,12 +175,20 @@ describe("ModifyTableForm — the column row", () => {
 
   it("orders the fields name → type → flags → default → comment", () => {
     open();
-    const fields = [...colFor("note").querySelectorAll("input,button,.sql-field")].map((e) =>
+    // The type field's option caret is deliberately out of the tab order, so it
+    // is excluded here exactly as the browser excludes it.
+    const fields = [...colFor("note").querySelectorAll('input,button:not([tabindex="-1"]),.sql-field')].map((e) =>
       e.classList.contains("sql-field") ? "sql" : (e as HTMLInputElement).type || "button",
     );
     // The order handle is hidden on PostgreSQL, so the row opens on the name;
     // the two `sql` slots are the type and the default (CodeMirror fields).
     expect(fields).toEqual(["text", "sql", "checkbox", "checkbox", "sql", "text", "submit"]);
+    // The Type field is a picker, not free text: it shows the list caret.
+    const typeField = colFor("note").querySelector(".cb-line1 .sql-field")!;
+    expect(typeField.querySelector(".sql-field-caret")).toBeTruthy();
+    expect(typeField.querySelector('.sql-field-caret[tabindex="-1"]')).toBeTruthy();
+    // The Default field stays free text — no caret.
+    expect(colFor("note").querySelector(".cb-line2 .sql-field-caret")).toBeNull();
     const line2 = colFor("note").querySelector(".cb-line2")!;
     const actions = colFor("note").querySelector(".cb-actions")!;
     // Line 2 precedes the actions in the DOM, which is what fixes the Tab order.

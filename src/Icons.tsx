@@ -61,6 +61,7 @@ export type IconName =
   | "comment"
   | "code"
   | "eyeOff"
+  | "filter"
   | "sortAsc"
   | "sortDesc"
   | "slash"
@@ -126,6 +127,10 @@ export function Icon(props: { name: IconName }): JSX.Element {
       return svg("currentColor", <><path d="M21 12a9 9 0 1 1-2.64-6.36L21 8" /><path d="M21 3v5h-5" /></>);
     case "search":
       return svg("currentColor", <><circle cx="11" cy="11" r="7" /><path d="m21 21-4.3-4.3" /></>);
+    // A funnel, not the magnifier: Find scans loaded rows, Filter narrows the
+    // query. One glyph for both made two different features look like one.
+    case "filter":
+      return svg("currentColor", <path d="M3 4h18l-7 8.5V20l-4 2v-9.5Z" />);
     case "edit":
       return svg("currentColor", <><path d="M17 3a2.83 2.83 0 0 1 4 4L7.5 20.5 2 22l1.5-5.5Z" /><path d="m15 5 4 4" /></>);
     case "trash":

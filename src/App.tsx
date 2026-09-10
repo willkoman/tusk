@@ -79,6 +79,7 @@ import { type DangerFacts } from "./forms/ConfirmDialog";
 import { type SettingsTab } from "./settings/SettingsDialog";
 const HelpDialog = lazy(() => import("./help/HelpDialog"));
 import { fontStack } from "./editor/theme";
+import { setFieldTheme } from "./editor/fieldTheme";
 import { type SqlEngine } from "./editor/lexer";
 import { ACTIONS, type ActionCtx, type ActionId, type KeyOverrides, canonicalKey, displayKey, effectiveKey, normalizeKeyEvent } from "./actions";
 import { measureEdges, reorder, slotOffset, startPointerDrag, type PointerDragHandle } from "./dnd";
@@ -1028,6 +1029,8 @@ function App() {
     // CSS fixes shared by every theme of that polarity.
     document.documentElement.dataset.theme = resolvedTheme();
     document.documentElement.dataset.mode = isDarkTheme(resolvedTheme()) ? "dark" : "light";
+    // Dialog SqlFields mount outside this tree and read the theme from here.
+    setFieldTheme(resolvedTheme());
   });
 
   // Lazily fetch FK edges when a tab switches to a not-yet-fetched schema.
@@ -1384,7 +1387,6 @@ function App() {
       detail: t.filePath ?? "",
       connectionId: t.connectionId,
       connectionLabel: labelOf(t.connectionId),
-      mascot: driverMascot(kindOf(t.connectionId)),
       dirty: t.dirty,
       pinned: t.pinned,
       color: t.color,
@@ -4858,7 +4860,7 @@ function App() {
               { label: "Export table…", icon: "export", onClick: () => void openTableExport(s!, n.name) },
               { label: "Import data into table…", icon: "import", ...importGate(canInsert(s!, n.name), `Requires INSERT on ${n.name}`), onClick: () => openImport({ schema: s!, name: n.name }) },
               { label: "Backup table…", icon: "archive", onClick: () => openBackup({ scope: "tables", schemas: [], tables: [{ schema: s!, name: n.name }], suggestedName: n.name }) },
-              { label: "Filter rows…", icon: "search", onClick: () => void filterTable(s!, n.name) },
+              { label: "Filter rows…", icon: "filter", onClick: () => void filterTable(s!, n.name) },
             ],
           },
           { sep: true },
@@ -4890,7 +4892,7 @@ function App() {
             icon: "table",
             items: [
               { label: "Export…", icon: "export", onClick: () => void openTableExport(s!, n.name, kw) },
-              { label: "Filter rows…", icon: "search", onClick: () => void filterTable(s!, n.name) },
+              { label: "Filter rows…", icon: "filter", onClick: () => void filterTable(s!, n.name) },
             ],
           },
         );
@@ -5339,7 +5341,9 @@ function App() {
                 <div class="connect-foot">Right-click a connection for more actions. <kbd class="kb-kbd">F1</kbd> opens the manual.</div>
               </div>
   
-              <form class="connect-card" onSubmit={doConnect}>
+              {/* `autocomplete` on every field: with a password present, Chromium logs a
+                  verbose warning for each unannotated input in the form. */}
+              <form class="connect-card" autocomplete="off" onSubmit={doConnect}>
                 <div class="brand-row">
                   <span class="brand-mark">{driverMascot(driver())}</span>
                   <div>
@@ -5347,7 +5351,7 @@ function App() {
                     <div class="subtitle">{editingId() ? "Edit connection" : "New connection"}</div>
                   </div>
                 </div>
-                <label>Name<input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="My database" /></label>
+                <label>Name<input autocomplete="off" value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="My database" /></label>
                 <label>Driver
                   <div class="driver-tiles" role="radiogroup" aria-label="Driver">
                     <For each={DRIVERS}>
@@ -5388,13 +5392,13 @@ function App() {
                   fallback={
                     <>
                       <div class="field-row host-port">
-                        <label>Host<input value={host()} onInput={(e) => setHost(e.currentTarget.value)} /></label>
-                        <label>Port<input type="number" min="1" max="65535" step="1" value={port()} onInput={(e) => setPort(Number(e.currentTarget.value))} /></label>
+                        <label>Host<input autocomplete="off" value={host()} onInput={(e) => setHost(e.currentTarget.value)} /></label>
+                        <label>Port<input type="number" autocomplete="off" min="1" max="65535" step="1" value={port()} onInput={(e) => setPort(Number(e.currentTarget.value))} /></label>
                       </div>
-                      <label>User<input value={user()} onInput={(e) => setUser(e.currentTarget.value)} placeholder={driver() === "mysql" ? "root" : driver() === "mssql" ? "sa" : "postgres"} /></label>
-                      <label>Password<input type="password" value={password()} onInput={(e) => setPassword(e.currentTarget.value)} placeholder={editingId() && savePassword() ? "•••••• (stored)" : ""} /></label>
+                      <label>User<input autocomplete="username" value={user()} onInput={(e) => setUser(e.currentTarget.value)} placeholder={driver() === "mysql" ? "root" : driver() === "mssql" ? "sa" : "postgres"} /></label>
+                      <label>Password<input type="password" autocomplete="current-password" value={password()} onInput={(e) => setPassword(e.currentTarget.value)} placeholder={editingId() && savePassword() ? "•••••• (stored)" : ""} /></label>
                       <div class="field-row halves">
-                        <label>Database<input value={dbname()} onInput={(e) => setDbname(e.currentTarget.value)} placeholder={driver() === "postgres" ? "postgres" : "(optional)"} /></label>
+                        <label>Database<input autocomplete="off" value={dbname()} onInput={(e) => setDbname(e.currentTarget.value)} placeholder={driver() === "postgres" ? "postgres" : "(optional)"} /></label>
                         <label>SSL mode
                           <select value={sslmode()} onChange={(e) => setSslmode(e.currentTarget.value)}>
                             <option value="disable">disable</option>
@@ -5409,7 +5413,7 @@ function App() {
                 >
                   <label>Database file
                     <div class="file-row">
-                      <input value={path()} onInput={(e) => setPath(e.currentTarget.value)} placeholder={`/path/to/db.${driver() === "sqlite" ? "sqlite" : "duckdb"} (blank = in-memory)`} />
+                      <input autocomplete="off" value={path()} onInput={(e) => setPath(e.currentTarget.value)} placeholder={`/path/to/db.${driver() === "sqlite" ? "sqlite" : "duckdb"} (blank = in-memory)`} />
                       <button type="button" class="ghost" onClick={browseDbFile}>Browse…</button>
                     </div>
                   </label>
@@ -5488,9 +5492,6 @@ function App() {
                     title={`${labelOf(id)} (${driverLabel(kindOf(id))}${env() === "none" ? "" : `, ${ENVIRONMENT_LABELS[env()]}`}${entry.conn.viaSsh ? ", over SSH" : ""}): ${connectionDotTitle(dot())}`}
                     onClick={() => focusConnection(id)}
                   >
-                    <Show when={connections().length > 1}>
-                      <span class="conn-mascot">{driverMascot(kindOf(id))}</span>
-                    </Show>
                     {/* The dot is the only place a background connection's state shows,
                         so when a query is running there it is also the way to cancel it
                         — behind a confirmation, since it sits inside a click target. */}
@@ -5531,7 +5532,7 @@ function App() {
               onClick={() => openConnectScreen()}
             ><Icon name="plus" /></button>
           </div>
-          <span class="meta">{driverLabel(connectionKind())} {conn()?.version ?? ""}</span>
+          <span class="meta topbar-version" title={`${driverLabel(connectionKind())} ${conn()?.version ?? ""}`}>{driverLabel(connectionKind())} {conn()?.version ?? ""}</span>
           <Show when={conn()?.readOnly}>
             <span class="badge badge-ro" title="Writes & DDL are blocked"><Icon name="lock" /> Read-only</span>
           </Show>
@@ -5792,9 +5793,6 @@ function App() {
                       }}
                     >
                       <Show when={t.color}><span class="tab-tag" data-color={t.color} title={`Colour: ${TAB_COLOR_LABELS[t.color as Exclude<TabColor, "">]}`} /></Show>
-                      <Show when={connections().length > 1 || t.pinned}>
-                        <span class="tab-conn" title={labelOf(t.connectionId)}>{driverMascot(kindOf(t.connectionId))}</span>
-                      </Show>
                       <Show
                         when={inlineRename()?.id === t.id}
                         fallback={<span class="tab-title">{t.pinned ? shortTabLabel(tabLabel(t)) : tabLabel(t)}</span>}
@@ -5949,9 +5947,19 @@ function App() {
                         <button classList={{ active: resultView() === "grid" }} onClick={() => patchTab(activeTabId(), { resultView: "grid" })}>Grid</button>
                       </div>
                     </Show>
-                    <Show when={!done()}>
-                      <span class="streaming" classList={{ idle: !(fetchingMore() || loadingAll()) }}>
-                        <Show when={fetchingMore() || loadingAll()} fallback={<><span class="stream-dot" />Idle</>}>
+                    {/* The cursor state, and only when it says something: while a
+                        query runs it described the PREVIOUS result's stream, so
+                        "Idle" sat directly above the "Running" pill. */}
+                    <Show when={!done() && !running()}>
+                      <span
+                        class="streaming"
+                        classList={{ idle: !(fetchingMore() || loadingAll()) }}
+                        title={fetchingMore() || loadingAll() ? "Fetching more rows" : "Not all rows are loaded"}
+                      >
+                        <Show
+                          when={fetchingMore() || loadingAll()}
+                          fallback={<><span class="stream-dot" />More rows</>}
+                        >
                           <span class="spinner-sm" />Streaming…
                         </Show>
                       </span>
@@ -5971,16 +5979,16 @@ function App() {
                   </div>
                   <div class="rt-zone rt-actions">
                     <Show when={!done()}>
-                      <button class="ghost export-btn" disabled={running() || !activeDatabaseAllowed()} onClick={loadAll}>{loadingAll() ? <><span class="spinner-sm" />Cancel</> : "Load all"}</button>
+                      <button class="ghost export-btn" title="Load every remaining row" disabled={running() || !activeDatabaseAllowed()} onClick={loadAll}>{loadingAll() ? <><span class="spinner-sm" /><span class="rt-text">Cancel</span></> : <><Icon name="download" /> <span class="rt-text">Load all</span></>}</button>
                       <span class="sb-sep" />
                     </Show>
                     <Show when={editCtx().editable || pendingCount(tabPending()) > 0}>
                       <Show when={pendingCount(tabPending()) > 0}>
-                        <button class="ghost export-btn sb-commit" onClick={openCommit} disabled={!editCtx().editable || running()} title={editCtx().editable ? "Preview & run the change script" : editCtx().reason}>{activeOwnsTransaction() ? "Apply…" : "Commit…"}</button>
-                        <button class="ghost export-btn" onClick={discardPending} disabled={running()}>Discard</button>
+                        <button class="ghost export-btn sb-commit" onClick={openCommit} disabled={!editCtx().editable || running()} title={editCtx().editable ? "Preview & run the change script" : editCtx().reason}><Icon name="check" /> <span class="rt-text">{activeOwnsTransaction() ? "Apply…" : "Commit…"}</span></button>
+                        <button class="ghost export-btn" title="Discard the pending grid changes" onClick={discardPending} disabled={running()}><Icon name="eraser" /> <span class="rt-text">Discard</span></button>
                       </Show>
                       <Show when={editCtx().editable}>
-                        <button class="ghost export-btn" title="Add a row, committed as INSERT" onClick={onAddRow} disabled={running()}><Icon name="plus" /> Row</button>
+                        <button class="ghost export-btn" title="Add a row, committed as INSERT" onClick={onAddRow} disabled={running()}><Icon name="plus" /> <span class="rt-text">Row</span></button>
                       </Show>
                       <span class="sb-sep" />
                     </Show>
@@ -5998,7 +6006,7 @@ function App() {
                         disabled={running()}
                         onClick={() => setGridView({ findOpen: !gridView().findOpen })}
                       >
-                        <Icon name="search" /> Find
+                        <Icon name="search" /> <span class="rt-text">Find</span>
                       </button>
                       <button
                         class="ghost export-btn"
@@ -6007,7 +6015,7 @@ function App() {
                         disabled={running()}
                         onClick={() => setGridView({ recordOpen: !gridView().recordOpen })}
                       >
-                        <Icon name="columns" /> Record
+                        <Icon name="columns" /> <span class="rt-text">Record</span>
                       </button>
                       <span class="sb-sep" />
                       <button
@@ -6017,12 +6025,12 @@ function App() {
                         title={canFilter() ? "Build a result filter" : sortUnavailable() || "This result can't be filtered"}
                         onClick={() => openFilterBuilder()}
                       >
-                        <Icon name="search" /> Filter
+                        <Icon name="filter" /> <span class="rt-text">Filter</span>
                       </button>
                     </Show>
                     <Show when={(lastQuery() || columns().length > 0) && caps()?.export !== false && !(planMemo() && resultView() === "plan")}>
                       <span class="sb-sep" />
-                      <button class="ghost export-btn" onClick={openExport} disabled={running()}>Export…</button>
+                      <button class="ghost export-btn" title="Export this result" onClick={openExport} disabled={running()}><Icon name="export" /> <span class="rt-text">Export…</span></button>
                     </Show>
                   </div>
                 </div>
@@ -6153,7 +6161,7 @@ function App() {
               <Show when={slackNotice()}>
                 <button
                   class="status-notice"
-                  title="Dismiss this notice"
+                  title={slackNotice()}
                   aria-label={`Dismiss Slack notice: ${slackNotice()}`}
                   onClick={() => setSlackNotice("")}
                 >

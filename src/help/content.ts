@@ -1426,6 +1426,7 @@ export const TOPICS: Topic[] = [
         "items": [
           "Auto-numbering: Postgres identity, MySQL `AUTO_INCREMENT`, SQLite `INTEGER PRIMARY KEY AUTOINCREMENT`, DuckDB a sequence alongside the table.",
           "A column is two lines: name, type and flags on the first; default and comment on the second.",
+          "The type field is a picker: its caret lists the connected engine's types, and typing filters them. The column header stays pinned while the list scrolls.",
           "An expandable section adds per-column checks, foreign keys, `IF NOT EXISTS`, `TEMPORARY`, and MySQL's engine and charset options."
         ]
       },
@@ -3095,7 +3096,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "**Pin** a tab to hold it in a fixed group at the left of the strip. A pinned tab shows its driver mascot and the first few characters of its name, has no ×, cannot be dragged past an unpinned tab, and is never closed by a close-many action. **Colour ›** tags a tab with one of six theme-aware swatches, drawn as a dot — distinct from the accent top rule that marks a transaction owner and the bottom rule that tints a tab by connection. Titles, pins and colours persist with the tab set."
+        "md": "**Pin** a tab to hold it in a fixed group at the left of the strip. A pinned tab shows the first few characters of its name, has no ×, cannot be dragged past an unpinned tab, and is never closed by a close-many action. **Colour ›** tags a tab with one of six theme-aware swatches, drawn as a dot — distinct from the accent top rule that marks a transaction owner and the bottom rule that tints a tab by connection. Titles, pins and colours persist with the tab set."
       },
       {
         "k": "p",
@@ -3122,7 +3123,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Up to **16** databases can be open at once. The topbar carries one chip per connection — mascot, database name, state dot, colour rail — and **+** adds one."
+        "md": "Up to **16** databases can be open at once. The topbar carries one chip per connection — database name, state dot, colour rail — and **+** adds one."
       },
       {
         "k": "p",
@@ -3195,7 +3196,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "[[topic:history|Query history]] is scoped to the destination, so the same profile opened twice shows one combined history.",
-          "Tabs belong to a connection. Above one connection each tab shows its mascot and colour rail, and clicking a tab switches connection.",
+          "Tabs belong to a connection. Above one connection each tab shows its colour rail, and clicking a tab switches connection.",
           "New tabs open on the connection in focus, and closing a connection's last tab opens a fresh one on it.",
           "The same saved connection opened twice gives each session its own tabs."
         ]
@@ -3597,7 +3598,8 @@ export const TOPICS: Topic[] = [
           "**Not yet on SQL Server** — file import, Explorer DDL builders, the Slack bot, and Explain.",
           "**Table editing on every engine that can express it**, with a searchable FK picker and a SQLite table rebuild. See [[topic:sidebar|Schema explorer & DDL]].",
           "**Safer defaults** — deleting a saved connection asks first, and Slack autostart binds to one saved connection.",
-          "**Tighter toolbars and a roomier column editor** — toolbar controls are one height again, and each column in Create/Modify table gets its own two-line row with a dedicated default and comment."
+          "**Tighter toolbars and a roomier column editor** — toolbar controls are one height again, and each column in Create/Modify table gets its own two-line row with a dedicated default and comment.",
+          "**Readable in every theme** — dialog SQL fields follow the app theme, and all four light palettes clear 4.5:1 on their own surface."
         ]
       },
       {

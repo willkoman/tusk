@@ -520,6 +520,9 @@ export function SlackPane(props: {
               Create a Slack app from the manifest in <code>docs/slack-setup.md</code>, then paste its two
               tokens here. Questions become SQL proposals; nothing runs without an Approve click.
             </div>
+            {/* `display: contents` form: a bare password input outside one makes
+                every Chromium build log a DOM warning. */}
+            <form class="subform" onSubmit={(e) => e.preventDefault()}>
             <label class="settings-row">
               <span class="settings-label">
                 <span>Bot token <Show when={hasBot()}><span class="ai-chip ok">saved</span></Show></span>
@@ -546,6 +549,7 @@ export function SlackPane(props: {
                 onInput={(e) => setAppToken(e.currentTarget.value)}
               />
             </label>
+            </form>
             <div class="settings-actions">
               <Show when={status().running && typedTokens()}>
                 <span class="settings-hint">Saving replacement tokens restarts the bot; failed validation stops it.</span>

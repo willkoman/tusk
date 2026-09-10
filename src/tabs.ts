@@ -68,7 +68,7 @@ export function interruptedResult(
     incomplete: reason,
     // The cause is a tooltip (`incomplete`), not a status line: the bar has room
     // for the count and the action, and the action is the part that matters.
-    status: `${result.rows.length.toLocaleString()} rows loaded. Re-run for all rows.`,
+    status: `${result.rows.length.toLocaleString()} rows loaded. Re-run for all.`,
   };
 }
 

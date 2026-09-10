@@ -22,6 +22,7 @@
 
 import { ident, lit } from "../sql/ident";
 import {
+  allConditions,
   arityOf,
   assertWithinLimits,
   conditions,
@@ -226,6 +227,27 @@ export function renderWhere(tree: FilterTree, ctx: FilterSqlCtx): string {
 export function activeConditionCount(tree: FilterTree, columns: string[]): number {
   const names = new Set(columns.map((c) => c.toLowerCase()));
   return conditions(tree).filter((c) => names.has(c.column.toLowerCase())).length;
+}
+
+/**
+ * Ids of the conditions the WHERE clause silently drops — a column no longer in
+ * the result, or a value slot left blank. The builder marks these rows: a group
+ * whose only condition is incomplete vanishes from the preview, and the filter
+ * then means something the user did not write. Pure; tested.
+ */
+export function incompleteConditionIds(tree: FilterTree, ctx: FilterSqlCtx): string[] {
+  const out: string[] = [];
+  for (const c of allConditions(tree)) {
+    let sql = "";
+    try {
+      sql = renderCondition(c, ctx);
+    } catch {
+      // Ambiguous column names are the dialog-level error renderWhere reports.
+      continue;
+    }
+    if (sql === "") out.push(c.id);
+  }
+  return out;
 }
 
 /** Value-slot count for a condition — the UI renders this many inputs. */

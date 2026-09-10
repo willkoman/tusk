@@ -16,7 +16,6 @@ export type TabSwitcherItem = {
   detail: string;
   connectionId: string;
   connectionLabel: string;
-  mascot: string;
   dirty: boolean;
   pinned: boolean;
   color: TabColor;
@@ -38,11 +37,11 @@ export function TabSwitcher(props: {
 
   /** Connection groups in first-seen order, so the list matches the strip. */
   const groups = createMemo(() => {
-    const out: { id: string; label: string; mascot: string; items: TabSwitcherItem[] }[] = [];
+    const out: { id: string; label: string; items: TabSwitcherItem[] }[] = [];
     for (const it of matches()) {
       let g = out.find((x) => x.id === it.connectionId);
       if (!g) {
-        g = { id: it.connectionId, label: it.connectionLabel, mascot: it.mascot, items: [] };
+        g = { id: it.connectionId, label: it.connectionLabel, items: [] };
         out.push(g);
       }
       g.items.push(it);
@@ -91,7 +90,6 @@ export function TabSwitcher(props: {
               {(g) => (
                 <>
                   <div class="ts-group">
-                    <span>{g.mascot}</span>
                     <span class="ts-group-name">{g.label}</span>
                     <span class="ts-group-count">{g.items.length}</span>
                   </div>

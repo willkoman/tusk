@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { renderCondition, renderWhere, activeConditionCount } from "./filterSql";
+import { renderCondition, renderWhere, activeConditionCount, incompleteConditionIds } from "./filterSql";
 import {
   classResolver,
   emptyFilter,
@@ -265,5 +265,44 @@ describe("bounds are enforced at render time", () => {
       items: Array.from({ length: 201 }, () => makeCondition("name", "eq", ["a"])),
     };
     expect(() => renderWhere(t, { columns: COLUMNS, dialect: "postgres" })).toThrow(/too many conditions/);
+  });
+});
+
+describe("incompleteConditionIds names what the WHERE clause drops", () => {
+  const ctx = { columns: COLUMNS, dialect: "postgres", classOf: CLASS_OF };
+
+  it("flags a blank value, a blank second value and an unknown column", () => {
+    const blank = makeCondition("name", "eq", [""]);
+    const halfRange = makeCondition("qty", "between", ["1", ""]);
+    const ghost = makeCondition("ghost", "eq", ["x"]);
+    const emptyList = makeCondition("name", "in", [""]);
+    const t: FilterTree = { ...emptyFilter(), items: [blank, halfRange, ghost, emptyList] };
+    expect(incompleteConditionIds(t, ctx).sort()).toEqual(
+      [blank.id, halfRange.id, ghost.id, emptyList.id].sort(),
+    );
+  });
+
+  it("leaves complete conditions and value-less operators alone", () => {
+    const t: FilterTree = {
+      ...emptyFilter(),
+      items: [
+        makeCondition("name", "eq", ["a"]),
+        makeCondition("name", "isNull", []),
+        makeCondition("flag", "isTrue", []),
+        makeCondition("qty", "between", ["1", "9"]),
+      ],
+    };
+    expect(incompleteConditionIds(t, ctx)).toEqual([]);
+  });
+
+  it("reaches conditions nested in a group — the case that vanished silently", () => {
+    const blank = makeCondition("name", "eq", [""]);
+    const t: FilterTree = {
+      ...emptyFilter(),
+      items: [makeCondition("qty", "gt", ["400"]), makeGroup("or", [blank])],
+    };
+    expect(incompleteConditionIds(t, ctx)).toEqual([blank.id]);
+    // The group contributes nothing to the SQL: that is what the marker explains.
+    expect(renderWhere(t, ctx)).toBe(`"qty" > 400`);
   });
 });

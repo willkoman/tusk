@@ -108,6 +108,10 @@ export function BackupDialog(props: {
     });
 
   const blocker = () => backupBlocker(opts()) || (path() ? "" : "Choose where to write the dump.");
+  /* An untouched form is not a form with an error in it. The missing destination
+     is already said by the disabled primary and by "No file chosen" beside the
+     picker, so only a real conflict is printed in red. */
+  const shownBlocker = () => backupBlocker(opts());
 
   async function pick() {
     setErr("");
@@ -154,7 +158,7 @@ export function BackupDialog(props: {
         <>
           {/* A disabled <button> fires no hover events on WebView2, so its `title` never
               appears. The reason why Back up is unavailable is visible text instead. */}
-          <Show when={blocker() && !busy() && !done()}><div class="field-error">{blocker()}</div></Show>
+          <Show when={shownBlocker() && !busy() && !done()}><div class="field-error">{shownBlocker()}</div></Show>
           <Show when={err() && !busy() && !done()}><div class="error">{err()}</div></Show>
           <div class="form-actions">
             <Show
@@ -210,9 +214,8 @@ export function BackupDialog(props: {
         <fieldset class="export-grid export-fieldset">
           <section class="export-sec">
             <div class="export-label">Source</div>
-            <div class="export-note">
-              {props.driverKind} · {props.database || "(unnamed database)"}
-            </div>
+            <div class="export-note">{props.database || "(unnamed database)"}</div>
+            <div class="export-note">{props.driverKind}</div>
           </section>
 
           <section class="export-sec">
@@ -236,7 +239,7 @@ export function BackupDialog(props: {
                 <label>
                   Filter
                   <input
-                    placeholder="type to narrow…"
+                    placeholder="Filter objects…"
                     value={filter()}
                     onInput={(e) => setFilter(e.currentTarget.value)}
                   />
@@ -334,7 +337,7 @@ export function BackupDialog(props: {
             <div class="export-label">Destination</div>
             <div class="export-row">
               <button class="ghost export-btn" onClick={() => void pick()}>Choose file…</button>
-              <span class="export-note">{path() || "no file chosen"}</span>
+              <span class="export-note">{path() || "No file chosen"}</span>
             </div>
           </section>
         </fieldset>
