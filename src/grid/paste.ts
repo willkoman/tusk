@@ -33,6 +33,8 @@ export type PastePlan = {
   rowCount: number;
   /** Most columns written in any single row. */
   colCount: number;
+  /** The block was repeated to fill the selection (positional mode only). */
+  tiled?: boolean;
 };
 
 const MAX_CLIPBOARD_CHARS = 10_000_000;
@@ -42,38 +44,79 @@ const MAX_CLIPBOARD_CELLS = 250_000;
 const MAX_CLIPBOARD_FIELD_CHARS = 1_000_000;
 
 /**
- * Parse clipboard text into a row/column grid. Delimiter is auto-detected: TAB when
- * any tab is present (Excel / another grid), else comma. Quoted fields (`"…"` with
- * `""` escaping, embedded delimiters/newlines) are honored for both delimiters —
- * spreadsheets quote tab/newline-bearing cells the same way. Quotes are meaningful
- * only at FIELD START (Excel-style): a bare `"` mid-field is literal data, so
- * external clipboards like `5" pipe<TAB>x` paste instead of erroring.
+ * Which character separates fields, or none. TAB the moment one appears outside
+ * quotes — Excel and every grid copy that way. Otherwise a COMMA only when the
+ * text looks like CSV rather than like values that happen to contain commas:
+ * two or more non-empty lines that all carry the same number of unquoted
+ * commas, at least one of them not followed by a space (`a,b` / `1,2`, never
+ * `Doe, Jane` / `Smith, John`), or a single line that opens with a quoted
+ * field. A lone `Doe, Jane` or `1,234` is therefore ONE value; the old
+ * "comma otherwise" rule split it across two columns on paste. A quote opens a
+ * field only at text start or right after a field/row boundary; a quote glued
+ * to data (`5"`) is literal and cannot hide a real tab.
+ */
+function sniffDelimiter(text: string): "\t" | "," | "" {
+  let quoted = false;
+  let prev = "";
+  let lineCommas = 0;
+  let lineHasText = false;
+  let lines = 0;
+  let firstCommas = -1;
+  let consistent = true;
+  let bareComma = false;
+  const endLine = () => {
+    if (!lineHasText) return;
+    lines++;
+    if (firstCommas < 0) firstCommas = lineCommas;
+    else if (lineCommas !== firstCommas) consistent = false;
+    lineCommas = 0;
+    lineHasText = false;
+  };
+  for (let d = 0; d < text.length; d++) {
+    const ch = text[d];
+    if (quoted) {
+      if (ch === '"') {
+        if (text[d + 1] === '"') d++;
+        else quoted = false;
+      }
+      prev = ch;
+      continue;
+    }
+    if (ch === '"' && (d === 0 || prev === "\t" || prev === "\n" || prev === "\r" || prev === ",")) {
+      quoted = true;
+      lineHasText = true;
+    } else if (ch === "\t") return "\t";
+    else if (ch === ",") {
+      lineCommas++;
+      lineHasText = true;
+      if (text[d + 1] !== " ") bareComma = true;
+    } else if (ch === "\n" || ch === "\r") {
+      endLine();
+      if (ch === "\r" && text[d + 1] === "\n") d++;
+      prev = "\n";
+      continue;
+    } else lineHasText = true;
+    prev = ch;
+  }
+  endLine();
+  if (firstCommas < 1) return "";
+  if (lines >= 2) return consistent && bareComma ? "," : "";
+  return text[0] === '"' ? "," : "";
+}
+
+/**
+ * Parse clipboard text into a row/column grid. The delimiter comes from
+ * `sniffDelimiter`: TAB (Excel / another grid), COMMA for text that reads as
+ * CSV, else none — one value per line. Quoted fields (`"…"` with `""` escaping,
+ * embedded delimiters/newlines) are honored in every mode — spreadsheets quote
+ * tab/newline-bearing cells the same way. Quotes are meaningful only at FIELD
+ * START (Excel-style): a bare `"` mid-field is literal data, so external
+ * clipboards like `5" pipe<TAB>x` paste instead of erroring.
  */
 export function parseClipboardTable(text: string): string[][] {
   if (text === "") return [];
   if (text.length > MAX_CLIPBOARD_CHARS) throw new Error("clipboard data exceeds 10,000,000 characters");
-  // A quote toggles "inside a quoted field" only when it can open one — at text
-  // start or right after a field/row boundary. A quote glued to data (`5"`) is
-  // literal and must not hide a real tab from delimiter detection.
-  let sniffQuoted = false;
-  let hasUnquotedTab = false;
-  let prev = "";
-  for (let d = 0; d < text.length; d++) {
-    const ch = text[d];
-    if (sniffQuoted) {
-      if (ch === '"') {
-        if (text[d + 1] === '"') d++;
-        else sniffQuoted = false;
-      }
-    } else if (ch === '"' && (d === 0 || prev === "\t" || prev === "\n" || prev === "\r" || prev === ",")) {
-      sniffQuoted = true;
-    } else if (ch === "\t") {
-      hasUnquotedTab = true;
-      break;
-    }
-    prev = text[d];
-  }
-  const delim = hasUnquotedTab ? "\t" : ",";
+  const delim = sniffDelimiter(text);
   const rows: string[][] = [];
   let field = "";
   let row: string[] = [];
@@ -175,7 +218,45 @@ export type PlanPasteInput = {
   loadedOrder?: number[];
   /** Count of existing pending insert rows. */
   nInsExisting: number;
+  /**
+   * Size of the selected rectangle the paste lands in. When a dimension is a
+   * whole multiple of the block's, the block is repeated to fill it (a 2-row
+   * block into 6 selected rows pastes three times); otherwise it pastes once
+   * from the anchor, as a spreadsheet does. Ignored by a header-mapped paste.
+   */
+  tile?: { rows: number; cols: number };
 };
+
+/** Ceiling on the cells a paste may fan out to once repeated across a selection. */
+export const MAX_TILED_CELLS = MAX_CLIPBOARD_CELLS;
+
+/**
+ * Repeat a block to fill a selection whose height and/or width is a whole
+ * multiple of it. A ragged block (rows of differing width) only repeats
+ * vertically — repeating it sideways would have to invent a column width.
+ */
+export function tileTable(table: string[][], rows: number, cols: number): { table: string[][]; tiled: boolean } {
+  const R = table.length;
+  if (!R) return { table, tiled: false };
+  const W = table[0].length;
+  const uniform = W > 0 && table.every((r) => r.length === W);
+  const outRows = rows > R && rows % R === 0 ? rows : R;
+  const outCols = uniform && cols > W && cols % W === 0 ? cols : W;
+  if (outRows === R && outCols === W) return { table, tiled: false };
+  if (outRows * outCols > MAX_TILED_CELLS) throw new Error("filling the selection would paste more than 250,000 cells");
+  const out: string[][] = [];
+  for (let j = 0; j < outRows; j++) {
+    const src = table[j % R];
+    if (outCols === W) {
+      out.push(src.slice());
+      continue;
+    }
+    const row: string[] = [];
+    for (let k = 0; k < outCols; k++) row.push(src[k % W]);
+    out.push(row);
+  }
+  return { table: out, tiled: true };
+}
 
 /** Normalize a parsed cell to a stored value: "" → NULL, otherwise the raw string. */
 const cellValue = (s: string): string | null => (s === "" ? null : s);
@@ -233,7 +314,9 @@ export function planPaste(input: PlanPasteInput): PastePlan {
     }
   }
 
-  // --- positional: block written from the anchor cell ---
+  // --- positional: block written from the anchor cell, repeated across a
+  // selection whose size is a whole multiple of it ---
+  const { table: block, tiled } = input.tile ? tileTable(table, input.tile.rows, input.tile.cols) : { table, tiled: false };
   const origColAt = (k: number): number => {
     const oc = displayOrigCols[anchorDisplayIdx + k];
     return oc !== undefined && isTableCol[oc] ? oc : -1;
@@ -251,8 +334,8 @@ export function planPaste(input: PlanPasteInput): PastePlan {
   const base = anchor.kind === "loaded" ? nLoaded : nInsExisting;
   const overflow = new Map<number, InsertRow>();
   let colCount = 0;
-  for (let j = 0; j < table.length; j++) {
-    const r = table[j];
+  for (let j = 0; j < block.length; j++) {
+    const r = block[j];
     let wrote = 0;
     for (let k = 0; k < r.length; k++) {
       const col = origColAt(k);
@@ -275,7 +358,7 @@ export function planPaste(input: PlanPasteInput): PastePlan {
   let maxO = -1;
   for (const o of overflow.keys()) if (o > maxO) maxO = o;
   for (let o = 0; o <= maxO; o++) inserts.push(overflow.get(o) ?? {});
-  return { mode: "positional", updates, inserts, rowCount: table.length, colCount };
+  return { mode: "positional", updates, inserts, rowCount: block.length, colCount, tiled };
 }
 
 /**

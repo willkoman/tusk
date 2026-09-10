@@ -50,6 +50,20 @@ export function boolWord(v: string): "TRUE" | "FALSE" | null {
   }
 }
 
+/**
+ * What a boolean column STORES for pasted or filled text. Copy writes the display
+ * word (`TRUE`/`FALSE`) and other grids write their own tokens (`t`, `1`,
+ * `true`); a paste maps any of those to the connected engine's edit token,
+ * exactly as the in-cell dropdown would — SQLite would otherwise keep the text
+ * `TRUE` in an integer column and MySQL would reject it. NULL and text that is
+ * not a boolean token pass through untouched for the server to judge.
+ */
+export function boolPasteValue(v: string | null, tokens: { trueVal: string; falseVal: string }): string | null {
+  if (v === null) return null;
+  const w = boolWord(v.trim());
+  return w === "TRUE" ? tokens.trueVal : w === "FALSE" ? tokens.falseVal : v;
+}
+
 const HEUR_TOKENS = new Set(["t", "f", "true", "false", "TRUE", "FALSE"]);
 
 /**

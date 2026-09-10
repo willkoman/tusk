@@ -47,9 +47,26 @@ export function summarizeSelection(
   cell: (r: number, c: number) => string | null,
   maxCells = SUMMARY_MAX_CELLS,
 ): SelectionSummary {
-  const cells = rows * cols;
+  if (rows <= 0 || cols <= 0) return { rows: Math.max(0, rows), cols: Math.max(0, cols), cells: 0, nulls: 0, numeric: null, truncated: false };
+  function* values() {
+    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) yield cell(r, c);
+  }
+  return summarizeValues({ rows, cols, cells: rows * cols }, values(), maxCells);
+}
+
+/**
+ * Summarize any set of cells — a multi-area selection is not a rectangle, so the
+ * grid hands over its distinct rows, distinct columns, distinct cell count and
+ * the displayed values in reading order. Above `maxCells` nothing is read.
+ */
+export function summarizeValues(
+  shape: { rows: number; cols: number; cells: number },
+  values: Iterable<string | null>,
+  maxCells = SUMMARY_MAX_CELLS,
+): SelectionSummary {
+  const { rows, cols, cells } = shape;
   const base = { rows, cols, cells, nulls: 0, numeric: null, truncated: false };
-  if (rows <= 0 || cols <= 0) return { ...base, rows: Math.max(0, rows), cols: Math.max(0, cols), cells: 0 };
+  if (cells <= 0) return { ...base, cells: 0 };
   if (cells > maxCells) return { ...base, truncated: true };
   let count = 0;
   let nulls = 0;
@@ -57,24 +74,21 @@ export function summarizeSelection(
   let min = Infinity;
   let max = -Infinity;
   let numeric = true;
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const v = cell(r, c);
-      if (v === null) {
-        nulls++;
-        continue;
-      }
-      if (!numeric) continue;
-      const n = numericValue(v);
-      if (n === null) {
-        numeric = false;
-        continue;
-      }
-      count++;
-      sum += n;
-      if (n < min) min = n;
-      if (n > max) max = n;
+  for (const v of values) {
+    if (v === null) {
+      nulls++;
+      continue;
     }
+    if (!numeric) continue;
+    const n = numericValue(v);
+    if (n === null) {
+      numeric = false;
+      continue;
+    }
+    count++;
+    sum += n;
+    if (n < min) min = n;
+    if (n > max) max = n;
   }
   return {
     rows,

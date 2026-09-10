@@ -942,7 +942,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Click a cell; drag or [[kbd:Shift]]-click for a range. The gutter selects rows, a header a column, the corner or [[kbd:Mod-a]] everything."
+        "md": "Click a cell; drag or [[kbd:Shift]]-click for a range. The gutter selects rows, a header a column, the corner or [[kbd:Mod-a]] everything. [[kbd:Mod]]-click adds another cell, gutter row or header column to the selection — drag with it held for another rectangle — and [[kbd:Mod]]-clicking a selected one takes it back out."
       },
       {
         "k": "keys",
@@ -990,6 +990,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "[[kbd:Mod-c]] copies TSV. The cell menu's **Copy as…** offers TSV, CSV, JSON, Markdown, SQL INSERT, and column names; it also has *Copy cell value* and *Copy column*.",
+          "A multi-area selection copies when its areas share the same rows or the same columns — the rectangle they form. An L-shape or a cross is refused with a status message rather than padded with cells you did not select.",
           "SQL INSERT names the edit target table when the result has one, `exported` otherwise, and uses the connected engine's identifier and literal syntax.",
           "Copy runs the same formatter as Export, so clipboard bytes match the file. See [[topic:import-export|Import & export]].",
           "Copy caps at 1,000,000 cells and 8,388,608 characters; past that the status line points to Export."
@@ -1129,6 +1130,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "Double-click a cell to edit; [[kbd:Mod]]+double-click keeps *View value*. With a cell selected, [[kbd:Enter]] or [[kbd:F2]] opens the editor.",
+          "**Fill handle.** Drag the small square at the bottom-right corner of the selection down, up, left or right: on release the selected values are copied into every cell crossed, the block repeating along the band. Values only — no series, no increments.",
           "Boolean columns get a **TRUE / FALSE** dropdown, plus `<null>` when nullable. Re-picking the original reverts the edit.",
           "The [[topic:results|record view]] edits the same row field by field, through the same pending overlay and the same column rules."
         ]
@@ -1162,7 +1164,7 @@ export const TOPICS: Topic[] = [
           ],
           [
             "Mod-V",
-            "Paste a TSV/CSV block from the clipboard"
+            "Paste a clipboard block; one value over a selection fills every selected cell"
           ]
         ]
       },
@@ -1195,7 +1197,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "[[kbd:Mod-V]] parses the clipboard as a table: tab-delimited when any tab is present, comma otherwise, with quoted fields honored."
+        "md": "[[kbd:Mod-V]] parses the clipboard as a table: tab-delimited when any tab is present; comma-separated when two or more lines share the same comma count and the commas look like separators (not every one followed by a space); otherwise one value per line, so a lone `Doe, Jane` or `1,234` stays one value. Quoted fields are honored, and text Tusk itself copied pastes back as the exact cells it came from."
       },
       {
         "k": "table",
@@ -1213,7 +1215,7 @@ export const TOPICS: Topic[] = [
           [
             "**Positional**",
             "Anything else",
-            "The block writes from the anchor cell across the visible columns; rows past the end overflow into new insert rows"
+            "The block writes from the top-left cell of the selection across the visible columns; rows past the end overflow into new insert rows"
           ]
         ]
       },
@@ -1222,6 +1224,9 @@ export const TOPICS: Topic[] = [
         "items": [
           "Empty cell → SQL `NULL`. A cell absent because the row is short is omitted, so the column keeps its default.",
           "Positional pastes write visible columns only; header-mapped can reach hidden ones. Non-table columns are never written.",
+          "A block pasted into a selection whose height or width is a whole multiple of the block's is repeated to fill it; otherwise it pastes once.",
+          "A single value pasted over several selected cells goes into every one of them, non-contiguous areas included.",
+          "A boolean word or token pasted or filled into a boolean column stores the engine's own token — `true`/`false` or `1`/`0` — as the dropdown would.",
           "With no active cell the paste anchors at the append region. For files, use [[topic:import-export|Import]]."
         ]
       },
@@ -3009,7 +3014,7 @@ export const TOPICS: Topic[] = [
           },
           {
             "combo": "Mod-v",
-            "does": "Paste TSV/CSV from the clipboard (editable grids only)"
+            "does": "Paste from the clipboard: a block, repeated across a selection it fits, or one value into every selected cell (editable grids only)"
           },
           {
             "combo": "Enter",
@@ -3563,6 +3568,20 @@ export const TOPICS: Topic[] = [
         "k": "tip",
         "kind": "tip",
         "md": "The updater shipped in v0.4.5, so an earlier install needs a fresh installer once."
+      },
+      {
+        "k": "h",
+        "text": "Unreleased — multi-area selection, fill handle, paste over a selection",
+        "id": "unreleased"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Select several areas of a result** — [[kbd:Mod]]-click adds cells, gutter rows or header columns, and takes a selected one out again; copy works when the areas form a rectangle. See [[topic:results|Results grid]].",
+          "**Fill handle** — drag the corner square of an editable selection to copy its values into the cells crossed, the block repeating along the band. See [[topic:grid-editing|Editing data in the grid]].",
+          "**Paste over a selection** — one value fills every selected cell; a block repeats across a selection it fits, and pastes once from the selection's top-left otherwise.",
+          "**Fixed** — a copied value holding a comma no longer splits across two columns on paste, the pending-changes counter no longer wraps to two rows in the result toolbar, and a keydown with no key name no longer crashes the workbench."
+        ]
       },
       {
         "k": "h",

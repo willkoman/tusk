@@ -1431,7 +1431,9 @@ body.dnd-dragging * { cursor: grabbing !important; user-select: none !important;
 .sb-copyhdr input { width: auto; margin: 0; cursor: pointer; }
 .sb-copyhdr:hover { color: var(--text); }
 .sb-commit:not(:disabled) { color: var(--accent); }
-.sb-pending { color: var(--edit-dirty); font-weight: 600; white-space: nowrap; }
+/* Icons are block-level SVG (.tw-svg): laid out in normal flow the pencil took a
+   line of its own and the counter stood two rows tall beside one-row controls. */
+.sb-pending { display: inline-flex; align-items: center; gap: 5px; color: var(--edit-dirty); font-weight: 600; white-space: nowrap; }
 .transaction-result-stale { color: var(--warn); font-size: var(--fs-xs); font-weight: 600; white-space: nowrap; }
 .result-incomplete { color: var(--warn); font-size: var(--fs-xs); font-weight: 600; white-space: nowrap; cursor: help; }
 /* Responsive tiers, mirroring the editor toolbar's. First the copy-headers
@@ -1523,6 +1525,13 @@ body.dnd-dragging * { cursor: grabbing !important; user-select: none !important;
   border: 1.5px solid var(--accent); border-radius: 0; outline: none;
 }
 .rg-edit-bool { padding: 0 6px; }
+/* Fill handle: the corner of a live selection in an editable grid; dragging it
+   copies the selected values into the band it crosses, which previews as a
+   dashed frame until release. Above the active cell's outline (z 1) and the
+   pinned column (z 2), below the in-cell editor (z 3, which hides the handle). */
+.rg-fill { position: absolute; z-index: 3; width: 8px; height: 8px; box-sizing: border-box; background: var(--accent); border: 1px solid var(--bg); cursor: crosshair; }
+.rg-fill:hover { transform: scale(1.3); }
+.rg-fillrange { position: absolute; z-index: 3; pointer-events: none; box-sizing: border-box; border: 1.5px dashed var(--accent); background: rgba(var(--accent-rgb), 0.12); }
 /* In light themes the header sat at the row background's own value; the border
    below it and the darker text are what separate them. */
 :root[data-mode="light"] .rg-headwrap, :root[data-mode="light"] .rg-corner { background: var(--panel-2); }

@@ -56,6 +56,7 @@ import { editTarget, editPlan, type EditPlan } from "./grid/editable";
 import { boolEditTokens, detectBoolCols, typeBoolCols } from "./grid/bool";
 import { buildCommitScript } from "./grid/editSql";
 import { planPaste, mergePaste, type RowRef } from "./grid/paste";
+import { boolPasteValue } from "./grid/bool";
 import { orderedRows, sortedRowOrder } from "./grid/sort";
 import { interruptedResult } from "./tabs";
 import { makeIndexer } from "./sql/aliases";
@@ -1865,8 +1866,14 @@ function App() {
     setPendingFor(t.id, isPendingEmpty(np) ? undefined : np);
   }
 
+  /** Pasted or filled text landing in a boolean column stores the engine's token, as the dropdown would. */
+  const boolForCol = (col: number, val: string | null): string | null => {
+    const be = boolEditInfo(col);
+    return be ? boolPasteValue(val, be) : val;
+  };
+
   /** Paste a clipboard grid (header-mapped or positional) into pending edits. */
-  function onPaste(anchor: RowRef, anchorDisplayIdx: number, displayOrigCols: number[], table: string[][]) {
+  function onPaste(anchor: RowRef, anchorDisplayIdx: number, displayOrigCols: number[], table: string[][], tile?: { rows: number; cols: number }) {
     const ec = editCtx();
     if (!ec.editable || !ec.plan || !table.length) return;
     const t = activeTab();
@@ -1881,7 +1888,11 @@ function App() {
       nLoaded: t.result.rows.length,
       loadedOrder: localRowOrder() ?? undefined,
       nInsExisting: p.inserts.length,
+      tile,
     });
+    // A boolean column takes the engine's own token whatever word was pasted.
+    plan.updates = plan.updates.map((u) => ({ ...u, val: boolForCol(u.col, u.val) }));
+    plan.inserts = plan.inserts.map((ins) => Object.fromEntries(Object.entries(ins).map(([c, v]) => [c, boolForCol(Number(c), v)])));
     if (!plan.updates.length && !plan.inserts.length) {
       setStatus("Nothing to paste. This result has no editable columns.");
       return;
@@ -1892,8 +1903,35 @@ function App() {
     setStatus(
       plan.mode === "mapped"
         ? `Pasted ${plan.rowCount} row${plan.rowCount === 1 ? "" : "s"} (mapped by header)`
-        : `Pasted ${plan.rowCount}×${plan.colCount}${added ? ` (+${added} new row${added === 1 ? "" : "s"})` : ""}`,
+        : `Pasted ${plan.rowCount}×${plan.colCount}${plan.tiled ? ", repeated across the selection" : ""}${added ? ` (+${added} new row${added === 1 ? "" : "s"})` : ""}`,
     );
+  }
+
+  /**
+   * Record many cell edits in one step (the fill handle, one value pasted over
+   * a selection). One pending-set replacement, not one per cell: a per-cell
+   * `onEditCell` would rebuild the tabs array once per cell.
+   */
+  function onEditCells(updates: { ref: RowRef; col: number; val: string | null }[]): boolean {
+    const ec = editCtx();
+    if (!ec.editable || !ec.plan || !updates.length) return false;
+    if (updates.length > 100_000) {
+      setStatus("Edit at most 100,000 cells at a time");
+      return false;
+    }
+    const t = activeTab();
+    const p = ensurePending();
+    const isTableCol = ec.plan.isTableCol;
+    const safe = updates.filter((u) => isTableCol[u.col] ?? false).map((u) => ({ ...u, val: boolForCol(u.col, u.val) }));
+    if (!safe.length) return false;
+    try {
+      const np = mergePaste(p, { mode: "positional", updates: safe, inserts: [], rowCount: 0, colCount: 0 }, t.result.rows);
+      setPendingFor(t.id, isPendingEmpty(np) ? undefined : np);
+      return true;
+    } catch (e) {
+      setStatus(`Edit rejected: ${errMsg(e)}`);
+      return false;
+    }
   }
 
   function onAddRow() {
@@ -6098,6 +6136,7 @@ function App() {
                   boolEdit={boolEditInfo}
                   pending={tabPending}
                   onEditCell={onEditCell}
+                  onEditCells={onEditCells}
                   onMarkDelete={onMarkDelete}
                   onAddRow={onAddRow}
                   registerSelectionSource={(get) => { gridSelection = get; }}

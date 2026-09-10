@@ -172,6 +172,9 @@ export function effectiveKey(id: ActionId, overrides: KeyOverrides): string | nu
  */
 export function normalizeKeyEvent(e: KeyboardEvent): string | null {
   const k = e.key;
+  // A keydown can reach the window with no key name at all (a 0.10.0 crash report
+  // from Windows/WebView2 read `.length` off an undefined key). It is not a chord.
+  if (typeof k !== "string" || k === "") return null;
   if (k === "Control" || k === "Meta" || k === "Alt" || k === "Shift") return null;
   const mod = e.metaKey || e.ctrlKey;
   // Unmodified printable keys (letters, digits, punctuation) can't be bindings.

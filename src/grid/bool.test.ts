@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isBoolType, boolWord, boolEditTokens, detectBoolCols, typeBoolCols } from "./bool";
+import { isBoolType, boolWord, boolEditTokens, boolPasteValue, detectBoolCols, typeBoolCols } from "./bool";
 import type { Column } from "../Tree";
 
 const col = (name: string, data_type: string, nullable = true): Column => ({
@@ -117,5 +117,23 @@ describe("boolEditTokens", () => {
     expect(boolWord("0")).toBe("FALSE");
     expect(boolWord("true")).toBe("TRUE");
     expect(boolWord("false")).toBe("FALSE");
+  });
+});
+
+describe("boolPasteValue", () => {
+  it("maps any boolean word or token to the engine's edit token", () => {
+    const pg = boolEditTokens("postgres");
+    const lite = boolEditTokens("sqlite");
+    expect(boolPasteValue("TRUE", pg)).toBe("true");
+    expect(boolPasteValue("t", lite)).toBe("1");
+    expect(boolPasteValue(" false ", lite)).toBe("0");
+    expect(boolPasteValue("0", pg)).toBe("false");
+  });
+
+  it("leaves NULL and non-boolean text for the server to judge", () => {
+    const pg = boolEditTokens("postgres");
+    expect(boolPasteValue(null, pg)).toBeNull();
+    expect(boolPasteValue("maybe", pg)).toBe("maybe");
+    expect(boolPasteValue("", pg)).toBe("");
   });
 });

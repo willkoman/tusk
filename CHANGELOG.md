@@ -2,6 +2,19 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
+## [Unreleased]
+
+### Added
+- **Select more than one area of a result.** `Ctrl/⌘`-click adds a cell, a gutter row or a header column to the selection, drag with it held to add a rectangle, and `Ctrl/⌘`-click a selected one to take it back out. Every area paints, the status bar counts the distinct cells and aggregates over all of them, delete marks cover every selected row, and Export → Selection covers every selected row too. Copy works when the areas form a rectangle — the same rows or the same columns — and the status line says so when they don't, rather than padding the clipboard with cells you did not select.
+- **Drag the fill handle to copy values.** An editable selection carries a small square at its bottom-right corner. Drag it down, up, left or right and the selected values are copied into every cell crossed, the block repeating along the band, the way a spreadsheet's fill handle copies values (no series, no increments). Non-editable columns and delete-marked rows are skipped and counted, and the result is one pending change, reviewed by **Commit…** like any other edit.
+- **Paste over a selection.** One value pasted with several cells selected goes into every one of them, non-contiguous areas included. A block pasted into a selection whose height or width is a whole multiple of the block's is repeated to fill it; otherwise it pastes once from the top-left of the selection — no longer from wherever the drag ended. `Ctrl/⌘+V` on a result that cannot be edited now says why instead of doing nothing.
+
+### Fixed
+- **A copied value with a comma pastes back whole.** `Doe, Jane` or `1,234` copied from one cell and pasted over a range was re-read as comma-separated text, so the selected column got `Doe` and the column beside it ` Jane`. A single line is never split on commas any more — comma-separated text is recognised only when two or more lines agree on their comma count and the commas look like separators rather than prose — and anything Tusk itself put on the clipboard pastes back as the exact cells it came from, whatever characters they hold.
+- **A pasted boolean stores the engine's own token.** Copy writes the display word, `TRUE` or `FALSE`; pasting or filling that into a boolean column now stores `true`/`false` on PostgreSQL and DuckDB and `1`/`0` on SQLite, MySQL and SQL Server, exactly as the in-cell dropdown does, rather than the literal word — which SQLite would have kept as text and MySQL would have rejected at commit.
+- **The pending-changes counter no longer stands two rows tall.** The pencil and the `N changes` text in the result toolbar were laid out on separate lines, so the counter towered over the buttons beside it.
+- **A keydown with no key name no longer crashes the workbench.** WebView2 on Windows delivered a keydown whose key was unset; the global shortcut handler read its length and took the whole window to the crash screen (a 0.10.0 crash report). Such an event is now ignored.
+
 ## [0.10.0] - 2026-09-09
 
 ### Added

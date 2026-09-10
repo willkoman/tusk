@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseClipboardTable, planPaste, mergePaste, type PlanPasteInput, type PastePlan } from "./paste";
+import { parseClipboardTable, planPaste, mergePaste, tileTable, type PlanPasteInput, type PastePlan } from "./paste";
 import { EMPTY_PENDING, type PendingEdits } from "../tabs";
 
 describe("parseClipboardTable", () => {
@@ -40,8 +40,25 @@ describe("parseClipboardTable", () => {
 
   it("treats bare quotes mid-field as literal data (external clipboards)", () => {
     expect(parseClipboardTable('5" pipe\tx')).toEqual([['5" pipe', "x"]]);
-    expect(parseClipboardTable('a"b,c')).toEqual([['a"b', "c"]]);
+    expect(parseClipboardTable('a"b,c\n1,2')).toEqual([['a"b', "c"], ["1", "2"]]);
     expect(parseClipboardTable('"a"x,c')).toEqual([["ax", "c"]]);
+  });
+
+  it("never splits a single line on commas — a copied value is one value", () => {
+    // `Doe, Jane` copied from one cell and pasted over a range used to land as
+    // `Doe` in the selected column and ` Jane` in the one beside it.
+    expect(parseClipboardTable("Doe, Jane\n")).toEqual([["Doe, Jane"]]);
+    expect(parseClipboardTable("1,234")).toEqual([["1,234"]]);
+    expect(parseClipboardTable('"quoted, single"\n')).toEqual([["quoted, single"]]);
+    expect(parseClipboardTable("a, b, c\n")).toEqual([["a, b, c"]]);
+  });
+
+  it("reads comma-separated text only when the lines agree and the commas look like separators", () => {
+    expect(parseClipboardTable("a,b\n1,2")).toEqual([["a", "b"], ["1", "2"]]);
+    expect(parseClipboardTable('"a","b"\n"1","2"')).toEqual([["a", "b"], ["1", "2"]]);
+    expect(parseClipboardTable("a,b\n\n1,2\n")).toEqual([["a", "b"], [""], ["1", "2"]]); // a blank row is not a disagreement
+    expect(parseClipboardTable("a,b\n1,2,3")).toEqual([["a,b"], ["1,2,3"]]); // lines disagree
+    expect(parseClipboardTable("Doe, Jane\nSmith, John\n")).toEqual([["Doe, Jane"], ["Smith, John"]]); // prose commas
   });
 
   it("detects delimiters outside quotes and preserves CR row endings", () => {
@@ -267,5 +284,73 @@ describe("mergePaste", () => {
     const out = mergePaste(pending, plan, loaded);
     expect(out.inserts).toEqual([{ 0: "5", 1: "X" }]);
     expect(pending.inserts[0]).toEqual({ 0: "5" }); // original untouched
+  });
+});
+
+describe("tileTable (repeat a block across a selection)", () => {
+  it("repeats vertically and horizontally when the selection is a whole multiple", () => {
+    expect(tileTable([["a"], ["b"]], 6, 1)).toEqual({ table: [["a"], ["b"], ["a"], ["b"], ["a"], ["b"]], tiled: true });
+    expect(tileTable([["a", "b"]], 1, 4)).toEqual({ table: [["a", "b", "a", "b"]], tiled: true });
+    expect(tileTable([["1", "2"], ["3", "4"]], 4, 4).table).toEqual([
+      ["1", "2", "1", "2"],
+      ["3", "4", "3", "4"],
+      ["1", "2", "1", "2"],
+      ["3", "4", "3", "4"],
+    ]);
+  });
+
+  it("pastes once when a dimension is not a multiple, and never shrinks", () => {
+    expect(tileTable([["a"], ["b"]], 5, 1)).toEqual({ table: [["a"], ["b"]], tiled: false });
+    expect(tileTable([["a"], ["b"]], 1, 1)).toEqual({ table: [["a"], ["b"]], tiled: false });
+    // 5 rows: not a multiple of 2 → once; 4 columns: a multiple of 1 → across.
+    expect(tileTable([["a"], ["b"]], 5, 4).table).toEqual([["a", "a", "a", "a"], ["b", "b", "b", "b"]]);
+  });
+
+  it("repeats a ragged block only vertically", () => {
+    expect(tileTable([["a", "b"], ["c"]], 4, 4)).toEqual({ table: [["a", "b"], ["c"], ["a", "b"], ["c"]], tiled: true });
+  });
+
+  it("refuses to fan out past the clipboard cell ceiling", () => {
+    expect(() => tileTable([["x"]], 250_001, 1)).toThrow(/250,000 cells/);
+  });
+});
+
+describe("planPaste — tiling across the selected rectangle", () => {
+  it("fills a 6-row selection with a 2-row block, three times over", () => {
+    const plan = planPaste(baseInput({
+      table: [["x"], ["y"]],
+      anchor: { kind: "loaded", i: 0 },
+      nLoaded: 6,
+      tile: { rows: 6, cols: 1 },
+    }));
+    expect(plan.mode).toBe("positional");
+    expect(plan.tiled).toBe(true);
+    expect(plan.rowCount).toBe(6);
+    expect(plan.updates.map((u) => [u.ref.i, u.col, u.val])).toEqual([
+      [0, 0, "x"], [1, 0, "y"], [2, 0, "x"], [3, 0, "y"], [4, 0, "x"], [5, 0, "y"],
+    ]);
+    expect(plan.inserts).toEqual([]);
+  });
+
+  it("pastes once, from the anchor, when the selection is not a multiple", () => {
+    const plan = planPaste(baseInput({
+      table: [["x"], ["y"]],
+      anchor: { kind: "loaded", i: 1 },
+      nLoaded: 6,
+      tile: { rows: 5, cols: 1 },
+    }));
+    expect(plan.tiled).toBe(false);
+    expect(plan.updates.map((u) => u.ref.i)).toEqual([1, 2]);
+  });
+
+  it("never repeats a header-mapped paste", () => {
+    const plan = planPaste(baseInput({
+      table: [["id", "name"], ["1", "A"]],
+      anchor: { kind: "loaded", i: 0 },
+      tile: { rows: 4, cols: 2 },
+    }));
+    expect(plan.mode).toBe("mapped");
+    expect(plan.inserts).toEqual([{ 0: "1", 1: "A" }]);
+    expect(plan.tiled).toBeUndefined();
   });
 });

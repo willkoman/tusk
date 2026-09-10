@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { fmtNumber, numericValue, summarizeSelection } from "./summary";
+import { fmtNumber, numericValue, summarizeSelection, summarizeValues } from "./summary";
 
 describe("numericValue", () => {
   it("accepts the literals a driver prints", () => {
@@ -66,5 +66,29 @@ describe("fmtNumber", () => {
     expect(fmtNumber(1e20)).toBe("1.0000e+20");
     expect(fmtNumber(0.0000001)).toBe("1.0000e-7");
     expect(fmtNumber(0)).toBe("0");
+  });
+});
+
+describe("summarizeValues (multi-area selections)", () => {
+  it("aggregates whatever cells the grid hands over, in any shape", () => {
+    const s = summarizeValues({ rows: 3, cols: 2, cells: 4 }, ["1", null, "2", "3"]);
+    expect(s).toEqual({ rows: 3, cols: 2, cells: 4, nulls: 1, numeric: { count: 3, sum: 6, avg: 2, min: 1, max: 3 }, truncated: false });
+  });
+
+  it("stops reading past the ceiling and reports it", () => {
+    let read = 0;
+    function* values() {
+      for (;;) {
+        read++;
+        yield "1";
+      }
+    }
+    expect(summarizeValues({ rows: 1, cols: 3, cells: 3 }, values(), 2).truncated).toBe(true);
+    expect(read).toBe(0);
+  });
+
+  it("keeps the rectangular entry point byte-for-byte", () => {
+    const grid = [["1", "x"], ["2", null]];
+    expect(summarizeSelection(2, 2, (r, c) => grid[r][c])).toEqual(summarizeValues({ rows: 2, cols: 2, cells: 4 }, ["1", "x", "2", null]));
   });
 });

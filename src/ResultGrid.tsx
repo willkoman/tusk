@@ -10,7 +10,25 @@ import { boolWord } from "./grid/bool";
 import { parseClipboardTable, type RowRef } from "./grid/paste";
 import { cellTitle, columnRenders, displayText, type ColumnRender } from "./grid/cellRender";
 import { findMatches, matchAtOrAfter, matchSet, stepMatch, type GridMatch } from "./grid/find";
-import { summarizeSelection, type SelectionSummary } from "./grid/summary";
+import { summarizeValues, type SelectionSummary } from "./grid/summary";
+import {
+  MAX_SEL_RECTS,
+  allRows,
+  anyHas,
+  expandSpans,
+  forEachCell,
+  forEachRow,
+  makeRect,
+  productCols,
+  runCellCount,
+  runColSpans,
+  runRowCount,
+  selectionRuns,
+  spanWidth,
+  subtractRect,
+  type SelRect,
+  type SelRun,
+} from "./grid/selection";
 import { sampleColumnWidths, AUTO_MAX_W } from "./grid/widths";
 import { slotOffset, startPointerDrag, type PointerDragHandle } from "./dnd";
 
@@ -56,8 +74,27 @@ export type GridStyle = {
 };
 
 type SelMode = "none" | "cell" | "range" | "rows" | "cols";
-type Sel = { mode: SelMode; ar: number; ac: number; fr: number; fc: number }; // col = display index
-const EMPTY_SEL: Sel = { mode: "none", ar: -1, ac: -1, fr: -1, fc: -1 };
+// The LIVE rectangle (anchor → focus; col = display index) plus the rectangles
+// committed with Ctrl/⌘-click, oldest first. `extra` is empty for every ordinary
+// selection, so the single-rectangle paths stay exactly as cheap as before.
+type Sel = { mode: SelMode; ar: number; ac: number; fr: number; fc: number; extra: SelRect[] };
+const EMPTY_SEL: Sel = { mode: "none", ar: -1, ac: -1, fr: -1, fc: -1, extra: [] };
+const cellSel = (r: number, c: number): Sel => ({ mode: "cell", ar: r, ac: c, fr: r, fc: c, extra: [] });
+/** Ceiling on the cells or rows one gesture may edit (fill, paste over a selection, delete marks). */
+const MAX_EDIT_CELLS = 100_000;
+/**
+ * The text Tusk last put on the clipboard, with the cells it was made from. A
+ * paste whose clipboard text is that same text takes the cells back verbatim,
+ * so a value holding a comma, a quote or a newline never depends on the parser
+ * guessing the shape of Tusk's own output. Module-level on purpose: a copy in
+ * one tab pastes exactly into another. Bounded by the copy ceiling.
+ */
+let lastCopy: { text: string; table: string[][] } | null = null;
+const rememberCopy = (text: string, cells: (string | null)[][]) => {
+  lastCopy = { text, table: cells.map((r) => r.map((v) => v ?? "")) };
+};
+/** The OS clipboard may hand back CRLF for the LF Tusk wrote; compare line endings loosely. */
+const sameClipboardText = (a: string, b: string) => a.replace(/\r\n?/g, "\n") === b.replace(/\r\n?/g, "\n");
 
 export type ResultGridProps = {
   columns: Accessor<string[]>;
@@ -97,6 +134,11 @@ export type ResultGridProps = {
   canEditCol: (origCol: number) => boolean;
   /** Record a cell edit: null = SQL NULL, undefined = revert (clear pending entry). */
   onEditCell: (ref: RowRef, origCol: number, val: string | null | undefined) => void;
+  /**
+   * Record many cell edits in one step (fill handle, one value pasted over a
+   * selection). Returns false when the edit was refused; App has said why.
+   */
+  onEditCells: (updates: { ref: RowRef; col: number; val: string | null }[]) => boolean;
   /** Per ORIGINAL column: render textual booleans as TRUE/FALSE badges. */
   isBoolCol: (origCol: number) => boolean;
   /** Driver type of an ORIGINAL column when the source relation's detail is loaded. */
@@ -119,9 +161,10 @@ export type ResultGridProps = {
   registerSelectionSource?: (get: (() => SelectionSource | null) | null) => void;
   /**
    * Paste a parsed clipboard grid. `anchor`/`anchorDisplayIdx`/`displayOrigCols`
-   * describe where a positional paste starts; header-mapped pastes ignore them.
+   * describe where a positional paste starts and `tile` the selected rectangle
+   * the block may be repeated across; header-mapped pastes ignore them all.
    */
-  onPaste: (anchor: RowRef, anchorDisplayIdx: number, displayOrigCols: number[], table: string[][]) => void;
+  onPaste: (anchor: RowRef, anchorDisplayIdx: number, displayOrigCols: number[], table: string[][], tile?: { rows: number; cols: number }) => void;
 };
 
 export function ResultGrid(props: ResultGridProps) {
@@ -361,7 +404,7 @@ export function ResultGrid(props: ResultGridProps) {
     let col = 0;
     for (let k = 0; k < dc.length; k++) if (props.canEditCol(dc[k])) { col = k; break; }
     queueMicrotask(() => {
-      setSel({ mode: "cell", ar: firstNew, ac: col, fr: firstNew, fc: col });
+      setSel(cellSel(firstNew, col));
       scrollCellIntoView(firstNew, col);
       focusGrid(); // +Row leaves focus on the button; reclaim it for immediate typing
     });
@@ -381,12 +424,45 @@ export function ResultGrid(props: ResultGridProps) {
     const s = sel();
     if (s.mode === "none") return false;
     const { r0, r1, c0, c1 } = rect();
-    if (s.mode === "rows") return r >= r0 && r <= r1;
-    if (s.mode === "cols") return dc >= c0 && dc <= c1;
-    return r >= r0 && r <= r1 && dc >= c0 && dc <= c1;
+    const live = s.mode === "rows" ? r >= r0 && r <= r1 : s.mode === "cols" ? dc >= c0 && dc <= c1 : r >= r0 && r <= r1 && dc >= c0 && dc <= c1;
+    return live || (s.extra.length > 0 && anyHas(s.extra, r, dc));
   }
   const isActive = (r: number, dc: number) => sel().fr === r && sel().fc === dc;
   const focusGrid = () => root?.focus();
+  const status = (text: string) => props.onStatus(text, props.activeTabId(), props.resultGeneration());
+
+  // --- multi-area selection ---
+  // Ctrl/⌘-click adds a rectangle beside the live one, or takes a selected cell,
+  // row or column back out. Every reader below goes through the folded runs, so
+  // an overlap is never counted, copied or written twice.
+  const liveRect = (s: Sel): SelRect | null =>
+    s.mode === "none" ? null : makeRect(s.mode === "rows" ? "rows" : s.mode === "cols" ? "cols" : "cells", s.ar, s.ac, s.fr, s.fc);
+  /** Every rectangle: committed ones first, the live one last. */
+  const allRects = (s: Sel = sel()): SelRect[] => {
+    const live = liveRect(s);
+    return live ? [...s.extra, live] : [];
+  };
+  /** The union, clamped to the loaded rows and the visible columns. */
+  const selRuns = createMemo<SelRun[]>(() => selectionRuns(allRects(), nRows(), displayCols().length));
+  const rowSelected = (r: number) => allRects().some((x) => x.kind === "rows" && r >= x.r0 && r <= x.r1);
+  const colSelected = (dc: number) => allRects().some((x) => x.kind === "cols" && dc >= x.c0 && dc <= x.c1);
+  /** Commit the live rectangle so a new one can start beside it. */
+  function withLiveCommitted(s: Sel): Sel {
+    const live = liveRect(s);
+    if (!live) return s;
+    return { ...s, extra: s.extra.length >= MAX_SEL_RECTS ? [...s.extra.slice(1), live] : [...s.extra, live] };
+  }
+  /** Take one cell, row or column back out; the last rectangle left becomes the live one. */
+  function deselect(cut: SelRect) {
+    const left = subtractRect(allRects(), cut, nRows(), displayCols().length);
+    const live = left.pop();
+    if (!live) {
+      setSel(EMPTY_SEL);
+      return;
+    }
+    const mode: SelMode = live.kind === "rows" ? "rows" : live.kind === "cols" ? "cols" : live.r0 === live.r1 && live.c0 === live.c1 ? "cell" : "range";
+    setSel({ mode, ar: live.r0, ac: live.c0, fr: live.r1, fc: live.c1, extra: left });
+  }
 
   function scrollCellIntoView(r: number, dc: number) {
     const sc = scroller;
@@ -406,7 +482,7 @@ export function ResultGrid(props: ResultGridProps) {
   }
 
   // --- mouse drag (cells + rows) with edge auto-scroll ---
-  let dragMode: null | "cell" | "rows" = null;
+  let dragMode: null | "cell" | "rows" | "fill" = null;
   let lastPtr = { x: 0, y: 0 };
   let autoRAF = 0;
   function cellFromPtr(cx: number, cy: number) {
@@ -433,6 +509,10 @@ export function ResultGrid(props: ResultGridProps) {
   }
   function updateDragFocus() {
     const { r, c } = cellFromPtr(lastPtr.x, lastPtr.y);
+    if (dragMode === "fill") {
+      updateFill(r, c);
+      return;
+    }
     const s = sel();
     if (dragMode === "rows") setSel({ ...s, mode: "rows", fr: r });
     else setSel({ ...s, mode: s.ar === r && s.ac === c ? "cell" : "range", fr: r, fc: c });
@@ -460,18 +540,29 @@ export function ResultGrid(props: ResultGridProps) {
     }
   }
   function endDrag() {
+    const was = dragMode;
     dragMode = null;
     cancelAnimationFrame(autoRAF);
     autoRAF = 0;
     document.body.style.userSelect = "";
     window.removeEventListener("mousemove", onDragMove);
     window.removeEventListener("mouseup", endDrag);
+    if (was === "fill") finishFill();
   }
+  const isAdd = (e: MouseEvent) => e.ctrlKey || e.metaKey;
   function onCellDown(e: MouseEvent, r: number, dc: number) {
     if (e.button !== 0) return;
     focusGrid();
-    if (e.shiftKey) setSel({ ...sel(), mode: "range", fr: r, fc: dc });
-    else setSel({ mode: "cell", ar: r, ac: dc, fr: r, fc: dc });
+    const s = sel();
+    if (e.shiftKey) setSel({ ...s, mode: "range", fr: r, fc: dc });
+    else if (isAdd(e)) {
+      // Ctrl/⌘: start another area — or take a selected cell back out.
+      if (isSel(r, dc)) {
+        deselect(makeRect("cells", r, dc, r, dc));
+        return;
+      }
+      setSel({ ...withLiveCommitted(s), mode: "cell", ar: r, ac: dc, fr: r, fc: dc });
+    } else setSel(cellSel(r, dc));
     dragMode = "cell";
     beginDrag(e);
   }
@@ -479,8 +570,15 @@ export function ResultGrid(props: ResultGridProps) {
     if (e.button !== 0) return;
     focusGrid();
     const n = displayCols().length;
-    if (e.shiftKey) setSel({ ...sel(), mode: "rows", fr: r, fc: n - 1 });
-    else setSel({ mode: "rows", ar: r, ac: 0, fr: r, fc: n - 1 });
+    const s = sel();
+    if (e.shiftKey) setSel({ ...s, mode: "rows", fr: r, fc: n - 1 });
+    else if (isAdd(e)) {
+      if (rowSelected(r)) {
+        deselect(makeRect("rows", r, 0, r, n - 1));
+        return;
+      }
+      setSel({ ...withLiveCommitted(s), mode: "rows", ar: r, ac: 0, fr: r, fc: n - 1 });
+    } else setSel({ mode: "rows", ar: r, ac: 0, fr: r, fc: n - 1, extra: [] });
     dragMode = "rows";
     beginDrag(e);
   }
@@ -488,7 +586,7 @@ export function ResultGrid(props: ResultGridProps) {
     const nr = nRows(),
       nc = displayCols().length;
     if (!nr || !nc) return;
-    setSel({ mode: "range", ar: 0, ac: 0, fr: nr - 1, fc: nc - 1 });
+    setSel({ mode: "range", ar: 0, ac: 0, fr: nr - 1, fc: nc - 1, extra: [] });
   }
 
   // --- find in loaded rows ---
@@ -532,7 +630,7 @@ export function ResultGrid(props: ResultGridProps) {
     const m = findHits().matches[i];
     setFindIdx(m ? i : -1);
     if (!m) return;
-    setSel({ mode: "cell", ar: m.r, ac: m.dc, fr: m.r, fc: m.dc });
+    setSel(cellSel(m.r, m.dc));
     scrollCellIntoView(m.r, m.dc);
   }
   function stepFind(dir: 1 | -1) {
@@ -580,7 +678,7 @@ export function ResultGrid(props: ResultGridProps) {
     if (oi === undefined || !props.canEditCol(oi)) return;
     editOrig = cellVal(r, oi);
     editCancelled = false;
-    setSel({ mode: "cell", ar: r, ac: dc, fr: r, fc: dc });
+    setSel(cellSel(r, dc));
     setEditing({ r, dc });
     scrollCellIntoView(r, dc);
   }
@@ -645,7 +743,7 @@ export function ResultGrid(props: ResultGridProps) {
   function moveSelTo(r: number, c: number) {
     r = Math.max(0, Math.min(nRows() - 1, r));
     c = Math.max(0, Math.min(displayCols().length - 1, c));
-    setSel({ mode: "cell", ar: r, ac: c, fr: r, fc: c });
+    setSel(cellSel(r, c));
     scrollCellIntoView(r, c);
   }
   /**
@@ -654,12 +752,115 @@ export function ResultGrid(props: ResultGridProps) {
    * fall back to the clicked row instead.
    */
   function selectedRowIndices(clickRow?: number): number[] {
-    const s = sel();
-    if (s.mode === "none" || s.mode === "cols") return clickRow !== undefined ? [clickRow] : [];
-    const { r0, r1 } = rect();
+    if (!selectedRowCount()) return clickRow !== undefined ? [clickRow] : [];
     const out: number[] = [];
-    for (let r = Math.max(0, r0); r <= Math.min(nRows() - 1, r1); r++) out.push(r);
+    forEachRow(selRuns(), (r) => out.push(r));
     return out;
+  }
+  /** Rows a delete mark would touch — zero once any whole column is part of the selection. */
+  function selectedRowCount(): number {
+    const rects = allRects();
+    if (!rects.length || rects.some((x) => x.kind === "cols")) return 0;
+    return runRowCount(selRuns());
+  }
+
+  // --- fill handle: drag the corner of the selection to copy its values ---
+  // The handle sits on the bottom-right corner of a live cell/range selection in
+  // an editable grid. Dragging it extends the selection along ONE axis — the one
+  // the pointer has travelled further along — and on release the source block is
+  // repeated into that band, the way a spreadsheet's fill handle copies values
+  // (no series, no increments). Source values read through the pending overlay.
+  const [fillRange, setFillRange] = createSignal<SelRect | null>(null);
+  let fillSrc: { r0: number; r1: number; c0: number; c1: number } | null = null;
+  const fillHandle = createMemo(() => {
+    const s = sel();
+    if (!props.editable() || editing() || s.extra.length || (s.mode !== "cell" && s.mode !== "range")) return null;
+    const { r0, r1, c0, c1 } = rect();
+    const dc = displayCols();
+    if (r0 < 0 || c0 < 0 || r1 >= nRows() || c1 >= dc.length) return null;
+    let editableCol = false;
+    for (let k = c0; k <= c1 && !editableCol; k++) editableCol = props.canEditCol(dc[k]);
+    if (!editableCol) return null;
+    return { x: offsets()[c1 + 1], y: (r1 + 1) * rowH() };
+  });
+  function onFillDown(e: MouseEvent) {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    fillSrc = rect();
+    setFillRange(null);
+    dragMode = "fill";
+    beginDrag(e);
+  }
+  function updateFill(r: number, c: number) {
+    const src = fillSrc;
+    if (!src) return;
+    const dr = r > src.r1 ? r - src.r1 : r < src.r0 ? r - src.r0 : 0;
+    const dcol = c > src.c1 ? c - src.c1 : c < src.c0 ? c - src.c0 : 0;
+    let next: SelRect | null = null;
+    if (Math.abs(dr) >= Math.abs(dcol)) {
+      if (dr > 0) next = makeRect("cells", src.r1 + 1, src.c0, r, src.c1);
+      else if (dr < 0) next = makeRect("cells", r, src.c0, src.r0 - 1, src.c1);
+    } else if (dcol > 0) next = makeRect("cells", src.r0, src.c1 + 1, src.r1, c);
+    else next = makeRect("cells", src.r0, c, src.r1, src.c0 - 1);
+    const cur = fillRange();
+    const same = cur === next || (!!cur && !!next && cur.r0 === next.r0 && cur.r1 === next.r1 && cur.c0 === next.c0 && cur.c1 === next.c1);
+    if (!same) setFillRange(next);
+  }
+  function finishFill() {
+    const src = fillSrc;
+    const target = fillRange();
+    fillSrc = null;
+    setFillRange(null);
+    if (!src || !target) return;
+    const dc = displayCols();
+    const h = src.r1 - src.r0 + 1;
+    const w = src.c1 - src.c0 + 1;
+    if ((target.r1 - target.r0 + 1) * (target.c1 - target.c0 + 1) > MAX_EDIT_CELLS) {
+      status("Fill at most 100,000 cells at a time");
+      return;
+    }
+    const updates: { ref: RowRef; col: number; val: string | null }[] = [];
+    let skipped = 0;
+    for (let r = target.r0; r <= target.r1; r++) {
+      const sr = src.r0 + ((((r - src.r0) % h) + h) % h);
+      for (let k = target.c0; k <= target.c1; k++) {
+        const oi = dc[k];
+        if (oi === undefined || !props.canEditCol(oi) || isDeleted(r)) {
+          skipped++;
+          continue;
+        }
+        const soi = dc[src.c0 + ((((k - src.c0) % w) + w) % w)];
+        updates.push({ ref: rowRef(r), col: oi, val: soi === undefined ? null : cellVal(sr, soi) });
+      }
+    }
+    if (!updates.length) {
+      status("Nothing to fill: the columns under the drag are not editable");
+      return;
+    }
+    if (!props.onEditCells(updates)) return;
+    setSel({ mode: "range", ar: Math.min(src.r0, target.r0), ac: Math.min(src.c0, target.c0), fr: Math.max(src.r1, target.r1), fc: Math.max(src.c1, target.c1), extra: [] });
+    status(`Filled ${updates.length.toLocaleString()} cell${updates.length === 1 ? "" : "s"}${skipped ? ` (${skipped.toLocaleString()} skipped)` : ""}`);
+  }
+  /** Write one value into every selected editable cell (a single value pasted over a selection). */
+  function fillSelection(runs: SelRun[], val: string | null) {
+    if (runCellCount(runs) > MAX_EDIT_CELLS) {
+      status("Paste into at most 100,000 cells at a time");
+      return;
+    }
+    const dc = displayCols();
+    const updates: { ref: RowRef; col: number; val: string | null }[] = [];
+    let skipped = 0;
+    forEachCell(runs, (r, k) => {
+      const oi = dc[k];
+      if (oi === undefined || !props.canEditCol(oi) || isDeleted(r)) skipped++;
+      else updates.push({ ref: rowRef(r), col: oi, val });
+    });
+    if (!updates.length) {
+      status("Nothing to paste into: the selected columns are not editable");
+      return;
+    }
+    if (!props.onEditCells(updates)) return;
+    status(`Pasted into ${updates.length.toLocaleString()} cell${updates.length === 1 ? "" : "s"}${skipped ? ` (${skipped.toLocaleString()} skipped)` : ""}`);
   }
 
   // --- keyboard ---
@@ -685,7 +886,7 @@ export function ResultGrid(props: ResultGridProps) {
       r = Math.max(0, Math.min(nr - 1, r));
       c = Math.max(0, Math.min(nc - 1, c));
       if (e.shiftKey) setSel({ ...sel(), mode: "range", fr: r, fc: c });
-      else setSel({ mode: "cell", ar: r, ac: c, fr: r, fc: c });
+      else setSel(cellSel(r, c));
       scrollCellIntoView(r, c);
       if (r > nr - 30) props.onLoadMore();
       e.preventDefault();
@@ -701,12 +902,17 @@ export function ResultGrid(props: ResultGridProps) {
       case "PageUp": move(fr - Math.floor(viewportH() / rowH()), fc); break;
       case "Escape":
         if (findOpen()) { closeFind(); e.preventDefault(); }
-        else setSel({ mode: "cell", ar: fr, ac: fc, fr, fc });
+        else setSel(cellSel(fr, fc));
         break;
       case "a": if (mod) { selectAll(); e.preventDefault(); } break;
       case "c": if (mod) { void copySelection("tsv"); e.preventDefault(); } break;
       case "v":
-        if (mod && props.editable()) { e.preventDefault(); e.stopPropagation(); void doPaste(); }
+        if (!mod) break;
+        e.preventDefault();
+        e.stopPropagation();
+        // A silent Mod+V read as "paste is broken"; say why the result cannot take one.
+        if (props.editable()) void doPaste();
+        else status(props.editReason() ? `Cannot paste: ${props.editReason()}` : "Cannot paste: this result is not editable");
         break;
       case "Enter":
       case "F2": {
@@ -722,9 +928,9 @@ export function ResultGrid(props: ResultGridProps) {
       case "Delete":
       case "Backspace":
         // Row-selection only — a stray Delete on a cell selection must not mark rows.
-        if (props.editable() && s.mode === "rows") {
-          const count = Math.max(0, rect().r1 - rect().r0 + 1);
-          if (count > 100_000) props.onStatus("Select at most 100,000 rows per edit", props.activeTabId(), props.resultGeneration());
+        if (props.editable() && allRows(allRects())) {
+          const count = selectedRowCount();
+          if (count > MAX_EDIT_CELLS) props.onStatus("Select at most 100,000 rows per edit", props.activeTabId(), props.resultGeneration());
           else props.onMarkDelete(selectedRowIndices().map(rowRef));
           e.preventDefault();
         }
@@ -737,13 +943,24 @@ export function ResultGrid(props: ResultGridProps) {
     const tabId = props.activeTabId();
     const generation = props.resultGeneration();
     const key = resultKey();
-    const selected = { ...sel() };
+    const selected = sel();
     const dc = [...displayCols()];
     const pending = props.pending();
-    const anchor = selected.mode === "none"
-      ? { kind: "insert" as const, i: nIns() }
-      : rowRef(Math.max(0, selected.fr < 0 ? 0 : Math.min(selected.fr, Math.max(0, nRows() - 1))));
-    const anchorCol = selected.fc < 0 ? 0 : selected.fc;
+    const runs = selRuns();
+    const re = rect();
+    // A positional paste starts at the top-left of the live rectangle (never the
+    // end of the drag), a row selection at its first column, and with nothing
+    // selected at the append region, so a stray paste never overwrites loaded rows.
+    const anchor: RowRef = selected.mode === "none" ? { kind: "insert", i: nIns() } : rowRef(Math.max(0, Math.min(re.r0, nRows() - 1)));
+    const anchorCol = selected.mode === "none" || selected.mode === "rows" ? 0 : Math.max(0, re.c0);
+    // The rectangle a block may be repeated across: one live area only.
+    const tile = selected.mode === "none" || selected.extra.length
+      ? undefined
+      : selected.mode === "rows"
+        ? { rows: re.r1 - re.r0 + 1, cols: dc.length }
+        : selected.mode === "cols"
+          ? { rows: nRows(), cols: re.c1 - re.c0 + 1 }
+          : { rows: re.r1 - re.r0 + 1, cols: re.c1 - re.c0 + 1 };
     try {
       const text = await clipRead();
       if (props.activeTabId() !== tabId || resultKey() !== key || props.pending() !== pending) {
@@ -751,11 +968,14 @@ export function ResultGrid(props: ResultGridProps) {
         return;
       }
       if (text == null || text === "") return;
-      const table = parseClipboardTable(text);
+      const table = lastCopy && sameClipboardText(lastCopy.text, text) ? lastCopy.table.map((r) => r.slice()) : parseClipboardTable(text);
       if (!table.length) return;
-      // No active cell → anchor at the append region so a stray paste never overwrites
-      // loaded rows; otherwise anchor at the focused cell captured before clipboard I/O.
-      props.onPaste(anchor, selected.mode === "none" ? 0 : anchorCol, dc, table);
+      // One value over several selected cells fills every one of them.
+      if (selected.mode !== "none" && table.length === 1 && table[0].length === 1 && runCellCount(runs) > 1) {
+        fillSelection(runs, table[0][0] === "" ? null : table[0][0]);
+        return;
+      }
+      props.onPaste(anchor, anchorCol, dc, table, tile);
     } catch (e) {
       props.onStatus(`Paste rejected: ${e instanceof Error ? e.message : String(e)}`, tabId, generation);
     }
@@ -767,31 +987,28 @@ export function ResultGrid(props: ResultGridProps) {
   // the WebView — the one crash class CrashGuard cannot catch. Export streams instead.
   const MAX_COPY_CELLS = 1_000_000;
   const MAX_COPY_CHARS = 8 * 1024 * 1024;
-  function selectionBounds(): { r0: number; r1: number; cols: number[] } {
+  const NOT_A_RECTANGLE = "Copy needs one rectangle, or areas that share the same rows or the same columns";
+  /**
+   * What copy sees: the folded runs, whether they form a rectangle (rows ×
+   * columns, see `productCols`), and the ORIGINAL indices of the columns
+   * involved. With nothing selected the whole loaded grid is the selection.
+   */
+  function selectionShape(): { runs: SelRun[]; product: boolean; cols: number[] } {
     const dc = displayCols();
-    const s = sel();
-    let r0 = 0,
-      r1 = nRows() - 1,
-      cols = dc;
-    if (s.mode === "cell" || s.mode === "range" || s.mode === "rows") {
-      const re = rect();
-      r0 = Math.max(0, re.r0);
-      r1 = Math.min(nRows() - 1, re.r1);
-    }
-    if (s.mode === "cell" || s.mode === "range" || s.mode === "cols") {
-      const re = rect();
-      cols = dc.slice(Math.max(0, re.c0), Math.min(dc.length, re.c1 + 1));
-    }
-    return { r0, r1, cols };
+    const runs = sel().mode === "none" ? selectionRuns([makeRect("cells", 0, 0, nRows() - 1, dc.length - 1)], nRows(), dc.length) : selRuns();
+    const spans = productCols(runs);
+    return { runs, product: !!spans, cols: expandSpans(spans ?? runColSpans(runs)).map((k) => dc[k]) };
   }
-  function selectionDataset(bounds = selectionBounds()): Dataset {
+  function selectionRowList(runs: SelRun[]): number[] {
+    const rows: number[] = [];
+    forEachRow(runs, (r) => rows.push(r));
+    return rows;
+  }
+  function selectionDataset(rows: number[], cols: number[]): Dataset {
     const names = props.columns();
-    const { r0, r1, cols } = bounds;
     // Read through the pending overlay + bool mapping so copy matches what's
     // displayed (edited cells, insert rows, TRUE/FALSE pills).
-    const rows: (string | null)[][] = [];
-    for (let r = r0; r <= r1; r++) rows.push(cols.map((oi) => copyVal(r, oi)));
-    return { columns: cols.map((oi) => names[oi]), rows };
+    return { columns: cols.map((oi) => names[oi]), rows: rows.map((r) => cols.map((oi) => copyVal(r, oi))) };
   }
   // The workbench reads the live selection through this getter (Export → Selection).
   // It returns the selected ROWS at full width in ORIGINAL column order, so the export
@@ -802,16 +1019,16 @@ export function ResultGrid(props: ResultGridProps) {
   // the database. That makes Selection and "Loaded rows" agree row for row.
   props.registerSelectionSource?.(() => {
     if (sel().mode === "none") return null;
-    const b = selectionBounds();
+    const runs = selRuns();
     const names = props.columns();
-    if (b.r1 < b.r0 || !names.length) return null;
-    if ((b.r1 - b.r0 + 1) * names.length > MAX_COPY_CELLS) return null;
+    if (!runs.length || !names.length) return null;
+    if (runRowCount(runs) * names.length > MAX_COPY_CELLS) return null;
     const out: (string | null)[][] = [];
-    for (let r = b.r0; r <= b.r1; r++) {
-      if (isInsRow(r)) continue;
+    forEachRow(runs, (r) => {
+      if (isInsRow(r)) return;
       const li = loadedAt(r);
       out.push(names.map((_, oi) => props.rows()[li]?.[oi] ?? null));
-    }
+    });
     if (!out.length) return null;
     return {
       tabId: props.activeTabId(),
@@ -838,24 +1055,28 @@ export function ResultGrid(props: ResultGridProps) {
     void props.rows();
     void props.pending();
     clearTimeout(summaryTimer);
-    if (s.mode === "none" || !dc.length || !nRows()) {
+    const runs = selRuns();
+    if (s.mode === "none" || !dc.length || !nRows() || !runs.length) {
       report(null);
       return;
     }
-    const b = selectionBounds();
-    const rowsN = Math.max(0, b.r1 - b.r0 + 1);
-    const colsN = b.cols.length;
+    const rowsN = runRowCount(runs);
+    const colsN = spanWidth(runColSpans(runs));
+    const cellsN = runCellCount(runs);
     const at = {
       row: Math.max(0, s.fr) + 1,
       col: Math.max(0, s.fc) + 1,
       column: props.columns()[dc[Math.max(0, s.fc)]] ?? "",
     };
-    const compute = () => summarizeSelection(rowsN, colsN, (r, c) => copyVal(b.r0 + r, b.cols[c]));
-    if (rowsN * colsN <= SUMMARY_INLINE_CELLS) {
+    function* values() {
+      for (const run of runs) for (let r = run.r0; r <= run.r1; r++) for (const sp of run.cols) for (let k = sp[0]; k <= sp[1]; k++) yield copyVal(r, dc[k]);
+    }
+    const compute = () => summarizeValues({ rows: rowsN, cols: colsN, cells: cellsN }, values());
+    if (cellsN <= SUMMARY_INLINE_CELLS) {
       report({ ...at, summary: compute() });
       return;
     }
-    report({ ...at, summary: { rows: rowsN, cols: colsN, cells: rowsN * colsN, nulls: 0, numeric: null, truncated: false } });
+    report({ ...at, summary: { rows: rowsN, cols: colsN, cells: cellsN, nulls: 0, numeric: null, truncated: false } });
     const tabId = props.activeTabId();
     const generation = props.resultGeneration();
     summaryTimer = setTimeout(() => {
@@ -905,19 +1126,28 @@ export function ResultGrid(props: ResultGridProps) {
   async function copySelection(fmt: CopyFmt) {
     const tabId = props.activeTabId();
     const generation = props.resultGeneration();
-    const b = selectionBounds();
+    const { runs, product, cols } = selectionShape();
     if (fmt === "headers") {
-      copyColumnNames(b.cols);
+      copyColumnNames(cols);
       return;
     }
-    const cells = (b.r1 - b.r0 + 1) * b.cols.length;
+    if (!runs.length) {
+      props.onStatus("Nothing to copy", tabId, generation);
+      return;
+    }
+    if (!product) {
+      props.onStatus(NOT_A_RECTANGLE, tabId, generation);
+      return;
+    }
+    const cells = runCellCount(runs);
     if (cells > MAX_COPY_CELLS) {
       props.onStatus(`Selection too large to copy (${cells.toLocaleString()} cells). Use Export… instead.`, tabId, generation);
       return;
     }
-    let chars = props.copyHeaders() ? b.cols.reduce((n, oi) => n + (props.columns()[oi]?.length ?? 0), 0) : 0;
-    outer: for (let r = b.r0; r <= b.r1; r++) {
-      for (const oi of b.cols) {
+    const rows = selectionRowList(runs);
+    let chars = props.copyHeaders() ? cols.reduce((n, oi) => n + (props.columns()[oi]?.length ?? 0), 0) : 0;
+    outer: for (const r of rows) {
+      for (const oi of cols) {
         chars += copyVal(r, oi)?.length ?? 0;
         if (chars > MAX_COPY_CHARS) break outer;
       }
@@ -926,17 +1156,21 @@ export function ResultGrid(props: ResultGridProps) {
       props.onStatus(`Selection too large to copy (${chars.toLocaleString()}+ characters). Use Export… instead.`, tabId, generation);
       return;
     }
-    const d = selectionDataset(b);
+    const d = selectionDataset(rows, cols);
     const h = props.copyHeaders();
     try {
-      const text = fmt === "sql" ? sqlInsertText(d, b.cols) : formatForCopy(d, fmt, h);
+      const text = fmt === "sql" ? sqlInsertText(d, cols) : formatForCopy(d, fmt, h);
       const ok = await clipWrite(text);
+      // Remembered with its header row when one was written, so a copy-with-names
+      // block still pastes back header-mapped, exactly as its text would parse.
+      if (ok) rememberCopy(text, (fmt === "tsv" || fmt === "csv") && h ? [d.columns, ...d.rows] : d.rows);
       props.onStatus(ok ? `Copied ${d.rows.length}×${d.columns.length}` : "Clipboard unavailable", tabId, generation);
     } catch (e) {
       props.onStatus(`Copy rejected: ${e instanceof Error ? e.message : String(e)}`, tabId, generation);
     }
   }
-  async function copyText(t: string, msg: string) {
+  /** `cells` is what the text was made from; a later paste of that text takes them back verbatim. */
+  async function copyText(t: string, msg: string, cells?: (string | null)[][]) {
     const tabId = props.activeTabId();
     const generation = props.resultGeneration();
     if (t.length > MAX_COPY_CHARS) {
@@ -945,6 +1179,7 @@ export function ResultGrid(props: ResultGridProps) {
     }
     try {
       const ok = await clipWrite(t);
+      if (ok && cells) rememberCopy(t, cells);
       props.onStatus(ok ? msg : "Clipboard unavailable", tabId, generation);
     } catch (e) {
       props.onStatus(`Copy rejected: ${e instanceof Error ? e.message : String(e)}`, tabId, generation);
@@ -965,7 +1200,8 @@ export function ResultGrid(props: ResultGridProps) {
       props.onStatus(`Column too large to copy (${chars.toLocaleString()}+ characters). Use Export… instead.`, props.activeTabId(), props.resultGeneration());
       return;
     }
-    void copyText(formatForCopy(columnDataset(oi), "tsv", props.copyHeaders()), "Copied column");
+    const d = columnDataset(oi);
+    void copyText(formatForCopy(d, "tsv", props.copyHeaders()), "Copied column", props.copyHeaders() ? [d.columns, ...d.rows] : d.rows);
   }
 
   function bindMenuItems(items: MenuItem[]): MenuItem[] {
@@ -999,13 +1235,13 @@ export function ResultGrid(props: ResultGridProps) {
   function onCellContext(e: MouseEvent, r: number, dc: number, oi: number, val: string | null) {
     e.preventDefault();
     e.stopPropagation();
-    if (!isSel(r, dc)) setSel({ mode: "cell", ar: r, ac: dc, fr: r, fc: dc });
+    if (!isSel(r, dc)) setSel(cellSel(r, dc));
     const name = props.columns()[oi];
     const clickedRef = rowRef(r);
     const editItems: MenuItem[] = [];
     if (props.editable()) {
-      const selectedCount = sel().mode === "none" || sel().mode === "cols" ? 1 : Math.max(0, rect().r1 - rect().r0 + 1);
-      const editSelectionTooLarge = selectedCount > 100_000;
+      const selectedCount = selectedRowCount() || 1;
+      const editSelectionTooLarge = selectedCount > MAX_EDIT_CELLS;
       const selRows = editSelectionTooLarge ? [] : selectedRowIndices(r);
       // "Undelete" only when every LOADED row in the selection is already marked
       // (insert rows aren't delete-marked — they're removed outright).
@@ -1041,7 +1277,7 @@ export function ResultGrid(props: ResultGridProps) {
       // component is flat by design, and one click still reaches every format.
       { label: "Copy as…", icon: "copy", onClick: () => openCopyAs(at.x, at.y) },
       { sep: true },
-      { label: val === null ? "Copy value (empty for NULL)" : "Copy cell value", icon: "copy", onClick: () => void copyText(copiedVal ?? "", "Copied value") },
+      { label: val === null ? "Copy value (empty for NULL)" : "Copy cell value", icon: "copy", onClick: () => void copyText(copiedVal ?? "", "Copied value", [[copiedVal]]) },
       { label: "Copy column", icon: "copy", onClick: () => copyColumn(oi) },
       { label: "View value…", icon: "search", onClick: () => props.onViewValue(name, val) },
     ]));
@@ -1230,6 +1466,7 @@ export function ResultGrid(props: ResultGridProps) {
     if (e.button !== 0) return;
     focusGrid();
     const shift = e.shiftKey;
+    const add = e.ctrlKey || e.metaKey;
     headerDrag?.cancel();
     headerDrag = startPointerDrag({
       event: e,
@@ -1246,7 +1483,13 @@ export function ResultGrid(props: ResultGridProps) {
         setDragCol(null);
         if (moved) return;
         const nr = nRows();
-        setSel({ mode: "cols", ar: 0, ac: dc, fr: nr - 1, fc: dc });
+        if (add) {
+          // Ctrl/⌘-click builds a multi-column selection; it never sorts.
+          if (colSelected(dc)) deselect(makeRect("cols", 0, dc, nr - 1, dc));
+          else setSel({ ...withLiveCommitted(sel()), mode: "cols", ar: 0, ac: dc, fr: nr - 1, fc: dc });
+          return;
+        }
+        setSel({ mode: "cols", ar: 0, ac: dc, fr: nr - 1, fc: dc, extra: [] });
         cycleSort(oi, shift);
       },
     });
@@ -1347,7 +1590,7 @@ export function ResultGrid(props: ResultGridProps) {
               return (
                 <div
                   class="rg-headcell"
-                  classList={{ sel: sel().mode === "cols" && isSel(0, k), "dnd-source": dragCol() === oi(), "rg-pinned": pinned() }}
+                  classList={{ sel: colSelected(k), "dnd-source": dragCol() === oi(), "rg-pinned": pinned() }}
                   style={{
                     left: `${offsets()[k]}px`,
                     width: `${colWidth(oi())}px`,
@@ -1428,7 +1671,7 @@ export function ResultGrid(props: ResultGridProps) {
             {(r) => (
               <div
                 class="rg-gutnum"
-                classList={{ sel: sel().mode === "rows" && isSel(r, 0), "rg-del": isDeleted(r), "rg-new": isInsRow(r), slim: !props.view().rowNumbers }}
+                classList={{ sel: rowSelected(r), "rg-del": isDeleted(r), "rg-new": isInsRow(r), slim: !props.view().rowNumbers }}
                 style={{ top: `${r * rowH()}px`, height: `${rowH()}px` }}
                 onMouseDown={(e) => onGutterDown(e, r)}
               >
@@ -1497,6 +1740,29 @@ export function ResultGrid(props: ResultGridProps) {
               </div>
             )}
           </For>
+          <Show when={fillRange()}>
+            {(band) => (
+              <div
+                class="rg-fillrange"
+                style={{
+                  left: `${offsets()[band().c0]}px`,
+                  top: `${band().r0 * rowH()}px`,
+                  width: `${offsets()[band().c1 + 1] - offsets()[band().c0]}px`,
+                  height: `${(band().r1 - band().r0 + 1) * rowH()}px`,
+                }}
+              />
+            )}
+          </Show>
+          <Show when={fillHandle()}>
+            {(h) => (
+              <div
+                class="rg-fill"
+                style={{ left: `${h().x - 4}px`, top: `${h().y - 4}px` }}
+                title="Drag to copy the selected values into the cells you cross"
+                onMouseDown={onFillDown}
+              />
+            )}
+          </Show>
           <Show when={editing()}>
             {(ed) => {
               const oi = () => displayCols()[ed().dc];
