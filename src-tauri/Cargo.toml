@@ -1,8 +1,10 @@
 [package]
 name = "tusk"
 version = "0.10.2"
-description = "A Tauri App"
-authors = ["you"]
+description = "Fast, native, lightweight SQL client. Postgres-first."
+authors = ["willkoman <willko@willko.dev>"]
+homepage = "https://github.com/willkoman/tusk"
+repository = "https://github.com/willkoman/tusk"
 edition = "2021"
 license = "MIT"
 

@@ -60,6 +60,7 @@ jobs:
             echo "TUSK_NOTES_EOF"
           } >> "$GITHUB_OUTPUT"
 
+  # macOS (arm64 + x64) and Windows build on the native runners.
   build:
     name: Build ${{ matrix.cache-key }}
     needs: verify
@@ -135,3 +136,198 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+
+  # Linux is its own job because it builds inside a container. GitHub is retiring
+  # the ubuntu-22.04 runner image (brownouts from 2026-09-17, removed 2027-04-17),
+  # but 22.04 is still the right BASE SYSTEM: a Tauri app links against the host's
+  # glibc and WebKitGTK, so the oldest supported base sets the floor. A build on
+  # 22.04 (glibc 2.35, webkit2gtk 4.1) runs on Ubuntu 22.04+, Debian 12+, Fedora
+  # 36+, Arch and Bazzite; one on 24.04 would refuse anything below glibc 2.39.
+  # It runs natively for x64 and arm64 (GitHub's ARM runners are free for public
+  # repositories and the container image is multi-arch). Each build yields three
+  # bundles (.AppImage, .deb, .rpm) with updater signatures, so the updater can
+  # replace an AppImage in place or install a .deb/.rpm through the system's
+  # admin prompt (tauri-plugin-updater >= 2.10). The .deb is also kept as a
+  # workflow artifact for the Flatpak job below.
+  build-linux:
+    name: Build ${{ matrix.cache-key }}
+    needs: verify
+    environment:
+      name: release
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ env.RELEASE_TAG }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            deb-arch: amd64
+            cache-key: linux-x64
+          - runner: ubuntu-24.04-arm
+            deb-arch: arm64
+            cache-key: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    # Pinned by digest like the conformance images (a manifest list, so the same
+    # digest serves both architectures). Dependabot does not track `container:`
+    # images, so bump the digest by hand when refreshing the base.
+    container:
+      image: ubuntu:22.04@sha256:829f6df217bcbae2b371026e81711d1a787c61b2967ad09d015063663ebafbf7
+    timeout-minutes: 150
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      # linuxdeploy strips the binary while packing the AppImage. Keep the symbol
+      # table: crash reports symbolize their backtraces with it (the Windows and
+      # macOS builds ship unstripped too), and the bundled strip is a known source
+      # of "file format not recognized" failures.
+      NO_STRIP: "true"
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config \
+            libssl-dev libdbus-1-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            patchelf file desktop-file-utils xdg-utils libgtk-3-bin libglib2.0-bin
+
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: ${{ matrix.cache-key }}
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Require updater signing key
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: test -n "$TAURI_SIGNING_PRIVATE_KEY" || { echo "TAURI_SIGNING_PRIVATE_KEY is missing from the release environment" >&2; exit 1; }
+
+      - name: Build and draft release
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        with:
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: Tusk ${{ env.RELEASE_TAG }}
+          releaseBody: |
+            ${{ needs.verify.outputs.notes }}
+
+            ---
+            Download the installer for your platform below.
+          releaseDraft: true
+          prerelease: false
+
+      - name: Keep the .deb for the Flatpak job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deb-${{ matrix.deb-arch }}
+          path: src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  # The Flatpak is that .deb repackaged onto the GNOME 50 runtime: the route for
+  # immutable distributions (Bazzite, Silverblue, Kinoite) and the shape Flathub
+  # builds from (`scripts/flathub-manifest.mjs` turns the manifest into the
+  # submission). It installs with `flatpak install ./tusk_*.flatpak`; the runtime
+  # comes from Flathub. The in-app updater stays silent inside the sandbox.
+  flatpak:
+    name: Flatpak ${{ matrix.arch }}
+    needs: [verify, build-linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            deb-arch: amd64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            deb-arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50@sha256:78bf5fcf1faca196ce6cdf34a317560e533e870861bbb752bdd3ad66d22ba0e9
+      options: --privileged
+    timeout-minutes: 45
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Fetch the .deb from the Linux build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deb-${{ matrix.deb-arch }}
+          path: packaging/flatpak
+
+      - name: Name the .deb for the manifest
+        id: name
+        run: |
+          mv packaging/flatpak/tusk_*_${{ matrix.deb-arch }}.deb packaging/flatpak/tusk_${{ matrix.deb-arch }}.deb
+          echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build the Flatpak bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@aa777012a985fe1b1fd3e66ea2173609cf0c9a70 # v6.8
+        with:
+          manifest-path: packaging/flatpak/com.willko.tusk.yml
+          bundle: tusk_${{ steps.name.outputs.version }}_${{ matrix.deb-arch }}.flatpak
+          arch: ${{ matrix.arch }}
+          cache: false
+          upload-artifact: false
+
+      - name: Keep the bundle for the attach job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flatpak-${{ matrix.deb-arch }}
+          path: tusk_*_${{ matrix.deb-arch }}.flatpak
+          if-no-files-found: error
+          retention-days: 7
+
+  # The Flatpak container has no `gh`, so a plain runner attaches the bundles to
+  # the draft tauri-action created.
+  attach-flatpak:
+    name: Attach Flatpak bundles
+    needs: [verify, flatpak]
+    environment:
+      name: release
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ env.RELEASE_TAG }}
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Fetch the bundles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: flatpak-*
+          merge-multiple: true
+          path: bundles
+
+      - name: Upload to the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "$RELEASE_TAG" bundles/*.flatpak --clobber

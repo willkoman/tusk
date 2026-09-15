@@ -24,8 +24,12 @@ Platform notes:
 
 - **Windows / macOS:** the system WebView (WebView2 / WKWebView) is already
   present; no extra setup.
-- **Linux:** you'll need the usual Tauri v2 prerequisites (`webkit2gtk`,
-  OpenSSL headers). See the [Tauri docs](https://tauri.app/start/prerequisites/).
+- **Linux:** the Tauri v2 prerequisites plus OpenSSL and D-Bus headers. On
+  Ubuntu/Debian: `sudo apt install build-essential curl pkg-config libssl-dev
+  libdbus-1-dev libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
+  librsvg2-dev patchelf file desktop-file-utils xdg-utils`; other distributions
+  per the [Tauri docs](https://tauri.app/start/prerequisites/). Saved passwords
+  need a running Secret Service (GNOME Keyring, KWallet, KeePassXC).
 - **Keychain in dev:** unsigned dev builds may re-prompt for saved connection
   passwords across rebuilds on macOS (keychain items are bound to the code
   signature). This is expected and disappears in signed release builds.
@@ -102,10 +106,30 @@ conformance, and dependency advisory/license/source checks.
 ## Releases
 
 Releases are built only by CI from a `v*` tag. Version numbers in
-`package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json` must
-match exactly, and the tagged release's `CHANGELOG.md` section becomes the
-GitHub release body — an empty section fails the release. See the README's
-*Building installers* section for details.
+`package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`,
+`packaging/arch/PKGBUILD` and the first `<release>` of
+`packaging/flatpak/com.willko.tusk.metainfo.xml` must match exactly
+(`npm run check:versions`), and the tagged release's `CHANGELOG.md` section
+becomes the GitHub release body — an empty section fails the release. CI builds
+macOS (arm64, x64), Windows, and Linux x64 + arm64 (AppImage, `.deb`, `.rpm`,
+built in an Ubuntu 22.04 container so they run on glibc 2.35+, plus a Flatpak
+bundle on the GNOME 50 runtime), signs the updater artifacts, and drafts the
+release. Every push to `master` also builds the unsigned Linux bundles and the
+Flatpaks and keeps them as workflow artifacts for a week, so a Linux change can
+be tried before it is tagged.
+
+After the draft is **published**:
+
+- `.github/workflows/aur.yml` pushes `packaging/arch/PKGBUILD` (checksums
+  filled in) and a fresh `.SRCINFO` to the `tusk-bin` AUR package. It needs the
+  `AUR_SSH_PRIVATE_KEY`, `AUR_USERNAME` and `AUR_EMAIL` repository secrets — an
+  AUR account whose SSH key is registered at aur.archlinux.org — and skips
+  itself, with a note in the log, until they exist.
+- Flathub is manual: `node scripts/flathub-manifest.mjs vX.Y.Z` prints the
+  manifest with the release's `.deb` URLs and checksums; submit it to
+  [flathub/flathub](https://github.com/flathub/flathub) per the
+  [submission guide](https://docs.flathub.org/docs/for-app-authors/submission)
+  the first time, then update the app's Flathub repository each release.
 
 ## Questions / bugs
 

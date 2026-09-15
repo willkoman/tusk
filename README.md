@@ -31,9 +31,23 @@ Grab the latest from **[Releases](https://github.com/willkoman/tusk/releases/lat
 | Windows (x64) | `tusk_x.y.z_x64-setup.exe` or `tusk_x.y.z_x64_en-US.msi` |
 | macOS (Apple Silicon) | `tusk_x.y.z_aarch64.dmg` |
 | macOS (Intel) | `tusk_x.y.z_x64.dmg` |
-| Linux | build from source — see [CONTRIBUTING.md](CONTRIBUTING.md) |
+| Linux — Flatpak (Bazzite, Silverblue, Kinoite, anything with Flatpak) | `tusk_x.y.z_amd64.flatpak` — `flatpak install ./tusk_x.y.z_amd64.flatpak` |
+| Linux — any distribution (Arch, SteamOS, …) | `tusk_x.y.z_amd64.AppImage` — `chmod +x` it and run |
+| Linux — Ubuntu 22.04+, Debian 12+, Mint, Pop!_OS | `tusk_x.y.z_amd64.deb` — `sudo apt install ./tusk_x.y.z_amd64.deb` |
+| Linux — Fedora 36+, openSUSE | `tusk-x.y.z-1.x86_64.rpm` — `sudo dnf install ./tusk-x.y.z-1.x86_64.rpm` |
+| Arch Linux, via pacman | [`packaging/arch/PKGBUILD`](packaging/arch/PKGBUILD) — `makepkg -si`, or `tusk-bin` from the AUR once it is published there |
+| Linux on ARM (Raspberry Pi 5, Asahi, ARM laptops) | the same four, named `arm64` / `aarch64`: `…_arm64.flatpak`, `…_aarch64.AppImage`, `…_arm64.deb`, `…aarch64.rpm` |
 
 A built-in updater checks GitHub releases and offers one-click updates. No database handy? Pick **DuckDB** or **SQLite** on the connect screen and leave the path blank for a zero-setup in-memory database.
+
+**Linux notes**
+
+- Every Linux build comes from an Ubuntu 22.04 base, so glibc 2.35 or newer is the floor. The `.deb` and `.rpm` use your distribution's WebKitGTK 4.1 (`libwebkit2gtk-4.1-0` / `webkit2gtk4.1`, pulled in automatically); the AppImage carries WebKitGTK and GTK itself.
+- The updater works with the native three: an AppImage replaces itself in place, and a `.deb` or `.rpm` install goes through the system's administrator prompt. The Flatpak updates through Flatpak, so the in-app updater stays quiet inside it.
+- The Flatpak runs on the GNOME 50 runtime, keeps its settings under `~/.var/app/com.willko.tusk`, and shares your home directory, the network and the desktop keyring — nothing else. On an immutable distribution such as Bazzite, install the Flatpak or run the AppImage; the `.deb`/`.rpm` installers cannot write to `/usr` there, and Bazzite's [Gear Lever](https://github.com/mijorus/gearlever) adds a menu entry for an AppImage.
+- Saved passwords live in the desktop's Secret Service (GNOME Keyring, KWallet, KeePassXC); one of them has to be running.
+- Blank window on NVIDIA? Tusk sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` for itself when the proprietary driver is loaded. If a window is still blank or flickers (VMs, some Wayland set-ups), launch with `WEBKIT_DISABLE_DMABUF_RENDERER=1 tusk`, or as a last resort `WEBKIT_DISABLE_COMPOSITING_MODE=1 tusk`.
+- An AppImage needs FUSE. If it refuses to start with a FUSE error, run it with `--appimage-extract-and-run` or install `libfuse2` (`libfuse2t64` on Ubuntu 24.04).
 
 ## Features
 

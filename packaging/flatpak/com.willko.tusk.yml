@@ -1,0 +1,56 @@
+# Flatpak manifest for CI and local builds. It takes the .deb Tauri just built
+# from this directory: CI downloads the bundle artifact here and names it
+# tusk_<debarch>.deb. Flathub needs URL + sha256 sources instead —
+# `node scripts/flathub-manifest.mjs vX.Y.Z` rewrites the block between the
+# sources markers from a published release. Build locally with
+#   flatpak-builder --user --install --force-clean build packaging/flatpak/com.willko.tusk.yml
+# The GNOME runtime carries WebKitGTK 4.1, GTK 3, OpenSSL 3 and libdbus, which
+# is everything the binary links.
+id: com.willko.tusk
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: tusk
+finish-args:
+  # Window, GPU and clipboard/IPC
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  # Database servers, SSH hosts, AI providers, Slack
+  - --share=network
+  # Saved passwords go to the desktop keyring through the Secret Service
+  - --talk-name=org.freedesktop.secrets
+  # DuckDB/SQLite files need their sibling WAL and lock files, SSH tunnels read
+  # ~/.ssh, and exports/backups land wherever the user says; the portal's
+  # per-file grants cannot express that, so the home directory is shared.
+  - --filesystem=home
+modules:
+  - name: tusk
+    buildsystem: simple
+    build-commands:
+      - mkdir deb
+      - ar x tusk.deb --output deb
+      - tar -C deb -xf deb/data.tar.gz
+      - install -Dm755 deb/usr/bin/tusk /app/bin/tusk
+      - install -Dm644 deb/usr/share/applications/tusk.desktop /app/share/applications/com.willko.tusk.desktop
+      - sed -i 's/^Icon=tusk$/Icon=com.willko.tusk/' /app/share/applications/com.willko.tusk.desktop
+      - |
+        for f in $(find deb/usr/share/icons/hicolor -name tusk.png); do
+          d=${f#deb/usr/share/}
+          install -Dm644 "$f" "/app/share/${d%/tusk.png}/com.willko.tusk.png"
+        done
+      - install -Dm644 com.willko.tusk.metainfo.xml /app/share/metainfo/com.willko.tusk.metainfo.xml
+    sources:
+      # sources:begin
+      - type: file
+        path: tusk_amd64.deb
+        dest-filename: tusk.deb
+        only-arches: [x86_64]
+      - type: file
+        path: tusk_arm64.deb
+        dest-filename: tusk.deb
+        only-arches: [aarch64]
+      # sources:end
+      - type: file
+        path: com.willko.tusk.metainfo.xml

@@ -2658,8 +2658,45 @@ async fn slack_test() -> Result<String, AppError> {
     Ok(team)
 }
 
+/// How this build reaches the user, so the frontend can keep the in-app updater
+/// quiet where a package manager owns updates. Flatpak mounts `/.flatpak-info`
+/// into every sandbox and nothing else creates that path; everything else
+/// (installer, AppImage, .deb/.rpm, dev build) is "direct" and self-updates.
+#[tauri::command]
+fn distribution_channel() -> &'static str {
+    if std::path::Path::new("/.flatpak-info").exists() {
+        "flatpak"
+    } else {
+        "direct"
+    }
+}
+
+/// Environment tweaks WebKitGTK needs on some Linux machines, applied before the
+/// webview exists. WebKitGTK's DMA-BUF renderer paints a blank window under the
+/// proprietary NVIDIA driver (tauri-apps/tauri#9394; the Tauri "Linux graphics
+/// issues" page). The documented fix is `WEBKIT_DISABLE_DMABUF_RENDERER=1`, which
+/// trades the faster render path for a window that paints. It is set only when
+/// that driver is loaded (`/proc/driver/nvidia/version` exists for the NVIDIA
+/// module and not for nouveau) and only when the user has not set the variable
+/// themselves, so an explicit `=0` on the command line still wins. A no-op on
+/// every other OS, but compiled everywhere so the Windows/macOS gates type-check
+/// it. Must run before any thread exists: `set_var` is not thread-safe.
+fn apply_linux_webkit_workarounds() {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    const VAR: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
+    if std::env::var_os(VAR).is_none()
+        && std::path::Path::new("/proc/driver/nvidia/version").exists()
+    {
+        std::env::set_var(VAR, "1");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    apply_linux_webkit_workarounds();
+
     // Pin the process-wide rustls CryptoProvider: the dep graph carries BOTH ring
     // (reqwest rustls-tls) and aws-lc-rs (tokio-tungstenite's rustls default) — with
     // two providers present rustls has no default and panics when a TLS config is
@@ -2718,6 +2755,7 @@ pub fn run() {
             list_functions,
             export_to_file,
             capabilities,
+            distribution_channel,
             transaction_status,
             permissions,
             cancel_operation,

@@ -37,13 +37,28 @@
     "active": true,
     "targets": "all",
     "createUpdaterArtifacts": true,
+    "category": "DeveloperTool",
+    "shortDescription": "Fast, native, lightweight SQL client. Postgres-first.",
+    "longDescription": "Tusk is a desktop SQL workbench for PostgreSQL, DuckDB, SQLite, MySQL and SQL Server: a schema-aware editor, streaming results with in-grid editing, visual EXPLAIN, an ERD, import and export, backup and restore, and a built-in updater. No Electron, no JVM, no telemetry.",
+    "homepage": "https://github.com/willkoman/tusk",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
+      "icons/icon.png",
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "linux": {
+      "deb": {
+        "depends": ["libssl3", "libdbus-1-3"],
+        "desktopTemplate": "linux/tusk.desktop"
+      },
+      "rpm": {
+        "depends": ["libssl.so.3()(64bit)", "libdbus-1.so.3()(64bit)"],
+        "desktopTemplate": "linux/tusk.desktop"
+      }
+    },
     "windows": {
       "webviewInstallMode": { "type": "downloadBootstrapper" },
       "nsis": { "installMode": "currentUser" }

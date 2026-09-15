@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metadata for the Flatpak. The first <release> must match the version
+  in package.json / Cargo.toml / tauri.conf.json (scripts/check-version.mjs
+  enforces it); add a new entry at the top with every release.
+-->
+<component type="desktop-application">
+  <id>com.willko.tusk</id>
+  <name>Tusk</name>
+  <summary>Fast, native, lightweight SQL client</summary>
+  <developer id="io.github.willkoman">
+    <name>willkoman</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      Tusk is a desktop SQL workbench for PostgreSQL, DuckDB, SQLite, MySQL and SQL Server.
+      It launches in under a second, idles light, and streams million-row results through a
+      virtualized grid. No Electron, no JVM, no telemetry.
+    </p>
+    <ul>
+      <li>SQL editor with context-aware autocomplete, JOIN conditions proposed from your foreign keys, three layers of linting, and per-statement run buttons</li>
+      <li>Streaming results grid with in-grid editing that shows the exact UPDATE, DELETE and INSERT script before it runs</li>
+      <li>Schema tree with right-click DDL forms, diff-based Modify Table, and Copy DDL</li>
+      <li>Visual EXPLAIN, foreign-key graph and ERD</li>
+      <li>Manual transactions, SSH tunnels, read-only mode, native backup and restore, and CSV, JSON and Excel import and export</li>
+      <li>Optional AI assistant (bring your own key) and Slack bot; generated SQL is proposed, never auto-run</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">com.willko.tusk.desktop</launchable>
+  <provides>
+    <binary>tusk</binary>
+  </provides>
+  <url type="homepage">https://github.com/willkoman/tusk</url>
+  <url type="bugtracker">https://github.com/willkoman/tusk/issues</url>
+  <url type="vcs-browser">https://github.com/willkoman/tusk</url>
+  <categories>
+    <category>Development</category>
+    <category>Database</category>
+  </categories>
+  <keywords>
+    <keyword>SQL</keyword>
+    <keyword>PostgreSQL</keyword>
+    <keyword>MySQL</keyword>
+    <keyword>SQLite</keyword>
+    <keyword>DuckDB</keyword>
+    <keyword>database</keyword>
+  </keywords>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/willkoman/tusk/master/docs/screenshots/workbench.png</image>
+      <caption>The workbench: SQL editor, streaming results grid and schema tree</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/willkoman/tusk/master/docs/screenshots/explain-plan.png</image>
+      <caption>Visual EXPLAIN as a heat-colored plan tree</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/willkoman/tusk/master/docs/screenshots/ai-assistant.png</image>
+      <caption>The AI assistant, grounded in the real schema and proposing SQL only</caption>
+    </screenshot>
+  </screenshots>
+  <content_rating type="oars-1.1" />
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <requires>
+    <display_length compare="ge">900</display_length>
+  </requires>
+  <releases>
+    <release version="0.10.2" date="2026-09-10">
+      <url>https://github.com/willkoman/tusk/releases/tag/v0.10.2</url>
+    </release>
+  </releases>
+</component>

@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Tusk
+GenericName=SQL Client
+{{#if comment}}
+Comment={{comment}}
+{{/if}}
+Exec={{exec}}
+Icon={{icon}}
+Terminal=false
+Categories=Development;Database;
+Keywords=SQL;PostgreSQL;Postgres;MySQL;SQLite;DuckDB;SQL Server;database;query;
+StartupWMClass={{exec}}
+{{#if mime_type}}
+MimeType={{mime_type}}
+{{/if}}

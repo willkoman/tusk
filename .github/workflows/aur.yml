@@ -1,0 +1,75 @@
+name: aur
+
+# Publishes packaging/arch/PKGBUILD as `tusk-bin` on the AUR once a release is
+# PUBLISHED, not when it is drafted: the PKGBUILD downloads the .deb from the
+# release page, and a draft's assets are not public. `updpkgsums` replaces the
+# repository copy's SKIP checksums with the published assets' sha256 before the
+# push, and makepkg regenerates .SRCINFO. Needs three repository secrets — an
+# AUR account's SSH key registered at https://aur.archlinux.org (AUR_SSH_PRIVATE_KEY)
+# plus the name and email to commit as (AUR_USERNAME, AUR_EMAIL); without them the
+# job explains itself and skips, so forks and dry runs stay quiet.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published v-prefixed tag to (re)publish to the AUR
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aur
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+
+jobs:
+  publish:
+    name: Publish tusk-bin to the AUR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # `secrets` cannot be read from an `if`, so a step turns their presence into
+      # an output; only that boolean reaches the log.
+      - name: Check for AUR credentials
+        id: creds
+        env:
+          ENABLED: ${{ secrets.AUR_SSH_PRIVATE_KEY != '' && secrets.AUR_USERNAME != '' && secrets.AUR_EMAIL != '' }}
+        run: |
+          echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
+          if [[ "$ENABLED" != "true" ]]; then
+            echo "AUR_SSH_PRIVATE_KEY, AUR_USERNAME and AUR_EMAIL are not all set; skipping the AUR publish." >&2
+          fi
+
+      - name: Check out release tag
+        if: steps.creds.outputs.enabled == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Require the PKGBUILD version to match the tag
+        if: steps.creds.outputs.enabled == 'true'
+        run: |
+          ver=$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)
+          test "v$ver" = "$RELEASE_TAG" || { echo "PKGBUILD pkgver $ver does not match $RELEASE_TAG" >&2; exit 1; }
+
+      - name: Publish PKGBUILD and .SRCINFO
+        if: steps.creds.outputs.enabled == 'true'
+        uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
+        with:
+          pkgname: tusk-bin
+          pkgbuild: ./packaging/arch/PKGBUILD
+          updpkgsums: true
+          test: false
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: Update to ${{ env.RELEASE_TAG }}
+          ssh_keyscan_types: rsa,ecdsa,ed25519

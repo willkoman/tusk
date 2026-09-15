@@ -74,7 +74,8 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**Save password** stores it in the OS keychain, keyed by profile id. `connections.json` holds metadata only.",
-          "Uncheck the box and save to delete the keychain entry."
+          "Uncheck the box and save to delete the keychain entry.",
+          "On Linux the keychain is the desktop's **Secret Service**: GNOME Keyring, KWallet or KeePassXC has to be running, or saving a password fails."
         ]
       },
       {
@@ -3330,6 +3331,7 @@ export const TOPICS: Topic[] = [
           "Checks GitHub releases ~3 seconds after launch, then every 5 minutes, and on window focus if an interval was missed.",
           "An **⬆ Update x.y.z** pill appears bottom-right on both screens.",
           "Click it for release notes and **Install & restart**: the signed artifact downloads, installs, relaunches.",
+          "On Linux an AppImage replaces itself in place; a `.deb` or `.rpm` install asks for your administrator password through the system prompt. A Flatpak install updates through Flatpak, so the pill never appears there.",
           "Failed checks — offline, dev build, no published release — are silent.",
           "The **What's new** panel covers an update that already installed, popping on the first launch of a new version.",
           "*What's new in this version* in the [[topic:shortcuts|command palette]] reopens it."
@@ -3532,7 +3534,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "Every credential lives in the OS keychain, never in a config file and never sent to the frontend: database passwords, [[topic:ai|AI keys]], [[topic:slack|Slack tokens]].",
+          "Every credential lives in the OS keychain (on Linux, the desktop's Secret Service), never in a config file and never sent to the frontend: database passwords, [[topic:ai|AI keys]], [[topic:slack|Slack tokens]].",
           "AI keys are bound to the approved HTTPS origin, so a changed API base cannot receive them.",
           "Profile metadata — host, port, user — is plain JSON without the password.",
           "Nothing leaves the machine by default. The AI assistant sends a token-budgeted context, with sample rows behind their own toggle.",
@@ -3561,6 +3563,7 @@ export const TOPICS: Topic[] = [
         "items": [
           "**Check cadence** — ~3 seconds after launch, then every 5 minutes, plus once on window focus after a missed interval.",
           "**Install** — click the pill for release notes; **Install & restart** downloads the signed bundle and relaunches.",
+          "**Linux** — an AppImage replaces itself in place; a `.deb` or `.rpm` install asks for your administrator password through the system prompt. A Flatpak updates through Flatpak, so the pill never appears there.",
           "**Failed checks stay silent** — offline, dev build, or no published release.",
           "The **What's new** panel pops on the first launch of a new version, listing every release since the last installed. It works offline."
         ]
@@ -3569,6 +3572,20 @@ export const TOPICS: Topic[] = [
         "k": "tip",
         "kind": "tip",
         "md": "The updater shipped in v0.4.5, so an earlier install needs a fresh installer once."
+      },
+      {
+        "k": "h",
+        "text": "Next release — Linux builds",
+        "id": "next"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Linux installers** — every release ships an AppImage (any distribution: mark it executable and run it), a `.deb` (Ubuntu 22.04+, Debian 12+), an `.rpm` (Fedora 36+) and a Flatpak (Bazzite, Silverblue, Kinoite), each for x64 and arm64. The native packages are built on Ubuntu 22.04, so they run on anything newer. Arch users who prefer pacman get `tusk-bin` from the AUR or the PKGBUILD in the repository's `packaging/arch/`.",
+          "**The updater covers Linux** — an AppImage replaces itself in place; a `.deb` or `.rpm` install asks for your administrator password through the system prompt. A Flatpak updates through Flatpak; the pill never appears there.",
+          "**NVIDIA blank-window workaround** — with the proprietary NVIDIA driver loaded, Tusk disables WebKitGTK's DMA-BUF renderer for itself before the window opens; set `WEBKIT_DISABLE_DMABUF_RENDERER` yourself to override.",
+          "**Saved passwords on Linux** use the desktop's Secret Service (GNOME Keyring, KWallet, KeePassXC). See [[topic:getting-started|Connections & drivers]]."
+        ]
       },
       {
         "k": "h",

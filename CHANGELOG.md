@@ -2,6 +2,15 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
+## [Unreleased]
+
+### Added
+- **Linux builds: AppImage, .deb, .rpm and Flatpak, on x64 and arm64.** Every release now ships `tusk_x.y.z_amd64.AppImage` (any distribution, including Arch: mark it executable and run it), `tusk_x.y.z_amd64.deb` (Ubuntu 22.04+, Debian 12+, Mint, Pop!_OS), `tusk-x.y.z-1.x86_64.rpm` (Fedora 36+, openSUSE) and `tusk_x.y.z_amd64.flatpak` (Bazzite, Silverblue, Kinoite and anything else with Flatpak: `flatpak install ./tusk_x.y.z_amd64.flatpak`), each also as an `arm64`/`aarch64` build for Raspberry Pi 5, Asahi and ARM laptops. The native packages are built on Ubuntu 22.04, so they run on anything with glibc 2.35 and WebKitGTK 4.1 or newer; the Flatpak runs on the GNOME 50 runtime. The built-in updater covers the native three: an AppImage replaces itself in place, and a `.deb` or `.rpm` install asks for your administrator password through the system prompt; a Flatpak updates through Flatpak, so the in-app updater stays quiet there. Arch users who prefer pacman get a `tusk-bin` PKGBUILD under `packaging/arch/` that repackages the release `.deb`, and publishing a release pushes it to the AUR once the maintainer's AUR key is configured.
+- **A blank window on NVIDIA is worked around.** WebKitGTK's DMA-BUF renderer paints nothing under the proprietary NVIDIA driver, a long-standing Linux quirk. When that driver is loaded, Tusk sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` for itself before the window opens; set the variable yourself, to `0` or `1`, to override.
+
+### Changed
+- **Package metadata says what Tusk is.** The description carried by the installers and shown by dpkg, rpm and the Linux app menu reads "Fast, native, lightweight SQL client. Postgres-first." instead of the Tauri template's "A Tauri App"; the Linux menu entry is titled *Tusk*, filed under Development, and found by SQL, PostgreSQL, MySQL, SQLite and DuckDB keywords; and a 512px icon joins the set.
+
 ## [0.10.2] - 2026-09-10
 
 ### Added

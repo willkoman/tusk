@@ -133,6 +133,137 @@ jobs:
         shell: bash
         run: cargo build --release --locked ${{ matrix.target && format('--target {0}', matrix.target) || '' }} --manifest-path src-tauri/Cargo.toml
 
+  # Same container and matrix as release.yml's build-linux (see the comment
+  # there for why a 22.04 base). Besides warming the caches this runs the real
+  # bundling step (deb, rpm and AppImage through linuxdeploy) on both
+  # architectures so a broken Linux package shows up on master, not on a tag.
+  # The bundles are unsigned (no updater key here) and kept as workflow
+  # artifacts for a week so a Linux build can be tried before a release is cut.
+  release-cache-linux:
+    name: Warm ${{ matrix.cache-key }} release cache and bundle
+    if: github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            deb-arch: amd64
+            cache-key: linux-x64
+          - runner: ubuntu-24.04-arm
+            deb-arch: arm64
+            cache-key: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ubuntu:22.04@sha256:829f6df217bcbae2b371026e81711d1a787c61b2967ad09d015063663ebafbf7
+    timeout-minutes: 150
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      NO_STRIP: "true"
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config \
+            libssl-dev libdbus-1-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            patchelf file desktop-file-utils xdg-utils libgtk-3-bin libglib2.0-bin
+
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: ${{ matrix.cache-key }}
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Linux bundles
+        run: npm run tauri -- build --ci --no-sign --bundles deb,rpm,appimage
+
+      - name: Keep the bundles
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-${{ matrix.deb-arch }}-bundles
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/rpm/*.rpm
+            src-tauri/target/release/bundle/appimage/*.AppImage
+
+  # The Flatpak from the same .deb, exactly as release.yml builds it, kept as an
+  # artifact so the sandboxed build can be tried before a tag.
+  flatpak:
+    name: Flatpak ${{ matrix.arch }}
+    if: github.event_name == 'push'
+    needs: release-cache-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            deb-arch: amd64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            deb-arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50@sha256:78bf5fcf1faca196ce6cdf34a317560e533e870861bbb752bdd3ad66d22ba0e9
+      options: --privileged
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch the Linux bundles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: linux-${{ matrix.deb-arch }}-bundles
+          path: bundles
+
+      - name: Name the .deb for the manifest
+        id: name
+        run: |
+          mv "$(find bundles -name "tusk_*_${{ matrix.deb-arch }}.deb" | head -n 1)" packaging/flatpak/tusk_${{ matrix.deb-arch }}.deb
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Build the Flatpak bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@aa777012a985fe1b1fd3e66ea2173609cf0c9a70 # v6.8
+        with:
+          manifest-path: packaging/flatpak/com.willko.tusk.yml
+          bundle: tusk_${{ steps.name.outputs.version }}_${{ matrix.deb-arch }}.flatpak
+          arch: ${{ matrix.arch }}
+          cache: false
+          upload-artifact: false
+
+      - name: Keep the bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flatpak-${{ matrix.deb-arch }}
+          path: tusk_*_${{ matrix.deb-arch }}.flatpak
+          if-no-files-found: error
+          retention-days: 7
+
   dependencies:
     name: Dependencies
     runs-on: ubuntu-24.04

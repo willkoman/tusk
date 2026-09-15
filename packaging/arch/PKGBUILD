@@ -1,0 +1,48 @@
+# Maintainer: willkoman <willko@willko.dev>
+#
+# tusk-bin: the release .deb repackaged for pacman (the same binary the AppImage
+# carries). This file lives in the Tusk repository as the AUR template; nothing
+# publishes it automatically.
+#
+#   makepkg -si          # build and install from this directory
+#
+# To publish a release to the AUR: pkgver is bumped with the other manifests
+# (scripts/check-version.mjs enforces it), replace the SKIP checksums with the
+# release assets' sha256, run `makepkg --printsrcinfo > .SRCINFO`, and push.
+pkgname=tusk-bin
+_pkgname=tusk
+pkgver=0.10.2
+pkgrel=1
+pkgdesc="Fast, native, lightweight SQL client. Postgres-first."
+arch=('x86_64')
+url="https://github.com/willkoman/tusk"
+license=('MIT')
+# webkit2gtk-4.1 pulls in gtk3 and the GStreamer libraries WebKit links; openssl
+# and dbus are what the binary itself links (native-tls, and the Secret Service
+# client behind saved passwords).
+depends=('webkit2gtk-4.1' 'gtk3' 'openssl' 'dbus' 'hicolor-icon-theme')
+optdepends=('gnome-keyring: Secret Service provider that stores saved passwords'
+            'kwallet: Secret Service provider on KDE Plasma'
+            'keepassxc: Secret Service provider')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+# The binary ships with its symbol table on every platform: crash reports
+# symbolize their backtraces with it.
+options=('!strip')
+source=("${_pkgname}_${pkgver}_amd64.deb::${url}/releases/download/v${pkgver}/${_pkgname}_${pkgver}_amd64.deb"
+        "LICENSE-${pkgver}::${url}/raw/v${pkgver}/LICENSE")
+sha256sums=('SKIP'
+            'SKIP')
+
+package() {
+  # makepkg unpacks the .deb into its control/data tarballs; fall back to bsdtar
+  # if a build environment does not.
+  local data
+  data=$(find "$srcdir" -maxdepth 1 -name 'data.tar.*' | head -n 1)
+  if [[ -z "$data" ]]; then
+    bsdtar -xf "$srcdir/${_pkgname}_${pkgver}_amd64.deb" -C "$srcdir"
+    data=$(find "$srcdir" -maxdepth 1 -name 'data.tar.*' | head -n 1)
+  fi
+  bsdtar -xf "$data" -C "$pkgdir"
+  install -Dm644 "$srcdir/LICENSE-${pkgver}" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

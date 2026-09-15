@@ -1,4 +1,5 @@
 import { createSignal, onMount, onCleanup, Show } from "solid-js";
+import { invoke } from "@tauri-apps/api/core";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 
@@ -10,7 +11,9 @@ import { relaunch } from "@tauri-apps/plugin-process";
 // notes and an Install button — download + install stream through the updater
 // plugin, then the app relaunches (on Windows the NSIS installer exits the app
 // itself). Check failures (offline, dev build, no published release) are
-// silent: the updater must never get in the way of using the app.
+// silent: the updater must never get in the way of using the app. A Flatpak
+// install never checks at all: Flatpak/Flathub own its updates and the plugin
+// cannot replace files inside the sandbox, so the pill would only ever fail.
 
 const CHECK_INTERVAL_MS = 5 * 60 * 1000; // re-check every 5 minutes
 
@@ -36,18 +39,30 @@ export function UpdateBadge() {
   }
 
   onMount(() => {
-    // Delayed so startup work (connect, schema load) wins the first seconds.
-    const initial = setTimeout(() => void runCheck(), 3000);
-    // Periodic re-check. setInterval can be starved while the machine sleeps, so
-    // also re-check when the window regains focus if a full interval has elapsed.
-    const interval = setInterval(() => void runCheck(), CHECK_INTERVAL_MS);
+    let initial: ReturnType<typeof setTimeout> | undefined;
+    let interval: ReturnType<typeof setInterval> | undefined;
+    let disposed = false;
     const onFocus = () => {
       if (Date.now() - lastCheck >= CHECK_INTERVAL_MS) void runCheck();
     };
-    window.addEventListener("focus", onFocus);
+    void (async () => {
+      try {
+        if ((await invoke<string>("distribution_channel")) !== "direct") return;
+      } catch {
+        /* no answer (older backend, browser preview): check as before */
+      }
+      if (disposed) return;
+      // Delayed so startup work (connect, schema load) wins the first seconds.
+      initial = setTimeout(() => void runCheck(), 3000);
+      // Periodic re-check. setInterval can be starved while the machine sleeps, so
+      // also re-check when the window regains focus if a full interval has elapsed.
+      interval = setInterval(() => void runCheck(), CHECK_INTERVAL_MS);
+      window.addEventListener("focus", onFocus);
+    })();
     onCleanup(() => {
-      clearTimeout(initial);
-      clearInterval(interval);
+      disposed = true;
+      if (initial !== undefined) clearTimeout(initial);
+      if (interval !== undefined) clearInterval(interval);
       window.removeEventListener("focus", onFocus);
     });
   });
