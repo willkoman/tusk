@@ -129,9 +129,23 @@ jobs:
           workspaces: "./src-tauri -> target"
           shared-key: ${{ matrix.cache-key }}
 
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # The same `tauri build` the release job runs, minus bundling. A plain
+      # `cargo build --release` warmed a cache the release could only partly use:
+      # `tauri build` compiles with its own feature set and build environment, so
+      # cargo's fingerprints differed and the v0.11.0 macOS jobs recompiled DuckDB
+      # (ten minutes each) despite restoring a 1 GB cache.
       - name: Build release target
         shell: bash
-        run: cargo build --release --locked ${{ matrix.target && format('--target {0}', matrix.target) || '' }} --manifest-path src-tauri/Cargo.toml
+        run: npm run tauri -- build --ci --no-sign --no-bundle ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
   # Same container and matrix as release.yml's build-linux (see the comment
   # there for why a 22.04 base). Besides warming the caches this runs the real
