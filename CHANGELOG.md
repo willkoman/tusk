@@ -10,6 +10,7 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ### Changed
 - **Package metadata says what Tusk is.** The description carried by the installers and shown by dpkg, rpm and the Linux app menu reads "Fast, native, lightweight SQL client. Postgres-first." instead of the Tauri template's "A Tauri App"; the Linux menu entry is titled *Tusk*, filed under Development, and found by SQL, PostgreSQL, MySQL, SQLite and DuckDB keywords; and a 512px icon joins the set.
+- **rustls updated to 0.23.45.** Closes RUSTSEC-2026-0285, where TLS 1.3 handshake messages were accepted across encryption-level boundaries, in the TLS stack behind MySQL connections, the AI proxy, the Slack socket and the update check. (PostgreSQL and SQL Server use the OS TLS stack and were never affected.)
 
 ## [0.10.2] - 2026-09-10
 
