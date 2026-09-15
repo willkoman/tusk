@@ -3575,8 +3575,8 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
-        "text": "Next release — Linux builds",
-        "id": "next"
+        "text": "v0.11.0 — Linux builds",
+        "id": "v0-11-0"
       },
       {
         "k": "list",
