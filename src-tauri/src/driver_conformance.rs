@@ -126,7 +126,7 @@ fn mysql_cfg() -> Option<ConnectionConfig> {
 
 /// The production classifier (non-DuckDB form): a `WITH`-led write must not stream.
 fn cursorable(sql: &str) -> bool {
-    crate::is_cursorable(sql, TransactionEngine::Postgres)
+    crate::sqlguard::is_cursorable(sql, TransactionEngine::Postgres)
 }
 
 async fn exec(b: &mut Backend, sql: &str) {
@@ -246,7 +246,7 @@ async fn syntax_error_recovery_battery(b: &mut Backend, eng: &Eng) {
 /// error at UPDATE) and every engine routed the write through the read path.
 async fn with_dml_battery(b: &mut Backend, eng: &Eng) {
     let q = eng.quote;
-    let cursorable = |sql: &str| crate::is_cursorable(sql, eng.engine);
+    let cursorable = |sql: &str| crate::sqlguard::is_cursorable(sql, eng.engine);
     exec(b, &format!("DROP TABLE IF EXISTS {}", q("wdml"))).await;
     exec(
         b,
@@ -3139,7 +3139,10 @@ fn is_read_only_stmt_classification() {
         "TABLE t",
         "VALUES (1)",
     ] {
-        assert!(crate::is_read_only_stmt(s, pg), "{s:?} should be read-only");
+        assert!(
+            crate::sqlguard::is_read_only_stmt(s, pg),
+            "{s:?} should be read-only"
+        );
     }
     for s in [
         "INSERT INTO t VALUES (1)",
@@ -3155,11 +3158,11 @@ fn is_read_only_stmt_classification() {
         "SELECT pg_catalog.\"set_config\"('default_transaction_read_only', 'off', false)",
     ] {
         assert!(
-            !crate::is_read_only_stmt(s, pg),
+            !crate::sqlguard::is_read_only_stmt(s, pg),
             "{s:?} should NOT be read-only"
         );
     }
-    assert!(crate::is_read_only_stmt(
+    assert!(crate::sqlguard::is_read_only_stmt(
         "SELECT 'set_config' AS harmless -- EXPLAIN ANALYZE",
         pg
     ));
@@ -3179,34 +3182,46 @@ fn is_read_only_stmt_is_engine_aware() {
         "/* outer /* inner */ still comment */ TRUNCATE TABLE dbo.victim",
     ] {
         assert!(
-            !crate::is_read_only_stmt(s, mssql),
+            !crate::sqlguard::is_read_only_stmt(s, mssql),
             "{s:?} must be blocked on SQL Server"
         );
     }
     // …and the `SHOW` exemption is gone everywhere it was never justified.
-    assert!(!crate::is_read_only_stmt("SHOW 1; DROP TABLE t", pg));
-    assert!(!crate::is_read_only_stmt(
+    assert!(!crate::sqlguard::is_read_only_stmt(
+        "SHOW 1; DROP TABLE t",
+        pg
+    ));
+    assert!(!crate::sqlguard::is_read_only_stmt(
         "SHOW /* */ tables /* */ ; DROP TABLE t",
         pg
     ));
     // MySQL's SHOW CREATE is the one read whose own syntax carries a mutation word.
-    assert!(crate::is_read_only_stmt("SHOW CREATE TABLE t", mysql));
-    assert!(!crate::is_read_only_stmt("SHOW CREATE TABLE t", pg));
-    assert!(!crate::is_read_only_stmt(
+    assert!(crate::sqlguard::is_read_only_stmt(
+        "SHOW CREATE TABLE t",
+        mysql
+    ));
+    assert!(!crate::sqlguard::is_read_only_stmt(
+        "SHOW CREATE TABLE t",
+        pg
+    ));
+    assert!(!crate::sqlguard::is_read_only_stmt(
         "SHOW CREATE TABLE t /* DROP TABLE u */; DROP TABLE u",
         mysql
     ));
     // `[bracket]` identifiers are names, not keywords: a legitimate read survives, and
     // a `'` inside one cannot open a phantom string that hides following code.
-    assert!(crate::is_read_only_stmt(
+    assert!(crate::sqlguard::is_read_only_stmt(
         "SELECT [insert], [delete] FROM [dbo].[Update]",
         mssql
     ));
-    assert!(!crate::is_read_only_stmt(
+    assert!(!crate::sqlguard::is_read_only_stmt(
         "SELECT [a'b] FROM t; DROP TABLE u",
         mssql
     ));
-    assert!(!crate::is_read_only_stmt("SELECT [set_config](1)", mssql));
+    assert!(!crate::sqlguard::is_read_only_stmt(
+        "SELECT [set_config](1)",
+        mssql
+    ));
 }
 
 #[tokio::test]

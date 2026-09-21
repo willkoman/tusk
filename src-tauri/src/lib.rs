@@ -14,6 +14,7 @@ mod relgraph;
 mod script;
 mod skills;
 mod slack;
+mod sqlguard;
 mod sqlite_ddl;
 mod ssh;
 #[cfg(test)]
@@ -371,70 +372,6 @@ pub(crate) async fn lock_conn(conn: &Conn) -> Result<ConnGuard<'_>, AppError> {
     Ok(ConnGuard { inner })
 }
 
-/// Only plain read queries can be wrapped in a server-side cursor for streaming.
-/// `duck` additionally admits DuckDB's FROM-first and PIVOT forms — they wrap as
-/// subqueries fine (pinned by `duck_from_first_and_pivot_stream`), and classifying
-/// them non-cursorable buffered ENTIRE tables in RAM (`FROM events` on a big table
-/// was an allocation-abort waiting to happen).
-pub(crate) fn is_cursorable(sql: &str, engine: script::TransactionEngine) -> bool {
-    let duck = engine == script::TransactionEngine::DuckDb;
-    let read_head = |w: &str| {
-        matches!(w, "select" | "table" | "values") || (duck && matches!(w, "from" | "pivot"))
-    };
-    let w = first_sql_word(sql, engine);
-    match w.as_str() {
-        // `WITH … UPDATE/INSERT/DELETE/MERGE` is a write wearing a read's first word:
-        // `DECLARE … CURSOR FOR` it is a syntax error, and a data-modifying CTE cannot
-        // sit under a cursor either. Only a WITH whose main statement is a read streams;
-        // anything else runs on the plain execute path.
-        "with" => script::with_shape(sql, engine)
-            .is_some_and(|s| !s.modifying_cte && !s.main_select_into && read_head(&s.main)),
-        "select" => !script::has_top_level_into(sql, engine),
-        _ => read_head(&w),
-    }
-}
-
-/// Statements allowed on a read-only connection. Engine-aware: SQL Server nests block
-/// comments and quotes identifiers with brackets, so classifying its SQL by
-/// PostgreSQL's lexical rules reads a different statement than the server executes.
-pub(crate) fn is_read_only_stmt(sql: &str, engine: script::TransactionEngine) -> bool {
-    let first = first_sql_word(sql, engine);
-    let allowed = matches!(
-        first.as_str(),
-        "select" | "with" | "show" | "explain" | "table" | "values" | "from" | "pivot"
-    );
-    if !allowed
-        || script::contains_code_word_for(sql, "set_config", engine)
-        || (first == "explain"
-            && (script::contains_code_word_for(sql, "analyze", engine)
-                || script::contains_code_word_for(sql, "analyse", engine)))
-    {
-        return false;
-    }
-    // The mutation scan ALWAYS runs. It used to be skipped entirely for a leading
-    // `SHOW`, which let `/*/* */ SHOW 1 */ DROP TABLE t` through on SQL Server (its
-    // nested comments hide the SHOW from the server, and it is the one engine with no
-    // server-side read-only enforcement). Only MySQL's `SHOW CREATE …` — a read whose
-    // own syntax carries a mutation keyword — is exempt, and only for that one word.
-    let allow_show_create = engine == script::TransactionEngine::MySql && first == "show";
-    slack::processor::find_mutation_word_for(sql, engine, allow_show_create).is_none()
-}
-
-fn first_sql_word(sql: &str, engine: script::TransactionEngine) -> String {
-    script::effective_start_for(sql, engine)
-        .chars()
-        .take_while(|c| c.is_ascii_alphabetic())
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-fn transaction_requests_write(sql: &str, action: Option<script::TransactionAction>) -> bool {
-    matches!(
-        action,
-        Some(script::TransactionAction::Begin | script::TransactionAction::SetTransaction)
-    ) && script::contains_code_word(sql, "write")
-}
-
 const DEFAULT_PAGE_SIZE: u32 = 1000;
 const MAX_PAGE_SIZE: u32 = 50_000;
 const MAX_SQL_BYTES: usize = 20 * 1024 * 1024;
@@ -763,8 +700,9 @@ async fn run_query(
     if c.read_only
         && items.iter().zip(&actions).any(|(item, action)| match item {
             script::Item::Sql(sql) => {
-                (action.is_none() && !is_read_only_stmt(sql.trim(), c.transaction_engine()))
-                    || transaction_requests_write(sql, *action)
+                (action.is_none()
+                    && !sqlguard::is_read_only_stmt(sql.trim(), c.transaction_engine()))
+                    || sqlguard::transaction_requests_write(sql, *action)
             }
             script::Item::Copy { .. } => true,
         })
@@ -839,8 +777,9 @@ async fn exec_items(
     if c.read_only
         && items.iter().zip(actions).any(|(item, action)| match item {
             script::Item::Sql(sql) => {
-                (action.is_none() && !is_read_only_stmt(sql.trim(), c.transaction_engine()))
-                    || transaction_requests_write(sql, *action)
+                (action.is_none()
+                    && !sqlguard::is_read_only_stmt(sql.trim(), c.transaction_engine()))
+                    || sqlguard::transaction_requests_write(sql, *action)
             }
             script::Item::Copy { .. } => true,
         })
@@ -897,13 +836,13 @@ async fn exec_items(
                     .run_manual_single(
                         trimmed,
                         page,
-                        is_cursorable(trimmed, engine),
+                        sqlguard::is_cursorable(trimmed, engine),
                         c.transaction.mode,
                     )
                     .await?
             } else {
                 c.backend
-                    .run_single(trimmed, page, is_cursorable(trimmed, engine))
+                    .run_single(trimmed, page, sqlguard::is_cursorable(trimmed, engine))
                     .await?
             };
             if let QueryOutcome::Rows { columns, rows, .. } = &out {
@@ -1261,18 +1200,13 @@ fn dollar_tag_end(b: &[u8], i: usize) -> Option<usize> {
 #[cfg(test)]
 mod bind_param_tests {
     use super::{
-        checked_page_size, disconnect_registered, exec_items, has_bind_params, is_cursorable,
-        is_read_only_stmt, lock_conn, lock_sync, persist_export_temp, validate_fetch_page,
-        validate_result_page, validate_sql_size, validate_tabular_payload, AppError, AppState,
-        CancelHandle, ConnState, ConnectionConfig, TransactionStatus, MAX_IPC_CELL_BYTES,
-        MAX_OPEN_CONNECTIONS, MAX_SQL_BYTES,
+        checked_page_size, disconnect_registered, exec_items, has_bind_params, lock_conn,
+        lock_sync, persist_export_temp, validate_fetch_page, validate_result_page,
+        validate_sql_size, validate_tabular_payload, AppError, AppState, CancelHandle, ConnState,
+        ConnectionConfig, TransactionStatus, MAX_IPC_CELL_BYTES, MAX_OPEN_CONNECTIONS,
+        MAX_SQL_BYTES,
     };
-    use crate::{driver, script};
-
-    /// The read-only guard as it runs against a PostgreSQL connection.
-    fn is_read_only_stmt_pg(sql: &str) -> bool {
-        is_read_only_stmt(sql, script::TransactionEngine::Postgres)
-    }
+    use crate::driver;
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -1296,86 +1230,6 @@ mod bind_param_tests {
         ] {
             assert!(!has_bind_params(sql), "unexpected bind param in {sql}");
         }
-    }
-
-    #[test]
-    fn query_classification_skips_comments_and_matches_whole_keywords() {
-        let pg = script::TransactionEngine::Postgres;
-        let duck = script::TransactionEngine::DuckDb;
-        let mysql = script::TransactionEngine::MySql;
-        assert!(is_cursorable("-- heading\nSELECT 1", pg));
-        assert!(is_read_only_stmt_pg(
-            "/* heading */ WITH x AS (SELECT 1) SELECT * FROM x"
-        ));
-        assert!(!is_cursorable("selection FROM t", pg));
-        assert!(!is_read_only_stmt_pg("showcase"));
-        // WITH streams only when the statement it feeds is a read.
-        assert!(is_cursorable("WITH x AS (SELECT 1) SELECT * FROM x", pg));
-        assert!(is_cursorable(
-            "WITH x AS (SELECT 1) SELECT 1 AS ordinal FROM x",
-            pg
-        ));
-        assert!(is_cursorable("WITH x AS (SELECT 1) TABLE x", pg));
-        assert!(!is_cursorable(
-            "WITH bnr AS (SELECT id FROM vendor) UPDATE pvl SET a = NULL FROM bnr WHERE 1=1",
-            pg
-        ));
-        assert!(!is_cursorable(
-            "WITH g AS (SELECT 1) INSERT INTO t SELECT * FROM g",
-            pg
-        ));
-        assert!(!is_cursorable(
-            "WITH g AS (SELECT 1) DELETE FROM t USING g",
-            pg
-        ));
-        assert!(!is_cursorable(
-            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
-            pg
-        ));
-        assert!(!is_cursorable(
-            "WITH RECURSIVE t(n) AS (VALUES (1) UNION ALL SELECT n+1 FROM t WHERE n<2) SEARCH DEPTH FIRST BY n SET \"select\" UPDATE \"target\" AS u SET n=2",
-            pg
-        ));
-        assert!(is_cursorable(
-            "WITH update AS (SELECT 1) SELECT * FROM update",
-            pg
-        ));
-        assert!(is_cursorable(
-            "WITH RECURSIVE update(i) USING KEY(i) AS (VALUES (1)) SELECT * FROM update",
-            duck
-        ));
-        assert!(is_cursorable(
-            "WITH x AS (SELECT 1) # choose rows\nSELECT * FROM x",
-            mysql
-        ));
-        assert!(is_cursorable("WITH x AS (SELECT 1) FROM x", duck));
-        assert!(!is_cursorable("WITH x AS (SELECT 1) FROM x", pg));
-        // DuckDB-only forms stream (buffering FROM <big table> whole was an OOM-abort
-        // class); other engines keep rejecting them as cursorable.
-        assert!(is_cursorable("FROM events", duck));
-        assert!(is_cursorable("PIVOT t ON k USING sum(v)", duck));
-        assert!(!is_cursorable("FROM events", pg));
-        assert!(!is_cursorable("SELECT * INTO archived FROM events", pg));
-        assert!(!is_cursorable(
-            "WITH x AS (SELECT 1) SELECT * INTO archived FROM x",
-            pg
-        ));
-        assert!(is_read_only_stmt_pg("FROM events"));
-        assert!(!is_read_only_stmt_pg("frombulate"));
-    }
-
-    #[test]
-    fn readonly_guard_rejects_writable_ctes_and_row_locks() {
-        assert!(!is_read_only_stmt_pg(
-            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"
-        ));
-        assert!(!is_read_only_stmt_pg("SELECT * FROM t FOR UPDATE"));
-        assert!(!is_read_only_stmt_pg("SELECT * FROM t FOR SHARE"));
-        assert!(!is_read_only_stmt_pg("SELECT * FROM t FOR\nSHARE"));
-        assert!(!is_read_only_stmt_pg(
-            "SELECT * FROM t INTO OUTFILE '/tmp/x'"
-        ));
-        assert!(is_read_only_stmt_pg("SELECT 'delete' AS word -- update"));
     }
 
     #[test]
@@ -2121,7 +1975,9 @@ async fn export_to_file(
             }
         };
         let engine = c.transaction_engine();
-        if !is_read_only_stmt(&export_sql, engine) || !is_cursorable(&export_sql, engine) {
+        if !sqlguard::is_read_only_stmt(&export_sql, engine)
+            || !sqlguard::is_cursorable(&export_sql, engine)
+        {
             return Err(AppError::new(
                 "export can re-run exactly one read-only result query",
             ));

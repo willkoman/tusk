@@ -932,7 +932,7 @@ impl Backend {
         let enforce_read_only = read_only || self.config().read_only;
         if enforce_read_only
             && items.iter().any(|item| match item {
-                script::Item::Sql(sql) => !crate::is_read_only_stmt(sql, self.engine()),
+                script::Item::Sql(sql) => !crate::sqlguard::is_read_only_stmt(sql, self.engine()),
                 script::Item::Copy { .. } => true,
             })
         {
@@ -974,7 +974,7 @@ impl Backend {
         if script::effective_start_for(trimmed, self.engine()).starts_with('\\') {
             return Err(AppError::new("psql meta-commands are not supported"));
         }
-        if self.config().read_only && !crate::is_read_only_stmt(trimmed, self.engine()) {
+        if self.config().read_only && !crate::sqlguard::is_read_only_stmt(trimmed, self.engine()) {
             return Err(AppError::new(
                 "connection is read-only. Writes and side effects are blocked.",
             ));
@@ -1005,7 +1005,7 @@ impl Backend {
         if script::effective_start_for(trimmed, self.engine()).starts_with('\\') {
             return Err(AppError::new("psql meta-commands are not supported"));
         }
-        if self.config().read_only && !crate::is_read_only_stmt(trimmed, self.engine()) {
+        if self.config().read_only && !crate::sqlguard::is_read_only_stmt(trimmed, self.engine()) {
             return Err(AppError::new(
                 "connection is read-only. Writes and side effects are blocked.",
             ));

@@ -25,7 +25,7 @@ fn flush(buf: Vec<u8>) -> String {
 
 /// If `b[i]` begins a valid dollar-quote tag (`$$`, `$_$`, `$body$`), return the
 /// index of its closing `$`. `$1` (a parameter) is not a dollar quote.
-fn dollar_tag_end(b: &[u8], i: usize) -> Option<usize> {
+pub(crate) fn dollar_tag_end(b: &[u8], i: usize) -> Option<usize> {
     let n = b.len();
     let mut j = i + 1;
     while j < n {
