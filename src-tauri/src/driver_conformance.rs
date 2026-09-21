@@ -1729,6 +1729,191 @@ async fn backup_restore_battery(b: &mut Backend, eng: &Eng) {
 /// conflict handling (PostgreSQL `ON CONFLICT`, MySQL `INSERT IGNORE` / `ON DUPLICATE
 /// KEY UPDATE`, SQLite/DuckDB `INSERT OR IGNORE` / `OR REPLACE`), truncate-and-reload,
 /// and rollback of a whole failed import.
+/// The Docker-free half of `backup_restore_battery`. DuckDB and SQLite have no
+/// `ALTER TABLE … ADD CONSTRAINT`, so their foreign keys stay inline in the dump
+/// (`deferrable_fks` is PG/MySQL/SQL Server only) and tables must be dumped in
+/// dependency order; SQLite additionally emits `PRAGMA foreign_keys = OFF` before
+/// anything runs. Neither can express an FK cycle inline, so this battery uses a
+/// one-way reference and pins the ordering rule instead.
+async fn embedded_backup_restore_battery(b: &mut Backend, eng: &Eng) {
+    let q = eng.quote;
+    let a_name = q("bk_a");
+    let b_name = q("bk_b");
+    // `bk_a` references `bk_b`: drop the referrer first (DuckDB refuses to drop a
+    // referenced table).
+    let reset_sql = [
+        format!("DROP TABLE IF EXISTS {a_name}"),
+        format!("DROP TABLE IF EXISTS {b_name}"),
+    ];
+    reset(b, &reset_sql).await;
+    exec(
+        b,
+        &format!("CREATE TABLE {b_name} (id INTEGER NOT NULL PRIMARY KEY)"),
+    )
+    .await;
+    exec(
+        b,
+        &format!(
+            "CREATE TABLE {a_name} (id INTEGER NOT NULL PRIMARY KEY, b_id INTEGER REFERENCES {b_name} (id), note VARCHAR(80))"
+        ),
+    )
+    .await;
+    exec(b, &format!("INSERT INTO {b_name} (id) VALUES (1)")).await;
+    exec(
+        b,
+        &format!("INSERT INTO {a_name} (id, b_id, note) VALUES (1, 1, 'it''s a \"quoted\" note')"),
+    )
+    .await;
+    exec(
+        b,
+        &format!("INSERT INTO {a_name} (id, b_id, note) VALUES (2, NULL, NULL)"),
+    )
+    .await;
+
+    let schema = eng.schema.to_string();
+    let options = crate::backup::BackupOptions {
+        scope: "tables".into(),
+        schemas: Vec::new(),
+        tables: vec![
+            crate::backup::QualifiedName {
+                schema: schema.clone(),
+                name: "bk_a".into(),
+            },
+            crate::backup::QualifiedName {
+                schema,
+                name: "bk_b".into(),
+            },
+        ],
+        content: "all".into(),
+        include_drop: true,
+        single_transaction: false,
+    };
+    let path = std::env::temp_dir().join(format!(
+        "tusk_backup_{}_{}.sql",
+        eng.name,
+        std::process::id()
+    ));
+    let p = path.to_string_lossy().to_string();
+    let flag = std::sync::atomic::AtomicBool::new(false);
+    let summary = crate::backup::run_backup(b, "conformance", &options, &p, &flag, &mut |_| {})
+        .await
+        .unwrap_or_else(|e| panic!("[{}] backup: {}", eng.name, e.message));
+    assert_eq!(summary.rows, 3, "[{}] rows dumped", eng.name);
+    let text = std::fs::read_to_string(&path).unwrap();
+
+    assert!(
+        text.contains("INSERT INTO"),
+        "[{}] INSERTs:\n{text}",
+        eng.name
+    );
+    assert!(
+        !text.lines().any(|line| line.starts_with("ALTER TABLE")),
+        "[{}] embedded engines keep foreign keys inline:\n{text}",
+        eng.name
+    );
+    assert!(
+        text.contains("REFERENCES"),
+        "[{}] the inline foreign key is carried:\n{text}",
+        eng.name
+    );
+    let create_b = text
+        .find(&format!("CREATE TABLE {b_name}"))
+        .or_else(|| text.find("CREATE TABLE bk_b"))
+        .unwrap_or_else(|| panic!("[{}] CREATE for the referenced table:\n{text}", eng.name));
+    let create_a = text
+        .find(&format!("CREATE TABLE {a_name}"))
+        .or_else(|| text.find("CREATE TABLE bk_a"))
+        .unwrap_or_else(|| panic!("[{}] CREATE for the referrer:\n{text}", eng.name));
+    assert!(
+        create_b < create_a,
+        "[{}] the referenced table is created first:\n{text}",
+        eng.name
+    );
+    if eng.name == "sqlite" {
+        assert!(
+            text.contains("PRAGMA foreign_keys = OFF"),
+            "[{}] foreign-key enforcement is suspended for the restore:\n{text}",
+            eng.name
+        );
+    }
+
+    reset(b, &reset_sql).await;
+    let restored = crate::backup::run_restore(
+        b,
+        eng.engine,
+        &p,
+        &crate::backup::RestoreOptions {
+            stop_on_error: true,
+            single_transaction: false,
+        },
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut |_| {},
+    )
+    .await
+    .unwrap_or_else(|e| panic!("[{}] restore: {}", eng.name, e.message));
+    assert_eq!(
+        restored.statements_failed, 0,
+        "[{}] restore errors: {:?}",
+        eng.name, restored.first_error
+    );
+    let rows = all(
+        b,
+        &format!("SELECT id, b_id, note FROM {a_name} ORDER BY id"),
+    )
+    .await;
+    assert_eq!(
+        cell(&rows[0], 1).as_deref(),
+        Some("1"),
+        "[{}] reference restored",
+        eng.name
+    );
+    assert_eq!(
+        cell(&rows[0], 2).as_deref(),
+        Some("it's a \"quoted\" note"),
+        "[{}] quoted text restored",
+        eng.name
+    );
+    assert_eq!(cell(&rows[1], 2), None, "[{}] NULL restored", eng.name);
+
+    // Both embedded engines have transactional DDL: a single-transaction restore commits.
+    reset(b, &reset_sql).await;
+    let restored = crate::backup::run_restore(
+        b,
+        eng.engine,
+        &p,
+        &crate::backup::RestoreOptions {
+            stop_on_error: true,
+            single_transaction: true,
+        },
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut |_| {},
+    )
+    .await
+    .unwrap_or_else(|e| panic!("[{}] single-transaction restore: {}", eng.name, e.message));
+    assert_eq!(
+        restored.statements_failed, 0,
+        "[{}] single-transaction restore errors: {:?}",
+        eng.name, restored.first_error
+    );
+    assert!(
+        restored.committed,
+        "[{}] a clean single-transaction restore commits",
+        eng.name
+    );
+    assert_eq!(
+        cell(
+            &all(b, &format!("SELECT COUNT(*) FROM {a_name}")).await[0],
+            0
+        )
+        .as_deref(),
+        Some("2"),
+        "[{}] single-transaction restore landed its rows",
+        eng.name
+    );
+    reset(b, &reset_sql).await;
+    let _ = std::fs::remove_file(&path);
+}
+
 async fn import_battery(b: &mut Backend, eng: &Eng) {
     use crate::import::{run_import, ImportColumn, ImportOptions, ImportRequest, ImportTarget};
     use std::sync::atomic::AtomicBool;
@@ -2072,6 +2257,7 @@ async fn conformance_duckdb() {
     import_battery(&mut b, &eng).await;
     binary_output_battery(&mut b, &eng).await;
     buffered_export_dialect_battery(&eng).await;
+    embedded_backup_restore_battery(&mut b, &eng).await;
     transaction_battery(&duck_cfg(), &eng).await;
 }
 
@@ -2093,6 +2279,7 @@ async fn conformance_sqlite() {
     import_battery(&mut b, &eng).await;
     binary_output_battery(&mut b, &eng).await;
     buffered_export_dialect_battery(&eng).await;
+    embedded_backup_restore_battery(&mut b, &eng).await;
     transaction_battery(&sqlite_cfg(), &eng).await;
 }
 
