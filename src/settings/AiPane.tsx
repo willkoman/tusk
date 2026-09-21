@@ -26,6 +26,7 @@ import {
 import { ModelMultiPicker } from "../ai/ModelMultiPicker";
 import { emptySkill, type Skill } from "../ai/skills";
 import { KeyedSerialQueue } from "../asyncQueue";
+import { KeyedStaleGuard } from "../staleGuard";
 
 const errMsg = (e: unknown): string => (e as { message?: string })?.message ?? String(e);
 
@@ -61,25 +62,24 @@ export function AiPane(props: { database: string }) {
   const [catalogState, setCatalogState] = createSignal<Record<string, { loading: boolean; error: string; live: boolean }>>({});
   const patchCatalog = (pid: AiProvider, p: Partial<{ loading: boolean; error: string; live: boolean }>) =>
     setCatalogState((m) => ({ ...m, [pid]: { ...{ loading: false, error: "", live: false }, ...m[pid], ...p } }));
-  const catalogGeneration = new Map<AiProvider, number>();
+  const catalogGuard = new KeyedStaleGuard<AiProvider>();
   /** Fetch the provider's live catalog for curation (no completion probe — Test does that). */
   async function fetchCatalog(pid: AiProvider) {
     const spec = providerInfo(pid);
     if (!originApproved(cfg(), pid)) { patchCatalog(pid, { error: "Approve the custom API origin first." }); return; }
     const base = resolveBaseUrl(pid, approvedBaseOverride(cfg(), pid));
     if (!base) { patchCatalog(pid, { error: "Set an API base URL first." }); return; }
-    const generation = (catalogGeneration.get(pid) ?? 0) + 1;
-    catalogGeneration.set(pid, generation);
+    const token = catalogGuard.mint(pid);
     patchCatalog(pid, { loading: true, error: "" });
     try {
       const list = await invoke<string[]>("ai_list_models", {
         provider: pid, wire: spec.wire, baseUrl: base, allowNoKey: !spec.needsKey,
       });
-      if (!mounted || catalogGeneration.get(pid) !== generation) return;
+      if (!catalogGuard.current(pid, token)) return;
       if (list.length) setLiveModels((m) => ({ ...m, [pid]: list }));
       patchCatalog(pid, { loading: false, live: list.length > 0, error: list.length ? "" : "The provider returned no models." });
     } catch (e) {
-      if (mounted && catalogGeneration.get(pid) === generation) patchCatalog(pid, { loading: false, error: errMsg(e) });
+      if (catalogGuard.current(pid, token)) patchCatalog(pid, { loading: false, error: errMsg(e) });
     }
   }
   /** Why the live catalog can't be fetched yet; empty once the provider is usable
@@ -97,15 +97,10 @@ export function AiPane(props: { database: string }) {
     setExpanded(opening ? pid : null);
     if (opening && !liveModels()[pid] && !refreshBlocked(pid)) void fetchCatalog(pid);
   };
-  const probeGeneration = new Map<AiProvider, number>();
+  const probeGuard = new KeyedStaleGuard<AiProvider>();
   const keyMutations = new KeyedSerialQueue<AiProvider>();
-  let mounted = true;
-  const nextProbe = (pid: AiProvider) => {
-    const generation = (probeGeneration.get(pid) ?? 0) + 1;
-    probeGeneration.set(pid, generation);
-    return generation;
-  };
-  const probeCurrent = (pid: AiProvider, generation: number) => mounted && probeGeneration.get(pid) === generation;
+  const nextProbe = (pid: AiProvider) => probeGuard.mint(pid);
+  const probeCurrent = (pid: AiProvider, token: number) => probeGuard.current(pid, token);
 
   const providerBase = (pid: AiProvider) =>
     originApproved(cfg(), pid) ? resolveBaseUrl(pid, approvedBaseOverride(cfg(), pid)) : "";
@@ -123,7 +118,7 @@ export function AiPane(props: { database: string }) {
   let unsubscribeConfig = () => {};
   onMount(() => {
     unsubscribeConfig = aiStore.subscribe((next) => {
-      for (const provider of AI_PROVIDERS) nextProbe(provider.id);
+      probeGuard.invalidateAll();
       setProbe((current) => Object.fromEntries(
         Object.entries(current).map(([provider, state]) => [provider, { ...state, testing: false, note: "", ok: null }]),
       ));
@@ -134,8 +129,8 @@ export function AiPane(props: { database: string }) {
     void refreshSkills();
   });
   onCleanup(() => {
-    mounted = false;
-    for (const provider of AI_PROVIDERS) nextProbe(provider.id);
+    probeGuard.dispose();
+    catalogGuard.dispose();
     unsubscribeConfig();
   });
 

@@ -10,6 +10,7 @@
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { StaleGuard } from "../staleGuard";
 import { activeBaseUrl, aiStore, defaultModel, isKeyless, resolveBaseUrl, resolveWire, type AiConfig, type AiProvider } from "../ai/store";
 import {
   DEFAULT_CONFIG,
@@ -80,14 +81,13 @@ export function SlackPane(props: {
 
   let unlisten: UnlistenFn | undefined;
   let unsubscribeAi = () => {};
-  let mounted = true;
-  let statusRevision = 0;
+  const statusGuard = new StaleGuard();
   onMount(() => {
     unsubscribeAi = aiStore.subscribe(setAi);
     void (async () => {
       try {
         const info = await slackIo.run("io", () => invoke<SlackConfigInfo>("slack_load_config"));
-        if (!mounted) return;
+        if (!statusGuard.alive) return;
         const loaded = normalizeSlackConfig(info.config);
         setCfg(loaded);
         setMaxTokensInput(String(loaded.aiMaxTokens));
@@ -96,20 +96,20 @@ export function SlackPane(props: {
       } catch {
         /* defaults stand */
       } finally {
-        if (mounted) setConfigLoaded(true);
+        if (statusGuard.alive) setConfigLoaded(true);
       }
     })();
     void (async () => {
       try {
         const stop = await listen<SlackStatus>("slack:status", (e) => {
-          statusRevision++;
+          statusGuard.invalidate();
           setStatus(e.payload);
           // A bot that FAILED is off, and the switch must say so. A bot that is merely
           // waiting (its bound connection closed, autostart still armed) keeps
           // `enabled: true` on disk, so the switch stays On over it — honestly.
           if (!e.payload.running && e.payload.error && !e.payload.waiting && cfg().enabled) setCfg({ ...cfg(), enabled: false });
         });
-        if (!mounted) {
+        if (!statusGuard.alive) {
           stop();
           return;
         }
@@ -117,17 +117,17 @@ export function SlackPane(props: {
       } catch {
         /* status events unavailable */
       }
-      const revision = statusRevision;
+      const token = statusGuard.mint();
       try {
         const current = await invoke<SlackStatus>("slack_status");
-        if (mounted && statusRevision === revision) setStatus(current);
+        if (statusGuard.current(token)) setStatus(current);
       } catch {
         /* ignore */
       }
     })();
   });
   onCleanup(() => {
-    mounted = false;
+    statusGuard.dispose();
     unsubscribeAi();
     unlisten?.();
   });
@@ -149,7 +149,7 @@ export function SlackPane(props: {
       }
       try {
         const info = await slackIo.run("io", () => invoke<SlackConfigInfo>("slack_load_config"));
-        if (!mounted) return;
+        if (!statusGuard.alive) return;
         const loaded = normalizeSlackConfig(info.config);
         setCfg(loaded);
         setMaxTokensInput(String(loaded.aiMaxTokens));

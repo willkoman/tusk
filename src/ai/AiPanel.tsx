@@ -11,6 +11,7 @@ import {
 import { buildSystemPrompt, relevantTables, type AiContext, type SampleTable } from "./context";
 import { Markdown } from "./markdown";
 import { ModelPicker } from "./ModelPicker";
+import { KeyedStaleGuard, StaleGuard } from "../staleGuard";
 
 /** A turn's outcome lives on the message, NOT in its `content` — an error appended to the
  *  text would be replayed to the provider as part of the conversation on the next send. */
@@ -74,17 +75,11 @@ export function AiPanel(props: {
    *  OpenCode gateways are fully covered today, so nothing is filtered in practice. */
   const modelsFor = (pid: AiProvider) =>
     visibleModels(cfg(), pid, liveModels()[pid], providerModels(pid)).filter((m) => modelSupported(pid, m));
-  const modelFetchGeneration = new Map<AiProvider, number>();
-  let keyGeneration = 0;
-  let keyedGeneration = 0;
-  let mounted = true;
-  const nextModelFetch = (pid: AiProvider) => {
-    const generation = (modelFetchGeneration.get(pid) ?? 0) + 1;
-    modelFetchGeneration.set(pid, generation);
-    return generation;
-  };
+  const modelFetchGuard = new KeyedStaleGuard<AiProvider>();
+  const keyGuard = new StaleGuard();
+  const keyedGuard = new StaleGuard();
   async function fetchModels(pid: AiProvider) {
-    const generation = nextModelFetch(pid);
+    const token = modelFetchGuard.mint(pid);
     const config = cfg();
     // The base override only applies to the provider it was configured for; every other
     // provider is fetched at its registry default.
@@ -100,7 +95,7 @@ export function AiPanel(props: {
         baseUrl,
         allowNoKey: !spec.needsKey,
       });
-      if (mounted && modelFetchGeneration.get(pid) === generation && list.length)
+      if (modelFetchGuard.current(pid, token) && list.length)
         setLiveModels((m) => ({ ...m, [pid]: list }));
     } catch {
       /* keep the curated fallback */
@@ -152,10 +147,10 @@ export function AiPanel(props: {
     return !!baseUrl && await invoke<boolean>("ai_has_key", { provider: p, baseUrl }).catch(() => false);
   };
   const refreshKey = async () => {
-    const generation = ++keyGeneration;
+    const token = keyGuard.mint();
     const config = cfg();
     const ready = await providerReady(config.provider, config);
-    if (mounted && keyGeneration === generation && cfg() === config) setHasKey(ready);
+    if (keyGuard.current(token) && cfg() === config) setHasKey(ready);
   };
   // First-open routing happens HERE, once the async keychain check resolves: no
   // saved key anywhere → show the setup form (provider/model/key prompt); a key
@@ -163,12 +158,12 @@ export function AiPanel(props: {
   // effect over keyed(), which starts []) wrongly flashed settings open on every
   // panel open even after setup.
   const refreshKeyed = async () => {
-    const generation = ++keyedGeneration;
+    const token = keyedGuard.mint();
     const config = cfg();
     const checks = await Promise.all(
       AI_PROVIDERS.map((p) => providerReady(p.id, config).then((ok) => (ok ? p.id : null))),
     );
-    if (!mounted || keyedGeneration !== generation || cfg() !== config) return;
+    if (!keyedGuard.current(token) || cfg() !== config) return;
     const list = checks.filter((x): x is AiProvider => !!x);
     setKeyed(list);
     // Keyless providers are "ready" but may have no server running — fetching their
@@ -188,7 +183,7 @@ export function AiPanel(props: {
           (previous.baseUrls[provider] ?? "") !== (next.baseUrls[provider] ?? "") ||
           previous.approvedOrigins[provider] !== next.approvedOrigins[provider]);
       if (changedBases.length) {
-        for (const provider of changedBases) nextModelFetch(provider);
+        for (const provider of changedBases) modelFetchGuard.invalidate(provider);
         setLiveModels((models) => {
           const updated = { ...models };
           for (const provider of changedBases) delete updated[provider];
@@ -483,10 +478,9 @@ export function AiPanel(props: {
   };
 
   onCleanup(() => {
-    mounted = false;
-    keyGeneration++;
-    keyedGeneration++;
-    for (const provider of AI_PROVIDERS) nextModelFetch(provider.id);
+    keyGuard.dispose();
+    keyedGuard.dispose();
+    modelFetchGuard.dispose();
     unsubscribeConfig();
     clearTimeout(modelsTimer);
     clearTimeout(deltaTimer);

@@ -1,5 +1,6 @@
 import { createMemo, createSignal, For, Show } from "solid-js";
 import { Dialog } from "../Dialog";
+import { StaleGuard } from "../staleGuard";
 import {
   autoMatch,
   buildTarget,
@@ -102,12 +103,12 @@ export function ImportDialog(props: {
   // Every option change fires a preview; two in-flight parses can resolve in either
   // order, so a stale one must never overwrite the preview OR the mapping derived
   // from it.
-  let previewGeneration = 0;
+  const previewGuard = new StaleGuard();
 
   async function reparse(target = path()) {
     if (!target) return;
-    const generation = ++previewGeneration;
-    const current = () => generation === previewGeneration;
+    const token = previewGuard.mint();
+    const current = () => previewGuard.current(token);
     setBusy(true);
     setErr("");
     try {

@@ -152,6 +152,7 @@ import { ddlCaps, ddlSupported } from "./sql/ddlCaps";
 import { clipWrite, clipRead } from "./clipboard";
 import { slackHistoryKey, type SlackExecuted } from "./slackEvents";
 import { KeyedSerialQueue } from "./asyncQueue";
+import { StaleGuard } from "./staleGuard";
 import {
   IDLE_TRANSACTION,
   INTERRUPTED_TRANSACTION_KEY,
@@ -590,14 +591,14 @@ function App() {
   // User-authored AI skills (stored on disk by Rust). Reloaded whenever Settings closes,
   // since that's the only place they're created/edited/imported/removed.
   const [skills, setSkills] = createSignal<Skill[]>([]);
-  let skillsGeneration = 0;
+  const skillsGuard = new StaleGuard();
   const refreshSkills = async () => {
-    const generation = ++skillsGeneration;
+    const token = skillsGuard.mint();
     try {
       const next = await invoke<Skill[]>("skills_list");
-      if (skillsGeneration === generation) setSkills(next);
+      if (skillsGuard.current(token)) setSkills(next);
     } catch {
-      if (skillsGeneration === generation) setSkills([]);
+      if (skillsGuard.current(token)) setSkills([]);
     }
   };
   // Sidebar context menu + active workbench dialog.
@@ -2114,7 +2115,7 @@ function App() {
   const [slackNotice, setSlackNotice] = createSignal("");
   const slackUnlisten: UnlistenFn[] = [];
   const slackHistoryKeys = new Map<string, string>();
-  let slackStatusRevision = 0;
+  const slackStatusGuard = new StaleGuard();
   /**
    * Slack autostart, scoped to ONE SAVED connection. The bot answers against a single
    * connection, so it used to be armed as a bare `enabled` flag and bound to whichever
@@ -2437,7 +2438,7 @@ function App() {
     // Best-effort — a failed listen must never break the app.
     try {
       const statusUnlisten = await listen<SlackStatus>("slack:status", (e) => {
-        slackStatusRevision++;
+        slackStatusGuard.invalidate();
         setSlackStatus(e.payload);
         // A bot that stopped on its own (its bound connection went away) must say so
         // where the user is looking, not only in Settings → Slack.
@@ -2465,10 +2466,10 @@ function App() {
     } catch {
       /* Slack audit events unavailable */
     }
-    const statusRevision = slackStatusRevision;
+    const statusToken = slackStatusGuard.mint();
     void invoke<SlackStatus>("slack_status")
       .then((current) => {
-        if (!appMounted || slackStatusRevision !== statusRevision) return;
+        if (!slackStatusGuard.current(statusToken)) return;
         setSlackStatus(current);
         // The armed-but-waiting status is published during Rust setup, BEFORE this
         // listener exists, so the snapshot is the only place it can reach the
@@ -2479,7 +2480,8 @@ function App() {
   });
   onCleanup(() => {
     appMounted = false;
-    skillsGeneration++;
+    skillsGuard.dispose();
+    slackStatusGuard.dispose();
     tabDrag?.cancel();
     tabDrag = null;
     document.removeEventListener("contextmenu", preventNativeContextMenu);
