@@ -379,13 +379,22 @@ pub(crate) struct TextLimits {
     pub max_total_bytes: usize,
 }
 
-/// Limits for query pages crossing the Tauri IPC boundary.
+/// Limits for query pages: what a driver collects from the server per page, and the
+/// same shape re-checked before the page crosses the Tauri IPC boundary. Every other
+/// table below is a stated deviation from this one, never a second set of numbers.
 pub(crate) const USER_TEXT_LIMITS: TextLimits = TextLimits {
     max_rows: 50_000,
     max_columns: 10_000,
     max_cells: 2_000_000,
     max_cell_bytes: 1024 * 1024,
     max_total_bytes: 64 * 1024 * 1024,
+};
+
+/// Rows the frontend sends INTO the backend (loaded-row export, clipboard parity):
+/// a tab can accumulate more than one page, so only the row count is wider.
+pub(crate) const IPC_PAYLOAD_LIMITS: TextLimits = TextLimits {
+    max_rows: 200_000,
+    ..USER_TEXT_LIMITS
 };
 
 /// Limits for catalog output. DDL reconstruction opts into a larger per-cell limit
@@ -408,10 +417,22 @@ pub(crate) struct TextBudget {
     rows: usize,
     cells: usize,
     bytes: usize,
+    /// Charge container overhead per row and cell as well as text bytes: the budget
+    /// then bounds the MEMORY a retained result occupies, not only its text.
+    overhead: bool,
 }
 
 impl TextBudget {
     pub(crate) fn new(columns: &[String], limits: TextLimits) -> Result<Self, AppError> {
+        Self::build(columns, limits, false)
+    }
+
+    /// A budget for a result that is held in memory rather than streamed to a sink.
+    pub(crate) fn with_overhead(columns: &[String], limits: TextLimits) -> Result<Self, AppError> {
+        Self::build(columns, limits, true)
+    }
+
+    fn build(columns: &[String], limits: TextLimits, overhead: bool) -> Result<Self, AppError> {
         if columns.len() > limits.max_columns {
             return Err(AppError::new("database result has too many columns"));
         }
@@ -421,11 +442,38 @@ impl TextBudget {
             rows: 0,
             cells: 0,
             bytes: 0,
+            overhead,
         };
+        if overhead {
+            budget.bytes = columns.len().saturating_mul(std::mem::size_of::<String>());
+        }
         for column in columns {
             budget.add_value(column, "column name")?;
         }
         Ok(budget)
+    }
+
+    /// Check one complete page against `limits` in one call.
+    pub(crate) fn check(
+        columns: &[String],
+        rows: &[Vec<Option<String>>],
+        limits: TextLimits,
+    ) -> Result<(), AppError> {
+        let mut budget = Self::new(columns, limits)?;
+        for row in rows {
+            budget.add_row(row)?;
+        }
+        Ok(())
+    }
+
+    /// Check a page whose column names are not at hand (a fetched continuation page):
+    /// the width is the first row's, and every row must match it.
+    pub(crate) fn check_rows(
+        rows: &[Vec<Option<String>>],
+        limits: TextLimits,
+    ) -> Result<(), AppError> {
+        let width = rows.first().map_or(0, Vec::len);
+        Self::check(&vec![String::new(); width], rows, limits)
     }
 
     fn add_value(&mut self, value: &str, label: &str) -> Result<(), AppError> {
@@ -455,6 +503,21 @@ impl TextBudget {
             return Err(AppError::new(
                 "database result exceeds its row or cell limit",
             ));
+        }
+        if self.overhead {
+            self.bytes = self
+                .bytes
+                .saturating_add(std::mem::size_of::<Vec<Option<String>>>())
+                .saturating_add(
+                    row.len()
+                        .saturating_mul(std::mem::size_of::<Option<String>>()),
+                );
+            if self.bytes > self.limits.max_total_bytes {
+                return Err(AppError::new(format!(
+                    "database result exceeds the {}-byte limit",
+                    self.limits.max_total_bytes
+                )));
+            }
         }
         for value in row.iter().flatten() {
             self.add_value(value, "value")?;
@@ -558,6 +621,58 @@ pub fn pg_string_literal(value: &str) -> Result<String, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_budget_check_and_check_rows_share_one_rule() {
+        let limits = TextLimits {
+            max_rows: 2,
+            max_columns: 2,
+            max_cells: 4,
+            max_cell_bytes: 3,
+            max_total_bytes: 8,
+        };
+        let cols = vec!["a".to_string(), "b".to_string()];
+        let ok = vec![vec![Some("x".into()), None], vec![None, Some("yz".into())]];
+        assert!(TextBudget::check(&cols, &ok, limits).is_ok());
+        assert!(TextBudget::check_rows(&ok, limits).is_ok());
+        // Third row, a ragged row, an oversized cell, and too many columns each fail.
+        let three = [ok.clone(), vec![vec![None, None]]].concat();
+        assert!(TextBudget::check(&cols, &three, limits).is_err());
+        assert!(TextBudget::check_rows(&three, limits).is_err());
+        assert!(TextBudget::check(&cols, &[vec![Some("x".into())]], limits).is_err());
+        assert!(TextBudget::check_rows(&[vec![None, None], vec![None]], limits).is_err());
+        assert!(TextBudget::check(&cols, &[vec![Some("long".into()), None]], limits).is_err());
+        assert!(TextBudget::check(&["a".into(), "b".into(), "c".into()], &[], limits).is_err());
+        // Total bytes: column names count too (a + b = 2, then x + yz = 3 → 5 ≤ 8).
+        let full = vec![vec![Some("abc".into()), Some("abc".into())]];
+        assert!(TextBudget::check(&cols, &full, limits).is_ok());
+        let over = vec![
+            vec![Some("abc".into()), Some("abc".into())],
+            vec![Some("a".into()), None],
+        ];
+        assert!(TextBudget::check(&cols, &over, limits).is_err());
+    }
+
+    #[test]
+    fn retained_budget_charges_container_overhead() {
+        // Text alone fits; the per-row and per-cell container overhead does not.
+        let limits = TextLimits {
+            max_rows: 10,
+            max_columns: 10,
+            max_cells: 100,
+            max_cell_bytes: 100,
+            max_total_bytes: 64,
+        };
+        let cols = vec!["a".to_string()];
+        let rows = vec![vec![Some("x".into())]; 3];
+        assert!(TextBudget::check(&cols, &rows, limits).is_ok());
+        let mut retained = TextBudget::with_overhead(&cols, limits).unwrap();
+        let outcome = rows.iter().try_for_each(|row| retained.add_row(row));
+        assert!(
+            outcome.is_err(),
+            "three retained rows exceed 64 bytes once containers count"
+        );
+    }
 
     #[test]
     fn postgres_literal_is_independent_of_standard_string_mode() {

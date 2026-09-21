@@ -11,7 +11,8 @@ use super::context::{self, SampleTable, SlackAiCtx};
 use super::format::{self, ResultFormat};
 use super::socket::SlackEvent;
 use super::SlackRuntime;
-use crate::db::{AppError, QueryOutcome};
+use crate::db::{AppError, TextLimits};
+use crate::results::{Bound, Mode, ResultStream};
 use crate::sqlguard::{
     find_mutation_word_for, is_read_only_stmt, is_wrappable_read, mask_sql, wrap_capped,
 };
@@ -884,74 +885,31 @@ fn validate_read_only(sql: &str, engine: script::TransactionEngine) -> Result<()
     Ok(())
 }
 
-const MAX_RESULT_COLUMNS: usize = 10_000;
-const MAX_RESULT_CELLS: usize = 2_000_000;
-const MAX_RESULT_VALUE_BYTES: usize = 1024 * 1024;
-const MAX_RESULT_TOTAL_BYTES: usize = 48 * 1024 * 1024;
-
-fn add_result_page(
-    columns: &[String],
-    rows: &[Vec<Option<String>>],
-    bytes: &mut usize,
-    cells: &mut usize,
-    first: bool,
-) -> Result<(), AppError> {
-    if columns.is_empty()
-        || columns.len() > MAX_RESULT_COLUMNS
-        || rows.iter().any(|r| r.len() != columns.len())
-    {
-        return Err(AppError::new(
-            "Slack result exceeds the supported row/column shape",
-        ));
-    }
-    if first {
-        *bytes = columns
-            .iter()
-            .map(|s| s.len().saturating_add(std::mem::size_of::<String>()))
-            .sum::<usize>();
-    }
-    *cells = cells.saturating_add(rows.len().saturating_mul(columns.len()));
-    if *cells > MAX_RESULT_CELLS {
-        return Err(AppError::new("Slack result exceeds the 2000000-cell limit"));
-    }
-    *bytes = bytes.saturating_add(
-        rows.len()
-            .saturating_mul(std::mem::size_of::<Vec<Option<String>>>()),
-    );
-    *bytes = bytes.saturating_add(
-        rows.len()
-            .saturating_mul(columns.len())
-            .saturating_mul(std::mem::size_of::<Option<String>>()),
-    );
-    if *bytes > MAX_RESULT_TOTAL_BYTES {
-        return Err(AppError::new(
-            "Slack result exceeds the 48 MiB memory budget",
-        ));
-    }
-    for value in rows.iter().flatten().flatten() {
-        if value.len() > MAX_RESULT_VALUE_BYTES {
-            return Err(AppError::new(
-                "Slack result contains a value larger than 1 MiB",
-            ));
-        }
-        *bytes = bytes.saturating_add(value.len());
-        if *bytes > MAX_RESULT_TOTAL_BYTES {
-            return Err(AppError::new(
-                "Slack result exceeds the 48 MiB memory budget",
-            ));
-        }
-    }
-    Ok(())
-}
+/// The retained-result budget: the shared page limits, with rows up to the file cap
+/// plus one (so truncation is detectable) and 48 MiB of MEMORY, container overhead
+/// included, because a Slack result is held for the requester's export buttons rather
+/// than streamed to a sink.
+const SLACK_RESULT_LIMITS: TextLimits = TextLimits {
+    max_rows: super::config::MAX_ROWS_FILE + 1,
+    max_total_bytes: 48 * 1024 * 1024,
+    ..crate::db::USER_TEXT_LIMITS
+};
 
 #[cfg(test)]
 fn validate_result_payload(
     columns: &[String],
     rows: &[Vec<Option<String>>],
 ) -> Result<(), AppError> {
-    let mut bytes = 0;
-    let mut cells = 0;
-    add_result_page(columns, rows, &mut bytes, &mut cells, true)
+    if columns.is_empty() {
+        return Err(AppError::new(
+            "Slack result exceeds the supported row/column shape",
+        ));
+    }
+    let mut budget = crate::db::TextBudget::with_overhead(columns, SLACK_RESULT_LIMITS)?;
+    for row in rows {
+        budget.add_row(row)?;
+    }
+    Ok(())
 }
 
 async fn collect_read_limited(
@@ -960,24 +918,29 @@ async fn collect_read_limited(
     cap: usize,
 ) -> Result<(Vec<String>, Vec<Vec<Option<String>>>), AppError> {
     let page = (cap.saturating_add(1).min(1_000)) as u32;
-    let out = backend.run_single_read_only(sql, page, true).await?;
-    let (columns, mut rows, mut done) = match out {
-        QueryOutcome::Rows {
-            columns,
-            rows,
-            done,
-            ..
-        } => (columns, rows, done),
-        QueryOutcome::Exec { .. } => return Err(AppError::new("the query returned no result set")),
+    let Some(mut stream) = ResultStream::open(
+        backend,
+        sql,
+        page,
+        Bound::Retained(SLACK_RESULT_LIMITS),
+        Mode::ReadOnlyIsolated,
+    )
+    .await?
+    else {
+        return Err(AppError::new("the query returned no result set"));
     };
-    let mut bytes = 0;
-    let mut cells = 0;
-    add_result_page(&columns, &rows, &mut bytes, &mut cells, true)?;
-    while !done && rows.len() <= cap {
-        let next = backend.fetch_page(page).await?;
-        add_result_page(&columns, &next.rows, &mut bytes, &mut cells, false)?;
-        rows.extend(next.rows);
-        done = next.done;
+    if stream.columns().is_empty() {
+        return Err(AppError::new(
+            "Slack result exceeds the supported row/column shape",
+        ));
+    }
+    let columns = stream.columns().to_vec();
+    let mut rows = Vec::new();
+    while rows.len() <= cap {
+        let Some(next) = stream.next_page().await? else {
+            break;
+        };
+        rows.extend(next);
     }
     rows.truncate(cap.saturating_add(1));
     Ok((columns, rows))

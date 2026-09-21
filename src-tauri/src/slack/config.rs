@@ -8,6 +8,9 @@
 use crate::db::AppError;
 use serde::{Deserialize, Serialize};
 
+/// The most rows a Slack answer may carry as a file; `max_rows_file` is validated against it.
+pub(crate) const MAX_ROWS_FILE: usize = 100_000;
+
 const KEYCHAIN_SERVICE: &str = "tusk-slack";
 const BOT_TOKEN_ACCOUNT: &str = "bot-token";
 const APP_TOKEN_ACCOUNT: &str = "app-token";
@@ -106,7 +109,7 @@ impl SlackConfig {
                 "Slack maxRowsInline must be between 1 and 100",
             ));
         }
-        if !(100..=100_000).contains(&self.max_rows_file) {
+        if !(100..=MAX_ROWS_FILE).contains(&self.max_rows_file) {
             return Err(AppError::new(
                 "Slack maxRowsFile must be between 100 and 100000",
             ));

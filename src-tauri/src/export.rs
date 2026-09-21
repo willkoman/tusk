@@ -1,4 +1,5 @@
 use crate::db::{self, collect_rows_limited, AppError, USER_TEXT_LIMITS};
+use crate::results::{Bound, Mode, ResultStream};
 use rust_xlsxwriter::{Format, Workbook};
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -1178,24 +1179,20 @@ async fn paged_inner(
     path: &str,
 ) -> Result<u64, AppError> {
     let mut feeder = SinkFeeder::new(opts, dialect, path);
-    let out = backend.run_single(sql, BATCH, true).await?;
-    let (cols, rows, mut done) = match out {
-        db::QueryOutcome::Rows {
-            columns,
-            rows,
-            done,
-            ..
-        } => (columns, rows, done),
-        db::QueryOutcome::Exec { .. } => {
-            return Err(AppError::new("the export query returned no result set"))
-        }
+    let Some(mut stream) = ResultStream::open(
+        backend,
+        sql,
+        BATCH,
+        Bound::PerPage(db::USER_TEXT_LIMITS),
+        Mode::Normal,
+    )
+    .await?
+    else {
+        return Err(AppError::new("the export query returned no result set"));
     };
-    feeder.init_cols(&cols)?;
-    feeder.feed(&rows).await?;
-    while !done {
-        let page = backend.fetch_page(BATCH).await?;
-        done = page.done;
-        feeder.feed(&page.rows).await?;
+    feeder.init_cols(stream.columns())?;
+    while let Some(rows) = stream.next_page().await? {
+        feeder.feed(&rows).await?;
     }
     feeder.finish().await
 }

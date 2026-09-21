@@ -12,6 +12,7 @@ mod perms;
 mod profiles;
 mod query_plan;
 mod relgraph;
+mod results;
 mod script;
 mod skills;
 mod slack;
@@ -378,11 +379,6 @@ const MAX_PAGE_SIZE: u32 = 50_000;
 const MAX_SQL_BYTES: usize = 20 * 1024 * 1024;
 const MAX_TEXT_FILE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_HISTORY_BYTES: usize = 10 * 1024 * 1024;
-const MAX_IPC_ROWS: usize = 200_000;
-const MAX_IPC_COLUMNS: usize = 10_000;
-const MAX_IPC_CELLS: usize = 2_000_000;
-const MAX_IPC_CELL_BYTES: usize = 1024 * 1024;
-const MAX_IPC_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TRANSACTION_OWNER_BYTES: usize = 256;
 
 fn validate_transaction_owner(owner: &str) -> Result<(), AppError> {
@@ -413,92 +409,26 @@ fn validate_sql_size(sql: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Rows the frontend hands in (loaded-row export): the shared shape, a wider row count.
 fn validate_tabular_payload(
     columns: &[String],
     rows: &[Vec<Option<String>>],
 ) -> Result<(), AppError> {
-    if columns.is_empty() || columns.len() > MAX_IPC_COLUMNS {
-        return Err(AppError::new(format!(
-            "column count must be between 1 and {MAX_IPC_COLUMNS}"
-        )));
+    if columns.is_empty() {
+        return Err(AppError::new("a row payload needs at least one column"));
     }
-    if rows.len() > MAX_IPC_ROWS || rows.len().saturating_mul(columns.len()) > MAX_IPC_CELLS {
-        return Err(AppError::new(format!(
-            "row payload exceeds the {MAX_IPC_CELLS}-cell limit"
-        )));
-    }
-    if rows.iter().any(|r| r.len() != columns.len()) {
-        return Err(AppError::new(
-            "every row must have exactly the same number of values as columns",
-        ));
-    }
-    let mut bytes = 0usize;
-    for value in columns.iter().chain(rows.iter().flatten().flatten()) {
-        if value.len() > MAX_IPC_CELL_BYTES {
-            return Err(AppError::new(format!(
-                "a column name or value exceeds the {MAX_IPC_CELL_BYTES}-byte limit"
-            )));
-        }
-        bytes = bytes.saturating_add(value.len());
-        if bytes > MAX_IPC_PAYLOAD_BYTES {
-            return Err(AppError::new(format!(
-                "row payload exceeds the {MAX_IPC_PAYLOAD_BYTES}-byte limit"
-            )));
-        }
-    }
-    Ok(())
+    db::TextBudget::check(columns, rows, db::IPC_PAYLOAD_LIMITS)
 }
 
+/// A query's first page, re-checked before it crosses IPC (the driver already
+/// collected it under the same limits; this is the belt).
 fn validate_result_page(columns: &[String], rows: &[Vec<Option<String>>]) -> Result<(), AppError> {
-    if columns.len() > MAX_IPC_COLUMNS {
-        return Err(AppError::new(format!(
-            "query result exceeds the {MAX_IPC_COLUMNS}-column limit"
-        )));
-    }
-    if rows.len() > MAX_IPC_ROWS || rows.len().saturating_mul(columns.len()) > MAX_IPC_CELLS {
-        return Err(AppError::new(format!(
-            "query result exceeds the {MAX_IPC_CELLS}-cell page limit"
-        )));
-    }
-    if rows.iter().any(|r| r.len() != columns.len()) {
-        return Err(AppError::new("query returned an inconsistent row shape"));
-    }
-    validate_result_bytes(columns.iter(), rows)
+    db::TextBudget::check(columns, rows, db::USER_TEXT_LIMITS)
 }
 
+/// A fetched continuation page: same limits, width taken from the rows.
 fn validate_fetch_page(rows: &[Vec<Option<String>>]) -> Result<(), AppError> {
-    let columns = rows.first().map_or(0, Vec::len);
-    if columns > MAX_IPC_COLUMNS
-        || rows.len() > MAX_IPC_ROWS
-        || rows.len().saturating_mul(columns) > MAX_IPC_CELLS
-        || rows.iter().any(|r| r.len() != columns)
-    {
-        return Err(AppError::new(
-            "fetched result page exceeds IPC shape limits",
-        ));
-    }
-    validate_result_bytes(std::iter::empty::<&String>(), rows)
-}
-
-fn validate_result_bytes<'a>(
-    columns: impl Iterator<Item = &'a String>,
-    rows: &'a [Vec<Option<String>>],
-) -> Result<(), AppError> {
-    let mut bytes = 0usize;
-    for value in columns.chain(rows.iter().flatten().flatten()) {
-        if value.len() > MAX_IPC_CELL_BYTES {
-            return Err(AppError::new(format!(
-                "query result contains a value over the {MAX_IPC_CELL_BYTES}-byte limit"
-            )));
-        }
-        bytes = bytes.saturating_add(value.len());
-        if bytes > MAX_IPC_PAYLOAD_BYTES {
-            return Err(AppError::new(format!(
-                "query result page exceeds the {MAX_IPC_PAYLOAD_BYTES}-byte limit"
-            )));
-        }
-    }
-    Ok(())
+    db::TextBudget::check_rows(rows, db::USER_TEXT_LIMITS)
 }
 
 #[tauri::command]
@@ -1127,7 +1057,7 @@ mod bind_param_tests {
         checked_page_size, disconnect_registered, exec_plan, has_bind_params, lock_conn, lock_sync,
         persist_export_temp, validate_fetch_page, validate_result_page, validate_sql_size,
         validate_tabular_payload, AppError, AppState, CancelHandle, ConnState, ConnectionConfig,
-        TransactionStatus, MAX_IPC_CELL_BYTES, MAX_OPEN_CONNECTIONS, MAX_SQL_BYTES,
+        TransactionStatus, MAX_OPEN_CONNECTIONS, MAX_SQL_BYTES,
     };
     use crate::driver;
     use std::sync::atomic::Ordering;
@@ -1175,7 +1105,9 @@ mod bind_param_tests {
         assert!(validate_tabular_payload(&["a".into()], &[vec![Some("1".into())]]).is_ok());
         assert!(validate_result_page(
             &["a".into()],
-            &[vec![Some("x".repeat(MAX_IPC_CELL_BYTES + 1))]]
+            &[vec![Some(
+                "x".repeat(crate::db::USER_TEXT_LIMITS.max_cell_bytes + 1)
+            )]]
         )
         .is_err());
         assert!(validate_fetch_page(&[

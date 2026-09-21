@@ -49,6 +49,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use crate::db::{self, AppError};
 use crate::driver::Backend;
 use crate::export::{ident_for, value_for, SqlDialect};
+use crate::results::{Bound, Mode, ResultStream};
 use crate::script;
 
 // --- limits -----------------------------------------------------------------
@@ -1471,13 +1472,17 @@ async fn insert_table(
         columns.len()
     };
     backend.rollback_cursor().await;
-    let first = backend.run_single(&select, DATA_PAGE, true).await?;
-    let (mut rows, mut done) = match first {
-        db::QueryOutcome::Rows { rows, done, .. } => (rows, done),
-        db::QueryOutcome::Exec { .. } => {
-            backend.rollback_cursor().await;
-            return Ok(0);
-        }
+    let opened = ResultStream::open(
+        backend,
+        &select,
+        DATA_PAGE,
+        Bound::PerPage(db::USER_TEXT_LIMITS),
+        Mode::Normal,
+    )
+    .await?;
+    let Some(mut stream) = opened else {
+        backend.rollback_cursor().await;
+        return Ok(0);
     };
     let mut written: u64 = 0;
     let mut buffer: Vec<String> = Vec::new();
@@ -1487,6 +1492,9 @@ async fn insert_table(
     let result: Result<(), AppError> = async {
         loop {
             cancelled(cancel)?;
+            let Some(rows) = stream.next_page().await? else {
+                break;
+            };
             for row in &rows {
                 if row.len() != expected_cells {
                     return Err(AppError::new(format!(
@@ -1536,16 +1544,11 @@ async fn insert_table(
                     bytes: out.bytes,
                 });
             }
-            if done {
-                break;
-            }
-            let page = backend.fetch_page(DATA_PAGE).await?;
-            done = page.done;
-            rows = page.rows;
         }
         flush_inserts(out, &insert_head, &mut buffer, &mut buffer_bytes).await
     }
     .await;
+    drop(stream);
     backend.rollback_cursor().await;
     result?;
     Ok(written)
