@@ -2,7 +2,7 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
-## [Unreleased]
+## [0.11.1] - 2026-09-21
 
 ### Fixed
 - **The topbar no longer reads "SQLite SQLite 3.46.0" or "DuckDB v1.4.5".** SQLite reported its version with the driver name in front and DuckDB with a `v`; the topbar already adds the driver name, so every engine now shows a bare version like "PostgreSQL 16.3".

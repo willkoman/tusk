@@ -3575,6 +3575,20 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
+        "text": "v0.11.1 — one run path, tidier headers",
+        "id": "v0-11-1"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Every action that reaches a server takes one run path** — a cancelled export, import or backup is logged as *cancelled* rather than *error*, the transaction status a reply carries is applied the same way everywhere, and a frozen session is refused before the result stream is released, so a refused backup or all-rows export no longer marks the tab's rows incomplete.",
+          "**Switching connections closes the prompts that belong to the one you left** — the parameter prompt, the discard and Explain Analyze confirmations and an in-progress tab rename. A parameter prompt answered after a switch used to run against the newly focused tab.",
+          "**A MySQL executable comment is not a read** — on a read-only MySQL connection a statement carrying `/*! … */` is refused, as scripts and Slack queries already were.",
+          "**Topbar and grid tidy-ups** — every engine shows a bare version (\"SQLite 3.46.0\", \"DuckDB 1.4.5\"), a sorted column keeps its name (the sort glyph takes the type badge's place), the Explorer remembers what you expanded per connection, catalog tables such as `sqlite_master` and PostgreSQL's `pg_*` are not underlined as unknown, and \"Copied 1 row\" pluralises."
+        ]
+      },
+      {
+        "k": "h",
         "text": "v0.11.0 — Linux builds",
         "id": "v0-11-0"
       },
