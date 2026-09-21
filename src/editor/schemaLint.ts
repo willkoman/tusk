@@ -171,7 +171,11 @@ export function schemaDiagnostics(
         allTablesResolve = false; // foreign catalog — unverifiable
         continue;
       }
-      if (parts.length === 1 && SYSTEM_TABLES.has(bare)) {
+      // PostgreSQL's catalog (`pg_class`, `pg_tables`, `pg_stat_activity`, …) is on every
+      // search_path implicitly and never in the schema listing; the `pg_` prefix is
+      // reserved for it. The other engines qualify their catalogs (`sys.`, `information_schema.`),
+      // which the foreign-catalog rule above already lets through.
+      if (parts.length === 1 && (SYSTEM_TABLES.has(bare) || bare.startsWith("pg_"))) {
         allTablesResolve = false; // a catalog table the schema list never carries
         continue;
       }

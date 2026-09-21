@@ -51,6 +51,10 @@ describe("schemaDiagnostics — detections", () => {
   it("never flags a catalog table the schema list does not carry", () => {
     expect(msgs("SELECT name FROM sqlite_master WHERE type='index'")).toEqual([]);
     expect(msgs("SELECT 1 FROM dual")).toEqual([]);
+    expect(msgs("SELECT relname FROM pg_class WHERE relkind = 'r'")).toEqual([]);
+    expect(msgs("SELECT * FROM pg_stat_activity")).toEqual([]);
+    expect(msgs("SELECT * FROM sys.tables")).toEqual([]);
+    expect(msgs("SELECT * FROM information_schema.tables")).toEqual([]);
     // Still unknown when qualified with a real schema: the catalog is not in `public`.
     expect(msgs("SELECT * FROM public.sqlite_master")[0]).toContain("Unknown table");
   });

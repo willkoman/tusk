@@ -1839,9 +1839,12 @@ impl DuckConn {
 
     fn open(config: &ConnectionConfig) -> Result<(Backend, String), AppError> {
         let conn = Self::open_conn(config)?;
+        // `version()` answers "v1.4.5"; the topbar prefixes the driver name itself, so
+        // the label matches the other engines' bare numbers ("PostgreSQL 16.3").
         let version = conn
             .query_row("SELECT version()", [], |r| r.get::<_, String>(0))
-            .unwrap_or_else(|_| "DuckDB".to_string());
+            .map(|v| v.strip_prefix('v').map(str::to_string).unwrap_or(v))
+            .unwrap_or_else(|_| "unknown".to_string());
         Ok((
             Backend::Duck(DuckConn {
                 conn: Mutex::new(Some(conn)),

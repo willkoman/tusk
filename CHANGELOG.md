@@ -5,10 +5,10 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 ## [Unreleased]
 
 ### Fixed
-- **The topbar no longer reads "SQLite SQLite 3.46.0".** The SQLite driver reported its version with the driver name in front; the topbar already adds it.
+- **The topbar no longer reads "SQLite SQLite 3.46.0" or "DuckDB v1.4.5".** SQLite reported its version with the driver name in front and DuckDB with a `v`; the topbar already adds the driver name, so every engine now shows a bare version like "PostgreSQL 16.3".
 - **A sorted column keeps its name.** The sort glyph now takes the type badge's place in the header instead of squeezing the column name down to one letter; the badge text is still in the header's tooltip.
 - **The Explorer remembers what you expanded when you switch connections.** Each connection keeps its own expanded set for the session, so switching away and back no longer collapses the tree to the schema root.
-- **`sqlite_master`, `sqlite_schema`, `sqlite_sequence` and `dual` are no longer underlined as unknown tables** by the schema lint; they are catalog tables no schema listing carries.
+- **Catalog tables are no longer underlined as unknown tables** by the schema lint: `sqlite_master`, `sqlite_schema`, `sqlite_sequence`, `dual`, and PostgreSQL's bare `pg_*` tables (`pg_class`, `pg_stat_activity`, …, on every search path implicitly). MySQL's `information_schema.*` and SQL Server's `sys.*` were already left alone.
 - **"Copied 1 rows" is now "Copied 1 row".**
 
 ### Changed
