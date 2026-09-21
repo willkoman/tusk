@@ -161,6 +161,7 @@ import { slackHistoryKey, type SlackExecuted } from "./slackEvents";
 import { KeyedSerialQueue } from "./asyncQueue";
 import { StaleGuard } from "./staleGuard";
 import { createOperationRunner, refusal } from "./operation";
+import { closeSurfaces, type Surface } from "./surfaces";
 import {
   IDLE_TRANSACTION,
   INTERRUPTED_TRANSACTION_KEY,
@@ -863,17 +864,7 @@ function App() {
       // belongs to the connection the user is looking at — a transaction opening on a
       // background connection must not dismiss the dialog you are filling in here.
       if (activeConnectionId() === target.id) {
-        setMenuState(null);
-        setDdlGraph(null);
-        setActiveDialog(null);
-        // Backup/restore need an idle session; an opened transaction has taken it.
-        closeBackup();
-        closeRestore();
-        if (importOpen() && !importBusy()) {
-          setImportOpen(null);
-          importOrigin = null;
-        }
-        if (exportTables() && !exportTablesBusy()) setExportTables(null);
+        closeSurfaces(surfaces, { kind: "transaction", connectionId: target.id });
       }
       if (next.state === "lost") {
         entry.patch({ transactionWarning: `Transaction ${next.id ?? "session"} was lost. Disconnect and reconnect, then verify its outcome.` });
@@ -940,22 +931,9 @@ function App() {
   // their live SQL preview is rendered with the ACTIVE dialect, and their Run is
   // pinned to the origin connection, so leaving one up would only show a lie.
   createEffect(on(activeConnectionId, (id, previous) => {
-    if (previous === undefined || id === previous) return;
-    setMenuState(null);
-    setActiveDialog(null);
-    setDdlGraph(null);
-    setCellView(null);
-    setRunChoice(null);
+    if (previous === undefined || id === previous || previous === null) return;
     setSelected(null);
-    setCommitView(null);
-    closeBackup();
-    closeRestore();
-    // These are frozen against one connection's result; after a switch their Run
-    // silently fails the origin check, which reads as a dead button. A run already
-    // in flight is the exception — it owns its progress and Cancel.
-    if (!exportBusy()) setExportSrc(null);
-    if (!exportTablesBusy()) { setExportTables(null); setExportTablesProgress(null); }
-    if (!importBusy()) { setImportOpen(null); importOrigin = null; }
+    closeSurfaces(surfaces, { kind: "switch", from: previous });
   }, { defer: true }));
 
   // Active-tab accessors so the existing editor + result-grid JSX stays unchanged.
@@ -3196,39 +3174,7 @@ function App() {
 
   /** Dismiss every modal/menu/dialog that was scoped to `connectionId`. */
   function closeSurfacesFor(connectionId: string) {
-    setMenu(null);
-    setCellView(null);
-    setConfirmClose(null);
-    setConfirmCancelConn(null);
-    setConfirmDisconnect(null);
-    setConfirmWindowClose(null);
-    setTransactionResolution(null);
-    setTransactionResolutionBusy(false);
-    setConfirmAnalyze(null);
-    setConfirmDiscard(null);
-    setRunChoice(null);
-    setParamPrompt(null);
-    setInlineRename(null);
-    setAllTabsOpen(false);
-    setCommitView(null);
-    transactionResolutionAfterApply = null;
-    if (dialogBinding()?.origin.connectionId === connectionId) setActiveDialog(null);
-    if (ddlGraph()?.connectionId === connectionId) setDdlGraph(null);
-    if (exportSrc()?.connectionId === connectionId) setExportSrc(null);
-    if (exportTables()?.connectionId === connectionId) {
-      setExportTables(null);
-      setExportTablesProgress(null);
-    }
-    if (importOrigin?.connection.id === connectionId) {
-      setImportBusy(false);
-      setImportProgress(null);
-      setImportOpen(null);
-      importOrigin = null;
-    }
-    // Backup/restore are bound to a connection generation of their own; close them
-    // through their helpers so the binding is cleared with the dialog.
-    if (backupConnection?.id === connectionId) closeBackup();
-    if (restoreConnection?.id === connectionId) closeRestore();
+    closeSurfaces(surfaces, { kind: "disconnect", connectionId });
   }
 
   /** Close the connection the workbench is focused on (topbar Disconnect). */
@@ -4159,6 +4105,64 @@ function App() {
     backupConnection = { id: c.id, generation: c.generation };
     setBackupTarget(target);
   }
+
+  /**
+   * Every surface the three teardown events can reach, with its scope (see
+   * surfaces.ts). A new dialog is one entry here, never three checklist edits.
+   * `focused` closes on a switch and any disconnect; `lifecycle` survives a switch;
+   * `global` is never torn down here; `bound` follows its own connection, and a busy
+   * one survives a switch or a transaction but not a disconnect.
+   */
+  const FOCUSED = { kind: "focused" } as const;
+  const LIFECYCLE = { kind: "lifecycle" } as const;
+  const GLOBAL = { kind: "global" } as const;
+  const bound = (connectionId: string | null | undefined, busy = false) =>
+    ({ kind: "bound", connectionId: connectionId ?? null, busy }) as const;
+  const surfaces: Surface[] = [
+    { name: "menu", scope: () => (menuState() ? FOCUSED : null), session: true, close: () => setMenu(null) },
+    { name: "dialog", scope: () => { const b = dialogBinding(); return b ? bound(b.origin.connectionId) : null; }, session: true, close: () => setActiveDialog(null) },
+    { name: "ddlGraph", scope: () => { const g = ddlGraph(); return g ? bound(g.connectionId) : null; }, session: true, close: () => setDdlGraph(null) },
+    { name: "cellView", scope: () => (cellView() ? FOCUSED : null), close: () => setCellView(null) },
+    { name: "runChoice", scope: () => (runChoice() ? FOCUSED : null), close: () => setRunChoice(null) },
+    { name: "commitView", scope: () => (commitView() ? FOCUSED : null), close: () => setCommitView(null) },
+    // A run prompt executes against the ACTIVE tab when answered: it must not outlive a switch.
+    { name: "paramPrompt", scope: () => (paramPrompt() ? FOCUSED : null), close: () => setParamPrompt(null) },
+    { name: "confirmDiscard", scope: () => (confirmDiscard() ? FOCUSED : null), close: () => setConfirmDiscard(null) },
+    { name: "confirmAnalyze", scope: () => (confirmAnalyze() ? FOCUSED : null), close: () => setConfirmAnalyze(null) },
+    { name: "inlineRename", scope: () => (inlineRename() ? FOCUSED : null), close: () => setInlineRename(null) },
+    { name: "confirmClose", scope: () => (confirmClose() ? LIFECYCLE : null), close: () => setConfirmClose(null) },
+    { name: "confirmDisconnect", scope: () => (confirmDisconnect() ? LIFECYCLE : null), close: () => setConfirmDisconnect(null) },
+    { name: "confirmWindowClose", scope: () => (confirmWindowClose() !== null ? LIFECYCLE : null), close: () => setConfirmWindowClose(null) },
+    { name: "confirmCancelConn", scope: () => (confirmCancelConn() ? LIFECYCLE : null), close: () => setConfirmCancelConn(null) },
+    { name: "allTabs", scope: () => (allTabsOpen() ? LIFECYCLE : null), close: () => setAllTabsOpen(false) },
+    {
+      name: "transactionResolution",
+      scope: () => (transactionResolution() || transactionResolutionAfterApply ? LIFECYCLE : null),
+      close: () => { setTransactionResolution(null); setTransactionResolutionBusy(false); transactionResolutionAfterApply = null; },
+    },
+    { name: "confirmDeleteProfile", scope: () => (confirmDeleteProfile() ? GLOBAL : null), close: () => setConfirmDeleteProfile(null) },
+    { name: "confirmPickedPath", scope: () => (confirmPickedPath() ? GLOBAL : null), close: () => setConfirmPickedPath(null) },
+    // Frozen against one connection's result: after a switch their Run would silently
+    // fail the origin check, which reads as a dead button. A run in flight owns its
+    // progress and Cancel and survives everything but its connection going away.
+    { name: "export", scope: () => { const src = exportSrc(); return src ? bound(src.connectionId, exportBusy()) : null; }, close: () => setExportSrc(null) },
+    {
+      name: "exportTables",
+      scope: () => { const src = exportTables(); return src ? bound(src.connectionId, exportTablesBusy()) : null; },
+      session: true,
+      close: () => { setExportTables(null); setExportTablesProgress(null); },
+    },
+    {
+      name: "import",
+      scope: () => (importOrigin || importOpen() ? bound(importOrigin?.connection.id, importBusy()) : null),
+      session: true,
+      close: () => { setImportBusy(false); setImportProgress(null); setImportOpen(null); importOrigin = null; },
+    },
+    // Backup/restore are bound to a connection generation of their own; their helpers
+    // clear the binding with the dialog and refuse while a run is in flight.
+    { name: "backup", scope: () => (backupTarget() || backupConnection ? bound(backupConnection?.id, backupBusy()) : null), session: true, close: closeBackup },
+    { name: "restore", scope: () => (restoreOpen() || restoreConnection ? bound(restoreConnection?.id, restoreBusy()) : null), session: true, close: closeRestore },
+  ];
 
   const pickBackupPath = (suggested: string) =>
     chooseSavePath({

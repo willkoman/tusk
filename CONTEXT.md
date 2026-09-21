@@ -33,6 +33,10 @@ The tab that opened the manual transaction. Only the owner may run against the s
 **Result snapshot**:
 The immutable rows and columns a tab last loaded, with the transaction identity they were produced under. Pending grid edits overlay it; a commit, rollback or loss marks it stale rather than discarding it.
 
+**Surface**:
+Anything drawn over the workbench that can act when answered: a context menu, a dialog, a confirmation, a docked tool. Each has one scope (focused, lifecycle, global, or bound to a connection) that decides which events dismiss it.
+_Avoid_: overlay, popup, modal (the mechanism, not the concept)
+
 **Explorer**:
 The sidebar tree of schemas, tables, views, sequences and functions, with the context menus that generate DDL and scaffolds.
 _Avoid_: sidebar (the panel), tree (the widget)
