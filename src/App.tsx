@@ -4,8 +4,8 @@ import {
   errorMessage,
   type ConnectReply,
   type ExportToFileArgs,
-  type FetchResult,
   type Profile,
+  type QueryResult,
   type SampleRows,
   type SchemaGraphReply,
   type TableExportResult,
@@ -160,6 +160,7 @@ import { clipWrite, clipRead } from "./clipboard";
 import { slackHistoryKey, type SlackExecuted } from "./slackEvents";
 import { KeyedSerialQueue } from "./asyncQueue";
 import { StaleGuard } from "./staleGuard";
+import { createOperationRunner, refusal } from "./operation";
 import {
   IDLE_TRANSACTION,
   INTERRUPTED_TRANSACTION_KEY,
@@ -174,12 +175,9 @@ import {
   transactionControlAvailability,
   transactionEvent,
   transactionFromError,
-  transactionHistoryScope,
-  transactionHistorySql,
   transactionOpen,
   transactionOwnedBy,
   transactionProvenanceNeedsRefresh,
-  transactionRecoveryAllowed,
   type TransactionEvent,
   type TransactionStatus,
 } from "./transaction";
@@ -268,7 +266,6 @@ type ConnRuntime = {
   cancelAll: boolean;
   /** False once this connection's stored recovery snapshot proved unwritable. */
   recoveryWritable: boolean;
-  runTimers: Set<ReturnType<typeof setInterval>>;
 };
 
 const makeRuntime = (): ConnRuntime => ({
@@ -288,7 +285,6 @@ const makeRuntime = (): ConnRuntime => ({
   sampleCache: new Map<string, SampleTable>(),
   cancelAll: false,
   recoveryWritable: true,
-  runTimers: new Set<ReturnType<typeof setInterval>>(),
 });
 
 /**
@@ -626,6 +622,44 @@ function App() {
   }
   const patchResult = (id: string, patch: Partial<ResultSnapshot>) =>
     setTabs((ts) => ts.map((t) => (t.id === id ? { ...t, result: { ...t.result, ...patch } } : t)));
+  /**
+   * Free a connection's result stream for an operation. When the owner IS the tab
+   * whose result the operation is about to replace, the release is silent: its
+   * snapshot is being superseded, not interrupted.
+   */
+  function releaseStream(connectionId: string, reason: string, keepTab: string | null) {
+    const rt = runtimes.get(connectionId);
+    if (!rt) return;
+    if (rt.cursorOwner && rt.cursorOwner.tabId !== keepTab) interruptStream(reason, connectionId);
+    rt.cursorOwner = null;
+    rt.cursorGeneration++;
+  }
+  const transactionOf = (id: string) => stateOf(id)?.transaction ?? IDLE_TRANSACTION;
+  const tabTitleOf = (id: string) => tabs().find((t) => t.id === id)?.title ?? null;
+  const operationTimers = new Set<ReturnType<typeof setInterval>>();
+  /**
+   * Every server-executing path (editor run, paging, Explorer DDL, grid Apply,
+   * export, backup, restore, import, DDL reads) goes through this one runner: it owns
+   * the freeze verdict, the stream release, the run timer, the authoritative
+   * transaction application, history and the cancel/error triage. See operation.ts.
+   */
+  const operations = createOperationRunner({
+    connectionOpen: (c) => connectionOpen(c),
+    transactionOf,
+    transactionHistoryKey: (id) => runtimes.get(id)?.transactionHistoryKey ?? null,
+    tabTitle: tabTitleOf,
+    releaseStream,
+    applyTransaction: (target, incoming, event, baseline) => applyAuthoritativeTransaction(target, incoming, event, baseline),
+    recordHistory: (entry, key) => recordHistory(entry, key),
+    transactionFromError,
+    errorMessage: errMsg,
+    now: () => performance.now(),
+    setInterval: (fn, ms) => { const handle = setInterval(fn, ms); operationTimers.add(handle); return handle; },
+    clearInterval: (handle) => {
+      clearInterval(handle as ReturnType<typeof setInterval>);
+      operationTimers.delete(handle as ReturnType<typeof setInterval>);
+    },
+  });
 
   // --- focus + strip -------------------------------------------------------
   /** Persistence key each connection's tabs live under (may differ from conn.key
@@ -1979,65 +2013,48 @@ function App() {
     if (!cv || !c || commitBusy() || running() || !originCurrent(cv.origin, true)) return;
     const tabId = cv.origin.tabId;
     if (!tabId) return;
-    setCommitBusy(true);
     setCommitErr("");
-    const t0 = performance.now();
-    const before = transaction();
-    const beforeHistoryKey = runtimes.get(c.id)?.transactionHistoryKey ?? null;
-    try {
-      // Fully-qualified statements — no search_path dependence. Multi-statement
-      // scripts run in one transaction (rolled back wholesale on failure).
-      const sqlText = cv.script.map((s) => s + ";").join("\n");
-      const out = await commands.runQuery({ connectionId: c.id, ownerId: tabId, sql: sqlText, pageSize: PAGE, searchPath: null });
-      const accepted = applyAuthoritativeTransaction(c, out.transaction, "grid_apply", before);
+    // Fully-qualified statements: no search_path dependence. Multi-statement
+    // scripts run in one transaction (rolled back wholesale on failure).
+    const sqlText = cv.script.map((s) => s + ";").join("\n");
+    const sourceCurrent = () => {
       const source = tabs().find((tab) => tab.id === tabId);
-      if (!accepted || transaction().revision !== out.transaction.revision || !connectionOpen(c) ||
-          source?.result.generation !== cv.origin.resultGeneration || source.result.epoch !== cv.origin.resultEpoch) return;
-      setPendingFor(tabId, undefined);
-      setCommitView(null);
-      patchResult(tabId, { status: transactionOpen(out.transaction)
-        ? `${cv.script.length} change${cv.script.length === 1 ? "" : "s"} applied inside transaction; commit the outer transaction separately`
-        : `${cv.script.length} change${cv.script.length === 1 ? "" : "s"} applied` });
-      recordHistory({
-        sql: historySqlForTransaction(c.id, sqlText, before, out.transaction, "grid_apply", beforeHistoryKey),
-        durationMs: Math.round(performance.now() - t0),
-        status: "ok",
-        rows: null,
-        error: null,
-        schema: null,
-      }, c.key);
-      if (transactionResolutionAfterApply) {
-        setTransactionResolution(transactionResolutionAfterApply);
-        transactionResolutionAfterApply = null;
-        return;
-      }
-      // Refresh the grid in place, keeping the current sort/filter view.
-      const t = tabs().find((x) => x.id === tabId);
-      if (t) {
-        const v = t.gridView;
-        const base = t.result.baseQuery;
-        const sqlToRun = hasViewRules(v.sorts, v.filters, t.result.columns) ? tryWrapQuery(t, v.sorts, v.filters) : base;
-        if (sqlToRun === null) return;
-        void executeQuery(sqlToRun, base, "wrapped");
-      }
-    } catch (e) {
-      const embedded = transactionFromError(e);
-      if (embedded) applyAuthoritativeTransaction(c, embedded, "grid_apply", before);
-      const source = tabs().find((tab) => tab.id === tabId);
-      if (connectionOpen(c) && source?.result.generation === cv.origin.resultGeneration && source.result.epoch === cv.origin.resultEpoch) {
-        const message = errMsg(e);
-        setCommitErr(message);
-        recordHistory({
-          sql: historySqlForTransaction(c.id, cv.script.map((s) => s + ";").join("\n"), before, embedded ?? transaction(), "grid_apply", beforeHistoryKey),
-          durationMs: Math.round(performance.now() - t0),
-          status: "error",
-          rows: null,
-          error: message.split("\n")[0],
-          schema: null,
-        }, c.key);
-      }
-    } finally {
-      setCommitBusy(false);
+      return source?.result.generation === cv.origin.resultGeneration && source.result.epoch === cv.origin.resultEpoch;
+    };
+    const out = await operations.run({
+      connection: c,
+      needs: "owner",
+      tabId,
+      release: null,
+      event: "grid_apply",
+      history: { sql: sqlText, transactionScoped: true, schema: null },
+      busy: setCommitBusy,
+      current: sourceCurrent,
+      run: () => commands.runQuery({ connectionId: c.id, ownerId: tabId, sql: sqlText, pageSize: PAGE, searchPath: null }),
+    });
+    if (!out.ok) {
+      if (out.refused || out.current) setCommitErr(out.error);
+      return;
+    }
+    if (!out.current) return;
+    setPendingFor(tabId, undefined);
+    setCommitView(null);
+    patchResult(tabId, { status: transactionOpen(out.transaction)
+      ? `${cv.script.length} change${cv.script.length === 1 ? "" : "s"} applied inside transaction; commit the outer transaction separately`
+      : `${cv.script.length} change${cv.script.length === 1 ? "" : "s"} applied` });
+    if (transactionResolutionAfterApply) {
+      setTransactionResolution(transactionResolutionAfterApply);
+      transactionResolutionAfterApply = null;
+      return;
+    }
+    // Refresh the grid in place, keeping the current sort/filter view.
+    const t = tabs().find((x) => x.id === tabId);
+    if (t) {
+      const v = t.gridView;
+      const base = t.result.baseQuery;
+      const sqlToRun = hasViewRules(v.sorts, v.filters, t.result.columns) ? tryWrapQuery(t, v.sorts, v.filters) : base;
+      if (sqlToRun === null) return;
+      void executeQuery(sqlToRun, base, "wrapped");
     }
   }
 
@@ -2471,10 +2488,8 @@ function App() {
     if (transactionTimer) clearInterval(transactionTimer);
     nativeCloseUnlisten?.();
     nativeResizeUnlisten?.();
-    for (const rt of runtimes.values()) {
-      for (const timer of rt.runTimers) clearInterval(timer);
-      rt.runTimers.clear();
-    }
+    for (const timer of operationTimers) clearInterval(timer);
+    operationTimers.clear();
     for (const cleanup of [...interactionCleanups]) cleanup();
   });
 
@@ -3142,8 +3157,6 @@ function App() {
     rt.detailInflight.clear();
     rt.fkInFlight.clear();
     rt.fkFetched.clear();
-    for (const timer of rt.runTimers) clearInterval(timer);
-    rt.runTimers.clear();
     runtimes.delete(connectionId);
     recoveryKeys.delete(connectionId);
     lastTabByConn.delete(connectionId);
@@ -3442,19 +3455,6 @@ function App() {
     for (const entry of connections()) if (entry.conn.key === key) entry.patch({ history: next });
   };
 
-  const historySqlForTransaction = (
-    connectionId: string,
-    sqlText: string,
-    before: TransactionStatus,
-    after: TransactionStatus,
-    event: TransactionEvent,
-    priorHistoryKey?: string | null,
-  ) => {
-    const current = runtimes.get(connectionId)?.transactionHistoryKey ?? null;
-    const key = transactionHistoryScope(before, after, event, current, priorHistoryKey ?? current);
-    return transactionHistorySql(sqlText, key, after.revision, event);
-  };
-
   // Shared query executor. `mode:"base"` = a user-issued query (resets sorts/filters,
   // fresh grid view if the column set changed); `mode:"wrapped"` = a sort/filter re-run
   // (keep the grid view — its sorts/filters drive the wrap).
@@ -3479,21 +3479,15 @@ function App() {
     // is the classification that decides commit/rollback boundary staling.
     const runEngine = connectionKindOf(entry!.state()) as SqlEngine;
     const event = transactionEvent(sqlToRun, runEngine);
-    // Read the RUN TAB's connection transaction, not `transaction()`. They are the
-    // same by the active-tab/active-connection invariant, but naming the connection
-    // keeps this correct if a future path ever runs a non-focused tab.
-    const runTx = () => entry!.state().transaction;
-    if (!transactionDatabaseAllowed(runTx(), runTabId)) {
-      patchResult(runTabId, { status: runTx().state === "lost"
-        ? "Transaction session lost; disconnect and reconnect"
-        : `Database actions are frozen in this tab while ${tabs().find((t) => t.id === runTx().owner)?.title ?? runTx().owner ?? "another tab"} owns the transaction` });
+    // The freeze verdict is asked up front so a frozen tab sees the reason before any
+    // pending-edit confirmation; the runner asks it again before releasing the stream.
+    const freeze = { needs: "owner" as const, tabId: runTabId, sql: sqlToRun, engine: runEngine };
+    const refused = refusal(freeze, transactionOf(c.id), tabTitleOf);
+    if (refused) {
+      patchResult(runTabId, { status: refused.message });
       return false;
     }
-    if (!transactionRecoveryAllowed(runTx(), sqlToRun, runEngine)) {
-      patchResult(runTabId, { status: "Transaction failed. Roll it back before any other database action." });
-      return false;
-    }
-    // Re-running replaces the rows the pending edits index into — confirm first.
+    // Re-running replaces the rows the pending edits index into: confirm first.
     const pcount = pendingCount(runTab.pending);
     if (pcount && !force) {
       const origin = captureOrigin();
@@ -3505,83 +3499,92 @@ function App() {
       return false;
     }
     if (pcount) patchTab(runTabId, { pending: undefined });
-    // Running with the results panel collapsed would hide the output — reopen it.
+    // Running with the results panel collapsed would hide the output: reopen it.
     if (!resultsOpen()) { setResultsOpen(true); persistLayout(); }
     const runSchema = runTab.searchSchema;
-    // Only THIS connection's cursor is freed: a run here must never interrupt a live
-    // stream on another connection, which has a server cursor of its own.
-    if (rt.cursorOwner && rt.cursorOwner.tabId !== runTabId)
-      interruptStream(`"${runTab.title}" ran a query and closed the stream`, c.id);
-    rt.cursorOwner = null;
-    rt.cursorGeneration++;
     rt.fetchGeneration++;
     patchConn(c.id, { fetchingMore: false });
     setMenuState(null);
     patchResult(runTabId, { runErr: "", status: "" });
     patchTab(runTabId, { resultView: undefined }); // a new run resets the Plan/Grid choice
     const runGeneration = ++rt.queryGeneration;
-    const txOf = () => stateOf(c.id)?.transaction ?? IDLE_TRANSACTION;
-    const before = txOf();
-    const beforeHistoryKey = rt.transactionHistoryKey;
-    let expectedTransactionRevision = before.revision;
-    rt.activeQuery = { generation: runGeneration, connectionGeneration: c.generation, tabId: runTabId, transactionRevision: before.revision };
+    rt.activeQuery = { generation: runGeneration, connectionGeneration: c.generation, tabId: runTabId, transactionRevision: transactionOf(c.id).revision };
     const originCurrentForRun = () =>
       rt.activeQuery?.generation === runGeneration &&
       rt.activeQuery.connectionGeneration === c.generation &&
       rt.activeQuery.tabId === runTabId &&
-      connectionOpen(c) &&
       tabs().some((t) => t.id === runTabId);
-    const isCurrent = () => originCurrentForRun() && txOf().revision === expectedTransactionRevision;
-    patchConn(c.id, { running: true, runningTabId: runTabId, runMs: 0 });
-    const t0 = performance.now();
-    const timer = setInterval(() => {
-      if (isCurrent()) patchConn(c.id, { runMs: performance.now() - t0 });
-    }, 200);
-    rt.runTimers.add(timer);
-    let completed = false;
-    try {
+    let mine = true;
+    const out = await operations.run<QueryResult>({
+      connection: c,
+      ...freeze,
+      // Only THIS connection's stream is freed, silently when the run tab owns it: a
+      // run here must never interrupt a live stream on another connection.
+      release: `"${runTab.title}" ran a query and closed the stream`,
+      event,
+      history: mode === "base"
+        ? {
+          sql: historySql,
+          transactionScoped: true,
+          schema: runSchema,
+          rows: (v) => { const r = v as QueryResult; return r.kind === "rows" ? r.rows.length : null; },
+        }
+        : null,
+      busy: (on) => {
+        if (on) { patchConn(c.id, { running: true, runningTabId: runTabId, runMs: 0 }); return; }
+        mine = rt.activeQuery?.generation === runGeneration;
+        if (mine) {
+          rt.activeQuery = null;
+          patchConn(c.id, { running: false, runningTabId: null, cancelling: false });
+        }
+      },
+      tick: (ms) => patchConn(c.id, { runMs: ms }),
+      current: originCurrentForRun,
       // In-grid editing needs the target table's detail (PK/columns). Fetching it AFTER
       // the run would roll back the result's cursor and truncate the stream, so resolve
       // the target from the (pre-execution) base query and load it now, while no
       // stream is open and `running` already excludes a concurrent run. Best-effort:
       // a failure just leaves the grid read-only.
-      if (mode === "base" && base && !transactionOpen(txOf())) {
+      prepare: async () => {
+        if (mode !== "base" || !base || transactionOpen(transactionOf(c.id))) return;
         try {
           const tgt = editTarget(base, editIndexer(stateOf(c.id)?.schema ?? []), runTab.searchSchema, connectionKindOf(stateOf(c.id)));
           if (tgt.ok && !(stateOf(c.id)?.details ?? {})[relKey(tgt.table.schema, tgt.table.name)])
             await loadDetail(tgt.table.schema, tgt.table.name, false, c);
         } catch { /* read-only grid until the detail loads later */ }
-        if (!isCurrent()) return false;
-      }
-      const out = await commands.runQuery({ connectionId: c.id, ownerId: runTabId, sql: sqlToRun, pageSize: PAGE, searchPath: runSchema });
-      expectedTransactionRevision = out.transaction.revision;
-      const accepted = applyAuthoritativeTransaction(c, out.transaction, event, before);
-      if (!accepted || !isCurrent()) return false;
+      },
+      run: () => commands.runQuery({ connectionId: c.id, ownerId: runTabId, sql: sqlToRun, pageSize: PAGE, searchPath: runSchema }),
+    });
+    if (mine && connectionOpen(c) && tabs().some((t) => t.id === runTabId))
+      patchResult(runTabId, { elapsed: out.durationMs });
+    if (!out.current) return false;
+    if (out.ok) {
+      const res = out.value;
       const runTabNow = tabs().find((t) => t.id === runTabId);
       const epoch = (runTabNow?.result.epoch ?? 0) + 1;
       const loadedGeneration = ++resultGeneration;
-      if (out.kind === "rows") {
+      if (res.kind === "rows") {
         const prevCols = runTabNow?.result.columns ?? [];
         patchResult(runTabId, {
-          columns: out.columns, rows: out.rows, done: out.done, lastQuery: sqlToRun, baseQuery: base, epoch, generation: loadedGeneration,
+          columns: res.columns, rows: res.rows, done: res.done, lastQuery: sqlToRun, baseQuery: base, epoch, generation: loadedGeneration,
           incomplete: "",
           rowsAreBase: mode === "base" || sqlToRun === base,
-          status: `${rowCountText(out.rows.length, out.done)}${out.note ? `. ${out.note}` : ""}`,
-          transactionId: transactionOpen(out.transaction) ? out.transaction.id : null,
-          transactionRevision: out.transaction.revision,
+          status: `${rowCountText(res.rows.length, res.done)}${res.note ? `. ${res.note}` : ""}`,
+          transactionId: transactionOpen(res.transaction) ? res.transaction.id : null,
+          transactionRevision: res.transaction.revision,
           transactionStale: "",
         });
         if (mode === "base") {
           // A fresh result resets sort/filter, but the panel toggles (filter row,
           // row numbers, frozen column, record view, find) are UI preferences the
-          // user turned on — `carryViewPrefs` keeps them across the reset.
+          // user turned on: `carryViewPrefs` keeps them across the reset.
           patchTab(runTabId, {
-            gridView: sameColumns(prevCols, out.columns)
-              ? { ...(runTabNow?.gridView ?? gridViewFor(out.columns.length)), sorts: [], filters: emptyFilter() }
-              : { ...gridViewFor(out.columns.length), ...carryViewPrefs(runTabNow?.gridView) },
+            gridView: sameColumns(prevCols, res.columns)
+              ? { ...(runTabNow?.gridView ?? gridViewFor(res.columns.length)), sorts: [], filters: emptyFilter() }
+              : { ...gridViewFor(res.columns.length), ...carryViewPrefs(runTabNow?.gridView) },
           });
         }
-        if (!out.done) {
+        if (!res.done) {
           rt.cursorOwner = {
             tabId: runTabId,
             connectionGeneration: c.generation,
@@ -3591,69 +3594,33 @@ function App() {
         }
       } else {
         patchResult(runTabId, {
-          columns: [], rows: [], done: true, incomplete: "", lastQuery: sqlToRun, baseQuery: base, rowsAreBase: false, epoch, generation: loadedGeneration, status: out.message,
-          transactionId: transactionOpen(out.transaction) ? out.transaction.id : null,
-          transactionRevision: out.transaction.revision,
+          columns: [], rows: [], done: true, incomplete: "", lastQuery: sqlToRun, baseQuery: base, rowsAreBase: false, epoch, generation: loadedGeneration, status: res.message,
+          transactionId: transactionOpen(res.transaction) ? res.transaction.id : null,
+          transactionRevision: res.transaction.revision,
           transactionStale: "",
         });
         if (mode === "base") patchTab(runTabId, { gridView: gridViewFor(0) });
       }
-      if (out.kind === "exec" || DDL_RE.test(sqlToRun)) void loadSchema(c);
-      if (mode === "base") {
-        recordHistory({
-          sql: historySqlForTransaction(c.id, historySql, before, out.transaction, event, beforeHistoryKey),
-          durationMs: Math.round(performance.now() - t0),
-          status: "ok",
-          rows: out.kind === "rows" ? out.rows.length : null,
-          error: null,
-          schema: runSchema,
-        }, c.key);
-      }
-      completed = true;
-    } catch (e) {
-      const embedded = transactionFromError(e);
-      if (embedded) {
-        expectedTransactionRevision = embedded.revision;
-        if (!applyAuthoritativeTransaction(c, embedded, event, before)) return false;
-      }
-      if (!isCurrent()) return false;
-      const msg = errMsg(e);
-      const failed = tabs().find((t) => t.id === runTabId);
-      const failedResult = {
-        epoch: (failed?.result.epoch ?? 0) + 1,
-        generation: ++resultGeneration,
-        lastQuery: sqlToRun,
-        baseQuery: base,
-        incomplete: "",
-        transactionId: transactionOpen(txOf()) ? txOf().id : null,
-        transactionRevision: txOf().revision,
-        transactionStale: txOf().state === "lost" ? "Transaction session lost; this result may no longer match the database" : "",
-      };
-      // A user cancel surfaces as Postgres' "canceling statement due to user request" —
-      // present it as a calm status, not a red error banner.
-      if (/cancel/i.test(msg)) patchResult(runTabId, { ...failedResult, runErr: "", status: "Query cancelled", columns: [], rows: [], done: true });
-      else patchResult(runTabId, { ...failedResult, runErr: msg, columns: [], rows: [], done: true });
-      if (mode === "base") {
-        recordHistory({
-          sql: historySqlForTransaction(c.id, historySql, before, embedded ?? txOf(), event, beforeHistoryKey),
-          durationMs: Math.round(performance.now() - t0),
-          status: /cancel/i.test(msg) ? "cancelled" : "error",
-          rows: null,
-          error: msg.split("\n")[0],
-          schema: runSchema,
-        }, c.key);
-      }
-    } finally {
-      clearInterval(timer);
-      rt.runTimers.delete(timer);
-      if (rt.activeQuery?.generation === runGeneration) {
-        rt.activeQuery = null;
-        patchConn(c.id, { running: false, runningTabId: null, cancelling: false });
-        if (connectionOpen(c) && tabs().some((t) => t.id === runTabId))
-          patchResult(runTabId, { elapsed: Math.round(performance.now() - t0) });
-      }
+      if (res.kind === "exec" || DDL_RE.test(sqlToRun)) void loadSchema(c);
+      return true;
     }
-    return completed;
+    const tx = transactionOf(c.id);
+    const failed = tabs().find((t) => t.id === runTabId);
+    const failedResult = {
+      epoch: (failed?.result.epoch ?? 0) + 1,
+      generation: ++resultGeneration,
+      lastQuery: sqlToRun,
+      baseQuery: base,
+      incomplete: "",
+      transactionId: transactionOpen(tx) ? tx.id : null,
+      transactionRevision: tx.revision,
+      transactionStale: tx.state === "lost" ? "Transaction session lost; this result may no longer match the database" : "",
+    };
+    // A user cancel surfaces as Postgres' "canceling statement due to user request":
+    // present it as a calm status, not a red error banner.
+    if (out.cancelled) patchResult(runTabId, { ...failedResult, runErr: "", status: "Query cancelled", columns: [], rows: [], done: true });
+    else patchResult(runTabId, { ...failedResult, runErr: out.error, columns: [], rows: [], done: true });
+    return false;
   }
 
   async function runTransactionControl(sqlText: string): Promise<boolean> {
@@ -4007,25 +3974,30 @@ function App() {
     const c = entry?.conn ?? null;
     const rt = entry?.runtime ?? null;
     if (!c || !rt || !tab) return;
-    const txOf = () => stateOf(c.id)?.transaction ?? IDLE_TRANSACTION;
-    if (tab.result.done || entry!.state().fetchingMore || !transactionDatabaseAllowed(txOf(), id)) return;
+    if (tab.result.done || entry!.state().fetchingMore || !transactionDatabaseAllowed(transactionOf(c.id), id)) return;
     const owner = rt.cursorOwner;
     if (!owner || owner.tabId !== id || owner.connectionGeneration !== c.generation || tab.result.generation !== owner.resultGeneration) return;
     const operation = ++rt.fetchGeneration;
-    const before = txOf();
-    let expectedTransactionRevision = before.revision;
-    const isCurrent = () =>
-      rt.fetchGeneration === operation &&
-      connectionOpen(c) &&
-      rt.cursorOwner?.cursorGeneration === owner.cursorGeneration &&
-      rt.cursorOwner.resultGeneration === owner.resultGeneration &&
-      tabs().find((t) => t.id === id)?.result.generation === owner.resultGeneration &&
-      txOf().revision === expectedTransactionRevision;
-    patchConn(c.id, { fetchingMore: true });
-    try {
-      const r: FetchResult = await commands.fetchMore(c.id, id, PAGE);
-      expectedTransactionRevision = r.transaction.revision;
-      if (!applyAuthoritativeTransaction(c, r.transaction, "statement", before) || !isCurrent()) return;
+    const out = await operations.run({
+      connection: c,
+      needs: "owner",
+      tabId: id,
+      release: null,
+      history: null,
+      busy: (on) => {
+        if (on) patchConn(c.id, { fetchingMore: true });
+        else if (rt.fetchGeneration === operation) patchConn(c.id, { fetchingMore: false });
+      },
+      current: () =>
+        rt.fetchGeneration === operation &&
+        rt.cursorOwner?.cursorGeneration === owner.cursorGeneration &&
+        rt.cursorOwner.resultGeneration === owner.resultGeneration &&
+        tabs().find((t) => t.id === id)?.result.generation === owner.resultGeneration,
+      run: () => commands.fetchMore(c.id, id, PAGE),
+    });
+    if (!out.current || (!out.ok && out.refused)) return;
+    if (out.ok) {
+      const r = out.value;
       // Read the captured tab's rows (the user may have switched tabs during the fetch).
       const prev = tabs().find((t) => t.id === id)?.result.rows ?? [];
       const merged = r.rows.length ? [...prev, ...r.rows] : prev;
@@ -4041,23 +4013,14 @@ function App() {
         rt.cursorOwner = null;
         rt.cursorGeneration++;
       }
-    } catch (e) {
-      const embedded = transactionFromError(e);
-      if (embedded) {
-        expectedTransactionRevision = embedded.revision;
-        if (!applyAuthoritativeTransaction(c, embedded, "statement", before)) return;
-      }
-      if (!isCurrent()) return;
-      // Streaming broke (e.g. connection dropped mid-fetch). Surface it instead of
-      // silently marking the result complete — show the error banner over the rows
-      // fetched so far, and stop paging so we don't hammer a dead cursor.
-      const msg = errMsg(e);
-      patchResult(id, { runErr: msg, status: `Streaming stopped: ${msg}`, done: true, incomplete: `Streaming stopped: ${msg}` });
-      rt.cursorOwner = null;
-      rt.cursorGeneration++;
-    } finally {
-      if (rt.fetchGeneration === operation) patchConn(c.id, { fetchingMore: false });
+      return;
     }
+    // Streaming broke (e.g. connection dropped mid-fetch). Surface it instead of
+    // silently marking the result complete: show the error banner over the rows
+    // fetched so far, and stop paging so we don't hammer a dead cursor.
+    patchResult(id, { runErr: out.error, status: `Streaming stopped: ${out.error}`, done: true, incomplete: `Streaming stopped: ${out.error}` });
+    rt.cursorOwner = null;
+    rt.cursorGeneration++;
   }
 
   // Drain the active tab's cursor to completion (or cancel). Yields between pages to
@@ -4103,9 +4066,14 @@ function App() {
   async function runExportToFile(opts: ExportOptions, scope: ExportScope): Promise<boolean> {
     const src = exportSrc();
     if (!src || !originCurrent(src.origin, true)) return false;
-    if (scope === "all" && transactionOpen(transaction())) {
-      throw new Error("All-rows export is frozen during a manual transaction. Export loaded rows instead.");
-    }
+    // All rows means re-running the query server-side, which the session must be idle
+    // for; loaded rows never touch the session.
+    const freeze = {
+      needs: scope === "all" ? "idle" as const : "none" as const,
+      frozenMessage: "All-rows export is frozen during a manual transaction. Export loaded rows instead.",
+    };
+    const early = refusal(freeze, transactionOf(src.connectionId), tabTitleOf);
+    if (early) throw new Error(early.message);
     const table = opts.sql.table || src.table;
     const path = await chooseSavePath({
       defaultPath: `${table}.${FORMAT_EXT[opts.format]}`,
@@ -4113,41 +4081,32 @@ function App() {
     });
     if (!path) return false;
     if (!originCurrent(src.origin, true)) return false;
+    const c = entryOf(src.connectionId)?.conn;
+    if (!c) return false;
     if (src.origin.tabId) patchResult(src.origin.tabId, { status: "Exporting…" });
     const inline = scope === "selection" ? src.selectionRows : src.rows;
     const args: ExportToFileArgs =
       scope === "all"
         ? { connectionId: src.connectionId, sql: src.query, options: opts, path, searchPath: src.searchSchema }
         : { connectionId: src.connectionId, columns: src.columns, rows: inline, options: opts, path };
-    const t0 = performance.now();
-    // A scope=all export RE-RUNS the query server-side — that belongs in history
-    // like every other server execution (Slack runs and Explorer DDL are recorded).
-    const exportHistory = (status: "ok" | "error", rows: number | null, error: string | null) => {
-      if (scope !== "all") return;
-      // Keyed by DESTINATION, like every other history write: an export that finishes
-      // after the user moved to another connection still belongs to the one that ran it.
-      const key = entryOf(src.connectionId)?.conn.key;
-      if (key) recordHistory({
-        sql: `-- [Export] ${opts.format} → ${path}\n${src.query}`,
-        durationMs: Math.round(performance.now() - t0),
-        status,
-        rows,
-        error,
-        schema: src.searchSchema ?? null,
-      }, key);
-    };
-    if (scope === "all") interruptStream("All-rows export closed the result stream", src.connectionId);
-    try {
-      const n = await commands.exportToFile(args);
-      exportHistory("ok", n, null);
-      if (originCurrent(src.origin, true) && src.origin.tabId) patchResult(src.origin.tabId, { status: `Exported ${n} rows to ${path}` });
+    const out = await operations.run({
+      connection: c,
+      ...freeze,
+      release: scope === "all" ? "All-rows export closed the result stream" : null,
+      // A scope=all export RE-RUNS the query server-side: that belongs in history like
+      // every other server execution, keyed by DESTINATION like every history write.
+      history: scope === "all"
+        ? { sql: `-- [Export] ${opts.format} → ${path}\n${src.query}`, schema: src.searchSchema ?? null, rows: (n) => n as number }
+        : null,
+      run: () => commands.exportToFile(args),
+    });
+    if (out.ok) {
+      if (originCurrent(src.origin, true) && src.origin.tabId) patchResult(src.origin.tabId, { status: `Exported ${out.value} rows to ${path}` });
       return true;
-    } catch (e) {
-      exportHistory("error", null, errMsg(e).split("\n")[0]);
-      if (originCurrent(src.origin, true) && src.origin.tabId)
-        patchResult(src.origin.tabId, { status: `Export rejected: ${errMsg(e)}` });
-      throw e;
     }
+    if (originCurrent(src.origin, true) && src.origin.tabId)
+      patchResult(src.origin.tabId, { status: `Export rejected: ${out.error}` });
+    throw new Error(out.error);
   }
 
   // --- backup / restore ---
@@ -4212,38 +4171,17 @@ function App() {
     if (!c) throw new Error("not connected");
     if (!boundToCurrentConnection(backupConnection))
       throw new Error("The connection changed. Close this dialog and start the backup again.");
-    // The backend refuses a backup while a manual transaction owns the session.
-    // Check that FIRST: `interruptStream` condemns a healthy cursor, and it must
-    // not be spent on a call that is going to be rejected anyway.
-    if (metadataFrozen())
-      throw new Error("Backup is frozen during a manual transaction. Commit or roll it back first.");
-    interruptStream("Backup closed the result stream", c.id);
-    const t0 = performance.now();
-    setBackupBusy(true);
-    try {
-      const summary = await commands.backupToFile(c.id, path, backupPayload(c.id, path, opts).options);
-      recordHistory({
-        sql: `-- [Backup] ${opts.scope}/${opts.content} → ${path}`,
-        durationMs: Math.round(performance.now() - t0),
-        status: "ok",
-        rows: summary.rows,
-        error: null,
-        schema: null,
-      }, c.key);
-      return summary;
-    } catch (e) {
-      recordHistory({
-        sql: `-- [Backup] ${opts.scope}/${opts.content} → ${path}`,
-        durationMs: Math.round(performance.now() - t0),
-        status: /cancel/i.test(errMsg(e)) ? "cancelled" : "error",
-        rows: null,
-        error: errMsg(e).split("\n")[0],
-        schema: null,
-      }, c.key);
-      throw e;
-    } finally {
-      setBackupBusy(false);
-    }
+    const out = await operations.run({
+      connection: c,
+      needs: "idle",
+      frozenMessage: "Backup is frozen during a manual transaction. Commit or roll it back first.",
+      release: "Backup closed the result stream",
+      history: { sql: `-- [Backup] ${opts.scope}/${opts.content} → ${path}`, rows: (v) => (v as BackupSummary).rows },
+      busy: setBackupBusy,
+      run: () => commands.backupToFile(c.id, path, backupPayload(c.id, path, opts).options),
+    });
+    if (!out.ok) throw new Error(out.error);
+    return out.value;
   }
 
   async function pickRestoreFile(): Promise<BackupFileInfo | null> {
@@ -4257,40 +4195,33 @@ function App() {
     if (!c) throw new Error("not connected");
     if (!boundToCurrentConnection(restoreConnection))
       throw new Error("The connection changed. Close this dialog and start the restore again.");
-    if (metadataFrozen())
-      throw new Error("Restore is frozen during a manual transaction. Commit or roll it back first.");
-    interruptStream("Restore closed the result stream", c.id);
-    const t0 = performance.now();
-    const entry = (status: HistoryEntry["status"], rows: number | null, error: string | null) =>
-      recordHistory({
+    const out = await operations.run({
+      connection: c,
+      needs: "idle",
+      frozenMessage: "Restore is frozen during a manual transaction. Commit or roll it back first.",
+      release: "Restore closed the result stream",
+      history: {
         sql: `-- [Restore] ${path}`,
-        durationMs: Math.round(performance.now() - t0),
-        status,
-        rows,
-        error,
-        schema: null,
-      }, c.key);
-    setRestoreBusy(true);
-    try {
-      const summary = await commands.restoreFromFile(c.id, path, opts);
-      entry(
-        summary.cancelled ? "cancelled" : summary.statementsFailed ? "error" : "ok",
-        summary.rowsCopied,
-        summary.firstError ? summary.firstError.message.split("\n")[0] : null,
-      );
-      // The database changed underneath the sidebar/autocomplete — refetch. Pass `c`:
-      // a restore can run for minutes, and the default target is whichever connection
-      // is focused when it finishes, which would refresh the wrong tree AND interrupt
-      // an unrelated connection's live stream.
-      if (connectionOpen(c)) await loadSchema(c);
-      return summary;
-    } catch (e) {
-      entry(/cancel/i.test(errMsg(e)) ? "cancelled" : "error", null, errMsg(e).split("\n")[0]);
-      if (connectionOpen(c)) await loadSchema(c);
-      throw e;
-    } finally {
-      setRestoreBusy(false);
-    }
+        rows: (v) => (v as RestoreSummary).rowsCopied,
+        status: (v) => {
+          const summary = v as RestoreSummary;
+          return {
+            status: summary.cancelled ? "cancelled" : summary.statementsFailed ? "error" : "ok",
+            error: summary.firstError ? summary.firstError.message.split("\n")[0] : null,
+          };
+        },
+      },
+      busy: setRestoreBusy,
+      run: () => commands.restoreFromFile(c.id, path, opts),
+    });
+    if (!out.ok && out.refused) throw new Error(out.error);
+    // The database changed underneath the sidebar/autocomplete: refetch. Pass `c`:
+    // a restore can run for minutes, and the default target is whichever connection
+    // is focused when it finishes, which would refresh the wrong tree AND interrupt
+    // an unrelated connection's live stream.
+    if (connectionOpen(c)) await loadSchema(c);
+    if (!out.ok) throw new Error(out.error);
+    return out.value;
   }
 
   // Immediately cancel + roll back the in-flight query/export/import on ONE
@@ -4408,43 +4339,31 @@ function App() {
   ): Promise<ImportSummary> {
     const binding = importOrigin;
     const c = binding?.connection;
-    // `frozenFor(c.id)`, not `metadataFrozen()`: the freeze that matters belongs to
-    // the BOUND connection, and the active one may have moved on.
-    if (!binding || !c || !connectionOpen(c) || frozenFor(c.id)) {
-      throw new Error("The connection changed. Reopen the import dialog.");
-    }
+    if (!binding || !c || !connectionOpen(c)) throw new Error("The connection changed. Reopen the import dialog.");
     const label = `${target.schema ? `${target.schema}.` : ""}${target.table}`;
-    const t0 = performance.now();
-    setImportBusy(true);
-    setImportProgress(null);
-    interruptStream("Import closed the result stream", c.id);
-    try {
-      const summary = await commands.importFromFile(c.id, path, options, target);
-      recordHistory({
-        sql: `-- [Import] ${path} → ${label} (${summary.rowsInserted} rows)`,
-        durationMs: Math.round(performance.now() - t0),
-        status: "ok",
-        rows: summary.rowsInserted,
-        error: null,
+    const out = await operations.run({
+      // The BOUND connection, not the active one: the freeze that matters belongs to
+      // it, and the active connection may have moved on.
+      connection: c,
+      needs: "idle",
+      frozenMessage: "The connection changed. Reopen the import dialog.",
+      release: "Import closed the result stream",
+      history: {
+        sql: (o) => (o.ok
+          ? `-- [Import] ${path} → ${label} (${(o.value as ImportSummary).rowsInserted} rows)`
+          : `-- [Import] ${path} → ${label}`),
+        rows: (v) => (v as ImportSummary).rowsInserted,
         schema: target.schema || null,
-      }, c.key);
-      if (connectionOpen(c) && !frozenFor(c.id)) await loadSchema(c);
-      return summary;
-    } catch (e) {
-      const message = errMsg(e);
-      recordHistory({
-        sql: `-- [Import] ${path} → ${label}`,
-        durationMs: Math.round(performance.now() - t0),
-        status: "error",
-        rows: null,
-        error: message.split("\n")[0],
-        schema: target.schema || null,
-      }, c.key);
-      throw new Error(/cancel/i.test(message) ? "Import cancelled. Changes were rolled back." : message);
-    } finally {
-      setImportBusy(false);
-      setImportProgress(null);
-    }
+      },
+      busy: (on) => {
+        setImportBusy(on);
+        setImportProgress(null);
+      },
+      run: () => commands.importFromFile(c.id, path, options, target),
+    });
+    if (!out.ok) throw new Error(out.cancelled ? "Import cancelled. Changes were rolled back." : out.error);
+    if (connectionOpen(c) && !frozenFor(c.id)) await loadSchema(c);
+    return out.value;
   }
 
   function closeImport() {
@@ -4511,24 +4430,28 @@ function App() {
     const src = exportTables();
     const c = conn();
     if (!src || !c || c.id !== src.connectionId) throw new Error("connection changed");
-    interruptStream("Table export closed the result stream", c.id);
-    const t0 = performance.now();
-    setExportTablesBusy(true);
-    try {
-      const results: TableExportResult[] = await commands.exportTables(src.connectionId, tables, options, directory);
-      const ok = results.filter((r) => !r.error).length;
-      recordHistory({
-        sql: `-- [Export] ${options.format} → ${directory} (${ok}/${results.length} tables)`,
-        durationMs: Math.round(performance.now() - t0),
-        status: ok === results.length ? "ok" : "error",
-        rows: results.reduce((n, r) => n + r.rows, 0),
-        error: results.find((r) => r.error)?.error ?? null,
-        schema: null,
-      }, c.key);
-      return results;
-    } finally {
-      setExportTablesBusy(false);
-    }
+    const out = await operations.run({
+      connection: c,
+      needs: "idle",
+      release: "Table export closed the result stream",
+      history: {
+        sql: (o) => {
+          if (!o.ok) return `-- [Export] ${options.format} → ${directory}`;
+          const results = o.value as TableExportResult[];
+          const ok = results.filter((r) => !r.error).length;
+          return `-- [Export] ${options.format} → ${directory} (${ok}/${results.length} tables)`;
+        },
+        rows: (v) => (v as TableExportResult[]).reduce((n, r) => n + r.rows, 0),
+        status: (v) => {
+          const failed = (v as TableExportResult[]).find((r) => r.error);
+          return failed ? { status: "error", error: failed.error } : null;
+        },
+      },
+      busy: setExportTablesBusy,
+      run: () => commands.exportTables(src.connectionId, tables, options, directory),
+    });
+    if (!out.ok) throw new Error(out.error);
+    return out.value;
   }
 
   function startResize(e: MouseEvent) {
@@ -4611,19 +4534,7 @@ function App() {
   async function runDDL(sqlText: string, origin = captureOrigin()): Promise<{ ok: boolean; error?: string }> {
     const c = conn();
     if (!c || !originCurrent(origin)) return { ok: false, error: "Connection or tab changed" };
-    if (metadataFrozen()) return { ok: false, error: "Explorer actions are frozen during a manual transaction" };
-    const before = transaction();
-    const t0 = performance.now();
-    const ddlHistory = (status: "ok" | "error", error: string | null) => recordHistory({
-      sql: `-- [Explorer]\n${sqlText}`,
-      durationMs: Math.round(performance.now() - t0),
-      status,
-      rows: null,
-      error,
-      schema: null,
-    }, c.key);
-    if (origin.tabId) patchResult(origin.tabId, { runErr: "" });
-    interruptStream("Explorer action closed the result stream", c.id);
+    const ownerId = origin.tabId ?? activeTabId();
     // A SQLite table rebuild DROPs the original, and DROP performs an implicit
     // `DELETE FROM` that a referencing child row turns into "FOREIGN KEY constraint
     // failed". `PRAGMA foreign_keys` is a silent no-op inside a transaction and the
@@ -4632,47 +4543,44 @@ function App() {
     const fkGuard = ddl.isSqliteRebuild(sqlText);
     const foreignKeys = async (on: boolean): Promise<string | null> => {
       try {
-        await commands.runQuery({
-          connectionId: c.id,
-          ownerId: origin.tabId ?? activeTabId(),
-          sql: `PRAGMA foreign_keys=${on ? "ON" : "OFF"}`,
-          pageSize: PAGE,
-          searchPath: null,
-        });
+        await commands.runQuery({ connectionId: c.id, ownerId, sql: `PRAGMA foreign_keys=${on ? "ON" : "OFF"}`, pageSize: PAGE, searchPath: null });
         return null;
       } catch (e) {
         return errMsg(e);
       }
     };
-    if (fkGuard) {
-      const failed = await foreignKeys(false);
-      if (failed) {
-        ddlHistory("error", failed.split("\n")[0]);
-        return { ok: false, error: `Could not suspend foreign-key enforcement: ${failed}` };
-      }
-    }
+    const out = await operations.run({
+      connection: c,
+      needs: "idle",
+      frozenMessage: "Explorer actions are frozen during a manual transaction",
+      release: "Explorer action closed the result stream",
+      history: { sql: `-- [Explorer]\n${sqlText}` },
+      prepare: async () => {
+        if (origin.tabId) patchResult(origin.tabId, { runErr: "" });
+        if (!fkGuard) return;
+        const failed = await foreignKeys(false);
+        if (failed) throw new Error(failed);
+      },
+      run: () => commands.runQuery({ connectionId: c.id, ownerId, sql: sqlText, pageSize: PAGE, searchPath: null }),
+    });
     try {
-      const out = await commands.runQuery({ connectionId: c.id, ownerId: origin.tabId ?? activeTabId(), sql: sqlText, pageSize: PAGE, searchPath: null });
-      ddlHistory("ok", null);
-      if (!applyAuthoritativeTransaction(c, out.transaction, "statement", before)) return { ok: false, error: "Stale transaction response" };
-      if (!connectionOpen(c) || !originCurrent(origin)) return { ok: false, error: "Connection or tab changed" };
+      if (!out.ok) {
+        if (out.refused) return { ok: false, error: out.error };
+        if (out.stage === "prepare") return { ok: false, error: `Could not suspend foreign-key enforcement: ${out.error}` };
+        // The dialog stays open with the message, but the status bar still carried the
+        // PREVIOUS action's `OK`: a failed edit must never read as a successful one.
+        if (origin.tabId && originCurrent(origin)) patchResult(origin.tabId, { status: "failed" });
+        return { ok: false, error: out.error };
+      }
+      if (!out.current || !originCurrent(origin)) return { ok: false, error: "Connection or tab changed" };
       if (origin.tabId) {
         if (!resultsOpen()) { setResultsOpen(true); persistLayout(); }
-        patchResult(origin.tabId, { status: out.kind === "exec" ? out.message : rowCountText(out.rows.length, out.done) });
+        patchResult(origin.tabId, { status: out.value.kind === "exec" ? out.value.message : rowCountText(out.value.rows.length, out.value.done) });
       }
       await loadSchema(c);
       return { ok: true };
-    } catch (e) {
-      const message = errMsg(e);
-      ddlHistory("error", message.split("\n")[0]);
-      const embedded = transactionFromError(e);
-      if (embedded) applyAuthoritativeTransaction(c, embedded, "statement", before);
-      // The dialog stays open with the message, but the status bar still carried the
-      // PREVIOUS action's `OK` — a failed edit must never read as a successful one.
-      if (origin.tabId && originCurrent(origin)) patchResult(origin.tabId, { status: "failed" });
-      return { ok: false, error: message };
     } finally {
-      if (fkGuard) {
+      if (fkGuard && !(!out.ok && out.refused)) {
         const failed = await foreignKeys(true);
         if (failed && origin.tabId && originCurrent(origin))
           patchResult(origin.tabId, { runErr: `Foreign-key enforcement is still off on this connection: ${failed}` });
@@ -4729,15 +4637,37 @@ function App() {
     const c = conn();
     if (!c || rejectFrozenExplorer()) return;
     const origin = captureOrigin();
-    interruptStream("Reading object DDL closed the result stream", c.id);
-    try {
-      const dd = await commands.objectDdl(c.id, n.kind, n.schema ?? "", n.name);
-      if (!connectionOpen(c) || !originAlive(origin) || !origin.tabId) return;
-      if (toEditor) scaffoldEditor(dd, origin.tabId);
-      else copyText(dd, "copied DDL", origin);
-    } catch (e) {
-      if (origin.tabId && originAlive(origin)) patchResult(origin.tabId, { runErr: errMsg(e) });
+    const out = await operations.run({
+      connection: c,
+      needs: "idle",
+      release: "Reading object DDL closed the result stream",
+      history: null,
+      run: () => commands.objectDdl(c.id, n.kind, n.schema ?? "", n.name),
+    });
+    if (!out.ok) {
+      if (origin.tabId && originAlive(origin)) patchResult(origin.tabId, { runErr: out.error });
+      return;
     }
+    if (!out.current || !originAlive(origin) || !origin.tabId) return;
+    if (toEditor) scaffoldEditor(out.value, origin.tabId);
+    else copyText(out.value, "copied DDL", origin);
+  }
+
+  /** The reconstructed CREATE for an export's SQL header; "" while the session is frozen. */
+  async function fetchCreateSql(src: NonNullable<ReturnType<typeof exportSrc>>): Promise<string> {
+    const d = src.ddl;
+    const c = entryOf(src.connectionId)?.conn;
+    if (!d || !c) return "";
+    const out = await operations.run({
+      connection: c,
+      needs: "idle",
+      release: "Reading object DDL closed the result stream",
+      history: null,
+      run: () => commands.objectDdl(src.connectionId, d.kind, d.schema, d.name),
+    });
+    if (out.ok) return out.value;
+    if (out.refused) return "";
+    throw new Error(out.error);
   }
 
   // Generate a SELECT/INSERT/UPDATE scaffold from a relation's columns into a NEW
@@ -6506,14 +6436,7 @@ function App() {
               selection={src().selectionRows.length ? { columns: src().columns, rows: src().selectionRows } : null}
               remembered={rememberedExport()}
               onRememberOptions={rememberExportOptions}
-              onFetchCreateSql={src().ddl
-                ? async () => {
-                  const d = src().ddl!;
-                  if (metadataFrozen()) return "";
-                  interruptStream("Reading object DDL closed the result stream", src().connectionId);
-                  return await commands.objectDdl(src().connectionId, d.kind, d.schema, d.name);
-                }
-                : undefined}
+              onFetchCreateSql={src().ddl ? () => fetchCreateSql(src()) : undefined}
               onClose={() => setExportSrc(null)}
               onExportFile={exportToFile}
               onExportClipboard={exportToClipboard}
