@@ -10,6 +10,7 @@ mod export;
 mod import;
 mod perms;
 mod profiles;
+mod query_plan;
 mod relgraph;
 mod script;
 mod skills;
@@ -674,7 +675,7 @@ async fn run_query(
     validate_transaction_owner(&owner_id)?;
     let conn = state.get(&connection_id)?;
     let mut c = lock_conn(&conn).await?;
-    // A run takes over the single result stream (exec_items closes the old cursor
+    // A run takes over the single result stream (exec_plan closes the old cursor
     // and clears `stream_owner`), so only the manual-transaction owner gate applies
     // here — otherwise one tab's unfinished page would lock every other tab out.
     c.require_transaction_owner(&owner_id)?;
@@ -684,34 +685,18 @@ async fn run_query(
     validate_sql_size(&sql).map_err(|error| error.with_transaction(c.transaction.clone()))?;
     let page = checked_page_size(page_size)
         .map_err(|error| error.with_transaction(c.transaction.clone()))?;
-    let items = script::parse_for_engine(sql.trim(), c.transaction_engine())
-        .map_err(|error| error.with_transaction(c.transaction.clone()))?;
-    if items.is_empty() {
+    // Everything decided before the backend is touched is one pure value: lexing,
+    // lifecycle preflight, the read-only verdict, the execution path.
+    let Some(plan) = query_plan::plan(&sql, c.transaction_engine(), &c.transaction, c.read_only)
+        .map_err(|error| error.with_transaction(c.transaction.clone()))?
+    else {
         return Ok(QueryResult {
             outcome: QueryOutcome::Exec {
                 message: "OK (nothing to run)".to_string(),
             },
             transaction: c.transaction.clone(),
         });
-    }
-    let actions = script::preflight_transactions(&items, c.transaction_engine(), &c.transaction)
-        .map_err(|error| error.with_transaction(c.transaction.clone()))?;
-
-    if c.read_only
-        && items.iter().zip(&actions).any(|(item, action)| match item {
-            script::Item::Sql(sql) => {
-                (action.is_none()
-                    && !sqlguard::is_read_only_stmt(sql.trim(), c.transaction_engine()))
-                    || sqlguard::transaction_requests_write(sql, *action)
-            }
-            script::Item::Copy { .. } => true,
-        })
-    {
-        return Err(
-            AppError::new("connection is read-only. Writes and DDL are blocked.")
-                .with_transaction(c.transaction.clone()),
-        );
-    }
+    };
     // Arm cancellation so the Run button can interrupt this query (Postgres CancelRequest)
     // by re-clicking. Armed after ensure_alive so the handle matches the live backend; the
     // handle lives outside the per-connection lock we hold here so `cancel_operation` reaches it.
@@ -724,149 +709,100 @@ async fn run_query(
             c.transaction.clone(),
         )
         .map_err(|error| error.with_transaction(c.transaction.clone()))?;
-    let out = match exec_items(&mut c, &items, &actions, page, &search_path, &owner_id).await {
+    let out = match exec_plan(&mut c, &plan, page, &search_path, &owner_id).await {
         Ok(outcome) => Ok(QueryResult {
             outcome,
             transaction: c.transaction.clone(),
         }),
-        // The server ended the transaction over a live connection (SQL Server deadlock
-        // victim / XACT_ABORT unwind). Nothing is lost and nothing needs reconnecting:
-        // report the statement's own error and return the tab to Idle.
-        Err(e)
-            if !c.backend.is_closed()
-                && c.transaction.owns_session()
-                && c.backend.manual_unit_ended() =>
-        {
-            c.end_transaction_server_unwound();
-            Err(e.with_transaction(c.transaction.clone()))
-        }
-        // Never replay a statement after it reached the server. Even read-only SQL may
-        // call volatile functions or external systems, so its effects are ambiguous.
-        // `ensure_alive` reconnects before the user's next explicit run instead.
-        Err(e)
-            if c.backend.is_closed()
-                || (c.transaction.owns_session() && c.backend.manual_session_ended()) =>
-        {
-            c.mark_transaction_lost();
-            Err(AppError::new(format!(
+        Err(e) => match c.settle_failure() {
+            // Never replay a statement after it reached the server. Even read-only SQL may
+            // call volatile functions or external systems, so its effects are ambiguous.
+            // `ensure_alive` reconnects before the user's next explicit run instead.
+            query_plan::FailureKind::Lost => Err(AppError::new(format!(
                 "connection dropped while the query was running and the outcome is unknown. Verify database state before retrying ({}).",
                 e.message
             ))
-            .with_transaction(c.transaction.clone()))
-        }
-        Err(e) => {
-            if c.backend.manual_errors_require_recovery() {
-                c.mark_transaction_failed();
-            }
-            Err(e.with_transaction(c.transaction.clone()))
-        }
+            .with_transaction(c.transaction.clone())),
+            // Server-unwound (SQL Server deadlock victim / XACT_ABORT): nothing is lost
+            // and nothing needs reconnecting, so the statement's own error is reported
+            // with the tab back at Idle. Recovery-required and plain failures likewise
+            // carry the settled status.
+            _ => Err(e.with_transaction(c.transaction.clone())),
+        },
     };
     drop(c);
     drop(cancel_registration);
     out
 }
 
-async fn exec_items(
+/// Execute a plan. Routing and the read-only verdict were decided in `query_plan`;
+/// this only closes the old stream, applies the search path, and runs.
+async fn exec_plan(
     c: &mut ConnState,
-    items: &[script::Item],
-    actions: &[Option<script::TransactionAction>],
+    plan: &query_plan::QueryPlan,
     page: u32,
     search_path: &Option<String>,
     owner: &str,
 ) -> Result<QueryOutcome, AppError> {
-    if c.read_only
-        && items.iter().zip(actions).any(|(item, action)| match item {
-            script::Item::Sql(sql) => {
-                (action.is_none()
-                    && !sqlguard::is_read_only_stmt(sql.trim(), c.transaction_engine()))
-                    || sqlguard::transaction_requests_write(sql, *action)
-            }
-            script::Item::Copy { .. } => true,
-        })
-    {
-        return Err(AppError::new(
-            "connection is read-only. Writes and DDL are blocked.",
-        ));
-    }
     let manual = c.transaction.owns_session();
     c.backend.close_stream(manual).await?;
     c.stream_owner = None;
-
-    let recovery_only = c.transaction.state == TransactionState::Failed
-        && actions.iter().all(|action| {
-            matches!(
-                action,
-                Some(
-                    script::TransactionAction::Rollback
-                        | script::TransactionAction::RollbackTo
-                        | script::TransactionAction::Commit
-                )
-            )
-        });
-    let control_only = actions.iter().all(Option::is_some);
-    if !recovery_only && !control_only {
+    if plan.apply_search_path {
         c.backend.apply_search_path(search_path).await?;
     }
 
     // A single plain statement runs interactively (streaming result grid).
-    let engine = c.transaction_engine();
-    if items.len() == 1 {
-        if let script::Item::Sql(stmt) = &items[0] {
-            let trimmed = stmt.trim();
-            let out = if let Some(action) = actions[0] {
-                let mode = c.transaction.mode;
-                let owned_before = c.transaction.owns_session();
-                let result = c
-                    .backend
-                    .run_transaction_statement(trimmed, action, mode)
-                    .await;
-                let out = match result {
-                    Ok(out) => out,
-                    Err(error) => {
-                        if !owned_before {
-                            c.backend.rollback_manual().await;
-                        }
-                        return Err(error);
+    if let query_plan::Path::Single { cursorable } = plan.path {
+        let script::Item::Sql(stmt) = &plan.items[0] else {
+            unreachable!("a Single plan is one SQL statement");
+        };
+        let trimmed = stmt.trim();
+        let out = if let Some(action) = plan.actions[0] {
+            let mode = c.transaction.mode;
+            let owned_before = c.transaction.owns_session();
+            let result = c
+                .backend
+                .run_transaction_statement(trimmed, action, mode)
+                .await;
+            let out = match result {
+                Ok(out) => out,
+                Err(error) => {
+                    if !owned_before {
+                        c.backend.rollback_manual().await;
                     }
-                };
-                c.apply_transaction_action(action, owner);
-                out
-            } else if c.transaction.owns_session() {
-                c.backend
-                    .run_manual_single(
-                        trimmed,
-                        page,
-                        sqlguard::is_cursorable(trimmed, engine),
-                        c.transaction.mode,
-                    )
-                    .await?
-            } else {
-                c.backend
-                    .run_single(trimmed, page, sqlguard::is_cursorable(trimmed, engine))
-                    .await?
-            };
-            if let QueryOutcome::Rows { columns, rows, .. } = &out {
-                if let Err(e) = validate_result_page(columns, rows) {
-                    c.backend.close_stream(c.transaction.owns_session()).await?;
-                    return Err(e);
+                    return Err(error);
                 }
+            };
+            c.apply_transaction_action(action, owner);
+            out
+        } else if c.transaction.owns_session() {
+            c.backend
+                .run_manual_single(trimmed, page, cursorable, c.transaction.mode)
+                .await?
+        } else {
+            c.backend.run_single(trimmed, page, cursorable).await?
+        };
+        if let QueryOutcome::Rows { columns, rows, .. } = &out {
+            if let Err(e) = validate_result_page(columns, rows) {
+                c.backend.close_stream(c.transaction.owns_session()).await?;
+                return Err(e);
             }
-            if matches!(&out, QueryOutcome::Rows { done: false, .. }) {
-                c.stream_owner = Some(owner.to_string());
-            }
-            return Ok(out);
         }
+        if matches!(&out, QueryOutcome::Rows { done: false, .. }) {
+            c.stream_owner = Some(owner.to_string());
+        }
+        return Ok(out);
     }
 
-    if actions.iter().all(Option::is_none) && !c.transaction.owns_session() {
+    if plan.path == query_plan::Path::AtomicScript {
         // Preserve the app-owned atomic wrapper for ordinary idle scripts.
-        let message = c.backend.run_script(items, c.read_only).await?;
+        let message = c.backend.run_script(&plan.items, c.read_only).await?;
         return Ok(QueryOutcome::Exec { message });
     }
 
     let mut statements = 0u64;
     let mut copied = 0u64;
-    for (item, action) in items.iter().zip(actions) {
+    for (item, action) in plan.items.iter().zip(&plan.actions) {
         match item {
             script::Item::Sql(sql) => {
                 let trimmed = sql.trim();
@@ -990,19 +926,7 @@ async fn fetch_more(
             })
         }
         Err(error) => {
-            if !c.backend.is_closed()
-                && c.transaction.owns_session()
-                && c.backend.manual_unit_ended()
-            {
-                // The unit ended on a live session (see `manual_unit_ended`).
-                c.end_transaction_server_unwound();
-            } else if c.backend.is_closed()
-                || (c.transaction.owns_session() && c.backend.manual_session_ended())
-            {
-                c.mark_transaction_lost();
-            } else if c.backend.manual_errors_require_recovery() {
-                c.mark_transaction_failed();
-            }
+            c.settle_failure();
             Err(error.with_transaction(c.transaction.clone()))
         }
     };
@@ -1200,11 +1124,10 @@ fn dollar_tag_end(b: &[u8], i: usize) -> Option<usize> {
 #[cfg(test)]
 mod bind_param_tests {
     use super::{
-        checked_page_size, disconnect_registered, exec_items, has_bind_params, lock_conn,
-        lock_sync, persist_export_temp, validate_fetch_page, validate_result_page,
-        validate_sql_size, validate_tabular_payload, AppError, AppState, CancelHandle, ConnState,
-        ConnectionConfig, TransactionStatus, MAX_IPC_CELL_BYTES, MAX_OPEN_CONNECTIONS,
-        MAX_SQL_BYTES,
+        checked_page_size, disconnect_registered, exec_plan, has_bind_params, lock_conn, lock_sync,
+        persist_export_temp, validate_fetch_page, validate_result_page, validate_sql_size,
+        validate_tabular_payload, AppError, AppState, CancelHandle, ConnState, ConnectionConfig,
+        TransactionStatus, MAX_IPC_CELL_BYTES, MAX_OPEN_CONNECTIONS, MAX_SQL_BYTES,
     };
     use crate::driver;
     use std::sync::atomic::Ordering;
@@ -1404,16 +1327,15 @@ mod bind_param_tests {
         {
             let mut c = lock_conn(&conn).await.unwrap();
             for sql in ["BEGIN", "INSERT INTO t VALUES (1)"] {
-                let items = crate::script::parse(sql).unwrap();
-                let actions = crate::script::preflight_transactions(
-                    &items,
+                let plan = crate::query_plan::plan(
+                    sql,
                     c.transaction_engine(),
                     &c.transaction,
+                    c.read_only,
                 )
+                .unwrap()
                 .unwrap();
-                exec_items(&mut c, &items, &actions, 100, &None, "tab-1")
-                    .await
-                    .unwrap();
+                exec_plan(&mut c, &plan, 100, &None, "tab-1").await.unwrap();
             }
         }
 
@@ -1466,15 +1388,10 @@ mod bind_param_tests {
     #[tokio::test]
     async fn two_connections_own_independent_transactions() {
         async fn run(c: &mut ConnState, sql: &str, owner: &str) -> Result<(), AppError> {
-            let items = crate::script::parse(sql)?;
-            let actions = crate::script::preflight_transactions(
-                &items,
-                c.transaction_engine(),
-                &c.transaction,
-            )?;
-            exec_items(c, &items, &actions, 100, &None, owner)
-                .await
-                .map(|_| ())
+            let plan =
+                crate::query_plan::plan(sql, c.transaction_engine(), &c.transaction, c.read_only)?
+                    .expect("statement");
+            exec_plan(c, &plan, 100, &None, owner).await.map(|_| ())
         }
 
         let dir = tempfile::tempdir().unwrap();

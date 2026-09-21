@@ -3,6 +3,7 @@ use bytes::Bytes;
 use futures_util::SinkExt;
 use tokio_postgres::Client;
 
+#[derive(Clone)]
 pub enum Item {
     Sql(String),
     /// `COPY ... FROM stdin` plus its inline data block (text format).

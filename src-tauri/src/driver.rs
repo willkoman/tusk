@@ -896,7 +896,7 @@ impl Backend {
     /// script::run; DuckDB/SQLite via an explicit BEGIN…COMMIT batch wrap;
     /// MySQL via START TRANSACTION around the loop, though MySQL DDL still
     /// auto-commits). This idle-only app wrapper rejects transaction control;
-    /// `exec_items` routes manual lifecycle scripts statement-by-statement instead.
+    /// `exec_plan` routes manual lifecycle scripts statement-by-statement instead.
     pub async fn run_script(
         &self,
         items: &[script::Item],
@@ -5008,6 +5008,28 @@ impl ConnState {
             self.transaction.health = TransactionHealth::Lost;
             self.transaction.revision = self.transaction.revision.saturating_add(1);
         }
+    }
+
+    /// Apply what a failed command means for the tracked transaction (see
+    /// `query_plan::failure_kind`) and report which case it was. `run_query`,
+    /// `fetch_more` and the conformance harness all settle through here, so none of
+    /// them can forget a branch.
+    pub fn settle_failure(&mut self) -> crate::query_plan::FailureKind {
+        use crate::query_plan::FailureKind;
+        let kind = crate::query_plan::failure_kind(
+            self.backend.is_closed(),
+            self.transaction.owns_session(),
+            || self.backend.manual_unit_ended(),
+            || self.backend.manual_session_ended(),
+            || self.backend.manual_errors_require_recovery(),
+        );
+        match kind {
+            FailureKind::ServerUnwound => self.end_transaction_server_unwound(),
+            FailureKind::Lost => self.mark_transaction_lost(),
+            FailureKind::RecoveryRequired => self.mark_transaction_failed(),
+            FailureKind::Plain => {}
+        }
+        kind
     }
 }
 

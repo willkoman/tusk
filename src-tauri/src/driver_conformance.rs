@@ -2736,8 +2736,8 @@ async fn permissions_postgres() {
     exec(&mut a, "DROP TABLE IF EXISTS perm_t").await;
 }
 
-// --- command layer (lib.rs exec_items: routing + the app-layer read-only guard that
-//     protects engines with no server-side read-only, e.g. MySQL) ---
+// --- command layer (query_plan + lib.rs exec_plan: routing + the app-layer read-only
+//     guard that protects engines with no server-side read-only, e.g. MySQL) ---
 
 use crate::driver::ConnState;
 
@@ -2750,18 +2750,18 @@ async fn command_exec(
     c: &mut ConnState,
     items: &[crate::script::Item],
 ) -> Result<QueryOutcome, crate::db::AppError> {
-    let actions =
-        crate::script::preflight_transactions(items, c.transaction_engine(), &c.transaction)?;
-    match crate::exec_items(c, items, &actions, 100, &None, "test-owner").await {
+    // The same planner and the same failure settlement the command uses: a routing
+    // rule or an error branch cannot pass here and fail in `run_query`.
+    let plan = crate::query_plan::plan_items(
+        items.to_vec(),
+        c.transaction_engine(),
+        &c.transaction,
+        c.read_only,
+    )?;
+    match crate::exec_plan(c, &plan, 100, &None, "test-owner").await {
         Ok(outcome) => Ok(outcome),
         Err(error) => {
-            if c.backend.is_closed()
-                || (c.transaction.owns_session() && c.backend.manual_session_ended())
-            {
-                c.mark_transaction_lost();
-            } else if c.backend.manual_errors_require_recovery() {
-                c.mark_transaction_failed();
-            }
+            c.settle_failure();
             Err(error.with_transaction(c.transaction.clone()))
         }
     }
@@ -3226,7 +3226,7 @@ fn is_read_only_stmt_is_engine_aware() {
 
 #[tokio::test]
 async fn app_readonly_guard_blocks_writes_single_and_multi() {
-    // The app-layer guard (exec_items) blocks writes on a read-only connection — single
+    // The app-layer guard (query_plan) blocks writes on a read-only connection — single
     // AND multi-statement — for every driver. This is the only protection for MySQL
     // (no engine-level read-only). Use SQLite in-memory as a stand-in for the guard logic.
     let mut c = state(&sqlite_cfg(), true).await;
@@ -3247,7 +3247,7 @@ async fn app_readonly_guard_blocks_writes_single_and_multi() {
 }
 
 #[tokio::test]
-async fn exec_items_routes_single_vs_script() {
+async fn exec_plan_routes_single_vs_script() {
     let mut c = state(&sqlite_cfg(), false).await;
     let run = |sql: &str| crate::script::split(sql);
     command_exec(&mut c, &run("CREATE TABLE t(a INTEGER)"))
