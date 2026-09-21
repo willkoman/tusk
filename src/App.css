@@ -2664,6 +2664,9 @@ label.slack-switch { display: inline-flex; flex-direction: row; align-items: cen
   /* No transform: a type name is server data, and a composite type keeps its case. */
 }
 .rg-type.inferred { background: transparent; border-bottom: 1px dotted var(--border); border-radius: 0; opacity: 0.75; }
+/* A sorted column shows its glyph instead of the badge: at grid widths the two together
+   truncated the column name to a single letter. The badge title survives on hover. */
+.rg-headcell:has(.rg-sort) .rg-type { display: none; }
 
 /* Numeric cells align right on tabular figures so magnitudes line up. */
 .rg-cell.rg-num { justify-content: flex-end; font-variant-numeric: tabular-nums; }

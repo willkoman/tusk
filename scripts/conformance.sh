@@ -25,8 +25,10 @@ readonly MS_PORT="${TUSK_TEST_MSSQL_PORT:-31433}"
 # `sa` password the suite connects with.
 readonly MS_PASSWORD="${TUSK_TEST_MSSQL_PASSWORD:-Tusk_Test_2024!}"
 # Three database servers now start together, so first-boot initialisation (MySQL
-# datadir, SQL Server system databases) can take several minutes on a cold machine.
-readonly STARTUP_TIMEOUT_SECONDS="${TUSK_TEST_STARTUP_TIMEOUT:-300}"
+# datadir, SQL Server system databases) can take several minutes on a cold machine,
+# and a cargo test build competes for the same cores: MySQL alone took over five
+# minutes on a laptop, so the budget is fifteen.
+readonly STARTUP_TIMEOUT_SECONDS="${TUSK_TEST_STARTUP_TIMEOUT:-900}"
 # SQL Server's first boot upgrades master/model/msdb one version step at a time and is
 # by far the slowest, so it gets its own budget rather than inflating everyone's.
 readonly MSSQL_TIMEOUT_SECONDS="${TUSK_TEST_MSSQL_STARTUP_TIMEOUT:-600}"

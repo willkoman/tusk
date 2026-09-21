@@ -4279,7 +4279,7 @@ function App() {
     }
     const ok = await clipWrite(text);
     if (originCurrent(src.origin, true) && src.origin.tabId)
-      patchResult(src.origin.tabId, { status: ok ? `Copied ${source.length} rows` : "Clipboard unavailable" });
+      patchResult(src.origin.tabId, { status: ok ? `Copied ${rowCountText(source.length, true)}` : "Clipboard unavailable" });
     if (!ok) throw new Error("Clipboard unavailable");
     return true;
   }
@@ -5678,6 +5678,7 @@ function App() {
                     details={details()}
                     filter={treeFilter()}
                     selectedKey={selected() ? nodeKey(selected()!) : undefined}
+                    stateKey={activeConnectionId() ?? undefined}
                     onRunTable={runTable}
                     onExpandTable={loadDetail}
                     onContext={openMenu}

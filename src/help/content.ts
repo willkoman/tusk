@@ -845,7 +845,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "Each header carries a small type badge. A solid badge is the driver's type; a dotted one is guessed from the loaded values.",
+          "Each header carries a small type badge. A solid badge is the driver's type; a dotted one is guessed from the loaded values. A sorted column shows its sort glyph in the badge's place; the type stays in the header tooltip.",
           "Numeric columns align right on tabular figures. Booleans render as a glyph plus TRUE/FALSE. NULL follows the *NULL cells show* setting.",
           "Values over 300 characters are cut in the cell with `…`; hover for the head of the value, or open **View value…** for all of it.",
           "Rendering never changes the data: copy, export and the value viewer use the raw driver text."

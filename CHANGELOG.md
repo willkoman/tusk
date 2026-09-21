@@ -4,6 +4,13 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ## [Unreleased]
 
+### Fixed
+- **The topbar no longer reads "SQLite SQLite 3.46.0".** The SQLite driver reported its version with the driver name in front; the topbar already adds it.
+- **A sorted column keeps its name.** The sort glyph now takes the type badge's place in the header instead of squeezing the column name down to one letter; the badge text is still in the header's tooltip.
+- **The Explorer remembers what you expanded when you switch connections.** Each connection keeps its own expanded set for the session, so switching away and back no longer collapses the tree to the schema root.
+- **`sqlite_master`, `sqlite_schema`, `sqlite_sequence` and `dual` are no longer underlined as unknown tables** by the schema lint; they are catalog tables no schema listing carries.
+- **"Copied 1 rows" is now "Copied 1 row".**
+
 ### Changed
 - **History records a cancelled export, import or backup as cancelled.** Every action that reaches a server now goes through one shared run path in the workbench, so a cancel is logged as *cancelled* rather than *error* everywhere (the editor already did this), the transaction status a reply carries is applied the same way for every action, and a frozen session is refused before the result stream is released, so refusing a backup or an all-rows export during a manual transaction no longer marks the tab's loaded rows incomplete. No visible change otherwise.
 - **Switching connections closes the prompts that belong to the connection you left.** The parameter prompt, the discard-pending-edits confirmation, the Explain Analyze confirmation and an in-progress tab rename now close when focus moves to another connection, like menus and dialogs already did; a parameter prompt answered after a switch used to run its SQL against the newly focused tab. Every overlay now follows one rule for what a switch, a disconnect or an opening transaction dismisses.

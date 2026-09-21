@@ -99,17 +99,27 @@ export const nodeKey = (n: NodeDescriptor) => `${n.kind}|${n.schema ?? ""}|${n.t
 const conIconName = (k: string): IconName =>
   k === "primary_key" ? "key" : k === "foreign_key" ? "link" : k === "unique" ? "hash" : k === "check" ? "check" : "dot";
 
+/** Expanded-node sets by `stateKey`: the tree remounts on a connection switch and would otherwise forget them. */
+const OPEN_BY_KEY = new Map<string, Set<string>>();
+
 export function Tree(props: {
   tree: DbTree;
   details: Record<string, RelationDetail>;
   filter?: string;
   selectedKey?: string;
+  /** Remembers the expanded set under this key across remounts (one per connection). */
+  stateKey?: string;
   onRunTable: (schema: string, name: string) => void;
   onExpandTable: (schema: string, name: string) => void;
   onContext: (e: MouseEvent, node: NodeDescriptor) => void;
   onSelect: (node: NodeDescriptor) => void;
 }) {
-  const [open, setOpen] = createSignal<Set<string>>(new Set(["db", "s:public", "c:public:tables"]));
+  const remembered = props.stateKey ? OPEN_BY_KEY.get(props.stateKey) : undefined;
+  const [open, setOpenRaw] = createSignal<Set<string>>(remembered ?? new Set(["db", "s:public", "c:public:tables"]));
+  const setOpen = (s: Set<string>) => {
+    setOpenRaw(s);
+    if (props.stateKey) OPEN_BY_KEY.set(props.stateKey, s);
+  };
   const f = () => (props.filter ?? "").trim().toLowerCase();
   const match = (s: string) => s.toLowerCase().includes(f());
   // While filtering, auto-expand structural containers (db / schema / category) so

@@ -1972,7 +1972,7 @@ impl SqliteConn {
                 stream_sql: None,
                 offset: 0,
             }),
-            format!("SQLite {version}"),
+            version,
         ))
     }
 
@@ -5789,7 +5789,10 @@ mod tests {
     #[test]
     fn sqlite_query_page_introspect() {
         let (backend, ver) = SqliteConn::open(&mem("sqlite")).unwrap();
-        assert!(ver.starts_with("SQLite"));
+        assert!(
+            ver.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "bare version, no driver name: {ver}"
+        );
         let mut s = match backend {
             Backend::Sqlite(s) => s,
             _ => panic!("expected SQLite backend"),

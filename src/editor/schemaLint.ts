@@ -68,6 +68,13 @@ export type SchemaDiag = {
  * Pure diagnostic core (unit-tested without an EditorView). `funcs` is the
  * lowercase live function catalog — empty set disables check (3).
  */
+/** Catalog tables a query may name that no schema listing carries. Their columns stay
+ *  opaque (bare-column checks are gated off), but the table itself is never "unknown". */
+const SYSTEM_TABLES: ReadonlySet<string> = new Set([
+  "sqlite_master", "sqlite_schema", "sqlite_temp_master", "sqlite_temp_schema", "sqlite_sequence",
+  "sqlite_stat1", "sqlite_stat4", "dual",
+]);
+
 export function schemaDiagnostics(
   doc: string,
   spans: Span[],
@@ -162,6 +169,10 @@ export function schemaDiagnostics(
       if (after < tableScan.length && tableScan[after] === "(") continue; // table function
       if (parts.length > 1 && !schemaNames.has(parts[parts.length - 2].toLowerCase())) {
         allTablesResolve = false; // foreign catalog — unverifiable
+        continue;
+      }
+      if (parts.length === 1 && SYSTEM_TABLES.has(bare)) {
+        allTablesResolve = false; // a catalog table the schema list never carries
         continue;
       }
       allTablesResolve = false;

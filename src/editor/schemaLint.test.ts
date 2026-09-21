@@ -48,6 +48,13 @@ describe("schemaDiagnostics — detections", () => {
     expect(msgs("SELECT * FROM userz")[0]).toContain('Unknown table "userz"');
   });
 
+  it("never flags a catalog table the schema list does not carry", () => {
+    expect(msgs("SELECT name FROM sqlite_master WHERE type='index'")).toEqual([]);
+    expect(msgs("SELECT 1 FROM dual")).toEqual([]);
+    // Still unknown when qualified with a real schema: the catalog is not in `public`.
+    expect(msgs("SELECT * FROM public.sqlite_master")[0]).toContain("Unknown table");
+  });
+
   it("flags unknown bare columns in a fully-resolved statement", () => {
     const out = diag("SELECT emial FROM users");
     expect(out.length).toBe(1);
