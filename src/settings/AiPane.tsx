@@ -1,4 +1,4 @@
-// Settings → AI. Three sections, all self-contained (direct `invoke`s, like SlackPane):
+// Settings → AI. Three sections, all self-contained (backend calls go through `commands`, like SlackPane):
 //
 //   Providers — one card each, two groups inside: **Connection** (key entry — never echoed
 //   back — API base, origin approval, Test) and **Models** (the ONE model control:
@@ -13,7 +13,6 @@
 //   `skills.rs`, so export is a file copy and any .md can be imported.
 
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
-import { invoke } from "@tauri-apps/api/core";
 import { Icon } from "../Icons";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { pickOpenPath, pickSavePath, UNVERIFIED_PICKER } from "../filePicker";
@@ -27,8 +26,9 @@ import { ModelMultiPicker } from "../ai/ModelMultiPicker";
 import { emptySkill, type Skill } from "../ai/skills";
 import { KeyedSerialQueue } from "../asyncQueue";
 import { KeyedStaleGuard } from "../staleGuard";
+import { commands, errorMessage } from "../commands";
 
-const errMsg = (e: unknown): string => (e as { message?: string })?.message ?? String(e);
+const errMsg = errorMessage;
 
 /** Per-provider live state: does a key exist, and what did Test say. */
 type ProbeState = { hasKey: boolean; testing: boolean; note: string; ok: boolean | null };
@@ -72,7 +72,7 @@ export function AiPane(props: { database: string }) {
     const token = catalogGuard.mint(pid);
     patchCatalog(pid, { loading: true, error: "" });
     try {
-      const list = await invoke<string[]>("ai_list_models", {
+      const list = await commands.aiListModels({
         provider: pid, wire: spec.wire, baseUrl: base, allowNoKey: !spec.needsKey,
       });
       if (!catalogGuard.current(pid, token)) return;
@@ -108,10 +108,7 @@ export function AiPane(props: { database: string }) {
     await Promise.all(AI_PROVIDERS.map(async (p) => {
       const generation = nextProbe(p.id);
       const baseUrl = providerBase(p.id);
-      const hasKey = isKeyless(p.id) || (!!baseUrl && await invoke<boolean>("ai_has_key", {
-        provider: p.id,
-        baseUrl,
-      }).catch(() => false));
+      const hasKey = isKeyless(p.id) || (!!baseUrl && await commands.aiHasKey(p.id, baseUrl).catch(() => false));
       if (probeCurrent(p.id, generation)) patchProbe(p.id, { hasKey });
     }));
   };
@@ -148,7 +145,7 @@ export function AiPane(props: { database: string }) {
     const generation = nextProbe(pid);
     patchProbe(pid, { testing: true, note: "", ok: null });
     try {
-      const list = await invoke<string[]>("ai_list_models", {
+      const list = await commands.aiListModels({
         provider: pid, wire: spec.wire, baseUrl: base, allowNoKey: !spec.needsKey,
         // `/models` is public on some gateways. Keyed providers also make a tiny
         // completion request so a green result proves the credential itself works.
@@ -181,12 +178,7 @@ export function AiPane(props: { database: string }) {
     }
     const generation = nextProbe(pid);
     try {
-      await keyMutations.run(pid, () => invoke("ai_save_key", {
-          provider: pid,
-          key: k,
-          baseUrl,
-          approveOrigin: originNeedsConsent(pid, override),
-        }));
+      await keyMutations.run(pid, () => commands.aiSaveKey(pid, k, baseUrl, originNeedsConsent(pid, override)));
       if (!probeCurrent(pid, generation)) return;
       setKeyInput((m) => ({ ...m, [pid]: "" }));
       patchProbe(pid, { hasKey: true, note: "Key saved.", ok: null });
@@ -199,7 +191,7 @@ export function AiPane(props: { database: string }) {
   async function clearKey(pid: AiProvider) {
     const generation = nextProbe(pid);
     try {
-      await keyMutations.run(pid, () => invoke("ai_clear_key", { provider: pid }));
+      await keyMutations.run(pid, () => commands.aiClearKey(pid));
       if (!probeCurrent(pid, generation)) return;
       patchProbe(pid, { hasKey: false, note: "", ok: null });
       // The catalog was fetched with the key just removed; fall back to the shipped ids.
@@ -229,14 +221,14 @@ export function AiPane(props: { database: string }) {
   const [skills, setSkills] = createSignal<Skill[]>([]);
   const [editing, setEditing] = createSignal<Skill | null>(null);
   const [skillNote, setSkillNote] = createSignal("");
-  const refreshSkills = () => invoke<Skill[]>("skills_list").then(setSkills).catch(() => setSkills([]));
+  const refreshSkills = () => commands.skillsList().then(setSkills).catch(() => setSkills([]));
 
   const inScope = (s: Skill) => s.scope === "workspace" || (!!props.database && s.database === props.database);
   const activeCount = createMemo(() => skills().filter((s) => s.enabled && inScope(s)).length);
 
   async function persist(s: Skill) {
     try {
-      await invoke<Skill>("skills_save", { skill: s });
+      await commands.skillsSave(s);
       await refreshSkills();
       setSkillNote("");
       return true;
@@ -249,7 +241,7 @@ export function AiPane(props: { database: string }) {
     await persist({ ...s, enabled: !s.enabled });
   }
   async function removeSkill(s: Skill) {
-    await invoke("skills_delete", { id: s.id }).catch((e) => setSkillNote(errMsg(e)));
+    await commands.skillsDelete(s.id).catch((e) => setSkillNote(errMsg(e)));
     await refreshSkills();
   }
   async function exportSkill(s: Skill) {
@@ -259,8 +251,8 @@ export function AiPane(props: { database: string }) {
     if (!picked.verified) { setSkillNote(UNVERIFIED_PICKER); return; }
     const path = picked.path;
     try {
-      const text = await invoke<string>("skills_export", { id: s.id });
-      await invoke("write_text_file", { path, contents: text });
+      const text = await commands.skillsExport(s.id);
+      await commands.writeTextFile(path, text);
       setSkillNote(`Exported ${s.name}.`);
     } catch (e) { setSkillNote(errMsg(e)); }
   }
@@ -270,9 +262,9 @@ export function AiPane(props: { database: string }) {
     if (!picked.verified) { setSkillNote(UNVERIFIED_PICKER); return; }
     const path = picked.path;
     try {
-      const text = await invoke<string>("read_text_file", { path });
+      const text = await commands.readTextFile(path);
       const stem = path.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, "") ?? "Imported skill";
-      const s = await invoke<Skill>("skills_import", { text, fallbackName: stem });
+      const s = await commands.skillsImport(text, stem);
       await refreshSkills();
       setSkillNote(`Imported “${s.name}”.`);
     } catch (e) { setSkillNote(errMsg(e)); }

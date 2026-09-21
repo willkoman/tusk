@@ -1,6 +1,6 @@
 import { createSignal, createEffect, createMemo, For, Index, Show, onCleanup, onMount, type Accessor } from "solid-js";
 import { Icon } from "../Icons";
-import { invoke, Channel } from "@tauri-apps/api/core";
+import { Channel } from "@tauri-apps/api/core";
 import {
   aiStore, activeBaseUrl, approvedBaseOverride, defaultModel, normalizeAiConfig,
   providerModels, providerInfo, AI_PROVIDERS, isKeyless, resolveWire, resolveBaseUrl,
@@ -12,6 +12,7 @@ import { buildSystemPrompt, relevantTables, type AiContext, type SampleTable } f
 import { Markdown } from "./markdown";
 import { ModelPicker } from "./ModelPicker";
 import { KeyedStaleGuard, StaleGuard } from "../staleGuard";
+import { commands, errorMessage } from "../commands";
 
 /** A turn's outcome lives on the message, NOT in its `content` — an error appended to the
  *  text would be replayed to the provider as part of the conversation on the next send. */
@@ -26,9 +27,7 @@ type ChatMsg = {
   truncated?: boolean;
 };
 
-function errMsg(e: unknown): string {
-  return e instanceof Object && "message" in e ? String((e as { message: unknown }).message) : String(e);
-}
+const errMsg = errorMessage;
 
 const newRequestId = () =>
   globalThis.crypto?.randomUUID?.() ?? `req-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -89,7 +88,7 @@ export function AiPanel(props: {
     const baseUrl = resolveBaseUrl(pid, override);
     if (!baseUrl) return; // no default, no override — never let the backend guess (see runTurn)
     try {
-      const list = await invoke<string[]>("ai_list_models", {
+      const list = await commands.aiListModels({
         provider: pid,
         wire: spec.wire,
         baseUrl,
@@ -144,7 +143,7 @@ export function AiPanel(props: {
     if (!originApproved(config, p)) return false;
     if (isKeyless(p)) return true;
     const baseUrl = resolveBaseUrl(p, approvedBaseOverride(config, p));
-    return !!baseUrl && await invoke<boolean>("ai_has_key", { provider: p, baseUrl }).catch(() => false);
+    return !!baseUrl && await commands.aiHasKey(p, baseUrl).catch(() => false);
   };
   const refreshKey = async () => {
     const token = keyGuard.mint();
@@ -389,8 +388,7 @@ export function AiPanel(props: {
         finishTurn(id, { error: "The active connection changed while preparing the request. Switch back, or start a new chat." });
         return;
       }
-      await invoke("ai_chat", {
-        req: {
+      await commands.aiChat({
           provider: c.provider,
           wire,
           model,
@@ -410,9 +408,7 @@ export function AiPanel(props: {
           maxTokens: latest.maxTokens,
           requestId: id,
           allowNoKey: isKeyless(c.provider),
-        },
-        onEvent: channel,
-      });
+        }, channel);
       // `ai_chat` resolves after its terminal event, so finishTurn has normally already
       // run. This only fires if the command returned without one (it shouldn't).
       finishTurn(id, { error: "The stream ended unexpectedly." });
@@ -436,7 +432,7 @@ export function AiPanel(props: {
     const id = curReq;
     if (!id) return;
     finishTurn(id, { cancelled: true }); // ends the turn even if the backend never answers
-    void invoke("ai_cancel", { requestId: id }).catch(() => { /* already finished */ });
+    void commands.aiCancel(id).catch(() => { /* already finished */ });
   }
 
   /** Re-run the failed/cancelled last turn, dropping its dead assistant message. Used by
@@ -488,7 +484,7 @@ export function AiPanel(props: {
     curReq = null;
     pendingDelta = "";
     pendingDeltaId = null;
-    if (id) void invoke("ai_cancel", { requestId: id }).catch(() => {});
+    if (id) void commands.aiCancel(id).catch(() => {});
   });
 
 

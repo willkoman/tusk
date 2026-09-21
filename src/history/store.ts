@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { commands } from "../commands";
 import { KeyedSerialQueue } from "../asyncQueue";
 
 // Per-connection query history, file-backed via the `load_history`/`save_history`
@@ -79,7 +79,7 @@ function scheduleSave(connKey: string) {
         if (!loaded.has(connKey)) await historyStore.load(connKey);
         const list = cache.get(connKey) ?? [];
         try {
-          await invoke("save_history", { connKey, json: JSON.stringify(list) });
+          await commands.saveHistory(connKey, JSON.stringify(list));
         } catch {
           /* degrade to in-memory */
         }
@@ -99,7 +99,7 @@ export const historyStore = {
     const request = (async () => {
       let list: HistoryEntry[] = [];
       try {
-        const raw = await invoke<string>("load_history", { connKey });
+        const raw = await commands.loadHistory(connKey);
         if (raw.length > MAX_HISTORY_CHARS) throw new Error("history is too large");
         list = normalizeHistory(JSON.parse(raw));
       } catch {
@@ -153,7 +153,7 @@ export const historyStore = {
   /** Move a pre-key-migration history file only after the new file is durable. */
   async migrate(from: string, to: string): Promise<HistoryEntry[]> {
     try {
-      const raw = await invoke<string>("migrate_history", { fromKey: from, toKey: to });
+      const raw = await commands.migrateHistory(from, to);
       if (raw.length > MAX_HISTORY_CHARS) throw new Error("history is too large");
       const migrated = normalizeHistory(JSON.parse(raw));
       const merged = mergeHistory(cache.get(to) ?? [], migrated);

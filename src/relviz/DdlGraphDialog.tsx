@@ -1,5 +1,5 @@
 import { For, Match, Show, Switch, createEffect, createMemo, createResource, createSignal, on } from "solid-js";
-import { invoke } from "@tauri-apps/api/core";
+import { commands } from "../commands";
 import { Dialog } from "../Dialog";
 import { Icon } from "../Icons";
 import { highlightSql } from "../ai/sqlHighlight";
@@ -111,11 +111,12 @@ export function DdlGraphDialog(props: {
   // Hovering a card lights up only its edges (everything else dims).
   const [hoverTable, setHoverTable] = createSignal<string | null>(null);
 
-  const centered = () => (center().name ? center() : null); // table-scoped resources skip schema-only mode
+  // table-scoped resources skip schema-only mode; the cast records the null check the guard just made
+  const centered = () => (center().name ? (center() as { schema: string; name: string; kind: string }) : null);
   const [ddl] = createResource(centered, async (c) => {
     try {
       props.onBeforeMetadata?.();
-      return { ok: await invoke<string>("object_ddl", { connectionId: props.connectionId, kind: c.kind, schema: c.schema, name: c.name }) };
+      return { ok: await commands.objectDdl(props.connectionId, c.kind, c.schema, c.name) };
     } catch (e) {
       return { err: errMsg(e) };
     }
@@ -123,14 +124,14 @@ export function DdlGraphDialog(props: {
   const [rels] = createResource(centered, async (c) => {
     try {
       props.onBeforeMetadata?.();
-      return readRelationships(await invoke<unknown>("table_relationships", { connectionId: props.connectionId, schema: c.schema, name: c.name }));
+      return readRelationships(await commands.tableRelationships(props.connectionId, c.schema, c.name));
     } catch (e) {
       return { kind: "error", message: errMsg(e) } as ValueLoad<never>;
     }
   });
   const [detail] = createResource(centered, async (c) => {
     try {
-      return readDetailColumns(await invoke<unknown>("table_detail", { connectionId: props.connectionId, schema: c.schema, name: c.name }));
+      return readDetailColumns(await commands.tableDetail(props.connectionId, c.schema, c.name));
     } catch (e) {
       return { kind: "error", message: errMsg(e) } as ValueLoad<never>;
     }
@@ -139,7 +140,7 @@ export function DdlGraphDialog(props: {
     () => (scope() === "schema" ? center().schema : null),
     async (schema) => {
       try {
-        return readSchemaGraph(await invoke<unknown>("schema_relationships", { connectionId: props.connectionId, schema }));
+        return readSchemaGraph(await commands.schemaRelationships(props.connectionId, schema));
       } catch (e) {
         return { kind: "error", message: errMsg(e) } as SchemaGraphLoad;
       }

@@ -1,5 +1,5 @@
 import { getVersion } from "@tauri-apps/api/app";
-import { invoke } from "@tauri-apps/api/core";
+import { commands } from "./commands";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ErrorBoundary, Show, createEffect, createSignal, onCleanup, onMount, type JSX } from "solid-js";
 import { crashConsent, setCrashConsent } from "./store";
@@ -113,17 +113,17 @@ function CapturedCrash(props: { source: string; reason: unknown; prior?: boolean
     if (props.prior) return;
     if (crashConsent() !== "on") {
       // Consent off/unset still shows the contained error, but retains no details on disk.
-      void invoke("crash_report_clear").catch(() => undefined);
+      void commands.crashReportClear().catch(() => undefined);
       return;
     }
     void getVersion()
       .then((version) => {
         const next = formatFrontendCrash(props.source, props.reason, version);
         setReport(next);
-        return invoke("crash_report_write", { report: next });
+        return commands.crashReportWrite(next);
       })
       .catch(() => {
-        void invoke("crash_report_write", { report: report() }).catch(() => undefined);
+        void commands.crashReportWrite(report()).catch(() => undefined);
       });
   });
 
@@ -151,7 +151,7 @@ export function CrashGuard(props: { children: JSX.Element }) {
 
   const clear = (after?: () => void) => {
     setUnexpected(null);
-    void invoke("crash_report_clear").catch(() => undefined);
+    void commands.crashReportClear().catch(() => undefined);
     // Only a reset REMOUNTS the app; dismissing a prior-run report leaves it running.
     if (after) recovering = true;
     after?.();
@@ -159,13 +159,13 @@ export function CrashGuard(props: { children: JSX.Element }) {
 
   const discardPrior = () => {
     setPriorReport(null);
-    void invoke("crash_report_clear").catch(() => undefined);
+    void commands.crashReportClear().catch(() => undefined);
   };
 
   // Route a recovered prior-run report by consent: show it, or clear it quietly.
   const routePrior = (report: string) => {
     if (crashConsent() === "off") {
-      void invoke("crash_report_clear").catch(() => undefined);
+      void commands.crashReportClear().catch(() => undefined);
     } else if (crashConsent() === "on") {
       if (!unexpected()) setUnexpected({ source: "previous native run", reason: report, prior: true });
     } else {
@@ -187,12 +187,12 @@ export function CrashGuard(props: { children: JSX.Element }) {
     if (crashConsent() !== "off") return;
     setPriorReport(null);
     if (unexpected()?.prior) setUnexpected(null);
-    void invoke("crash_report_clear").catch(() => undefined);
+    void commands.crashReportClear().catch(() => undefined);
   });
 
   onMount(() => {
     if (crashConsent() !== "off") {
-      void invoke<string | null>("crash_report_get")
+      void commands.crashReportGet()
         .then((report) => {
           if (report) routePrior(report);
         })

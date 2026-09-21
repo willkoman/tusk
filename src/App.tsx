@@ -1,5 +1,15 @@
 import { batch, createSignal, createMemo, createEffect, on, onMount, onCleanup, untrack, For, Show, lazy } from "solid-js";
-import { invoke } from "@tauri-apps/api/core";
+import {
+  commands,
+  errorMessage,
+  type ConnectReply,
+  type ExportToFileArgs,
+  type FetchResult,
+  type Profile,
+  type SampleRows,
+  type SchemaGraphReply,
+  type TableExportResult,
+} from "./commands";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "./App.css";
@@ -73,9 +83,9 @@ import {
   type ImportTarget,
 } from "./import";
 import { pickOpenPath, pickSavePath, type PickedPath, type PickerOptions } from "./filePicker";
-import { Tree, type DbTree, type RelationDetail, type NodeDescriptor, nodeKey, relKey } from "./Tree";
+import { Tree, type RelationDetail, type NodeDescriptor, nodeKey, relKey } from "./Tree";
 import { ContextMenu, type MenuItem, type MenuState } from "./ContextMenu";
-import { bindBot, saveBinding, slackErrMsg, slackTone, startBotBound, stopBot, type SlackStatus } from "./slack/bind";
+import { bindBot, saveBinding, slackErrMsg, slackTone, startBotBound, stopBot, type SlackConfigInfo, type SlackStatus } from "./slack/bind";
 import { type DialogState } from "./WorkbenchDialogs";
 import { type DangerFacts } from "./forms/ConfirmDialog";
 import { type SettingsTab } from "./settings/SettingsDialog";
@@ -100,7 +110,6 @@ import {
   sshPayload,
   validateSshForm,
   type SshFormState,
-  type SshMeta,
 } from "./forms/SshSection";
 import { SshHostKeyDialog, type SshHostKeyPrompt } from "./forms/SshHostKeyDialog";
 import { detectPlan } from "./plan/detect";
@@ -130,10 +139,8 @@ import {
   claimFirstMount,
   shouldAutoConnect,
   stepConnection,
-  type Capabilities,
   type ConnectionState,
   type Connected,
-  type Permissions,
   type TableInfo,
 } from "./connections";
 import {
@@ -177,30 +184,6 @@ import {
   type TransactionStatus,
 } from "./transaction";
 
-type Profile = {
-  id: string;
-  name: string;
-  host: string;
-  port: number;
-  user: string;
-  dbname: string;
-  save_password: boolean;
-  sslmode?: string | null;
-  read_only: boolean;
-  default_connect: boolean;
-  driver?: string | null;
-  path?: string | null;
-  ssh?: SshMeta | null;
-  save_ssh_secret: boolean;
-  /** "dev" | "staging" | "prod"; null/absent = untagged. See src/environment.ts. */
-  environment?: string | null;
-};
-type QueryOutcome =
-  | { kind: "rows"; columns: string[]; rows: (string | null)[][]; done: boolean; note?: string }
-  | { kind: "exec"; message: string };
-type QueryResult = QueryOutcome & { transaction: TransactionStatus };
-type FetchResult = { rows: (string | null)[][]; done: boolean; interrupted?: boolean; transaction: TransactionStatus };
-type ConnectReply = { connection_id: string; server_version: string; read_only: boolean; viaSsh?: boolean };
 type UiOrigin = {
   connectionId: string | null;
   connectionGeneration: number;
@@ -233,10 +216,7 @@ const CommandPalette = lazy(() => import("./CommandPalette").then((m) => ({ defa
 const PlanView = lazy(() => import("./plan/PlanView").then((m) => ({ default: m.PlanView })));
 const DdlGraphDialog = lazy(() => import("./relviz/DdlGraphDialog").then((m) => ({ default: m.DdlGraphDialog })));
 
-function errMsg(e: unknown): string {
-  if (e && typeof e === "object" && "message" in e) return String((e as any).message);
-  return String(e);
-}
+const errMsg = errorMessage;
 
 /**
  * One row-count string for the whole app. Grouped thousands, a real plural, and
@@ -441,9 +421,7 @@ function App() {
         const hit = rt.sampleCache.get(key);
         if (hit) return hit;
         try {
-          const r = await invoke<{ columns: string[]; rows: (string | null)[][] }>("sample_rows", {
-            connectionId: c.id, schema: t.schema, name: t.name, limit: 5,
-          });
+          const r: SampleRows = await commands.sampleRows(c.id, t.schema, t.name, 5);
           if (!connectionOpen(c) || (stateOf(c.id)?.transaction.revision ?? -1) !== transactionRevision || frozenFor(c.id)) return null;
           const s: SampleTable = { schema: t.schema, name: t.name, columns: r.columns, rows: r.rows };
           rt.sampleCache.set(key, s);
@@ -595,7 +573,7 @@ function App() {
   const refreshSkills = async () => {
     const token = skillsGuard.mint();
     try {
-      const next = await invoke<Skill[]>("skills_list");
+      const next = await commands.skillsList();
       if (skillsGuard.current(token)) setSkills(next);
     } catch {
       if (skillsGuard.current(token)) setSkills([]);
@@ -1124,7 +1102,7 @@ function App() {
     // which fires this lint ~600ms later — it must not kill the stream it just opened.)
     if (!c || running() || activeRuntime()?.cursorOwner != null || metadataFrozen() || !prefs().serverLint) return [];
     try {
-      const diagnostics = await invoke<ServerDiag[]>("validate_sql", { connectionId: c.id, sql: sqlText, searchPath: activeTab().searchSchema });
+      const diagnostics = await commands.validateSql(c.id, sqlText, activeTab().searchSchema);
       return connectionOpen(c) && originCurrent(origin) ? diagnostics : [];
     } catch {
       return [];
@@ -1465,7 +1443,7 @@ function App() {
         switchTab(existing.id);
         return;
       }
-      const contents = await invoke<string>("read_text_file", { path });
+      const contents = await commands.readTextFile(path);
       if (!originCurrent(origin)) return;
       const openedWhileReading = tabs().find((t) => t.filePath === path);
       if (openedWhileReading) {
@@ -1533,7 +1511,7 @@ function App() {
       saveOperations.set(tabId, operation);
       // Atomic writes still race with each other. Serialize by destination so an
       // older save can never finish after, and overwrite, a newer invocation.
-      await fileWrites.run(filePath, () => invoke("write_text_file", { path: filePath, contents: text }));
+      await fileWrites.run(filePath, () => commands.writeTextFile(filePath, text));
       if (saveOperations.get(tabId) !== operation) return false;
       const current = tabs().find((x) => x.id === tabId);
       if (!current) return false;
@@ -2010,7 +1988,7 @@ function App() {
       // Fully-qualified statements — no search_path dependence. Multi-statement
       // scripts run in one transaction (rolled back wholesale on failure).
       const sqlText = cv.script.map((s) => s + ";").join("\n");
-      const out = await invoke<QueryResult>("run_query", { connectionId: c.id, ownerId: tabId, sql: sqlText, pageSize: PAGE, searchPath: null });
+      const out = await commands.runQuery({ connectionId: c.id, ownerId: tabId, sql: sqlText, pageSize: PAGE, searchPath: null });
       const accepted = applyAuthoritativeTransaction(c, out.transaction, "grid_apply", before);
       const source = tabs().find((tab) => tab.id === tabId);
       if (!accepted || transaction().revision !== out.transaction.revision || !connectionOpen(c) ||
@@ -2132,7 +2110,7 @@ function App() {
   });
   async function refreshSlackAutostart() {
     try {
-      const info = await invoke<{ config: { enabled?: boolean; boundProfileId?: string | null }; hasBotToken?: boolean; hasAppToken?: boolean }>("slack_load_config");
+      const info: SlackConfigInfo = await commands.slackLoadConfig();
       setSlackAutostart({
         enabled: info.config?.enabled === true,
         profileId: info.config?.boundProfileId || null,
@@ -2229,11 +2207,11 @@ function App() {
     if (!auto.enabled || !auto.profileId || !profileId || auto.profileId !== profileId) return;
     const status = slackStatus();
     if (status.running) {
-      if (!status.connectionId) await invoke("slack_set_connection", { connectionId }).catch(() => {});
+      if (!status.connectionId) await commands.slackSetConnection(connectionId).catch(() => {});
       return;
     }
     // Failures publish their reason through `slack:status`; the badge and Settings show it.
-    await invoke("slack_start", { connectionId }).catch(() => {});
+    await commands.slackStart(connectionId).catch(() => {});
   }
   /** Connections offered as the Slack bot's target (Settings → Slack picker). */
   const slackConnectionOptions = () =>
@@ -2324,7 +2302,7 @@ function App() {
       if (importBusy() && importOrigin?.connection.id === c.id) continue;
       if (commitBusy() && commitView()?.origin.connectionId === c.id) continue;
       try {
-        const status = await invoke<TransactionStatus>("transaction_status", { connectionId: c.id });
+        const status = await commands.transactionStatus(c.id);
         if (connectionOpen(c)) applyAuthoritativeTransaction(c, status);
       } catch {
         /* The next transaction-aware command will surface a connection failure. */
@@ -2467,7 +2445,7 @@ function App() {
       /* Slack audit events unavailable */
     }
     const statusToken = slackStatusGuard.mint();
-    void invoke<SlackStatus>("slack_status")
+    void commands.slackStatus()
       .then((current) => {
         if (!slackStatusGuard.current(statusToken)) return;
         setSlackStatus(current);
@@ -2597,7 +2575,7 @@ function App() {
 
   async function loadProfiles() {
     try {
-      setProfiles(await invoke<Profile[]>("list_profiles"));
+      setProfiles(await commands.listProfiles());
     } catch (e) {
       setProfiles([]);
       setConnErr(`Could not load saved profiles: ${errMsg(e)}`);
@@ -2732,7 +2710,7 @@ function App() {
         recoveryKeys.delete(r.connection_id);
         slackHistoryKeys.delete(r.connection_id);
         lastTabByConn.delete(r.connection_id);
-        void invoke("disconnect", { connectionId: r.connection_id }).catch(() => {});
+        void commands.disconnect(r.connection_id).catch(() => {});
       }
       throw e;
     }
@@ -2860,20 +2838,20 @@ function App() {
     } finally {
       restoring = false;
     }
-    void invoke("set_active_connection", { connectionId: connected.id }).catch(() => {});
+    void commands.setActiveConnection(connected.id).catch(() => {});
     // Slack starts here, not at launch: it is armed for one saved connection and this is
     // the moment that connection exists. Never "whichever connection opened first".
     void slackAutostartFor(connected.id, meta.profileId);
 
     try {
-      const status = await invoke<TransactionStatus>("transaction_status", { connectionId: r.connection_id });
+      const status = await commands.transactionStatus(r.connection_id);
       if (!connectionOpen(connected)) return;
       applyAuthoritativeTransaction(connected, status);
     } catch {
       if (!connectionOpen(connected)) return;
     }
     try {
-      const next = await invoke<Capabilities>("capabilities", { connectionId: r.connection_id });
+      const next = await commands.capabilities(r.connection_id);
       if (!connectionOpen(connected)) return;
       patchConn(connected.id, { caps: next });
     } catch {
@@ -2884,7 +2862,7 @@ function App() {
     // is streaming yet). Drives the Explain action's wrapping.
     if (connectionKindOf(stateOf(connected.id)) === "duckdb") {
       try {
-        const probe = await invoke<QueryResult>("run_query", { connectionId: r.connection_id, ownerId: restoredTabs[restoredActive]?.id ?? restoredTabs[0].id, sql: "EXPLAIN (FORMAT json) SELECT 1", pageSize: PAGE, searchPath: null });
+        const probe = await commands.runQuery({ connectionId: r.connection_id, ownerId: restoredTabs[restoredActive]?.id ?? restoredTabs[0].id, sql: "EXPLAIN (FORMAT json) SELECT 1", pageSize: PAGE, searchPath: null });
         applyAuthoritativeTransaction(connected, probe.transaction);
         if (!connectionOpen(connected)) return;
         patchConn(connected.id, { duckJsonExplain: true });
@@ -2962,7 +2940,7 @@ function App() {
         ? basename(submittedPath || ":memory:")
         : submittedDatabase || submittedHost;
       await connectWithHostKeyPrompt(async () => {
-        const r = await invoke<ConnectReply>("connect", { config });
+        const r = await commands.connect(config);
         await afterConnect(r, { key: submittedKey, legacyKey: submittedLegacyKey, target: submittedTarget, origin: isFile ? "" : submittedHost, environment: submittedEnvironment, name: submittedName, driver: submittedDriver, profileId: null });
       });
     } catch (e) {
@@ -3002,7 +2980,7 @@ function App() {
         ? isEmbeddedDriver(profile.driver) ? "" : profile.host
         : "";
       await connectWithHostKeyPrompt(async () => {
-        const r = await invoke<ConnectReply>("connect_profile", { id });
+        const r = await commands.connectProfile(id);
         await afterConnect(r, { key: `profile:${id}`, legacyKey: null, target, origin, environment: parseEnvironment(profile?.environment), name: profile?.name, driver: profile?.driver ?? "postgres", profileId: id });
       });
       return "";
@@ -3029,8 +3007,8 @@ function App() {
         if (problem) throw new Error(problem);
       }
       const saveSshSecret = !!sshState?.enabled && sshState.saveSecret && sshNeedsSecret(sshState.auth);
-      const p = await invoke<Profile>("save_profile", {
-        profile: {
+      const p = await commands.saveProfile(
+        {
           id: editingId(),
           name: name() || (embedded ? basename(path() || ":memory:") : host()),
           host: host(),
@@ -3048,9 +3026,9 @@ function App() {
           ssh: sshState ? sshPayload(sshState, false) : null,
           save_ssh_secret: saveSshSecret,
         },
-        password: !embedded && savePassword() && password() ? password() : null,
-        sshSecret: saveSshSecret && sshState?.secret ? sshState.secret : null,
-      });
+        !embedded && savePassword() && password() ? password() : null,
+        saveSshSecret && sshState?.secret ? sshState.secret : null,
+      );
       setEditingId(p.id);
       setSshSecretStored(!!p.ssh && p.save_ssh_secret && sshNeedsSecret(p.ssh.auth));
       await loadProfiles();
@@ -3074,7 +3052,7 @@ function App() {
   async function deleteProfile(id: string) {
     setConfirmDeleteProfile(null);
     try {
-      await invoke("delete_profile", { id });
+      await commands.deleteProfile(id);
       if (editingId() === id) newProfile();
       await loadProfiles();
     } catch (e) {
@@ -3141,7 +3119,7 @@ function App() {
     // open on failure; users can save files or retry once storage is available.
     if (!saved.ok && snapshot.tabs.some((tab) => tab.dirty)) return false;
     try {
-      await invoke("disconnect", { connectionId });
+      await commands.disconnect(connectionId);
     } catch (e) {
       const embedded = transactionFromError(e);
       if (embedded) applyAuthoritativeTransaction(c, embedded);
@@ -3264,7 +3242,7 @@ function App() {
   // Slack bot binds to, and the fallback for anything not already pinned to an id.
   createEffect(() => {
     const id = activeConnectionId();
-    if (id) void invoke("set_active_connection", { connectionId: id }).catch(() => {});
+    if (id) void commands.setActiveConnection(id).catch(() => {});
   });
 
 
@@ -3308,7 +3286,7 @@ function App() {
     patchConn(c.id, { schemaLoading: true });
     rt.sampleCache.clear(); // schema (and likely data) may have changed - drop stale AI samples
     try {
-      const t = await invoke<DbTree>("db_tree", { connectionId: c.id });
+      const t = await commands.dbTree(c.id);
       if (!isCurrent()) return;
       patchConn(c.id, { tree: t });
       // Prune cached detail for relations that no longer exist (dropped / renamed),
@@ -3323,7 +3301,7 @@ function App() {
       void loadTables(c, operation);
       void refreshLoadedDetails(c, operation);
       // Refresh effective privileges alongside the tree (grants/ownership can change).
-      invoke<Permissions>("permissions", { connectionId: c.id })
+      commands.permissions(c.id)
         .then((p) => { if (isCurrent()) patchConn(c.id, { perms: p }); })
         .catch(() => { if (isCurrent()) patchConn(c.id, { perms: null }); });
     } catch (e) {
@@ -3345,7 +3323,7 @@ function App() {
     const isCurrent = () => connectionOpen(c) && rt.schemaGeneration === operation
       && (stateOf(c.id)?.transaction.revision ?? -1) === transactionRevision && !frozenFor(c.id);
     try {
-      const tables = await invoke<TableInfo[]>("list_schema", { connectionId: c.id });
+      const tables = await commands.listSchema(c.id);
       if (!isCurrent()) return;
       patchConn(c.id, { schema: tables });
     } catch (e) {
@@ -3353,7 +3331,7 @@ function App() {
       console.error(e);
     }
     try {
-      const names = await invoke<string[]>("list_functions", { connectionId: c.id });
+      const names = await commands.listFunctions(c.id);
       if (!isCurrent()) return;
       patchConn(c.id, { funcs: new Set(names.map((n) => n.toLowerCase())) });
     } catch {
@@ -3391,7 +3369,7 @@ function App() {
     if (rt.fkInFlight.has(inflightKey)) return;
     rt.fkInFlight.add(inflightKey);
     try {
-      const g = await invoke<{ tables: unknown[]; edges: FkEdge[] }>("schema_relationships", { connectionId: c.id, schema: schemaName });
+      const g: SchemaGraphReply = await commands.schemaRelationships(c.id, schemaName);
       if (!connectionOpen(c) || rt.fkGeneration !== generation
         || (stateOf(c.id)?.transaction.revision ?? -1) !== transactionRevision || frozenFor(c.id)) return;
       // Mark fetched ONLY on success. `fksKnown` (which gates the AI prompt's "this schema
@@ -3424,11 +3402,7 @@ function App() {
     rt.detailInflight.add(inflightKey);
     interruptStream("Expanding a relation closed the result stream", c.id);
     try {
-      const d = await invoke<RelationDetail>("table_detail", {
-        connectionId: c.id,
-        schema: schemaName,
-        name,
-      });
+      const d = await commands.tableDetail(c.id, schemaName, name);
       if (!connectionOpen(c) || rt.schemaGeneration !== generation
         || (stateOf(c.id)?.transaction.revision ?? -1) !== transactionRevision || frozenFor(c.id)) return;
       rt.loadedRels.set(key, { schema: schemaName, name });
@@ -3579,7 +3553,7 @@ function App() {
         } catch { /* read-only grid until the detail loads later */ }
         if (!isCurrent()) return false;
       }
-      const out = await invoke<QueryResult>("run_query", { connectionId: c.id, ownerId: runTabId, sql: sqlToRun, pageSize: PAGE, searchPath: runSchema });
+      const out = await commands.runQuery({ connectionId: c.id, ownerId: runTabId, sql: sqlToRun, pageSize: PAGE, searchPath: runSchema });
       expectedTransactionRevision = out.transaction.revision;
       const accepted = applyAuthoritativeTransaction(c, out.transaction, event, before);
       if (!accepted || !isCurrent()) return false;
@@ -4049,7 +4023,7 @@ function App() {
       txOf().revision === expectedTransactionRevision;
     patchConn(c.id, { fetchingMore: true });
     try {
-      const r = await invoke<FetchResult>("fetch_more", { connectionId: c.id, ownerId: id, pageSize: PAGE });
+      const r: FetchResult = await commands.fetchMore(c.id, id, PAGE);
       expectedTransactionRevision = r.transaction.revision;
       if (!applyAuthoritativeTransaction(c, r.transaction, "statement", before) || !isCurrent()) return;
       // Read the captured tab's rows (the user may have switched tabs during the fetch).
@@ -4141,7 +4115,7 @@ function App() {
     if (!originCurrent(src.origin, true)) return false;
     if (src.origin.tabId) patchResult(src.origin.tabId, { status: "Exporting…" });
     const inline = scope === "selection" ? src.selectionRows : src.rows;
-    const args =
+    const args: ExportToFileArgs =
       scope === "all"
         ? { connectionId: src.connectionId, sql: src.query, options: opts, path, searchPath: src.searchSchema }
         : { connectionId: src.connectionId, columns: src.columns, rows: inline, options: opts, path };
@@ -4164,7 +4138,7 @@ function App() {
     };
     if (scope === "all") interruptStream("All-rows export closed the result stream", src.connectionId);
     try {
-      const n = await invoke<number>("export_to_file", args);
+      const n = await commands.exportToFile(args);
       exportHistory("ok", n, null);
       if (originCurrent(src.origin, true) && src.origin.tabId) patchResult(src.origin.tabId, { status: `Exported ${n} rows to ${path}` });
       return true;
@@ -4247,7 +4221,7 @@ function App() {
     const t0 = performance.now();
     setBackupBusy(true);
     try {
-      const summary = await invoke<BackupSummary>("backup_to_file", backupPayload(c.id, path, opts));
+      const summary = await commands.backupToFile(c.id, path, backupPayload(c.id, path, opts).options);
       recordHistory({
         sql: `-- [Backup] ${opts.scope}/${opts.content} → ${path}`,
         durationMs: Math.round(performance.now() - t0),
@@ -4275,7 +4249,7 @@ function App() {
   async function pickRestoreFile(): Promise<BackupFileInfo | null> {
     const path = await chooseOpenPath({ filters: [{ name: "SQL", extensions: ["sql"] }] });
     if (!path) return null;
-    return invoke<BackupFileInfo>("read_backup_header", { path });
+    return commands.readBackupHeader(path);
   }
 
   async function runRestore(path: string, opts: RestoreOptions): Promise<RestoreSummary> {
@@ -4298,7 +4272,7 @@ function App() {
       }, c.key);
     setRestoreBusy(true);
     try {
-      const summary = await invoke<RestoreSummary>("restore_from_file", { connectionId: c.id, path, options: opts });
+      const summary = await commands.restoreFromFile(c.id, path, opts);
       entry(
         summary.cancelled ? "cancelled" : summary.statementsFailed ? "error" : "ok",
         summary.rowsCopied,
@@ -4327,7 +4301,7 @@ function App() {
     if (!connectionId || !entry) return;
     const c = entry.conn;
     try {
-      const status = await invoke<TransactionStatus>("cancel_operation", { connectionId, ownerId });
+      const status = await commands.cancelOperation(connectionId, ownerId);
       applyAuthoritativeTransaction(c, status);
     } catch (e) {
       // A rejected cancel means no unwind will ever reset the Cancelling… state or
@@ -4402,7 +4376,7 @@ function App() {
 
   /** Parse the head of a file in Rust. No connection is involved. */
   function previewImport(path: string, options: ImportOptions): Promise<ImportPreview> {
-    return invoke<ImportPreview>("import_preview", { path, options });
+    return commands.importPreview(path, options);
   }
 
   /** Target-table columns for the mapping step (cached tree detail where possible). */
@@ -4445,12 +4419,7 @@ function App() {
     setImportProgress(null);
     interruptStream("Import closed the result stream", c.id);
     try {
-      const summary = await invoke<ImportSummary>("import_from_file", {
-        connectionId: c.id,
-        path,
-        options,
-        target,
-      });
+      const summary = await commands.importFromFile(c.id, path, options, target);
       recordHistory({
         sql: `-- [Import] ${path} → ${label} (${summary.rowsInserted} rows)`,
         durationMs: Math.round(performance.now() - t0),
@@ -4546,10 +4515,7 @@ function App() {
     const t0 = performance.now();
     setExportTablesBusy(true);
     try {
-      const results = await invoke<{ schema: string; name: string; path: string; rows: number; error: string }[]>(
-        "export_tables",
-        { connectionId: src.connectionId, tables, options, directory },
-      );
+      const results: TableExportResult[] = await commands.exportTables(src.connectionId, tables, options, directory);
       const ok = results.filter((r) => !r.error).length;
       recordHistory({
         sql: `-- [Export] ${options.format} → ${directory} (${ok}/${results.length} tables)`,
@@ -4666,7 +4632,7 @@ function App() {
     const fkGuard = ddl.isSqliteRebuild(sqlText);
     const foreignKeys = async (on: boolean): Promise<string | null> => {
       try {
-        await invoke("run_query", {
+        await commands.runQuery({
           connectionId: c.id,
           ownerId: origin.tabId ?? activeTabId(),
           sql: `PRAGMA foreign_keys=${on ? "ON" : "OFF"}`,
@@ -4686,7 +4652,7 @@ function App() {
       }
     }
     try {
-      const out = await invoke<QueryResult>("run_query", { connectionId: c.id, ownerId: origin.tabId ?? activeTabId(), sql: sqlText, pageSize: PAGE, searchPath: null });
+      const out = await commands.runQuery({ connectionId: c.id, ownerId: origin.tabId ?? activeTabId(), sql: sqlText, pageSize: PAGE, searchPath: null });
       ddlHistory("ok", null);
       if (!applyAuthoritativeTransaction(c, out.transaction, "statement", before)) return { ok: false, error: "Stale transaction response" };
       if (!connectionOpen(c) || !originCurrent(origin)) return { ok: false, error: "Connection or tab changed" };
@@ -4765,12 +4731,7 @@ function App() {
     const origin = captureOrigin();
     interruptStream("Reading object DDL closed the result stream", c.id);
     try {
-      const dd = await invoke<string>("object_ddl", {
-        connectionId: c.id,
-        kind: n.kind,
-        schema: n.schema ?? "",
-        name: n.name,
-      });
+      const dd = await commands.objectDdl(c.id, n.kind, n.schema ?? "", n.name);
       if (!connectionOpen(c) || !originAlive(origin) || !origin.tabId) return;
       if (toEditor) scaffoldEditor(dd, origin.tabId);
       else copyText(dd, "copied DDL", origin);
@@ -5259,11 +5220,11 @@ function App() {
   }
   async function duplicateProfile(p: Profile) {
     try {
-      await invoke("save_profile", {
-        profile: { id: "", name: `${p.name} copy`, host: p.host, port: p.port, user: p.user, dbname: p.dbname, save_password: false, sslmode: p.sslmode, read_only: p.read_only, default_connect: false, environment: p.environment ?? null, driver: p.driver ?? "postgres", path: p.path ?? null, ssh: p.ssh ?? null, save_ssh_secret: false },
-        password: null,
-        sshSecret: null,
-      });
+      await commands.saveProfile(
+        { id: "", name: `${p.name} copy`, host: p.host, port: p.port, user: p.user, dbname: p.dbname, save_password: false, sslmode: p.sslmode, read_only: p.read_only, default_connect: false, environment: p.environment ?? null, driver: p.driver ?? "postgres", path: p.path ?? null, ssh: p.ssh ?? null, save_ssh_secret: false },
+        null,
+        null,
+      );
       await loadProfiles();
     } catch (e) {
       setConnErr(errMsg(e));
@@ -5271,7 +5232,7 @@ function App() {
   }
   async function setProfileDefault(p: Profile, val: boolean) {
     try {
-      await invoke("save_profile", { profile: { ...p, default_connect: val }, password: null, sshSecret: null });
+      await commands.saveProfile({ ...p, default_connect: val }, null, null);
       await loadProfiles();
     } catch (e) {
       setConnErr(errMsg(e));
@@ -6550,7 +6511,7 @@ function App() {
                   const d = src().ddl!;
                   if (metadataFrozen()) return "";
                   interruptStream("Reading object DDL closed the result stream", src().connectionId);
-                  return await invoke<string>("object_ddl", { connectionId: src().connectionId, kind: d.kind, schema: d.schema, name: d.name });
+                  return await commands.objectDdl(src().connectionId, d.kind, d.schema, d.name);
                 }
                 : undefined}
               onClose={() => setExportSrc(null)}
@@ -6811,11 +6772,7 @@ function App() {
             onTrust={async () => {
               const { prompt, retry } = p();
               try {
-                await invoke("ssh_trust_host", {
-                  host: prompt.host,
-                  port: prompt.port,
-                  fingerprint: prompt.fingerprint,
-                });
+                await commands.sshTrustHost(prompt.host, prompt.port, prompt.fingerprint);
               } catch (e) {
                 setSshPrompt(null);
                 setConnErr(errMsg(e));

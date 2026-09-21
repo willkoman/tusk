@@ -8,8 +8,8 @@
 // non-token control saves as it changes; the token section keeps explicit Save/Test.
 
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
-import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { commands } from "../commands";
 import { StaleGuard } from "../staleGuard";
 import { activeBaseUrl, aiStore, defaultModel, isKeyless, resolveBaseUrl, resolveWire, type AiConfig, type AiProvider } from "../ai/store";
 import {
@@ -25,7 +25,6 @@ import {
   startBotBound,
   stopBot,
   type SlackConfig,
-  type SlackConfigInfo,
   type SlackConnectionOption,
   type SlackStatus,
 } from "../slack/bind";
@@ -86,7 +85,7 @@ export function SlackPane(props: {
     unsubscribeAi = aiStore.subscribe(setAi);
     void (async () => {
       try {
-        const info = await slackIo.run("io", () => invoke<SlackConfigInfo>("slack_load_config"));
+        const info = await slackIo.run("io", () => commands.slackLoadConfig());
         if (!statusGuard.alive) return;
         const loaded = normalizeSlackConfig(info.config);
         setCfg(loaded);
@@ -119,7 +118,7 @@ export function SlackPane(props: {
       }
       const token = statusGuard.mint();
       try {
-        const current = await invoke<SlackStatus>("slack_status");
+        const current = await commands.slackStatus();
         if (statusGuard.current(token)) setStatus(current);
       } catch {
         /* ignore */
@@ -148,7 +147,7 @@ export function SlackPane(props: {
         return;
       }
       try {
-        const info = await slackIo.run("io", () => invoke<SlackConfigInfo>("slack_load_config"));
+        const info = await slackIo.run("io", () => commands.slackLoadConfig());
         if (!statusGuard.alive) return;
         const loaded = normalizeSlackConfig(info.config);
         setCfg(loaded);
@@ -187,14 +186,14 @@ export function SlackPane(props: {
       aiAllowNoKey: isKeyless(provider),
     };
     try {
-      await invoke("slack_save_config", {
+      await commands.slackSaveConfig(
         config,
-        botToken: (includeTokens && botToken().trim()) || null,
-        appToken: (includeTokens && appToken().trim()) || null,
-      });
+        (includeTokens && botToken().trim()) || null,
+        (includeTokens && appToken().trim()) || null,
+      );
       // Read-after-write catches stale controlled-input values and serialization/
       // persistence failures before the UI claims success.
-      const verified = await invoke<SlackConfigInfo>("slack_load_config");
+      const verified = await commands.slackLoadConfig();
       const persisted = normalizeSlackConfig(verified.config);
       if (!slackConfigMatches(config, persisted)) {
         throw new Error("Slack settings did not reload unchanged.");
@@ -215,7 +214,7 @@ export function SlackPane(props: {
   };
 
   const disableAfterRestartFailure = async (message: string) => {
-    await invoke("slack_stop").catch(() => {});
+    await commands.slackStop().catch(() => {});
     patch({ enabled: false });
     const disabled = await save({ enabled: false });
     setNote(disabled
@@ -282,10 +281,10 @@ export function SlackPane(props: {
     try {
       saved = await save();
       if (!saved) return;
-      const team = await invoke<string>("slack_test");
+      const team = await commands.slackTest();
       tokensValidated = true;
       if (wasRunning && saved.tokensChanged) {
-        await invoke("slack_start", { connectionId: status().connectionId ?? props.activeConnectionId?.() ?? null });
+        await commands.slackStart(status().connectionId ?? props.activeConnectionId?.() ?? null);
         setNote(`Tokens valid for workspace “${team}”. Bot restarted.`);
       } else {
         setNote(`Tokens valid for workspace “${team}”.`);
@@ -311,8 +310,8 @@ export function SlackPane(props: {
     if (saved) {
       if (wasRunning && saved.tokensChanged) {
         try {
-          await invoke("slack_test");
-          await invoke("slack_start", { connectionId: status().connectionId ?? props.activeConnectionId?.() ?? null });
+          await commands.slackTest();
+          await commands.slackStart(status().connectionId ?? props.activeConnectionId?.() ?? null);
           setNote("Saved and validated. Bot restarted.");
         } catch (e) {
           await disableAfterRestartFailure(`Saved, but the restart failed: ${errMsg(e)} Bot stopped and disabled.`);

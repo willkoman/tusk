@@ -9,7 +9,7 @@
 // takes a `persist` callback: the pane passes its mirroring save, the badge menu
 // passes `saveBinding`, which patches the two fields and leaves the rest as loaded.
 
-import { invoke } from "@tauri-apps/api/core";
+import { commands } from "../commands";
 import { normalizeMaxTokens } from "../ai/store";
 import { KeyedSerialQueue } from "../asyncQueue";
 
@@ -133,10 +133,10 @@ export class PersistFailed extends Error {
  */
 export const saveBinding: Persist = (patch) =>
   slackIo.run("io", async () => {
-    const info = await invoke<SlackConfigInfo>("slack_load_config");
+    const info = await commands.slackLoadConfig();
     const config: SlackConfig = { ...normalizeSlackConfig(info.config), ...patch };
-    await invoke("slack_save_config", { config, botToken: null, appToken: null });
-    const verified = normalizeSlackConfig((await invoke<SlackConfigInfo>("slack_load_config")).config);
+    await commands.slackSaveConfig(config, null, null);
+    const verified = normalizeSlackConfig((await commands.slackLoadConfig()).config);
     if (!slackConfigMatches(config, verified)) throw new Error("Slack settings did not reload unchanged.");
     return verified;
   });
@@ -162,12 +162,12 @@ export const startedNote = (connectionId: string | null, profileId: string | nul
  */
 export async function startBotBound(connectionId: string | null, profileId: string | null, persist: Persist): Promise<string> {
   await ensure(persist, { enabled: false, boundProfileId: profileId });
-  await invoke("slack_test");
-  await invoke("slack_start", { connectionId });
+  await commands.slackTest();
+  await commands.slackStart(connectionId);
   try {
     await ensure(persist, { enabled: true, boundProfileId: profileId });
   } catch {
-    await invoke("slack_stop").catch(() => {});
+    await commands.slackStop().catch(() => {});
     await persist({ enabled: false }).catch(() => {});
     throw new Error("Could not save the enabled setting. Bot stopped and disabled.");
   }
@@ -177,7 +177,7 @@ export async function startBotBound(connectionId: string | null, profileId: stri
 /** Persist Off first, then stop, so disk never says "on" over a stopped bot. */
 export async function stopBot(persist: Persist): Promise<string> {
   await ensure(persist, { enabled: false });
-  await invoke("slack_stop");
+  await commands.slackStop();
   return "Bot stopped.";
 }
 
@@ -186,7 +186,7 @@ export async function stopBot(persist: Persist): Promise<string> {
  * connection's profile so the next launch waits for the one it actually answers on.
  */
 export async function repointBot(connectionId: string, profileId: string | null, persist: Persist): Promise<string> {
-  await slackIo.run("io", () => invoke("slack_set_connection", { connectionId }));
+  await slackIo.run("io", () => commands.slackSetConnection(connectionId));
   await ensure(persist, { boundProfileId: profileId });
   return profileId
     ? "Bot repointed. Applies from the next question."

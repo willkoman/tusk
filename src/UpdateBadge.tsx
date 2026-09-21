@@ -1,5 +1,5 @@
 import { createSignal, onMount, onCleanup, Show } from "solid-js";
-import { invoke } from "@tauri-apps/api/core";
+import { commands } from "./commands";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 
@@ -47,7 +47,7 @@ export function UpdateBadge() {
     };
     void (async () => {
       try {
-        if ((await invoke<string>("distribution_channel")) !== "direct") return;
+        if ((await commands.distributionChannel()) !== "direct") return;
       } catch {
         /* no answer (older backend, browser preview): check as before */
       }
