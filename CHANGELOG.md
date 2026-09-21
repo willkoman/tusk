@@ -6,6 +6,7 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ### Changed
 - **History records a cancelled export, import or backup as cancelled.** Every action that reaches a server now goes through one shared run path in the workbench, so a cancel is logged as *cancelled* rather than *error* everywhere (the editor already did this), the transaction status a reply carries is applied the same way for every action, and a frozen session is refused before the result stream is released, so refusing a backup or an all-rows export during a manual transaction no longer marks the tab's loaded rows incomplete. No visible change otherwise.
+- **A MySQL executable comment is not a read.** On a read-only MySQL connection, a single statement carrying a `/*! … */` executable comment is now refused like a script or a Slack query carrying one already was: the server runs the body, and the read-only scan cannot see inside it.
 
 ## [0.11.0] - 2026-09-15
 
