@@ -21,6 +21,13 @@ updates:
       time: "09:00"
       timezone: Etc/UTC
     open-pull-requests-limit: 5
+    ignore:
+      # duckdb 1.10500+ is the DuckDB 1.5 engine series under a new version scheme;
+      # Dependabot reads it as a minor bump. The crate stays on ~1.4 (see CLAUDE.md,
+      # driver.rs) until the engine upgrade is done deliberately with the conformance
+      # battery, so only patch releases flow through the weekly group.
+      - dependency-name: duckdb
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
     groups:
       cargo-minor-patch:
         patterns: ["*"]
