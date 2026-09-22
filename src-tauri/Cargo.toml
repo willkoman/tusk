@@ -36,7 +36,7 @@ native-tls = "0.2"
 postgres-native-tls = "0.5"
 bytes = "1"
 futures-util = "0.3"
-rust_xlsxwriter = { version = "0.95.0", features = ["constant_memory"] }
+rust_xlsxwriter = { version = "0.99.1", features = ["constant_memory"] }
 # xlsx READING for the import path (rust_xlsxwriter only writes). `dates` renders
 # date-formatted cells through chrono instead of leaving raw serial numbers.
 calamine = { version = "0.36", features = ["dates"] }
@@ -73,7 +73,7 @@ duckdb = { version = "~1.4", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Embedded SQLite. `bundled` statically compiles SQLite (small, fast) + `column_decltype`
 # for declared column types in introspection.
-rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
+rusqlite = { version = "0.40", features = ["bundled", "column_decltype"] }
 # MySQL (network). Pure-Rust async driver; its `Pool` is Send+Sync (avoids the
 # !Sync-connection problem) and its `Value` enum makes all-text extraction easy.
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls"] }
