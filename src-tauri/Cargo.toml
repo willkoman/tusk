@@ -36,7 +36,7 @@ native-tls = "0.2"
 postgres-native-tls = "0.5"
 bytes = "1"
 futures-util = "0.3"
-rust_xlsxwriter = { version = "0.95.0", features = ["constant_memory"] }
+rust_xlsxwriter = { version = "0.99.1", features = ["constant_memory"] }
 # xlsx READING for the import path (rust_xlsxwriter only writes). `dates` renders
 # date-formatted cells through chrono instead of leaving raw serial numbers.
 calamine = { version = "0.36", features = ["dates"] }
