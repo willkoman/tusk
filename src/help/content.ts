@@ -3575,6 +3575,19 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
+        "text": "v0.11.2 — dependency refresh",
+        "id": "v0-11-2"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Embedded SQLite is 3.53.2** (was 3.46.0); DuckDB stays on the 1.4 series on purpose.",
+          "**Drivers and runtime updated** — MySQL/MariaDB client, Excel export, SSH tunnel and async runtime libraries, plus the Tauri plugins and CodeMirror. No behaviour change intended; the five-engine conformance suite passes.",
+          "**Build toolchain** — Vite 8 and TypeScript 7; the shipped app is the same code."
+        ]
+      },
+      {
+        "k": "h",
         "text": "v0.11.1 — one run path, tidier headers",
         "id": "v0-11-1"
       },

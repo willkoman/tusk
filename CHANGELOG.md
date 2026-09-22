@@ -2,6 +2,13 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
+## [0.11.2] - 2026-09-22
+
+### Changed
+- **Embedded SQLite is now 3.53.2** (was 3.46.0), through rusqlite 0.40.2, so SQLite files get the last year of upstream fixes and query-planner work; DuckDB stays on the 1.4 series on purpose.
+- **Driver and runtime libraries updated.** MySQL/MariaDB client `mysql_async` 0.37.1, Excel export `rust_xlsxwriter` 0.99.1, `tokio` 1.53, `russh` 0.63.3 for SSH tunnels, and the Tauri updater/dialog/opener plugins; on the frontend, CodeMirror, SolidJS 1.9.15 and the Tauri JS plugins. No behaviour change is intended; the five-engine conformance suite passes on all of it.
+- **Build toolchain: Vite 8 (Rolldown) and TypeScript 7.** Faster production builds and type checks; the shipped bundle is the same code. Vitest moved to 4.1.11, which closes GHSA advisory `@vitest/mocker` (a dev-only path-traversal finding; nothing shipped was affected).
+
 ## [0.11.1] - 2026-09-21
 
 ### Fixed

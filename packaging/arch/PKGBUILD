@@ -11,7 +11,7 @@
 # release assets' sha256, run `makepkg --printsrcinfo > .SRCINFO`, and push.
 pkgname=tusk-bin
 _pkgname=tusk
-pkgver=0.11.1
+pkgver=0.11.2
 pkgrel=1
 pkgdesc="Fast, native, lightweight SQL client. Postgres-first."
 arch=('x86_64')
