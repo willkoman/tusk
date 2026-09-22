@@ -1,6 +1,6 @@
 {
   "name": "tusk",
-  "version": "0.11.1",
+  "version": "0.11.2",
   "description": "",
   "type": "module",
   "scripts": {
@@ -38,9 +38,9 @@
     "@tauri-apps/cli": "^2",
     "@testing-library/jest-dom": "^7.0.1",
     "jsdom": "^29.1.1",
-    "typescript": "~5.6.2",
-    "vite": "^6.0.3",
-    "vite-plugin-solid": "^2.11.0",
-    "vitest": "^4.1.8"
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0",
+    "vite-plugin-solid": "^2.11.14",
+    "vitest": "^4.1.11"
   }
 }

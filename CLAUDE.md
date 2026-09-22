@@ -7,7 +7,7 @@ This file is the source of truth for working in this repo. Keep it, `CHANGELOG.m
 ## Stack
 
 - **Shell:** Tauri v2 (system WebView2 / WKWebView / WebKitGTK — no bundled browser).
-- **Frontend:** SolidJS + TypeScript + Vite + CodeMirror 6.
+- **Frontend:** SolidJS + TypeScript 7 + Vite 8 (Rolldown bundler; `build.rollupOptions` is now `build.rolldownOptions`, and a module imported both statically and dynamically is reported as `INEFFECTIVE_DYNAMIC_IMPORT` — make it static) + CodeMirror 6.
 - **Backend:** Rust + `tokio-postgres` (text/simple protocol), `native-tls`, `keyring`; `duckdb`/`rusqlite` embedded, `mysql_async` and `tiberius-ng` (TDS) over the network, `russh` (SSH tunnels).
 
 ## Build / run / verify

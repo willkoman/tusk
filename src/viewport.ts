@@ -18,6 +18,8 @@
  */
 
 import { createSignal } from "solid-js";
+import { PhysicalSize } from "@tauri-apps/api/dpi";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 export type ViewportSize = { w: number; h: number };
 
@@ -143,10 +145,6 @@ export async function nudgeWindowLayout(): Promise<void> {
   try {
     await nextFrame();
     await nextFrame();
-    const [{ getCurrentWindow }, { PhysicalSize }] = await Promise.all([
-      import("@tauri-apps/api/window"),
-      import("@tauri-apps/api/dpi"),
-    ]);
     const win = getCurrentWindow();
     const [maximized, fullscreen] = await Promise.all([win.isMaximized(), win.isFullscreen()]);
     if (shouldNudge({ maximized, fullscreen, done: false })) {
