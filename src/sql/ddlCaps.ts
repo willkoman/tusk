@@ -115,6 +115,10 @@ export type DdlCaps = {
    *  not just the defaults that use it (PostgreSQL). The Explorer offers no Cascade box
    *  there: dropping a table must go through the table's own typed confirmation. */
   cascadeDropsTables: boolean;
+  /** Procedures and functions have SEPARATE namespaces (MySQL), so one name can be both:
+   *  the Explorer lists two routine nodes, and each must ask `object_ddl` for its own
+   *  type rather than for "function" (`definitionKind` in Tree.tsx). */
+  routineNamespaces: boolean;
   truncate: boolean;
   truncateOptions: boolean; // RESTART IDENTITY / CASCADE
   duplicate: "like" | "ctas"; // CREATE TABLE … (LIKE …) vs CTAS
@@ -176,6 +180,7 @@ const POSTGRES: DdlCaps = {
   partialIndex: true,
   cascade: true,
   cascadeDropsTables: false,
+  routineNamespaces: false,
   truncate: true,
   truncateOptions: true,
   duplicate: "like",
@@ -271,6 +276,7 @@ const MYSQL: DdlCaps = {
   partialIndex: false,
   cascade: false,
   cascadeDropsTables: false,
+  routineNamespaces: true,
   truncate: true,
   truncateOptions: false,
   duplicate: "like",
@@ -333,6 +339,7 @@ const SQLITE: DdlCaps = {
   partialIndex: true, // SQLite has had partial indexes since 3.8
   cascade: false,
   cascadeDropsTables: false,
+  routineNamespaces: false,
   truncate: false, // no TRUNCATE statement — DELETE FROM is the equivalent
   truncateOptions: false,
   duplicate: "ctas",

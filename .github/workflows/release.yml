@@ -137,6 +137,14 @@ jobs:
           prerelease: false
           args: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
+      # tauri-action builds and uploads in one step, so this can only run after the
+      # Windows assets reached the draft. A failure here fails the job, and the
+      # draft must not be published: that build's DuckDB can deadlock after an error.
+      - name: Check DuckDB was compiled with /EHsc
+        if: runner.os == 'Windows'
+        shell: bash
+        run: bash scripts/check-duckdb-ehsc.sh src-tauri/target/release
+
   # Linux is its own job because it builds inside a container. GitHub is retiring
   # the ubuntu-22.04 runner image (brownouts from 2026-09-17, removed 2027-04-17),
   # but 22.04 is still the right BASE SYSTEM: a Tauri app links against the host's

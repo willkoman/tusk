@@ -486,33 +486,49 @@ const DUCK_INTERRUPT_PREFIX: &str = "INTERRUPT Error:";
 /// `DuckConn::quarantine_poisoned` reported, if the failure also poisoned the
 /// connection.
 ///
-/// The frontend files an outcome as cancelled, not failed, only when its message says
-/// "cancel" (`isCancelMessage` in `src/operation.ts`, and the export dialog). PostgreSQL's
-/// "canceling statement due to user request" already does; DuckDB's interrupt does not,
-/// so it is renamed here. A quarantined connection keeps DuckDB's own wording instead:
-/// a cancelled outcome replaces the message with "Query cancelled", and the user must
-/// see that the connection or its in-memory data is gone.
+/// Every DuckDB run/fetch/script/import failure passes through here, so this is where
+/// it is settled whether the failure was a cancellation (`AppError.cancelled`, which
+/// the frontend files as cancelled rather than failed): an interrupt is one, a
+/// quarantine never is — a cancelled outcome replaces the message with "Query
+/// cancelled", and the user must see that the connection or its in-memory data is
+/// gone — and any other engine error is not, even one whose text says "cancel". An
+/// error that already knows (a cooperative import stop) keeps its answer. The
+/// interrupt is also renamed to say "cancel", for the frontend's message test on an
+/// error that a later `format!` strips the flag from.
 fn duck_failure(mut err: AppError, quarantine: Option<&str>) -> AppError {
     if let Some(hint) = quarantine {
         return AppError::new(format!(
             "{}. DuckDB left the connection unusable: {hint}",
             err.message
-        ));
+        ))
+        .with_cancelled(false);
     }
     if let Some(detail) = err.message.trim_start().strip_prefix(DUCK_INTERRUPT_PREFIX) {
         err.message = format!("query cancelled (DuckDB: {})", detail.trim());
+        err.cancelled = Some(true);
     }
+    err.cancelled.get_or_insert(false);
     err
 }
 
 fn duck_error_is_poison(error: &duckdb::Error) -> bool {
+    let message = error.to_string();
     // A normal statement error aborts a DuckDB manual transaction. Until ROLLBACK,
     // every probe reports this state; it is recoverable and must not be confused with
     // the libduckdb parser/interrupt poison that requires leaking the handle.
-    !error
-        .to_string()
+    if message
         .to_ascii_lowercase()
         .contains("current transaction is aborted")
+    {
+        return false;
+    }
+    // Nor is an interrupt that reached the probe itself. DuckDB clears the flag when a
+    // statement starts, so one only fails the probe by landing while it runs — a
+    // Cancel that arrived just after the query it meant to stop had already failed.
+    // The connection is healthy; leaking it (and an in-memory database's data) for
+    // that would turn a late click into data loss. A poisoned connection reports
+    // "resource deadlock would occur", never an interrupt.
+    !message.trim_start().starts_with(DUCK_INTERRUPT_PREFIX)
 }
 
 impl Drop for DuckConn {
@@ -1303,6 +1319,30 @@ impl Backend {
         }
     }
 
+    /// Every column default of the opened DuckDB database that mentions `nextval` or
+    /// `currval`: the sequence references a backup has to carry, read in one catalog
+    /// scan rather than one `table_detail` per dumped table (a schema of thousands of
+    /// tables made that pre-pass the slowest part of a dump). Other engines report
+    /// none — PostgreSQL resolves its sequences through `pg_depend`.
+    pub async fn duck_sequence_defaults(&self) -> Result<Vec<SequenceDefault>, AppError> {
+        let Backend::Duck(d) = self else {
+            return Ok(Vec::new());
+        };
+        // Backup reads this with Cancel armed. Bind first: quarantine_if_poisoned
+        // re-locks.
+        let read = duck_query(&d.lock(), DUCK_SEQUENCE_DEFAULTS);
+        let (_c, rows) = read.map_err(|e| d.quarantine_if_poisoned(e))?;
+        Ok(rows
+            .iter()
+            .map(|r| SequenceDefault {
+                schema: dcell(r, 0),
+                table: dcell(r, 1),
+                column: dcell(r, 2),
+                default: dcell(r, 3),
+            })
+            .collect())
+    }
+
     /// FK relationships of one relation (outbound + inbound). Best-effort:
     /// engines that can't answer return empty lists, never errors.
     pub async fn table_relationships(
@@ -1461,7 +1501,7 @@ impl Backend {
         name: &str,
     ) -> Result<Vec<MySqlRoutineDef>, AppError> {
         match self {
-            Backend::MySql(m) => mysql_routine_defs(&m.pool, "function", schema, name).await,
+            Backend::MySql(m) => mysql_routine_defs(&m.pool, "routine", schema, name).await,
             _ => Ok(Vec::new()),
         }
     }
@@ -1506,7 +1546,7 @@ impl Backend {
                 parts.extend(idx.iter().filter_map(|r| r.first().cloned().flatten()));
                 Ok(parts.join(";\n\n") + ";\n")
             }
-            Backend::MySql(m) if matches!(kind, "function" | "procedure") => {
+            Backend::MySql(m) if matches!(kind, "function" | "procedure" | "routine") => {
                 mysql_routine_ddl(&m.pool, kind, schema, name).await
             }
             Backend::MySql(m) => {
@@ -3444,8 +3484,8 @@ async fn mysql_build_tree(pool: &mysql_async::Pool) -> Result<tree::DbTree, AppE
     )
     .await?;
     // Stored procedures and functions. Both land in the Explorer's one "function" node
-    // kind with the routine type in `returns`, like SQL Server's; `relation_ddl` looks
-    // the type up again because the Explorer sends "function" for either. Best-effort,
+    // kind with the routine type in `returns`, like SQL Server's; the Explorer asks
+    // `relation_ddl` for that type, since one name can be both. Best-effort,
     // like DuckDB's macro listing: a MySQL-compatible server without stored routines
     // (Vitess, TiDB, …) may reject the view, and that must not take the whole tree down.
     // A server that rejects it has no routines for a backup to miss.
@@ -3486,10 +3526,12 @@ async fn mysql_build_tree(pool: &mysql_async::Pool) -> Result<tree::DbTree, AppE
     })
 }
 
-/// `SHOW CREATE PROCEDURE` / `SHOW CREATE FUNCTION` for one routine. The Explorer sends
-/// kind "function" for every routine, so that kind looks the type up in
-/// `information_schema.routines`. Procedures and functions have separate namespaces on
-/// MySQL, so one name can be both: then both definitions are returned, procedure first.
+/// `SHOW CREATE PROCEDURE` / `SHOW CREATE FUNCTION` for one routine. Procedures and
+/// functions have separate namespaces on MySQL, so one name can be both and the
+/// Explorer lists two nodes: each asks for its own type, kind "procedure" or
+/// "function" (from the tree's `returns`). Kind "routine" — a caller that does not
+/// know the type — looks it up in `information_schema.routines` and, for a name that
+/// is both, returns both definitions, procedure first.
 async fn mysql_routine_ddl(
     pool: &mysql_async::Pool,
     kind: &str,
@@ -3525,6 +3567,8 @@ async fn mysql_routine_defs(
 ) -> Result<Vec<MySqlRoutineDef>, AppError> {
     let types: Vec<&'static str> = if kind == "procedure" {
         vec!["PROCEDURE"]
+    } else if kind == "function" {
+        vec!["FUNCTION"]
     } else {
         let (_c, rows, _a) = mysql_run_params(
             pool,
@@ -5763,6 +5807,23 @@ fn dlit(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// A DuckDB column default that calls a sequence function (`Backend::duck_sequence_defaults`).
+pub struct SequenceDefault {
+    pub schema: String,
+    pub table: String,
+    pub column: String,
+    pub default: String,
+}
+
+/// Scoped to the opened database like every other catalog read here: an ATTACHED
+/// file's tables are not this dump's. The text filter only narrows the scan;
+/// `backup::duck_sequence_calls` decides what a default actually calls.
+const DUCK_SEQUENCE_DEFAULTS: &str = "SELECT schema_name, table_name, column_name, column_default \
+     FROM duckdb_columns() \
+     WHERE database_name = current_database() AND column_default IS NOT NULL \
+       AND (lower(column_default) LIKE '%nextval%' OR lower(column_default) LIKE '%currval%') \
+     ORDER BY schema_name, table_name, column_index";
+
 fn duck_build_tree(conn: &duckdb::Connection) -> Result<tree::DbTree, AppError> {
     let database = conn
         .query_row("SELECT current_database()", [], |r| r.get::<_, String>(0))
@@ -6712,6 +6773,53 @@ mod tests {
         );
     }
 
+    /// A Cancel inside a DuckDB manual transaction aborts the transaction, as a
+    /// PostgreSQL cancel does: until ROLLBACK every statement reports it, which the
+    /// probe reads as recoverable (Recovery required), not as poison. DuckDB has no
+    /// savepoints, so ROLLBACK is the only way out; the manual says so.
+    #[test]
+    fn duckdb_interrupt_aborts_a_manual_transaction() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t(a INTEGER); BEGIN; INSERT INTO t VALUES (1)")
+            .unwrap();
+        let handle = conn.interrupt_handle();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        // A query clears a pending interrupt when it starts: keep sending until it
+        // lands.
+        let interrupter = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Acquire) {
+                handle.interrupt();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+        let error = conn
+            .execute_batch("SELECT count(*) FROM range(100000000000) t(x) WHERE x % 7 = 3")
+            .unwrap_err();
+        stop.store(true, Ordering::Release);
+        interrupter.join().unwrap();
+        assert!(
+            error.to_string().starts_with(DUCK_INTERRUPT_PREFIX),
+            "{error}"
+        );
+        let probe = conn.execute_batch("SELECT 1").unwrap_err();
+        assert!(
+            probe
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("current transaction is aborted"),
+            "{probe}"
+        );
+        assert!(!duck_error_is_poison(&probe));
+        conn.execute_batch("ROLLBACK").unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "the transaction's insert was rolled back");
+    }
+
     #[test]
     fn duckdb_manual_error_state_is_recoverable() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -6727,10 +6835,11 @@ mod tests {
         conn.execute_batch("SELECT 1").unwrap();
     }
 
-    /// The frontend files an outcome as cancelled when the message says "cancel"
-    /// (`isCancelMessage`, `/cancel/i`). A DuckDB interrupt must say it; a quarantine
-    /// must not, or "Query cancelled" would replace the news that the connection
-    /// (or the in-memory data) is gone.
+    /// `duck_failure` settles `AppError.cancelled`, which the frontend files outcomes
+    /// by. A DuckDB interrupt is a cancellation (and also says "cancel", for the
+    /// message test an error that loses the flag falls back to); a quarantine is not,
+    /// or "Query cancelled" would replace the news that the connection (or the
+    /// in-memory data) is gone; and no other engine error is, whatever it names.
     #[test]
     fn duckdb_interrupt_reads_as_cancelled_unless_quarantined() {
         let says_cancel = |e: &AppError| e.message.to_ascii_lowercase().contains("cancel");
@@ -6738,6 +6847,7 @@ mod tests {
 
         let cancelled = duck_failure(interrupt(), None);
         assert_eq!(cancelled.message, "query cancelled (DuckDB: Interrupted!)");
+        assert_eq!(cancelled.cancelled, Some(true));
         assert!(says_cancel(&cancelled));
 
         let quarantined = duck_failure(interrupt(), Some("the connection was discarded."));
@@ -6745,7 +6855,24 @@ mod tests {
             quarantined.message,
             "INTERRUPT Error: Interrupted!. DuckDB left the connection unusable: the connection was discarded."
         );
+        assert_eq!(quarantined.cancelled, Some(false));
         assert!(!says_cancel(&quarantined), "{}", quarantined.message);
+
+        // A binder error naming a `cancellations` table, quarantined or not, is a
+        // failure the message test alone would have filed as cancelled.
+        let named = || {
+            AppError::new(
+                "Binder Error: Table \"cancellations\" does not have a column named \"x\"",
+            )
+        };
+        assert_eq!(duck_failure(named(), None).cancelled, Some(false));
+        assert_eq!(
+            duck_failure(named(), Some("the connection was discarded.")).cancelled,
+            Some(false)
+        );
+        // An error that already knows keeps its answer.
+        let stopped = AppError::cancelled("import cancelled and rolled back");
+        assert_eq!(duck_failure(stopped, None).cancelled, Some(true));
 
         // Any other failure passes through untouched, including one that merely
         // mentions an interrupt.
@@ -6753,8 +6880,29 @@ mod tests {
             "Catalog Error: Table with name nope does not exist!",
             "Binder Error: column \"INTERRUPT Error:\" not found",
         ] {
-            assert_eq!(duck_failure(AppError::new(message), None).message, message);
+            let settled = duck_failure(AppError::new(message), None);
+            assert_eq!(settled.message, message);
+            assert_eq!(settled.cancelled, Some(false));
         }
+    }
+
+    /// An interrupt that reaches the `SELECT 1` probe (a Cancel landing just after the
+    /// query it meant to stop had failed) is not the libduckdb poison: quarantining on
+    /// it would leak a healthy connection and discard an in-memory database.
+    #[test]
+    fn duckdb_interrupted_probe_is_not_poison() {
+        let failure = |text: &str| {
+            duckdb::Error::DuckDBFailure(duckdb::ffi::Error::new(1), Some(text.to_string()))
+        };
+        assert!(!duck_error_is_poison(&failure(
+            "INTERRUPT Error: Interrupted!"
+        )));
+        assert!(!duck_error_is_poison(&failure(
+            "TransactionContext Error: Current transaction is aborted (please ROLLBACK)"
+        )));
+        assert!(duck_error_is_poison(&failure(
+            "Invalid Error: resource deadlock would occur"
+        )));
     }
 
     #[test]
@@ -6990,6 +7138,38 @@ mod tests {
         // An uncommented column stays None, not Some("").
         assert_eq!(det.columns[1].comment, None);
     }
+
+    /// A TEMP table lives in the `temp` catalog, not the opened database: scoping the
+    /// detail to `current_database()` alone left it with no columns, so it could no
+    /// longer be edited in the grid. A TEMP table shadows a namesake, as DuckDB binds it.
+    #[test]
+    fn duckdb_temp_table_detail_is_read_from_the_temp_catalog() {
+        let (backend, _v) = DuckConn::open(&duck_mem()).unwrap();
+        let d = match backend {
+            Backend::Duck(d) => d,
+            _ => panic!("expected DuckDB backend"),
+        };
+        d.lock()
+            .execute_batch("CREATE TEMP TABLE tt(id INTEGER PRIMARY KEY, v VARCHAR)")
+            .unwrap();
+        let det = duck_table_detail(&d.lock(), "main", "tt").unwrap();
+        assert_eq!(det.columns.len(), 2);
+        assert!(det.columns[0].is_pk);
+        d.lock()
+            .execute_batch(
+                "CREATE TABLE both_t(x INTEGER); CREATE TEMP TABLE both_t(y INTEGER, z INTEGER)",
+            )
+            .unwrap();
+        let det = duck_table_detail(&d.lock(), "main", "both_t").unwrap();
+        assert_eq!(
+            det.columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["y", "z"],
+            "the TEMP table shadows, and its columns are not doubled"
+        );
+    }
 }
 
 #[allow(clippy::items_after_test_module)]
@@ -6998,10 +7178,20 @@ fn duck_table_detail(
     schema: &str,
     name: &str,
 ) -> Result<tree::RelationDetail, AppError> {
+    // `information_schema` and every catalog function below span each ATTACHED
+    // database, so each read scopes to ONE catalog. Unscoped, an attached file with
+    // the same schema.table doubled the columns and lent its defaults (and through
+    // them its sequences) to the backup's pre-pass. That catalog is `temp` when a TEMP
+    // table of this name exists (it shadows the database's own, as DuckDB resolves an
+    // unqualified name), else the database the connection opened: scoping to the
+    // opened one alone made TEMP tables lose their columns, and with them editability.
+    let catalog = duck_detail_catalog(conn, schema, name);
+    let cat = dlit(&catalog);
     let q = format!(
         "SELECT column_name, data_type, is_nullable, column_default \
          FROM information_schema.columns \
-         WHERE table_schema = {} AND table_name = {} ORDER BY ordinal_position",
+         WHERE table_catalog = {cat} \
+           AND table_schema = {} AND table_name = {} ORDER BY ordinal_position",
         dlit(schema),
         dlit(name)
     );
@@ -7033,7 +7223,8 @@ fn duck_table_detail(
         conn,
         &format!(
             "SELECT column_name, comment FROM duckdb_columns() \
-             WHERE schema_name = {} AND table_name = {}",
+             WHERE database_name = {cat} \
+               AND schema_name = {} AND table_name = {}",
             dlit(schema),
             dlit(name)
         ),
@@ -7053,7 +7244,8 @@ fn duck_table_detail(
         conn,
         &format!(
             "SELECT comment FROM duckdb_tables() \
-             WHERE schema_name = {} AND table_name = {}",
+             WHERE database_name = {cat} \
+               AND schema_name = {} AND table_name = {}",
             dlit(schema),
             dlit(name)
         ),
@@ -7089,7 +7281,8 @@ fn duck_table_detail(
         conn,
         &format!(
             "SELECT index_name, is_unique, COALESCE(sql,'') FROM duckdb_indexes() \
-             WHERE schema_name = {} AND table_name = {} ORDER BY index_name",
+             WHERE database_name = {cat} \
+               AND schema_name = {} AND table_name = {} ORDER BY index_name",
             dlit(schema),
             dlit(name)
         ),
@@ -7111,7 +7304,8 @@ fn duck_table_detail(
         conn,
         &format!(
             "SELECT constraint_type, COALESCE(constraint_text,'') FROM duckdb_constraints() \
-             WHERE schema_name = {} AND table_name = {}",
+             WHERE database_name = {cat} \
+               AND schema_name = {} AND table_name = {}",
             dlit(schema),
             dlit(name)
         ),
@@ -7152,4 +7346,27 @@ fn duck_table_detail(
         table_options: String::new(),
         definition_read: true,
     })
+}
+
+/// The catalog `duck_table_detail` reads `schema.name` from: `temp` when a TEMP table
+/// or view of that name exists, else the opened database. Best-effort: a failed
+/// lookup means the opened database, the pre-TEMP behaviour.
+fn duck_detail_catalog(conn: &duckdb::Connection, schema: &str, name: &str) -> String {
+    let q = format!(
+        "SELECT table_catalog FROM information_schema.tables \
+         WHERE table_catalog IN ('temp', current_database()) \
+           AND table_schema = {} AND table_name = {} \
+         ORDER BY table_catalog = 'temp' DESC LIMIT 1",
+        dlit(schema),
+        dlit(name)
+    );
+    duck_query(conn, &q)
+        .ok()
+        .and_then(|(_c, rows)| rows.first().map(|r| dcell(r, 0)))
+        .filter(|c| !c.is_empty())
+        .or_else(|| {
+            conn.query_row("SELECT current_database()", [], |r| r.get::<_, String>(0))
+                .ok()
+        })
+        .unwrap_or_else(|| "memory".to_string())
 }

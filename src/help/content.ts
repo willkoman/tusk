@@ -563,7 +563,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "A PostgreSQL statement error or cancellation requires `ROLLBACK` or `ROLLBACK TO` before further work."
+        "md": "A PostgreSQL statement error or cancellation requires `ROLLBACK` or `ROLLBACK TO` before further work. On DuckDB an error or a cancellation aborts the transaction too, and only `ROLLBACK` clears it: DuckDB has no savepoints."
       },
       {
         "k": "list",
@@ -1492,7 +1492,7 @@ export const TOPICS: Topic[] = [
           "**Copy DDL** rebuilds a runnable `CREATE` from the system catalogs on every engine, best-effort on DuckDB.",
           "On Postgres it covers tables, views, matviews, functions including overloads, and sequences.",
           "**MySQL tables and views** come from `SHOW CREATE TABLE` / `SHOW CREATE VIEW`, with the name qualified by its database. A view is read with no database selected, so every table in its body is qualified too, and the copy recreates the same view whichever database is selected.",
-          "**MySQL routines** come from `SHOW CREATE PROCEDURE` / `SHOW CREATE FUNCTION`, with the routine name qualified by its database so the copy recreates it there whichever database is selected. A compound `BEGIN … END` body runs as one statement, so a copy pasted into the editor replays as is. A name that is both a procedure and a function shows both. A role that may run a routine but not read it (no `SHOW_ROUTINE`, not its definer) gets that explanation instead of empty text.",
+          "**MySQL routines** come from `SHOW CREATE PROCEDURE` / `SHOW CREATE FUNCTION`, with the routine name qualified by its database so the copy recreates it there whichever database is selected. A compound `BEGIN … END` body runs as one statement, so a copy pasted into the editor replays as is. MySQL keeps procedures and functions apart, so one name can be both: it is listed twice, and each entry shows its own definition. A role that may run a routine but not read it (no `SHOW_ROUTINE`, not its definer) gets that explanation instead of empty text.",
           "**DuckDB sequences** come from their stored `CREATE SEQUENCE`, with the name schema-qualified and quoted. Its `START` is the next value the sequence will hand out; once a non-cycling sequence has used its last value, DuckDB refuses its own stored text, so `START` is clamped to the bound and a following `SELECT nextval(…)` uses it up again. **DuckDB macros** are rebuilt with every overload and parameter type, but without parameter defaults, which DuckDB does not report; a comment says so.",
           "On PostgreSQL and SQL Server, foreign keys emit as trailing `ALTER TABLE … ADD CONSTRAINT`, so copied tables replay in any order; MySQL's stay inline, as `SHOW CREATE TABLE` prints them. Constraint-backed indexes are skipped.",
           "**Copy DDL to editor** pastes the reconstruction at the cursor — useful for [[topic:import-export|exporting]] a structure alongside its data."
@@ -1601,7 +1601,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "During an all-rows stream the dialog locks its controls and shows **Cancel export**.",
-          "Postgres and DuckDB cancel immediately. SQLite, MySQL and SQL Server finish the current query first.",
+          "Postgres and DuckDB cancel immediately. SQLite, MySQL and SQL Server finish the page being read (10,000 rows), then stop.",
           "Cancel or error rolls back the read transaction and deletes the partial file. xlsx writes the destination only at the end.",
           "Loaded-rows and clipboard exports run in memory, with no query to cancel."
         ]
@@ -1752,7 +1752,7 @@ export const TOPICS: Topic[] = [
         "rows": [
           [
             "**Scope**",
-            "**Whole database**, **Selected schemas**, or **Selected tables**. A table selection also carries its sequences: on PostgreSQL the ones its tables own, on DuckDB the ones its column defaults call with `nextval`."
+            "**Whole database**, **Selected schemas**, or **Selected tables**. A table selection also carries its sequences: on PostgreSQL the ones its tables own, on DuckDB the ones its column defaults call with `nextval`, resolved as DuckDB resolves them (an unqualified name in the table's own schema first, then `main`). A default whose sequence name Tusk cannot read is named in a dump warning."
           ],
           [
             "**Contents**",
@@ -3500,7 +3500,7 @@ export const TOPICS: Topic[] = [
           "Postgres gets a real `CancelRequest`; DuckDB fires its interrupt handle. Either way the run is logged as *cancelled*, not as an error.",
           "SQLite, MySQL and SQL Server have no out-of-band cancel, so the button shows a disabled **Running** timer instead.",
           "A cancel the backend rejects resets the button with the reason.",
-          "Cancelling inside a PostgreSQL manual transaction leaves it in **Recovery required** until `ROLLBACK` or `ROLLBACK TO`.",
+          "Cancelling inside a PostgreSQL or DuckDB manual transaction leaves it in **Recovery required**: until `ROLLBACK` or `ROLLBACK TO` on PostgreSQL, until `ROLLBACK` on DuckDB.",
           "`Mod-F2` is the shipped shortcut, since Ctrl+Esc is reserved by Windows."
         ]
       },
@@ -3587,6 +3587,24 @@ export const TOPICS: Topic[] = [
         "k": "tip",
         "kind": "tip",
         "md": "The updater shipped in v0.4.5, so an earlier install needs a fresh installer once."
+      },
+      {
+        "k": "h",
+        "text": "v0.11.3 — definitions, steadier tabs, DuckDB on Windows",
+        "id": "v0-11-3"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**View definition** — double-click (or press [[kbd:Enter]] on) a constraint, index, trigger, routine or sequence in the Explorer, or pick it from the menu, to read its definition; **Open in new tab** starts clean.",
+          "**MySQL routines and DuckDB sequences and macros** now appear in the Explorer, with their definitions and the right *Drop*.",
+          "**Unsaved means changed** — a tab is dirty only when its text differs from what it last matched, so a tab opened by double-clicking a table no longer asks to be saved.",
+          "**Column names win** over type badges in the results grid; the type is always in the header tooltip.",
+          "**The tab strip holds still** — hovering a tab or running a query no longer resizes it, overflow fades instead of growing a scrollbar, and a new tab scrolls into view.",
+          "**DuckDB on Windows** — Cancel works, an ordinary error no longer freezes the connection, and a cancelled query reads as cancelled.",
+          "**DuckDB backups carry sequences**, so tables numbered by `nextval` restore and keep counting.",
+          "**Cancel stops an export** even between pages, and a cancelled backup never replaces your file."
+        ]
       },
       {
         "k": "h",

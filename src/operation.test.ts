@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Connected } from "./connections";
-import { createOperationRunner, isCancelMessage, refusal, type HistoryDraft, type Operation, type OperationDeps } from "./operation";
+import { createOperationRunner, isCancelledError, refusal, type HistoryDraft, type Operation, type OperationDeps } from "./operation";
 import { IDLE_TRANSACTION, type TransactionStatus } from "./transaction";
 
 const conn = (id = "c1", generation = 1): Connected => ({
@@ -37,7 +37,7 @@ function world(overrides: Partial<OperationDeps> = {}): World {
     applyTransaction: (_c, incoming) => { applied.push(incoming); tx.set("c1", incoming as TransactionStatus); return true; },
     recordHistory: (entry, key) => history.push({ entry, key }),
     transactionFromError: (e) => (e && typeof e === "object" && "transaction" in e ? (e as any).transaction : null),
-    errorMessage: (e) => (e instanceof Error ? e.message : String(e)),
+    errorMessage: (e) => (e !== null && typeof e === "object" && "message" in e ? String((e as { message: unknown }).message) : String(e)),
     now: () => clock.now,
     setInterval: (fn, ms) => globalThis.setInterval(fn, ms),
     clearInterval: (h) => globalThis.clearInterval(h as ReturnType<typeof setInterval>),
@@ -129,17 +129,32 @@ describe("createOperationRunner", () => {
     expect(w.history.map((h) => [h.entry.status, h.entry.error])).toEqual([["cancelled", "canceling statement due to user request"], ["error", "syntax error"]]);
   });
 
-  it("classifies each engine's cancel wording, and never a quarantine, as cancelled", () => {
-    // The backend owns the wording (driver.rs `duck_failure`): DuckDB's own
-    // "INTERRUPT Error: Interrupted!" is renamed so it reads as a cancel, while a
-    // quarantine keeps DuckDB's text so its "unusable" message is not hidden.
-    expect(isCancelMessage("canceling statement due to user request")).toBe(true);
-    expect(isCancelMessage("query cancelled (DuckDB: Interrupted!)")).toBe(true);
-    expect(isCancelMessage("cancelled")).toBe(true);
-    expect(isCancelMessage("INTERRUPT Error: Interrupted!")).toBe(false);
-    expect(isCancelMessage(
-      "INTERRUPT Error: Interrupted!. DuckDB left the connection unusable: the connection was discarded. The next query reopens the file; restart Tusk if it stays locked.",
-    )).toBe(false);
+  it("files an error by the backend's cancelled flag, and only an unflagged one by its text", () => {
+    // AppError.cancelled (db.rs): PostgreSQL's query_canceled and a DuckDB interrupt
+    // say true; a quarantine, or a binder error naming a `cancellations` table, says
+    // false — the text alone would have called both cancelled.
+    expect(isCancelledError({ message: "canceling statement due to user request", cancelled: true }, "canceling statement due to user request")).toBe(true);
+    expect(isCancelledError({ message: "query cancelled (DuckDB: Interrupted!)", cancelled: true }, "query cancelled (DuckDB: Interrupted!)")).toBe(true);
+    const quarantine = "INTERRUPT Error: Interrupted!. DuckDB left the connection unusable: the connection was discarded.";
+    expect(isCancelledError({ message: quarantine, cancelled: false }, quarantine)).toBe(false);
+    const named = 'Binder Error: Table "cancellations" does not have a column named "x"';
+    expect(isCancelledError({ message: named, cancelled: false }, named)).toBe(false);
+    // No answer on the error (wrapped by a `format!`, or thrown by the frontend): the text.
+    expect(isCancelledError({ message: "restore failed at statement 3: canceling statement due to user request" }, "restore failed at statement 3: canceling statement due to user request")).toBe(true);
+    expect(isCancelledError(new Error("cancelled"), "cancelled")).toBe(true);
+    expect(isCancelledError(new Error("syntax error"), "syntax error")).toBe(false);
+    expect(isCancelledError("cancelled", "cancelled")).toBe(true);
+    expect(isCancelledError(null, "null")).toBe(false);
+  });
+
+  it("a flagged backend error decides the outcome over its wording", async () => {
+    const w = world();
+    const runner = createOperationRunner(w.deps);
+    const named = await runner.run(op(w, { run: async () => { throw { message: 'Binder Error: Table "cancellations" not found', cancelled: false }; } }));
+    const stopped = await runner.run(op(w, { run: async () => { throw { message: "export stopped", cancelled: true }; } }));
+    if (!named.ok) expect(named.cancelled).toBe(false);
+    if (!stopped.ok) expect(stopped.cancelled).toBe(true);
+    expect(w.history.map((h) => h.entry.status)).toEqual(["error", "cancelled"]);
   });
 
   it("history: null records nothing", async () => {

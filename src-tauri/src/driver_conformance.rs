@@ -1123,6 +1123,7 @@ async fn export_battery(b: &mut Backend, eng: &Eng) {
         &format!("SELECT n FROM {} ORDER BY n", q("exp_t")),
         &opts,
         &p,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .await
     .unwrap_or_else(|e| panic!("[{}] paged export: {}", eng.name, e.message));
@@ -1144,6 +1145,7 @@ async fn export_battery(b: &mut Backend, eng: &Eng) {
         &format!("SELECT n FROM {} WHERE 1 = 0", q("exp_t")),
         &opts,
         &p,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .await
     .unwrap_or_else(|e| panic!("[{}] empty paged export: {}", eng.name, e.message));
@@ -1152,6 +1154,26 @@ async fn export_battery(b: &mut Backend, eng: &Eng) {
         std::fs::read_to_string(&path).unwrap(),
         "n\n",
         "[{}] empty export replaces stale destination",
+        eng.name
+    );
+    // A Cancel the engine never saw (it landed between two pages, where PostgreSQL
+    // ignores a CancelRequest and DuckDB's next page clears the interrupt) still
+    // stops the export through the cooperative flag, and the previous file stays.
+    std::fs::write(&path, "stale").unwrap();
+    let err = crate::export::run_export_paged(
+        b,
+        &format!("SELECT n FROM {} ORDER BY n", q("exp_t")),
+        &opts,
+        &p,
+        &std::sync::atomic::AtomicBool::new(true),
+    )
+    .await
+    .expect_err("a cancelled export fails");
+    assert_eq!(err.cancelled, Some(true), "[{}] {}", eng.name, err.message);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "stale",
+        "[{}] a cancelled export leaves the destination alone",
         eng.name
     );
     let _ = std::fs::remove_file(&path);
@@ -1320,9 +1342,15 @@ async fn bool_export_battery(b: &mut Backend, eng: &Eng) {
         std::process::id()
     ));
     let p = path.to_string_lossy().to_string();
-    crate::export::run_export_paged(b, &sql, &opts, &p)
-        .await
-        .unwrap_or_else(|e| panic!("[{}] bool export: {}", eng.name, e.message));
+    crate::export::run_export_paged(
+        b,
+        &sql,
+        &opts,
+        &p,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("[{}] bool export: {}", eng.name, e.message));
     let text = std::fs::read_to_string(&path).unwrap();
     let _ = std::fs::remove_file(&path);
     let want = if eng.name == "mysql" {
@@ -4636,11 +4664,188 @@ async fn duckdb_backup_without_drops_restores_beside_a_live_sequence() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The backup reads which sequence a default names the way DuckDB's binder does, and
+/// this checks that against DuckDB itself rather than against Tusk's reading of the
+/// binder: from a table in schema `s`, `memory.bind_seq` is the catalog `memory`
+/// searched like an unqualified name — the table's schema first — so it is `s`'s
+/// sequence, not `main`'s. `'main.cast_seq'::VARCHAR` comes back from
+/// `duckdb_columns()` as a CAST and still names its sequence. And an ATTACHed
+/// database holding the same schema.table lends the table detail and the dump nothing.
+#[tokio::test]
+async fn duckdb_backup_resolves_sequences_like_the_binder() {
+    let (mut b, _v) = connect(&duck_cfg()).await.unwrap();
+    for sql in [
+        r#"CREATE SCHEMA "s""#,
+        r#"CREATE SEQUENCE "main"."bind_seq" START 100"#,
+        r#"CREATE SEQUENCE "s"."bind_seq" START 500"#,
+        r#"CREATE SEQUENCE "main"."cast_seq" START 900"#,
+        r#"CREATE TABLE "s"."bind_t" (a INTEGER DEFAULT nextval('memory.bind_seq'), b INTEGER DEFAULT nextval('main.cast_seq'::VARCHAR), v VARCHAR)"#,
+        r#"INSERT INTO "s"."bind_t" (v) VALUES ('x')"#,
+        "ATTACH ':memory:' AS other",
+        r#"CREATE SCHEMA other."s""#,
+        r#"CREATE SEQUENCE other."s"."bind_other" START 7"#,
+        r#"CREATE TABLE other."s"."bind_t" (z INTEGER DEFAULT nextval('other.s.bind_other'))"#,
+    ] {
+        exec(&mut b, sql).await;
+    }
+    let rows = all(&mut b, r#"SELECT a, b FROM "s"."bind_t""#).await;
+    assert_eq!(
+        rows,
+        vec![vec![Some("500".to_string()), Some("900".to_string())]],
+        "DuckDB bound memory.bind_seq to s's sequence"
+    );
+    let rendered = all(
+        &mut b,
+        "SELECT column_default FROM duckdb_columns() WHERE database_name = current_database() \
+         AND table_name = 'bind_t' AND column_name = 'b'",
+    )
+    .await;
+    assert_eq!(
+        cell(&rendered[0], 0).as_deref(),
+        Some("nextval(CAST('main.cast_seq' AS VARCHAR))"),
+        "the cast is what the catalog hands back"
+    );
+
+    let detail = b.table_detail("s", "bind_t").await.expect("table detail");
+    let names: Vec<&str> = detail.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["a", "b", "v"],
+        "the attached bind_t adds no columns"
+    );
+
+    let opts = crate::backup::BackupOptions {
+        scope: "tables".into(),
+        schemas: Vec::new(),
+        tables: vec![crate::backup::QualifiedName {
+            schema: "s".into(),
+            name: "bind_t".into(),
+        }],
+        content: "all".into(),
+        include_drop: true,
+        single_transaction: false,
+    };
+    let (summary, text, path) = duck_backup(&mut b, "binder", &opts).await;
+    assert!(
+        summary.warnings.iter().all(|w| !w.contains("sequence")),
+        "{:?}",
+        summary.warnings
+    );
+    for carried in [
+        r#"CREATE SEQUENCE "s"."bind_seq" "#,
+        r#"CREATE SEQUENCE "main"."cast_seq" "#,
+    ] {
+        assert!(text.contains(carried), "{carried}:\n{text}");
+    }
+    assert!(
+        !text.contains(r#""main"."bind_seq""#),
+        "main's namesake is not the sequence DuckDB bound:\n{text}"
+    );
+    assert!(!text.contains("bind_other"), "{text}");
+
+    exec(&mut b, "DETACH other").await;
+    reset(
+        &mut b,
+        &[
+            r#"DROP TABLE IF EXISTS "s"."bind_t""#.to_string(),
+            r#"DROP SEQUENCE IF EXISTS "s"."bind_seq""#.to_string(),
+            r#"DROP SEQUENCE IF EXISTS "main"."cast_seq""#.to_string(),
+        ],
+    )
+    .await;
+    duck_restore(&mut b, "binder", &path).await;
+    exec(&mut b, r#"INSERT INTO "s"."bind_t" (v) VALUES ('y')"#).await;
+    let rows = all(&mut b, r#"SELECT a, b FROM "s"."bind_t" ORDER BY a"#).await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("500".to_string()), Some("900".to_string())],
+            vec![Some("501".to_string()), Some("901".to_string())],
+        ],
+        "both defaults continue from the restored sequences"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A DuckDB FILE keeps no table → sequence dependency once it is closed and reopened
+/// (`duckdb_dependencies()` comes back empty), which is why the backup reads column
+/// defaults instead of the dependency catalog. Pinned on a real reopen: the source
+/// file is written, closed and reopened before the backup, and the restore target is
+/// a second file that is itself closed and reopened before its numbering is checked.
+#[tokio::test]
+async fn duckdb_backup_after_a_reopen_carries_sequences() {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let src = dir.join(format!("tusk_seq_reopen_src_{pid}.duckdb"));
+    let dst = dir.join(format!("tusk_seq_reopen_dst_{pid}.duckdb"));
+    let clean = || {
+        for p in [&src, &dst] {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(p.with_extension("duckdb.wal"));
+        }
+    };
+    clean();
+    let file = |p: &std::path::Path| ConnectionConfig {
+        path: Some(p.to_string_lossy().into_owned()),
+        ..duck_cfg()
+    };
+    {
+        let (mut b, _v) = connect(&file(&src)).await.unwrap();
+        for sql in [
+            r#"CREATE SCHEMA "app""#,
+            r#"CREATE SEQUENCE "app"."ids" START 10"#,
+            r#"CREATE TABLE "app"."items" (id INTEGER DEFAULT nextval('ids') PRIMARY KEY, v VARCHAR)"#,
+            r#"INSERT INTO "app"."items" (v) VALUES ('a'), ('b')"#,
+        ] {
+            exec(&mut b, sql).await;
+        }
+    } // closed
+    let (mut b, _v) = connect(&file(&src)).await.unwrap();
+    let opts = crate::backup::BackupOptions {
+        scope: "tables".into(),
+        schemas: Vec::new(),
+        tables: vec![crate::backup::QualifiedName {
+            schema: "app".into(),
+            name: "items".into(),
+        }],
+        content: "all".into(),
+        include_drop: true,
+        single_transaction: true,
+    };
+    let (summary, text, dump) = duck_backup(&mut b, "reopen", &opts).await;
+    assert!(
+        summary.warnings.iter().all(|w| !w.contains("sequence")),
+        "{:?}",
+        summary.warnings
+    );
+    assert!(
+        text.contains(r#"CREATE SEQUENCE "app"."ids" "#),
+        "the reopened file's sequence is carried:\n{text}"
+    );
+    assert!(text.contains("START 12 "), "its position travels:\n{text}");
+    drop(b);
+    {
+        let (mut b, _v) = connect(&file(&dst)).await.unwrap();
+        duck_restore(&mut b, "reopen", &dump).await;
+    } // closed
+    let (mut b, _v) = connect(&file(&dst)).await.unwrap();
+    exec(&mut b, r#"INSERT INTO "app"."items" (v) VALUES ('c')"#).await;
+    let rows = all(&mut b, r#"SELECT id, v FROM "app"."items" ORDER BY id"#).await;
+    assert_eq!(
+        rows.iter().map(|r| cell(r, 0)).collect::<Vec<_>>(),
+        ["10", "11", "12"].map(|s| Some(s.to_string())).to_vec(),
+        "numbering continues in the restored, reopened file"
+    );
+    drop(b);
+    let _ = std::fs::remove_file(&dump);
+    clean();
+}
+
 /// MySQL lists stored procedures and functions in the Explorer (routine type in
-/// `returns`), and "View definition" shows `SHOW CREATE PROCEDURE|FUNCTION`. The
-/// Explorer sends kind "function" for both, so the driver looks the type up; one name
-/// can be a procedure AND a function on MySQL, which shows both. The drop forms are the
-/// ones `sql/ddl.ts` emits for MySQL (`dropFunction` in `ddl.test.ts`).
+/// `returns`), and "View definition" shows `SHOW CREATE PROCEDURE|FUNCTION`. One name
+/// can be a procedure AND a function on MySQL, so each node asks for its own type;
+/// kind "routine" looks the type up and shows both. The drop forms are the ones
+/// `sql/ddl.ts` emits for MySQL (`dropFunction` in `ddl.test.ts`).
 #[tokio::test]
 async fn mysql_routines_listed_and_defined() {
     let Some(cfg) = mysql_cfg() else {
@@ -4683,8 +4888,9 @@ async fn mysql_routines_listed_and_defined() {
         "the sys schema (and its routines) stays out"
     );
 
+    // Each Explorer node asks for its own type (`definitionKind` in Tree.tsx).
     let p = b
-        .relation_ddl("function", "test", "tusk_p")
+        .relation_ddl("procedure", "test", "tusk_p")
         .await
         .expect("procedure ddl");
     // Qualified with the schema it came from, so it replays from any default database.
@@ -4699,8 +4905,34 @@ async fn mysql_routines_listed_and_defined() {
         f.contains("FUNCTION `test`.`tusk_f`") && f.contains("RETURN x * 2"),
         "{f}"
     );
-    let both = b
+    let only_proc = b
+        .relation_ddl("procedure", "test", "tusk_both")
+        .await
+        .expect("procedure-only ddl");
+    assert!(
+        only_proc.contains("PROCEDURE `test`.`tusk_both`") && !only_proc.contains("FUNCTION"),
+        "{only_proc}"
+    );
+    let only_fn = b
         .relation_ddl("function", "test", "tusk_both")
+        .await
+        .expect("function-only ddl");
+    assert!(
+        only_fn.contains("FUNCTION `test`.`tusk_both`") && !only_fn.contains("PROCEDURE"),
+        "{only_fn}"
+    );
+    // A caller that does not know the type looks it up, and a name that is both
+    // shows both, procedure first.
+    let looked_up = b
+        .relation_ddl("routine", "test", "tusk_p")
+        .await
+        .expect("looked-up ddl");
+    assert!(
+        looked_up.contains("PROCEDURE `test`.`tusk_p`"),
+        "{looked_up}"
+    );
+    let both = b
+        .relation_ddl("routine", "test", "tusk_both")
         .await
         .expect("both ddl");
     let (pi, fi) = (
@@ -4710,15 +4942,11 @@ async fn mysql_routines_listed_and_defined() {
             .expect("function part"),
     );
     assert!(pi < fi, "procedure first: {both}");
-    let only_proc = b
-        .relation_ddl("procedure", "test", "tusk_both")
-        .await
-        .expect("procedure-only ddl");
-    assert!(!only_proc.contains("FUNCTION"), "{only_proc}");
     assert!(b
-        .relation_ddl("function", "test", "tusk_missing")
+        .relation_ddl("routine", "test", "tusk_missing")
         .await
         .is_err());
+    assert!(b.relation_ddl("function", "test", "tusk_p").await.is_err());
 
     // The definition replays after the Explorer's drop.
     exec(&mut b, "DROP PROCEDURE `test`.`tusk_p`").await;
@@ -4804,7 +5032,7 @@ END;";
 
     // Read back as one statement and replay after a drop, through the planner again.
     let p = b
-        .relation_ddl("function", "test", "tusk_cmp_p")
+        .relation_ddl("procedure", "test", "tusk_cmp_p")
         .await
         .expect("procedure ddl");
     assert!(

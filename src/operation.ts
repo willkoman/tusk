@@ -122,7 +122,18 @@ export type Outcome<T> =
       stage: "prepare" | "run" | null;
     };
 
-export const isCancelMessage = (message: string): boolean => /cancel/i.test(message);
+/**
+ * Whether a failed operation was a cancellation the user asked for. The backend says so
+ * on the error (`AppError.cancelled` in db.rs), set by whatever produced it — PostgreSQL's
+ * `query_canceled`, a DuckDB interrupt, a cooperative stop — and says `false` for an
+ * engine error that merely mentions "cancel" (a table named `cancellations`, a quarantine).
+ * Only an error that carries no answer, because something wrapped it on the way or the
+ * frontend threw it, falls back to its message.
+ */
+export function isCancelledError(error: unknown, message: string): boolean {
+  const flag = error !== null && typeof error === "object" ? (error as { cancelled?: unknown }).cancelled : undefined;
+  return typeof flag === "boolean" ? flag : /cancel/i.test(message);
+}
 
 const TICK_MS = 200;
 
@@ -230,7 +241,7 @@ export function createOperationRunner(deps: OperationDeps) {
         accepted = deps.applyTransaction(c, embedded, event, before);
       }
       const message = deps.errorMessage(e);
-      const cancelled = isCancelMessage(message);
+      const cancelled = isCancelledError(e, message);
       const after = embedded ?? deps.transactionOf(c.id);
       if (op.history) {
         deps.recordHistory({

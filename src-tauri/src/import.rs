@@ -2219,7 +2219,7 @@ async fn load(
     let tail = plan.insert_tail();
     while let Some(chunk) = rx.recv().await {
         if cancel.load(Ordering::Acquire) {
-            return Err(AppError::new("import cancelled and rolled back"));
+            return Err(AppError::cancelled("import cancelled and rolled back"));
         }
         let chunk = chunk?;
         take_warnings(summary, chunk.warnings);
@@ -2247,7 +2247,7 @@ async fn load(
         });
     }
     if cancel.load(Ordering::Acquire) {
-        return Err(AppError::new("import cancelled and rolled back"));
+        return Err(AppError::cancelled("import cancelled and rolled back"));
     }
     Ok(())
 }
@@ -2272,7 +2272,7 @@ async fn copy_load(
     let outcome = async {
         while let Some(chunk) = rx.recv().await {
             if cancel.load(Ordering::Acquire) {
-                return Err(AppError::new("import cancelled and rolled back"));
+                return Err(AppError::cancelled("import cancelled and rolled back"));
             }
             let chunk = chunk?;
             take_warnings(summary, chunk.warnings);
@@ -2295,7 +2295,7 @@ async fn copy_load(
             });
         }
         if cancel.load(Ordering::Acquire) {
-            return Err(AppError::new("import cancelled and rolled back"));
+            return Err(AppError::cancelled("import cancelled and rolled back"));
         }
         if !buf.is_empty() {
             sink.as_mut().send(Bytes::from(buf)).await?;

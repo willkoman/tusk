@@ -2,6 +2,7 @@ import { createSignal, createMemo, For, Show } from "solid-js";
 import { Dialog } from "../Dialog";
 import { Icon } from "../Icons";
 import { formatWithOptions } from "../formats";
+import { isCancelledError } from "../operation";
 import {
   applyRememberedExportOptions,
   defaultExportOptions,
@@ -157,7 +158,7 @@ export function ExportDialog(props: {
       if (completed) props.onClose();
     } catch (e) {
       const m = e instanceof Object && "message" in e ? String((e as any).message) : String(e);
-      setErr(/cancel/i.test(m) ? "Export cancelled." : m);
+      setErr(isCancelledError(e, m) ? "Export cancelled." : m);
     } finally {
       setBusy(false);
     }
