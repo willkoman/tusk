@@ -436,8 +436,9 @@ export const TOPICS: Topic[] = [
           "**SQL Server** — `[bracketed identifiers]`, `N'literals'`, and nested block comments hold semicolons inertly.",
           "A line-only `GO` ends the batch without being sent to the server. `GO 5` is refused.",
           "A `;` inside `BEGIN … END`, `BEGIN TRY` or `CASE … END` belongs to the statement, so a `CREATE PROCEDURE` body runs whole.",
-          "**MySQL stored programs** — in `CREATE PROCEDURE`, `FUNCTION`, `TRIGGER` or `EVENT`, a `;` inside the `BEGIN … END` body (with its `IF`, `CASE`, `LOOP`, `WHILE` and `REPEAT` blocks) belongs to the statement, so the body runs whole with no `DELIMITER` line. A `DELIMITER` line is refused: it is a command-line client feature, not SQL.",
-          "MySQL does not reserve `BEGIN` or `END`, so a column or variable named `end` works inside a body. If Tusk reports that a stored program's blocks do not balance, or that text follows its final `END`, close every block with `END` and end the statement after the last one, or quote such a name with backticks."
+          "**MySQL stored programs** — in `CREATE PROCEDURE`, `FUNCTION`, `TRIGGER` or `EVENT`, a `;` inside the `BEGIN … END` body (with its `IF`, `CASE`, `LOOP`, `WHILE` and `REPEAT` blocks) belongs to the statement, so the body runs whole with no `DELIMITER` line. A body that is one `IF`, `CASE`, `LOOP`, `WHILE` or `REPEAT` statement works the same way. A `DELIMITER` line is refused: it is a command-line client feature, not SQL.",
+          "MySQL does not reserve `BEGIN` or `END`, so a column or variable named `end` works inside a body. If Tusk reports that a stored program's blocks do not balance or match, or that text follows its final `END`, close each block with its own `END` (`END IF`, `END LOOP`, …) and end the statement after the last one, or quote such a name with backticks.",
+          "Before running MySQL text that has a `;` in it, Tusk asks the server to confirm it is one statement, so a statement Tusk misreads is refused with the server's own error instead of running as several. `$` is part of a MySQL name (`a$$b`), never a quote."
         ]
       },
       {
