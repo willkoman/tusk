@@ -110,7 +110,11 @@ fn mssql_cfg() -> Option<ConnectionConfig> {
 }
 fn mysql_cfg() -> Option<ConnectionConfig> {
     let port: u16 = std::env::var("TUSK_TEST_MYSQL_PORT").ok()?.parse().ok()?;
-    Some(ConnectionConfig {
+    Some(mysql_cfg_at(port))
+}
+/// A MySQL-protocol server on localhost (root / `test`, database `test`).
+fn mysql_cfg_at(port: u16) -> ConnectionConfig {
+    ConnectionConfig {
         driver: Some("mysql".into()),
         host: "127.0.0.1".into(),
         port,
@@ -119,7 +123,7 @@ fn mysql_cfg() -> Option<ConnectionConfig> {
         dbname: "test".into(),
         sslmode: Some("disable".into()),
         ..base()
-    })
+    }
 }
 
 // --- helpers ---
@@ -5215,9 +5219,81 @@ END;";
 }
 
 /// The server-side belt under the MySQL splitter: before COM_QUERY runs a text that holds
-/// a `;` before its end, COM_STMT_PREPARE must accept it as ONE statement. A text the
-/// client kept together but the server reads as several (as a lexer misread would) is
-/// refused without running anything; one stored program passes and then runs.
+/// a `;` before its end, the server must accept it as ONE statement. A text the client kept
+/// together but the server reads as several (as a lexer misread would) is refused without
+/// running anything; one stored program passes and then runs — including a label written
+/// `lbl:begin`, which mysql_async's COM_STMT_PREPARE path would have rewritten into a false
+/// syntax error — and the check leaves no session state behind.
+async fn one_statement_belt_battery(cfg: &ConnectionConfig, engine: &str) {
+    use mysql_async::prelude::Queryable;
+    let (mut b, _v) = connect(cfg).await.expect("connect");
+    for sql in [
+        "DROP PROCEDURE IF EXISTS `test`.`tusk_belt_p`",
+        "DROP PROCEDURE IF EXISTS `test`.`tusk_belt_l`",
+        "DROP TABLE IF EXISTS `test`.`tusk_belt_t`",
+        "CREATE TABLE `test`.`tusk_belt_t` (id INT)",
+        "INSERT INTO `test`.`tusk_belt_t` VALUES (1)",
+    ] {
+        exec(&mut b, sql).await;
+    }
+    let Backend::MySql(m) = &b else {
+        panic!("[{engine}] expected a MySQL backend")
+    };
+    let mut conn = m.pool.get_conn().await.expect("connection");
+    let glued = "CREATE PROCEDURE `test`.`tusk_belt_p`() BEGIN SELECT 1; END; DELETE FROM `test`.`tusk_belt_t`; START TRANSACTION";
+    let refused = crate::driver::mysql_server_single_statement(&mut conn, glued)
+        .await
+        .expect_err("several statements are refused");
+    assert!(
+        refused
+            .message
+            .starts_with("the server could not confirm this is one statement:")
+            && refused.message.contains("syntax"),
+        "[{engine}] {}",
+        refused.message
+    );
+    // One stored program (labels written either way), and statements whose `;` sits in a
+    // string — plainly, which skips the check, and after a backslash escape, which goes
+    // through it — pass.
+    for one in [
+        "CREATE PROCEDURE `test`.`tusk_belt_p`() BEGIN SELECT 1; SELECT 2; END",
+        "CREATE PROCEDURE `test`.`tusk_belt_l`() lbl:begin SELECT 1; end lbl",
+        "INSERT INTO `test`.`tusk_belt_t` VALUES (LENGTH('a;b'))",
+        "INSERT INTO `test`.`tusk_belt_t` VALUES (LENGTH('é\\n;b'))",
+    ] {
+        crate::driver::mysql_server_single_statement(&mut conn, one)
+            .await
+            .unwrap_or_else(|e| panic!("[{engine}] [{one}] {}", e.message));
+    }
+    let probe: Option<Option<String>> = conn
+        .query_first("SELECT @tusk_one_statement")
+        .await
+        .expect("read the probe variable");
+    assert_eq!(
+        probe,
+        Some(None),
+        "[{engine}] the probe variable is cleared"
+    );
+    drop(conn);
+    // Nothing of the refused text ran: no procedure, and the row is still there. The
+    // `lbl:begin` one runs through the ordinary path.
+    let rows = all(
+        &mut b,
+        "SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema = 'test' AND routine_name = 'tusk_belt_p'",
+    )
+    .await;
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("0"), "[{engine}]");
+    let rows = all(&mut b, "SELECT COUNT(*) FROM `test`.`tusk_belt_t`").await;
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("1"), "[{engine}]");
+    exec(
+        &mut b,
+        "CREATE PROCEDURE `test`.`tusk_belt_l`() lbl:begin SELECT 1; end lbl",
+    )
+    .await;
+    exec(&mut b, "DROP PROCEDURE `test`.`tusk_belt_l`").await;
+    exec(&mut b, "DROP TABLE `test`.`tusk_belt_t`").await;
+}
+
 #[tokio::test]
 async fn mysql_server_refuses_text_it_reads_as_several_statements() {
     let Some(cfg) = mysql_cfg() else {
@@ -5226,44 +5302,24 @@ async fn mysql_server_refuses_text_it_reads_as_several_statements() {
         );
         return;
     };
-    let (mut b, _v) = connect(&cfg).await.expect("connect mysql");
-    for sql in [
-        "DROP PROCEDURE IF EXISTS `test`.`tusk_belt_p`",
-        "DROP TABLE IF EXISTS `test`.`tusk_belt_t`",
-        "CREATE TABLE `test`.`tusk_belt_t` (id INT)",
-        "INSERT INTO `test`.`tusk_belt_t` VALUES (1)",
-    ] {
-        exec(&mut b, sql).await;
-    }
-    let Backend::MySql(m) = &b else {
-        panic!("expected a MySQL backend")
+    one_statement_belt_battery(&cfg, "mysql").await;
+}
+
+/// The same battery on MariaDB, which PREPAREs a `CREATE PROCEDURE` where MySQL answers
+/// 1295. `scripts/conformance.sh` does not start MariaDB; point TUSK_TEST_MARIADB_PORT at a
+/// `mariadb` container (root password `test`, database `test`) to run it.
+#[tokio::test]
+async fn mariadb_server_refuses_text_it_reads_as_several_statements() {
+    let Some(port) = std::env::var("TUSK_TEST_MARIADB_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+    else {
+        eprintln!(
+            "SKIP mariadb_server_refuses_text_it_reads_as_several_statements (set TUSK_TEST_MARIADB_PORT)"
+        );
+        return;
     };
-    let mut conn = m.pool.get_conn().await.expect("mysql connection");
-    let glued = "CREATE PROCEDURE `test`.`tusk_belt_p`() BEGIN SELECT 1; END; DELETE FROM `test`.`tusk_belt_t`; START TRANSACTION";
-    let refused = crate::driver::mysql_server_single_statement(&mut conn, glued)
-        .await
-        .expect_err("several statements are refused");
-    assert!(refused.message.contains("syntax"), "{}", refused.message);
-    // One stored program, and a statement whose `;` sits in a string, pass.
-    for one in [
-        "CREATE PROCEDURE `test`.`tusk_belt_p`() BEGIN SELECT 1; SELECT 2; END",
-        "INSERT INTO `test`.`tusk_belt_t` VALUES (LENGTH('a;b'))",
-    ] {
-        crate::driver::mysql_server_single_statement(&mut conn, one)
-            .await
-            .unwrap_or_else(|e| panic!("[{one}] {}", e.message));
-    }
-    drop(conn);
-    // Nothing of the refused text ran: no procedure, and the row is still there.
-    let rows = all(
-        &mut b,
-        "SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema = 'test' AND routine_name = 'tusk_belt_p'",
-    )
-    .await;
-    assert_eq!(cell(&rows[0], 0).as_deref(), Some("0"));
-    let rows = all(&mut b, "SELECT COUNT(*) FROM `test`.`tusk_belt_t`").await;
-    assert_eq!(cell(&rows[0], 0).as_deref(), Some("1"));
-    exec(&mut b, "DROP TABLE `test`.`tusk_belt_t`").await;
+    one_statement_belt_battery(&mysql_cfg_at(port), "mariadb").await;
 }
 
 /// A MySQL backup of a database that is NOT the session's default one restores into

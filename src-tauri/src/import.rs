@@ -1984,6 +1984,10 @@ impl Session<'_> {
                 result.map_err(|e| duck.quarantine_if_poisoned(e))
             }
             Session::Sqlite(sqlite) => sqlite.lock().execute_batch(sql).map_err(de),
+            // Outside `driver::mysql_server_single_statement` on purpose: this is Tusk's own
+            // composed, quoted SQL (transaction control, CREATE TABLE and DELETE here, INSERT
+            // batches below), never user
+            // text, so no `;` in it can start a second statement.
             Session::MySql(conn) => {
                 use mysql_async::prelude::Queryable;
                 conn.query_drop(sql).await.map_err(de)

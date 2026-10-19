@@ -3380,18 +3380,36 @@ async fn mysql_run_conn_limited(
     Ok((columns, data, affected))
 }
 
+/// Prefix for every refusal from the one-statement check below, so it reads as Tusk's
+/// check rather than an error in the statement itself.
+const MYSQL_ONE_STATEMENT: &str = "the server could not confirm this is one statement";
+
 /// The SERVER's verdict that `sql` is one statement, asked on the same session right before
 /// COM_QUERY runs it. mysql_async always negotiates `CLIENT_MULTI_STATEMENTS` (and exposes no
 /// `COM_SET_OPTION` to turn it off), so a text the client-side splitter kept together but the
 /// server reads as several statements would run every one of them — a hidden
 /// `START TRANSACTION` past preflight, say. That can only happen when the text holds a `;`
-/// before its end (a stored program's `BEGIN … END` body, or any lexical disagreement), so
-/// only such a text is checked: COM_STMT_PREPARE parses exactly ONE statement and executes
-/// nothing. Anything after the first statement fails the parse with ER_PARSE_ERROR (1064)
-/// before a single statement runs; one statement either prepares (and is closed again) or is
-/// refused with ER_UNSUPPORTED_PS (1295), which is what every `CREATE PROCEDURE|FUNCTION|
-/// TRIGGER|EVENT` gets. Any other server error is the one running the text would have hit,
-/// so it is reported instead of running anything.
+/// before its end (a stored program's `BEGIN … END` body, or a lexical disagreement), so only
+/// such a text is checked, and one whose every `;` sits plainly inside quotes is let through
+/// first (`mysql_semicolons_only_quoted`, so a restore's INSERT batches skip the round trips).
+///
+/// The check is a SQL `PREPARE … FROM @tusk_one_statement`, the user variable set from a
+/// binary hex literal: the server parses exactly ONE statement and executes nothing, on the
+/// text's exact bytes in the session's client character set — as COM_QUERY would. (Not
+/// COM_STMT_PREPARE: mysql_async rewrites `:name` outside quotes to `?` before preparing, so
+/// `lbl:begin` would come back as a false syntax error.) Anything after the first statement
+/// fails the parse with ER_PARSE_ERROR (1064) before a single statement runs; one statement
+/// either prepares (MariaDB ≥ 10.6 prepares a `CREATE PROCEDURE` too; it is deallocated
+/// again) or is refused with ER_UNSUPPORTED_PS (1295, MySQL's answer for every stored-program
+/// CREATE). Every other error refuses the text too, prefixed as this check's.
+///
+/// Three limits refuse a text the server would have run: with `max_prepared_stmt_count`
+/// exhausted or 0 every such text gets 1461 (the message says so); a text whose hex form does
+/// not fit the server's `max_allowed_packet` (one over about half of it) is refused before
+/// it is sent, since an oversized packet would drop the connection; and on
+/// Vitess/PlanetScale — whose vtgate "prepares" DDL without parsing it and splits COM_QUERY
+/// itself — such text is refused outright, since nothing there can confirm it is one
+/// statement.
 pub(crate) async fn mysql_server_single_statement(
     conn: &mut mysql_async::Conn,
     sql: &str,
@@ -3401,14 +3419,128 @@ pub(crate) async fn mysql_server_single_statement(
     while let Some(rest) = body.strip_suffix(';') {
         body = rest.trim_end();
     }
-    if !body.contains(';') {
+    if !body.contains(';') || mysql_semicolons_only_quoted(body) {
         return Ok(());
     }
-    match conn.prep(body).await {
-        Ok(stmt) => conn.close(stmt).await.map_err(de),
-        Err(mysql_async::Error::Server(e)) if e.code == 1295 => Ok(()),
-        Err(e) => Err(de(e)),
+    let probe = mysql_check_probe(conn).await;
+    if probe.vitess {
+        return Err(AppError::new(format!(
+            "{MYSQL_ONE_STATEMENT}: this server is Vitess (PlanetScale), whose vtgate splits statements itself and cannot vouch that text holding a `;` is one statement, so Tusk does not send it. Run it against the underlying MySQL instead."
+        )));
     }
+    const SET: &str = "SET @tusk_one_statement = X''";
+    let packet = 1 + SET.len() + 2 * body.len();
+    if let Some(max) = probe.max_packet.filter(|&max| packet > max) {
+        return Err(AppError::new(format!(
+            "{MYSQL_ONE_STATEMENT}: the text is too large to check (the check sends it hex-encoded, {packet} bytes, over this server's max_allowed_packet of {max})"
+        )));
+    }
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut hex = String::with_capacity(body.len() * 2);
+    for b in body.bytes() {
+        hex.push(HEX[usize::from(b >> 4)] as char);
+        hex.push(HEX[usize::from(b & 15)] as char);
+    }
+    let refused = |e: mysql_async::Error| {
+        let hint = match &e {
+            mysql_async::Error::Server(s) if s.code == 1461 => {
+                " (the server's max_prepared_stmt_count is used up or 0; Tusk needs one prepared statement to check text holding a `;`)"
+            }
+            _ => "",
+        };
+        AppError::new(format!("{MYSQL_ONE_STATEMENT}: {}{hint}", de(e).message))
+    };
+    conn.query_drop(format!("SET @tusk_one_statement = X'{hex}'"))
+        .await
+        .map_err(refused)?;
+    let verdict = match conn
+        .query_drop("PREPARE tusk_one_statement FROM @tusk_one_statement")
+        .await
+    {
+        Ok(()) => conn
+            .query_drop("DEALLOCATE PREPARE tusk_one_statement")
+            .await
+            .map_err(de),
+        Err(mysql_async::Error::Server(e)) if e.code == 1295 => Ok(()),
+        Err(e) => Err(refused(e)),
+    };
+    let _ = conn.query_drop("SET @tusk_one_statement = NULL").await;
+    verdict
+}
+
+/// Every `;` in `sql` sits inside quotes, in a text the server cannot lex differently
+/// whatever its `sql_mode` or client character set: no backslash (so `NO_BACKSLASH_ESCAPES`
+/// cannot matter), no comment marker outside quotes, and balanced `'`/`"`/`` ` `` quotes
+/// with doubled-quote escapes. Non-ASCII text is fine with one exception: in a multi-byte
+/// client charset (sjis, gbk, big5, gb18030, …) a byte can only be swallowed into a
+/// character when it directly follows a byte ≥ 0x80, and of the bytes this scan steers by
+/// only `` ` `` (0x60) is ever a valid trail byte — `'`, `"`, `;`, `#`, `-`, `/` and `*` all
+/// sit below 0x40 and outside gb18030's digit range — so a backtick right after a
+/// non-ASCII byte refuses. Anything else is left to the server's check.
+fn mysql_semicolons_only_quoted(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    if b.contains(&b'\\') || b.windows(2).any(|w| w[0] >= 0x80 && w[1] == b'`') {
+        return false;
+    }
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'"' | b'`') => {
+                i += 1;
+                loop {
+                    match b.get(i) {
+                        None => return false,
+                        Some(&c) if c == q && b.get(i + 1) == Some(&q) => i += 2,
+                        Some(&c) if c == q => break,
+                        Some(_) => i += 1,
+                    }
+                }
+            }
+            b';' | b'#' => return false,
+            b'-' if b.get(i + 1) == Some(&b'-') => return false,
+            b'/' if b.get(i + 1) == Some(&b'*') => return false,
+            _ => {}
+        }
+        i += 1;
+    }
+    true
+}
+
+/// What the one-statement check needs to know about the server it is about to ask.
+struct MySqlCheckProbe {
+    /// Vitess (PlanetScale) is in front.
+    vitess: bool,
+    /// The session's `max_allowed_packet`, when the server reported it.
+    max_packet: Option<usize>,
+}
+
+/// Vitess is recognised by its version strings or — since Vitess 23 advertises a plain MySQL
+/// version by default — by a system variable only vtgate has.
+async fn mysql_check_probe(conn: &mut mysql_async::Conn) -> MySqlCheckProbe {
+    use mysql_async::prelude::Queryable;
+    let mut probe = MySqlCheckProbe {
+        vitess: false,
+        max_packet: None,
+    };
+    if let Ok(Some((version, comment, max_packet))) = conn
+        .query_first::<(Option<String>, Option<String>, Option<u64>), _>(
+            "SELECT @@version, @@version_comment, @@max_allowed_packet",
+        )
+        .await
+    {
+        let both = format!(
+            "{} {}",
+            version.unwrap_or_default(),
+            comment.unwrap_or_default()
+        )
+        .to_ascii_lowercase();
+        probe.vitess = both.contains("vitess") || both.contains("planetscale");
+        probe.max_packet = max_packet.and_then(|p| usize::try_from(p).ok());
+    }
+    if !probe.vitess {
+        probe.vitess = conn.query_drop("SELECT @@ddl_strategy").await.is_ok();
+    }
+    probe
 }
 
 async fn mysql_page_conn(
@@ -6365,6 +6497,34 @@ mod tests {
         use mysql_async::consts::ColumnType;
         assert!(!mysql_is_binary_column(ColumnType::MYSQL_TYPE_LONG, 63,));
         assert!(mysql_is_binary_column(ColumnType::MYSQL_TYPE_BLOB, 63,));
+    }
+
+    /// Only a text whose every `;` sits plainly inside quotes skips the server's
+    /// one-statement check; anything the server might lex differently does not.
+    #[test]
+    fn mysql_semicolons_only_quoted_is_conservative() {
+        for sql in [
+            "INSERT INTO `t` VALUES ('a;b'), (\"c;d\")",
+            "SELECT 'it''s;', `we``ird;`",
+            "INSERT INTO `t` VALUES ('café;'), ('ソ;')",
+            "SELECT `ソ x`, ';'",
+        ] {
+            assert!(mysql_semicolons_only_quoted(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT 'a;b'; DROP TABLE t",
+            "CREATE PROCEDURE p() BEGIN SELECT 1; END",
+            r"SELECT 'a\';', 1",
+            // A backtick right after a non-ASCII byte may be a trail byte to the server.
+            "SELECT `ソ`, ';'",
+            "SELECT ソ`;`",
+            "SELECT 1 /* ; */",
+            "SELECT 1 -- ;\n",
+            "SELECT 1 # ;\n",
+            "SELECT 'unterminated;",
+        ] {
+            assert!(!mysql_semicolons_only_quoted(sql), "{sql}");
+        }
     }
 
     #[test]
