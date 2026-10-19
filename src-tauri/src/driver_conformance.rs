@@ -3926,3 +3926,233 @@ async fn postgres_identity_columns_are_detected() {
     assert!(!is_identity("d"), "a plain column is not identity");
     exec(&mut b, r#"DROP TABLE "public"."ids""#).await;
 }
+
+// --- Explorer routines and sequences (build_tree + relation_ddl) ---
+
+/// DuckDB lists its sequences and user macros in the Explorer, and "View definition"
+/// shows runnable DDL for both: the sequence's stored text with its name qualified and
+/// quoted (DuckDB stores it bare and unquoted), and every macro overload restated. Each
+/// definition is replayed after a drop, using the drop forms `sql/ddl.ts` emits for
+/// DuckDB (`dropSequence` / `dropFunction` in `ddl.test.ts`).
+#[tokio::test]
+async fn duckdb_sequences_and_macros_listed_and_defined() {
+    let (mut b, _v) = connect(&duck_cfg()).await.unwrap();
+    for sql in [
+        r#"CREATE SCHEMA "x""#,
+        r#"CREATE SEQUENCE "main"."tusk_seq" START 5 INCREMENT BY 2"#,
+        r#"CREATE SEQUENCE "x"."we""ird seq""#,
+        r#"CREATE MACRO "main"."tusk_add"(a, b := 5) AS a + b, (a) AS a * 10"#,
+        r#"CREATE MACRO "main"."tusk_typed"(a INTEGER, b VARCHAR) AS a"#,
+        r#"CREATE MACRO "x"."tusk_rows"(n) AS TABLE SELECT * FROM range(n)"#,
+    ] {
+        exec(&mut b, sql).await;
+    }
+
+    let tree = b.build_tree().await.expect("build_tree");
+    let schema = |n: &str| {
+        tree.schemas
+            .iter()
+            .find(|s| s.name == n)
+            .unwrap_or_else(|| panic!("schema {n}"))
+    };
+    assert_eq!(schema("main").sequences, vec!["tusk_seq".to_string()]);
+    assert_eq!(schema("x").sequences, vec!["we\"ird seq".to_string()]);
+    let routines = |n: &str| {
+        schema(n)
+            .functions
+            .iter()
+            .map(|f| (f.name.clone(), f.returns.clone()))
+            .collect::<Vec<_>>()
+    };
+    // Overloads collapse into one node; internal macros never appear.
+    assert_eq!(
+        routines("main"),
+        vec![
+            ("tusk_add".to_string(), "macro".to_string()),
+            ("tusk_typed".to_string(), "macro".to_string()),
+        ]
+    );
+    assert_eq!(
+        routines("x"),
+        vec![("tusk_rows".to_string(), "table macro".to_string())]
+    );
+
+    // Sequences: qualified, quoted, options kept, and runnable.
+    let seq = b
+        .relation_ddl("sequence", "main", "tusk_seq")
+        .await
+        .expect("sequence ddl");
+    assert!(
+        seq.starts_with(r#"CREATE SEQUENCE "main"."tusk_seq" "#),
+        "{seq}"
+    );
+    assert!(
+        seq.contains("INCREMENT BY 2") && seq.contains("START 5"),
+        "{seq}"
+    );
+    let weird = b
+        .relation_ddl("sequence", "x", "we\"ird seq")
+        .await
+        .expect("weird sequence ddl");
+    assert!(
+        weird.starts_with(r#"CREATE SEQUENCE "x"."we""ird seq" "#),
+        "{weird}"
+    );
+    exec(&mut b, r#"DROP SEQUENCE "x"."we""ird seq" CASCADE"#).await;
+    exec(&mut b, &weird).await;
+    // (`nextval('…')` cannot name it: DuckDB's string form does not undouble quotes.)
+    let back = all(
+        &mut b,
+        r#"SELECT schema_name FROM duckdb_sequences() WHERE sequence_name = 'we"ird seq'"#,
+    )
+    .await;
+    assert_eq!(back, vec![vec![Some("x".to_string())]], "replayed into x");
+    exec(&mut b, r#"DROP SEQUENCE "main"."tusk_seq""#).await;
+    exec(&mut b, &seq).await;
+    let next = all(&mut b, r#"SELECT nextval('main.tusk_seq')"#).await;
+    assert_eq!(next[0][0].as_deref(), Some("5"));
+
+    // Macros: every overload, parameter types kept, and a defaults caveat.
+    let add = b
+        .relation_ddl("function", "main", "tusk_add")
+        .await
+        .expect("macro ddl");
+    assert!(add.contains("parameter"), "defaults caveat: {add}");
+    assert!(
+        add.contains(r#"CREATE MACRO "main"."tusk_add"("a", "b") AS"#),
+        "{add}"
+    );
+    assert!(add.contains(r#"("a") AS"#), "second overload: {add}");
+    exec(&mut b, r#"DROP MACRO "main"."tusk_add" CASCADE"#).await;
+    exec(&mut b, &add).await;
+    let rows = all(
+        &mut b,
+        r#"SELECT "main"."tusk_add"(2, 3), "main"."tusk_add"(2)"#,
+    )
+    .await;
+    assert_eq!(rows[0], vec![Some("5".to_string()), Some("20".to_string())]);
+
+    let typed = b
+        .relation_ddl("function", "main", "tusk_typed")
+        .await
+        .expect("typed macro ddl");
+    assert!(typed.contains(r#"("a" INTEGER, "b" VARCHAR)"#), "{typed}");
+
+    let table = b
+        .relation_ddl("function", "x", "tusk_rows")
+        .await
+        .expect("table macro ddl");
+    assert!(
+        table.contains(r#"CREATE MACRO "x"."tusk_rows"("n") AS TABLE ("#),
+        "{table}"
+    );
+    exec(&mut b, r#"DROP MACRO TABLE "x"."tusk_rows""#).await;
+    exec(&mut b, &table).await;
+    let rows = all(&mut b, r#"SELECT count(*) FROM "x"."tusk_rows"(4)"#).await;
+    assert_eq!(rows[0][0].as_deref(), Some("4"));
+
+    let missing = b.relation_ddl("function", "main", "no_such_macro").await;
+    assert!(
+        missing.is_err(),
+        "an unknown macro is an error, not empty DDL"
+    );
+}
+
+/// MySQL lists stored procedures and functions in the Explorer (routine type in
+/// `returns`), and "View definition" shows `SHOW CREATE PROCEDURE|FUNCTION`. The
+/// Explorer sends kind "function" for both, so the driver looks the type up; one name
+/// can be a procedure AND a function on MySQL, which shows both. The drop forms are the
+/// ones `sql/ddl.ts` emits for MySQL (`dropFunction` in `ddl.test.ts`).
+#[tokio::test]
+async fn mysql_routines_listed_and_defined() {
+    let Some(cfg) = mysql_cfg() else {
+        eprintln!("SKIP mysql_routines_listed_and_defined (set TUSK_TEST_MYSQL_PORT)");
+        return;
+    };
+    let (mut b, _v) = connect(&cfg).await.expect("connect mysql");
+    for sql in [
+        "DROP PROCEDURE IF EXISTS `test`.`tusk_p`",
+        "DROP FUNCTION IF EXISTS `test`.`tusk_f`",
+        "DROP PROCEDURE IF EXISTS `test`.`tusk_both`",
+        "DROP FUNCTION IF EXISTS `test`.`tusk_both`",
+        "CREATE PROCEDURE `test`.`tusk_p`(IN n INT) SELECT n + 1 AS next_n",
+        "CREATE FUNCTION `test`.`tusk_f`(x INT) RETURNS INT DETERMINISTIC RETURN x * 2",
+        "CREATE PROCEDURE `test`.`tusk_both`() SELECT 1",
+        "CREATE FUNCTION `test`.`tusk_both`() RETURNS INT DETERMINISTIC RETURN 2",
+    ] {
+        exec(&mut b, sql).await;
+    }
+
+    let tree = b.build_tree().await.expect("build_tree");
+    let test = tree
+        .schemas
+        .iter()
+        .find(|s| s.name == "test")
+        .expect("test schema");
+    let has = |name: &str, returns: &str| {
+        test.functions
+            .iter()
+            .any(|f| f.name == name && f.returns == returns)
+    };
+    assert!(has("tusk_p", "procedure"), "procedure listed");
+    assert!(has("tusk_f", "function"), "function listed");
+    assert!(
+        has("tusk_both", "procedure") && has("tusk_both", "function"),
+        "a name that is both is listed twice"
+    );
+    assert!(
+        !tree.schemas.iter().any(|s| s.name == "sys"),
+        "the sys schema (and its routines) stays out"
+    );
+
+    let p = b
+        .relation_ddl("function", "test", "tusk_p")
+        .await
+        .expect("procedure ddl");
+    assert!(p.contains("PROCEDURE `tusk_p`"), "{p}");
+    assert!(p.contains("SELECT n + 1"), "{p}");
+    assert!(!p.contains("FUNCTION"), "{p}");
+    let f = b
+        .relation_ddl("function", "test", "tusk_f")
+        .await
+        .expect("function ddl");
+    assert!(
+        f.contains("FUNCTION `tusk_f`") && f.contains("RETURN x * 2"),
+        "{f}"
+    );
+    let both = b
+        .relation_ddl("function", "test", "tusk_both")
+        .await
+        .expect("both ddl");
+    let (pi, fi) = (
+        both.find("PROCEDURE `tusk_both`").expect("procedure part"),
+        both.find("FUNCTION `tusk_both`").expect("function part"),
+    );
+    assert!(pi < fi, "procedure first: {both}");
+    let only_proc = b
+        .relation_ddl("procedure", "test", "tusk_both")
+        .await
+        .expect("procedure-only ddl");
+    assert!(!only_proc.contains("FUNCTION"), "{only_proc}");
+    assert!(b
+        .relation_ddl("function", "test", "tusk_missing")
+        .await
+        .is_err());
+
+    // The definition replays after the Explorer's drop.
+    exec(&mut b, "DROP PROCEDURE `test`.`tusk_p`").await;
+    exec(&mut b, &p).await;
+    exec(&mut b, "DROP FUNCTION `test`.`tusk_f`").await;
+    exec(&mut b, &f).await;
+    let rows = all(&mut b, "SELECT `test`.`tusk_f`(21)").await;
+    assert_eq!(rows[0][0].as_deref(), Some("42"));
+
+    for sql in [
+        "DROP PROCEDURE `test`.`tusk_p`",
+        "DROP FUNCTION `test`.`tusk_f`",
+        "DROP PROCEDURE `test`.`tusk_both`",
+        "DROP FUNCTION `test`.`tusk_both`",
+    ] {
+        exec(&mut b, sql).await;
+    }
+}

@@ -870,9 +870,24 @@ export function dropSequence(schema: string, name: string, cascade: boolean): st
   return `DROP SEQUENCE ${qualify(schema, name)}${cascadeSuffix(cascade)}`;
 }
 
-/** DROP FUNCTION by name (best-effort; errors if overloaded — needs arg types then). */
-export function dropFunction(schema: string, name: string, cascade: boolean): string {
-  return `DROP FUNCTION ${qualify(schema, name)}${cascadeSuffix(cascade)}`;
+/** What kind of routine an Explorer "function" node is, from the tree's `returns` (the
+ *  routine type on MySQL/DuckDB, the return type on PostgreSQL). Drives Drop's keyword
+ *  and the confirm dialog's wording. */
+export function routineKind(returns: string | undefined): "procedure" | "macro" | "table macro" | "function" {
+  return returns === "procedure" || returns === "macro" || returns === "table macro" ? returns : "function";
+}
+
+/** DROP a routine by name (best-effort; PostgreSQL errors if overloaded — needs arg
+ *  types then). MySQL keeps procedures apart from functions (`DROP PROCEDURE`), and
+ *  DuckDB drops a table macro with `DROP MACRO TABLE` — a plain `DROP MACRO` misses it. */
+export function dropFunction(schema: string, name: string, cascade: boolean, returns?: string): string {
+  const caps = ddlCaps();
+  const kind = routineKind(returns);
+  const q = qualify(schema, name);
+  if (caps.dialect === "mysql") return `DROP ${kind === "procedure" ? "PROCEDURE" : "FUNCTION"} ${q}`;
+  if (caps.dialect === "duckdb" && kind === "table macro") return `DROP MACRO TABLE ${q}${cascadeSuffix(cascade, caps)}`;
+  if (caps.dialect === "duckdb" && kind === "macro") return `DROP MACRO ${q}${cascadeSuffix(cascade, caps)}`;
+  return `DROP FUNCTION ${q}${cascadeSuffix(cascade, caps)}`;
 }
 
 export function dropConstraint(schema: string, table: string, name: string, cascade: boolean, kind?: string): string {

@@ -1454,6 +1454,9 @@ impl Backend {
                 parts.extend(idx.iter().filter_map(|r| r.first().cloned().flatten()));
                 Ok(parts.join(";\n\n") + ";\n")
             }
+            Backend::MySql(m) if matches!(kind, "function" | "procedure") => {
+                mysql_routine_ddl(&m.pool, kind, schema, name).await
+            }
             Backend::MySql(m) => {
                 let is_view = kind == "view" || kind == "matview";
                 let q = format!(
@@ -1467,6 +1470,30 @@ impl Backend {
                     .and_then(|r| r.get(1).cloned().flatten())
                     .map(|s| s + ";\n")
                     .ok_or_else(|| AppError::new("no DDL returned"))
+            }
+            Backend::Duck(d) if matches!(kind, "function" | "macro" | "table macro") => {
+                duck_macro_ddl(&d.lock(), schema, name)
+            }
+            Backend::Duck(d) if kind == "sequence" => {
+                let conn = d.lock();
+                let q = format!(
+                    "SELECT sql FROM duckdb_sequences() WHERE database_name = current_database() \
+                     AND schema_name = {} AND sequence_name = {}",
+                    dlit(schema),
+                    dlit(name)
+                );
+                let (_c, rows) = duck_query_limited(&conn, &q, db::DDL_TEXT_LIMITS)?;
+                let sql = rows
+                    .first()
+                    .and_then(|r| r.first().cloned().flatten())
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| AppError::new("no stored DDL for this sequence"))?;
+                let sql = duck_qualify_sequence_sql(sql.trim(), schema, name);
+                Ok(if sql.ends_with(';') {
+                    sql + "\n"
+                } else {
+                    sql + ";\n"
+                })
             }
             Backend::Duck(d) => {
                 let conn = d.lock();
@@ -3293,6 +3320,19 @@ async fn mysql_build_tree(pool: &mysql_async::Pool) -> Result<tree::DbTree, AppE
         ),
     )
     .await?;
+    // Stored procedures and functions. Both land in the Explorer's one "function" node
+    // kind with the routine type in `returns`, like SQL Server's; `relation_ddl` looks
+    // the type up again because the Explorer sends "function" for either.
+    let (_c4, routine_rows, _a4) = mysql_run(
+        pool,
+        &format!(
+            "SELECT routine_schema, routine_name, LOWER(routine_type) \
+             FROM information_schema.routines \
+             WHERE routine_schema NOT IN {SYS} AND routine_type IN ('PROCEDURE','FUNCTION') \
+             ORDER BY routine_schema, routine_name, routine_type"
+        ),
+    )
+    .await?;
     let (_c3, dbrow, _a3) = mysql_run(pool, "SELECT database()").await?;
     let database = dbrow
         .first()
@@ -3309,12 +3349,67 @@ async fn mysql_build_tree(pool: &mysql_async::Pool) -> Result<tree::DbTree, AppE
         })
         .collect();
     attach_rels(&mut schemas, &table_rows);
+    attach_funcs(&mut schemas, &routine_rows);
     let databases = schemas.iter().map(|s| s.name.clone()).collect();
     Ok(tree::DbTree {
         database,
         databases,
         schemas,
     })
+}
+
+/// `SHOW CREATE PROCEDURE` / `SHOW CREATE FUNCTION` for one routine. The Explorer sends
+/// kind "function" for every routine, so that kind looks the type up in
+/// `information_schema.routines`. Procedures and functions have separate namespaces on
+/// MySQL, so one name can be both: then both definitions are returned, procedure first.
+async fn mysql_routine_ddl(
+    pool: &mysql_async::Pool,
+    kind: &str,
+    schema: &str,
+    name: &str,
+) -> Result<String, AppError> {
+    let types: Vec<&'static str> = if kind == "procedure" {
+        vec!["PROCEDURE"]
+    } else {
+        let (_c, rows, _a) = mysql_run_params(
+            pool,
+            "SELECT routine_type FROM information_schema.routines \
+             WHERE routine_schema = ? AND routine_name = ? \
+               AND routine_type IN ('PROCEDURE','FUNCTION')",
+            mysql_async::Params::Positional(vec![schema.into(), name.into()]),
+        )
+        .await?;
+        let found = |t: &str| rows.iter().any(|r| dcell(r, 0).eq_ignore_ascii_case(t));
+        ["PROCEDURE", "FUNCTION"]
+            .into_iter()
+            .filter(|t| found(t))
+            .collect()
+    };
+    if types.is_empty() {
+        return Err(AppError::new("no routine with this name in the schema"));
+    }
+    let mut parts = Vec::new();
+    for routine in types {
+        let q = format!(
+            "SHOW CREATE {routine} `{}`.`{}`",
+            schema.replace('`', "``"),
+            name.replace('`', "``")
+        );
+        let (_c, rows, _a) = mysql_run_limited(pool, &q, db::DDL_TEXT_LIMITS).await?;
+        // Column 2 is `Create Procedure` / `Create Function`. MySQL returns NULL there,
+        // not an error, when the role may run the routine but not read its body.
+        let body = rows.first().and_then(|r| r.get(2).cloned().flatten());
+        match body {
+            Some(text) => parts.push(format!("{};\n", text.trim_end().trim_end_matches(';'))),
+            None => {
+                return Err(AppError::new(format!(
+                    "MySQL hid this {}'s definition: reading it needs the SHOW_ROUTINE privilege, ownership (DEFINER), or SELECT on mysql.proc on older servers",
+                    routine.to_ascii_lowercase()
+                )))
+            }
+        }
+    }
+    Ok(parts.join("\n"))
 }
 
 async fn mysql_table_detail(
@@ -5256,6 +5351,27 @@ fn attach_rels(schemas: &mut [tree::Schema], table_rows: &[Vec<Option<String>>])
     }
 }
 
+/// Attach `(schema, name, routine type)` rows to their schema as `tree::Func`s with the
+/// type ("procedure", "function", "macro", "table macro") in `returns`, the way the SQL
+/// Server path reports routines. Rows for a schema the tree does not list are dropped.
+fn attach_funcs(schemas: &mut [tree::Schema], func_rows: &[Vec<Option<String>>]) {
+    let idx: std::collections::HashMap<String, usize> = schemas
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name.clone(), i))
+        .collect();
+    for r in func_rows {
+        let Some(&i) = idx.get(&dcell(r, 0)) else {
+            continue;
+        };
+        schemas[i].functions.push(tree::Func {
+            name: dcell(r, 1),
+            args: String::new(),
+            returns: dcell(r, 2),
+        });
+    }
+}
+
 /// FK edges from duckdb_constraints(), trying the structured columns first
 /// (newer libduckdb) and falling back to parsing constraint_text; any failure
 /// yields an empty list (best-effort contract — never an error).
@@ -5304,11 +5420,156 @@ fn duck_build_tree(conn: &duckdb::Connection) -> Result<tree::DbTree, AppError> 
         })
         .collect();
     attach_rels(&mut schemas, &table_rows);
+    // Sequences and user macros of the current database. Best-effort: these feed the
+    // sidebar only, so a catalog function this build lacks must not hide the tables.
+    if let Ok((_c3, seq_rows)) = duck_query(conn, DUCK_SEQUENCES) {
+        let idx: std::collections::HashMap<String, usize> = schemas
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.name.clone(), i))
+            .collect();
+        for r in &seq_rows {
+            if let Some(&i) = idx.get(&dcell(r, 0)) {
+                schemas[i].sequences.push(dcell(r, 1));
+            }
+        }
+    }
+    if let Ok((_c4, macro_rows)) = duck_query(conn, DUCK_MACROS) {
+        attach_funcs(&mut schemas, &macro_rows);
+    }
     Ok(tree::DbTree {
         database: database.clone(),
         databases: vec![database],
         schemas,
     })
+}
+
+const DUCK_SEQUENCES: &str = "SELECT schema_name, sequence_name FROM duckdb_sequences() \
+     WHERE database_name = current_database() ORDER BY schema_name, sequence_name";
+
+/// One row per macro NAME and kind: overloads of a macro share a name and collapse into
+/// one Explorer node, whose definition (`duck_macro_ddl`) restates every overload.
+const DUCK_MACROS: &str = "SELECT DISTINCT schema_name, function_name, \
+       replace(function_type, '_', ' ') \
+     FROM duckdb_functions() \
+     WHERE database_name = current_database() AND NOT internal \
+       AND function_type IN ('macro', 'table_macro') \
+     ORDER BY 1, 2, 3";
+
+/// A sequence's stored `CREATE SEQUENCE` text with its name schema-qualified and quoted.
+/// DuckDB stores the name bare and unquoted (`CREATE SEQUENCE we"ird seq INCREMENT …`),
+/// which neither runs nor says which schema it belongs to; the options after the name
+/// are DuckDB's own rendering and are kept verbatim. Text that does not start with the
+/// expected prefix is returned unchanged rather than guessed at.
+fn duck_qualify_sequence_sql(sql: &str, schema: &str, name: &str) -> String {
+    let qualified = format!("{}.{}", db::ident(schema), db::ident(name));
+    for spelled in [name.to_string(), db::ident(name)] {
+        let prefix = format!("CREATE SEQUENCE {spelled} ");
+        if let Some(rest) = sql.strip_prefix(&prefix) {
+            return format!("CREATE SEQUENCE {qualified} {rest}");
+        }
+    }
+    sql.to_string()
+}
+
+/// A user macro's `CREATE MACRO` statement, restating every overload of `schema.name`.
+/// `duckdb_functions()` keeps the body and the parameter names/types but NOT parameter
+/// defaults, so a parameter declared as `name := value` comes back without its default;
+/// the leading comment says so. A scalar and a table macro may share a name (they live
+/// in separate catalogs), in which case both statements are returned.
+fn duck_macro_ddl(conn: &duckdb::Connection, schema: &str, name: &str) -> Result<String, AppError> {
+    use duckdb::types::Value;
+    let mut stmt = conn
+        .prepare(
+            "SELECT function_type, parameters, parameter_types, macro_definition \
+             FROM duckdb_functions() \
+             WHERE database_name = current_database() AND NOT internal \
+               AND function_type IN ('macro', 'table_macro') \
+               AND schema_name = ? AND function_name = ?",
+        )
+        .map_err(de)?;
+    let mut rows = stmt.query(duckdb::params![schema, name]).map_err(de)?;
+    let text_list = |v: Value| -> Vec<Option<String>> {
+        match v {
+            Value::List(items) => items.into_iter().map(duck_value_to_string).collect(),
+            _ => Vec::new(),
+        }
+    };
+    let columns = [
+        "function_type",
+        "parameters",
+        "parameter_types",
+        "macro_definition",
+    ]
+    .map(String::from)
+    .to_vec();
+    let mut budget = db::TextBudget::new(&columns, db::DDL_TEXT_LIMITS)?;
+    // (is table macro, rendered parameter list, body), in catalog order.
+    let mut overloads: Vec<(bool, String, String)> = Vec::new();
+    let mut any_params = false;
+    while let Some(row) = rows.next().map_err(de)? {
+        let kind: String = row.get(0).map_err(de)?;
+        let params = text_list(row.get(1).map_err(de)?);
+        let types = text_list(row.get(2).map_err(de)?);
+        let body: Option<String> = row.get(3).map_err(de)?;
+        let body = body.unwrap_or_default();
+        any_params |= !params.is_empty();
+        let rendered = params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let mut out = db::ident(p.as_deref().unwrap_or_default());
+                if let Some(t) = types.get(i).cloned().flatten().filter(|t| !t.is_empty()) {
+                    out.push(' ');
+                    out.push_str(&t);
+                }
+                out
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        budget.add_row(&[
+            Some(kind.clone()),
+            Some(rendered.clone()),
+            None,
+            Some(body.clone()),
+        ])?;
+        overloads.push((kind == "table_macro", rendered, body));
+    }
+    if overloads.is_empty() {
+        return Err(AppError::new(
+            "no macro with this name in the current database",
+        ));
+    }
+    let qualified = format!("{}.{}", db::ident(schema), db::ident(name));
+    let mut out = String::new();
+    if any_params {
+        out.push_str(
+            "-- Reconstructed from duckdb_functions(). DuckDB does not report parameter\n\
+             -- defaults, so a parameter declared as name := value appears without one.\n",
+        );
+    }
+    for table in [false, true] {
+        let mine: Vec<String> = overloads
+            .iter()
+            .filter(|(t, _, _)| *t == table)
+            .map(|(_, params, body)| {
+                // A table macro's body must be parenthesised once a second overload
+                // follows it; the parentheses are harmless on a single one.
+                if table {
+                    format!("({params}) AS TABLE ({})", body.trim())
+                } else {
+                    format!("({params}) AS {}", body.trim())
+                }
+            })
+            .collect();
+        if !mine.is_empty() {
+            out.push_str(&format!(
+                "CREATE MACRO {qualified}{};\n",
+                mine.join(",\n    ")
+            ));
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -5326,6 +5587,24 @@ mod tests {
         }
         assert_eq!(mssql_object_types("table"), &["U"]);
         assert_eq!(mssql_object_types("view"), &["V"]);
+    }
+
+    /// DuckDB stores `CREATE SEQUENCE <bare name> …`; the name is qualified and quoted,
+    /// and text with an unexpected prefix is left alone rather than rewritten.
+    #[test]
+    fn duck_sequence_sql_is_qualified_only_when_the_prefix_matches() {
+        assert_eq!(
+            duck_qualify_sequence_sql("CREATE SEQUENCE we\"ird seq START 3;", "x", "we\"ird seq"),
+            "CREATE SEQUENCE \"x\".\"we\"\"ird seq\" START 3;"
+        );
+        assert_eq!(
+            duck_qualify_sequence_sql("CREATE SEQUENCE \"s\" START 1;", "main", "s"),
+            "CREATE SEQUENCE \"main\".\"s\" START 1;"
+        );
+        assert_eq!(
+            duck_qualify_sequence_sql("CREATE TEMP SEQUENCE s START 1;", "main", "s"),
+            "CREATE TEMP SEQUENCE s START 1;"
+        );
     }
     use crate::db::QueryOutcome;
 

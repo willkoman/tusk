@@ -10,6 +10,7 @@ import {
   createTable,
   dropColumn,
   dropConstraint,
+  dropFunction,
   dropIndex,
   droppableIndexes,
   dropSchema,
@@ -22,6 +23,7 @@ import {
   needsRebuild,
   renameColumn,
   renameRelation,
+  routineKind,
   genSelect,
   limitedSelect,
   scriptNote,
@@ -177,6 +179,31 @@ describe("dialect-specific syntax", () => {
     expect(truncate("s", "t", { cascade: true, restartIdentity: true })).toBe(`TRUNCATE TABLE "s"."t"`);
     setSqlDialect("postgres");
     expect(truncate("s", "t", { cascade: true, restartIdentity: true })).toBe(`TRUNCATE TABLE "s"."t" RESTART IDENTITY CASCADE`);
+  });
+});
+
+// Routine drops. The MySQL and DuckDB strings are executed by `mysql_routines_listed_and_
+// defined` / `duckdb_sequences_and_macros_listed_and_defined` in driver_conformance.rs.
+describe("dropFunction per routine kind", () => {
+  it("postgres keeps DROP FUNCTION whatever the return type", () => {
+    expect(dropFunction("public", "f", true, "integer")).toBe(`DROP FUNCTION "public"."f" CASCADE`);
+    expect(dropFunction("public", "f", false)).toBe(`DROP FUNCTION "public"."f"`);
+  });
+  it("mysql picks PROCEDURE or FUNCTION and never cascades", () => {
+    setSqlDialect("mysql");
+    expect(dropFunction("test", "tusk_p", true, "procedure")).toBe("DROP PROCEDURE `test`.`tusk_p`");
+    expect(dropFunction("test", "tusk_f", true, "function")).toBe("DROP FUNCTION `test`.`tusk_f`");
+  });
+  it("duckdb drops macros, and table macros with DROP MACRO TABLE", () => {
+    setSqlDialect("duckdb");
+    expect(dropFunction("main", "tusk_add", true, "macro")).toBe(`DROP MACRO "main"."tusk_add" CASCADE`);
+    expect(dropFunction("x", "tusk_rows", false, "table macro")).toBe(`DROP MACRO TABLE "x"."tusk_rows"`);
+  });
+  it("routineKind reads only the routine types it knows", () => {
+    expect(routineKind("procedure")).toBe("procedure");
+    expect(routineKind("table macro")).toBe("table macro");
+    expect(routineKind("integer")).toBe("function");
+    expect(routineKind(undefined)).toBe("function");
   });
 });
 
