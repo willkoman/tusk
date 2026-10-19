@@ -314,7 +314,7 @@ export const TOPICS: Topic[] = [
           [
             "Cancel a running query",
             "yes (`CancelRequest`)",
-            "yes, except on Windows",
+            "yes (interrupt)",
             "—",
             "—",
             "—"
@@ -1598,7 +1598,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "During an all-rows stream the dialog locks its controls and shows **Cancel export**.",
-          "Postgres and DuckDB cancel immediately, except DuckDB on Windows. SQLite, MySQL and SQL Server finish the current query first.",
+          "Postgres and DuckDB cancel immediately. SQLite, MySQL and SQL Server finish the current query first.",
           "Cancel or error rolls back the read transaction and deletes the partial file. xlsx writes the destination only at the end.",
           "Loaded-rows and clipboard exports run in memory, with no query to cancel."
         ]
@@ -3488,7 +3488,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "While a query runs, the Run button becomes **✕ Cancel** with an elapsed counter.",
-          "Postgres gets a real `CancelRequest`; DuckDB fires its interrupt handle, except on Windows.",
+          "Postgres gets a real `CancelRequest`; DuckDB fires its interrupt handle.",
           "SQLite, MySQL and SQL Server have no out-of-band cancel, so the button shows a disabled **Running** timer instead.",
           "A cancel the backend rejects resets the button with the reason.",
           "Cancelling inside a PostgreSQL manual transaction leaves it in **Recovery required** until `ROLLBACK` or `ROLLBACK TO`.",

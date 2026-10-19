@@ -91,8 +91,8 @@ pub struct Capabilities {
     /// EXPLAIN ANALYZE exists on this engine (SQLite has no ANALYZE variant).
     pub explain_analyze: bool,
     /// An in-flight query can be cancelled out-of-band. PostgreSQL: CancelRequest.
-    /// DuckDB: interrupt handle, except Windows where interrupt poisons the bundled
-    /// connection. SQLite/MySQL expose no UI-query cancel handle.
+    /// DuckDB: interrupt handle (Windows needs DuckDB built with /EHsc, see
+    /// `.cargo/config.toml`). SQLite/MySQL expose no UI-query cancel handle.
     pub cancel_query: bool,
     pub manual_transactions: bool,
     pub transaction_savepoints: bool,
@@ -143,7 +143,7 @@ impl Capabilities {
             ddl: true,           // best-effort via duckdb_tables()/duckdb_views()
             relationships: true, // best-effort via duckdb_constraints()
             explain_analyze: true,
-            cancel_query: !cfg!(windows), // interrupt() poisons the bundled connection on Windows
+            cancel_query: true,
             manual_transactions: true,
             transaction_savepoints: false,
             set_transaction: false,
@@ -250,23 +250,13 @@ impl CancelHandle {
                 Ok(())
             }
             CancelHandle::Duck(handle) => {
-                // Windows bundled DuckDB: interrupt() leaves the connection in the
-                // #209 poisoned state — every later statement fails with "resource
-                // deadlock would occur" and the leaked handle keeps a file-backed
-                // .duckdb locked until app restart. A query that can't be cancelled
-                // beats a database that can't be reopened.
-                #[cfg(windows)]
-                {
-                    let _ = handle;
-                    Err(AppError::new(
-                        "cancel isn't available for DuckDB on Windows. The query runs to completion.",
-                    ))
-                }
-                #[cfg(not(windows))]
-                {
-                    handle.interrupt();
-                    Ok(())
-                }
+                // On Windows this is safe only because DuckDB is compiled with /EHsc
+                // (`.cargo/config.toml`): without it the interrupt exception leaked an
+                // engine lock and left the connection stuck. An interrupt that reaches
+                // an idle connection is harmless — DuckDB clears it when the next query
+                // starts.
+                handle.interrupt();
+                Ok(())
             }
             CancelHandle::None => Ok(()),
         }

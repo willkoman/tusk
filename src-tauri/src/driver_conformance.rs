@@ -4220,6 +4220,127 @@ fn duckdb_parser_error_leaves_connection_usable() {
     assert!(ok, "another thread after a parser error");
 }
 
+/// Cancel stops a running DuckDB query and the connection carries on, Windows included.
+/// Without /EHsc an interrupt kept the same engine lock a failed statement did, so
+/// Cancel was switched off on Windows. The interrupt goes through
+/// `CancelHandle::cancel`, the call `cancel_operation` makes, while the query runs on
+/// another thread; every later step runs on a thread of its own (`duck_step`). The
+/// in-memory database must keep its rows (a quarantine would discard them) and the
+/// file-backed one must give its file lock back once idle.
+#[test]
+fn duckdb_cancel_interrupts_and_leaves_connection_usable() {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::{Duration, Instant};
+    const LONG: &str = "SELECT count(*) FROM range(100000000000) t(x) WHERE x % 7 = 3";
+
+    let path = std::env::temp_dir().join(format!("tusk_cancel_{}.duckdb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let file_cfg = ConnectionConfig {
+        path: Some(path.to_string_lossy().into_owned()),
+        ..duck_cfg()
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    for cfg in [duck_cfg(), file_cfg] {
+        let (b, _version) = rt.block_on(connect(&cfg)).unwrap();
+        let (b, ()) = duck_step(b, "setup", |mut b| async move {
+            exec(&mut b, r#"CREATE TABLE "main"."tusk_cancel" (id INTEGER)"#).await;
+            exec(&mut b, r#"INSERT INTO "main"."tusk_cancel" VALUES (1)"#).await;
+            (b, ())
+        });
+
+        let handle = b.cancel_handle();
+        assert!(
+            matches!(handle, crate::driver::CancelHandle::Duck(_)),
+            "DuckDB arms its interrupt handle"
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut b = b;
+            let out = rt.block_on(async {
+                b.rollback_cursor().await;
+                b.run_single(LONG, 100, cursorable(LONG)).await
+            });
+            let _ = tx.send((b, out));
+        });
+        // A query clears a pending interrupt when it starts, so one that lands before
+        // the query is under way is lost: keep cancelling until the query stops.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (b, outcome) = loop {
+            rt.block_on(handle.clone().cancel(&cfg))
+                .unwrap_or_else(|e| panic!("cancel refused: {}", e.message));
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(out) => break out,
+                Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+                // The blocked worker keeps the backend; it is leaked with the thread.
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("the cancelled DuckDB query never stopped")
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    std::panic::resume_unwind(worker.join().expect_err("worker sent nothing"))
+                }
+            }
+        };
+        let err = outcome.expect_err("the cancelled query fails");
+        assert!(err.message.contains("Interrupted"), "{}", err.message);
+        assert!(
+            !err.message.contains("unusable"),
+            "quarantined: {}",
+            err.message
+        );
+
+        let (b, one) = duck_step(b, "the next query", |mut b| async move {
+            let one = all(&mut b, "SELECT 1").await;
+            (b, one)
+        });
+        assert_eq!(one[0][0].as_deref(), Some("1"));
+
+        let (b, tree) = duck_step(b, "the Explorer refresh", |b| async move {
+            let tree = b.build_tree().await;
+            (b, tree)
+        });
+        let tree = tree.expect("build_tree");
+        let main = tree
+            .schemas
+            .iter()
+            .find(|s| s.name == "main")
+            .expect("main schema");
+        let tables: Vec<&str> = main.tables.iter().map(|t| t.name.as_str()).collect();
+        assert!(tables.contains(&"tusk_cancel"), "{tables:?}");
+
+        let (b, count) = duck_step(b, "the next write", |mut b| async move {
+            exec(&mut b, r#"INSERT INTO "main"."tusk_cancel" VALUES (2)"#).await;
+            let count = all(&mut b, r#"SELECT count(*) FROM "main"."tusk_cancel""#).await;
+            (b, count)
+        });
+        assert_eq!(count[0][0].as_deref(), Some("2"), "rows kept, write landed");
+
+        if cfg.path.as_deref() != Some(":memory:") {
+            let reopen_cfg = cfg.clone();
+            let (_b, reopened) = duck_step(b, "releasing the file", |b| async move {
+                b.release_idle(false);
+                let closed = b.is_closed();
+                // DuckDB takes an exclusive lock per process: a second open fails
+                // while the first connection (or a leaked one) still holds the file.
+                let reopened = match connect(&reopen_cfg).await {
+                    Ok((mut other, _)) => {
+                        Ok(all(&mut other, r#"SELECT count(*) FROM "main"."tusk_cancel""#).await)
+                    }
+                    Err(e) => Err(e.message),
+                };
+                (b, (closed, reopened))
+            });
+            assert!(reopened.0, "released when idle");
+            let rows = reopened.1.expect("file lock freed after a cancel");
+            assert_eq!(rows[0][0].as_deref(), Some("2"));
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
 /// MySQL lists stored procedures and functions in the Explorer (routine type in
 /// `returns`), and "View definition" shows `SHOW CREATE PROCEDURE|FUNCTION`. The
 /// Explorer sends kind "function" for both, so the driver looks the type up; one name
