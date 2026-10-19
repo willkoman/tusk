@@ -1276,10 +1276,17 @@ body > div[class] > .cm-tooltip { z-index: 500; }
        bar on the bottom edge at full strength — another connection's tab is
        marked by colour, never by dimming, which reads as disabled. --- */
 .tab-bar { display: flex; align-items: stretch; background: var(--panel); min-width: 0; }
-.tab-bar > .tab-strip { flex: 1; min-width: 0; }
-.tab-strip { position: relative; display: flex; align-items: stretch; gap: 2px; padding: var(--s1) 6px 0; background: var(--panel); overflow-x: auto; }
-.tab-strip::-webkit-scrollbar { height: 5px; }
-.tab-strip::-webkit-scrollbar-thumb { border-width: 1px; }
+/* The strip is as wide as its tabs (then scrolls), so the ＋ after it follows the
+   last tab and the "All tabs" chevron takes the far right. */
+.tab-bar > .tab-strip { flex: 0 1 auto; min-width: 0; }
+/* No scrollbar: one appearing when the tabs overflow grew the strip and pushed the
+   editor down. The wheel scrolls it, the active tab is kept in view, and the edge
+   with more tabs behind it fades (mask alpha only — any opaque token works). */
+.tab-strip { position: relative; display: flex; align-items: stretch; gap: 2px; padding: var(--s1) 6px 0; background: var(--panel); overflow-x: auto; scrollbar-width: none; }
+/* 28px = STRIP_FADE_PX in App.tsx, which keeps the active tab clear of the fade. */
+.tab-strip.fade-l { mask-image: linear-gradient(to right, transparent, var(--bg) 28px); }
+.tab-strip.fade-r { mask-image: linear-gradient(to left, transparent, var(--bg) 28px); }
+.tab-strip.fade-l.fade-r { mask-image: linear-gradient(to right, transparent, var(--bg) 28px, var(--bg) calc(100% - 28px), transparent); }
 .tab {
   position: relative; display: flex; align-items: center; gap: 6px; min-height: var(--tab-h);
   padding: var(--s1) var(--s2) var(--s1) 11px; max-width: 200px;
@@ -1294,18 +1301,25 @@ body > div[class] > .cm-tooltip { z-index: 500; }
 .tab[style*="--conn-color"] { border-bottom: 3px solid var(--conn-color); }
 .tab-tx { padding: 1px var(--s1); border-radius: var(--r-xs); background: var(--accent-soft); color: var(--accent-2); font-size: 9px; font-weight: 700; }
 .tab-title { overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
-/* Dirty marker and close button share one 16px slot that swaps on hover. */
-.tab-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--accent-2); }
-.tab:hover .tab-dot { display: none; }
-.tab-spin { width: 9px; height: 9px; border-width: 1.5px; margin-right: 0; color: var(--accent); flex-shrink: 0; }
-.tab-close { background: transparent; border: none; color: var(--muted); border-radius: var(--r-xs); width: 16px; height: 16px; padding: 0; line-height: 1; cursor: pointer; opacity: 0; }
+/* One fixed 16px end slot holds the running spinner, the unsaved dot and the ✕,
+   stacked and swapped by opacity: a run starting or a hover never changes the
+   tab's width, so the tabs after it never jump along the strip. */
+.tab-end { flex: none; display: grid; place-items: center; width: 16px; height: 16px; }
+.tab-end > * { grid-area: 1 / 1; transition: opacity var(--dur-fast) var(--ease); }
+.tab-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent-2); pointer-events: none; }
+.tab-spin { width: 10px; height: 10px; border-width: 1.5px; margin-right: 0; vertical-align: 0; color: var(--accent); pointer-events: none; }
+.tab-close { display: grid; place-items: center; background: transparent; border: none; color: var(--muted); border-radius: var(--r-xs); width: 16px; height: 16px; padding: 0; line-height: 1; cursor: pointer; opacity: 0; }
 .tab:hover .tab-close, .tab.active .tab-close, .tab-close:focus-visible { opacity: 0.8; }
-.tab-close:hover { background: var(--border); color: var(--text); opacity: 1; }
-.tab-new { background: transparent; border: none; color: var(--muted); font-size: 15px; padding: 0 var(--s2); cursor: pointer; border-radius: var(--r-sm); }
+/* A running or unsaved tab shows its marker until the pointer asks for the ✕. */
+.tab-end.dirty .tab-close, .tab-end.running .tab-close, .tab-end.running .tab-dot { opacity: 0; }
+.tab:hover .tab-end:has(.tab-close) > :not(.tab-close) { opacity: 0; }
+.tab:hover .tab-end .tab-close, .tab-end .tab-close:focus-visible { opacity: 0.8; }
+.tab:hover .tab-end .tab-close:hover { background: var(--border); color: var(--text); opacity: 1; }
+.tab-new { flex: none; align-self: center; height: var(--tab-h); margin: var(--s1) 0 0 2px; background: transparent; border: none; color: var(--muted); font-size: 15px; padding: 0 var(--s2); cursor: pointer; border-radius: var(--r-sm); }
 .tab-new:hover { background: var(--panel-2); color: var(--text); }
 .tab-overflow {
   flex: none; align-self: center; background: transparent; border: none; color: var(--muted);
-  font-size: var(--fs-base); line-height: 1; padding: 0 var(--s2); margin: var(--s1) var(--s1) 0;
+  font-size: var(--fs-base); line-height: 1; padding: 0 var(--s2); margin: var(--s1) var(--s1) 0 auto;
   height: var(--tab-h); border-radius: var(--r-sm); cursor: pointer;
 }
 .tab-overflow:hover { background: var(--panel-2); color: var(--text); }
@@ -1484,7 +1498,17 @@ body.dnd-dragging * { cursor: grabbing !important; user-select: none !important;
 .rg-headcell { position: absolute; top: 0; display: flex; align-items: center; gap: var(--s1); padding: 0 6px 0 var(--s3); border-right: 1px solid var(--border); font-weight: 600; color: var(--text); font-size: var(--fs-sm); cursor: pointer; user-select: none; overflow: hidden; touch-action: none; }
 .rg-headcell:hover { background: var(--panel); }
 .rg-headcell.sel { background: var(--accent-soft); color: var(--text); }
-.rg-headname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+/* Name + type badge share a wrapping row exactly one header tall: when the badge
+   cannot fit whole beside the full name it wraps onto a second line that the
+   overflow clips, so the type never squeezes the name. A name longer than the cell
+   sits alone on the first line and ellipsizes. The sort glyph stays outside. */
+.rg-headlabel {
+  flex: 1 1 auto; min-width: 0; height: 100%; overflow: hidden;
+  display: flex; flex-wrap: wrap; align-items: center; align-content: flex-start; column-gap: var(--s1);
+}
+/* line-height = HEAD_H (ResultGrid.tsx): the first flex line fills the header. */
+.rg-headname { flex: 0 1 auto; min-width: 0; height: 100%; line-height: 30px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rg-headlabel > .rg-type { margin-left: auto; }
 .rg-headtype { flex: none; font-size: 9px; font-weight: 700; color: var(--muted); }
 .rg-sort { color: var(--accent); font-size: 10px; flex-shrink: 0; font-variant-numeric: tabular-nums; }
 .rg-resize { position: absolute; right: 0; top: 0; width: 6px; height: 100%; cursor: col-resize; z-index: 5; }
@@ -2398,6 +2422,11 @@ label.slack-switch { display: inline-flex; flex-direction: row; align-items: cen
 /* The DDL pane wraps rather than clipping: a hard-clipped `NOT NUL` is a lie. */
 .ddl-code { flex: 1; margin: 0; padding: var(--s3); overflow: auto; font-family: var(--mono); font-size: var(--fs-sm); line-height: var(--lh-body); color: var(--text); }
 .ddl-code code { white-space: pre-wrap; overflow-wrap: anywhere; }
+/* Explorer "View definition" (forms/DefinitionDialog.tsx): the same highlighted code
+   surface as the DDL viewer, bounded so a long function body scrolls inside it. */
+.def-code { max-height: min(60vh, 560px); min-height: 72px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-md); }
+.def-state { display: flex; align-items: center; gap: var(--s2); min-height: 72px; padding: var(--s3); }
+.def-state.muted { color: var(--muted); }
 .rel-edge { fill: none; stroke: var(--border-hover); stroke-width: 1.6; pointer-events: stroke; cursor: pointer; opacity: 0.65; }
 .edge-hover .rel-edge { stroke: var(--accent) !important; stroke-width: 2.2; opacity: 1; }
 .rel-edge-label { font-size: 10px; fill: var(--muted); font-family: var(--mono); paint-order: stroke; stroke: var(--bg); stroke-width: 3px; }
@@ -2664,9 +2693,9 @@ label.slack-switch { display: inline-flex; flex-direction: row; align-items: cen
   /* No transform: a type name is server data, and a composite type keeps its case. */
 }
 .rg-type.inferred { background: transparent; border-bottom: 1px dotted var(--border); border-radius: 0; opacity: 0.75; }
-/* A sorted column shows its glyph instead of the badge: at grid widths the two together
-   truncated the column name to a single letter. The badge title survives on hover. */
-.rg-headcell:has(.rg-sort) .rg-type { display: none; }
+/* The record view keeps the same priority: one clipped wrapping line, name first. */
+.rg-rec-name { flex-wrap: wrap; height: 20px; line-height: 20px; overflow: hidden; }
+.rg-rec-name > .rg-type { line-height: normal; }
 
 /* Numeric cells align right on tabular figures so magnitudes line up. */
 .rg-cell.rg-num { justify-content: flex-end; font-variant-numeric: tabular-nums; }

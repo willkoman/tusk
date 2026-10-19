@@ -387,7 +387,9 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**Open** — the **＋** button or [[kbd:Mod-t]].",
-          "**Close** — **×**, [[kbd:Mod-w]], or middle-click. A dirty tab (● dot) prompts **Save** / **Don't save** / **Cancel**.",
+          "**Close** — **×**, [[kbd:Mod-w]], or middle-click. A dirty tab (● dot, which turns into the **×** on hover) prompts **Save** / **Don't save** / **Cancel**.",
+          "**Dirty** means the text differs from what the tab last matched: the file as opened or saved, the SQL a generated tab opened with (double-click a table, *Select 100 rows*, *Generate…*, *Open in new tab*), or nothing for a new tab. Undoing back to that text clears the dot.",
+          "**Overflow** — the strip scrolls with the wheel, keeps the active tab in view, and fades the edge with more tabs behind it.",
           "**Right-click** — Rename…, Close, Close others, Close tabs to the right. Bulk-close skips dirty tabs.",
           "**Reorder** — drag a tab; [[kbd:Alt-Shift-ArrowLeft]] / [[kbd:Alt-Shift-ArrowRight]] moves the active one. Escape cancels."
         ]
@@ -845,7 +847,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "Each header carries a small type badge. A solid badge is the driver's type; a dotted one is guessed from the loaded values. A sorted column shows its sort glyph in the badge's place; the type stays in the header tooltip.",
+          "Each header carries a small type badge. A solid badge is the driver's type; a dotted one is guessed from the loaded values. The name always wins the width: the badge shows only when it fits whole beside the full name, and the type is always in the header tooltip.",
           "Numeric columns align right on tabular figures. Booleans render as a glyph plus TRUE/FALSE. NULL follows the *NULL cells show* setting.",
           "Values over 300 characters are cut in the cell with `…`; hover for the head of the value, or open **View value…** for all of it.",
           "Rendering never changes the data: copy, export and the value viewer use the raw driver text."
@@ -1302,6 +1304,7 @@ export const TOPICS: Topic[] = [
           "The tree loads shallow at connect. Expanding a table lazily fetches and caches Columns, Indexes, Constraints, Triggers.",
           "**Row estimates and sizes (Postgres)** — `≈1.2K · 64 MB`, from the planner. A never-analyzed table shows no estimate.",
           "**Tooltips** carry comments, a column's `default:`, and full index, constraint, trigger and function definitions.",
+          "**View definition** — double-click (or [[kbd:Enter]] on) a constraint, index, trigger, function/procedure or sequence, or pick *View definition* from any of those menus and from a table's or view's, to read its definition with highlighting. **Copy** and **Open in new tab** take it from there; the new tab starts saved. Constraints, indexes and triggers show instantly from the loaded table detail; the rest is read from the catalog like *Copy DDL*, so it is frozen during a manual transaction.",
           "**Column badges** — key icon for primary key, link icon for foreign key, `·NN` for `NOT NULL`.",
           "**Filter box** — live substring match; containers auto-expand to reveal matches.",
           "**Refresh** re-introspects the tree, autocomplete catalog, privileges and expanded details. Sidebar DDL refreshes automatically."
@@ -1335,11 +1338,11 @@ export const TOPICS: Topic[] = [
         "rows": [
           [
             "Table",
-            "Select 100 rows · Select all rows · **Generate** (SELECT / INSERT / UPDATE) · **Copy** (name / qualified name / DDL / DDL to editor) · **Data** (Export table… / Import data into table… / Backup table… / Filter rows…) · **Modify table…** · Add column… · Add index… · Add constraint… · Rename… · Duplicate… · Edit comment… · DDL & relationships… · Truncate… · Drop…"
+            "Select 100 rows · Select all rows · **Generate** (SELECT / INSERT / UPDATE) · **Copy** (name / qualified name / DDL / DDL to editor) · **Data** (Export table… / Import data into table… / Backup table… / Filter rows…) · **Modify table…** · Add column… · Add index… · Add constraint… · Rename… · Duplicate… · Edit comment… · View definition · DDL & relationships… · Truncate… · Drop…"
           ],
           [
             "View / matview",
-            "Select all rows · **Copy** · **Data** (Export… / Filter rows…) · matview **Refresh** / **Refresh concurrently** · Rename… · Edit comment… · DDL & relationships… · Drop…"
+            "Select all rows · View definition · **Copy** · **Data** (Export… / Filter rows…) · matview **Refresh** / **Refresh concurrently** · Rename… · Edit comment… · DDL & relationships… · Drop…"
           ],
           [
             "Column",
@@ -1347,23 +1350,23 @@ export const TOPICS: Topic[] = [
           ],
           [
             "Index",
-            "Rename… · Copy name · Drop…"
+            "View definition · Rename… · Copy name · Drop…"
           ],
           [
             "Constraint",
-            "Rename… · Copy name · Drop…"
+            "View definition · Rename… · Copy name · Drop…"
           ],
           [
             "Sequence",
-            "Restart… · Rename… · Copy DDL / Copy DDL to editor · Copy name · Drop…"
+            "View definition · Restart… · Rename… · Copy DDL / Copy DDL to editor · Copy name · Drop…"
           ],
           [
             "Function",
-            "Copy DDL / Copy DDL to editor · Copy name · Drop…"
+            "View definition · Copy DDL / Copy DDL to editor · Copy name · Drop…"
           ],
           [
             "Trigger",
-            "Copy DDL / Copy DDL to editor · Copy name · Drop…"
+            "View definition · Copy DDL / Copy DDL to editor · Copy name · Drop…"
           ],
           [
             "Schema",

@@ -113,6 +113,8 @@ export function Tree(props: {
   onExpandTable: (schema: string, name: string) => void;
   onContext: (e: MouseEvent, node: NodeDescriptor) => void;
   onSelect: (node: NodeDescriptor) => void;
+  /** Double-click / Enter on a leaf object (constraint, index, trigger, routine, sequence). */
+  onOpenDefinition?: (node: NodeDescriptor) => void;
 }) {
   const remembered = props.stateKey ? OPEN_BY_KEY.get(props.stateKey) : undefined;
   const [open, setOpenRaw] = createSignal<Set<string>>(remembered ?? new Set(["db", "s:public", "c:public:tables"]));
@@ -174,6 +176,8 @@ export function Tree(props: {
     selected?: boolean;
     onToggle?: () => void;
     onActivate?: () => void;
+    /** Leaf rows: double-click / Enter only (a single click just selects). */
+    onOpen?: () => void;
     onContext?: (e: MouseEvent) => void;
     onSelect?: () => void;
   }) {
@@ -189,7 +193,7 @@ export function Tree(props: {
           if (e.key !== "Enter" && e.key !== " ") return;
           e.preventDefault();
           p.onSelect?.();
-          p.expandable ? p.onToggle?.() : p.onActivate?.();
+          p.expandable ? p.onToggle?.() : (p.onActivate ?? p.onOpen)?.();
         }}
         style={{ "padding-left": `${p.depth * 13 + 6}px`, "--d": p.depth }}
         onClick={(e) => {
@@ -200,7 +204,7 @@ export function Tree(props: {
           p.onSelect?.();
           p.expandable ? p.onToggle?.() : p.onActivate?.();
         }}
-        onDblClick={() => p.onActivate?.()}
+        onDblClick={() => (p.onActivate ?? p.onOpen)?.()}
         onContextMenu={(e) => {
           e.stopPropagation();
           p.onSelect?.();
@@ -339,6 +343,7 @@ export function Tree(props: {
                           title={x.def}
                           selected={props.selectedKey === nodeKey({ kind: "index", schema, table: rel.name, name: x.name })}
                           onSelect={() => props.onSelect({ kind: "index", schema, table: rel.name, name: x.name })}
+                          onOpen={() => props.onOpenDefinition?.({ kind: "index", schema, table: rel.name, name: x.name })}
                           onContext={(e) => props.onContext(e, { kind: "index", schema, table: rel.name, name: x.name })}
                         />
                       )}
@@ -358,6 +363,7 @@ export function Tree(props: {
                           title={cn.def}
                           selected={props.selectedKey === nodeKey({ kind: "constraint", schema, table: rel.name, name: cn.name })}
                           onSelect={() => props.onSelect({ kind: "constraint", schema, table: rel.name, name: cn.name })}
+                          onOpen={() => props.onOpenDefinition?.({ kind: "constraint", schema, table: rel.name, name: cn.name })}
                           onContext={(e) => props.onContext(e, { kind: "constraint", schema, table: rel.name, name: cn.name })}
                         />
                       )}
@@ -376,6 +382,7 @@ export function Tree(props: {
                           title={tg.def}
                           selected={props.selectedKey === nodeKey({ kind: "trigger", schema, table: rel.name, name: tg.name })}
                           onSelect={() => props.onSelect({ kind: "trigger", schema, table: rel.name, name: tg.name, trigger: tg })}
+                          onOpen={() => props.onOpenDefinition?.({ kind: "trigger", schema, table: rel.name, name: tg.name, trigger: tg })}
                           onContext={(e) => props.onContext(e, { kind: "trigger", schema, table: rel.name, name: tg.name, trigger: tg })}
                         />
                       )}
@@ -433,6 +440,7 @@ export function Tree(props: {
                     label={sq}
                     selected={props.selectedKey === nodeKey({ kind: "sequence", schema: s.name, name: sq })}
                     onSelect={() => props.onSelect({ kind: "sequence", schema: s.name, name: sq })}
+                    onOpen={() => props.onOpenDefinition?.({ kind: "sequence", schema: s.name, name: sq })}
                     onContext={(e) => props.onContext(e, { kind: "sequence", schema: s.name, name: sq })}
                   />
                 )}
@@ -452,6 +460,7 @@ export function Tree(props: {
                     title={`${fn.name}(${fn.args}) → ${fn.returns}`}
                     selected={props.selectedKey === nodeKey({ kind: "function", schema: s.name, name: fn.name })}
                     onSelect={() => props.onSelect({ kind: "function", schema: s.name, name: fn.name })}
+                    onOpen={() => props.onOpenDefinition?.({ kind: "function", schema: s.name, name: fn.name })}
                     onContext={(e) => props.onContext(e, { kind: "function", schema: s.name, name: fn.name })}
                   />
                 )}

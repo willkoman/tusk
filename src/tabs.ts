@@ -204,7 +204,16 @@ export type Tab = {
   color: TabColor;
   sql: string;
   filePath: string | null;
+  /** Derived from `sql` vs `cleanSql` on every edit (`isDirtyText`), never set by hand. */
   dirty: boolean;
+  /**
+   * The text this buffer last matched with nothing to lose: the file as opened or
+   * last saved, the SQL a generated tab opened with, "" for a fresh tab. Null =
+   * unknown (a file-backed buffer restored dirty), which stays dirty until saved.
+   * Comparing against it is what keeps a generated `SELECT *` tab from asking to
+   * be saved, and an edit typed and then undone from counting as a change.
+   */
+  cleanSql: string | null;
   /** Bumped for every buffer edit; async saves may only clear the revision they wrote. */
   revision: number;
   /** Active schema for this console (Postgres search_path); null = connection default. */
@@ -231,8 +240,29 @@ export function basename(p: string): string {
   return p.split(/[\\/]/).pop() || p;
 }
 
+/** Line endings are not a change: a CRLF file reads back from CodeMirror as LF. */
+const normalizeEol = (text: string) => text.replace(/\r\n?/g, "\n");
+
+/** Does `text` hold anything its clean baseline does not? (`Tab.cleanSql`) */
+export function isDirtyText(text: string, cleanSql: string | null): boolean {
+  return cleanSql === null || normalizeEol(text) !== normalizeEol(cleanSql);
+}
+
+/**
+ * The baseline a tab starts from when the caller gives none. A clean tab's own text
+ * is its baseline. A restored DIRTY tab's is not known: an untitled one had nothing
+ * before it was typed into (""), a file-backed one had the file, which is not read
+ * back here (null — dirty until saved).
+ */
+function initialCleanSql(init: Partial<Tab> | undefined): string | null {
+  if (init?.cleanSql !== undefined) return init.cleanSql;
+  if (!init?.dirty) return init?.sql ?? "";
+  return init.filePath ? null : "";
+}
+
 export function makeTab(init?: Partial<Tab>): Tab {
   counter += 1;
+  const cleanSql = initialCleanSql(init);
   return {
     id: `tab-${counter}`,
     connectionId: init?.connectionId ?? "",
@@ -242,7 +272,8 @@ export function makeTab(init?: Partial<Tab>): Tab {
     color: normalizeTabColor(init?.color),
     sql: init?.sql ?? "",
     filePath: init?.filePath ?? null,
-    dirty: init?.dirty ?? false,
+    dirty: isDirtyText(init?.sql ?? "", cleanSql),
+    cleanSql,
     revision: init?.revision ?? 0,
     searchSchema: init?.searchSchema ?? null,
     result: init?.result ?? { ...EMPTY_RESULT },
@@ -355,7 +386,7 @@ export function snapshotTabs(tabs: Tab[], activeTabId: string, activeDoc?: strin
         pinned: tab.pinned,
         color: tab.color,
         searchSchema: tab.searchSchema,
-        dirty: tab.dirty || live !== tab.sql,
+        dirty: isDirtyText(live, tab.cleanSql),
       };
     }),
     activeIndex: Math.max(0, tabs.findIndex((tab) => tab.id === activeTabId)),

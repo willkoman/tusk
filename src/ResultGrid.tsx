@@ -1597,7 +1597,7 @@ export function ResultGrid(props: ResultGridProps) {
                     height: `${HEAD_H}px`,
                     ...(pinned() ? { transform: `translateX(${scrollLeft()}px)`, "z-index": "6" } : {}),
                   }}
-                  title={props.columns()[oi()]}
+                  title={[props.columns()[oi()], renderOf(oi()).badgeTitle].filter(Boolean).join("\n")}
                   onPointerDown={(e) => onHeaderDown(e, k, oi())}
                   // Chromium starts a text selection on press and paints it once the
                   // drag crosses selectable content. Cancelling the mousedown (not the
@@ -1606,16 +1606,20 @@ export function ResultGrid(props: ResultGridProps) {
                   onMouseDown={(e) => { if (e.button === 0) e.preventDefault(); }}
                   onContextMenu={(e) => onHeaderContext(e, oi(), k)}
                 >
-                  <span class="rg-headname">{props.columns()[oi()]}</span>
-                  <Show when={renderOf(oi()).badge}>
-                    <span
-                      class="rg-type"
-                      classList={{ inferred: renderOf(oi()).inferred }}
-                      title={renderOf(oi()).inferred ? `${renderOf(oi()).badgeTitle} (guessed from loaded rows)` : renderOf(oi()).badgeTitle}
-                    >
-                      {renderOf(oi()).badge}
-                    </span>
-                  </Show>
+                  {/* The name always wins the width: the badge only shows when it fits
+                      whole beside the full name (it wraps onto a clipped second line). */}
+                  <span class="rg-headlabel">
+                    <span class="rg-headname">{props.columns()[oi()]}</span>
+                    <Show when={renderOf(oi()).badge}>
+                      <span
+                        class="rg-type"
+                        classList={{ inferred: renderOf(oi()).inferred }}
+                        title={renderOf(oi()).inferred ? `${renderOf(oi()).badgeTitle} (guessed from loaded rows)` : renderOf(oi()).badgeTitle}
+                      >
+                        {renderOf(oi()).badge}
+                      </span>
+                    </Show>
+                  </span>
                   <Show when={s()}>
                     {(sk) => <span class="rg-sort">{sk().dir === "asc" ? "▲" : "▼"}{props.view().sorts.length > 1 ? sortIndex(oi()) + 1 : ""}</span>}
                   </Show>
@@ -1861,7 +1865,7 @@ export function ResultGrid(props: ResultGridProps) {
                   const be = () => (editable() ? props.boolEdit(oi) : null);
                   return (
                     <div class="rg-rec-row" classList={{ dirty: isDirty(r(), oi) }}>
-                      <div class="rg-rec-name" title={props.columns()[oi]}>
+                      <div class="rg-rec-name" title={[props.columns()[oi], renderOf(oi).badgeTitle].filter(Boolean).join("\n")}>
                         <span class="rg-rec-col">{props.columns()[oi]}</span>
                         <Show when={renderOf(oi).badge}>
                           <span class="rg-type" classList={{ inferred: renderOf(oi).inferred }}>{renderOf(oi).badge}</span>

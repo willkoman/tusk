@@ -2,6 +2,17 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
+## [Unreleased]
+
+### Added
+- **View any object's definition from the Explorer.** Double-click (or press Enter on) a constraint, index, trigger, function, procedure or sequence, or choose *View definition* from its context menu or a table's or view's, and Tusk shows the definition with syntax highlighting, with **Copy** and **Open in new tab**. A constraint reads as the `ALTER TABLE … ADD CONSTRAINT` that would create it. Constraints, indexes and triggers open instantly from the table detail already loaded; routines, sequences, views and tables are reconstructed from the catalog, like *Copy DDL*. Before this, a definition was only reachable through a tooltip or by copying DDL into the editor.
+
+### Fixed
+- **A tab whose text you haven't changed no longer asks to be saved.** A tab is now unsaved only when its text differs from what it last matched: the file as opened or saved, the SQL a generated tab opened with (double-clicking a table, *Select 100 rows*, *Generate…*), or nothing for a new tab. Undoing back to that text clears the dot, and a Windows file's CRLF line endings no longer count as a change after a restart.
+- **Column names win over type badges in the results grid.** The type badge now appears only when it fits whole beside the full column name, so a narrow column shows its name instead of a truncated name and a type; the type is always in the header tooltip. The record view follows the same rule.
+- **The tab strip no longer jumps.** The unsaved dot, the running spinner and the close button share one fixed slot, so hovering a tab or starting a query no longer resizes it and shoves every tab after it; the strip no longer grows a scrollbar (which pushed the editor down) when tabs overflow, fading the edge that has more tabs behind it instead; and a tab opened off-screen, like a table you double-click, scrolls into view.
+- **SQL Server procedures: Copy DDL works.** The Explorer lists procedures as functions, and a procedure's definition lookup searched only function types, so it failed with "no such relation".
+
 ## [0.11.2] - 2026-09-22
 
 ### Changed

@@ -4637,8 +4637,12 @@ fn mssql_object_types(kind: &str) -> &'static [&'static str] {
         "table" => &["U"],
         "view" | "matview" => &["V"],
         "sequence" => &["SO"],
-        "procedure" => &["P", "PC"],
-        "function" | "aggregate" | "table function" => &["FN", "IF", "TF", "FS", "FT", "AF"],
+        // The Explorer lists procedures and functions as one "function" node kind, so
+        // every routine kind resolves against every routine type. That cannot pick the
+        // wrong object: sys.objects names are unique within a schema.
+        "function" | "procedure" | "aggregate" | "table function" => {
+            &["FN", "IF", "TF", "FS", "FT", "AF", "P", "PC"]
+        }
         "trigger" => &["TR"],
         // Unknown kind: any object that can carry stored DDL.
         _ => &[
@@ -5310,6 +5314,19 @@ fn duck_build_tree(conn: &duckdb::Connection) -> Result<tree::DbTree, AppError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Explorer sends "function" for every routine; a procedure must still resolve.
+    #[test]
+    fn mssql_routine_kinds_cover_procedures_and_functions() {
+        for kind in ["function", "procedure", "aggregate", "table function"] {
+            let types = mssql_object_types(kind);
+            for code in ["P", "PC", "FN", "IF", "TF"] {
+                assert!(types.contains(&code), "{kind} misses {code}");
+            }
+        }
+        assert_eq!(mssql_object_types("table"), &["U"]);
+        assert_eq!(mssql_object_types("view"), &["V"]);
+    }
     use crate::db::QueryOutcome;
 
     fn mem(driver: &str) -> ConnectionConfig {

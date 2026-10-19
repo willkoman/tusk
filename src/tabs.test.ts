@@ -9,14 +9,51 @@ import {
   filterTabs,
   gridViewFor,
   interruptedResult,
+  isDirtyText,
   makeTab,
   pendingCount,
   pinnedCount,
   shortTabLabel,
+  snapshotTabs,
   sortPinned,
   tabLabel,
   type Tab,
 } from "./tabs";
+
+describe("unsaved-change tracking", () => {
+  it("opens a generated tab clean, and only an actual change dirties it", () => {
+    const tab = makeTab({ sql: "SELECT * FROM t LIMIT 100" });
+    expect(tab.dirty).toBe(false);
+    expect(tab.cleanSql).toBe("SELECT * FROM t LIMIT 100");
+    expect(isDirtyText("SELECT * FROM t LIMIT 100", tab.cleanSql)).toBe(false);
+    expect(isDirtyText("SELECT * FROM t LIMIT 10", tab.cleanSql)).toBe(true);
+  });
+
+  it("treats an edit that was undone, or a line-ending difference, as no change", () => {
+    expect(isDirtyText("a\nb", "a\r\nb")).toBe(false);
+    expect(isDirtyText("", makeTab().cleanSql)).toBe(false);
+  });
+
+  it("keeps a restored dirty buffer dirty, with the right baseline", () => {
+    const file = makeTab({ sql: "SELECT 2", filePath: "q.sql", dirty: true });
+    expect(file.dirty).toBe(true);
+    expect(file.cleanSql).toBeNull();
+    expect(isDirtyText("anything", null)).toBe(true);
+    // An untitled buffer had nothing before it was typed into.
+    const untitled = makeTab({ sql: "SELECT 2", dirty: true });
+    expect(untitled.dirty).toBe(true);
+    expect(untitled.cleanSql).toBe("");
+  });
+
+  it("persists dirtiness against the baseline, not against the last patch", () => {
+    const tab = makeTab({ sql: "SELECT 1", filePath: "q.sql" });
+    expect(snapshotTabs([tab], tab.id, "SELECT 1").tabs[0].dirty).toBe(false);
+    expect(snapshotTabs([tab], tab.id, "SELECT 11").tabs[0].dirty).toBe(true);
+    // A CRLF file reads back from the editor as LF: still clean.
+    const crlf = makeTab({ sql: "SELECT 1\r\nFROM t", filePath: "w.sql" });
+    expect(snapshotTabs([crlf], crlf.id, "SELECT 1\nFROM t").tabs[0].dirty).toBe(false);
+  });
+});
 
 describe("tab identities", () => {
   it("starts editor and loaded-result generations independently", () => {

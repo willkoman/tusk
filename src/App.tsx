@@ -19,7 +19,7 @@ import { driverDialect, type DialectId } from "./sql/dialects";
 import { type AiContext, type SampleTable } from "./ai/context";
 import { type CursorInfo, type EditorPrefs, type ServerDiag } from "./editor/types";
 import { prefsStore, tabsStore, layoutStore, type PersistedTabs, type TabsPersistenceFailure } from "./store";
-import { makeTab, basename, gridViewFor, pendingCount, snapshotTabs as recoverySnapshot, type Tab, type ResultSnapshot, type GridView, type SortKey, type PendingEdits } from "./tabs";
+import { makeTab, basename, gridViewFor, isDirtyText, pendingCount, snapshotTabs as recoverySnapshot, type Tab, type ResultSnapshot, type GridView, type SortKey, type PendingEdits } from "./tabs";
 // --- ui/customize: tab organisation + appearance tokens ---
 import {
   TAB_COLORS,
@@ -155,6 +155,8 @@ import {
 } from "./environment";
 import * as ddl from "./sql/ddl";
 import { limitedSelect } from "./sql/ddl";
+import { constraintDefinition, indexDefinition, triggerDefinition } from "./sql/definition";
+import type { DefinitionView } from "./forms/DefinitionDialog";
 import { ddlCaps, ddlSupported } from "./sql/ddlCaps";
 import { clipWrite, clipRead } from "./clipboard";
 import { slackHistoryKey, type SlackExecuted } from "./slackEvents";
@@ -213,6 +215,19 @@ const ShortcutsPane = lazy(() => import("./settings/ShortcutsPane").then((m) => 
 const HistoryPanel = lazy(() => import("./history/HistoryPanel").then((m) => ({ default: m.HistoryPanel })));
 const CommandPalette = lazy(() => import("./CommandPalette").then((m) => ({ default: m.CommandPalette })));
 const PlanView = lazy(() => import("./plan/PlanView").then((m) => ({ default: m.PlanView })));
+const DefinitionDialog = lazy(() => import("./forms/DefinitionDialog").then((m) => ({ default: m.DefinitionDialog })));
+
+/** "View definition" dialog titles per Explorer node kind. */
+const DEFINITION_TITLES: Partial<Record<string, string>> = {
+  table: "Table",
+  view: "View",
+  matview: "Materialized view",
+  constraint: "Constraint",
+  index: "Index",
+  trigger: "Trigger",
+  sequence: "Sequence",
+  function: "Routine",
+};
 const DdlGraphDialog = lazy(() => import("./relviz/DdlGraphDialog").then((m) => ({ default: m.DdlGraphDialog })));
 
 const errMsg = errorMessage;
@@ -380,6 +395,7 @@ function App() {
   // "DDL & relationships" viewer (read-only — standalone signal, not DialogState).
   // name=null = opened from a schema node, straight into the whole-schema ERD.
   const [ddlGraph, setDdlGraph] = createSignal<{ schema: string; name: string | null; kind: string; connectionId: string; origin: UiOrigin } | null>(null);
+  const [definitionView, setDefinitionView] = createSignal<(DefinitionView & { connectionId: string; origin: UiOrigin; node: NodeDescriptor }) | null>(null);
   // Context handed to the AI: connected DB dialect/version, schema summary, the role's
   // privileges, the active schema, and the current editor SQL/selection/last error.
   const aiContext = (): AiContext => ({
@@ -1253,6 +1269,48 @@ function App() {
   /** Set when a press turned into a drag, so the trailing click doesn't switch tabs. */
   let tabClickBlocked = false;
 
+  /**
+   * The strip scrolls without a scrollbar (one appearing would push the editor down
+   * 5px the moment the tabs overflow), so overflow is shown by fading the edge that
+   * has more tabs behind it.
+   */
+  const [stripFade, setStripFade] = createSignal({ left: false, right: false });
+  function measureStrip() {
+    const el = stripEl;
+    if (!el) return;
+    const max = el.scrollWidth - el.clientWidth;
+    const next = { left: el.scrollLeft > 1, right: el.scrollLeft < max - 1 };
+    const cur = stripFade();
+    if (cur.left !== next.left || cur.right !== next.right) setStripFade(next);
+  }
+  /** Bring the active tab into view, clear of the edge fades (`STRIP_FADE_PX`, the CSS
+   *  mask width): generated tabs open at the far end of the strip. */
+  const STRIP_FADE_PX = 28;
+  function revealActiveTab() {
+    queueMicrotask(() => {
+      const el = stripEl;
+      const tab = el?.querySelector<HTMLElement>(".tab.active");
+      if (el && tab) {
+        const sr = el.getBoundingClientRect();
+        const tr = tab.getBoundingClientRect();
+        let target = el.scrollLeft;
+        if (tr.left < sr.left + STRIP_FADE_PX) target += tr.left - sr.left - STRIP_FADE_PX;
+        else if (tr.right > sr.right - STRIP_FADE_PX) target += tr.right - sr.right + STRIP_FADE_PX;
+        el.scrollLeft = Math.max(0, Math.min(el.scrollWidth - el.clientWidth, target));
+      }
+      measureStrip();
+    });
+  }
+  createEffect(on(() => [activeTabId(), tabs().length] as const, revealActiveTab));
+  // The strip remounts with the workbench, so its ref callback (re)attaches this.
+  const stripResize = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => measureStrip());
+  onCleanup(() => stripResize?.disconnect());
+  function attachStrip(el: HTMLDivElement) {
+    stripEl = el;
+    stripResize?.disconnect();
+    stripResize?.observe(el);
+  }
+
   /** Item boundaries of the rendered tabs, in the strip's content coordinates. */
   const tabEdges = () =>
     stripEl ? measureEdges(Array.from(stripEl.querySelectorAll<HTMLElement>(".tab")), stripEl) : [];
@@ -1295,7 +1353,7 @@ function App() {
       if (from < 0) return ts;
       return reorder(ts, from, clampPinSlot(ts, from, from + (delta === 1 ? 2 : -1))) as Tab[];
     });
-    queueMicrotask(() => stripEl?.querySelector(".tab.active")?.scrollIntoView({ block: "nearest", inline: "nearest" }));
+    revealActiveTab();
   }
 
   /** Close every tab matching the predicate, skipping dirty ones (reported). */
@@ -1364,7 +1422,7 @@ function App() {
       const next = ts.map((t) => (t.id === id ? { ...t, pinned: !t.pinned } : t));
       return sortPinned(next) as Tab[];
     });
-    queueMicrotask(() => stripEl?.querySelector(".tab.active")?.scrollIntoView({ block: "nearest", inline: "nearest" }));
+    revealActiveTab();
   }
 
   const setTabColor = (id: string, color: TabColor) => patchTab(id, { color });
@@ -1517,7 +1575,7 @@ function App() {
       let revision = t.revision;
       if (text !== t.sql) {
         revision++;
-        patchTab(tabId, { sql: text, dirty: true, revision });
+        patchTab(tabId, { sql: text, dirty: isDirtyText(text, t.cleanSql), revision });
       }
       const operation = (saveOperations.get(tabId) ?? 0) + 1;
       saveOperations.set(tabId, operation);
@@ -1528,10 +1586,13 @@ function App() {
       const current = tabs().find((x) => x.id === tabId);
       if (!current) return false;
       const unchanged = current.revision === revision && current.sql === text;
+      // The file now holds `text`: that is the new baseline, and edits made while the
+      // write was in flight stay dirty against it.
       patchTab(tabId, {
         filePath,
         title: basename(filePath),
-        ...(unchanged ? { dirty: false } : {}),
+        cleanSql: text,
+        dirty: isDirtyText(current.sql, text),
       });
       patchResult(tabId, { status: unchanged ? `Saved ${filePath}` : `Saved ${filePath}. Newer edits remain unsaved.` });
       return unchanged;
@@ -4122,6 +4183,8 @@ function App() {
     { name: "menu", scope: () => (menuState() ? FOCUSED : null), session: true, close: () => setMenu(null) },
     { name: "dialog", scope: () => { const b = dialogBinding(); return b ? bound(b.origin.connectionId) : null; }, session: true, close: () => setActiveDialog(null) },
     { name: "ddlGraph", scope: () => { const g = ddlGraph(); return g ? bound(g.connectionId) : null; }, session: true, close: () => setDdlGraph(null) },
+    // A viewer: it reads once and then holds text, so a transaction opening leaves it up.
+    { name: "definition", scope: () => { const v = definitionView(); return v ? bound(v.connectionId) : null; }, close: () => setDefinitionView(null) },
     { name: "cellView", scope: () => (cellView() ? FOCUSED : null), close: () => setCellView(null) },
     { name: "runChoice", scope: () => (runChoice() ? FOCUSED : null), close: () => setRunChoice(null) },
     { name: "commitView", scope: () => (commitView() ? FOCUSED : null), close: () => setCommitView(null) },
@@ -4610,11 +4673,10 @@ function App() {
     if (api && tabId === activeTabId()) api.insertAtCursor(body);
     else {
       const t = tabs().find((x) => x.id === tabId);
-      if (t) patchTab(tabId, {
-        sql: (t.sql ? t.sql.replace(/\s*$/, "\n\n") : "") + body,
-        dirty: true,
-        revision: t.revision + 1,
-      });
+      if (t) {
+        const next = (t.sql ? t.sql.replace(/\s*$/, "\n\n") : "") + body;
+        patchTab(tabId, { sql: next, dirty: isDirtyText(next, t.cleanSql), revision: t.revision + 1 });
+      }
     }
   }
 
@@ -4814,6 +4876,65 @@ function App() {
     setMenu({ x: e.clientX, y: e.clientY, items });
   }
 
+  /**
+   * Explorer "View definition" (double-click, Enter, or the context menu). A
+   * constraint, index or trigger already carries its definition in the cached
+   * relation detail, so it shows instantly and never touches the result stream;
+   * functions/procedures, sequences, views and tables are reconstructed by
+   * `object_ddl`, an explicit read like Copy DDL.
+   */
+  function openDefinition(n: NodeDescriptor) {
+    const c = conn();
+    if (!c) return;
+    const where = n.kind === "constraint" || n.kind === "index" || n.kind === "trigger" ? `${n.schema}.${n.table}` : n.schema ?? "";
+    const base = {
+      connectionId: c.id,
+      origin: captureOrigin(),
+      node: n,
+      title: `${DEFINITION_TITLES[n.kind] ?? "Object"} ${n.name}`,
+      subtitle: [where, driverLabel(connectionKind())].filter(Boolean).join(" · "),
+    };
+    if (n.kind === "constraint" || n.kind === "index" || n.kind === "trigger") {
+      const d = details()[relKey(n.schema!, n.table!)];
+      const sql = withDialect(connectionKind(), () => {
+        if (n.kind === "trigger") {
+          const t = n.trigger ?? d?.triggers.find((x) => x.name === n.name);
+          return t ? triggerDefinition(n.schema!, n.table!, t) : null;
+        }
+        if (n.kind === "index") {
+          const x = d?.indexes.find((i) => i.name === n.name);
+          return x ? indexDefinition(n.schema!, n.table!, x) : null;
+        }
+        const con = d?.constraints.find((k) => k.name === n.name);
+        return con ? constraintDefinition(n.schema!, n.table!, con, dcaps().addConstraint) : null;
+      });
+      setDefinitionView({ ...base, sql, error: sql === null ? `The detail for ${n.table} is no longer loaded. Expand the table again.` : null });
+      return;
+    }
+    if (rejectFrozenExplorer()) return;
+    setDefinitionView({ ...base, sql: null, error: null });
+    void loadDefinition(base.node);
+  }
+
+  async function loadDefinition(node: NodeDescriptor) {
+    const view = definitionView();
+    const c = view ? entryOf(view.connectionId)?.conn : undefined;
+    if (!view || !c) return;
+    setDefinitionView({ ...view, sql: null, error: null });
+    const out = await operations.run({
+      connection: c,
+      needs: "idle",
+      release: "Reading an object definition closed the result stream",
+      history: null,
+      run: () => commands.objectDdl(c.id, node.kind, node.schema ?? "", node.name),
+    });
+    const cur = definitionView();
+    if (!cur || cur.node !== node) return; // closed, or another object opened meanwhile
+    setDefinitionView(out.ok
+      ? { ...cur, sql: out.value, error: null }
+      : { ...cur, sql: null, error: out.refused ? "Explorer reads are frozen until the transaction ends" : out.error });
+  }
+
   function openDdlGraph(schemaName: string, name: string | null, kind: string) {
     const c = conn();
     if (!c || rejectFrozenExplorer()) return;
@@ -4851,6 +4972,7 @@ function App() {
       { label: "Copy DDL to editor", icon: "fileCode", onClick: () => copyDDL(n, true) },
     ];
     const items: MenuItem[] = [];
+    const VIEW_DEF: MenuItem = { label: "View definition", icon: "fileCode", onClick: () => openDefinition(n) };
 
     switch (n.kind) {
       case "table":
@@ -4890,7 +5012,11 @@ function App() {
           { label: "Duplicate…", icon: "duplicate", ...gate(canCreateInSchema(s!), `Requires CREATE on schema ${s}`), onClick: () => setActiveDialog({ kind: "duplicate", title: `Duplicate ${n.name}`, defaultName: `${n.name}_copy`, build: (nn, wd) => ddl.duplicateTable(s!, n.name, nn, wd) }) },
           { label: "Edit comment…", icon: "comment", ...gate(ownsTable(s!, n.name), `Requires ownership of ${n.name}`), ...engineCan(dcaps().comments !== "none", "comment on a table"), onClick: () => setActiveDialog({ kind: "comment", title: `Comment on ${n.name}`, current: n.detail?.comment ?? "", build: (t) => ddl.commentOnTable(s!, n.name, t) }) },
           ...(caps()?.ddl !== false || caps()?.relationships !== false
-            ? [{ sep: true as const }, { label: "DDL & relationships…", icon: "fileCode" as const, onClick: () => openDdlGraph(s!, n.name, "table") }]
+            ? [
+                { sep: true as const },
+                ...(caps()?.ddl !== false ? [{ label: "View definition", icon: "fileCode" as const, onClick: () => openDefinition(n) }] : []),
+                { label: "DDL & relationships…", icon: "fileCode" as const, onClick: () => openDdlGraph(s!, n.name, "table") },
+              ]
             : []),
           { sep: "danger" },
           { label: dcaps().truncate ? "Truncate…" : "Delete all rows…", icon: "eraser", danger: true, ...gate(canTruncate(s!, n.name), `Requires TRUNCATE or ownership of ${n.name}`), onClick: () => setActiveDialog({ kind: "confirm", title: dcaps().truncate ? "Truncate table" : "Delete all rows", subtitle: `${s}.${n.name}`, primaryLabel: dcaps().truncate ? "Truncate" : "Delete all rows", lead: "Every row goes. The table and its structure stay.", facts: dangerFacts("Table", s, n.name), confirmName: n.name, showCascade: dcaps().truncateOptions, showRestartIdentity: dcaps().truncateOptions, build: (o) => ddl.truncate(s!, n.name, o) }) },
@@ -4902,6 +5028,7 @@ function App() {
         const kw = n.kind;
         items.push(
           { label: "Select all rows", icon: "play", onClick: () => runTable(s!, n.name) },
+          ...(caps()?.ddl !== false ? [{ label: "View definition", icon: "fileCode" as const, onClick: () => openDefinition(n) }] : []),
           { sep: true },
           { label: "Copy", icon: "copy", items: [copyName, copyQual, ...copyDdl] },
           {
@@ -5018,6 +5145,8 @@ function App() {
       }
       case "index":
         items.push(
+          VIEW_DEF,
+          { sep: true },
           { label: "Rename…", icon: "edit", ...gate(true, ""), ...engineCan(dcaps().renameIndex, "rename an index"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename index ${n.name}`, current: n.name, build: (nn) => ddl.renameIndex(s!, n.name, nn, n.table) }) },
           copyName,
           { sep: "danger" },
@@ -5026,6 +5155,8 @@ function App() {
         break;
       case "constraint":
         items.push(
+          VIEW_DEF,
+          { sep: true },
           { label: "Rename…", icon: "edit", ...gate(true, ""), ...engineCan(dcaps().renameConstraint, "rename a constraint"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename constraint ${n.name}`, current: n.name, build: (nn) => ddl.renameConstraint(s!, n.table!, n.name, nn) }) },
           copyName,
           { sep: "danger" },
@@ -5034,6 +5165,8 @@ function App() {
         break;
       case "sequence":
         items.push(
+          VIEW_DEF,
+          { sep: true },
           { label: "Restart… (edit value)", icon: "refresh", ...gate(true, ""), ...engineCan(dcaps().alterSequence, "restart a sequence"), onClick: () => editAsSql(ddl.alterSequenceRestart(s!, n.name, "1")) },
           { label: "Rename…", icon: "edit", ...gate(true, ""), ...engineCan(dcaps().renameSequence, "rename a sequence"), onClick: () => setActiveDialog({ kind: "rename", title: `Rename sequence ${n.name}`, current: n.name, build: (nn) => ddl.renameSequence(s!, n.name, nn) }) },
           { sep: true },
@@ -5045,6 +5178,8 @@ function App() {
         break;
       case "function":
         items.push(
+          VIEW_DEF,
+          { sep: true },
           ...copyDdl,
           copyName,
           { sep: "danger" },
@@ -5055,6 +5190,8 @@ function App() {
         // The trigger def rides along on the node (pg_get_triggerdef) — no backend roundtrip.
         const def = n.trigger?.def ?? "";
         items.push(
+          VIEW_DEF,
+          { sep: true },
           { label: "Copy DDL", icon: "fileCode", onClick: () => copyText(def.endsWith(";") ? def : def + ";", "copied DDL") },
           { label: "Copy DDL to editor", icon: "fileCode", onClick: () => editAsSql(def) },
           copyName,
@@ -5682,6 +5819,7 @@ function App() {
                     onRunTable={runTable}
                     onExpandTable={loadDetail}
                     onContext={openMenu}
+                    onOpenDefinition={openDefinition}
                     onSelect={setSelected}
                   />
                 )}
@@ -5697,7 +5835,9 @@ function App() {
               <div class="tab-bar">
               <div
                 class="tab-strip"
-                ref={(el) => (stripEl = el)}
+                ref={attachStrip}
+                classList={{ "fade-l": stripFade().left, "fade-r": stripFade().right }}
+                onScroll={measureStrip}
                 onWheel={(e) => {
                   // Vertical wheel scrolls the horizontal strip when it overflows.
                   const el = e.currentTarget;
@@ -5829,16 +5969,25 @@ function App() {
                           }}
                         />
                       </Show>
-                      <Show when={stateOf(t.connectionId)?.running && stateOf(t.connectionId)?.runningTabId === t.id}><span class="spinner-sm tab-spin" title="Query running" /></Show>
                       <Show when={stateOf(t.connectionId)?.transaction.owner === t.id}><span class="tab-tx" title={`Owns ${stateOf(t.connectionId)?.transaction.id ?? "manual transaction"}`}>TX</span></Show>
-                      <Show when={t.dirty}><span class="tab-dot" title="Unsaved changes" /></Show>
-                      <Show when={!t.pinned}>
-                        <button class="tab-close" title="Close tab" onClick={(e) => { e.stopPropagation(); closeTab(t.id); }}><Icon name="close" /></button>
-                      </Show>
+                      {/* Spinner, unsaved dot and ✕ share ONE fixed 16px slot and swap by
+                          opacity, so a run starting or a hover never resizes the tab and
+                          shoves every tab after it along the strip. */}
+                      {(() => {
+                        const running = () => !!stateOf(t.connectionId)?.running && stateOf(t.connectionId)?.runningTabId === t.id;
+                        return (
+                          <span class="tab-end" classList={{ dirty: t.dirty, running: running() }}>
+                            <Show when={running()}><span class="spinner-sm tab-spin" title="Query running" /></Show>
+                            <Show when={t.dirty}><span class="tab-dot" title="Unsaved changes" /></Show>
+                            <Show when={!t.pinned}>
+                              <button class="tab-close" title="Close tab" onClick={(e) => { e.stopPropagation(); closeTab(t.id); }}><Icon name="close" /></button>
+                            </Show>
+                          </span>
+                        );
+                      })()}
                     </div>
                   )}
                 </For>
-                <button class="tab-new" title="New tab" onClick={openNewTab}><Icon name="plus" /></button>
                 {/* Insertion bar: placed with translateX so it slides between slots
                     (`.dnd-bar`, 120 ms, disabled under prefers-reduced-motion). The
                     slot is pin-clamped so the bar only ever promises a legal drop. */}
@@ -5851,6 +6000,9 @@ function App() {
                   />
                 </Show>
               </div>
+              {/* Outside the scroller: it follows the last tab, and stays reachable at
+                  the strip's edge once the tabs overflow. */}
+              <button class="tab-new" title="New tab" onClick={openNewTab}><Icon name="plus" /></button>
               {/* "All tabs": the strip scrolls and hides tabs, this list never does. */}
               <button
                 class="tab-overflow"
@@ -5926,7 +6078,7 @@ function App() {
                 value={sql()}
                 onChange={(text, id) => {
                   const tab = tabs().find((t) => t.id === id);
-                  if (tab && text !== tab.sql) patchTab(id, { sql: text, dirty: true, revision: tab.revision + 1 });
+                  if (tab && text !== tab.sql) patchTab(id, { sql: text, dirty: isDirtyText(text, tab.cleanSql), revision: tab.revision + 1 });
                 }}
                 onRun={() => doRun()}
                 onRunStatement={(t) => doRun(t)}
@@ -6314,6 +6466,22 @@ function App() {
               }}
               onCopy={copyText}
               onClose={() => setDdlGraph(null)}
+            />
+          )}
+        </Show>
+
+        <Show when={definitionView()}>
+          {(v) => (
+            <DefinitionDialog
+              view={v()}
+              onCopy={(sql) => copyText(sql, "copied definition", v().origin)}
+              onOpenInTab={(sql) => {
+                const binding = v();
+                setDefinitionView(null);
+                if (originAlive(binding.origin)) openGeneratedTab(sql, binding.node.schema ?? null, binding.node.name);
+              }}
+              onRetry={v().node.kind === "constraint" || v().node.kind === "index" || v().node.kind === "trigger" ? undefined : () => void loadDefinition(v().node)}
+              onClose={() => setDefinitionView(null)}
             />
           )}
         </Show>
