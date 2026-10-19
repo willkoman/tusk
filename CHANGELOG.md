@@ -2,7 +2,7 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
-## [Unreleased]
+## [0.11.3] - 2026-10-19
 
 ### Added
 - **View any object's definition from the Explorer.** Double-click (or press Enter on) a constraint, index, trigger, function, procedure or sequence, or choose *View definition* from its context menu or a table's or view's, and Tusk shows the definition with syntax highlighting, with **Copy** and **Open in new tab**. A constraint reads as the `ALTER TABLE … ADD CONSTRAINT` that would create it. Constraints, indexes and triggers open instantly from the table detail already loaded; routines, sequences, views and tables are reconstructed from the catalog, like *Copy DDL*. Before this, a definition was only reachable through a tooltip or by copying DDL into the editor.

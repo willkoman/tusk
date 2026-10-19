@@ -3584,6 +3584,24 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
+        "text": "v0.11.3 — definitions, steadier tabs, DuckDB on Windows",
+        "id": "v0-11-3"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**View definition** — double-click (or press [[kbd:Enter]] on) a constraint, index, trigger, routine or sequence in the Explorer, or pick it from the menu, to read its definition; **Open in new tab** starts clean.",
+          "**MySQL routines and DuckDB sequences and macros** now appear in the Explorer, with their definitions and the right *Drop*.",
+          "**Unsaved means changed** — a tab is dirty only when its text differs from what it last matched, so a tab opened by double-clicking a table no longer asks to be saved.",
+          "**Column names win** over type badges in the results grid; the type is always in the header tooltip.",
+          "**The tab strip holds still** — hovering a tab or running a query no longer resizes it, overflow fades instead of growing a scrollbar, and a new tab scrolls into view.",
+          "**DuckDB on Windows** — Cancel works, an ordinary error no longer freezes the connection, and a cancelled query reads as cancelled.",
+          "**DuckDB backups carry sequences**, so tables numbered by `nextval` restore and keep counting.",
+          "**Cancel stops an export** even between pages, and a cancelled backup never replaces your file."
+        ]
+      },
+      {
+        "k": "h",
         "text": "v0.11.2 — dependency refresh",
         "id": "v0-11-2"
       },
