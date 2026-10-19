@@ -91,8 +91,8 @@ pub struct Capabilities {
     /// EXPLAIN ANALYZE exists on this engine (SQLite has no ANALYZE variant).
     pub explain_analyze: bool,
     /// An in-flight query can be cancelled out-of-band. PostgreSQL: CancelRequest.
-    /// DuckDB: interrupt handle, except Windows where interrupt poisons the bundled
-    /// connection. SQLite/MySQL expose no UI-query cancel handle.
+    /// DuckDB: interrupt handle (Windows needs DuckDB built with /EHsc, see
+    /// `.cargo/config.toml`). SQLite/MySQL expose no UI-query cancel handle.
     pub cancel_query: bool,
     pub manual_transactions: bool,
     pub transaction_savepoints: bool,
@@ -143,7 +143,7 @@ impl Capabilities {
             ddl: true,           // best-effort via duckdb_tables()/duckdb_views()
             relationships: true, // best-effort via duckdb_constraints()
             explain_analyze: true,
-            cancel_query: !cfg!(windows), // interrupt() poisons the bundled connection on Windows
+            cancel_query: true,
             manual_transactions: true,
             transaction_savepoints: false,
             set_transaction: false,
@@ -250,23 +250,13 @@ impl CancelHandle {
                 Ok(())
             }
             CancelHandle::Duck(handle) => {
-                // Windows bundled DuckDB: interrupt() leaves the connection in the
-                // #209 poisoned state — every later statement fails with "resource
-                // deadlock would occur" and the leaked handle keeps a file-backed
-                // .duckdb locked until app restart. A query that can't be cancelled
-                // beats a database that can't be reopened.
-                #[cfg(windows)]
-                {
-                    let _ = handle;
-                    Err(AppError::new(
-                        "cancel isn't available for DuckDB on Windows. The query runs to completion.",
-                    ))
-                }
-                #[cfg(not(windows))]
-                {
-                    handle.interrupt();
-                    Ok(())
-                }
+                // On Windows this is safe only because DuckDB is compiled with /EHsc
+                // (`.cargo/config.toml`): without it the interrupt exception leaked an
+                // engine lock and left the connection stuck. An interrupt that reaches
+                // an idle connection is harmless — DuckDB clears it when the next query
+                // starts.
+                handle.interrupt();
+                Ok(())
             }
             CancelHandle::None => Ok(()),
         }
@@ -393,17 +383,12 @@ impl DuckConn {
         })
     }
 
-    /// Wrap an operation error with the quarantine consequence when the error also
-    /// poisoned the connection — otherwise "resource deadlock would occur" repeats
-    /// on every later statement with no way out.
+    /// Settle an operation error into the message the user sees: the quarantine
+    /// consequence when the error also poisoned the connection (otherwise "resource
+    /// deadlock would occur" repeats on every later statement with no way out), else
+    /// an interrupt named as the cancellation it is (`duck_failure`).
     pub(crate) fn quarantine_if_poisoned(&self, err: AppError) -> AppError {
-        match self.quarantine_poisoned() {
-            Some(hint) => AppError::new(format!(
-                "{}. DuckDB left the connection unusable: {hint}",
-                err.message
-            )),
-            None => err,
-        }
+        duck_failure(err, self.quarantine_poisoned())
     }
 
     fn manual_transaction_aborted(&self) -> bool {
@@ -489,6 +474,35 @@ fn forget_if_poisoned(conn: duckdb::Connection) -> bool {
     } else {
         false
     }
+}
+
+/// How DuckDB words a statement stopped by `InterruptHandle::interrupt` — the Cancel
+/// button, through `CancelHandle::Duck` — as in "INTERRUPT Error: Interrupted!".
+/// duckdb-rs reports every failure with `ErrorCode::Unknown`, so the text is all
+/// there is to recognise it by.
+const DUCK_INTERRUPT_PREFIX: &str = "INTERRUPT Error:";
+
+/// The error a DuckDB failure reaches the user with. `quarantine` is the consequence
+/// `DuckConn::quarantine_poisoned` reported, if the failure also poisoned the
+/// connection.
+///
+/// The frontend files an outcome as cancelled, not failed, only when its message says
+/// "cancel" (`isCancelMessage` in `src/operation.ts`, and the export dialog). PostgreSQL's
+/// "canceling statement due to user request" already does; DuckDB's interrupt does not,
+/// so it is renamed here. A quarantined connection keeps DuckDB's own wording instead:
+/// a cancelled outcome replaces the message with "Query cancelled", and the user must
+/// see that the connection or its in-memory data is gone.
+fn duck_failure(mut err: AppError, quarantine: Option<&str>) -> AppError {
+    if let Some(hint) = quarantine {
+        return AppError::new(format!(
+            "{}. DuckDB left the connection unusable: {hint}",
+            err.message
+        ));
+    }
+    if let Some(detail) = err.message.trim_start().strip_prefix(DUCK_INTERRUPT_PREFIX) {
+        err.message = format!("query cancelled (DuckDB: {})", detail.trim());
+    }
+    err
 }
 
 fn duck_error_is_poison(error: &duckdb::Error) -> bool {
@@ -1221,7 +1235,12 @@ impl Backend {
     pub async fn build_tree(&self) -> Result<tree::DbTree, AppError> {
         match self {
             Backend::Pg(p) => tree::build_shallow(&p.client).await,
-            Backend::Duck(d) => duck_build_tree(&d.lock()),
+            Backend::Duck(d) => {
+                // Backup reads the tree with Cancel armed, so an interrupt can land
+                // here. Bind first: quarantine_if_poisoned re-locks.
+                let tree = duck_build_tree(&d.lock());
+                tree.map_err(|e| d.quarantine_if_poisoned(e))
+            }
             Backend::Sqlite(s) => sqlite_build_tree(&s.lock()),
             Backend::MySql(m) => mysql_build_tree(&m.pool).await,
             Backend::MsSql(m) => m.build_tree().await,
@@ -1543,6 +1562,7 @@ impl Backend {
                     .filter(|s| !s.trim().is_empty())
                     .ok_or_else(|| AppError::new("no stored DDL for this sequence"))?;
                 let sql = duck_qualify_sequence_sql(sql.trim(), schema, name);
+                let sql = duck_settle_exhausted_sequence(&sql, schema, name);
                 Ok(if sql.ends_with(';') {
                     sql + "\n"
                 } else {
@@ -3384,8 +3404,11 @@ async fn mysql_build_tree(pool: &mysql_async::Pool) -> Result<tree::DbTree, AppE
     .await?;
     // Stored procedures and functions. Both land in the Explorer's one "function" node
     // kind with the routine type in `returns`, like SQL Server's; `relation_ddl` looks
-    // the type up again because the Explorer sends "function" for either.
-    let (_c4, routine_rows, _a4) = mysql_run(
+    // the type up again because the Explorer sends "function" for either. Best-effort,
+    // like DuckDB's macro listing: a MySQL-compatible server without stored routines
+    // (Vitess, TiDB, …) may reject the view, and that must not take the whole tree down.
+    // A server that rejects it has no routines for a backup to miss.
+    let routine_rows = mysql_run(
         pool,
         &format!(
             "SELECT routine_schema, routine_name, LOWER(routine_type) \
@@ -3394,7 +3417,9 @@ async fn mysql_build_tree(pool: &mysql_async::Pool) -> Result<tree::DbTree, AppE
              ORDER BY routine_schema, routine_name, routine_type"
         ),
     )
-    .await?;
+    .await
+    .map(|(_c, rows, _a)| rows)
+    .unwrap_or_default();
     let (_c3, dbrow, _a3) = mysql_run(pool, "SELECT database()").await?;
     let database = dbrow
         .first()
@@ -5763,6 +5788,72 @@ fn duck_qualify_sequence_sql(sql: &str, schema: &str, name: &str) -> String {
     sql.to_string()
 }
 
+/// DuckDB renders a sequence's `START` as the NEXT value it will issue — which is how a
+/// replayed definition (and a backup) continues numbering where the source left off.
+/// Once a `NO CYCLE` sequence has issued its last value, though, that next value lies
+/// past the bound (`MAXVALUE 3 … START 5`) and DuckDB refuses to run its own text
+/// ("START value (5) cannot be greater than MAXVALUE (3)"). Such a sequence gets START
+/// clamped to the bound plus one `nextval` that consumes it, so the copy is exhausted
+/// exactly like the source. `sql` must already be qualified by
+/// `duck_qualify_sequence_sql`; any other shape is returned unchanged.
+fn duck_settle_exhausted_sequence(sql: &str, schema: &str, name: &str) -> String {
+    let qualified = format!("{}.{}", db::ident(schema), db::ident(name));
+    let prefix = format!("CREATE SEQUENCE {qualified} ");
+    let Some(rest) = sql.strip_prefix(&prefix) else {
+        return sql.to_string();
+    };
+    let mut tokens: Vec<String> = rest
+        .trim_end()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    let at = |tokens: &[String], key: &str| tokens.iter().position(|t| t == key);
+    let value = |tokens: &[String], key: &str| {
+        at(tokens, key)
+            .and_then(|i| tokens.get(i + 1))
+            .and_then(|v| v.parse::<i64>().ok())
+    };
+    let (Some(min), Some(max), Some(start), Some(start_at)) = (
+        value(&tokens, "MINVALUE"),
+        value(&tokens, "MAXVALUE"),
+        value(&tokens, "START"),
+        at(&tokens, "START"),
+    ) else {
+        return sql.to_string();
+    };
+    let no_cycle = tokens.len() >= 2
+        && tokens[tokens.len() - 2] == "NO"
+        && tokens[tokens.len() - 1] == "CYCLE";
+    if !no_cycle || (min..=max).contains(&start) {
+        return sql.to_string();
+    }
+    // The counter overshoots in the increment's direction; follow the sign rather than
+    // the side START landed on, which is wrong once it wraps past the i64 limit.
+    let ascending = at(&tokens, "INCREMENT")
+        .and_then(|i| tokens.get(i + 2))
+        .and_then(|v| v.parse::<i64>().ok())
+        .map_or(start > max, |step| step > 0);
+    let bound = if ascending { max } else { min };
+    tokens[start_at + 1] = bound.to_string();
+    let create = format!("{prefix}{};", tokens.join(" "));
+    // `nextval('…')` splits its argument on `.` and `"` without undoubling a `""`, so
+    // a name containing a double quote cannot be spelled there (see the conformance
+    // test); that copy issues the bound once more instead.
+    if schema.contains('"') || name.contains('"') {
+        return format!(
+            "-- Exhausted on the source. START is clamped to the bound so DuckDB accepts\n\
+             -- the statement; this copy issues that last value once more.\n{create}"
+        );
+    }
+    format!(
+        "-- Exhausted on the source. START is clamped to the bound so DuckDB accepts\n\
+         -- the statement, and the nextval below consumes it again.\n\
+         {create}\nSELECT nextval({})",
+        dlit(&qualified)
+    )
+}
+
 /// A user macro's `CREATE MACRO` statement, restating every overload of `schema.name`.
 /// `duckdb_functions()` keeps the body and the parameter names/types but NOT parameter
 /// defaults, so a parameter declared as `name := value` comes back without its default;
@@ -5896,6 +5987,51 @@ mod tests {
             duck_qualify_sequence_sql("CREATE TEMP SEQUENCE s START 1;", "main", "s"),
             "CREATE TEMP SEQUENCE s START 1;"
         );
+    }
+
+    /// The stored START of an exhausted NO CYCLE sequence is past its bound; it is
+    /// clamped and consumed. A cycling or in-range sequence is untouched.
+    #[test]
+    fn exhausted_duck_sequences_are_clamped_and_consumed() {
+        let tail = "INCREMENT BY 1 MINVALUE 1 MAXVALUE 3";
+        let up = format!("CREATE SEQUENCE \"main\".\"a\" {tail} START 5 NO CYCLE;");
+        let settled = duck_settle_exhausted_sequence(&up, "main", "a");
+        assert!(
+            settled.contains(&format!(
+                "CREATE SEQUENCE \"main\".\"a\" {tail} START 3 NO CYCLE;"
+            )),
+            "{settled}"
+        );
+        assert!(
+            settled.ends_with("SELECT nextval('\"main\".\"a\"')"),
+            "{settled}"
+        );
+        let down = "CREATE SEQUENCE \"main\".\"d\" INCREMENT BY -1 MINVALUE 1 MAXVALUE 2 START 0 NO CYCLE;";
+        assert!(duck_settle_exhausted_sequence(down, "main", "d")
+            .contains("MAXVALUE 2 START 1 NO CYCLE;"));
+        // A counter that wrapped past i64::MAX still clamps toward its increment.
+        let wrapped = format!(
+            "CREATE SEQUENCE \"main\".\"w\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 3 START {} NO CYCLE;",
+            i64::MIN
+        );
+        assert!(duck_settle_exhausted_sequence(&wrapped, "main", "w")
+            .contains("MAXVALUE 3 START 3 NO CYCLE;"));
+        let quoted = "CREATE SEQUENCE \"x\".\"q\"\"s\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 3 START 4 NO CYCLE;";
+        let settled = duck_settle_exhausted_sequence(quoted, "x", "q\"s");
+        assert!(
+            settled.contains("START 3 NO CYCLE;") && !settled.contains("nextval"),
+            "{settled}"
+        );
+        for unchanged in [
+            "CREATE SEQUENCE \"main\".\"a\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 3 START 3 NO CYCLE;",
+            "CREATE SEQUENCE \"main\".\"a\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 3 START 5 CYCLE;",
+            "CREATE SEQUENCE a INCREMENT BY 1 MINVALUE 1 MAXVALUE 3 START 5 NO CYCLE;",
+        ] {
+            assert_eq!(
+                duck_settle_exhausted_sequence(unchanged, "main", "a"),
+                unchanged
+            );
+        }
     }
     use crate::db::QueryOutcome;
 
@@ -6531,6 +6667,36 @@ mod tests {
         assert!(!duck_error_is_poison(&probe));
         conn.execute_batch("ROLLBACK").unwrap();
         conn.execute_batch("SELECT 1").unwrap();
+    }
+
+    /// The frontend files an outcome as cancelled when the message says "cancel"
+    /// (`isCancelMessage`, `/cancel/i`). A DuckDB interrupt must say it; a quarantine
+    /// must not, or "Query cancelled" would replace the news that the connection
+    /// (or the in-memory data) is gone.
+    #[test]
+    fn duckdb_interrupt_reads_as_cancelled_unless_quarantined() {
+        let says_cancel = |e: &AppError| e.message.to_ascii_lowercase().contains("cancel");
+        let interrupt = || AppError::new("INTERRUPT Error: Interrupted!");
+
+        let cancelled = duck_failure(interrupt(), None);
+        assert_eq!(cancelled.message, "query cancelled (DuckDB: Interrupted!)");
+        assert!(says_cancel(&cancelled));
+
+        let quarantined = duck_failure(interrupt(), Some("the connection was discarded."));
+        assert_eq!(
+            quarantined.message,
+            "INTERRUPT Error: Interrupted!. DuckDB left the connection unusable: the connection was discarded."
+        );
+        assert!(!says_cancel(&quarantined), "{}", quarantined.message);
+
+        // Any other failure passes through untouched, including one that merely
+        // mentions an interrupt.
+        for message in [
+            "Catalog Error: Table with name nope does not exist!",
+            "Binder Error: column \"INTERRUPT Error:\" not found",
+        ] {
+            assert_eq!(duck_failure(AppError::new(message), None).message, message);
+        }
     }
 
     #[test]

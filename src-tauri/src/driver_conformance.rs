@@ -4058,6 +4058,584 @@ async fn duckdb_sequences_and_macros_listed_and_defined() {
     );
 }
 
+// --- DuckDB errors release the engine's locks ---
+
+/// Run one step of a DuckDB scenario on its own OS thread, failing the test instead of
+/// hanging it when the step blocks. The fresh thread matters: a lock leaked by a failed
+/// statement makes the thread that leaked it fail with "resource deadlock would occur",
+/// but blocks every OTHER thread forever, and Tusk's commands run on whichever tokio
+/// worker is free.
+fn duck_step<T, F, Fut>(b: Backend, what: &str, step: F) -> (Backend, T)
+where
+    T: Send + 'static,
+    F: FnOnce(Backend) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = (Backend, T)>,
+{
+    use std::sync::mpsc::RecvTimeoutError;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = tx.send(rt.block_on(step(b)));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(out) => out,
+        // The blocked worker keeps the backend; it is leaked with the thread.
+        Err(RecvTimeoutError::Timeout) => panic!(
+            "DuckDB blocked during {what}: a failed statement left an engine lock held. \
+             Is DuckDB compiled with /EHsc (.cargo/config.toml)?"
+        ),
+        Err(RecvTimeoutError::Disconnected) => {
+            std::panic::resume_unwind(worker.join().expect_err("worker sent nothing"))
+        }
+    }
+}
+
+/// A DuckDB statement that fails while the engine holds an internal lock must release
+/// the lock. libduckdb-sys compiles DuckDB without an /EH option, and MSVC then unwinds
+/// a C++ exception without running destructors, so the `lock_guard` around the failing
+/// code never unlocks (`.cargo/config.toml` supplies /EHsc). Two of the errors that hit
+/// this are ordinary user mistakes:
+/// - `nextval` on an exhausted NO CYCLE sequence, or `currval` before any `nextval`,
+///   kept the sequence's lock. The Explorer's next refresh (`build_tree` reads
+///   `duckdb_sequences()`), View definition and backup then blocked forever.
+/// - A duplicate primary key kept a lock the table's next write needs, and that write
+///   blocked forever.
+///
+/// The `SELECT 1` probe behind `quarantine_if_poisoned` passed in both cases, so nothing
+/// discarded the connection. These must not be quarantined either: the in-memory
+/// database keeps its rows.
+#[test]
+fn duckdb_failed_statements_release_engine_locks() {
+    let (b, _version) = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(connect(&duck_cfg()))
+        .unwrap();
+    let (b, ()) = duck_step(b, "setup", |mut b| async move {
+        for sql in [
+            r#"CREATE SEQUENCE "main"."tusk_spent" MAXVALUE 2"#,
+            r#"CREATE SEQUENCE "main"."tusk_unused""#,
+            "SELECT nextval('main.tusk_spent')",
+            "SELECT nextval('main.tusk_spent')",
+            r#"CREATE TABLE "main"."tusk_keyed" (id INTEGER PRIMARY KEY)"#,
+            r#"INSERT INTO "main"."tusk_keyed" VALUES (1)"#,
+        ] {
+            exec(&mut b, sql).await;
+        }
+        (b, ())
+    });
+
+    // The failures come from one thread; everything after runs on others.
+    let (b, errors) = duck_step(b, "the failing statements", |mut b| async move {
+        let mut errors = Vec::new();
+        for sql in [
+            "SELECT nextval('main.tusk_spent')",
+            "SELECT currval('main.tusk_unused')",
+            r#"INSERT INTO "main"."tusk_keyed" VALUES (1)"#,
+        ] {
+            b.rollback_cursor().await;
+            let err = b
+                .run_single(sql, 100, cursorable(sql))
+                .await
+                .expect_err(sql);
+            errors.push(err.message);
+        }
+        (b, errors)
+    });
+    for (err, expected) in
+        errors
+            .iter()
+            .zip(["reached maximum value", "not yet defined", "Duplicate key"])
+    {
+        assert!(err.contains(expected), "{expected}: {err}");
+        assert!(!err.contains("unusable"), "quarantined: {err}");
+    }
+
+    let (b, tree) = duck_step(b, "the Explorer refresh", |b| async move {
+        let tree = b.build_tree().await;
+        (b, tree)
+    });
+    let tree = tree.expect("build_tree");
+    let main = tree
+        .schemas
+        .iter()
+        .find(|s| s.name == "main")
+        .expect("main schema");
+    // build_tree drops a failed sequence read silently, so an error shows up here.
+    assert_eq!(main.sequences, vec!["tusk_spent", "tusk_unused"]);
+
+    let (b, ddl) = duck_step(b, "View definition", |b| async move {
+        let ddl = b.relation_ddl("sequence", "main", "tusk_spent").await;
+        (b, ddl)
+    });
+    let ddl = ddl.expect("sequence ddl");
+    assert!(ddl.contains("MAXVALUE 2"), "{ddl}");
+
+    let (_b, (count, again)) = duck_step(b, "the next write", |mut b| async move {
+        exec(&mut b, r#"INSERT INTO "main"."tusk_keyed" VALUES (2)"#).await;
+        let count = all(&mut b, r#"SELECT count(*) FROM "main"."tusk_keyed""#).await;
+        b.rollback_cursor().await;
+        let again = b
+            .run_single("SELECT nextval('main.tusk_spent')", 100, true)
+            .await;
+        (b, (count, again))
+    });
+    assert_eq!(count[0][0].as_deref(), Some("2"), "rows kept, write landed");
+    let again = again.expect_err("the sequence is still exhausted");
+    assert!(
+        again.message.contains("reached maximum value"),
+        "{}",
+        again.message
+    );
+}
+
+/// The parser-error face of the same build defect (duckdb-rs #209). `parse_check`
+/// keeps parser errors off the real connection, so this asks libduckdb directly: with
+/// /EHsc the connection stays usable on its own thread and on another.
+#[test]
+fn duckdb_parser_error_leaves_connection_usable() {
+    // A poisoned connection aborts the process when dropped, so a failure here must
+    // leak it rather than unwind through its destructor.
+    let c = std::mem::ManuallyDrop::new(duckdb::Connection::open_in_memory().unwrap());
+    assert!(c.prepare("SELEC 1").is_err(), "a parser error");
+    let probe = c.prepare("SELECT 1").map(drop);
+    assert!(probe.is_ok(), "same thread after a parser error: {probe:?}");
+    let c = std::mem::ManuallyDrop::into_inner(c);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = c.query_row("SELECT 42", [], |r| r.get::<_, i32>(0));
+        let ok = matches!(r, Ok(42));
+        let _ = tx.send(ok);
+        if ok {
+            drop(c);
+        } else {
+            std::mem::forget(c);
+        }
+    });
+    let ok = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("another thread blocked after a parser error");
+    assert!(ok, "another thread after a parser error");
+}
+
+/// Cancel stops a running DuckDB query and the connection carries on, Windows included.
+/// Without /EHsc an interrupt kept the same engine lock a failed statement did, so
+/// Cancel was switched off on Windows. The interrupt goes through
+/// `CancelHandle::cancel`, the call `cancel_operation` makes, while the query runs on
+/// another thread; every later step runs on a thread of its own (`duck_step`). The
+/// query fails with a message the UI files as cancelled, the in-memory database must
+/// keep its rows (a quarantine would discard them) and the file-backed one must give
+/// its file lock back once idle.
+#[test]
+fn duckdb_cancel_interrupts_and_leaves_connection_usable() {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::{Duration, Instant};
+    const LONG: &str = "SELECT count(*) FROM range(100000000000) t(x) WHERE x % 7 = 3";
+
+    let path = std::env::temp_dir().join(format!("tusk_cancel_{}.duckdb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let file_cfg = ConnectionConfig {
+        path: Some(path.to_string_lossy().into_owned()),
+        ..duck_cfg()
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    for cfg in [duck_cfg(), file_cfg] {
+        let (b, _version) = rt.block_on(connect(&cfg)).unwrap();
+        let (b, ()) = duck_step(b, "setup", |mut b| async move {
+            exec(&mut b, r#"CREATE TABLE "main"."tusk_cancel" (id INTEGER)"#).await;
+            exec(&mut b, r#"INSERT INTO "main"."tusk_cancel" VALUES (1)"#).await;
+            (b, ())
+        });
+
+        let handle = b.cancel_handle();
+        assert!(
+            matches!(handle, crate::driver::CancelHandle::Duck(_)),
+            "DuckDB arms its interrupt handle"
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut b = b;
+            let out = rt.block_on(async {
+                b.rollback_cursor().await;
+                b.run_single(LONG, 100, cursorable(LONG)).await
+            });
+            let _ = tx.send((b, out));
+        });
+        // A query clears a pending interrupt when it starts, so one that lands before
+        // the query is under way is lost: keep cancelling until the query stops.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (b, outcome) = loop {
+            rt.block_on(handle.clone().cancel(&cfg))
+                .unwrap_or_else(|e| panic!("cancel refused: {}", e.message));
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(out) => break out,
+                Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+                // The blocked worker keeps the backend; it is leaked with the thread.
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("the cancelled DuckDB query never stopped")
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    std::panic::resume_unwind(worker.join().expect_err("worker sent nothing"))
+                }
+            }
+        };
+        let err = outcome.expect_err("the cancelled query fails");
+        // Named as a cancellation: the frontend files an outcome as cancelled, not
+        // failed, only when the message says "cancel" (`isCancelMessage`).
+        assert_eq!(
+            err.message, "query cancelled (DuckDB: Interrupted!)",
+            "an interrupt reads as a cancel, never as a quarantine"
+        );
+
+        let (b, one) = duck_step(b, "the next query", |mut b| async move {
+            let one = all(&mut b, "SELECT 1").await;
+            (b, one)
+        });
+        assert_eq!(one[0][0].as_deref(), Some("1"));
+
+        let (b, tree) = duck_step(b, "the Explorer refresh", |b| async move {
+            let tree = b.build_tree().await;
+            (b, tree)
+        });
+        let tree = tree.expect("build_tree");
+        let main = tree
+            .schemas
+            .iter()
+            .find(|s| s.name == "main")
+            .expect("main schema");
+        let tables: Vec<&str> = main.tables.iter().map(|t| t.name.as_str()).collect();
+        assert!(tables.contains(&"tusk_cancel"), "{tables:?}");
+
+        let (b, count) = duck_step(b, "the next write", |mut b| async move {
+            exec(&mut b, r#"INSERT INTO "main"."tusk_cancel" VALUES (2)"#).await;
+            let count = all(&mut b, r#"SELECT count(*) FROM "main"."tusk_cancel""#).await;
+            (b, count)
+        });
+        assert_eq!(count[0][0].as_deref(), Some("2"), "rows kept, write landed");
+
+        if cfg.path.as_deref() != Some(":memory:") {
+            let reopen_cfg = cfg.clone();
+            let (_b, reopened) = duck_step(b, "releasing the file", |b| async move {
+                b.release_idle(false);
+                let closed = b.is_closed();
+                // DuckDB takes an exclusive lock per process: a second open fails
+                // while the first connection (or a leaked one) still holds the file.
+                let reopened = match connect(&reopen_cfg).await {
+                    Ok((mut other, _)) => {
+                        Ok(all(&mut other, r#"SELECT count(*) FROM "main"."tusk_cancel""#).await)
+                    }
+                    Err(e) => Err(e.message),
+                };
+                (b, (closed, reopened))
+            });
+            assert!(reopened.0, "released when idle");
+            let rows = reopened.1.expect("file lock freed after a cancel");
+            assert_eq!(rows[0][0].as_deref(), Some("2"));
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+async fn duck_backup(
+    b: &mut Backend,
+    tag: &str,
+    options: &crate::backup::BackupOptions,
+) -> (crate::backup::BackupSummary, String, std::path::PathBuf) {
+    let path = std::env::temp_dir().join(format!("tusk_duck_seq_{tag}_{}.sql", std::process::id()));
+    let flag = std::sync::atomic::AtomicBool::new(false);
+    let summary = crate::backup::run_backup(
+        b,
+        "conformance",
+        options,
+        &path.to_string_lossy(),
+        &flag,
+        &mut |_| {},
+    )
+    .await
+    .unwrap_or_else(|e| panic!("[{tag}] backup: {}", e.message));
+    let text = std::fs::read_to_string(&path).unwrap();
+    (summary, text, path)
+}
+
+async fn duck_restore(b: &mut Backend, tag: &str, path: &std::path::Path) {
+    let restored = crate::backup::run_restore(
+        b,
+        TransactionEngine::DuckDb,
+        &path.to_string_lossy(),
+        &crate::backup::RestoreOptions {
+            stop_on_error: true,
+            single_transaction: false,
+        },
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut |_| {},
+    )
+    .await
+    .unwrap_or_else(|e| panic!("[{tag}] restore: {}", e.message));
+    assert_eq!(
+        restored.statements_failed, 0,
+        "[{tag}] restore errors: {:?}",
+        restored.first_error
+    );
+}
+
+/// DuckDB tables whose keys default to `nextval('…')` survive backup → drop → restore.
+/// The dump creates each sequence before the tables (DuckDB checks a default's sequence
+/// at CREATE TABLE), at the source's NEXT value — DuckDB has no `setval`, so the
+/// position travels in the stored `START`. A `tables` selection carries only the
+/// sequences its defaults name, resolved the way DuckDB binds them (an unqualified name
+/// in the table's own schema first); drops leave out `CASCADE`, which on DuckDB drops
+/// dependent tables; an exhausted sequence is replayed exhausted; and a data-only dump
+/// warns that it cannot move positions.
+#[tokio::test]
+async fn duckdb_backup_restores_sequences() {
+    let (mut b, _v) = connect(&duck_cfg()).await.unwrap();
+    let teardown: Vec<String> = [
+        r#"DROP TABLE IF EXISTS "x"."bk_t""#,
+        r#"DROP TABLE IF EXISTS "main"."bk_s""#,
+        r#"DROP SEQUENCE IF EXISTS "main"."bk_seq""#,
+        r#"DROP SEQUENCE IF EXISTS "main"."bk_unused""#,
+        r#"DROP SEQUENCE IF EXISTS "main"."bk_done""#,
+        r#"DROP SEQUENCE IF EXISTS "x"."we'ird seq""#,
+    ]
+    .map(String::from)
+    .to_vec();
+    for sql in [
+        r#"CREATE SCHEMA "x""#,
+        r#"CREATE SEQUENCE "main"."bk_seq" START 5 INCREMENT BY 2"#,
+        r#"CREATE SEQUENCE "main"."bk_unused""#,
+        r#"CREATE SEQUENCE "main"."bk_done" MAXVALUE 2"#,
+        r#"CREATE SEQUENCE "x"."we'ird seq" START 100"#,
+        r#"CREATE TABLE "main"."bk_s" (id INTEGER DEFAULT nextval('bk_seq') PRIMARY KEY, v VARCHAR)"#,
+        // Unqualified: binds to x's own sequence. Qualified: main's, shared with bk_s.
+        r#"CREATE TABLE "x"."bk_t" (id INTEGER DEFAULT nextval('we''ird seq'), w INTEGER DEFAULT nextval('main.bk_seq'))"#,
+        r#"INSERT INTO "main"."bk_s" (v) VALUES ('a'), ('b'), ('c')"#,
+        r#"INSERT INTO "x"."bk_t" DEFAULT VALUES"#,
+    ] {
+        exec(&mut b, sql).await;
+    }
+    for _ in 0..2 {
+        all(&mut b, "SELECT nextval('main.bk_done')").await;
+    }
+    // bk_seq issued 5, 7, 9 (bk_s) and 11 (bk_t.w): its next value is 13.
+
+    // --- a `tables` selection: one table, the one sequence it names ---
+    let only_s = crate::backup::BackupOptions {
+        scope: "tables".into(),
+        schemas: Vec::new(),
+        tables: vec![crate::backup::QualifiedName {
+            schema: "main".into(),
+            name: "bk_s".into(),
+        }],
+        content: "all".into(),
+        include_drop: true,
+        single_transaction: false,
+    };
+    let (summary, text, path) = duck_backup(&mut b, "tables", &only_s).await;
+    assert!(
+        summary.warnings.iter().all(|w| !w.contains("sequence")),
+        "{:?}",
+        summary.warnings
+    );
+    let create_seq = text
+        .find(r#"CREATE SEQUENCE "main"."bk_seq" "#)
+        .unwrap_or_else(|| panic!("the referenced sequence is created:\n{text}"));
+    let create_table = text
+        .find("CREATE TABLE bk_s")
+        .unwrap_or_else(|| panic!("the table is created:\n{text}"));
+    assert!(create_seq < create_table, "sequence before table:\n{text}");
+    assert!(
+        text.contains("START 13 "),
+        "the next value travels:\n{text}"
+    );
+    assert!(
+        text.contains("DROP SEQUENCE IF EXISTS \"main\".\"bk_seq\";\n"),
+        "dropped without CASCADE:\n{text}"
+    );
+    for absent in ["bk_unused", "bk_done", "ird seq", "CASCADE"] {
+        assert!(
+            !text.contains(absent),
+            "{absent} is not in a bk_s dump:\n{text}"
+        );
+    }
+    reset(&mut b, &teardown).await;
+    duck_restore(&mut b, "tables", &path).await;
+    let rows = all(&mut b, r#"SELECT id, v FROM "main"."bk_s" ORDER BY id"#).await;
+    assert_eq!(
+        rows.iter().map(|r| cell(r, 0)).collect::<Vec<_>>(),
+        ["5", "7", "9"].map(|s| Some(s.to_string())).to_vec()
+    );
+    exec(&mut b, r#"INSERT INTO "main"."bk_s" (v) VALUES ('d')"#).await;
+    let next = all(&mut b, r#"SELECT id FROM "main"."bk_s" WHERE v = 'd'"#).await;
+    assert_eq!(
+        cell(&next[0], 0).as_deref(),
+        Some("13"),
+        "numbering continues"
+    );
+    let _ = std::fs::remove_file(&path);
+
+    // --- the whole database: every sequence, the exhausted one included ---
+    reset(&mut b, &teardown).await;
+    for sql in [
+        r#"CREATE SEQUENCE "main"."bk_seq" START 5 INCREMENT BY 2"#,
+        r#"CREATE SEQUENCE "main"."bk_unused""#,
+        r#"CREATE SEQUENCE "main"."bk_done" MAXVALUE 2"#,
+        r#"CREATE SEQUENCE "x"."we'ird seq" START 100"#,
+        r#"CREATE TABLE "main"."bk_s" (id INTEGER DEFAULT nextval('bk_seq') PRIMARY KEY, v VARCHAR)"#,
+        r#"CREATE TABLE "x"."bk_t" (id INTEGER DEFAULT nextval('we''ird seq'), w INTEGER DEFAULT nextval('main.bk_seq'))"#,
+        r#"INSERT INTO "main"."bk_s" (v) VALUES ('a'), ('b'), ('c')"#,
+        r#"INSERT INTO "x"."bk_t" DEFAULT VALUES"#,
+    ] {
+        exec(&mut b, sql).await;
+    }
+    for _ in 0..2 {
+        all(&mut b, "SELECT nextval('main.bk_done')").await;
+    }
+    let whole = crate::backup::BackupOptions {
+        scope: "database".into(),
+        tables: Vec::new(),
+        ..only_s.clone()
+    };
+    let (summary, text, path) = duck_backup(&mut b, "database", &whole).await;
+    assert!(
+        summary.warnings.iter().all(|w| !w.contains("sequence")),
+        "{:?}",
+        summary.warnings
+    );
+    for seq in [
+        r#"CREATE SEQUENCE "main"."bk_seq" "#,
+        r#"CREATE SEQUENCE "main"."bk_unused" "#,
+        r#"CREATE SEQUENCE "main"."bk_done" "#,
+        r#"CREATE SEQUENCE "x"."we'ird seq" "#,
+    ] {
+        assert!(text.contains(seq), "{seq}:\n{text}");
+    }
+    assert!(
+        text.contains(r#"SELECT nextval('"main"."bk_done"')"#),
+        "the exhausted sequence is consumed again:\n{text}"
+    );
+    reset(&mut b, &teardown).await;
+    duck_restore(&mut b, "database", &path).await;
+    // A second restore runs its drops against live dependencies: tables go first, so
+    // the CASCADE-free sequence drops succeed.
+    duck_restore(&mut b, "database again", &path).await;
+    exec(&mut b, r#"INSERT INTO "x"."bk_t" DEFAULT VALUES"#).await;
+    let rows = all(&mut b, r#"SELECT id, w FROM "x"."bk_t" ORDER BY id"#).await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("100".to_string()), Some("11".to_string())],
+            vec![Some("101".to_string()), Some("13".to_string())],
+        ],
+        "both defaults resolve and continue"
+    );
+    let fresh = all(&mut b, "SELECT nextval('main.bk_unused')").await;
+    assert_eq!(cell(&fresh[0], 0).as_deref(), Some("1"));
+    // Exhausted like the source: its last value is the bound and its next one is past
+    // it. Read from the catalog rather than by calling nextval and expecting the error
+    // — on Windows the bundled DuckDB leaves the sequence's lock held after that error,
+    // and every later read of `duckdb_sequences()` fails or blocks.
+    let done = all(
+        &mut b,
+        "SELECT last_value, max_value, sql FROM duckdb_sequences() WHERE sequence_name = 'bk_done'",
+    )
+    .await;
+    assert_eq!(
+        cell(&done[0], 0),
+        cell(&done[0], 1),
+        "last value is the bound"
+    );
+    assert!(
+        cell(&done[0], 2).is_some_and(|sql| sql.contains("MAXVALUE 2 START 3 ")),
+        "{done:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+
+    // --- data only: no CREATE, so no way to move a position ---
+    let data_only = crate::backup::BackupOptions {
+        content: "data".into(),
+        ..only_s.clone()
+    };
+    let (summary, text, path) = duck_backup(&mut b, "data", &data_only).await;
+    assert!(!text.contains("CREATE SEQUENCE"), "{text}");
+    assert!(
+        summary.warnings.iter().any(|w| w.contains("setval")),
+        "{:?}",
+        summary.warnings
+    );
+    let _ = std::fs::remove_file(&path);
+    reset(&mut b, &teardown).await;
+}
+
+/// A dump WITHOUT drops restores beside a sequence that is still there. A DuckDB
+/// sequence outlives the table numbering from it, so dropping only the table and
+/// restoring its backup into the same database used to stop at `CREATE SEQUENCE`
+/// ("already exists"). The dump now says `IF NOT EXISTS`, leaves out the consuming
+/// `nextval` of an exhausted sequence, and the live sequence keeps its position. The
+/// backup runs wrapped in one transaction, the UI's default.
+#[tokio::test]
+async fn duckdb_backup_without_drops_restores_beside_a_live_sequence() {
+    let (mut b, _v) = connect(&duck_cfg()).await.unwrap();
+    let teardown: Vec<String> = [
+        r#"DROP TABLE IF EXISTS "main"."nd_t""#,
+        r#"DROP SEQUENCE IF EXISTS "main"."nd_seq""#,
+        r#"DROP SEQUENCE IF EXISTS "main"."nd_done""#,
+    ]
+    .map(String::from)
+    .to_vec();
+    for sql in [
+        r#"CREATE SEQUENCE "main"."nd_seq""#,
+        r#"CREATE SEQUENCE "main"."nd_done" MAXVALUE 2"#,
+        r#"CREATE TABLE "main"."nd_t" (id INTEGER DEFAULT nextval('nd_seq') PRIMARY KEY, d INTEGER DEFAULT nextval('nd_done'))"#,
+        // ids 1, 2 and d 1, 2: nd_done is now exhausted.
+        r#"INSERT INTO "main"."nd_t" DEFAULT VALUES"#,
+        r#"INSERT INTO "main"."nd_t" DEFAULT VALUES"#,
+    ] {
+        exec(&mut b, sql).await;
+    }
+    let opts = crate::backup::BackupOptions {
+        scope: "tables".into(),
+        schemas: Vec::new(),
+        tables: vec![crate::backup::QualifiedName {
+            schema: "main".into(),
+            name: "nd_t".into(),
+        }],
+        content: "all".into(),
+        include_drop: false,
+        single_transaction: true,
+    };
+    let (_summary, text, path) = duck_backup(&mut b, "no drops", &opts).await;
+    for seq in [
+        r#"CREATE SEQUENCE IF NOT EXISTS "main"."nd_seq" "#,
+        r#"CREATE SEQUENCE IF NOT EXISTS "main"."nd_done" "#,
+    ] {
+        assert!(text.contains(seq), "{seq}:\n{text}");
+    }
+    assert!(
+        !text.contains("SELECT nextval("),
+        "no consuming nextval in a dump without drops:\n{text}"
+    );
+    // Drop only the table: DuckDB leaves both sequences in place.
+    exec(&mut b, r#"DROP TABLE "main"."nd_t""#).await;
+    duck_restore(&mut b, "no drops", &path).await;
+    let rows = all(&mut b, r#"SELECT id, d FROM "main"."nd_t" ORDER BY id"#).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(cell(&rows[1], 0).as_deref(), Some("2"));
+    let next = all(&mut b, "SELECT nextval('main.nd_seq')").await;
+    assert_eq!(
+        cell(&next[0], 0).as_deref(),
+        Some("3"),
+        "the live position is kept"
+    );
+    reset(&mut b, &teardown).await;
+    let _ = std::fs::remove_file(&path);
+}
+
 /// MySQL lists stored procedures and functions in the Explorer (routine type in
 /// `returns`), and "View definition" shows `SHOW CREATE PROCEDURE|FUNCTION`. The
 /// Explorer sends kind "function" for both, so the driver looks the type up; one name

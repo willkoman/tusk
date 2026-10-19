@@ -1,0 +1,15 @@
+# Cargo reads this file from the working directory upward, so it applies both to
+# `cargo … --manifest-path src-tauri/Cargo.toml` run from the repository root and to
+# the Tauri CLI, which runs cargo inside src-tauri.
+
+[env]
+# libduckdb-sys compiles DuckDB's C++ through the `cc` crate, which passes no /EH
+# option to MSVC. Without one, a C++ exception unwinds WITHOUT running destructors,
+# so every lock a `lock_guard` held when DuckDB raised an error stays locked: after
+# a parser error, an interrupt, an exhausted sequence or a duplicate key, the next
+# statement that needs that lock fails with "resource deadlock would occur" on the
+# same thread and blocks forever on any other. /EHsc is the standard C++ unwinding
+# model, the one DuckDB's own CMake build and the Python wheel use. `cc` reads
+# CXXFLAGS_<target>; src-tauri/build.rs refuses a Windows build without it.
+CXXFLAGS_x86_64_pc_windows_msvc = "/EHsc"
+CXXFLAGS_aarch64_pc_windows_msvc = "/EHsc"

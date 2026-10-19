@@ -314,7 +314,7 @@ export const TOPICS: Topic[] = [
           [
             "Cancel a running query",
             "yes (`CancelRequest`)",
-            "yes, except on Windows",
+            "yes (interrupt)",
             "—",
             "—",
             "—"
@@ -436,8 +436,8 @@ export const TOPICS: Topic[] = [
           "**SQL Server** — `[bracketed identifiers]`, `N'literals'`, and nested block comments hold semicolons inertly.",
           "A line-only `GO` ends the batch without being sent to the server. `GO 5` is refused.",
           "A `;` inside `BEGIN … END`, `BEGIN TRY` or `CASE … END` belongs to the statement, so a `CREATE PROCEDURE` body runs whole.",
-          "**MySQL stored programs** — in `CREATE PROCEDURE`, `FUNCTION`, `TRIGGER` or `EVENT`, a `;` inside the `BEGIN … END` body (with its `IF`, `CASE`, `LOOP`, `WHILE` and `REPEAT` blocks) belongs to the statement, so the body runs whole with no `DELIMITER` line. Leave `DELIMITER` out: it is a command-line client feature, not SQL.",
-          "MySQL does not reserve `BEGIN` or `END`, so a column or variable named `end` works inside a body. If Tusk reports that a stored program's blocks do not balance, close every block with `END`, or quote such a name with backticks."
+          "**MySQL stored programs** — in `CREATE PROCEDURE`, `FUNCTION`, `TRIGGER` or `EVENT`, a `;` inside the `BEGIN … END` body (with its `IF`, `CASE`, `LOOP`, `WHILE` and `REPEAT` blocks) belongs to the statement, so the body runs whole with no `DELIMITER` line. A `DELIMITER` line is refused: it is a command-line client feature, not SQL.",
+          "MySQL does not reserve `BEGIN` or `END`, so a column or variable named `end` works inside a body. If Tusk reports that a stored program's blocks do not balance, or that text follows its final `END`, close every block with `END` and end the statement after the last one, or quote such a name with backticks."
         ]
       },
       {
@@ -1493,7 +1493,7 @@ export const TOPICS: Topic[] = [
           "On Postgres it covers tables, views, matviews, functions including overloads, and sequences.",
           "**MySQL tables and views** come from `SHOW CREATE TABLE` / `SHOW CREATE VIEW`, with the name qualified by its database. A view is read with no database selected, so every table in its body is qualified too, and the copy recreates the same view whichever database is selected.",
           "**MySQL routines** come from `SHOW CREATE PROCEDURE` / `SHOW CREATE FUNCTION`, with the routine name qualified by its database so the copy recreates it there whichever database is selected. A compound `BEGIN … END` body runs as one statement, so a copy pasted into the editor replays as is. A name that is both a procedure and a function shows both. A role that may run a routine but not read it (no `SHOW_ROUTINE`, not its definer) gets that explanation instead of empty text.",
-          "**DuckDB sequences** come from their stored `CREATE SEQUENCE`, with the name schema-qualified and quoted. **DuckDB macros** are rebuilt with every overload and parameter type, but without parameter defaults, which DuckDB does not report; a comment says so.",
+          "**DuckDB sequences** come from their stored `CREATE SEQUENCE`, with the name schema-qualified and quoted. Its `START` is the next value the sequence will hand out; once a non-cycling sequence has used its last value, DuckDB refuses its own stored text, so `START` is clamped to the bound and a following `SELECT nextval(…)` uses it up again. **DuckDB macros** are rebuilt with every overload and parameter type, but without parameter defaults, which DuckDB does not report; a comment says so.",
           "On PostgreSQL and SQL Server, foreign keys emit as trailing `ALTER TABLE … ADD CONSTRAINT`, so copied tables replay in any order; MySQL's stay inline, as `SHOW CREATE TABLE` prints them. Constraint-backed indexes are skipped.",
           "**Copy DDL to editor** pastes the reconstruction at the cursor — useful for [[topic:import-export|exporting]] a structure alongside its data."
         ]
@@ -1601,7 +1601,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "During an all-rows stream the dialog locks its controls and shows **Cancel export**.",
-          "Postgres and DuckDB cancel immediately, except DuckDB on Windows. SQLite, MySQL and SQL Server finish the current query first.",
+          "Postgres and DuckDB cancel immediately. SQLite, MySQL and SQL Server finish the current query first.",
           "Cancel or error rolls back the read transaction and deletes the partial file. xlsx writes the destination only at the end.",
           "Loaded-rows and clipboard exports run in memory, with no query to cancel."
         ]
@@ -1752,7 +1752,7 @@ export const TOPICS: Topic[] = [
         "rows": [
           [
             "**Scope**",
-            "**Whole database**, **Selected schemas**, or **Selected tables**. On PostgreSQL a table selection also carries the sequences its identity columns own."
+            "**Whole database**, **Selected schemas**, or **Selected tables**. A table selection also carries its sequences: on PostgreSQL the ones its tables own, on DuckDB the ones its column defaults call with `nextval`."
           ],
           [
             "**Contents**",
@@ -1783,15 +1783,19 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "A header comment records the Tusk version, engine, database, timestamp and options. Then: drops, schemas, sequences, tables, data, MySQL routines, views, PostgreSQL routines and triggers, and deferred foreign keys."
+        "md": "A header comment records the Tusk version, engine, database, timestamp and options. Then: drops, schemas, sequences, tables, data, deferred foreign keys, MySQL routines, views, and PostgreSQL routines and triggers."
       },
       {
         "k": "list",
         "items": [
-          "**Foreign keys come last on PostgreSQL, MySQL and SQL Server**, as trailing `ALTER TABLE … ADD CONSTRAINT`, so a restore cannot break on table order.",
+          "**Foreign keys come after all the data on PostgreSQL, MySQL and SQL Server**, as `ALTER TABLE … ADD CONSTRAINT` statements, so a restore cannot break on table order.",
           "**MySQL dumps name every object with its database**: tables, views, routines, data and foreign keys. A dump restores into the databases it came from whichever database the connection has selected, and never selects one itself.",
           "**SQLite and DuckDB keep foreign keys inline**, since neither can add one with `ALTER TABLE`. A SQLite schema dump writes `PRAGMA foreign_keys = OFF` first.",
-          "**Functions and procedures are reconstructed on PostgreSQL and MySQL.** MySQL's come from `SHOW CREATE`, qualified by their database, and go before the views so a view that calls a stored function restores. Elsewhere the dump counts the routines it could not carry (SQL Server procedures and functions, DuckDB macros).",
+          "**Sequences are carried on PostgreSQL and DuckDB.** PostgreSQL restores each position with `setval` when data is included. DuckDB has no `setval`, so each `CREATE SEQUENCE` starts at the source's next value, in a schema-only dump too; a data-only DuckDB dump cannot move positions and says so in a warning.",
+          "**DuckDB sequence drops leave out `CASCADE`**, which on DuckDB drops every table that uses the sequence. Restoring with drops over a database where a table outside the dump still uses one of its sequences normally stops at that drop with DuckDB's dependency error; check first if the dump came from a selection of tables, because a database file that was closed and reopened may no longer record that dependency.",
+          "**A DuckDB dump without drops keeps sequences that already exist** (`CREATE SEQUENCE IF NOT EXISTS`): a DuckDB sequence outlives the table that numbers from it, so restoring a dropped table's backup into its own database continues from the live sequence's position.",
+          "**Functions and procedures are reconstructed on PostgreSQL and MySQL.** MySQL's come from `SHOW CREATE`, qualified by their database and wrapped in the `sql_mode` and collation each was created with, as `mysqldump` writes them. They go after the foreign keys and before the views, so a view that calls a stored function restores. A routine Tusk could not replay as one statement (a body with a backslash-escaped quote such as `'can\\'t'`, or a `/*! … */` comment) is left out with a warning, and the dump does not drop it either. Elsewhere the dump counts the routines it could not carry (SQL Server procedures and functions, DuckDB macros).",
+          "**A MySQL routine keeps its `DEFINER`.** Restoring it as another account needs `SET_USER_ID` (or `SUPER`), and with binary logging on, a function not declared `DETERMINISTIC`, `NO SQL` or `READS SQL DATA` needs `log_bin_trust_function_creators`; the dump's header says so.",
           "**Triggers are reconstructed on PostgreSQL only**, and MySQL events are not carried; the dump warns about them on every other engine.",
           "**PostgreSQL data streams through `COPY`**, in blocks terminated by `\\.`, so no table is held in memory.",
           "**Other engines emit batched multi-row `INSERT`s**, paged so memory stays flat, with binary columns as native blob literals.",
@@ -3493,7 +3497,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "While a query runs, the Run button becomes **✕ Cancel** with an elapsed counter.",
-          "Postgres gets a real `CancelRequest`; DuckDB fires its interrupt handle, except on Windows.",
+          "Postgres gets a real `CancelRequest`; DuckDB fires its interrupt handle. Either way the run is logged as *cancelled*, not as an error.",
           "SQLite, MySQL and SQL Server have no out-of-band cancel, so the button shows a disabled **Running** timer instead.",
           "A cancel the backend rejects resets the button with the reason.",
           "Cancelling inside a PostgreSQL manual transaction leaves it in **Recovery required** until `ROLLBACK` or `ROLLBACK TO`.",

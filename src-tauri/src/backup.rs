@@ -12,7 +12,7 @@
 //!                              --  BEGIN opens a statement block, not a transaction)
 //! DROP … IF EXISTS             -- include_drop, reverse dependency order
 //! CREATE SCHEMA IF NOT EXISTS
-//! CREATE SEQUENCE
+//! CREATE SEQUENCE              -- PostgreSQL and DuckDB
 //! CREATE TABLE (+ indexes, comments)   -- PG/MySQL/SQL Server: FOREIGN KEYs held back
 //! <data>                       -- PG: COPY … FROM stdin blocks; others: INSERTs
 //! CREATE PROCEDURE / FUNCTION  -- MySQL: SHOW CREATE text, before the views that call it
@@ -31,6 +31,14 @@
 //! so their FKs stay inline: SQLite's dump switches enforcement off instead, and a
 //! cycle that `topo_order` cannot resolve is recorded as a warning in the dump and the
 //! summary rather than silently written.
+//!
+//! **Sequences are PostgreSQL and DuckDB.** PostgreSQL restores positions with
+//! trailing `setval`s. DuckDB has no `setval`, but its stored `CREATE SEQUENCE` text
+//! already starts at the next unissued value, so the CREATE carries the position (in a
+//! schema-only dump too); a data-only dump cannot move one and says so in a warning.
+//! A DuckDB `tables` selection carries the sequences its column defaults name
+//! (`duck_sequence_calls` / `resolve_duck_sequence`), and its drops omit `CASCADE`,
+//! which on DuckDB drops dependent tables rather than just their defaults.
 //!
 //! Restore streams the file back through `script::parse_stream_chunk` so a
 //! multi-gigabyte dump never has to be resident, and executes statement by statement
@@ -445,6 +453,158 @@ fn qual(schema: &str, name: &str, dialect: SqlDialect, schemas: bool) -> String 
     }
 }
 
+/// The sequence names a DuckDB column default passes to `nextval` / `currval`, each
+/// split the way DuckDB's `QualifiedName::Parse` splits that string argument: `.`
+/// separates parts, `"` toggles quoting and is never undoubled, nothing is
+/// case-folded. String literals and quoted identifiers elsewhere in the expression are
+/// skipped, and a call whose argument is not a plain string literal names nothing.
+/// A DuckDB dump without drops must not fail on a sequence that is already there:
+/// unlike a PostgreSQL `serial`, a DuckDB sequence outlives the table numbering from
+/// it, so restoring a dropped table's backup into its own database meets the sequence
+/// still in place. `IF NOT EXISTS` keeps the live one (and its position). The trailing
+/// `SELECT nextval` an exhausted sequence carries is left out too: run against the
+/// live sequence it would consume a value, or fail on an exhausted one. A fresh
+/// restore of an exhausted sequence then has its last value once more.
+fn duck_sequence_if_missing(ddl: &str) -> String {
+    let exhausted = ddl.lines().any(|line| line.starts_with("--"));
+    let create = ddl
+        .lines()
+        .filter(|line| !line.starts_with("--") && !line.starts_with("SELECT nextval("))
+        .map(|line| match line.strip_prefix("CREATE SEQUENCE ") {
+            Some(rest) => format!("CREATE SEQUENCE IF NOT EXISTS {rest}"),
+            None => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if exhausted {
+        format!(
+            "-- Exhausted on the source. START is clamped to the bound so DuckDB accepts\n\
+             -- the statement; an existing sequence of this name is kept as it is.\n{create}"
+        )
+    } else {
+        create
+    }
+}
+
+fn duck_sequence_calls(default: &str) -> Vec<Vec<String>> {
+    let chars: Vec<char> = default.chars().collect();
+    let mut calls = Vec::new();
+    let mut i = 0;
+    // Index just past the string literal opening at `start` (a `'`), and its value.
+    let literal = |start: usize| -> (usize, Option<String>) {
+        let mut value = String::new();
+        let mut j = start + 1;
+        while j < chars.len() {
+            if chars[j] == '\'' {
+                if chars.get(j + 1) == Some(&'\'') {
+                    value.push('\'');
+                    j += 2;
+                    continue;
+                }
+                return (j + 1, Some(value));
+            }
+            value.push(chars[j]);
+            j += 1;
+        }
+        (j, None)
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            i = literal(i).0;
+        } else if c == '"' {
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                i += 1;
+            }
+            i += 1;
+        } else if c.is_alphabetic() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            if !(word.eq_ignore_ascii_case("nextval") || word.eq_ignore_ascii_case("currval")) {
+                continue;
+            }
+            let mut j = i;
+            while chars.get(j).is_some_and(|c| c.is_whitespace()) {
+                j += 1;
+            }
+            if chars.get(j) != Some(&'(') {
+                continue;
+            }
+            j += 1;
+            while chars.get(j).is_some_and(|c| c.is_whitespace()) {
+                j += 1;
+            }
+            if chars.get(j) != Some(&'\'') {
+                continue;
+            }
+            let (end, value) = literal(j);
+            i = end;
+            if let Some(parts) = value.as_deref().and_then(duck_qualified_name) {
+                calls.push(parts);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    calls
+}
+
+/// DuckDB's `QualifiedName::Parse`, minus the error text: `None` for an unterminated
+/// quote, an empty name, or more than three parts.
+fn duck_qualified_name(input: &str) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut entry = String::new();
+    let mut quoted = false;
+    for c in input.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            '.' if !quoted => parts.push(std::mem::take(&mut entry)),
+            _ => entry.push(c),
+        }
+    }
+    parts.push(entry);
+    if quoted || parts.len() > 3 || parts.last().is_some_and(|p| p.is_empty()) {
+        return None;
+    }
+    Some(parts)
+}
+
+/// The sequence (of `known`, this database's `(schema, name)` pairs) a DuckDB default
+/// naming `parts` binds to. An unqualified name resolves in the table's own schema
+/// first and then `main` — DuckDB binds a default in its table's schema before the
+/// search path; `a.b` is schema `a`, or this database's `main` when `a` is the
+/// database's name; `c.s.n` must name this database. Comparison ignores case, as
+/// DuckDB's catalog does. `None` for a sequence this database does not have
+/// (including one in another attached database).
+fn resolve_duck_sequence(
+    parts: &[String],
+    table_schema: &str,
+    database: &str,
+    known: &[(String, String)],
+) -> Option<(String, String)> {
+    let candidates: Vec<(&str, &str)> = match parts {
+        [name] => vec![(table_schema, name.as_str()), ("main", name.as_str())],
+        [first, name] if first.eq_ignore_ascii_case(database) => {
+            vec![(first.as_str(), name.as_str()), ("main", name.as_str())]
+        }
+        [schema, name] => vec![(schema.as_str(), name.as_str())],
+        [catalog, schema, name] if catalog.eq_ignore_ascii_case(database) => {
+            vec![(schema.as_str(), name.as_str())]
+        }
+        _ => Vec::new(),
+    };
+    candidates.into_iter().find_map(|(schema, name)| {
+        known
+            .iter()
+            .find(|(s, n)| s.eq_ignore_ascii_case(schema) && n.eq_ignore_ascii_case(name))
+            .cloned()
+    })
+}
+
 /// Split PostgreSQL table DDL into the CREATE half and the trailing
 /// `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` statements `ddl.rs` defers. Those
 /// are re-emitted after ALL data so restore order can never break on an FK cycle.
@@ -674,6 +834,7 @@ async fn backup_inner(
     let dialect = SqlDialect::parse(caps.kind)?;
     let is_pg = matches!(backend, Backend::Pg(_));
     let is_mysql = matches!(backend, Backend::MySql(_));
+    let is_duck = matches!(backend, Backend::Duck(_));
     // SQL Server's reconstruction already emits foreign keys as trailing
     // `ALTER TABLE … ADD CONSTRAINT` lines, in the same shape PostgreSQL's does — so
     // they can be deferred past all data and a cycle restores. Only SQLite and DuckDB
@@ -825,11 +986,97 @@ async fn backup_inner(
         }
     }
 
+    // DuckDB sequences. DuckDB has no identity columns, so every sequence is an
+    // independent object a `DEFAULT nextval('…')` names — and its catalog does not keep
+    // the table → sequence dependency across a reopen (`duckdb_dependencies()` comes
+    // back empty for a file database), so the references are read from every dumped
+    // table's column defaults instead. A database or schema dump carries every
+    // sequence of its schemas plus any sequence a dumped table's default names in
+    // another schema; a `tables` selection carries only the sequences its tables
+    // name. A name that resolves to no sequence of this database is a warning, never
+    // a guess.
+    let mut warnings: Vec<String> = Vec::new();
+    // Schemas the dump must create only because a carried sequence lives there.
+    let mut sequence_schemas: Vec<String> = Vec::new();
+    if is_duck {
+        let known: Vec<(String, String)> = tree
+            .schemas
+            .iter()
+            .flat_map(|s| s.sequences.iter().map(|n| (s.name.clone(), n.clone())))
+            .collect();
+        let mut carried: std::collections::BTreeSet<(String, String)> = known
+            .iter()
+            .filter(|(schema, _)| opts.scope != "tables" && schema_names.contains(schema))
+            .cloned()
+            .collect();
+        for t in &tables {
+            cancelled(cancel)?;
+            let detail = match backend.table_detail(&t.schema, &t.name).await {
+                Ok(detail) => detail,
+                Err(e) => {
+                    // Without its column defaults, a sequence this table numbers from
+                    // cannot be found, and the restore would fail at its CREATE TABLE
+                    // with nothing in the dump saying why.
+                    if opts.wants_schema() {
+                        warnings.push(format!(
+                            "table {}.{}: its column defaults could not be read ({}), so \
+                             any sequence it numbers from is not carried",
+                            t.schema,
+                            t.name,
+                            comment_safe(&e.message)
+                        ));
+                    }
+                    continue;
+                }
+            };
+            for column in &detail.columns {
+                let Some(default) = column.default.as_deref() else {
+                    continue;
+                };
+                for parts in duck_sequence_calls(default) {
+                    match resolve_duck_sequence(&parts, &t.schema, &database, &known) {
+                        Some(found) => {
+                            carried.insert(found);
+                        }
+                        None if opts.wants_schema() => warnings.push(format!(
+                            "table {}.{} column {}: the default `{}` names a sequence \
+                             this database does not have, so the dump does not create \
+                             it — the table will not restore until that sequence exists",
+                            t.schema,
+                            t.name,
+                            column.name,
+                            comment_safe(default)
+                        )),
+                        None => {}
+                    }
+                }
+            }
+        }
+        for (schema, name) in carried {
+            if !schema_names.contains(&schema) && !sequence_schemas.contains(&schema) {
+                sequence_schemas.push(schema.clone());
+            }
+            all_sequences.push((schema.clone(), name.clone()));
+            create_sequences.push((schema, name));
+        }
+        // The position travels inside the CREATE (DuckDB writes the next value as
+        // START), and DuckDB has neither `setval` nor `ALTER SEQUENCE … RESTART` — so
+        // a dump without the schema has no way to move a sequence at all.
+        if !opts.wants_schema() && !all_sequences.is_empty() {
+            warnings.push(format!(
+                "DuckDB has no setval, so a data-only dump cannot move sequence \
+                 positions: after restoring, the {} sequence(s) in this selection keep \
+                 their current values and nextval may return ids the restored rows \
+                 already hold",
+                all_sequences.len()
+            ));
+        }
+    }
+
     // MySQL routines are read and checked before anything is written, so the drops
     // cover exactly the routines the dump recreates: a restore must never drop one the
     // dump leaves out. Procedures and functions have separate namespaces (one name can
     // be both), so each keeps its own type for its DROP.
-    let mut warnings: Vec<String> = Vec::new();
     let mut routines: Vec<(String, String, &'static str, String)> = Vec::new();
     if is_mysql && opts.wants_schema() {
         for (schema, name) in &functions {
@@ -982,10 +1229,15 @@ async fn backup_inner(
                 ))
                 .await?;
             }
+            // DuckDB's CASCADE drops every TABLE whose default uses the sequence (not
+            // just the default, as PostgreSQL's does), which could destroy a table that
+            // is not in this dump. Without it, a sequence still used by such a table is
+            // refused and the restore stops there — loudly, with nothing lost.
             for (schema, name) in create_sequences.iter().rev() {
                 out.stmt(&format!(
-                    "DROP SEQUENCE IF EXISTS {} CASCADE",
-                    qual(schema, name, dialect, caps.schemas)
+                    "DROP SEQUENCE IF EXISTS {}{}",
+                    qual(schema, name, dialect, caps.schemas),
+                    if is_duck { "" } else { " CASCADE" }
                 ))
                 .await?;
             }
@@ -994,7 +1246,7 @@ async fn backup_inner(
         // Schemas.
         if caps.schemas {
             out.put("-- schemas\n").await?;
-            for schema in &schema_names {
+            for schema in schema_names.iter().chain(&sequence_schemas) {
                 let stmt = if is_mysql {
                     format!(
                         "CREATE DATABASE IF NOT EXISTS {}",
@@ -1017,13 +1269,24 @@ async fn backup_inner(
             }
         }
 
-        // Sequences (PostgreSQL).
+        // Sequences (PostgreSQL, DuckDB).
         if !create_sequences.is_empty() {
-            out.put("-- sequences\n").await?;
+            out.put(if is_duck {
+                "-- sequences (DuckDB stores each one's next value as its START, so\n\
+                 -- numbering continues where the source left off)\n"
+            } else {
+                "-- sequences\n"
+            })
+            .await?;
             for (schema, name) in &create_sequences {
                 cancelled(cancel)?;
                 match backend.relation_ddl("sequence", schema, name).await {
                     Ok(ddl) => {
+                        let ddl = if is_duck && !opts.include_drop {
+                            duck_sequence_if_missing(&ddl)
+                        } else {
+                            ddl
+                        };
                         out.stmt(&ddl).await?;
                         objects += 1;
                     }
@@ -2226,6 +2489,93 @@ mod tests {
             fks[0],
             "ALTER TABLE `test`.`bk_a` ADD CONSTRAINT `bk_a_b_fk` FOREIGN KEY (`b_id`) REFERENCES `bk_b` (`id`)"
         );
+    }
+
+    /// Without drops, a DuckDB sequence is created only if missing and never consumed.
+    #[test]
+    fn duck_sequences_without_drops_keep_an_existing_one() {
+        let plain =
+            "CREATE SEQUENCE \"main\".\"s\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 9 START 4 NO CYCLE;";
+        assert_eq!(
+            duck_sequence_if_missing(plain),
+            "CREATE SEQUENCE IF NOT EXISTS \"main\".\"s\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 9 START 4 NO CYCLE;"
+        );
+        let exhausted = "-- Exhausted on the source. START is clamped to the bound so DuckDB accepts\n\
+                         -- the statement, and the nextval below consumes it again.\n\
+                         CREATE SEQUENCE \"main\".\"d\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 1 START 1 NO CYCLE;\n\
+                         SELECT nextval('\"main\".\"d\"')";
+        let kept = duck_sequence_if_missing(exhausted);
+        assert!(kept.ends_with(
+            "\nCREATE SEQUENCE IF NOT EXISTS \"main\".\"d\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 1 START 1 NO CYCLE;"
+        ), "{kept}");
+        assert!(!kept.contains("nextval"), "{kept}");
+        assert!(kept.starts_with("-- Exhausted on the source."), "{kept}");
+    }
+
+    /// The defaults below are DuckDB's own `duckdb_columns().column_default` renderings.
+    #[test]
+    fn duck_sequence_calls_read_the_nextval_argument_like_duckdb() {
+        let calls = |d: &str| duck_sequence_calls(d);
+        let parts = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(calls("nextval('seq')"), vec![parts(&["seq"])]);
+        assert_eq!(calls("nextval('main.seq')"), vec![parts(&["main", "seq"])]);
+        assert_eq!(
+            calls("nextval('s.\"we''ird seq\"')"),
+            vec![parts(&["s", "we'ird seq"])]
+        );
+        assert_eq!(
+            calls("(NEXTVAL ( 'db.s.q' ) * 2) + currval('r')"),
+            vec![parts(&["db", "s", "q"]), parts(&["r"])]
+        );
+        // Not a call: a different function, a string that merely says nextval, a
+        // non-literal argument, too many parts, an unterminated quote.
+        for none in [
+            "my_nextval('seq')",
+            "'nextval(''seq'')'",
+            "nextval(seq_name)",
+            "nextval('a.b.c.d')",
+            "nextval('\"open')",
+            "42",
+        ] {
+            assert!(calls(none).is_empty(), "{none}");
+        }
+    }
+
+    #[test]
+    fn duck_sequence_references_resolve_like_duckdb_binds_them() {
+        let known = vec![
+            ("main".to_string(), "seq".to_string()),
+            ("s".to_string(), "seq".to_string()),
+            ("main".to_string(), "only_main".to_string()),
+            ("s".to_string(), "Mixed".to_string()),
+        ];
+        let resolve = |parts: &[&str], table_schema: &str| {
+            let parts: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
+            resolve_duck_sequence(&parts, table_schema, "memory", &known)
+                .map(|(s, n)| format!("{s}.{n}"))
+        };
+        // Unqualified: the table's own schema wins, then main.
+        assert_eq!(resolve(&["seq"], "s").as_deref(), Some("s.seq"));
+        assert_eq!(resolve(&["seq"], "main").as_deref(), Some("main.seq"));
+        assert_eq!(
+            resolve(&["only_main"], "s").as_deref(),
+            Some("main.only_main")
+        );
+        assert_eq!(resolve(&["mixed"], "s").as_deref(), Some("s.Mixed"));
+        assert_eq!(resolve(&["s", "seq"], "main").as_deref(), Some("s.seq"));
+        // A leading database name is this catalog's `main` (or its named schema).
+        assert_eq!(
+            resolve(&["memory", "seq"], "s").as_deref(),
+            Some("main.seq")
+        );
+        assert_eq!(
+            resolve(&["MEMORY", "s", "seq"], "main").as_deref(),
+            Some("s.seq")
+        );
+        // Another attached database, or a sequence nobody has.
+        assert_eq!(resolve(&["other", "main", "seq"], "main"), None);
+        assert_eq!(resolve(&["missing"], "main"), None);
+        assert_eq!(resolve(&["x", "seq"], "main"), None);
     }
 
     #[test]

@@ -1434,8 +1434,8 @@ pub async fn export_tables(
         None,
         c.transaction.clone(),
     )?;
-    // SQLite/MySQL have no out-of-band query cancel and DuckDB's is disabled on Windows,
-    // so the engine handle alone left Cancel dead for up to 2,000 tables. A cooperative
+    // SQLite/MySQL/SQL Server have no out-of-band query cancel, so the engine handle
+    // alone left Cancel dead for up to 2,000 tables. A cooperative
     // flag (the same one backup/restore use) stops the run between tables on every
     // engine; the engine handle still interrupts the current table where it can.
     let soft = cancel_registration.soft_cancel_flag();
