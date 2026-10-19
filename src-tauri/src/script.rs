@@ -540,9 +540,9 @@ fn mysql_body_word(b: &[u8], start: usize, end: usize, prev: MyPrev, st: &mut My
         let (_, next_word, _) = mysql_peek(b, end);
         // `END IF`/`END LOOP`/… close what was never pushed; `END CASE` must not close
         // a block (input that unbalanced is refused at the end instead).
-        let pops = !word_is(next_word, &MYSQL_NEUTRAL_END)
-            && !(top == Some(MyFrame::Block) && next_word.eq_ignore_ascii_case(b"case"));
-        if pops {
+        let keeps = word_is(next_word, &MYSQL_NEUTRAL_END)
+            || (top == Some(MyFrame::Block) && next_word.eq_ignore_ascii_case(b"case"));
+        if !keeps {
             st.frames.pop();
             if top == Some(MyFrame::Block) && st.frames.is_empty() {
                 st.done = true;
