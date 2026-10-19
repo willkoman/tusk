@@ -4341,3 +4341,171 @@ END;";
     exec(b, "DROP DATABASE `tusk_bk_routines`").await;
     let _ = std::fs::remove_file(&path);
 }
+
+/// A MySQL backup of a database that is NOT the session's default one restores into
+/// THAT database. `SHOW CREATE TABLE` names a table bare and the dump never selects a
+/// database (a `USE` would outlive the restore on the pooled connection), so before
+/// `relation_ddl` qualified the name, the tables were created in the session's default
+/// database and the qualified INSERTs that followed failed. A view in the default
+/// database is read on a session with none, so its body names its tables' database too.
+#[tokio::test]
+async fn mysql_backup_restores_a_non_default_database() {
+    let Some(cfg) = mysql_cfg() else {
+        eprintln!("SKIP mysql_backup_restores_a_non_default_database (set TUSK_TEST_MYSQL_PORT)");
+        return;
+    };
+    let mysql = TransactionEngine::MySql;
+    let (mut b, _v) = connect(&cfg).await.expect("connect mysql");
+    let b = &mut b;
+    let leftovers = [
+        "DROP DATABASE IF EXISTS `tusk_bk_tables`".to_string(),
+        "DROP VIEW IF EXISTS `test`.`tusk_bkt_dv`".to_string(),
+        "DROP TABLE IF EXISTS `test`.`tusk_bkt_base`".to_string(),
+    ];
+    reset(b, &leftovers).await;
+
+    // A view in the session's default database: SHOW CREATE VIEW on a pooled
+    // connection prints it as `VIEW \`tusk_bkt_dv\` AS select … from \`tusk_bkt_base\``.
+    exec(
+        b,
+        "CREATE TABLE `test`.`tusk_bkt_base` (id INT PRIMARY KEY)",
+    )
+    .await;
+    exec(
+        b,
+        "CREATE VIEW `test`.`tusk_bkt_dv` AS SELECT id FROM tusk_bkt_base WHERE id > 0",
+    )
+    .await;
+    let view = b
+        .relation_ddl("view", "test", "tusk_bkt_dv")
+        .await
+        .expect("view ddl");
+    assert!(
+        view.contains("VIEW `test`.`tusk_bkt_dv` AS")
+            && view.contains("from `test`.`tusk_bkt_base`"),
+        "every name in the view qualified: {view}"
+    );
+    let table = b
+        .relation_ddl("table", "test", "tusk_bkt_base")
+        .await
+        .expect("table ddl");
+    assert!(
+        table.starts_with("CREATE TABLE `test`.`tusk_bkt_base` ("),
+        "{table}"
+    );
+    // The view read took its connection out of the pool; the pool still answers with
+    // its default database selected.
+    let rows = all(b, "SELECT DATABASE(), COUNT(*) FROM tusk_bkt_dv").await;
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("test"));
+    reset(b, &leftovers).await;
+
+    for sql in [
+        "CREATE DATABASE `tusk_bk_tables`",
+        "CREATE TABLE `tusk_bk_tables`.`tusk_bkt_parent` (id INT PRIMARY KEY, label VARCHAR(20))",
+        "CREATE TABLE `tusk_bk_tables`.`tusk_bkt_child` (id INT PRIMARY KEY, parent_id INT, \
+         CONSTRAINT `tusk_bkt_fk` FOREIGN KEY (parent_id) REFERENCES `tusk_bk_tables`.`tusk_bkt_parent` (id))",
+        "INSERT INTO `tusk_bk_tables`.`tusk_bkt_parent` VALUES (1, 'one'), (2, 'two')",
+        "INSERT INTO `tusk_bk_tables`.`tusk_bkt_child` VALUES (10, 1), (20, 2), (30, 2)",
+        "CREATE VIEW `tusk_bk_tables`.`tusk_bkt_v` AS SELECT c.id, p.label \
+         FROM `tusk_bk_tables`.`tusk_bkt_child` c JOIN `tusk_bk_tables`.`tusk_bkt_parent` p ON p.id = c.parent_id",
+    ] {
+        exec(b, sql).await;
+    }
+    let options = crate::backup::BackupOptions {
+        scope: "schemas".into(),
+        schemas: vec!["tusk_bk_tables".into()],
+        tables: Vec::new(),
+        content: "all".into(),
+        include_drop: true,
+        single_transaction: false,
+    };
+    let path = std::env::temp_dir().join(format!("tusk_backup_tables_{}.sql", std::process::id()));
+    let pth = path.to_string_lossy().to_string();
+    let flag = std::sync::atomic::AtomicBool::new(false);
+    let summary = crate::backup::run_backup(b, "conformance", &options, &pth, &flag, &mut |_| {})
+        .await
+        .unwrap_or_else(|e| panic!("backup: {}", e.message));
+    assert_eq!(summary.rows, 5, "rows dumped");
+    let text = std::fs::read_to_string(&path).unwrap();
+    for needle in [
+        "CREATE TABLE `tusk_bk_tables`.`tusk_bkt_parent` (",
+        "CREATE TABLE `tusk_bk_tables`.`tusk_bkt_child` (",
+        "VIEW `tusk_bk_tables`.`tusk_bkt_v` AS",
+        "INSERT INTO `tusk_bk_tables`.`tusk_bkt_child`",
+        "ALTER TABLE `tusk_bk_tables`.`tusk_bkt_child` ADD CONSTRAINT `tusk_bkt_fk` FOREIGN KEY",
+    ] {
+        assert!(text.contains(needle), "dump lacks {needle}:\n{text}");
+    }
+    assert!(
+        !text.contains("USE "),
+        "the dump never selects a database:\n{text}"
+    );
+
+    // Into a server where the database is gone, then again over the restored copy
+    // (the dump's own drops), the session's default database staying `test` throughout.
+    exec(b, "DROP DATABASE `tusk_bk_tables`").await;
+    for pass in ["fresh", "over the restored copy"] {
+        let restored = crate::backup::run_restore(
+            b,
+            mysql,
+            &pth,
+            &crate::backup::RestoreOptions {
+                stop_on_error: true,
+                single_transaction: false,
+            },
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .await
+        .unwrap_or_else(|e| panic!("restore {pass}: {}", e.message));
+        assert_eq!(
+            restored.statements_failed, 0,
+            "restore {pass}: {:?}\n{text}",
+            restored.first_error
+        );
+        let rows = all(
+            b,
+            "SELECT DATABASE(), \
+               (SELECT COUNT(*) FROM `tusk_bk_tables`.`tusk_bkt_parent`), \
+               (SELECT COUNT(*) FROM `tusk_bk_tables`.`tusk_bkt_child`), \
+               (SELECT COUNT(*) FROM `tusk_bk_tables`.`tusk_bkt_v` WHERE label = 'two')",
+        )
+        .await;
+        let got: Vec<Option<String>> = (0..4).map(|i| cell(&rows[0], i)).collect();
+        assert_eq!(
+            got,
+            ["test", "2", "3", "2"].map(|s| Some(s.to_string())),
+            "restore {pass}"
+        );
+        // The deferred foreign key names the parent bare; it has to resolve to the
+        // child's own database, not the session's.
+        let rows = all(
+            b,
+            "SELECT referenced_table_schema, referenced_table_name \
+             FROM information_schema.key_column_usage \
+             WHERE table_schema = 'tusk_bk_tables' AND constraint_name = 'tusk_bkt_fk'",
+        )
+        .await;
+        assert_eq!(
+            (cell(&rows[0], 0), cell(&rows[0], 1)),
+            (
+                Some("tusk_bk_tables".into()),
+                Some("tusk_bkt_parent".into())
+            ),
+            "restore {pass}"
+        );
+        let rows = all(
+            b,
+            "SELECT COUNT(*) FROM information_schema.tables \
+             WHERE table_schema = 'test' AND table_name LIKE 'tusk_bkt%'",
+        )
+        .await;
+        assert_eq!(
+            cell(&rows[0], 0).as_deref(),
+            Some("0"),
+            "restore {pass}: nothing landed in the default database"
+        );
+    }
+    exec(b, "DROP DATABASE `tusk_bk_tables`").await;
+    let _ = std::fs::remove_file(&path);
+}

@@ -1491,9 +1491,10 @@ export const TOPICS: Topic[] = [
         "items": [
           "**Copy DDL** rebuilds a runnable `CREATE` from the system catalogs on every engine, best-effort on DuckDB.",
           "On Postgres it covers tables, views, matviews, functions including overloads, and sequences.",
+          "**MySQL tables and views** come from `SHOW CREATE TABLE` / `SHOW CREATE VIEW`, with the name qualified by its database. A view is read with no database selected, so every table in its body is qualified too, and the copy recreates the same view whichever database is selected.",
           "**MySQL routines** come from `SHOW CREATE PROCEDURE` / `SHOW CREATE FUNCTION`, with the routine name qualified by its database so the copy recreates it there whichever database is selected. A compound `BEGIN … END` body runs as one statement, so a copy pasted into the editor replays as is. A name that is both a procedure and a function shows both. A role that may run a routine but not read it (no `SHOW_ROUTINE`, not its definer) gets that explanation instead of empty text.",
           "**DuckDB sequences** come from their stored `CREATE SEQUENCE`, with the name schema-qualified and quoted. **DuckDB macros** are rebuilt with every overload and parameter type, but without parameter defaults, which DuckDB does not report; a comment says so.",
-          "Foreign keys emit as trailing `ALTER TABLE … ADD CONSTRAINT`, so copied tables replay in any order. Constraint-backed indexes are skipped.",
+          "On PostgreSQL and SQL Server, foreign keys emit as trailing `ALTER TABLE … ADD CONSTRAINT`, so copied tables replay in any order; MySQL's stay inline, as `SHOW CREATE TABLE` prints them. Constraint-backed indexes are skipped.",
           "**Copy DDL to editor** pastes the reconstruction at the cursor — useful for [[topic:import-export|exporting]] a structure alongside its data."
         ]
       },
@@ -1788,6 +1789,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "**Foreign keys come last on PostgreSQL, MySQL and SQL Server**, as trailing `ALTER TABLE … ADD CONSTRAINT`, so a restore cannot break on table order.",
+          "**MySQL dumps name every object with its database**: tables, views, routines, data and foreign keys. A dump restores into the databases it came from whichever database the connection has selected, and never selects one itself.",
           "**SQLite and DuckDB keep foreign keys inline**, since neither can add one with `ALTER TABLE`. A SQLite schema dump writes `PRAGMA foreign_keys = OFF` first.",
           "**Functions and procedures are reconstructed on PostgreSQL and MySQL.** MySQL's come from `SHOW CREATE`, qualified by their database, and go before the views so a view that calls a stored function restores. Elsewhere the dump counts the routines it could not carry (SQL Server procedures and functions, DuckDB macros).",
           "**Triggers are reconstructed on PostgreSQL only**, and MySQL events are not carried; the dump warns about them on every other engine.",
@@ -1838,7 +1840,7 @@ export const TOPICS: Topic[] = [
         "items": [
           "DDL reconstruction matches [[topic:sidebar|Copy DDL]]: partitioning, inheritance, row-level security, grants, storage parameters and tablespaces are out of scope.",
           "DuckDB dumps carry no `CREATE INDEX`.",
-          "MySQL's `CREATE TABLE` is unqualified, so it restores into the connected database.",
+          "A MySQL dump cannot be restored into a database with a different name without editing the names in the file.",
           "SQL Server table reconstruction needs SQL Server 2017 or later."
         ]
       }

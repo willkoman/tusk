@@ -962,6 +962,9 @@ async fn backup_inner(
                     bytes: out.bytes,
                 });
             }
+            // MySQL DDL comes back qualified with its database (`relation_ddl`), like the
+            // data and FK statements: the dump never `USE`s one, so a bare name would
+            // land in whatever database the restoring session has selected.
             match backend.relation_ddl(&t.kind, &t.schema, &t.name).await {
                 Ok(ddl) => {
                     let (main, fks) = if is_pg || matches!(backend, Backend::MsSql(_)) {

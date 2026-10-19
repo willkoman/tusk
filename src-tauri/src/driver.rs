@@ -1465,10 +1465,16 @@ impl Backend {
                     schema.replace('`', "``"),
                     name.replace('`', "``")
                 );
-                let (_c, rows, _a) = mysql_run_limited(&m.pool, &q, db::DDL_TEXT_LIMITS).await?;
+                let (_c, rows, _a) = if is_view {
+                    mysql_show_create_view(&m.pool, &q).await?
+                } else {
+                    mysql_run_limited(&m.pool, &q, db::DDL_TEXT_LIMITS).await?
+                };
                 rows.first()
                     .and_then(|r| r.get(1).cloned().flatten())
-                    .map(|s| s + ";\n")
+                    .map(|s| {
+                        mysql_qualify_create(s.trim_end().trim_end_matches(';'), schema) + ";\n"
+                    })
                     .ok_or_else(|| AppError::new("no DDL returned"))
             }
             Backend::Duck(d) if matches!(kind, "function" | "macro" | "table macro") => {
@@ -3402,7 +3408,7 @@ async fn mysql_routine_ddl(
         match body {
             Some(text) => parts.push(format!(
                 "{};\n",
-                mysql_qualify_routine(text.trim_end().trim_end_matches(';'), schema)
+                mysql_qualify_create(text.trim_end().trim_end_matches(';'), schema)
             )),
             None => {
                 return Err(AppError::new(format!(
@@ -3415,13 +3421,43 @@ async fn mysql_routine_ddl(
     Ok(parts.join("\n"))
 }
 
-/// `SHOW CREATE PROCEDURE|FUNCTION` names the routine bare, so replaying it creates the
-/// routine in whatever database the session has selected. Qualify the name with the
-/// schema it was read from (as DuckDB's stored sequence text is re-qualified), so Copy
-/// DDL and a backup put it back where it came from from any default database. The body
-/// needs nothing: a routine runs with its own database selected. Text whose head is not
-/// `CREATE [DEFINER = user] [AGGREGATE] PROCEDURE|FUNCTION name` comes back unchanged.
-fn mysql_qualify_routine(sql: &str, schema: &str) -> String {
+/// `SHOW CREATE VIEW` leaves the database off every table the body reads from the
+/// session's DEFAULT database, and off the view's own name when it lives there, so text
+/// read on a pooled connection only replays correctly on a session with that same
+/// default database. Read it on a session with none and every name comes back
+/// qualified. (`information_schema.views` is no substitute: it is always qualified but
+/// drops charset introducers, and does not carry ALGORITHM or a column list.)
+///
+/// `change_user` to no database takes the connection OUT of the pool when the pool has a
+/// default database, so it is closed on drop rather than handed back to a later user
+/// query without one; a pool with no default database gets it back unchanged. If the
+/// server refuses the change, the view is read on an ordinary pooled connection: its
+/// head is still qualified by `mysql_qualify_create`, only the body keeps the bare names.
+async fn mysql_show_create_view(
+    pool: &mysql_async::Pool,
+    sql: &str,
+) -> Result<(Vec<String>, Vec<Vec<Option<String>>>, u64), AppError> {
+    let mut conn = pool.get_conn().await.map_err(de)?;
+    let unscoped = mysql_async::ChangeUserOpts::default().with_db_name(None);
+    if conn.change_user(unscoped).await.is_ok() {
+        return mysql_run_conn_limited(&mut conn, sql, db::DDL_TEXT_LIMITS).await;
+    }
+    drop(conn);
+    mysql_run_limited(pool, sql, db::DDL_TEXT_LIMITS).await
+}
+
+/// `SHOW CREATE TABLE|VIEW|PROCEDURE|FUNCTION` names the object bare (a view only when
+/// it lives in the session's default database), so replaying the text creates it in
+/// whatever database the session has selected. Qualify the name with the schema it was
+/// read from (as DuckDB's stored sequence text is re-qualified), so Copy DDL and a
+/// backup put it back where it came from whatever the default database. Only the head
+/// changes: a table's inline `REFERENCES t` already resolves against the table's own
+/// database, a routine body runs with its own database selected, and a view is read on
+/// a session with no default database, where every name in its body comes back
+/// qualified (`mysql_show_create_view`). Text whose head is not `CREATE [ALGORITHM = …]
+/// [DEFINER = user] [SQL SECURITY …] [AGGREGATE] TABLE|VIEW|PROCEDURE|FUNCTION|SEQUENCE
+/// name` comes back unchanged, as does a name that is already qualified.
+fn mysql_qualify_create(sql: &str, schema: &str) -> String {
     let b = sql.as_bytes();
     let n = b.len();
     let ws = |mut i: usize| {
@@ -3438,8 +3474,8 @@ fn mysql_qualify_routine(sql: &str, schema: &str) -> String {
         }
         (&sql[i..j], j)
     };
-    // One `user` or `host` part of a definer: quoted with a doubled-quote escape, or a
-    // bare run up to whitespace or `@`.
+    // One quoted part (identifier, or a definer's `user` / `host`) with a doubled-quote
+    // escape, or a bare run up to whitespace or `@`.
     let part = |mut i: usize| {
         if i < n && matches!(b[i], b'`' | b'\'' | b'"') {
             let q = b[i];
@@ -3467,33 +3503,68 @@ fn mysql_qualify_routine(sql: &str, schema: &str) -> String {
             return None;
         }
         i = ws(i);
-        let (w, j) = word(i);
-        if w.eq_ignore_ascii_case("definer") {
-            i = ws(j);
-            if b.get(i) != Some(&b'=') {
-                return None;
+        // The clauses MySQL prints between CREATE and the object keyword: a view's
+        // `ALGORITHM = …` and `SQL SECURITY …`, the `DEFINER = user@host` of views and
+        // routines, and MariaDB's `AGGREGATE` function marker.
+        loop {
+            let (w, j) = word(i);
+            if w.eq_ignore_ascii_case("algorithm") {
+                i = ws(j);
+                if b.get(i) != Some(&b'=') {
+                    return None;
+                }
+                let (v, j) = word(ws(i + 1));
+                if v.is_empty() {
+                    return None;
+                }
+                i = ws(j);
+            } else if w.eq_ignore_ascii_case("definer") {
+                i = ws(j);
+                if b.get(i) != Some(&b'=') {
+                    return None;
+                }
+                i = part(ws(i + 1))?;
+                if b.get(i) == Some(&b'@') {
+                    i = part(i + 1)?;
+                }
+                i = ws(i);
+            } else if w.eq_ignore_ascii_case("sql") {
+                let (s, j) = word(ws(j));
+                let (v, j) = word(ws(j));
+                if !s.eq_ignore_ascii_case("security") || v.is_empty() {
+                    return None;
+                }
+                i = ws(j);
+            } else if w.eq_ignore_ascii_case("aggregate") {
+                i = ws(j);
+            } else {
+                break;
             }
-            i = part(ws(i + 1))?;
-            if b.get(i) == Some(&b'@') {
-                i = part(i + 1)?;
-            }
-            i = ws(i);
         }
         let (w, j) = word(i);
-        if w.eq_ignore_ascii_case("aggregate") {
-            i = ws(j);
-        }
-        let (w, j) = word(i);
-        if !(w.eq_ignore_ascii_case("procedure") || w.eq_ignore_ascii_case("function")) {
+        if !["table", "view", "procedure", "function", "sequence"]
+            .iter()
+            .any(|k| w.eq_ignore_ascii_case(k))
+        {
             return None;
         }
         let name = ws(j);
-        // Already qualified (`db`.`name` / db.name): leave it alone.
-        let after = if b.get(name) == Some(&b'`') {
-            part(name)?
-        } else {
-            word(name).1
+        // A quoted name (backticks, or double quotes under ANSI_QUOTES), or a bare one
+        // as `sql_quote_show_create = OFF` prints it: MySQL's unquoted identifiers also
+        // take `$` and any non-ASCII character.
+        let after = match b.get(name) {
+            Some(b'`' | b'"') => part(name)?,
+            _ => {
+                let mut j = name;
+                while j < n
+                    && (b[j].is_ascii_alphanumeric() || matches!(b[j], b'_' | b'$') || b[j] >= 0x80)
+                {
+                    j += 1;
+                }
+                j
+            }
         };
+        // Already qualified (`db`.`name` / db.name): leave it alone.
         if after == name || b.get(after) == Some(&b'.') {
             return None;
         }
@@ -5919,7 +5990,7 @@ mod tests {
     #[test]
     fn mysql_routine_text_is_qualified_with_its_schema() {
         assert_eq!(
-            mysql_qualify_routine(
+            mysql_qualify_create(
                 "CREATE DEFINER=`root`@`%` PROCEDURE `p`(IN n INT)\nBEGIN SELECT 1; END",
                 "test"
             ),
@@ -5927,7 +5998,7 @@ mod tests {
         );
         // Quote characters inside the definer, the name and the schema are escaped.
         assert_eq!(
-            mysql_qualify_routine(
+            mysql_qualify_create(
                 "CREATE DEFINER=`we``ird`@`h@st` FUNCTION `a``b`() RETURNS INT RETURN 1",
                 "s`x"
             ),
@@ -5935,28 +6006,99 @@ mod tests {
         );
         // sql_quote_show_create=OFF prints everything bare; MariaDB AGGREGATE heads.
         assert_eq!(
-            mysql_qualify_routine(
+            mysql_qualify_create(
                 "CREATE DEFINER=root@% FUNCTION f() RETURNS INT RETURN 1",
                 "db"
             ),
             "CREATE DEFINER=root@% FUNCTION `db`.f() RETURNS INT RETURN 1"
         );
         assert_eq!(
-            mysql_qualify_routine(
+            mysql_qualify_create(
                 "CREATE DEFINER=CURRENT_USER AGGREGATE FUNCTION g(x INT) RETURNS INT BEGIN RETURN 1; END",
                 "db"
             ),
             "CREATE DEFINER=CURRENT_USER AGGREGATE FUNCTION `db`.g(x INT) RETURNS INT BEGIN RETURN 1; END"
         );
-        // Already qualified, or not a routine head: unchanged.
+        // Already qualified, or not a CREATE head this knows: unchanged.
         for sql in [
             "CREATE PROCEDURE `db`.`p`() SELECT 1",
             "CREATE PROCEDURE db.p() SELECT 1",
-            "CREATE TABLE t (a INT)",
+            "CREATE TABLE `db`.`t` (a INT)",
+            "CREATE VIEW db.v AS SELECT 1",
+            "CREATE INDEX i ON t (a)",
+            "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW SET NEW.a = 1",
+            "CREATE ALGORITHM VIEW v AS SELECT 1",
+            "CREATE SQL VIEW v AS SELECT 1",
             "SELECT 1",
+            "",
         ] {
-            assert_eq!(mysql_qualify_routine(sql, "other"), sql);
+            assert_eq!(mysql_qualify_create(sql, "other"), sql);
         }
+    }
+
+    #[test]
+    fn mysql_table_and_view_text_is_qualified_with_its_schema() {
+        // SHOW CREATE TABLE never names the database; the body (inline foreign keys
+        // included) is left exactly as it was.
+        let table = "CREATE TABLE `c` (\n  `id` int NOT NULL,\n  `pid` int DEFAULT NULL,\n  \
+                     PRIMARY KEY (`id`),\n  KEY `c_fk` (`pid`),\n  \
+                     CONSTRAINT `c_fk` FOREIGN KEY (`pid`) REFERENCES `p` (`id`)\n\
+                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        assert_eq!(
+            mysql_qualify_create(table, "tusk_bk"),
+            table.replacen("CREATE TABLE `c`", "CREATE TABLE `tusk_bk`.`c`", 1)
+        );
+        // Backticks in either name are doubled; the table name keeps its own escaping.
+        assert_eq!(
+            mysql_qualify_create("CREATE TABLE `ta``ble` (`a` int)", "we`ird"),
+            "CREATE TABLE `we``ird`.`ta``ble` (`a` int)"
+        );
+        // A view's ALGORITHM / DEFINER / SQL SECURITY prefix and its column list.
+        assert_eq!(
+            mysql_qualify_create(
+                "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `v` (`a`,`b`) AS select `t`.`id` AS `id` from `t` WITH CASCADED CHECK OPTION",
+                "app"
+            ),
+            "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `app`.`v` (`a`,`b`) AS select `t`.`id` AS `id` from `t` WITH CASCADED CHECK OPTION"
+        );
+        assert_eq!(
+            mysql_qualify_create(
+                "CREATE ALGORITHM = MERGE DEFINER = `a b`@`localhost` SQL SECURITY INVOKER VIEW `v``x` AS select 1 AS `1`",
+                "db"
+            ),
+            "CREATE ALGORITHM = MERGE DEFINER = `a b`@`localhost` SQL SECURITY INVOKER VIEW `db`.`v``x` AS select 1 AS `1`"
+        );
+        // Read on a session with no default database the view is already qualified.
+        let qualified = "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `app`.`v` AS select `app`.`t`.`id` AS `id` from `app`.`t`";
+        assert_eq!(mysql_qualify_create(qualified, "app"), qualified);
+        // ANSI_QUOTES prints identifiers in double quotes; sql_quote_show_create=OFF
+        // prints them bare, and a bare MySQL identifier may contain `$` or non-ASCII.
+        assert_eq!(
+            mysql_qualify_create("CREATE TABLE \"t\" (\"a\" int)", "db"),
+            "CREATE TABLE `db`.\"t\" (\"a\" int)"
+        );
+        assert_eq!(
+            mysql_qualify_create("CREATE TABLE t$1 (a int)", "db"),
+            "CREATE TABLE `db`.t$1 (a int)"
+        );
+        assert_eq!(
+            mysql_qualify_create("CREATE VIEW vüe AS select 1 AS `1`", "db"),
+            "CREATE VIEW `db`.vüe AS select 1 AS `1`"
+        );
+        for sql in [
+            "CREATE TABLE db$x.t (a int)",
+            "CREATE VIEW dbé.v AS select 1",
+        ] {
+            assert_eq!(mysql_qualify_create(sql, "other"), sql);
+        }
+        // MariaDB reports a sequence through SHOW CREATE TABLE.
+        assert_eq!(
+            mysql_qualify_create(
+                "CREATE SEQUENCE `s` start with 1 minvalue 1 maxvalue 9223372036854775806 increment by 1 cache 1000 nocycle ENGINE=InnoDB",
+                "db"
+            ),
+            "CREATE SEQUENCE `db`.`s` start with 1 minvalue 1 maxvalue 9223372036854775806 increment by 1 cache 1000 nocycle ENGINE=InnoDB"
+        );
     }
 
     #[test]
