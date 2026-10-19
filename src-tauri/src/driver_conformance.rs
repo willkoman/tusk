@@ -4261,14 +4261,38 @@ END;";
     }
 
     // A schema backup carries compound routines (before any view that might call them)
-    // and restores them into THEIR database, not the session's default one.
+    // and restores them into THEIR database, not the session's default one, under the
+    // sql_mode they were created with. A routine the restore could not replay (a
+    // backslash-escaped quote) is left out with a warning — and not dropped either —
+    // instead of stopping the restore after the tables and data; the foreign keys come
+    // before every routine, so they cannot be lost to one.
     for sql in [
         "DROP DATABASE IF EXISTS `tusk_bk_routines`",
         "CREATE DATABASE `tusk_bk_routines`",
         "CREATE FUNCTION `tusk_bk_routines`.`tusk_bk_f`(x INT) RETURNS INT DETERMINISTIC BEGIN DECLARE y INT DEFAULT 0; SET y = x * 3; RETURN y; END",
         "CREATE PROCEDURE `tusk_bk_routines`.`tusk_bk_p`() BEGIN DECLARE z INT; SET z = 1; SELECT z; END",
+        "CREATE TABLE `tusk_bk_routines`.`tusk_bk_parent` (id INT PRIMARY KEY)",
+        "CREATE TABLE `tusk_bk_routines`.`tusk_bk_child` (id INT PRIMARY KEY, parent_id INT, CONSTRAINT `tusk_bk_child_fk` FOREIGN KEY (parent_id) REFERENCES `tusk_bk_routines`.`tusk_bk_parent` (id))",
+        "INSERT INTO `tusk_bk_routines`.`tusk_bk_parent` VALUES (1), (2)",
+        "INSERT INTO `tusk_bk_routines`.`tusk_bk_child` VALUES (10, 1), (20, 2)",
+        "CREATE VIEW `tusk_bk_routines`.`tusk_bk_v` AS SELECT `tusk_bk_routines`.`tusk_bk_f`(id) AS tripled FROM `tusk_bk_routines`.`tusk_bk_child`",
     ] {
         exec(b, sql).await;
+    }
+    // Created on a raw session: Tusk's own lexer refuses `\'` (it is ambiguous under
+    // NO_BACKSLASH_ESCAPES), and PIPES_AS_CONCAT must be the session's mode at CREATE.
+    if let Backend::MySql(m) = &*b {
+        use mysql_async::prelude::Queryable;
+        let mut raw = m.pool.get_conn().await.expect("raw mysql connection");
+        for sql in [
+            r"CREATE PROCEDURE `tusk_bk_routines`.`tusk_bk_esc`() BEGIN SELECT 'can\'t'; END",
+            "SET SESSION sql_mode = 'PIPES_AS_CONCAT'",
+            "CREATE FUNCTION `tusk_bk_routines`.`tusk_bk_concat`() RETURNS VARCHAR(10) DETERMINISTIC RETURN 'a' || 'b'",
+        ] {
+            raw.query_drop(sql)
+                .await
+                .unwrap_or_else(|e| panic!("raw [{sql}]: {e}"));
+        }
     }
     let options = crate::backup::BackupOptions {
         scope: "schemas".into(),
@@ -4295,10 +4319,29 @@ END;";
         summary.warnings
     );
     assert!(
+        summary
+            .warnings
+            .iter()
+            .any(|w| w.contains("procedure tusk_bk_routines.tusk_bk_esc is NOT in the dump")),
+        "{:?}",
+        summary.warnings
+    );
+    assert!(
         text.contains("DROP FUNCTION IF EXISTS `tusk_bk_routines`.`tusk_bk_f`")
             && text.contains("FUNCTION `tusk_bk_routines`.`tusk_bk_f`(")
-            && text.contains("PROCEDURE `tusk_bk_routines`.`tusk_bk_p`()"),
+            && text.contains("PROCEDURE `tusk_bk_routines`.`tusk_bk_p`()")
+            && text.contains("SET SESSION sql_mode = 'PIPES_AS_CONCAT'")
+            && !text.contains("tusk_bk_esc`()")
+            && !text.contains("DROP PROCEDURE IF EXISTS `tusk_bk_routines`.`tusk_bk_esc`"),
         "{text}"
+    );
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("{needle} missing:\n{text}"))
+    };
+    assert!(
+        at("ADD CONSTRAINT") < at("-- routines") && at("-- routines") < at("-- views"),
+        "foreign keys, then routines, then views:\n{text}"
     );
     exec(b, "DROP FUNCTION `tusk_bk_routines`.`tusk_bk_f`").await;
     exec(b, "DROP PROCEDURE `tusk_bk_routines`.`tusk_bk_p`").await;
@@ -4322,12 +4365,35 @@ END;";
     );
     let rows = all(b, "SELECT `tusk_bk_routines`.`tusk_bk_f`(5)").await;
     assert_eq!(cell(&rows[0], 0).as_deref(), Some("15"));
+    // Recreated under its own sql_mode: `||` still concatenates.
+    let rows = all(b, "SELECT `tusk_bk_routines`.`tusk_bk_concat`()").await;
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("ab"));
+    let rows = all(
+        b,
+        "SELECT tripled FROM `tusk_bk_routines`.`tusk_bk_v` ORDER BY tripled",
+    )
+    .await;
+    assert_eq!(
+        rows.iter().map(|r| cell(r, 0)).collect::<Vec<_>>(),
+        vec![Some("30".to_string()), Some("60".to_string())]
+    );
+    let rows = all(
+        b,
+        "SELECT COUNT(*) FROM information_schema.referential_constraints WHERE constraint_schema = 'tusk_bk_routines'",
+    )
+    .await;
+    assert_eq!(
+        cell(&rows[0], 0).as_deref(),
+        Some("1"),
+        "foreign key restored"
+    );
+    // f, p, concat recreated; esc never dropped.
     let rows = all(
         b,
         "SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema = 'tusk_bk_routines'",
     )
     .await;
-    assert_eq!(cell(&rows[0], 0).as_deref(), Some("2"));
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("4"));
     let rows = all(
         b,
         "SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema = 'test' AND routine_name LIKE 'tusk_bk_%'",

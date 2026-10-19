@@ -797,6 +797,23 @@ impl Backend {
         }
     }
 
+    /// Keep catalog sessions that `relation_ddl` would otherwise open per call alive
+    /// until `end_ddl_batch` (a backup reads every view). Only MySQL has one: the
+    /// connection with no default database that view definitions are read on.
+    pub fn begin_ddl_batch(&mut self) {
+        if let Backend::MySql(m) = self {
+            m.ddl_batch = true;
+        }
+    }
+
+    /// Close what `begin_ddl_batch` kept. Infallible: it runs on every backup exit path.
+    pub async fn end_ddl_batch(&mut self) {
+        if let Backend::MySql(m) = self {
+            m.ddl_batch = false;
+            m.view_reader.lock().await.take();
+        }
+    }
+
     /// Roll back + drop any open streaming cursor/transaction. PostgreSQL issues
     /// ROLLBACK only when cursor state is tracked — an idle autocommit session has
     /// nothing to roll back, and doing it anyway costs a round trip plus a server
@@ -1414,6 +1431,20 @@ impl Backend {
         }
     }
 
+    /// MySQL's stored routines under one name (a procedure and a function may share it),
+    /// each with the session settings it was created under, for a backup to restore
+    /// around it. Every other engine has none to report.
+    pub async fn mysql_routine_defs(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> Result<Vec<MySqlRoutineDef>, AppError> {
+        match self {
+            Backend::MySql(m) => mysql_routine_defs(&m.pool, "function", schema, name).await,
+            _ => Ok(Vec::new()),
+        }
+    }
+
     /// Reconstructed CREATE DDL for one relation, per engine: PG pg_catalog
     /// (full reconstruction in ddl.rs), SQLite sqlite_master (+ index DDL),
     /// MySQL SHOW CREATE, DuckDB duckdb_tables()/duckdb_views() best-effort.
@@ -1465,15 +1496,32 @@ impl Backend {
                     schema.replace('`', "``"),
                     name.replace('`', "``")
                 );
-                let (_c, rows, _a) = if is_view {
-                    mysql_show_create_view(&m.pool, &q).await?
+                let (rows, scoped) = if is_view {
+                    mysql_show_create_view(m, &q).await?
                 } else {
-                    mysql_run_limited(&m.pool, &q, db::DDL_TEXT_LIMITS).await?
+                    (
+                        mysql_run_limited(&m.pool, &q, db::DDL_TEXT_LIMITS).await?.1,
+                        true,
+                    )
+                };
+                // A view read with a default database still selected names that
+                // database's tables bare in its body: say so rather than hand back text
+                // that only replays with the same database selected.
+                // (The pool's default database is the one the connection was opened
+                // with; with none, every name comes back qualified anyway.)
+                let default_db = m.config.dbname.replace(['\r', '\n'], " ");
+                let note = if scoped || default_db.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "-- note: MySQL refused to read this view without a default database, so tables in `{default_db}` are named without it; replay it with `{default_db}` selected.\n"
+                    )
                 };
                 rows.first()
                     .and_then(|r| r.get(1).cloned().flatten())
                     .map(|s| {
-                        mysql_qualify_create(s.trim_end().trim_end_matches(';'), schema) + ";\n"
+                        note + &mysql_qualify_create(s.trim_end().trim_end_matches(';'), schema)
+                            + ";\n"
                     })
                     .ok_or_else(|| AppError::new("no DDL returned"))
             }
@@ -2614,6 +2662,12 @@ pub struct MySqlConn {
     /// decides how the frontend escapes text inside a MySQL string literal, and getting
     /// it wrong silently corrupts every backslash in a COMMENT.
     no_backslash_escapes: bool,
+    /// While a DDL batch runs (a backup reading every view), the one connection with no
+    /// default database that `SHOW CREATE VIEW` is read on, reused instead of opening a
+    /// fresh one per view (a new TLS + auth handshake, through the tunnel when there is
+    /// one). Outside a batch it is never kept.
+    view_reader: tokio::sync::Mutex<Option<mysql_async::Conn>>,
+    ddl_batch: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -2693,6 +2747,8 @@ impl MySqlConn {
                 manual_lost: false,
                 autocommit_off: false,
                 no_backslash_escapes,
+                view_reader: tokio::sync::Mutex::new(None),
+                ddl_batch: false,
             }),
             format!("MySQL {version}"),
         ))
@@ -3374,6 +3430,33 @@ async fn mysql_routine_ddl(
     schema: &str,
     name: &str,
 ) -> Result<String, AppError> {
+    let defs = mysql_routine_defs(pool, kind, schema, name).await?;
+    Ok(defs
+        .iter()
+        .map(|d| format!("{};\n", d.ddl))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// One MySQL stored routine as `SHOW CREATE PROCEDURE|FUNCTION` reports it: the
+/// schema-qualified definition (no trailing `;`) and the session settings it was
+/// created under, which a dump must restore around it for the body to mean the same
+/// thing (`sql_mode` decides, among other things, whether `\` escapes and `"` quotes).
+pub struct MySqlRoutineDef {
+    /// `PROCEDURE` or `FUNCTION`.
+    pub routine: &'static str,
+    pub ddl: String,
+    pub sql_mode: String,
+    pub character_set_client: String,
+    pub collation_connection: String,
+}
+
+async fn mysql_routine_defs(
+    pool: &mysql_async::Pool,
+    kind: &str,
+    schema: &str,
+    name: &str,
+) -> Result<Vec<MySqlRoutineDef>, AppError> {
     let types: Vec<&'static str> = if kind == "procedure" {
         vec!["PROCEDURE"]
     } else {
@@ -3394,7 +3477,7 @@ async fn mysql_routine_ddl(
     if types.is_empty() {
         return Err(AppError::new("no routine with this name in the schema"));
     }
-    let mut parts = Vec::new();
+    let mut defs = Vec::new();
     for routine in types {
         let q = format!(
             "SHOW CREATE {routine} `{}`.`{}`",
@@ -3402,14 +3485,19 @@ async fn mysql_routine_ddl(
             name.replace('`', "``")
         );
         let (_c, rows, _a) = mysql_run_limited(pool, &q, db::DDL_TEXT_LIMITS).await?;
-        // Column 2 is `Create Procedure` / `Create Function`. MySQL returns NULL there,
-        // not an error, when the role may run the routine but not read its body.
-        let body = rows.first().and_then(|r| r.get(2).cloned().flatten());
+        // Columns: name, sql_mode, `Create Procedure|Function`, character_set_client,
+        // collation_connection, Database Collation. MySQL returns NULL in column 2, not
+        // an error, when the role may run the routine but not read its body.
+        let row = rows.first();
+        let body = row.and_then(|r| r.get(2).cloned().flatten());
         match body {
-            Some(text) => parts.push(format!(
-                "{};\n",
-                mysql_qualify_create(text.trim_end().trim_end_matches(';'), schema)
-            )),
+            Some(text) => defs.push(MySqlRoutineDef {
+                routine,
+                ddl: mysql_qualify_create(text.trim_end().trim_end_matches(';'), schema),
+                sql_mode: row.map(|r| dcell(r, 1)).unwrap_or_default(),
+                character_set_client: row.map(|r| dcell(r, 3)).unwrap_or_default(),
+                collation_connection: row.map(|r| dcell(r, 4)).unwrap_or_default(),
+            }),
             None => {
                 return Err(AppError::new(format!(
                     "MySQL hid this {}'s definition: reading it needs the SHOW_ROUTINE privilege, ownership (DEFINER), or SELECT on mysql.proc on older servers",
@@ -3418,7 +3506,7 @@ async fn mysql_routine_ddl(
             }
         }
     }
-    Ok(parts.join("\n"))
+    Ok(defs)
 }
 
 /// `SHOW CREATE VIEW` leaves the database off every table the body reads from the
@@ -3433,17 +3521,32 @@ async fn mysql_routine_ddl(
 /// query without one; a pool with no default database gets it back unchanged. If the
 /// server refuses the change, the view is read on an ordinary pooled connection: its
 /// head is still qualified by `mysql_qualify_create`, only the body keeps the bare names.
+///
+/// Returns the rows and whether they were read unscoped. During a DDL batch the unscoped
+/// connection is kept in `view_reader` for the next view.
 async fn mysql_show_create_view(
-    pool: &mysql_async::Pool,
+    m: &MySqlConn,
     sql: &str,
-) -> Result<(Vec<String>, Vec<Vec<Option<String>>>, u64), AppError> {
-    let mut conn = pool.get_conn().await.map_err(de)?;
-    let unscoped = mysql_async::ChangeUserOpts::default().with_db_name(None);
-    if conn.change_user(unscoped).await.is_ok() {
-        return mysql_run_conn_limited(&mut conn, sql, db::DDL_TEXT_LIMITS).await;
+) -> Result<(Vec<Vec<Option<String>>>, bool), AppError> {
+    let mut reader = m.view_reader.lock().await;
+    let mut conn = match reader.take() {
+        Some(conn) => conn,
+        None => {
+            let mut conn = m.pool.get_conn().await.map_err(de)?;
+            let unscoped = mysql_async::ChangeUserOpts::default().with_db_name(None);
+            if conn.change_user(unscoped).await.is_err() {
+                drop(conn);
+                let (_c, rows, _a) = mysql_run_limited(&m.pool, sql, db::DDL_TEXT_LIMITS).await?;
+                return Ok((rows, false));
+            }
+            conn
+        }
+    };
+    let (_c, rows, _a) = mysql_run_conn_limited(&mut conn, sql, db::DDL_TEXT_LIMITS).await?;
+    if m.ddl_batch {
+        *reader = Some(conn);
     }
-    drop(conn);
-    mysql_run_limited(pool, sql, db::DDL_TEXT_LIMITS).await
+    Ok((rows, true))
 }
 
 /// `SHOW CREATE TABLE|VIEW|PROCEDURE|FUNCTION` names the object bare (a view only when
@@ -3458,6 +3561,34 @@ async fn mysql_show_create_view(
 /// [DEFINER = user] [SQL SECURITY …] [AGGREGATE] TABLE|VIEW|PROCEDURE|FUNCTION|SEQUENCE
 /// name` comes back unchanged, as does a name that is already qualified.
 fn mysql_qualify_create(sql: &str, schema: &str) -> String {
+    match mysql_create_name_span(sql) {
+        // Already qualified (`db`.`name` / db.name): leave it alone.
+        Some((name, after)) if sql.as_bytes().get(after) != Some(&b'.') => format!(
+            "{}`{}`.{}",
+            &sql[..name],
+            schema.replace('`', "``"),
+            &sql[name..]
+        ),
+        _ => sql.to_string(),
+    }
+}
+
+/// The reverse of `mysql_qualify_create` for a file meant to load ANYWHERE: SQL export's
+/// "Include CREATE TABLE" pairs this CREATE with `INSERT INTO <bare table>`, so a
+/// qualified head would create the table in the source database and insert into the
+/// selected one.
+pub(crate) fn mysql_unqualify_create(sql: &str) -> String {
+    match mysql_create_name_span(sql) {
+        Some((name, after)) if sql.as_bytes().get(after) == Some(&b'.') => {
+            format!("{}{}", &sql[..name], &sql[after + 1..])
+        }
+        _ => sql.to_string(),
+    }
+}
+
+/// Where the created object's name starts in a `SHOW CREATE` head, and where its first
+/// part ends (a `.` there means the name is qualified).
+fn mysql_create_name_span(sql: &str) -> Option<(usize, usize)> {
     let b = sql.as_bytes();
     let n = b.len();
     let ws = |mut i: usize| {
@@ -3497,7 +3628,7 @@ fn mysql_qualify_create(sql: &str, schema: &str) -> String {
         }
         Some(i)
     };
-    let qualify = || -> Option<String> {
+    let span = || -> Option<(usize, usize)> {
         let (w, mut i) = word(ws(0));
         if !w.eq_ignore_ascii_case("create") {
             return None;
@@ -3564,18 +3695,12 @@ fn mysql_qualify_create(sql: &str, schema: &str) -> String {
                 j
             }
         };
-        // Already qualified (`db`.`name` / db.name): leave it alone.
-        if after == name || b.get(after) == Some(&b'.') {
+        if after == name {
             return None;
         }
-        Some(format!(
-            "{}`{}`.{}",
-            &sql[..name],
-            schema.replace('`', "``"),
-            &sql[name..]
-        ))
+        Some((name, after))
     };
-    qualify().unwrap_or_else(|| sql.to_string())
+    span()
 }
 
 async fn mysql_table_detail(
@@ -5985,6 +6110,28 @@ mod tests {
         use mysql_async::consts::ColumnType;
         assert!(!mysql_is_binary_column(ColumnType::MYSQL_TYPE_LONG, 63,));
         assert!(mysql_is_binary_column(ColumnType::MYSQL_TYPE_BLOB, 63,));
+    }
+
+    #[test]
+    fn mysql_create_heads_unqualify_for_export() {
+        assert_eq!(
+            mysql_unqualify_create("CREATE TABLE `shop`.`t` (`id` int)"),
+            "CREATE TABLE `t` (`id` int)"
+        );
+        assert_eq!(
+            mysql_unqualify_create(
+                "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `s``x`.`v` AS select 1"
+            ),
+            "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `v` AS select 1"
+        );
+        // Round trip, and unqualified or foreign text stays as it is.
+        let bare = "CREATE TABLE `t` (`id` int)";
+        assert_eq!(
+            mysql_unqualify_create(&mysql_qualify_create(bare, "db")),
+            bare
+        );
+        assert_eq!(mysql_unqualify_create(bare), bare);
+        assert_eq!(mysql_unqualify_create("SELECT 1"), "SELECT 1");
     }
 
     #[test]

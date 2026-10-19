@@ -493,6 +493,59 @@ fn split_mysql_fk_alters(ddl: &str, relation: &str) -> (String, Vec<String>) {
     (body.join("\n"), fks)
 }
 
+/// One MySQL routine as the dump writes it, or why it is left out.
+///
+/// The definition must replay as exactly ONE statement through `script`, the lexer the
+/// restore runs: a body Tusk refuses to split (a backslash-escaped quote such as
+/// `'can\'t'`, an executable `/*! … */` comment) would otherwise stop the restore partway,
+/// so it is left out with a warning instead. Around the CREATE go the `sql_mode` and
+/// collation the routine was created under, as mysqldump writes them — `sql_mode`
+/// decides what the body means (backslash escapes, `"` quoting, `||`) — and the session's
+/// own values come back after it. Restore runs on one pinned connection, so the SETs
+/// hold for exactly that CREATE. `character_set_client` is restored only for a UTF-8
+/// one: the dump's bytes are UTF-8 whatever the routine was created with.
+fn mysql_routine_dump(def: &crate::driver::MySqlRoutineDef) -> Result<String, String> {
+    if script::contains_mysql_executable_comment(&def.ddl) {
+        return Err(
+            "its body holds a MySQL executable comment (/*! … */), which Tusk does not run".into(),
+        );
+    }
+    match script::parse_for_engine(&def.ddl, script::TransactionEngine::MySql) {
+        Ok(items) if matches!(items.as_slice(), [script::Item::Sql(_)]) => {}
+        Ok(_) => return Err("its definition does not read as one statement".into()),
+        Err(e) => {
+            return Err(format!(
+                "Tusk cannot replay its definition ({}); recreate it by hand",
+                e.message
+            ))
+        }
+    }
+    let token = |v: &str, comma: bool| {
+        v.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || (comma && c == b','))
+    };
+    if !token(&def.sql_mode, true) {
+        return Err(format!("unexpected sql_mode `{}`", def.sql_mode));
+    }
+    let mut session = vec![format!("sql_mode = '{}'", def.sql_mode)];
+    let cs = &def.character_set_client;
+    if !cs.is_empty() && token(cs, false) && cs.to_ascii_lowercase().starts_with("utf8") {
+        session.push(format!("character_set_client = {cs}"));
+    }
+    let collation = &def.collation_connection;
+    if !collation.is_empty() && token(collation, false) {
+        session.push(format!("collation_connection = {collation}"));
+    }
+    Ok(format!(
+        "SET @tusk_sql_mode = @@SESSION.sql_mode, @tusk_character_set_client = @@SESSION.character_set_client, @tusk_collation_connection = @@SESSION.collation_connection;\n\
+         SET SESSION {};\n\
+         {};\n\
+         SET SESSION sql_mode = @tusk_sql_mode, character_set_client = @tusk_character_set_client, collation_connection = @tusk_collation_connection;\n\n",
+        session.join(", "),
+        def.ddl.trim_end()
+    ))
+}
+
 #[derive(Clone)]
 struct Rel {
     schema: String,
@@ -596,7 +649,10 @@ pub async fn run_backup(
             .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .await?;
     }
+    // One catalog session for every view definition, not one per view.
+    backend.begin_ddl_batch();
     let result = backup_inner(backend, app_version, opts, path, cancel, progress).await;
+    backend.end_ddl_batch().await;
     if is_pg {
         if let Ok(client) = backend.pg() {
             let _ = client.batch_execute("COMMIT").await;
@@ -644,9 +700,6 @@ async fn backup_inner(
     let mut tables: Vec<Rel> = Vec::new();
     let mut views: Vec<Rel> = Vec::new();
     let mut functions: Vec<(String, String)> = Vec::new();
-    // MySQL keeps procedures and functions in separate namespaces (one name can be
-    // both), so the drops need each routine's own type: (schema, name, returns).
-    let mut routine_types: Vec<(String, String, String)> = Vec::new();
     let mut schema_names: Vec<String> = Vec::new();
     for schema in &tree.schemas {
         if !wanted_schema(&schema.name) {
@@ -676,9 +729,6 @@ async fn backup_inner(
         for f in &schema.functions {
             if seen_fn.insert(f.name.as_str()) {
                 functions.push((schema.name.clone(), f.name.clone()));
-            }
-            if is_mysql {
-                routine_types.push((schema.name.clone(), f.name.clone(), f.returns.clone()));
             }
         }
     }
@@ -775,9 +825,40 @@ async fn backup_inner(
         }
     }
 
+    // MySQL routines are read and checked before anything is written, so the drops
+    // cover exactly the routines the dump recreates: a restore must never drop one the
+    // dump leaves out. Procedures and functions have separate namespaces (one name can
+    // be both), so each keeps its own type for its DROP.
+    let mut warnings: Vec<String> = Vec::new();
+    let mut routines: Vec<(String, String, &'static str, String)> = Vec::new();
+    if is_mysql && opts.wants_schema() {
+        for (schema, name) in &functions {
+            cancelled(cancel)?;
+            match backend.mysql_routine_defs(schema, name).await {
+                Ok(defs) => {
+                    for def in &defs {
+                        match mysql_routine_dump(def) {
+                            Ok(text) => {
+                                routines.push((schema.clone(), name.clone(), def.routine, text))
+                            }
+                            Err(why) => warnings.push(format!(
+                                "{} {schema}.{name} is NOT in the dump: {}",
+                                def.routine.to_ascii_lowercase(),
+                                comment_safe(&why)
+                            )),
+                        }
+                    }
+                }
+                Err(e) => warnings.push(format!(
+                    "routine {schema}.{name} is NOT in the dump: {}",
+                    comment_safe(&e.message)
+                )),
+            }
+        }
+    }
+
     // --- write ---
     let mut out = DumpFile::create(path).await?;
-    let mut warnings: Vec<String> = Vec::new();
     let mut throttle = Throttle::new();
     let mut rows_total: u64 = 0;
     let mut tables_done: u64 = 0;
@@ -820,6 +901,17 @@ async fn backup_inner(
         ));
         out.put("-- note: this engine has no transactional DDL; the dump is not wrapped.\n\n")
             .await?;
+    }
+    if !routines.is_empty() {
+        out.put(
+            "-- note: MySQL routines keep their DEFINER. Restoring them as another account\n\
+             -- needs SET_USER_ID (or SUPER), and with binary logging on, a function not\n\
+             -- declared DETERMINISTIC, NO SQL or READS SQL DATA needs\n\
+             -- log_bin_trust_function_creators = 1. Tables, data and foreign keys come\n\
+             -- first; a routine that fails stops the views after it unless the restore\n\
+             -- continues past errors.\n\n",
+        )
+        .await?;
     }
     // SQLite and DuckDB keep foreign keys INLINE in the table body: neither engine can
     // add one with `ALTER TABLE`, so they cannot be deferred the way PostgreSQL's and
@@ -870,14 +962,9 @@ async fn backup_inner(
                 ))
                 .await?;
             }
-            for (schema, name, returns) in &routine_types {
-                let kw = if returns == "procedure" {
-                    "PROCEDURE"
-                } else {
-                    "FUNCTION"
-                };
+            for (schema, name, routine, _) in &routines {
                 out.stmt(&format!(
-                    "DROP {kw} IF EXISTS {}",
+                    "DROP {routine} IF EXISTS {}",
                     qual(schema, name, dialect, caps.schemas)
                 ))
                 .await?;
@@ -1081,24 +1168,32 @@ async fn backup_inner(
     }
 
     if opts.wants_schema() {
+        // Foreign keys first: they need only the tables and the data, and nothing that
+        // follows (a routine a restore cannot recreate, say) can then cost them.
+        if !fk_alters.is_empty() {
+            progress(BackupProgress {
+                phase: "constraints",
+                object: "foreign keys".to_string(),
+                tables_done,
+                tables_total,
+                rows: rows_total,
+                bytes: out.bytes,
+            });
+            out.put("-- foreign keys (restored after all data)\n")
+                .await?;
+            for alter in &fk_alters {
+                out.stmt(alter).await?;
+            }
+        }
         // MySQL routines go BEFORE the views: creating a view that calls a stored
         // function fails while the function is missing, whereas creating a routine never
         // resolves the objects its body names. `SHOW CREATE` returns each body as one
         // statement with its own `;` inside — `script` keeps it whole on restore.
-        if is_mysql && !functions.is_empty() {
+        if !routines.is_empty() {
             out.put("-- routines\n").await?;
-            for (schema, name) in &functions {
-                cancelled(cancel)?;
-                match backend.relation_ddl("function", schema, name).await {
-                    Ok(ddl) => {
-                        out.stmt(&ddl).await?;
-                        objects += 1;
-                    }
-                    Err(e) => warnings.push(format!(
-                        "routine {schema}.{name}: {}",
-                        comment_safe(&e.message)
-                    )),
-                }
+            for (_, _, _, text) in &routines {
+                out.put(text).await?;
+                objects += 1;
             }
         }
         if !views.is_empty() {
@@ -1162,21 +1257,6 @@ async fn backup_inner(
             for def in &triggers {
                 out.stmt(def).await?;
                 objects += 1;
-            }
-        }
-        if !fk_alters.is_empty() {
-            progress(BackupProgress {
-                phase: "constraints",
-                object: "foreign keys".to_string(),
-                tables_done,
-                tables_total,
-                rows: rows_total,
-                bytes: out.bytes,
-            });
-            out.put("-- foreign keys (restored after all data)\n")
-                .await?;
-            for alter in &fk_alters {
-                out.stmt(alter).await?;
             }
         }
     }
@@ -1994,6 +2074,73 @@ mod tests {
 
     fn opts(json: &str) -> BackupOptions {
         serde_json::from_str(json).unwrap()
+    }
+
+    fn routine(ddl: &str, sql_mode: &str, cs: &str) -> crate::driver::MySqlRoutineDef {
+        crate::driver::MySqlRoutineDef {
+            routine: "PROCEDURE",
+            ddl: ddl.to_string(),
+            sql_mode: sql_mode.to_string(),
+            character_set_client: cs.to_string(),
+            collation_connection: "utf8mb4_0900_ai_ci".to_string(),
+        }
+    }
+
+    /// A routine is dumped only when the restore's own lexer reads it as ONE statement,
+    /// wrapped in the session settings it was created under and the session's own after.
+    #[test]
+    fn mysql_routines_dump_with_their_session_settings_or_not_at_all() {
+        let text = mysql_routine_dump(&routine(
+            "CREATE PROCEDURE `db`.`p`() BEGIN SELECT 'a'; SELECT 'b'; END",
+            "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION",
+            "utf8mb4",
+        ))
+        .unwrap();
+        let items = script::parse_for_engine(&text, script::TransactionEngine::MySql).unwrap();
+        let sql: Vec<String> = items
+            .iter()
+            .map(|i| match i {
+                script::Item::Sql(s) => s.clone(),
+                script::Item::Copy { stmt, .. } => stmt.clone(),
+            })
+            .collect();
+        assert_eq!(sql.len(), 4, "{sql:?}");
+        assert!(sql[0].starts_with("SET @tusk_sql_mode = @@SESSION.sql_mode"));
+        assert_eq!(
+            sql[1],
+            "SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION', character_set_client = utf8mb4, collation_connection = utf8mb4_0900_ai_ci"
+        );
+        assert!(sql[2].starts_with("CREATE PROCEDURE `db`.`p`() BEGIN"));
+        assert!(sql[3].starts_with("SET SESSION sql_mode = @tusk_sql_mode"));
+        // The dump's bytes are UTF-8, so a latin1 client charset is not reinstated.
+        let latin1 = mysql_routine_dump(&routine(
+            "CREATE PROCEDURE `db`.`p`() SELECT 1",
+            "",
+            "latin1",
+        ))
+        .unwrap();
+        assert!(
+            latin1.contains("SET SESSION sql_mode = '', collation_connection"),
+            "{latin1}"
+        );
+        assert!(
+            !latin1.contains("character_set_client = latin1"),
+            "{latin1}"
+        );
+        // Bodies the restore could not split are left out, never written half-runnable.
+        let escaped = mysql_routine_dump(&routine(
+            r"CREATE PROCEDURE `db`.`p`() BEGIN SELECT 'can\'t'; END",
+            "",
+            "utf8mb4",
+        ))
+        .unwrap_err();
+        assert!(escaped.contains("backslash"), "{escaped}");
+        assert!(mysql_routine_dump(&routine(
+            "CREATE PROCEDURE `db`.`p`() BEGIN /*!80000 SELECT 1; */ END",
+            "",
+            "utf8mb4"
+        ))
+        .is_err());
     }
 
     #[test]

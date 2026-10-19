@@ -486,6 +486,15 @@ fn header_text(
                 // carries the real types, keys and defaults.
                 let ddl = opts.sql.create_sql.trim_end();
                 let ddl = ddl.strip_suffix(';').unwrap_or(ddl);
+                // The INSERTs name the table bare, so the CREATE must too: MySQL's DDL
+                // comes back qualified with its database (for Copy DDL and backups),
+                // which would create the table in the SOURCE database and fill the
+                // selected one wherever the file is loaded.
+                let ddl = if dialect == SqlDialect::MySql {
+                    crate::driver::mysql_unqualify_create(ddl)
+                } else {
+                    ddl.to_string()
+                };
                 format!("{ddl};{nl}")
             } else if opts.sql.include_create {
                 let table = if opts.sql.table.is_empty() {
@@ -1545,6 +1554,23 @@ mod tests {
         let mut o = opts(r#"{"format":"xlsx"}"#);
         o.xlsx.sheet_name = sanitize_sheet("2024/Q1");
         assert!(o.validate().is_ok());
+    }
+
+    /// The reconstructed MySQL CREATE comes back qualified with its database; the
+    /// INSERTs after it name the table bare, so the export drops the qualifier.
+    #[test]
+    fn mysql_sql_export_creates_the_table_its_inserts_fill() {
+        let mut o = opts(r#"{"format":"sql"}"#);
+        o.sql.include_create = true;
+        o.sql.table = "t".into();
+        o.sql.create_sql = "CREATE TABLE `shop`.`t` (\n  `id` int NOT NULL\n);\n".into();
+        let cols = vec!["id".to_string()];
+        let head = header_text(&o, &cols, &[false], SqlDialect::MySql).unwrap();
+        assert!(head.starts_with("CREATE TABLE `t` ("), "{head}");
+        // Other engines keep the reconstruction as it came.
+        o.sql.create_sql = "CREATE TABLE \"public\".\"t\" (id integer);".into();
+        let pg = header_text(&o, &cols, &[false], SqlDialect::Postgres).unwrap();
+        assert!(pg.starts_with("CREATE TABLE \"public\".\"t\""), "{pg}");
     }
 
     #[test]

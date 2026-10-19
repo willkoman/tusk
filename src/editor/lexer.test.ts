@@ -203,6 +203,37 @@ describe("engine-aware lexing (parity with script.rs split_impl)", () => {
         "mysql",
       ),
     ).toHaveLength(2);
+    // Two statements must never merge (a CASE expression's END after a non-reserved
+    // column or a BEGIN read as a name closes the CASE; a block's END closes only
+    // right after `;`).
+    for (const name of ["event", "begin"]) {
+      expect(
+        stmtTexts(
+          `CREATE PROCEDURE p() BEGIN SELECT CASE WHEN a THEN 1 ELSE ${name} END FROM log; END; START TRANSACTION; DELETE FROM log; SELECT 1 end;`,
+          "mysql",
+        ),
+      ).toEqual([
+        `CREATE PROCEDURE p() BEGIN SELECT CASE WHEN a THEN 1 ELSE ${name} END FROM log; END;`,
+        "START TRANSACTION;",
+        "DELETE FROM log;",
+        "SELECT 1 end;",
+      ]);
+    }
+    // CASE statements and expressions nest; depth-0 aliases; statement-position BEGIN.
+    for (const [sql, count] of [
+      ["CREATE PROCEDURE p() BEGIN CASE WHEN a THEN SELECT CASE WHEN b THEN 1 ELSE CASE WHEN c THEN 2 END END; ELSE BEGIN SELECT 3; END; END CASE; END; SELECT 9;", 2],
+      ["CREATE PROCEDURE p() BEGIN IF a THEN CASE x WHEN 1 THEN SET y = CASE WHEN z THEN end ELSE begin END; END CASE; END IF; END; SELECT 9;", 2],
+      ["CREATE PROCEDURE p() SELECT * FROM t begin FOR UPDATE; SELECT 9;", 2],
+      ["CREATE PROCEDURE p() SELECT * FROM t begin STRAIGHT_JOIN u; SELECT 9;", 2],
+      ["CREATE PROCEDURE p() SELECT * FROM t begin NATURAL JOIN u; SELECT 9;", 2],
+      ["CREATE PROCEDURE p() SELECT * FROM t begin FORCE INDEX (i); SELECT 9;", 2],
+      ["CREATE PROCEDURE p() SELECT * FROM t begin WINDOW w AS (); SELECT 9;", 2],
+      ["CREATE PROCEDURE p() SELECT a FROM t begin EXCEPT SELECT a FROM u; SELECT 9;", 2],
+      ["CREATE PROCEDURE p() BEGIN SELECT * FROM t begin FOR UPDATE; SELECT * FROM t begin JOIN u; END; SELECT 9;", 2],
+      ["CREATE PROCEDURE p() BEGIN (SELECT 1) UNION (SELECT 2); END; SELECT 9;", 2],
+    ] as const) {
+      expect(stmtTexts(sql, "mysql"), sql).toHaveLength(count);
+    }
     // Unclosed: the editor keeps the rest together (execution refuses it in Rust).
     expect(stmtTexts("CREATE PROCEDURE p() BEGIN SELECT 1; DROP TABLE t;", "mysql")).toHaveLength(1);
     // Outside a stored-program head nothing changes.
