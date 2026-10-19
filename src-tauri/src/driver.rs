@@ -1489,6 +1489,7 @@ impl Backend {
                     .filter(|s| !s.trim().is_empty())
                     .ok_or_else(|| AppError::new("no stored DDL for this sequence"))?;
                 let sql = duck_qualify_sequence_sql(sql.trim(), schema, name);
+                let sql = duck_settle_exhausted_sequence(&sql, schema, name);
                 Ok(if sql.ends_with(';') {
                     sql + "\n"
                 } else {
@@ -5472,6 +5473,66 @@ fn duck_qualify_sequence_sql(sql: &str, schema: &str, name: &str) -> String {
     sql.to_string()
 }
 
+/// DuckDB renders a sequence's `START` as the NEXT value it will issue — which is how a
+/// replayed definition (and a backup) continues numbering where the source left off.
+/// Once a `NO CYCLE` sequence has issued its last value, though, that next value lies
+/// past the bound (`MAXVALUE 3 … START 5`) and DuckDB refuses to run its own text
+/// ("START value (5) cannot be greater than MAXVALUE (3)"). Such a sequence gets START
+/// clamped to the bound plus one `nextval` that consumes it, so the copy is exhausted
+/// exactly like the source. `sql` must already be qualified by
+/// `duck_qualify_sequence_sql`; any other shape is returned unchanged.
+fn duck_settle_exhausted_sequence(sql: &str, schema: &str, name: &str) -> String {
+    let qualified = format!("{}.{}", db::ident(schema), db::ident(name));
+    let prefix = format!("CREATE SEQUENCE {qualified} ");
+    let Some(rest) = sql.strip_prefix(&prefix) else {
+        return sql.to_string();
+    };
+    let mut tokens: Vec<String> = rest
+        .trim_end()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    let at = |tokens: &[String], key: &str| tokens.iter().position(|t| t == key);
+    let value = |tokens: &[String], key: &str| {
+        at(tokens, key)
+            .and_then(|i| tokens.get(i + 1))
+            .and_then(|v| v.parse::<i64>().ok())
+    };
+    let (Some(min), Some(max), Some(start), Some(start_at)) = (
+        value(&tokens, "MINVALUE"),
+        value(&tokens, "MAXVALUE"),
+        value(&tokens, "START"),
+        at(&tokens, "START"),
+    ) else {
+        return sql.to_string();
+    };
+    let no_cycle = tokens.len() >= 2
+        && tokens[tokens.len() - 2] == "NO"
+        && tokens[tokens.len() - 1] == "CYCLE";
+    if !no_cycle || (min..=max).contains(&start) {
+        return sql.to_string();
+    }
+    let bound = if start > max { max } else { min };
+    tokens[start_at + 1] = bound.to_string();
+    let create = format!("{prefix}{};", tokens.join(" "));
+    // `nextval('…')` splits its argument on `.` and `"` without undoubling a `""`, so
+    // a name containing a double quote cannot be spelled there (see the conformance
+    // test); that copy issues the bound once more instead.
+    if schema.contains('"') || name.contains('"') {
+        return format!(
+            "-- Exhausted on the source. START is clamped to the bound so DuckDB accepts\n\
+             -- the statement; this copy issues that last value once more.\n{create}"
+        );
+    }
+    format!(
+        "-- Exhausted on the source. START is clamped to the bound so DuckDB accepts\n\
+         -- the statement, and the nextval below consumes it again.\n\
+         {create}\nSELECT nextval({})",
+        dlit(&qualified)
+    )
+}
+
 /// A user macro's `CREATE MACRO` statement, restating every overload of `schema.name`.
 /// `duckdb_functions()` keeps the body and the parameter names/types but NOT parameter
 /// defaults, so a parameter declared as `name := value` comes back without its default;
@@ -5605,6 +5666,44 @@ mod tests {
             duck_qualify_sequence_sql("CREATE TEMP SEQUENCE s START 1;", "main", "s"),
             "CREATE TEMP SEQUENCE s START 1;"
         );
+    }
+
+    /// The stored START of an exhausted NO CYCLE sequence is past its bound; it is
+    /// clamped and consumed. A cycling or in-range sequence is untouched.
+    #[test]
+    fn exhausted_duck_sequences_are_clamped_and_consumed() {
+        let tail = "INCREMENT BY 1 MINVALUE 1 MAXVALUE 3";
+        let up = format!("CREATE SEQUENCE \"main\".\"a\" {tail} START 5 NO CYCLE;");
+        let settled = duck_settle_exhausted_sequence(&up, "main", "a");
+        assert!(
+            settled.contains(&format!(
+                "CREATE SEQUENCE \"main\".\"a\" {tail} START 3 NO CYCLE;"
+            )),
+            "{settled}"
+        );
+        assert!(
+            settled.ends_with("SELECT nextval('\"main\".\"a\"')"),
+            "{settled}"
+        );
+        let down = "CREATE SEQUENCE \"main\".\"d\" INCREMENT BY -1 MINVALUE 1 MAXVALUE 2 START 0 NO CYCLE;";
+        assert!(duck_settle_exhausted_sequence(down, "main", "d")
+            .contains("MAXVALUE 2 START 1 NO CYCLE;"));
+        let quoted = "CREATE SEQUENCE \"x\".\"q\"\"s\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 3 START 4 NO CYCLE;";
+        let settled = duck_settle_exhausted_sequence(quoted, "x", "q\"s");
+        assert!(
+            settled.contains("START 3 NO CYCLE;") && !settled.contains("nextval"),
+            "{settled}"
+        );
+        for unchanged in [
+            "CREATE SEQUENCE \"main\".\"a\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 3 START 3 NO CYCLE;",
+            "CREATE SEQUENCE \"main\".\"a\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 3 START 5 CYCLE;",
+            "CREATE SEQUENCE a INCREMENT BY 1 MINVALUE 1 MAXVALUE 3 START 5 NO CYCLE;",
+        ] {
+            assert_eq!(
+                duck_settle_exhausted_sequence(unchanged, "main", "a"),
+                unchanged
+            );
+        }
     }
     use crate::db::QueryOutcome;
 

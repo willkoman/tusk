@@ -1490,7 +1490,7 @@ export const TOPICS: Topic[] = [
           "**Copy DDL** rebuilds a runnable `CREATE` from the system catalogs on every engine, best-effort on DuckDB.",
           "On Postgres it covers tables, views, matviews, functions including overloads, and sequences.",
           "**MySQL routines** come from `SHOW CREATE PROCEDURE` / `SHOW CREATE FUNCTION`. A name that is both a procedure and a function shows both. A role that may run a routine but not read it (no `SHOW_ROUTINE`, not its definer) gets that explanation instead of empty text.",
-          "**DuckDB sequences** come from their stored `CREATE SEQUENCE`, with the name schema-qualified and quoted. **DuckDB macros** are rebuilt with every overload and parameter type, but without parameter defaults, which DuckDB does not report; a comment says so.",
+          "**DuckDB sequences** come from their stored `CREATE SEQUENCE`, with the name schema-qualified and quoted. Its `START` is the next value the sequence will hand out; once a non-cycling sequence has used its last value, DuckDB refuses its own stored text, so `START` is clamped to the bound and a following `SELECT nextval(…)` uses it up again.**DuckDB macros** are rebuilt with every overload and parameter type, but without parameter defaults, which DuckDB does not report; a comment says so.",
           "Foreign keys emit as trailing `ALTER TABLE … ADD CONSTRAINT`, so copied tables replay in any order. Constraint-backed indexes are skipped.",
           "**Copy DDL to editor** pastes the reconstruction at the cursor — useful for [[topic:import-export|exporting]] a structure alongside its data."
         ]
@@ -1749,7 +1749,7 @@ export const TOPICS: Topic[] = [
         "rows": [
           [
             "**Scope**",
-            "**Whole database**, **Selected schemas**, or **Selected tables**. On PostgreSQL a table selection also carries the sequences its identity columns own."
+            "**Whole database**, **Selected schemas**, or **Selected tables**. A table selection also carries its sequences: on PostgreSQL the ones its tables own, on DuckDB the ones its column defaults call with `nextval`."
           ],
           [
             "**Contents**",
@@ -1787,6 +1787,8 @@ export const TOPICS: Topic[] = [
         "items": [
           "**Foreign keys come last on PostgreSQL, MySQL and SQL Server**, as trailing `ALTER TABLE … ADD CONSTRAINT`, so a restore cannot break on table order.",
           "**SQLite and DuckDB keep foreign keys inline**, since neither can add one with `ALTER TABLE`. A SQLite schema dump writes `PRAGMA foreign_keys = OFF` first.",
+          "**Sequences are carried on PostgreSQL and DuckDB.** PostgreSQL restores each position with `setval` when data is included. DuckDB has no `setval`, so each `CREATE SEQUENCE` starts at the source's next value, in a schema-only dump too; a data-only DuckDB dump cannot move positions and says so in a warning.",
+          "**DuckDB sequence drops leave out `CASCADE`**, which on DuckDB drops every table that uses the sequence. Restoring with drops over a database where a table outside the dump still uses one of its sequences stops at that drop with DuckDB's dependency error.",
           "**Functions, procedures and triggers are reconstructed on PostgreSQL only**; elsewhere the dump counts the routines it could not carry (MySQL and SQL Server procedures and functions, DuckDB macros).",
           "**PostgreSQL data streams through `COPY`**, in blocks terminated by `\\.`, so no table is held in memory.",
           "**Other engines emit batched multi-row `INSERT`s**, paged so memory stays flat, with binary columns as native blob literals.",
