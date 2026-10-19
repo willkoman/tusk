@@ -4058,6 +4058,168 @@ async fn duckdb_sequences_and_macros_listed_and_defined() {
     );
 }
 
+// --- DuckDB errors release the engine's locks ---
+
+/// Run one step of a DuckDB scenario on its own OS thread, failing the test instead of
+/// hanging it when the step blocks. The fresh thread matters: a lock leaked by a failed
+/// statement makes the thread that leaked it fail with "resource deadlock would occur",
+/// but blocks every OTHER thread forever, and Tusk's commands run on whichever tokio
+/// worker is free.
+fn duck_step<T, F, Fut>(b: Backend, what: &str, step: F) -> (Backend, T)
+where
+    T: Send + 'static,
+    F: FnOnce(Backend) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = (Backend, T)>,
+{
+    use std::sync::mpsc::RecvTimeoutError;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = tx.send(rt.block_on(step(b)));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(out) => out,
+        // The blocked worker keeps the backend; it is leaked with the thread.
+        Err(RecvTimeoutError::Timeout) => panic!(
+            "DuckDB blocked during {what}: a failed statement left an engine lock held. \
+             Is DuckDB compiled with /EHsc (.cargo/config.toml)?"
+        ),
+        Err(RecvTimeoutError::Disconnected) => {
+            std::panic::resume_unwind(worker.join().expect_err("worker sent nothing"))
+        }
+    }
+}
+
+/// A DuckDB statement that fails while the engine holds an internal lock must release
+/// the lock. libduckdb-sys compiles DuckDB without an /EH option, and MSVC then unwinds
+/// a C++ exception without running destructors, so the `lock_guard` around the failing
+/// code never unlocks (`.cargo/config.toml` supplies /EHsc). Two of the errors that hit
+/// this are ordinary user mistakes:
+/// - `nextval` on an exhausted NO CYCLE sequence, or `currval` before any `nextval`,
+///   kept the sequence's lock. The Explorer's next refresh (`build_tree` reads
+///   `duckdb_sequences()`), View definition and backup then blocked forever.
+/// - A duplicate primary key kept a lock the table's next write needs, and that write
+///   blocked forever.
+///
+/// The `SELECT 1` probe behind `quarantine_if_poisoned` passed in both cases, so nothing
+/// discarded the connection. These must not be quarantined either: the in-memory
+/// database keeps its rows.
+#[test]
+fn duckdb_failed_statements_release_engine_locks() {
+    let (b, _version) = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(connect(&duck_cfg()))
+        .unwrap();
+    let (b, ()) = duck_step(b, "setup", |mut b| async move {
+        for sql in [
+            r#"CREATE SEQUENCE "main"."tusk_spent" MAXVALUE 2"#,
+            r#"CREATE SEQUENCE "main"."tusk_unused""#,
+            "SELECT nextval('main.tusk_spent')",
+            "SELECT nextval('main.tusk_spent')",
+            r#"CREATE TABLE "main"."tusk_keyed" (id INTEGER PRIMARY KEY)"#,
+            r#"INSERT INTO "main"."tusk_keyed" VALUES (1)"#,
+        ] {
+            exec(&mut b, sql).await;
+        }
+        (b, ())
+    });
+
+    // The failures come from one thread; everything after runs on others.
+    let (b, errors) = duck_step(b, "the failing statements", |mut b| async move {
+        let mut errors = Vec::new();
+        for sql in [
+            "SELECT nextval('main.tusk_spent')",
+            "SELECT currval('main.tusk_unused')",
+            r#"INSERT INTO "main"."tusk_keyed" VALUES (1)"#,
+        ] {
+            b.rollback_cursor().await;
+            let err = b
+                .run_single(sql, 100, cursorable(sql))
+                .await
+                .expect_err(sql);
+            errors.push(err.message);
+        }
+        (b, errors)
+    });
+    for (err, expected) in
+        errors
+            .iter()
+            .zip(["reached maximum value", "not yet defined", "Duplicate key"])
+    {
+        assert!(err.contains(expected), "{expected}: {err}");
+        assert!(!err.contains("unusable"), "quarantined: {err}");
+    }
+
+    let (b, tree) = duck_step(b, "the Explorer refresh", |b| async move {
+        let tree = b.build_tree().await;
+        (b, tree)
+    });
+    let tree = tree.expect("build_tree");
+    let main = tree
+        .schemas
+        .iter()
+        .find(|s| s.name == "main")
+        .expect("main schema");
+    // build_tree drops a failed sequence read silently, so an error shows up here.
+    assert_eq!(main.sequences, vec!["tusk_spent", "tusk_unused"]);
+
+    let (b, ddl) = duck_step(b, "View definition", |b| async move {
+        let ddl = b.relation_ddl("sequence", "main", "tusk_spent").await;
+        (b, ddl)
+    });
+    let ddl = ddl.expect("sequence ddl");
+    assert!(ddl.contains("MAXVALUE 2"), "{ddl}");
+
+    let (_b, (count, again)) = duck_step(b, "the next write", |mut b| async move {
+        exec(&mut b, r#"INSERT INTO "main"."tusk_keyed" VALUES (2)"#).await;
+        let count = all(&mut b, r#"SELECT count(*) FROM "main"."tusk_keyed""#).await;
+        b.rollback_cursor().await;
+        let again = b
+            .run_single("SELECT nextval('main.tusk_spent')", 100, true)
+            .await;
+        (b, (count, again))
+    });
+    assert_eq!(count[0][0].as_deref(), Some("2"), "rows kept, write landed");
+    let again = again.expect_err("the sequence is still exhausted");
+    assert!(
+        again.message.contains("reached maximum value"),
+        "{}",
+        again.message
+    );
+}
+
+/// The parser-error face of the same build defect (duckdb-rs #209). `parse_check`
+/// keeps parser errors off the real connection, so this asks libduckdb directly: with
+/// /EHsc the connection stays usable on its own thread and on another.
+#[test]
+fn duckdb_parser_error_leaves_connection_usable() {
+    // A poisoned connection aborts the process when dropped, so a failure here must
+    // leak it rather than unwind through its destructor.
+    let c = std::mem::ManuallyDrop::new(duckdb::Connection::open_in_memory().unwrap());
+    assert!(c.prepare("SELEC 1").is_err(), "a parser error");
+    let probe = c.prepare("SELECT 1").map(drop);
+    assert!(probe.is_ok(), "same thread after a parser error: {probe:?}");
+    let c = std::mem::ManuallyDrop::into_inner(c);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = c.query_row("SELECT 42", [], |r| r.get::<_, i32>(0));
+        let ok = matches!(r, Ok(42));
+        let _ = tx.send(ok);
+        if ok {
+            drop(c);
+        } else {
+            std::mem::forget(c);
+        }
+    });
+    let ok = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("another thread blocked after a parser error");
+    assert!(ok, "another thread after a parser error");
+}
+
 /// MySQL lists stored procedures and functions in the Explorer (routine type in
 /// `returns`), and "View definition" shows `SHOW CREATE PROCEDURE|FUNCTION`. The
 /// Explorer sends kind "function" for both, so the driver looks the type up; one name
