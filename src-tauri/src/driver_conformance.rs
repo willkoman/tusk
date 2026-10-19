@@ -4342,6 +4342,236 @@ fn duckdb_cancel_interrupts_and_leaves_connection_usable() {
     let _ = std::fs::remove_file(&path);
 }
 
+async fn duck_backup(
+    b: &mut Backend,
+    tag: &str,
+    options: &crate::backup::BackupOptions,
+) -> (crate::backup::BackupSummary, String, std::path::PathBuf) {
+    let path = std::env::temp_dir().join(format!("tusk_duck_seq_{tag}_{}.sql", std::process::id()));
+    let flag = std::sync::atomic::AtomicBool::new(false);
+    let summary = crate::backup::run_backup(
+        b,
+        "conformance",
+        options,
+        &path.to_string_lossy(),
+        &flag,
+        &mut |_| {},
+    )
+    .await
+    .unwrap_or_else(|e| panic!("[{tag}] backup: {}", e.message));
+    let text = std::fs::read_to_string(&path).unwrap();
+    (summary, text, path)
+}
+
+async fn duck_restore(b: &mut Backend, tag: &str, path: &std::path::Path) {
+    let restored = crate::backup::run_restore(
+        b,
+        TransactionEngine::DuckDb,
+        &path.to_string_lossy(),
+        &crate::backup::RestoreOptions {
+            stop_on_error: true,
+            single_transaction: false,
+        },
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut |_| {},
+    )
+    .await
+    .unwrap_or_else(|e| panic!("[{tag}] restore: {}", e.message));
+    assert_eq!(
+        restored.statements_failed, 0,
+        "[{tag}] restore errors: {:?}",
+        restored.first_error
+    );
+}
+
+/// DuckDB tables whose keys default to `nextval('…')` survive backup → drop → restore.
+/// The dump creates each sequence before the tables (DuckDB checks a default's sequence
+/// at CREATE TABLE), at the source's NEXT value — DuckDB has no `setval`, so the
+/// position travels in the stored `START`. A `tables` selection carries only the
+/// sequences its defaults name, resolved the way DuckDB binds them (an unqualified name
+/// in the table's own schema first); drops leave out `CASCADE`, which on DuckDB drops
+/// dependent tables; an exhausted sequence is replayed exhausted; and a data-only dump
+/// warns that it cannot move positions.
+#[tokio::test]
+async fn duckdb_backup_restores_sequences() {
+    let (mut b, _v) = connect(&duck_cfg()).await.unwrap();
+    let teardown: Vec<String> = [
+        r#"DROP TABLE IF EXISTS "x"."bk_t""#,
+        r#"DROP TABLE IF EXISTS "main"."bk_s""#,
+        r#"DROP SEQUENCE IF EXISTS "main"."bk_seq""#,
+        r#"DROP SEQUENCE IF EXISTS "main"."bk_unused""#,
+        r#"DROP SEQUENCE IF EXISTS "main"."bk_done""#,
+        r#"DROP SEQUENCE IF EXISTS "x"."we'ird seq""#,
+    ]
+    .map(String::from)
+    .to_vec();
+    for sql in [
+        r#"CREATE SCHEMA "x""#,
+        r#"CREATE SEQUENCE "main"."bk_seq" START 5 INCREMENT BY 2"#,
+        r#"CREATE SEQUENCE "main"."bk_unused""#,
+        r#"CREATE SEQUENCE "main"."bk_done" MAXVALUE 2"#,
+        r#"CREATE SEQUENCE "x"."we'ird seq" START 100"#,
+        r#"CREATE TABLE "main"."bk_s" (id INTEGER DEFAULT nextval('bk_seq') PRIMARY KEY, v VARCHAR)"#,
+        // Unqualified: binds to x's own sequence. Qualified: main's, shared with bk_s.
+        r#"CREATE TABLE "x"."bk_t" (id INTEGER DEFAULT nextval('we''ird seq'), w INTEGER DEFAULT nextval('main.bk_seq'))"#,
+        r#"INSERT INTO "main"."bk_s" (v) VALUES ('a'), ('b'), ('c')"#,
+        r#"INSERT INTO "x"."bk_t" DEFAULT VALUES"#,
+    ] {
+        exec(&mut b, sql).await;
+    }
+    for _ in 0..2 {
+        all(&mut b, "SELECT nextval('main.bk_done')").await;
+    }
+    // bk_seq issued 5, 7, 9 (bk_s) and 11 (bk_t.w): its next value is 13.
+
+    // --- a `tables` selection: one table, the one sequence it names ---
+    let only_s = crate::backup::BackupOptions {
+        scope: "tables".into(),
+        schemas: Vec::new(),
+        tables: vec![crate::backup::QualifiedName {
+            schema: "main".into(),
+            name: "bk_s".into(),
+        }],
+        content: "all".into(),
+        include_drop: true,
+        single_transaction: false,
+    };
+    let (summary, text, path) = duck_backup(&mut b, "tables", &only_s).await;
+    assert!(
+        summary.warnings.iter().all(|w| !w.contains("sequence")),
+        "{:?}",
+        summary.warnings
+    );
+    let create_seq = text
+        .find(r#"CREATE SEQUENCE "main"."bk_seq" "#)
+        .unwrap_or_else(|| panic!("the referenced sequence is created:\n{text}"));
+    let create_table = text
+        .find("CREATE TABLE bk_s")
+        .unwrap_or_else(|| panic!("the table is created:\n{text}"));
+    assert!(create_seq < create_table, "sequence before table:\n{text}");
+    assert!(
+        text.contains("START 13 "),
+        "the next value travels:\n{text}"
+    );
+    assert!(
+        text.contains("DROP SEQUENCE IF EXISTS \"main\".\"bk_seq\";\n"),
+        "dropped without CASCADE:\n{text}"
+    );
+    for absent in ["bk_unused", "bk_done", "ird seq", "CASCADE"] {
+        assert!(
+            !text.contains(absent),
+            "{absent} is not in a bk_s dump:\n{text}"
+        );
+    }
+    reset(&mut b, &teardown).await;
+    duck_restore(&mut b, "tables", &path).await;
+    let rows = all(&mut b, r#"SELECT id, v FROM "main"."bk_s" ORDER BY id"#).await;
+    assert_eq!(
+        rows.iter().map(|r| cell(r, 0)).collect::<Vec<_>>(),
+        ["5", "7", "9"].map(|s| Some(s.to_string())).to_vec()
+    );
+    exec(&mut b, r#"INSERT INTO "main"."bk_s" (v) VALUES ('d')"#).await;
+    let next = all(&mut b, r#"SELECT id FROM "main"."bk_s" WHERE v = 'd'"#).await;
+    assert_eq!(
+        cell(&next[0], 0).as_deref(),
+        Some("13"),
+        "numbering continues"
+    );
+    let _ = std::fs::remove_file(&path);
+
+    // --- the whole database: every sequence, the exhausted one included ---
+    reset(&mut b, &teardown).await;
+    for sql in [
+        r#"CREATE SEQUENCE "main"."bk_seq" START 5 INCREMENT BY 2"#,
+        r#"CREATE SEQUENCE "main"."bk_unused""#,
+        r#"CREATE SEQUENCE "main"."bk_done" MAXVALUE 2"#,
+        r#"CREATE SEQUENCE "x"."we'ird seq" START 100"#,
+        r#"CREATE TABLE "main"."bk_s" (id INTEGER DEFAULT nextval('bk_seq') PRIMARY KEY, v VARCHAR)"#,
+        r#"CREATE TABLE "x"."bk_t" (id INTEGER DEFAULT nextval('we''ird seq'), w INTEGER DEFAULT nextval('main.bk_seq'))"#,
+        r#"INSERT INTO "main"."bk_s" (v) VALUES ('a'), ('b'), ('c')"#,
+        r#"INSERT INTO "x"."bk_t" DEFAULT VALUES"#,
+    ] {
+        exec(&mut b, sql).await;
+    }
+    for _ in 0..2 {
+        all(&mut b, "SELECT nextval('main.bk_done')").await;
+    }
+    let whole = crate::backup::BackupOptions {
+        scope: "database".into(),
+        tables: Vec::new(),
+        ..only_s.clone()
+    };
+    let (summary, text, path) = duck_backup(&mut b, "database", &whole).await;
+    assert!(
+        summary.warnings.iter().all(|w| !w.contains("sequence")),
+        "{:?}",
+        summary.warnings
+    );
+    for seq in [
+        r#"CREATE SEQUENCE "main"."bk_seq" "#,
+        r#"CREATE SEQUENCE "main"."bk_unused" "#,
+        r#"CREATE SEQUENCE "main"."bk_done" "#,
+        r#"CREATE SEQUENCE "x"."we'ird seq" "#,
+    ] {
+        assert!(text.contains(seq), "{seq}:\n{text}");
+    }
+    assert!(
+        text.contains(r#"SELECT nextval('"main"."bk_done"')"#),
+        "the exhausted sequence is consumed again:\n{text}"
+    );
+    reset(&mut b, &teardown).await;
+    duck_restore(&mut b, "database", &path).await;
+    // A second restore runs its drops against live dependencies: tables go first, so
+    // the CASCADE-free sequence drops succeed.
+    duck_restore(&mut b, "database again", &path).await;
+    exec(&mut b, r#"INSERT INTO "x"."bk_t" DEFAULT VALUES"#).await;
+    let rows = all(&mut b, r#"SELECT id, w FROM "x"."bk_t" ORDER BY id"#).await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("100".to_string()), Some("11".to_string())],
+            vec![Some("101".to_string()), Some("13".to_string())],
+        ],
+        "both defaults resolve and continue"
+    );
+    let fresh = all(&mut b, "SELECT nextval('main.bk_unused')").await;
+    assert_eq!(cell(&fresh[0], 0).as_deref(), Some("1"));
+    // Exhausted like the source: its last value is the bound and its next one is past
+    // it. Read from the catalog rather than by calling nextval and expecting the error
+    // — on Windows the bundled DuckDB leaves the sequence's lock held after that error,
+    // and every later read of `duckdb_sequences()` fails or blocks.
+    let done = all(
+        &mut b,
+        "SELECT last_value, max_value, sql FROM duckdb_sequences() WHERE sequence_name = 'bk_done'",
+    )
+    .await;
+    assert_eq!(
+        cell(&done[0], 0),
+        cell(&done[0], 1),
+        "last value is the bound"
+    );
+    assert!(
+        cell(&done[0], 2).is_some_and(|sql| sql.contains("MAXVALUE 2 START 3 ")),
+        "{done:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+
+    // --- data only: no CREATE, so no way to move a position ---
+    let data_only = crate::backup::BackupOptions {
+        content: "data".into(),
+        ..only_s.clone()
+    };
+    let (summary, text, path) = duck_backup(&mut b, "data", &data_only).await;
+    assert!(!text.contains("CREATE SEQUENCE"), "{text}");
+    assert!(
+        summary.warnings.iter().any(|w| w.contains("setval")),
+        "{:?}",
+        summary.warnings
+    );
+    let _ = std::fs::remove_file(&path);
+    reset(&mut b, &teardown).await;
+}
+
 /// MySQL lists stored procedures and functions in the Explorer (routine type in
 /// `returns`), and "View definition" shows `SHOW CREATE PROCEDURE|FUNCTION`. The
 /// Explorer sends kind "function" for both, so the driver looks the type up; one name
