@@ -5275,23 +5275,41 @@ async fn one_statement_belt_battery(cfg: &ConnectionConfig, engine: &str) {
     }
     let mut conn = mysql_session(cfg).await;
     let glued = "CREATE PROCEDURE `test`.`tusk_belt_p`() BEGIN SELECT 1; END; DELETE FROM `test`.`tusk_belt_t`; START TRANSACTION";
-    let refused = check(&mut conn, glued)
-        .await
-        .expect_err("several statements are refused");
-    assert!(
-        refused.message.starts_with(REFUSED) && refused.message.contains("syntax"),
-        "[{engine}] {}",
-        refused.message
-    );
+    // Every kind of stored program, glued to a second statement: MySQL's 1295 for a
+    // stored-program CREATE only ever comes after the whole text parsed, so the second
+    // statement is a parse error first.
+    let tail = "; DELETE FROM `test`.`tusk_belt_t`";
+    let programs = [
+        "CREATE TRIGGER `test`.`tusk_belt_tr` BEFORE INSERT ON `test`.`tusk_belt_t` FOR EACH ROW BEGIN SET NEW.id = NEW.id; END",
+        "CREATE EVENT `test`.`tusk_belt_e` ON SCHEDULE EVERY 1 DAY DO BEGIN SELECT 1; END",
+        "CREATE FUNCTION `test`.`tusk_belt_f`() RETURNS INT DETERMINISTIC BEGIN RETURN 1; END",
+    ];
+    for text in std::iter::once(glued.to_string())
+        .chain(programs.iter().map(|program| format!("{program}{tail}")))
+    {
+        let refused = check(&mut conn, &text)
+            .await
+            .expect_err("several statements are refused");
+        assert!(
+            refused.message.starts_with(REFUSED) && refused.message.contains("syntax"),
+            "[{engine}] {text}: {}",
+            refused.message
+        );
+    }
+    for one in programs {
+        check(&mut conn, one)
+            .await
+            .unwrap_or_else(|e| panic!("[{engine}] [{one}] {}", e.message));
+    }
 
-    // Statements whose `;` the skip will not vouch for (a backslash escape, a `$`, a
-    // comment) are checked; the canary is not asked again, and each prepared statement is
-    // closed.
+    // Statements whose `;` the skip will not vouch for (a backslash escape, a `$` outside
+    // quotes, a comment) are checked, each after its own canary, and each prepared
+    // statement is closed.
     let prepared = session_counter(&mut conn, "Com_stmt_prepare").await;
     let closed = session_counter(&mut conn, "Com_stmt_close").await;
     for one in [
         "INSERT INTO `test`.`tusk_belt_t` VALUES (LENGTH('é\\n;b'))",
-        "INSERT INTO `test`.`tusk_belt_t` VALUES (LENGTH('a$;b'))",
+        "SELECT 1 AS a$b, ';' AS c",
         "SELECT 1 /* ; */",
     ] {
         assert!(!skips(one), "[{engine}] {one}");
@@ -5301,8 +5319,8 @@ async fn one_statement_belt_battery(cfg: &ConnectionConfig, engine: &str) {
     }
     assert_eq!(
         session_counter(&mut conn, "Com_stmt_prepare").await - prepared,
-        3,
-        "[{engine}] one prepare per text, no second canary"
+        6,
+        "[{engine}] a canary and a prepare per text"
     );
     assert_eq!(
         session_counter(&mut conn, "Com_stmt_close").await - closed,
@@ -5349,14 +5367,20 @@ async fn one_statement_belt_battery(cfg: &ConnectionConfig, engine: &str) {
     // A diagnostics statement holding a `;` is refused before anything runs, so the
     // warnings it would report survive.
     let _ = conn.query_drop("SELECT CAST('x' AS SIGNED)").await;
-    let refused = check(&mut conn, "SHOW WARNINGS /* ; */")
-        .await
-        .expect_err("diagnostics refused");
-    assert!(
-        refused.message.contains("SHOW WARNINGS"),
-        "[{engine}] {}",
-        refused.message
-    );
+    for text in [
+        "SHOW WARNINGS /* ; */",
+        "SELECT @@warning_count /* ; */",
+        "/*!40100 SHOW WARNINGS */ /* ; */",
+    ] {
+        let refused = check(&mut conn, text)
+            .await
+            .expect_err("diagnostics refused");
+        assert!(
+            refused.message.contains("SHOW WARNINGS"),
+            "[{engine}] {text}: {}",
+            refused.message
+        );
+    }
     let warnings: Vec<(String, u32, String)> = conn.query("SHOW WARNINGS").await.expect("warnings");
     assert!(
         warnings.iter().any(|w| w.1 == 1292),
@@ -5366,27 +5390,31 @@ async fn one_statement_belt_battery(cfg: &ConnectionConfig, engine: &str) {
 
     // A pending SET TRANSACTION survives the check, canary included: it still applies to
     // the transaction the checked text starts.
-    let mut fresh = mysql_session(cfg).await;
-    fresh
-        .query_drop("SET TRANSACTION READ ONLY")
-        .await
-        .expect("set transaction");
-    let start = "START TRANSACTION /* ; */";
-    check(&mut fresh, start)
-        .await
-        .unwrap_or_else(|e| panic!("[{engine}] {}", e.message));
-    fresh.query_drop(start).await.expect("start");
-    let read_only = fresh
-        .query_drop("INSERT INTO `test`.`tusk_belt_t` VALUES (3)")
-        .await
-        .expect_err("the transaction is read only");
-    assert_eq!(
-        server_code(&read_only),
-        Some(1792),
-        "[{engine}] {read_only}"
-    );
-    fresh.query_drop("ROLLBACK").await.expect("rollback");
-    drop(fresh);
+    // Both mechanisms: COM_STMT_PREPARE, and SQL PREPARE for text with a `:name` in it.
+    for start in [
+        "START TRANSACTION /* ; */",
+        "START TRANSACTION /* at:once; */",
+    ] {
+        let mut fresh = mysql_session(cfg).await;
+        fresh
+            .query_drop("SET TRANSACTION READ ONLY")
+            .await
+            .expect("set transaction");
+        check(&mut fresh, start)
+            .await
+            .unwrap_or_else(|e| panic!("[{engine}] {start}: {}", e.message));
+        fresh.query_drop(start).await.expect("start");
+        let read_only = fresh
+            .query_drop("INSERT INTO `test`.`tusk_belt_t` VALUES (3)")
+            .await
+            .expect_err("the transaction is read only");
+        assert_eq!(
+            server_code(&read_only),
+            Some(1792),
+            "[{engine}] {start}: {read_only}"
+        );
+        fresh.query_drop("ROLLBACK").await.expect("rollback");
+    }
 
     // The skip under session settings. What it lets through is one statement there; a
     // backtick right after a non-ASCII byte is a trail byte in gbk and sjis, so the
@@ -5420,7 +5448,7 @@ async fn one_statement_belt_battery(cfg: &ConnectionConfig, engine: &str) {
         assert_eq!(skips(text), skipped, "[{engine}] {text}");
         let mut s = mysql_session(cfg).await;
         s.query_drop(setup).await.expect(setup);
-        let answer = prepare(&mut s, text).await;
+        let answer = prepare(&mut s, text).await.expect("closed");
         if one {
             assert!(answer.is_ok(), "[{engine}] {setup}: {text}: {answer:?}");
         } else {
@@ -5443,7 +5471,7 @@ async fn one_statement_belt_battery(cfg: &ConnectionConfig, engine: &str) {
     // `lbl:begin` one runs through the ordinary path.
     let rows = all(
         &mut b,
-        "SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema = 'test' AND routine_name = 'tusk_belt_p'",
+        "SELECT (SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema = 'test' AND routine_name IN ('tusk_belt_p', 'tusk_belt_f')) + (SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema = 'test' AND trigger_name = 'tusk_belt_tr') + (SELECT COUNT(*) FROM information_schema.events WHERE event_schema = 'test' AND event_name = 'tusk_belt_e')",
     )
     .await;
     assert_eq!(cell(&rows[0], 0).as_deref(), Some("0"), "[{engine}]");
@@ -5487,17 +5515,30 @@ async fn mariadb_server_refuses_text_it_reads_as_several_statements() {
 }
 
 /// Vitess cannot vouch for text holding a `;` (vtgate splits statements itself; it answers
-/// the canary with 1105, older releases "prepare" it), so such text is refused before it is
+/// the canary with 1105 over COM_STMT_PREPARE and 1149 over SQL PREPARE, older releases
+/// "prepare" it), so such text is refused through either mechanism before it is
 /// sent, while text with no `;` is never checked. `scripts/conformance.sh` does not start
 /// Vitess; point TUSK_TEST_VITESS_PORT at a `vitess/vttestserver` vtgate (keyspace `test`,
 /// any user, no password) to run it.
 #[tokio::test]
 async fn vitess_refuses_text_holding_a_semicolon() {
-    let Some(port) = std::env::var("TUSK_TEST_VITESS_PORT")
+    unvouched_server_battery("TUSK_TEST_VITESS_PORT").await;
+}
+
+/// TiDB answers the canary with its own 8115 ("Can not prepare multiple statements"), not
+/// MySQL's parse error, so it is refused the same way, conservatively. Point
+/// TUSK_TEST_TIDB_PORT at a `pingcap/tidb` container (root, no password) to run it.
+#[tokio::test]
+async fn tidb_refuses_text_holding_a_semicolon() {
+    unvouched_server_battery("TUSK_TEST_TIDB_PORT").await;
+}
+
+async fn unvouched_server_battery(port_var: &str) {
+    let Some(port) = std::env::var(port_var)
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
     else {
-        eprintln!("SKIP vitess_refuses_text_holding_a_semicolon (set TUSK_TEST_VITESS_PORT)");
+        eprintln!("SKIP {port_var} is not set");
         return;
     };
     let mut conn = mysql_session(&ConnectionConfig {
@@ -5506,15 +5547,18 @@ async fn vitess_refuses_text_holding_a_semicolon() {
     })
     .await;
     for text in [
-        "SELECT 'a\\';b'",
+        r"SELECT 'a\';b'",
         "CREATE PROCEDURE p() BEGIN SELECT 1; END",
+        // A `:name` takes the SQL PREPARE path, whose canary must be refused too.
+        "CREATE PROCEDURE p() lbl:begin SELECT 1; end lbl",
     ] {
         let refused = crate::driver::mysql_server_single_statement(&mut conn, text)
             .await
-            .expect_err("refused on Vitess");
+            .expect_err("refused");
         assert!(
-            refused.message.contains("Vitess") && refused.message.contains("1105"),
-            "{}",
+            refused.message.contains("Vitess")
+                && refused.message.contains("instead of MySQL's parse error"),
+            "[{port_var}] {text}: {}",
             refused.message
         );
     }
