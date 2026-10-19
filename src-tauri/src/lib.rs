@@ -203,12 +203,18 @@ impl AppState {
             return None;
         }
         entry.cancelling = true;
-        // Cooperative operations stop at their next unit boundary; the handle-based
-        // cancel below (where the driver has one) still interrupts the live statement.
+        // The cooperative flag is NOT raised here: see `raise_soft_cancel`.
+        Some(entry.clone())
+    }
+
+    /// Stop a cooperative operation at its next unit boundary. Raised only AFTER the
+    /// out-of-band cancel has been sent: an export that saw the flag first could reach
+    /// a page boundary and send its ROLLBACK while a PostgreSQL CancelRequest was still
+    /// in flight, and the request then landed on that ROLLBACK instead.
+    fn raise_soft_cancel(entry: &CancelEntry) {
         if let Some(flag) = &entry.soft {
             flag.store(true, Ordering::Release);
         }
-        Some(entry.clone())
     }
 
     fn abort_cancel_generation(&self, id: &str, generation: u64) {
@@ -558,7 +564,8 @@ async fn disconnect_registered(state: &AppState, connection_id: &str) -> Result<
         // already armed itself. A command that raced before removal may still hold its
         // Arc; waiting for its lock below makes disconnect deterministic.
         if let Some(entry) = state.begin_cancel(connection_id) {
-            let _ = entry.handle.cancel(&entry.config).await;
+            let _ = entry.handle.clone().cancel(&entry.config).await;
+            AppState::raise_soft_cancel(&entry);
         }
         let mut c = conn.inner.lock().await;
         if c.transaction.owns_session() {
@@ -1698,8 +1705,8 @@ async fn cancel_operation(
         return Err(AppError::new("in-flight operation is owned by another tab")
             .with_transaction(entry.transaction));
     }
-    // A cooperative operation is already stopping (begin_cancel set its flag), so the
-    // absence of an out-of-band handle is not a failure there.
+    // A cooperative operation stops on its flag (raised below, after any out-of-band
+    // cancel), so the absence of an out-of-band handle is not a failure there.
     let soft = entry.soft.is_some();
     if matches!(entry.handle, CancelHandle::None) && !soft {
         state.abort_cancel_generation(&connection_id, entry.generation);
@@ -1714,6 +1721,7 @@ async fn cancel_operation(
             return Err(error.with_transaction(entry.transaction));
         }
     }
+    AppState::raise_soft_cancel(&entry);
 
     // Keep the generation tombstone until the owning command has observed the
     // cancellation and released its connection lock. Otherwise a delayed PostgreSQL

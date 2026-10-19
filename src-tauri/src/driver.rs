@@ -6632,6 +6632,38 @@ mod tests {
         // An uncommented column stays None, not Some("").
         assert_eq!(det.columns[1].comment, None);
     }
+
+    /// A TEMP table lives in the `temp` catalog, not the opened database: scoping the
+    /// detail to `current_database()` alone left it with no columns, so it could no
+    /// longer be edited in the grid. A TEMP table shadows a namesake, as DuckDB binds it.
+    #[test]
+    fn duckdb_temp_table_detail_is_read_from_the_temp_catalog() {
+        let (backend, _v) = DuckConn::open(&duck_mem()).unwrap();
+        let d = match backend {
+            Backend::Duck(d) => d,
+            _ => panic!("expected DuckDB backend"),
+        };
+        d.lock()
+            .execute_batch("CREATE TEMP TABLE tt(id INTEGER PRIMARY KEY, v VARCHAR)")
+            .unwrap();
+        let det = duck_table_detail(&d.lock(), "main", "tt").unwrap();
+        assert_eq!(det.columns.len(), 2);
+        assert!(det.columns[0].is_pk);
+        d.lock()
+            .execute_batch(
+                "CREATE TABLE both_t(x INTEGER); CREATE TEMP TABLE both_t(y INTEGER, z INTEGER)",
+            )
+            .unwrap();
+        let det = duck_table_detail(&d.lock(), "main", "both_t").unwrap();
+        assert_eq!(
+            det.columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["y", "z"],
+            "the TEMP table shadows, and its columns are not doubled"
+        );
+    }
 }
 
 #[allow(clippy::items_after_test_module)]
@@ -6641,13 +6673,18 @@ fn duck_table_detail(
     name: &str,
 ) -> Result<tree::RelationDetail, AppError> {
     // `information_schema` and every catalog function below span each ATTACHED
-    // database, so each read scopes to the one the connection opened. Unscoped, an
-    // attached file with the same schema.table doubled the columns and lent its
-    // defaults (and through them its sequences) to the backup's pre-pass.
+    // database, so each read scopes to ONE catalog. Unscoped, an attached file with
+    // the same schema.table doubled the columns and lent its defaults (and through
+    // them its sequences) to the backup's pre-pass. That catalog is `temp` when a TEMP
+    // table of this name exists (it shadows the database's own, as DuckDB resolves an
+    // unqualified name), else the database the connection opened: scoping to the
+    // opened one alone made TEMP tables lose their columns, and with them editability.
+    let catalog = duck_detail_catalog(conn, schema, name);
+    let cat = dlit(&catalog);
     let q = format!(
         "SELECT column_name, data_type, is_nullable, column_default \
          FROM information_schema.columns \
-         WHERE table_catalog = current_database() \
+         WHERE table_catalog = {cat} \
            AND table_schema = {} AND table_name = {} ORDER BY ordinal_position",
         dlit(schema),
         dlit(name)
@@ -6680,7 +6717,7 @@ fn duck_table_detail(
         conn,
         &format!(
             "SELECT column_name, comment FROM duckdb_columns() \
-             WHERE database_name = current_database() \
+             WHERE database_name = {cat} \
                AND schema_name = {} AND table_name = {}",
             dlit(schema),
             dlit(name)
@@ -6701,7 +6738,7 @@ fn duck_table_detail(
         conn,
         &format!(
             "SELECT comment FROM duckdb_tables() \
-             WHERE database_name = current_database() \
+             WHERE database_name = {cat} \
                AND schema_name = {} AND table_name = {}",
             dlit(schema),
             dlit(name)
@@ -6738,7 +6775,7 @@ fn duck_table_detail(
         conn,
         &format!(
             "SELECT index_name, is_unique, COALESCE(sql,'') FROM duckdb_indexes() \
-             WHERE database_name = current_database() \
+             WHERE database_name = {cat} \
                AND schema_name = {} AND table_name = {} ORDER BY index_name",
             dlit(schema),
             dlit(name)
@@ -6761,7 +6798,7 @@ fn duck_table_detail(
         conn,
         &format!(
             "SELECT constraint_type, COALESCE(constraint_text,'') FROM duckdb_constraints() \
-             WHERE database_name = current_database() \
+             WHERE database_name = {cat} \
                AND schema_name = {} AND table_name = {}",
             dlit(schema),
             dlit(name)
@@ -6803,4 +6840,27 @@ fn duck_table_detail(
         table_options: String::new(),
         definition_read: true,
     })
+}
+
+/// The catalog `duck_table_detail` reads `schema.name` from: `temp` when a TEMP table
+/// or view of that name exists, else the opened database. Best-effort: a failed
+/// lookup means the opened database, the pre-TEMP behaviour.
+fn duck_detail_catalog(conn: &duckdb::Connection, schema: &str, name: &str) -> String {
+    let q = format!(
+        "SELECT table_catalog FROM information_schema.tables \
+         WHERE table_catalog IN ('temp', current_database()) \
+           AND table_schema = {} AND table_name = {} \
+         ORDER BY table_catalog = 'temp' DESC LIMIT 1",
+        dlit(schema),
+        dlit(name)
+    );
+    duck_query(conn, &q)
+        .ok()
+        .and_then(|(_c, rows)| rows.first().map(|r| dcell(r, 0)))
+        .filter(|c| !c.is_empty())
+        .or_else(|| {
+            conn.query_row("SELECT current_database()", [], |r| r.get::<_, String>(0))
+                .ok()
+        })
+        .unwrap_or_else(|| "memory".to_string())
 }

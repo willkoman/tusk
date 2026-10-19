@@ -1010,6 +1010,12 @@ pub async fn run_export_query(
 
     match stream_to_sink(client, opts, SqlDialect::Postgres, output.path(), cancel).await {
         Ok(n) => {
+            // A Cancel during the last short FETCH or while the sink finished (an xlsx
+            // can take seconds) still stops the export: the old file stays in place.
+            if let Err(cancelled) = export_cancelled(cancel) {
+                let _ = client.batch_execute("ROLLBACK").await;
+                return Err(cancelled);
+            }
             if let Err(error) = client.batch_execute("COMMIT").await {
                 let _ = client.batch_execute("ROLLBACK").await;
                 return Err(AppError::new(format!(
@@ -1182,6 +1188,9 @@ pub async fn run_export_paged(
     match paged_inner(backend, sql, opts, dialect, output.path(), cancel).await {
         Ok(n) => {
             backend.rollback_cursor().await; // close any remaining pager state
+                                             // A late Cancel (after the last page, or while the sink finished) still
+                                             // stops it; dropping `output` removes the sibling temp file.
+            export_cancelled(cancel)?;
             output.persist()?;
             Ok(n)
         }
