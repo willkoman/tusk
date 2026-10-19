@@ -91,6 +91,10 @@ export type NodeDescriptor = {
   detail?: RelationDetail; // loaded relation detail, when available
   column?: Column; // for kind === "column"
   trigger?: Trg; // for kind === "trigger" (def carried so Copy DDL needs no roundtrip)
+  /** For kind === "function": the tree's `returns` — the routine type on MySQL, SQL Server
+   *  and DuckDB ("procedure", "function", "macro", "table macro"), the return type on
+   *  PostgreSQL. Drop needs it: MySQL drops a procedure with DROP PROCEDURE. */
+  returns?: string;
 };
 
 /** Stable identity key for selection/highlight (ignores transient `detail`). */
@@ -459,9 +463,9 @@ export function Tree(props: {
                     detail={fn.returns}
                     title={`${fn.name}(${fn.args}) → ${fn.returns}`}
                     selected={props.selectedKey === nodeKey({ kind: "function", schema: s.name, name: fn.name })}
-                    onSelect={() => props.onSelect({ kind: "function", schema: s.name, name: fn.name })}
-                    onOpen={() => props.onOpenDefinition?.({ kind: "function", schema: s.name, name: fn.name })}
-                    onContext={(e) => props.onContext(e, { kind: "function", schema: s.name, name: fn.name })}
+                    onSelect={() => props.onSelect({ kind: "function", schema: s.name, name: fn.name, returns: fn.returns })}
+                    onOpen={() => props.onOpenDefinition?.({ kind: "function", schema: s.name, name: fn.name, returns: fn.returns })}
+                    onContext={(e) => props.onContext(e, { kind: "function", schema: s.name, name: fn.name, returns: fn.returns })}
                   />
                 )}
               </For>

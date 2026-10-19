@@ -70,7 +70,7 @@ struct CancelRegistration<'a> {
 impl CancelRegistration<'_> {
     /// Install and return this generation's cooperative cancel flag. `cancel_operation`
     /// sets it, which lets backup/restore stop between statements even on drivers with
-    /// no out-of-band query cancel (SQLite/MySQL, and DuckDB on Windows).
+    /// no out-of-band query cancel (SQLite/MySQL/SQL Server).
     fn soft_cancel_flag(&self) -> Arc<AtomicBool> {
         let flag = Arc::new(AtomicBool::new(false));
         let mut cancels = lock_sync(&self.state.cancels);

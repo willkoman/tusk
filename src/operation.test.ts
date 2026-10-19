@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Connected } from "./connections";
-import { createOperationRunner, refusal, type HistoryDraft, type Operation, type OperationDeps } from "./operation";
+import { createOperationRunner, isCancelMessage, refusal, type HistoryDraft, type Operation, type OperationDeps } from "./operation";
 import { IDLE_TRANSACTION, type TransactionStatus } from "./transaction";
 
 const conn = (id = "c1", generation = 1): Connected => ({
@@ -127,6 +127,19 @@ describe("createOperationRunner", () => {
     if (!cancelled.ok) expect(cancelled.cancelled).toBe(true);
     if (!failed.ok) expect(failed.cancelled).toBe(false);
     expect(w.history.map((h) => [h.entry.status, h.entry.error])).toEqual([["cancelled", "canceling statement due to user request"], ["error", "syntax error"]]);
+  });
+
+  it("classifies each engine's cancel wording, and never a quarantine, as cancelled", () => {
+    // The backend owns the wording (driver.rs `duck_failure`): DuckDB's own
+    // "INTERRUPT Error: Interrupted!" is renamed so it reads as a cancel, while a
+    // quarantine keeps DuckDB's text so its "unusable" message is not hidden.
+    expect(isCancelMessage("canceling statement due to user request")).toBe(true);
+    expect(isCancelMessage("query cancelled (DuckDB: Interrupted!)")).toBe(true);
+    expect(isCancelMessage("cancelled")).toBe(true);
+    expect(isCancelMessage("INTERRUPT Error: Interrupted!")).toBe(false);
+    expect(isCancelMessage(
+      "INTERRUPT Error: Interrupted!. DuckDB left the connection unusable: the connection was discarded. The next query reopens the file; restart Tusk if it stays locked.",
+    )).toBe(false);
   });
 
   it("history: null records nothing", async () => {

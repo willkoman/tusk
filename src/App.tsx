@@ -228,6 +228,16 @@ const DEFINITION_TITLES: Partial<Record<string, string>> = {
   sequence: "Sequence",
   function: "Routine",
 };
+/** A "function" node's title when the engine reports its routine type (MySQL, SQL
+ *  Server, DuckDB); PostgreSQL reports a return type instead and stays "Routine". */
+const ROUTINE_TITLES: Partial<Record<string, string>> = {
+  procedure: "Procedure",
+  function: "Function",
+  "table function": "Table function",
+  aggregate: "Aggregate",
+  macro: "Macro",
+  "table macro": "Table macro",
+};
 const DdlGraphDialog = lazy(() => import("./relviz/DdlGraphDialog").then((m) => ({ default: m.DdlGraphDialog })));
 
 const errMsg = errorMessage;
@@ -4891,7 +4901,7 @@ function App() {
       connectionId: c.id,
       origin: captureOrigin(),
       node: n,
-      title: `${DEFINITION_TITLES[n.kind] ?? "Object"} ${n.name}`,
+      title: `${(n.kind === "function" && ROUTINE_TITLES[n.returns ?? ""]) || DEFINITION_TITLES[n.kind] || "Object"} ${n.name}`,
       subtitle: [where, driverLabel(connectionKind())].filter(Boolean).join(" · "),
     };
     if (n.kind === "constraint" || n.kind === "index" || n.kind === "trigger") {
@@ -5176,16 +5186,19 @@ function App() {
           { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop sequence", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop sequence", facts: { kind: "Sequence", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropSequence(s!, n.name, o.cascade) }) },
         );
         break;
-      case "function":
+      case "function": {
+        // MySQL procedures and DuckDB macros share this node kind; Drop names what it drops.
+        const what = ddl.routineKind(n.returns);
         items.push(
           VIEW_DEF,
           { sep: true },
           ...copyDdl,
           copyName,
           { sep: "danger" },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop function", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop function", facts: { kind: "Function", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropFunction(s!, n.name, o.cascade) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop ${what}`, subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: `Drop ${what}`, facts: { kind: what.charAt(0).toUpperCase() + what.slice(1), name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: dcaps().cascade, build: (o) => ddl.dropFunction(s!, n.name, o.cascade, n.returns) }) },
         );
         break;
+      }
       case "trigger": {
         // The trigger def rides along on the node (pg_get_triggerdef) — no backend roundtrip.
         const def = n.trigger?.def ?? "";

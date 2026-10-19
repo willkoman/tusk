@@ -314,7 +314,7 @@ export const TOPICS: Topic[] = [
           [
             "Cancel a running query",
             "yes (`CancelRequest`)",
-            "yes, except on Windows",
+            "yes (interrupt)",
             "—",
             "—",
             "—"
@@ -1301,6 +1301,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "Hierarchy: databases → schemas → Tables / Views / Sequences / Functions. Other databases are listed but muted.",
+          "**Sequences** appear on PostgreSQL, SQL Server and DuckDB. **Functions** holds PostgreSQL functions and procedures, MySQL and SQL Server procedures and functions, and DuckDB macros (one entry per name, overloads included). The muted label beside a routine names its kind; on PostgreSQL it is the return type.",
           "The tree loads shallow at connect. Expanding a table lazily fetches and caches Columns, Indexes, Constraints, Triggers.",
           "**Row estimates and sizes (Postgres)** — `≈1.2K · 64 MB`, from the planner. A never-analyzed table shows no estimate.",
           "**Tooltips** carry comments, a column's `default:`, and full index, constraint, trigger and function definitions.",
@@ -1362,7 +1363,7 @@ export const TOPICS: Topic[] = [
           ],
           [
             "Function",
-            "View definition · Copy DDL / Copy DDL to editor · Copy name · Drop…"
+            "View definition · Copy DDL / Copy DDL to editor · Copy name · Drop… (`DROP PROCEDURE` for a MySQL procedure, `DROP MACRO` / `DROP MACRO TABLE` for a DuckDB macro)"
           ],
           [
             "Trigger",
@@ -1488,6 +1489,8 @@ export const TOPICS: Topic[] = [
         "items": [
           "**Copy DDL** rebuilds a runnable `CREATE` from the system catalogs on every engine, best-effort on DuckDB.",
           "On Postgres it covers tables, views, matviews, functions including overloads, and sequences.",
+          "**MySQL routines** come from `SHOW CREATE PROCEDURE` / `SHOW CREATE FUNCTION`. A name that is both a procedure and a function shows both. A role that may run a routine but not read it (no `SHOW_ROUTINE`, not its definer) gets that explanation instead of empty text.",
+          "**DuckDB sequences** come from their stored `CREATE SEQUENCE`, with the name schema-qualified and quoted. **DuckDB macros** are rebuilt with every overload and parameter type, but without parameter defaults, which DuckDB does not report; a comment says so.",
           "Foreign keys emit as trailing `ALTER TABLE … ADD CONSTRAINT`, so copied tables replay in any order. Constraint-backed indexes are skipped.",
           "**Copy DDL to editor** pastes the reconstruction at the cursor — useful for [[topic:import-export|exporting]] a structure alongside its data."
         ]
@@ -1595,7 +1598,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "During an all-rows stream the dialog locks its controls and shows **Cancel export**.",
-          "Postgres and DuckDB cancel immediately, except DuckDB on Windows. SQLite, MySQL and SQL Server finish the current query first.",
+          "Postgres and DuckDB cancel immediately. SQLite, MySQL and SQL Server finish the current query first.",
           "Cancel or error rolls back the read transaction and deletes the partial file. xlsx writes the destination only at the end.",
           "Loaded-rows and clipboard exports run in memory, with no query to cancel."
         ]
@@ -1784,7 +1787,7 @@ export const TOPICS: Topic[] = [
         "items": [
           "**Foreign keys come last on PostgreSQL, MySQL and SQL Server**, as trailing `ALTER TABLE … ADD CONSTRAINT`, so a restore cannot break on table order.",
           "**SQLite and DuckDB keep foreign keys inline**, since neither can add one with `ALTER TABLE`. A SQLite schema dump writes `PRAGMA foreign_keys = OFF` first.",
-          "**Functions, procedures and triggers are reconstructed on PostgreSQL only**; elsewhere the dump counts the routines it could not carry.",
+          "**Functions, procedures and triggers are reconstructed on PostgreSQL only**; elsewhere the dump counts the routines it could not carry (MySQL and SQL Server procedures and functions, DuckDB macros).",
           "**PostgreSQL data streams through `COPY`**, in blocks terminated by `\\.`, so no table is held in memory.",
           "**Other engines emit batched multi-row `INSERT`s**, paged so memory stays flat, with binary columns as native blob literals.",
           "**PostgreSQL dumps are snapshot-consistent**; other engines page a table at a time."
@@ -3485,7 +3488,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "While a query runs, the Run button becomes **✕ Cancel** with an elapsed counter.",
-          "Postgres gets a real `CancelRequest`; DuckDB fires its interrupt handle, except on Windows.",
+          "Postgres gets a real `CancelRequest`; DuckDB fires its interrupt handle. Either way the run is logged as *cancelled*, not as an error.",
           "SQLite, MySQL and SQL Server have no out-of-band cancel, so the button shows a disabled **Running** timer instead.",
           "A cancel the backend rejects resets the button with the reason.",
           "Cancelling inside a PostgreSQL manual transaction leaves it in **Recovery required** until `ROLLBACK` or `ROLLBACK TO`.",
