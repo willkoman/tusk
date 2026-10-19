@@ -1838,6 +1838,10 @@ async fn export_to_file(
             None,
             c.transaction.clone(),
         )?;
+        // The engine handle interrupts the page being read; this flag stops the export
+        // at the next page when the interrupt found nothing running (see
+        // `export::export_cancelled`).
+        let cancel = cancel_registration.soft_cancel_flag();
         c.backend.rollback_cursor().await;
         c.backend.apply_search_path(&search_path).await?;
         // Scope=all re-runs the query, so the frontend's grid-based bool detection
@@ -1850,9 +1854,11 @@ async fn export_to_file(
         // PG streams through a server-side cursor (snapshot-consistent);
         // other drivers page via LIMIT/OFFSET through the same sink feeder.
         let result = if matches!(c.backend, driver::Backend::Pg(_)) {
-            export::run_export_query(c.backend.pg()?, &export_sql, &options, &temp_name).await
+            export::run_export_query(c.backend.pg()?, &export_sql, &options, &temp_name, &cancel)
+                .await
         } else {
-            export::run_export_paged(&mut c.backend, &export_sql, &options, &temp_name).await
+            export::run_export_paged(&mut c.backend, &export_sql, &options, &temp_name, &cancel)
+                .await
         };
         drop(c);
         drop(cancel_registration);

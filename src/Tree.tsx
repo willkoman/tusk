@@ -97,8 +97,19 @@ export type NodeDescriptor = {
   returns?: string;
 };
 
-/** Stable identity key for selection/highlight (ignores transient `detail`). */
-export const nodeKey = (n: NodeDescriptor) => `${n.kind}|${n.schema ?? ""}|${n.table ?? ""}|${n.name}`;
+/** Stable identity key for selection/highlight (ignores transient `detail`). A routine's
+ *  type is part of it: on MySQL a procedure and a function can share one name. */
+export const nodeKey = (n: NodeDescriptor) =>
+  `${n.kind}|${n.schema ?? ""}|${n.table ?? ""}|${n.name}${n.kind === "function" && n.returns ? `|${n.returns}` : ""}`;
+
+/** The kind `object_ddl` is asked for. Where procedures and functions have separate
+ *  namespaces (`ddlCaps().routineNamespaces`, MySQL) one name can be both, so a routine
+ *  node asks for its own type; "routine" (look it up, show both) only when the tree did
+ *  not report one. Everywhere else a routine is "function". */
+export function definitionKind(n: NodeDescriptor, routineNamespaces: boolean): string {
+  if (n.kind !== "function" || !routineNamespaces) return n.kind;
+  return n.returns === "procedure" || n.returns === "function" ? n.returns : "routine";
+}
 
 const conIconName = (k: string): IconName =>
   k === "primary_key" ? "key" : k === "foreign_key" ? "link" : k === "unique" ? "hash" : k === "check" ? "check" : "dot";
@@ -462,7 +473,7 @@ export function Tree(props: {
                     label={fn.name}
                     detail={fn.returns}
                     title={`${fn.name}(${fn.args}) → ${fn.returns}`}
-                    selected={props.selectedKey === nodeKey({ kind: "function", schema: s.name, name: fn.name })}
+                    selected={props.selectedKey === nodeKey({ kind: "function", schema: s.name, name: fn.name, returns: fn.returns })}
                     onSelect={() => props.onSelect({ kind: "function", schema: s.name, name: fn.name, returns: fn.returns })}
                     onOpen={() => props.onOpenDefinition?.({ kind: "function", schema: s.name, name: fn.name, returns: fn.returns })}
                     onContext={(e) => props.onContext(e, { kind: "function", schema: s.name, name: fn.name, returns: fn.returns })}

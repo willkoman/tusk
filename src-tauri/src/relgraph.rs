@@ -512,15 +512,21 @@ pub fn duck_edges(rows: &[Vec<Option<String>>], structured: bool) -> Vec<FkEdge>
     out
 }
 
+// `duckdb_constraints()` spans every ATTACHED catalog, each with its own `main`, so
+// these scope to the database the connection opened: an attached file with the same
+// schema.table would otherwise add its keys to this one's.
 pub const DUCK_FK_STRUCTURED: &str =
     "SELECT schema_name, table_name, constraint_text, referenced_table, \
        CAST(constraint_column_names AS VARCHAR), CAST(referenced_column_names AS VARCHAR) \
-     FROM duckdb_constraints() WHERE constraint_type = 'FOREIGN KEY'";
+     FROM duckdb_constraints() \
+     WHERE constraint_type = 'FOREIGN KEY' AND database_name = current_database()";
 pub const DUCK_FK_TEXT: &str = "SELECT schema_name, table_name, constraint_text \
-     FROM duckdb_constraints() WHERE constraint_type = 'FOREIGN KEY'";
+     FROM duckdb_constraints() \
+     WHERE constraint_type = 'FOREIGN KEY' AND database_name = current_database()";
 pub const DUCK_PK: &str =
     "SELECT schema_name, table_name, CAST(constraint_column_names AS VARCHAR) \
-     FROM duckdb_constraints() WHERE constraint_type = 'PRIMARY KEY'";
+     FROM duckdb_constraints() \
+     WHERE constraint_type = 'PRIMARY KEY' AND database_name = current_database()";
 
 #[cfg(test)]
 mod tests {

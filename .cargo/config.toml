@@ -10,6 +10,10 @@
 # statement that needs that lock fails with "resource deadlock would occur" on the
 # same thread and blocks forever on any other. /EHsc is the standard C++ unwinding
 # model, the one DuckDB's own CMake build and the Python wheel use. `cc` reads
-# CXXFLAGS_<target>; src-tauri/build.rs refuses a Windows build without it.
+# CXXFLAGS_<target>; src-tauri/build.rs refuses a Windows build without it. A change
+# here reaches an already-built libduckdb-sys only on cargo 1.86 or later (the
+# package's rust-version), the first to count [env] for rerun-if-env-changed.
 CXXFLAGS_x86_64_pc_windows_msvc = "/EHsc"
 CXXFLAGS_aarch64_pc_windows_msvc = "/EHsc"
+CXXFLAGS_i686_pc_windows_msvc = "/EHsc"
+CXXFLAGS_arm64ec_pc_windows_msvc = "/EHsc"

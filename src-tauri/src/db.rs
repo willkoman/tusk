@@ -27,6 +27,15 @@ pub struct AppError {
     /// in this crate, and an inline prompt would push every `Result` past clippy's
     /// large-error threshold.
     pub ssh_host_key: Option<Box<SshHostKeyPrompt>>,
+    /// Whether the operation stopped because the user cancelled it, where the code that
+    /// produced the error KNOWS: `Some(true)` for a cancellation (PostgreSQL's
+    /// `query_canceled`, a DuckDB interrupt, a cooperative stop), `Some(false)` for an
+    /// engine error that is definitely not one. `None` (sent as no field) leaves the
+    /// frontend to its message test, which is all an error wrapped by `format!` keeps;
+    /// a definite answer matters because a message can say "cancel" for any reason —
+    /// a table named `cancellations` in a binder error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancelled: Option<bool>,
 }
 
 impl AppError {
@@ -35,7 +44,22 @@ impl AppError {
             message: msg.into(),
             transaction: None,
             ssh_host_key: None,
+            cancelled: None,
         }
+    }
+
+    /// An error for an operation the user cancelled.
+    pub fn cancelled(msg: impl Into<String>) -> Self {
+        Self {
+            cancelled: Some(true),
+            ..Self::new(msg)
+        }
+    }
+
+    /// Record what the producer knows about whether this was a cancellation.
+    pub fn with_cancelled(mut self, cancelled: bool) -> Self {
+        self.cancelled = Some(cancelled);
+        self
     }
 
     pub fn with_transaction(mut self, transaction: TransactionStatus) -> Self {
@@ -65,10 +89,16 @@ impl From<tokio_postgres::Error> for AppError {
         } else {
             e.to_string()
         };
+        // A cancel the user asked for reaches the session as `query_canceled`; any
+        // other server error is definitely not one, whatever its text says.
+        let cancelled = e
+            .code()
+            .map(|code| *code == tokio_postgres::error::SqlState::QUERY_CANCELED);
         Self {
             message,
             transaction: None,
             ssh_host_key: None,
+            cancelled,
         }
     }
 }

@@ -4,6 +4,7 @@ use rust_xlsxwriter::{Format, Workbook};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio_postgres::Client;
@@ -973,14 +974,30 @@ impl AtomicExport {
 // Public entry points
 // ---------------------------------------------------------------------------
 
+/// Stop an export between pages once `cancel_operation` set the cooperative flag.
+///
+/// The engine's own cancel is not enough while an export pages: PostgreSQL ignores a
+/// CancelRequest that arrives between two FETCHes, and DuckDB clears a pending
+/// interrupt when the next page's query starts. A Cancel that landed while a page was
+/// being written to the file was lost, and `cancel_operation` refuses a second one
+/// while the first is outstanding, so the export could no longer be stopped.
+fn export_cancelled(cancel: &AtomicBool) -> Result<(), AppError> {
+    if cancel.load(Ordering::Acquire) {
+        Err(AppError::cancelled("export cancelled"))
+    } else {
+        Ok(())
+    }
+}
+
 /// Stream a query's full result to `path`, honoring `opts`. Text formats stream in
 /// constant memory; xlsx uses rust_xlsxwriter's constant-memory mode (per-sheet tempfile),
-/// so RAM stays flat for both.
+/// so RAM stays flat for both. `cancel` is checked before every FETCH.
 pub async fn run_export_query(
     client: &Client,
     sql: &str,
     opts: &ExportOptions,
     path: &str,
+    cancel: &AtomicBool,
 ) -> Result<u64, AppError> {
     opts.validate()?;
     let output = AtomicExport::new(path)?;
@@ -991,7 +1008,7 @@ pub async fn run_export_query(
         return Err(e.into());
     }
 
-    match stream_to_sink(client, opts, SqlDialect::Postgres, output.path()).await {
+    match stream_to_sink(client, opts, SqlDialect::Postgres, output.path(), cancel).await {
         Ok(n) => {
             if let Err(error) = client.batch_execute("COMMIT").await {
                 let _ = client.batch_execute("ROLLBACK").await;
@@ -1124,9 +1141,11 @@ async fn stream_to_sink(
     opts: &ExportOptions,
     dialect: SqlDialect,
     path: &str,
+    cancel: &AtomicBool,
 ) -> Result<u64, AppError> {
     let mut feeder = SinkFeeder::new(opts, dialect, path);
     loop {
+        export_cancelled(cancel)?;
         let fetch = format!("FETCH FORWARD {BATCH} FROM {EXPORT_CURSOR}");
         let messages = client.simple_query(&fetch).await?;
         let (cols, rows) = collect_rows_limited(&messages, USER_TEXT_LIMITS)?;
@@ -1147,18 +1166,20 @@ async fn stream_to_sink(
 /// SQLite / MySQL): page 1 via `run_single`, then `fetch_page` until done,
 /// through the same SinkFeeder as the PG cursor path. On error the pager is
 /// reset and the sibling temp removed. NOTE: LIMIT/OFFSET pages aren't
-/// snapshot-consistent under concurrent writes (same class as grid paging).
+/// snapshot-consistent under concurrent writes (same class as grid paging). `cancel`
+/// is checked before every page.
 pub async fn run_export_paged(
     backend: &mut crate::driver::Backend,
     sql: &str,
     opts: &ExportOptions,
     path: &str,
+    cancel: &AtomicBool,
 ) -> Result<u64, AppError> {
     opts.validate()?;
     let dialect = SqlDialect::parse(backend.capabilities().kind)?;
     let output = AtomicExport::new(path)?;
     backend.rollback_cursor().await;
-    match paged_inner(backend, sql, opts, dialect, output.path()).await {
+    match paged_inner(backend, sql, opts, dialect, output.path(), cancel).await {
         Ok(n) => {
             backend.rollback_cursor().await; // close any remaining pager state
             output.persist()?;
@@ -1177,7 +1198,9 @@ async fn paged_inner(
     opts: &ExportOptions,
     dialect: SqlDialect,
     path: &str,
+    cancel: &AtomicBool,
 ) -> Result<u64, AppError> {
+    export_cancelled(cancel)?;
     let mut feeder = SinkFeeder::new(opts, dialect, path);
     let Some(mut stream) = ResultStream::open(
         backend,
@@ -1191,7 +1214,11 @@ async fn paged_inner(
         return Err(AppError::new("the export query returned no result set"));
     };
     feeder.init_cols(stream.columns())?;
-    while let Some(rows) = stream.next_page().await? {
+    loop {
+        export_cancelled(cancel)?;
+        let Some(rows) = stream.next_page().await? else {
+            break;
+        };
         feeder.feed(&rows).await?;
     }
     feeder.finish().await
@@ -1427,8 +1454,9 @@ pub async fn export_tables(
     )?;
     // SQLite/MySQL/SQL Server have no out-of-band query cancel, so the engine handle
     // alone left Cancel dead for up to 2,000 tables. A cooperative
-    // flag (the same one backup/restore use) stops the run between tables on every
-    // engine; the engine handle still interrupts the current table where it can.
+    // flag (the same one backup/restore use) stops the run between tables, and the
+    // current table between pages, on every engine; the engine handle still
+    // interrupts the page being read where it can.
     let soft = cancel_registration.soft_cancel_flag();
     c.backend.rollback_cursor().await;
 
@@ -1436,7 +1464,7 @@ pub async fn export_tables(
     let mut results: Vec<TableExportResult> = Vec::with_capacity(total);
     let mut used: HashSet<String> = HashSet::new();
     for (index, table) in tables.iter().enumerate() {
-        if soft.load(std::sync::atomic::Ordering::Acquire) {
+        if soft.load(Ordering::Acquire) {
             for remaining in tables.iter().skip(index) {
                 results.push(TableExportResult {
                     schema: remaining.schema.clone(),
@@ -1481,9 +1509,9 @@ pub async fn export_tables(
         };
         table_options.bool_cols = c.backend.bool_columns(&sql).await;
         let outcome = if matches!(c.backend, crate::driver::Backend::Pg(_)) {
-            run_export_query(c.backend.pg()?, &sql, &table_options, &path_string).await
+            run_export_query(c.backend.pg()?, &sql, &table_options, &path_string, &soft).await
         } else {
-            run_export_paged(&mut c.backend, &sql, &table_options, &path_string).await
+            run_export_paged(&mut c.backend, &sql, &table_options, &path_string, &soft).await
         };
         let result = match outcome {
             Ok(rows) => TableExportResult {

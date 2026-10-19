@@ -92,6 +92,40 @@ jobs:
       - name: Test all database drivers
         run: scripts/conformance.sh
 
+  # The Rust gates above run on Linux, but the DuckDB lock defects (parser errors,
+  # interrupts, exhausted sequences, duplicate keys deadlocking the next statement)
+  # only ever showed on Windows, where they depend on DuckDB being compiled with
+  # /EHsc. This runs every DuckDB test there, embedded conformance included, and
+  # then checks that the DuckDB it linked was really built with the flag.
+  duckdb-windows:
+    name: DuckDB on Windows
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: windows-validation
+
+      - name: Test DuckDB paths
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib duck
+
+      - name: Check DuckDB was compiled with /EHsc
+        shell: bash
+        run: bash scripts/check-duckdb-ehsc.sh src-tauri/target/debug
+
   release-cache:
     name: Warm ${{ matrix.cache-key }} release cache
     if: github.event_name == 'push'
@@ -146,6 +180,11 @@ jobs:
       - name: Build release target
         shell: bash
         run: npm run tauri -- build --ci --no-sign --no-bundle ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+
+      - name: Check DuckDB was compiled with /EHsc
+        if: runner.os == 'Windows'
+        shell: bash
+        run: bash scripts/check-duckdb-ehsc.sh src-tauri/target/release
 
   # Same container and matrix as release.yml's build-linux (see the comment
   # there for why a 22.04 base). Besides warming the caches this runs the real

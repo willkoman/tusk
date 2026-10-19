@@ -405,7 +405,7 @@ impl DumpFile {
 
 fn cancelled(flag: &AtomicBool) -> Result<(), AppError> {
     if flag.load(Ordering::Relaxed) {
-        Err(AppError::new("cancelled"))
+        Err(AppError::cancelled("cancelled"))
     } else {
         Ok(())
     }
@@ -452,11 +452,6 @@ fn qual(schema: &str, name: &str, dialect: SqlDialect, schemas: bool) -> String 
     }
 }
 
-/// The sequence names a DuckDB column default passes to `nextval` / `currval`, each
-/// split the way DuckDB's `QualifiedName::Parse` splits that string argument: `.`
-/// separates parts, `"` toggles quoting and is never undoubled, nothing is
-/// case-folded. String literals and quoted identifiers elsewhere in the expression are
-/// skipped, and a call whose argument is not a plain string literal names nothing.
 /// A DuckDB dump without drops must not fail on a sequence that is already there:
 /// unlike a PostgreSQL `serial`, a DuckDB sequence outlives the table numbering from
 /// it, so restoring a dropped table's backup into its own database meets the sequence
@@ -485,10 +480,44 @@ fn duck_sequence_if_missing(ddl: &str) -> String {
     }
 }
 
-fn duck_sequence_calls(default: &str) -> Vec<Vec<String>> {
+/// One `nextval` / `currval` call in a DuckDB column default.
+#[derive(Debug, PartialEq)]
+enum DuckSequenceRef {
+    /// The sequence the call names, split the way DuckDB's `QualifiedName::Parse`
+    /// splits the argument's value: `.` separates parts, `"` toggles quoting and is
+    /// never undoubled, nothing is case-folded.
+    Named(Vec<String>),
+    /// An argument this reader does not evaluate. DuckDB folds ANY constant
+    /// expression there and parses the result (`NextValBind`), so `'s' || 'eq'` binds
+    /// as well as `'seq'` does; such a call is reported, never guessed at.
+    Unreadable,
+}
+
+/// The sequences a DuckDB column default passes to `nextval` / `currval`. The argument
+/// is read when it is a string literal, bare or inside `CAST(… AS VARCHAR)` — how
+/// DuckDB renders `'seq'::VARCHAR` back — and is otherwise `Unreadable`. String
+/// literals and quoted identifiers elsewhere in the expression are skipped.
+fn duck_sequence_calls(default: &str) -> Vec<DuckSequenceRef> {
     let chars: Vec<char> = default.chars().collect();
     let mut calls = Vec::new();
     let mut i = 0;
+    let skip_ws = |mut j: usize| {
+        while chars.get(j).is_some_and(|c| c.is_whitespace()) {
+            j += 1;
+        }
+        j
+    };
+    // Index just past the identifier-like word starting at `start`, and the word.
+    let word = |start: usize| -> (usize, String) {
+        let mut j = start;
+        while chars
+            .get(j)
+            .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+        {
+            j += 1;
+        }
+        (j, chars[start..j].iter().collect())
+    };
     // Index just past the string literal opening at `start` (a `'`), and its value.
     let literal = |start: usize| -> (usize, Option<String>) {
         let mut value = String::new();
@@ -507,6 +536,36 @@ fn duck_sequence_calls(default: &str) -> Vec<Vec<String>> {
         }
         (j, None)
     };
+    // The string argument starting at `start`: index just past it and its value
+    // (`None` when unterminated), or `None` when it is not one this reader evaluates.
+    let string_argument = |start: usize| -> Option<(usize, Option<String>)> {
+        if chars.get(start) == Some(&'\'') {
+            return Some(literal(start));
+        }
+        let (j, cast) = word(start);
+        if !cast.eq_ignore_ascii_case("CAST") {
+            return None;
+        }
+        let j = skip_ws(j);
+        if chars.get(j) != Some(&'(') {
+            return None;
+        }
+        let j = skip_ws(j + 1);
+        if chars.get(j) != Some(&'\'') {
+            return None;
+        }
+        let (j, value) = literal(j);
+        let (j, as_kw) = word(skip_ws(j));
+        if !as_kw.eq_ignore_ascii_case("AS") {
+            return None;
+        }
+        let (j, type_name) = word(skip_ws(j));
+        let text_type = ["VARCHAR", "TEXT", "STRING", "CHAR", "BPCHAR"]
+            .iter()
+            .any(|t| type_name.eq_ignore_ascii_case(t));
+        let j = skip_ws(j);
+        (text_type && chars.get(j) == Some(&')')).then_some((j + 1, value))
+    };
     while i < chars.len() {
         let c = chars[i];
         if c == '\'' {
@@ -518,33 +577,38 @@ fn duck_sequence_calls(default: &str) -> Vec<Vec<String>> {
             }
             i += 1;
         } else if c.is_alphabetic() || c == '_' {
-            let start = i;
-            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
-                i += 1;
-            }
-            let word: String = chars[start..i].iter().collect();
-            if !(word.eq_ignore_ascii_case("nextval") || word.eq_ignore_ascii_case("currval")) {
+            let (end, function) = word(i);
+            i = end;
+            if !(function.eq_ignore_ascii_case("nextval")
+                || function.eq_ignore_ascii_case("currval"))
+            {
                 continue;
             }
-            let mut j = i;
-            while chars.get(j).is_some_and(|c| c.is_whitespace()) {
-                j += 1;
-            }
+            let j = skip_ws(i);
             if chars.get(j) != Some(&'(') {
                 continue;
             }
-            j += 1;
-            while chars.get(j).is_some_and(|c| c.is_whitespace()) {
-                j += 1;
-            }
-            if chars.get(j) != Some(&'\'') {
+            let j = skip_ws(j + 1);
+            let Some((end, value)) = string_argument(j) else {
+                calls.push(DuckSequenceRef::Unreadable);
+                i = j;
                 continue;
-            }
-            let (end, value) = literal(j);
+            };
+            let close = skip_ws(end);
             i = end;
-            if let Some(parts) = value.as_deref().and_then(duck_qualified_name) {
-                calls.push(parts);
-            }
+            // Anything after the string (`'s' || 'eq'`) is more expression to fold.
+            let named = (chars.get(close) == Some(&')'))
+                .then_some(value)
+                .flatten()
+                .as_deref()
+                .and_then(duck_qualified_name);
+            calls.push(match named {
+                Some(parts) => {
+                    i = close + 1;
+                    DuckSequenceRef::Named(parts)
+                }
+                None => DuckSequenceRef::Unreadable,
+            });
         } else {
             i += 1;
         }
@@ -573,22 +637,34 @@ fn duck_qualified_name(input: &str) -> Option<Vec<String>> {
 }
 
 /// The sequence (of `known`, this database's `(schema, name)` pairs) a DuckDB default
-/// naming `parts` binds to. An unqualified name resolves in the table's own schema
-/// first and then `main` — DuckDB binds a default in its table's schema before the
-/// search path; `a.b` is schema `a`, or this database's `main` when `a` is the
-/// database's name; `c.s.n` must name this database. Comparison ignores case, as
-/// DuckDB's catalog does. `None` for a sequence this database does not have
-/// (including one in another attached database).
+/// naming `parts` binds to, in DuckDB's binder order. A default binds against the
+/// search path `[table's schema, main]` of the table's database
+/// (`Binder::BindDefaultValues`), so an unqualified name resolves in the table's own
+/// schema first and then `main`. `a.b` with `a` naming a DATABASE is that catalog
+/// before any schema (`Binder::BindSchemaOrCatalog`): for this database's name, the
+/// same `[table's schema, main]` lookup — unless this database also has a schema of
+/// that name, which DuckDB refuses as an ambiguous reference. Any other `a.b` is
+/// schema `a`; `c.s.n` must name this database. `schemas` is every schema of this
+/// database. Comparison ignores case, as DuckDB's catalog does. `None` for a sequence
+/// this database does not have, one in another attached database, or an ambiguous
+/// reference.
 fn resolve_duck_sequence(
     parts: &[String],
     table_schema: &str,
     database: &str,
+    schemas: &[String],
     known: &[(String, String)],
 ) -> Option<(String, String)> {
     let candidates: Vec<(&str, &str)> = match parts {
         [name] => vec![(table_schema, name.as_str()), ("main", name.as_str())],
+        [first, _]
+            if first.eq_ignore_ascii_case(database)
+                && schemas.iter().any(|s| s.eq_ignore_ascii_case(first)) =>
+        {
+            Vec::new()
+        }
         [first, name] if first.eq_ignore_ascii_case(database) => {
-            vec![(first.as_str(), name.as_str()), ("main", name.as_str())]
+            vec![(table_schema, name.as_str()), ("main", name.as_str())]
         }
         [schema, name] => vec![(schema.as_str(), name.as_str())],
         [catalog, schema, name] if catalog.eq_ignore_ascii_case(database) => {
@@ -932,12 +1008,13 @@ async fn backup_inner(
     // DuckDB sequences. DuckDB has no identity columns, so every sequence is an
     // independent object a `DEFAULT nextval('…')` names — and its catalog does not keep
     // the table → sequence dependency across a reopen (`duckdb_dependencies()` comes
-    // back empty for a file database), so the references are read from every dumped
-    // table's column defaults instead. A database or schema dump carries every
+    // back empty for a file database), so the references are read from the dumped
+    // tables' column defaults instead — in ONE catalog read for the whole database,
+    // not a `table_detail` per table. A database or schema dump carries every
     // sequence of its schemas plus any sequence a dumped table's default names in
     // another schema; a `tables` selection carries only the sequences its tables
-    // name. A name that resolves to no sequence of this database is a warning, never
-    // a guess.
+    // name. A name that resolves to no sequence of this database, or an argument
+    // Tusk cannot read, is a warning, never a guess.
     let mut warnings: Vec<String> = Vec::new();
     // Schemas the dump must create only because a carried sequence lives there.
     let mut sequence_schemas: Vec<String> = Vec::new();
@@ -947,50 +1024,73 @@ async fn backup_inner(
             .iter()
             .flat_map(|s| s.sequences.iter().map(|n| (s.name.clone(), n.clone())))
             .collect();
+        let all_schemas: Vec<String> = tree.schemas.iter().map(|s| s.name.clone()).collect();
         let mut carried: std::collections::BTreeSet<(String, String)> = known
             .iter()
             .filter(|(schema, _)| opts.scope != "tables" && schema_names.contains(schema))
             .cloned()
             .collect();
-        for t in &tables {
-            cancelled(cancel)?;
-            let detail = match backend.table_detail(&t.schema, &t.name).await {
-                Ok(detail) => detail,
-                Err(e) => {
-                    // Without its column defaults, a sequence this table numbers from
-                    // cannot be found, and the restore would fail at its CREATE TABLE
-                    // with nothing in the dump saying why.
-                    if opts.wants_schema() {
-                        warnings.push(format!(
-                            "table {}.{}: its column defaults could not be read ({}), so \
-                             any sequence it numbers from is not carried",
-                            t.schema,
-                            t.name,
-                            comment_safe(&e.message)
-                        ));
-                    }
-                    continue;
+        let dumped: HashSet<(&str, &str)> = tables
+            .iter()
+            .map(|t| (t.schema.as_str(), t.name.as_str()))
+            .collect();
+        cancelled(cancel)?;
+        match backend.duck_sequence_defaults().await {
+            // Without the column defaults, a sequence a table numbers from cannot be
+            // found, and the restore would fail at its CREATE TABLE with nothing in the
+            // dump saying why.
+            Err(e) => {
+                if opts.wants_schema() {
+                    warnings.push(format!(
+                        "the column defaults could not be read ({}), so a sequence a \
+                         table numbers from is carried only if it lives in a dumped \
+                         schema",
+                        comment_safe(&e.message)
+                    ));
                 }
-            };
-            for column in &detail.columns {
-                let Some(default) = column.default.as_deref() else {
-                    continue;
-                };
-                for parts in duck_sequence_calls(default) {
-                    match resolve_duck_sequence(&parts, &t.schema, &database, &known) {
-                        Some(found) => {
-                            carried.insert(found);
+            }
+            Ok(defaults) => {
+                for column in defaults
+                    .iter()
+                    .filter(|c| dumped.contains(&(c.schema.as_str(), c.table.as_str())))
+                {
+                    let what = |problem: &str| {
+                        format!(
+                            "table {}.{} column {}: the default `{}` {problem}, so the \
+                             dump does not create it — the table will not restore until \
+                             that sequence exists",
+                            column.schema,
+                            column.table,
+                            column.column,
+                            comment_safe(&column.default)
+                        )
+                    };
+                    for call in duck_sequence_calls(&column.default) {
+                        let found = match &call {
+                            DuckSequenceRef::Named(parts) => resolve_duck_sequence(
+                                parts,
+                                &column.schema,
+                                &database,
+                                &all_schemas,
+                                &known,
+                            ),
+                            DuckSequenceRef::Unreadable => None,
+                        };
+                        match found {
+                            Some(found) => {
+                                carried.insert(found);
+                            }
+                            None if opts.wants_schema() => warnings.push(match call {
+                                DuckSequenceRef::Named(_) => {
+                                    what("names a sequence this database does not have")
+                                }
+                                DuckSequenceRef::Unreadable => what(
+                                    "computes its sequence name in a way Tusk does not \
+                                     evaluate",
+                                ),
+                            }),
+                            None => {}
                         }
-                        None if opts.wants_schema() => warnings.push(format!(
-                            "table {}.{} column {}: the default `{}` names a sequence \
-                             this database does not have, so the dump does not create \
-                             it — the table will not restore until that sequence exists",
-                            t.schema,
-                            t.name,
-                            column.name,
-                            comment_safe(default)
-                        )),
-                        None => {}
                     }
                 }
             }
@@ -1490,6 +1590,11 @@ async fn backup_inner(
     ))
     .await?;
 
+    // The last word before the rename. A Cancel that lands while the final objects are
+    // read can surface only as one of their warnings (a failed `relation_ddl` becomes
+    // "-- warning: …", and `data_columns` falls back on error), so without this the
+    // dump would replace the previous file and report success.
+    cancelled(cancel)?;
     let bytes = out.finish().await?;
     progress(BackupProgress {
         phase: "done",
@@ -1649,7 +1754,7 @@ async fn copy_out_table(
     let mut block_bytes: u64 = 0;
     while let Some(chunk) = stream.next().await {
         if cancel.load(Ordering::Relaxed) {
-            return Err(AppError::new("cancelled"));
+            return Err(AppError::cancelled("cancelled"));
         }
         let chunk = chunk?;
         carry.extend_from_slice(&chunk);
@@ -2322,30 +2427,50 @@ mod tests {
     /// The defaults below are DuckDB's own `duckdb_columns().column_default` renderings.
     #[test]
     fn duck_sequence_calls_read_the_nextval_argument_like_duckdb() {
+        use DuckSequenceRef::{Named, Unreadable};
         let calls = |d: &str| duck_sequence_calls(d);
-        let parts = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(calls("nextval('seq')"), vec![parts(&["seq"])]);
-        assert_eq!(calls("nextval('main.seq')"), vec![parts(&["main", "seq"])]);
+        let named = |p: &[&str]| Named(p.iter().map(|s| s.to_string()).collect());
+        assert_eq!(calls("nextval('seq')"), vec![named(&["seq"])]);
+        assert_eq!(calls("nextval('main.seq')"), vec![named(&["main", "seq"])]);
         assert_eq!(
             calls("nextval('s.\"we''ird seq\"')"),
-            vec![parts(&["s", "we'ird seq"])]
+            vec![named(&["s", "we'ird seq"])]
         );
         assert_eq!(
             calls("(NEXTVAL ( 'db.s.q' ) * 2) + currval('r')"),
-            vec![parts(&["db", "s", "q"]), parts(&["r"])]
+            vec![named(&["db", "s", "q"]), named(&["r"])]
         );
-        // Not a call: a different function, a string that merely says nextval, a
-        // non-literal argument, too many parts, an unterminated quote.
-        for none in [
-            "my_nextval('seq')",
-            "'nextval(''seq'')'",
+        // `DEFAULT nextval('seq'::VARCHAR)` comes back as a CAST; DuckDB folds it.
+        assert_eq!(
+            calls("nextval(CAST('main.seq' AS VARCHAR))"),
+            vec![named(&["main", "seq"])]
+        );
+        assert_eq!(
+            calls("nextval( cast ( 'seq' as text ) ) + 1"),
+            vec![named(&["seq"])]
+        );
+        // Not a call: a different function, a string that merely says nextval.
+        for none in ["my_nextval('seq')", "'nextval(''seq'')'", "42"] {
+            assert!(calls(none).is_empty(), "{none}");
+        }
+        // A call whose sequence Tusk cannot read is reported, not dropped: any other
+        // constant expression, a non-text cast, too many parts, an unterminated quote.
+        for unreadable in [
+            "nextval('s' || 'eq')",
+            "nextval(CAST('seq' AS VARCHAR) || '')",
+            "nextval(CAST('1' AS INTEGER))",
             "nextval(seq_name)",
             "nextval('a.b.c.d')",
             "nextval('\"open')",
-            "42",
+            "nextval('open",
         ] {
-            assert!(calls(none).is_empty(), "{none}");
+            assert_eq!(calls(unreadable), vec![Unreadable], "{unreadable}");
         }
+        // One unreadable call does not hide a readable one after it.
+        assert_eq!(
+            calls("coalesce(nextval('a' || 'b'), nextval('c'))"),
+            vec![Unreadable, named(&["c"])]
+        );
     }
 
     #[test]
@@ -2356,11 +2481,14 @@ mod tests {
             ("main".to_string(), "only_main".to_string()),
             ("s".to_string(), "Mixed".to_string()),
         ];
-        let resolve = |parts: &[&str], table_schema: &str| {
+        let schemas = vec!["main".to_string(), "s".to_string()];
+        let resolve_in = |schemas: &[String], parts: &[&str], table_schema: &str| {
             let parts: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
-            resolve_duck_sequence(&parts, table_schema, "memory", &known)
+            resolve_duck_sequence(&parts, table_schema, "memory", schemas, &known)
                 .map(|(s, n)| format!("{s}.{n}"))
         };
+        let resolve =
+            |parts: &[&str], table_schema: &str| resolve_in(&schemas, parts, table_schema);
         // Unqualified: the table's own schema wins, then main.
         assert_eq!(resolve(&["seq"], "s").as_deref(), Some("s.seq"));
         assert_eq!(resolve(&["seq"], "main").as_deref(), Some("main.seq"));
@@ -2370,15 +2498,22 @@ mod tests {
         );
         assert_eq!(resolve(&["mixed"], "s").as_deref(), Some("s.Mixed"));
         assert_eq!(resolve(&["s", "seq"], "main").as_deref(), Some("s.seq"));
-        // A leading database name is this catalog's `main` (or its named schema).
+        // A leading database name is the catalog, searched like an unqualified name:
+        // the table's schema, then main (pinned against DuckDB itself by
+        // `duckdb_backup_resolves_sequences_like_the_binder`).
+        assert_eq!(resolve(&["memory", "seq"], "s").as_deref(), Some("s.seq"));
         assert_eq!(
-            resolve(&["memory", "seq"], "s").as_deref(),
-            Some("main.seq")
+            resolve(&["memory", "only_main"], "s").as_deref(),
+            Some("main.only_main")
         );
         assert_eq!(
             resolve(&["MEMORY", "s", "seq"], "main").as_deref(),
             Some("s.seq")
         );
+        // ...unless a schema of this database has the database's name: DuckDB refuses
+        // that reference as ambiguous.
+        let with_namesake = vec!["main".to_string(), "s".to_string(), "Memory".to_string()];
+        assert_eq!(resolve_in(&with_namesake, &["memory", "seq"], "s"), None);
         // Another attached database, or a sequence nobody has.
         assert_eq!(resolve(&["other", "main", "seq"], "main"), None);
         assert_eq!(resolve(&["missing"], "main"), None);

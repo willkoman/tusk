@@ -83,7 +83,7 @@ import {
   type ImportTarget,
 } from "./import";
 import { pickOpenPath, pickSavePath, type PickedPath, type PickerOptions } from "./filePicker";
-import { Tree, type RelationDetail, type NodeDescriptor, nodeKey, relKey } from "./Tree";
+import { Tree, type RelationDetail, type NodeDescriptor, nodeKey, relKey, definitionKind } from "./Tree";
 import { ContextMenu, type MenuItem, type MenuState } from "./ContextMenu";
 import { bindBot, saveBinding, slackErrMsg, slackTone, startBotBound, stopBot, type SlackConfigInfo, type SlackStatus } from "./slack/bind";
 import { type DialogState } from "./WorkbenchDialogs";
@@ -4122,8 +4122,9 @@ function App() {
       return true;
     }
     if (originCurrent(src.origin, true) && src.origin.tabId)
-      patchResult(src.origin.tabId, { status: `Export rejected: ${out.error}` });
-    throw new Error(out.error);
+      patchResult(src.origin.tabId, { status: out.cancelled ? "Export cancelled" : `Export rejected: ${out.error}` });
+    // Carry the runner's verdict: the dialog must not re-guess it from the text.
+    throw Object.assign(new Error(out.error), { cancelled: out.cancelled });
   }
 
   // --- backup / restore ---
@@ -4718,7 +4719,7 @@ function App() {
       needs: "idle",
       release: "Reading object DDL closed the result stream",
       history: null,
-      run: () => commands.objectDdl(c.id, n.kind, n.schema ?? "", n.name),
+      run: () => commands.objectDdl(c.id, definitionKind(n, ddlCaps(kindOf(c.id)).routineNamespaces), n.schema ?? "", n.name),
     });
     if (!out.ok) {
       if (origin.tabId && originAlive(origin)) patchResult(origin.tabId, { runErr: out.error });
@@ -4936,7 +4937,7 @@ function App() {
       needs: "idle",
       release: "Reading an object definition closed the result stream",
       history: null,
-      run: () => commands.objectDdl(c.id, node.kind, node.schema ?? "", node.name),
+      run: () => commands.objectDdl(c.id, definitionKind(node, ddlCaps(kindOf(c.id)).routineNamespaces), node.schema ?? "", node.name),
     });
     const cur = definitionView();
     if (!cur || cur.node !== node) return; // closed, or another object opened meanwhile
