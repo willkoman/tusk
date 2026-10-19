@@ -3488,7 +3488,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "While a query runs, the Run button becomes **✕ Cancel** with an elapsed counter.",
-          "Postgres gets a real `CancelRequest`; DuckDB fires its interrupt handle.",
+          "Postgres gets a real `CancelRequest`; DuckDB fires its interrupt handle. Either way the run is logged as *cancelled*, not as an error.",
           "SQLite, MySQL and SQL Server have no out-of-band cancel, so the button shows a disabled **Running** timer instead.",
           "A cancel the backend rejects resets the button with the reason.",
           "Cancelling inside a PostgreSQL manual transaction leaves it in **Recovery required** until `ROLLBACK` or `ROLLBACK TO`.",

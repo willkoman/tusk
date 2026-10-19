@@ -4225,8 +4225,9 @@ fn duckdb_parser_error_leaves_connection_usable() {
 /// Cancel was switched off on Windows. The interrupt goes through
 /// `CancelHandle::cancel`, the call `cancel_operation` makes, while the query runs on
 /// another thread; every later step runs on a thread of its own (`duck_step`). The
-/// in-memory database must keep its rows (a quarantine would discard them) and the
-/// file-backed one must give its file lock back once idle.
+/// query fails with a message the UI files as cancelled, the in-memory database must
+/// keep its rows (a quarantine would discard them) and the file-backed one must give
+/// its file lock back once idle.
 #[test]
 fn duckdb_cancel_interrupts_and_leaves_connection_usable() {
     use std::sync::mpsc::RecvTimeoutError;
@@ -4285,11 +4286,11 @@ fn duckdb_cancel_interrupts_and_leaves_connection_usable() {
             }
         };
         let err = outcome.expect_err("the cancelled query fails");
-        assert!(err.message.contains("Interrupted"), "{}", err.message);
-        assert!(
-            !err.message.contains("unusable"),
-            "quarantined: {}",
-            err.message
+        // Named as a cancellation: the frontend files an outcome as cancelled, not
+        // failed, only when the message says "cancel" (`isCancelMessage`).
+        assert_eq!(
+            err.message, "query cancelled (DuckDB: Interrupted!)",
+            "an interrupt reads as a cancel, never as a quarantine"
         );
 
         let (b, one) = duck_step(b, "the next query", |mut b| async move {

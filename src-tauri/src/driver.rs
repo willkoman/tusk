@@ -383,17 +383,12 @@ impl DuckConn {
         })
     }
 
-    /// Wrap an operation error with the quarantine consequence when the error also
-    /// poisoned the connection — otherwise "resource deadlock would occur" repeats
-    /// on every later statement with no way out.
+    /// Settle an operation error into the message the user sees: the quarantine
+    /// consequence when the error also poisoned the connection (otherwise "resource
+    /// deadlock would occur" repeats on every later statement with no way out), else
+    /// an interrupt named as the cancellation it is (`duck_failure`).
     pub(crate) fn quarantine_if_poisoned(&self, err: AppError) -> AppError {
-        match self.quarantine_poisoned() {
-            Some(hint) => AppError::new(format!(
-                "{}. DuckDB left the connection unusable: {hint}",
-                err.message
-            )),
-            None => err,
-        }
+        duck_failure(err, self.quarantine_poisoned())
     }
 
     fn manual_transaction_aborted(&self) -> bool {
@@ -479,6 +474,35 @@ fn forget_if_poisoned(conn: duckdb::Connection) -> bool {
     } else {
         false
     }
+}
+
+/// How DuckDB words a statement stopped by `InterruptHandle::interrupt` — the Cancel
+/// button, through `CancelHandle::Duck` — as in "INTERRUPT Error: Interrupted!".
+/// duckdb-rs reports every failure with `ErrorCode::Unknown`, so the text is all
+/// there is to recognise it by.
+const DUCK_INTERRUPT_PREFIX: &str = "INTERRUPT Error:";
+
+/// The error a DuckDB failure reaches the user with. `quarantine` is the consequence
+/// `DuckConn::quarantine_poisoned` reported, if the failure also poisoned the
+/// connection.
+///
+/// The frontend files an outcome as cancelled, not failed, only when its message says
+/// "cancel" (`isCancelMessage` in `src/operation.ts`, and the export dialog). PostgreSQL's
+/// "canceling statement due to user request" already does; DuckDB's interrupt does not,
+/// so it is renamed here. A quarantined connection keeps DuckDB's own wording instead:
+/// a cancelled outcome replaces the message with "Query cancelled", and the user must
+/// see that the connection or its in-memory data is gone.
+fn duck_failure(mut err: AppError, quarantine: Option<&str>) -> AppError {
+    if let Some(hint) = quarantine {
+        return AppError::new(format!(
+            "{}. DuckDB left the connection unusable: {hint}",
+            err.message
+        ));
+    }
+    if let Some(detail) = err.message.trim_start().strip_prefix(DUCK_INTERRUPT_PREFIX) {
+        err.message = format!("query cancelled (DuckDB: {})", detail.trim());
+    }
+    err
 }
 
 fn duck_error_is_poison(error: &duckdb::Error) -> bool {
@@ -1194,7 +1218,12 @@ impl Backend {
     pub async fn build_tree(&self) -> Result<tree::DbTree, AppError> {
         match self {
             Backend::Pg(p) => tree::build_shallow(&p.client).await,
-            Backend::Duck(d) => duck_build_tree(&d.lock()),
+            Backend::Duck(d) => {
+                // Backup reads the tree with Cancel armed, so an interrupt can land
+                // here. Bind first: quarantine_if_poisoned re-locks.
+                let tree = duck_build_tree(&d.lock());
+                tree.map_err(|e| d.quarantine_if_poisoned(e))
+            }
             Backend::Sqlite(s) => sqlite_build_tree(&s.lock()),
             Backend::MySql(m) => mysql_build_tree(&m.pool).await,
             Backend::MsSql(m) => m.build_tree().await,
@@ -6073,6 +6102,36 @@ mod tests {
         assert!(!duck_error_is_poison(&probe));
         conn.execute_batch("ROLLBACK").unwrap();
         conn.execute_batch("SELECT 1").unwrap();
+    }
+
+    /// The frontend files an outcome as cancelled when the message says "cancel"
+    /// (`isCancelMessage`, `/cancel/i`). A DuckDB interrupt must say it; a quarantine
+    /// must not, or "Query cancelled" would replace the news that the connection
+    /// (or the in-memory data) is gone.
+    #[test]
+    fn duckdb_interrupt_reads_as_cancelled_unless_quarantined() {
+        let says_cancel = |e: &AppError| e.message.to_ascii_lowercase().contains("cancel");
+        let interrupt = || AppError::new("INTERRUPT Error: Interrupted!");
+
+        let cancelled = duck_failure(interrupt(), None);
+        assert_eq!(cancelled.message, "query cancelled (DuckDB: Interrupted!)");
+        assert!(says_cancel(&cancelled));
+
+        let quarantined = duck_failure(interrupt(), Some("the connection was discarded."));
+        assert_eq!(
+            quarantined.message,
+            "INTERRUPT Error: Interrupted!. DuckDB left the connection unusable: the connection was discarded."
+        );
+        assert!(!says_cancel(&quarantined), "{}", quarantined.message);
+
+        // Any other failure passes through untouched, including one that merely
+        // mentions an interrupt.
+        for message in [
+            "Catalog Error: Table with name nope does not exist!",
+            "Binder Error: column \"INTERRUPT Error:\" not found",
+        ] {
+            assert_eq!(duck_failure(AppError::new(message), None).message, message);
+        }
     }
 
     #[test]
