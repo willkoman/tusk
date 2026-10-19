@@ -5218,14 +5218,51 @@ END;";
     let _ = std::fs::remove_file(&path);
 }
 
+/// A dedicated session on a MySQL-protocol server (no pool), for checks that read session
+/// counters or change session settings.
+async fn mysql_session(cfg: &ConnectionConfig) -> mysql_async::Conn {
+    let opts = mysql_async::OptsBuilder::default()
+        .ip_or_hostname(cfg.host.clone())
+        .tcp_port(cfg.port)
+        .user(Some(cfg.user.clone()))
+        .pass(Some(cfg.password.clone()))
+        .db_name((!cfg.dbname.is_empty()).then(|| cfg.dbname.clone()));
+    mysql_async::Conn::new(opts).await.expect("session")
+}
+
+async fn session_counter(conn: &mut mysql_async::Conn, name: &str) -> u64 {
+    use mysql_async::prelude::Queryable;
+    let row: Option<(String, String)> = conn
+        .query_first(format!("SHOW SESSION STATUS LIKE '{name}'"))
+        .await
+        .expect(name);
+    row.and_then(|(_, v)| v.parse().ok()).expect(name)
+}
+
+fn server_code(e: &mysql_async::Error) -> Option<u16> {
+    match e {
+        mysql_async::Error::Server(s) => Some(s.code),
+        _ => None,
+    }
+}
+
 /// The server-side belt under the MySQL splitter: before COM_QUERY runs a text that holds
 /// a `;` before its end, the server must accept it as ONE statement. A text the client kept
 /// together but the server reads as several (as a lexer misread would) is refused without
 /// running anything; one stored program passes and then runs — including a label written
-/// `lbl:begin`, which mysql_async's COM_STMT_PREPARE path would have rewritten into a false
-/// syntax error — and the check leaves no session state behind.
+/// `lbl:begin`, which goes through SQL PREPARE because mysql_async would rewrite it — and
+/// the check leaves no prepared statement or variable behind, asks the canary once per
+/// connection, commits nothing, keeps a pending `SET TRANSACTION`, and never runs between a
+/// statement and the SHOW WARNINGS that reports on it. What the quote-only skip lets
+/// through is one statement under ANSI_QUOTES and multi-byte client charsets too, and what
+/// it holds back can really read differently there.
 async fn one_statement_belt_battery(cfg: &ConnectionConfig, engine: &str) {
+    use crate::driver::{
+        mysql_protocol_prepare as prepare, mysql_semicolons_only_quoted as skips,
+        mysql_server_single_statement as check,
+    };
     use mysql_async::prelude::Queryable;
+    const REFUSED: &str = "the server could not confirm this is one statement:";
     let (mut b, _v) = connect(cfg).await.expect("connect");
     for sql in [
         "DROP PROCEDURE IF EXISTS `test`.`tusk_belt_p`",
@@ -5236,45 +5273,172 @@ async fn one_statement_belt_battery(cfg: &ConnectionConfig, engine: &str) {
     ] {
         exec(&mut b, sql).await;
     }
-    let Backend::MySql(m) = &b else {
-        panic!("[{engine}] expected a MySQL backend")
-    };
-    let mut conn = m.pool.get_conn().await.expect("connection");
+    let mut conn = mysql_session(cfg).await;
     let glued = "CREATE PROCEDURE `test`.`tusk_belt_p`() BEGIN SELECT 1; END; DELETE FROM `test`.`tusk_belt_t`; START TRANSACTION";
-    let refused = crate::driver::mysql_server_single_statement(&mut conn, glued)
+    let refused = check(&mut conn, glued)
         .await
         .expect_err("several statements are refused");
     assert!(
-        refused
-            .message
-            .starts_with("the server could not confirm this is one statement:")
-            && refused.message.contains("syntax"),
+        refused.message.starts_with(REFUSED) && refused.message.contains("syntax"),
         "[{engine}] {}",
         refused.message
     );
-    // One stored program (labels written either way), and statements whose `;` sits in a
-    // string — plainly, which skips the check, and after a backslash escape, which goes
-    // through it — pass.
+
+    // Statements whose `;` the skip will not vouch for (a backslash escape, a `$`, a
+    // comment) are checked; the canary is not asked again, and each prepared statement is
+    // closed.
+    let prepared = session_counter(&mut conn, "Com_stmt_prepare").await;
+    let closed = session_counter(&mut conn, "Com_stmt_close").await;
     for one in [
-        "CREATE PROCEDURE `test`.`tusk_belt_p`() BEGIN SELECT 1; SELECT 2; END",
-        "CREATE PROCEDURE `test`.`tusk_belt_l`() lbl:begin SELECT 1; end lbl",
-        "INSERT INTO `test`.`tusk_belt_t` VALUES (LENGTH('a;b'))",
         "INSERT INTO `test`.`tusk_belt_t` VALUES (LENGTH('é\\n;b'))",
+        "INSERT INTO `test`.`tusk_belt_t` VALUES (LENGTH('a$;b'))",
+        "SELECT 1 /* ; */",
     ] {
-        crate::driver::mysql_server_single_statement(&mut conn, one)
+        assert!(!skips(one), "[{engine}] {one}");
+        check(&mut conn, one)
             .await
             .unwrap_or_else(|e| panic!("[{engine}] [{one}] {}", e.message));
     }
-    let probe: Option<Option<String>> = conn
-        .query_first("SELECT @tusk_one_statement")
-        .await
-        .expect("read the probe variable");
     assert_eq!(
-        probe,
-        Some(None),
-        "[{engine}] the probe variable is cleared"
+        session_counter(&mut conn, "Com_stmt_prepare").await - prepared,
+        3,
+        "[{engine}] one prepare per text, no second canary"
+    );
+    assert_eq!(
+        session_counter(&mut conn, "Com_stmt_close").await - closed,
+        3,
+        "[{engine}] every prepared statement is closed"
+    );
+
+    // One stored program, plainly and with a `lbl:begin` label (SQL PREPARE).
+    for one in [
+        "CREATE PROCEDURE `test`.`tusk_belt_p`() BEGIN SELECT 1; SELECT 2; END",
+        "CREATE PROCEDURE `test`.`tusk_belt_l`() lbl:begin SELECT 1; end lbl",
+    ] {
+        check(&mut conn, one)
+            .await
+            .unwrap_or_else(|e| panic!("[{engine}] [{one}] {}", e.message));
+    }
+    let gone = conn
+        .query_drop("EXECUTE __tusk_one_statement")
+        .await
+        .expect_err("the SQL PREPARE statement is deallocated");
+    assert_eq!(server_code(&gone), Some(1243), "[{engine}] {gone}");
+    let probe: Option<Option<String>> = conn
+        .query_first("SELECT @__tusk_one_statement")
+        .await
+        .expect("read the check's variable");
+    assert_eq!(probe, Some(None), "[{engine}] the variable is cleared");
+
+    // Inside a transaction the check commits nothing and leaves it open, refused or not.
+    conn.query_drop("START TRANSACTION").await.expect("start");
+    conn.query_drop("INSERT INTO `test`.`tusk_belt_t` VALUES (2)")
+        .await
+        .expect("insert");
+    check(&mut conn, "SELECT 1 /* ; */")
+        .await
+        .expect("checked in a transaction");
+    check(&mut conn, glued).await.expect_err("refused");
+    conn.query_drop("ROLLBACK").await.expect("rollback");
+    let count: Option<u64> = conn
+        .query_first("SELECT COUNT(*) FROM `test`.`tusk_belt_t`")
+        .await
+        .expect("count");
+    assert_eq!(count, Some(1), "[{engine}] the check committed nothing");
+
+    // A diagnostics statement holding a `;` is refused before anything runs, so the
+    // warnings it would report survive.
+    let _ = conn.query_drop("SELECT CAST('x' AS SIGNED)").await;
+    let refused = check(&mut conn, "SHOW WARNINGS /* ; */")
+        .await
+        .expect_err("diagnostics refused");
+    assert!(
+        refused.message.contains("SHOW WARNINGS"),
+        "[{engine}] {}",
+        refused.message
+    );
+    let warnings: Vec<(String, u32, String)> = conn.query("SHOW WARNINGS").await.expect("warnings");
+    assert!(
+        warnings.iter().any(|w| w.1 == 1292),
+        "[{engine}] {warnings:?}"
     );
     drop(conn);
+
+    // A pending SET TRANSACTION survives the check, canary included: it still applies to
+    // the transaction the checked text starts.
+    let mut fresh = mysql_session(cfg).await;
+    fresh
+        .query_drop("SET TRANSACTION READ ONLY")
+        .await
+        .expect("set transaction");
+    let start = "START TRANSACTION /* ; */";
+    check(&mut fresh, start)
+        .await
+        .unwrap_or_else(|e| panic!("[{engine}] {}", e.message));
+    fresh.query_drop(start).await.expect("start");
+    let read_only = fresh
+        .query_drop("INSERT INTO `test`.`tusk_belt_t` VALUES (3)")
+        .await
+        .expect_err("the transaction is read only");
+    assert_eq!(
+        server_code(&read_only),
+        Some(1792),
+        "[{engine}] {read_only}"
+    );
+    fresh.query_drop("ROLLBACK").await.expect("rollback");
+    drop(fresh);
+
+    // The skip under session settings. What it lets through is one statement there; a
+    // backtick right after a non-ASCII byte is a trail byte in gbk and sjis, so the
+    // server reads `;SELECT 2;` as code, which is why the skip leaves such text to it.
+    let trap_gbk = "SELECT 1 AS `ソ`, 2 AS `;SELECT 2;`";
+    let trap_sjis = "SELECT 1 AS `ā`, 2 AS `;SELECT 2;`";
+    let mut cases = vec![
+        (
+            "SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')",
+            "SELECT 'a;b' AS \"c;d\"",
+            true,
+            true,
+        ),
+        ("SET NAMES gbk", "SELECT 'é;' AS `é;`", true, true),
+        ("SET NAMES sjis", "SELECT 'é;' AS `é;`", true, true),
+        ("SET NAMES utf8mb4", trap_gbk, false, true),
+        ("SET NAMES gbk", trap_gbk, false, false),
+        ("SET NAMES utf8mb4", trap_sjis, false, true),
+        ("SET NAMES sjis", trap_sjis, false, false),
+    ];
+    if engine == "mariadb" {
+        // MariaDB's MSSQL mode quotes identifiers with brackets, which can hold a `'`.
+        cases.push((
+            "SET SESSION sql_mode = 'MSSQL'",
+            "SELECT 1 AS [a'b]; SELECT 2 AS [c'd]",
+            false,
+            false,
+        ));
+    }
+    for (setup, text, skipped, one) in cases {
+        assert_eq!(skips(text), skipped, "[{engine}] {text}");
+        let mut s = mysql_session(cfg).await;
+        s.query_drop(setup).await.expect(setup);
+        let answer = prepare(&mut s, text).await;
+        if one {
+            assert!(answer.is_ok(), "[{engine}] {setup}: {text}: {answer:?}");
+        } else {
+            let e = answer.expect_err(text);
+            assert_eq!(
+                server_code(&e),
+                Some(1064),
+                "[{engine}] {setup}: {text}: {e}"
+            );
+            let refused = check(&mut s, text).await.expect_err("refused");
+            assert!(
+                refused.message.starts_with(REFUSED),
+                "[{engine}] {}",
+                refused.message
+            );
+        }
+    }
+
     // Nothing of the refused text ran: no procedure, and the row is still there. The
     // `lbl:begin` one runs through the ordinary path.
     let rows = all(
@@ -5320,6 +5484,43 @@ async fn mariadb_server_refuses_text_it_reads_as_several_statements() {
         return;
     };
     one_statement_belt_battery(&mysql_cfg_at(port), "mariadb").await;
+}
+
+/// Vitess cannot vouch for text holding a `;` (vtgate splits statements itself; it answers
+/// the canary with 1105, older releases "prepare" it), so such text is refused before it is
+/// sent, while text with no `;` is never checked. `scripts/conformance.sh` does not start
+/// Vitess; point TUSK_TEST_VITESS_PORT at a `vitess/vttestserver` vtgate (keyspace `test`,
+/// any user, no password) to run it.
+#[tokio::test]
+async fn vitess_refuses_text_holding_a_semicolon() {
+    let Some(port) = std::env::var("TUSK_TEST_VITESS_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+    else {
+        eprintln!("SKIP vitess_refuses_text_holding_a_semicolon (set TUSK_TEST_VITESS_PORT)");
+        return;
+    };
+    let mut conn = mysql_session(&ConnectionConfig {
+        password: String::new(),
+        ..mysql_cfg_at(port)
+    })
+    .await;
+    for text in [
+        "SELECT 'a\\';b'",
+        "CREATE PROCEDURE p() BEGIN SELECT 1; END",
+    ] {
+        let refused = crate::driver::mysql_server_single_statement(&mut conn, text)
+            .await
+            .expect_err("refused on Vitess");
+        assert!(
+            refused.message.contains("Vitess") && refused.message.contains("1105"),
+            "{}",
+            refused.message
+        );
+    }
+    crate::driver::mysql_server_single_statement(&mut conn, "SELECT 1")
+        .await
+        .expect("no `;`, no check");
 }
 
 /// A MySQL backup of a database that is NOT the session's default one restores into

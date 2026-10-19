@@ -3009,6 +3009,8 @@ impl MySqlConn {
         let (columns, rows, affected) = if action == script::TransactionAction::SetTransaction {
             // MySQL's unscoped SET TRANSACTION applies to the next transaction. Any
             // status SELECT here would consume it before the user's START TRANSACTION.
+            // (The one-statement check only prepares, which consumes nothing; conformance
+            // `mysql_server_refuses_text_it_reads_as_several_statements` pins that.)
             result?
         } else {
             let current = match action {
@@ -3384,6 +3386,57 @@ async fn mysql_run_conn_limited(
 /// check rather than an error in the statement itself.
 const MYSQL_ONE_STATEMENT: &str = "the server could not confirm this is one statement";
 
+/// Two statements no MySQL-protocol server may prepare as one. A connection's verdicts
+/// are trusted only after it has refused this text, through the same mechanism, with
+/// MySQL's parse error.
+const MYSQL_CHECK_CANARY: &str = "SET @__tusk_canary = 1; SET @__tusk_canary = 2";
+
+/// The user variable and statement name the SQL `PREPARE` path uses (and reserves).
+const MYSQL_CHECK_VAR: &str = "@__tusk_one_statement";
+const MYSQL_CHECK_STMT: &str = "__tusk_one_statement";
+
+/// Assumed when the server will not report its `max_allowed_packet` (MySQL's old default).
+const MYSQL_FALLBACK_MAX_PACKET: usize = 1024 * 1024;
+
+/// What a connection has shown about itself.
+#[derive(Clone, Copy, Default)]
+struct MySqlCheckedSession {
+    /// It refused the canary through COM_STMT_PREPARE with a parse error.
+    protocol: bool,
+    /// It refused the canary through SQL `PREPARE`; with its `max_allowed_packet`.
+    sql: Option<usize>,
+}
+
+/// A connection by endpoint, server version and server connection id. A restarted server
+/// reuses ids, so an entry can outlive its connection; it then speaks for whatever server
+/// answers at the same endpoint with the same version and id.
+type MySqlCheckKey = (String, u16, (u16, u16, u16), u32);
+
+fn mysql_check_key(conn: &mysql_async::Conn) -> MySqlCheckKey {
+    let opts = conn.opts();
+    (
+        opts.ip_or_hostname().to_string(),
+        opts.tcp_port(),
+        conn.server_version(),
+        conn.id(),
+    )
+}
+
+fn mysql_checked_sessions(
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<MySqlCheckKey, MySqlCheckedSession>> {
+    static CHECKED: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<MySqlCheckKey, MySqlCheckedSession>>,
+    > = std::sync::OnceLock::new();
+    let mut map = CHECKED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if map.len() >= 4096 {
+        map.clear();
+    }
+    map
+}
+
 /// The SERVER's verdict that `sql` is one statement, asked on the same session right before
 /// COM_QUERY runs it. mysql_async always negotiates `CLIENT_MULTI_STATEMENTS` (and exposes no
 /// `COM_SET_OPTION` to turn it off), so a text the client-side splitter kept together but the
@@ -3393,28 +3446,36 @@ const MYSQL_ONE_STATEMENT: &str = "the server could not confirm this is one stat
 /// such a text is checked, and one whose every `;` sits plainly inside quotes is let through
 /// first (`mysql_semicolons_only_quoted`, so a restore's INSERT batches skip the round trips).
 ///
-/// The check is a SQL `PREPARE … FROM @tusk_one_statement`, the user variable set from a
-/// binary hex literal: the server parses exactly ONE statement and executes nothing, on the
-/// text's exact bytes in the session's client character set — as COM_QUERY would. (Not
-/// COM_STMT_PREPARE: mysql_async rewrites `:name` outside quotes to `?` before preparing, so
-/// `lbl:begin` would come back as a false syntax error.) Anything after the first statement
-/// fails the parse with ER_PARSE_ERROR (1064) before a single statement runs; one statement
-/// either prepares (MariaDB ≥ 10.6 prepares a `CREATE PROCEDURE` too; it is deallocated
-/// again) or is refused with ER_UNSUPPORTED_PS (1295, MySQL's answer for every stored-program
-/// CREATE). Every other error refuses the text too, prefixed as this check's.
+/// The check PREPAREs the text: the server parses exactly ONE statement and executes
+/// nothing. Anything after the first statement fails the parse with ER_PARSE_ERROR (1064)
+/// before a single statement runs; one statement either prepares (and is closed again —
+/// MariaDB ≥ 10.6 prepares a `CREATE PROCEDURE` too) or is refused with ER_UNSUPPORTED_PS
+/// (1295, MySQL's answer for every stored-program CREATE). Every other error refuses the
+/// text, prefixed as this check's. Preparing consumes no pending `SET TRANSACTION`
+/// characteristics and commits nothing.
 ///
-/// Three limits refuse a text the server would have run: with `max_prepared_stmt_count`
-/// exhausted or 0 every such text gets 1461 (the message says so); a text whose hex form does
-/// not fit the server's `max_allowed_packet` (one over about half of it) is refused before
-/// it is sent, since an oversized packet would drop the connection; and on
-/// Vitess/PlanetScale — whose vtgate "prepares" DDL without parsing it and splits COM_QUERY
-/// itself — such text is refused outright, since nothing there can confirm it is one
-/// statement.
+/// The text goes through COM_STMT_PREPARE unchanged, so the server's general/audit logs
+/// see it as COM_QUERY's would, with `IDENTIFIED BY` secrets masked — unless it has a
+/// `:name` in it (`mysql_may_hold_named_param`), which mysql_async would rewrite to `?`
+/// before preparing (`lbl:begin` became a false syntax error). Such text is set into
+/// `@__tusk_one_statement` from a hex literal and checked with SQL
+/// `PREPARE __tusk_one_statement FROM …`: the same bytes, lexed in the client charset as
+/// COM_QUERY would (a binary variable is not converted), but the hex form reaches the logs
+/// unmasked, and it must fit `max_allowed_packet` twice over — a larger one is refused
+/// before it is sent, since an oversized packet drops the connection. A check abandoned
+/// midway (its future dropped) can leave that variable or statement on the session.
+///
+/// A connection's answers count only after it has refused `MYSQL_CHECK_CANARY` through
+/// the same mechanism with 1064 (cached per connection): Vitess answers 1105, an older
+/// vtgate "prepares" it, and a proxy that splits or prepares without parsing cannot
+/// vouch for anything, so every such text is refused there. So are SHOW WARNINGS / SHOW
+/// ERRORS / GET DIAGNOSTICS texts holding a `;`: they report on the statement before them,
+/// which any check would replace. With `max_prepared_stmt_count` used up or 0 every such
+/// text gets 1461, and the message says so.
 pub(crate) async fn mysql_server_single_statement(
     conn: &mut mysql_async::Conn,
     sql: &str,
 ) -> Result<(), AppError> {
-    use mysql_async::prelude::Queryable;
     let mut body = sql.trim_end();
     while let Some(rest) = body.strip_suffix(';') {
         body = rest.trim_end();
@@ -3422,64 +3483,196 @@ pub(crate) async fn mysql_server_single_statement(
     if !body.contains(';') || mysql_semicolons_only_quoted(body) {
         return Ok(());
     }
-    let probe = mysql_check_probe(conn).await;
-    if probe.vitess {
+    if mysql_diagnostic_head(body) {
         return Err(AppError::new(format!(
-            "{MYSQL_ONE_STATEMENT}: this server is Vitess (PlanetScale), whose vtgate splits statements itself and cannot vouch that text holding a `;` is one statement, so Tusk does not send it. Run it against the underlying MySQL instead."
+            "{MYSQL_ONE_STATEMENT}: SHOW WARNINGS, SHOW ERRORS and GET DIAGNOSTICS report on the statement before them, and checking this text first would replace that report, so Tusk does not run it. A `;` can only sit in a comment here; remove it."
         )));
     }
-    const SET: &str = "SET @tusk_one_statement = X''";
-    let packet = 1 + SET.len() + 2 * body.len();
-    if let Some(max) = probe.max_packet.filter(|&max| packet > max) {
+    let key = mysql_check_key(conn);
+    let known = mysql_checked_sessions()
+        .get(&key)
+        .copied()
+        .unwrap_or_default();
+    if !mysql_may_hold_named_param(body) {
+        if !known.protocol {
+            mysql_canary(mysql_protocol_prepare(conn, MYSQL_CHECK_CANARY).await)?;
+            mysql_checked_sessions().entry(key).or_default().protocol = true;
+        }
+        return mysql_check_verdict(mysql_protocol_prepare(conn, body).await);
+    }
+    let max = match known.sql {
+        Some(max) => max,
+        None => {
+            mysql_canary(mysql_sql_prepare(conn, MYSQL_CHECK_CANARY).await)?;
+            use mysql_async::prelude::Queryable;
+            let max = conn
+                .query_first::<u64, _>("SELECT @@max_allowed_packet")
+                .await
+                .ok()
+                .flatten()
+                .and_then(|max| usize::try_from(max).ok())
+                .unwrap_or(MYSQL_FALLBACK_MAX_PACKET);
+            mysql_checked_sessions().entry(key).or_default().sql = Some(max);
+            max
+        }
+    };
+    // Command byte + the SET around the hex, and room for query attributes.
+    let packet = 1 + "SET  = X''".len() + MYSQL_CHECK_VAR.len() + 2 * body.len();
+    if packet + 1024 > max {
         return Err(AppError::new(format!(
-            "{MYSQL_ONE_STATEMENT}: the text is too large to check (the check sends it hex-encoded, {packet} bytes, over this server's max_allowed_packet of {max})"
+            "{MYSQL_ONE_STATEMENT}: text with a `:name` in it is checked hex-encoded ({packet} bytes here), which does not fit this server's max_allowed_packet of {max}; raise max_allowed_packet to at least {} and reconnect",
+            packet + 1024
         )));
     }
+    mysql_check_verdict(mysql_sql_prepare(conn, body).await)
+}
+
+/// One COM_STMT_PREPARE of `sql`, closed again if it prepared.
+pub(crate) async fn mysql_protocol_prepare(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+) -> Result<(), mysql_async::Error> {
+    use mysql_async::prelude::Queryable;
+    let stmt = conn.prep(sql).await?;
+    conn.close(stmt).await
+}
+
+/// One SQL `PREPARE` of `sql` from a binary user variable; the statement is deallocated
+/// and the variable cleared again. The first error wins.
+async fn mysql_sql_prepare(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+) -> Result<(), mysql_async::Error> {
+    use mysql_async::prelude::Queryable;
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut hex = String::with_capacity(body.len() * 2);
-    for b in body.bytes() {
+    let mut hex = String::with_capacity(sql.len() * 2);
+    for b in sql.bytes() {
         hex.push(HEX[usize::from(b >> 4)] as char);
         hex.push(HEX[usize::from(b & 15)] as char);
     }
-    let refused = |e: mysql_async::Error| {
-        let hint = match &e {
-            mysql_async::Error::Server(s) if s.code == 1461 => {
-                " (the server's max_prepared_stmt_count is used up or 0; Tusk needs one prepared statement to check text holding a `;`)"
-            }
-            _ => "",
-        };
-        AppError::new(format!("{MYSQL_ONE_STATEMENT}: {}{hint}", de(e).message))
+    conn.query_drop(format!("SET {MYSQL_CHECK_VAR} = X'{hex}'"))
+        .await?;
+    let prepared = conn
+        .query_drop(format!("PREPARE {MYSQL_CHECK_STMT} FROM {MYSQL_CHECK_VAR}"))
+        .await;
+    let deallocated = match prepared {
+        Ok(()) => {
+            conn.query_drop(format!("DEALLOCATE PREPARE {MYSQL_CHECK_STMT}"))
+                .await
+        }
+        Err(_) => Ok(()),
     };
-    conn.query_drop(format!("SET @tusk_one_statement = X'{hex}'"))
-        .await
-        .map_err(refused)?;
-    let verdict = match conn
-        .query_drop("PREPARE tusk_one_statement FROM @tusk_one_statement")
-        .await
-    {
-        Ok(()) => conn
-            .query_drop("DEALLOCATE PREPARE tusk_one_statement")
-            .await
-            .map_err(de),
+    let cleared = conn
+        .query_drop(format!("SET {MYSQL_CHECK_VAR} = NULL"))
+        .await;
+    prepared.and(deallocated).and(cleared)
+}
+
+/// A prepare's answer as the check's verdict: prepared or 1295 is one statement.
+fn mysql_check_verdict(answer: Result<(), mysql_async::Error>) -> Result<(), AppError> {
+    match answer {
+        Ok(()) => Ok(()),
         Err(mysql_async::Error::Server(e)) if e.code == 1295 => Ok(()),
-        Err(e) => Err(refused(e)),
+        Err(e) => Err(mysql_check_refused(e)),
+    }
+}
+
+/// The canary's answer: only MySQL's parse error shows the server parses what it prepares.
+fn mysql_canary(answer: Result<(), mysql_async::Error>) -> Result<(), AppError> {
+    let said = match answer {
+        Err(mysql_async::Error::Server(e)) if e.code == 1064 => return Ok(()),
+        Err(mysql_async::Error::Server(e)) if e.code != 1461 => {
+            format!("answered {} ({})", e.code, e.message)
+        }
+        Ok(()) => "prepared it".to_string(),
+        Err(e) => return Err(mysql_check_refused(e)),
     };
-    let _ = conn.query_drop("SET @tusk_one_statement = NULL").await;
-    verdict
+    Err(AppError::new(format!(
+        "{MYSQL_ONE_STATEMENT}: asked to prepare a test text holding two statements, this server (or a proxy in front of it, such as Vitess or PlanetScale) {said} instead of MySQL's parse error, so it cannot vouch that text holding a `;` is one statement, and Tusk does not send it. Run it against MySQL or MariaDB directly."
+    )))
+}
+
+fn mysql_check_refused(e: mysql_async::Error) -> AppError {
+    let hint = match &e {
+        mysql_async::Error::Server(s) if s.code == 1461 => {
+            " (the server's max_prepared_stmt_count is used up or 0; Tusk needs one prepared statement to check text holding a `;`)"
+        }
+        _ => "",
+    };
+    AppError::new(format!("{MYSQL_ONE_STATEMENT}: {}{hint}", de(e).message))
+}
+
+/// mysql_async would rewrite a `:name` in this text to `?` before a COM_STMT_PREPARE: a
+/// `:` then `a`–`z` or `_` ANYWHERE (mysql_common's parser skips quotes and comments, so
+/// this finds every one it finds, and more).
+fn mysql_may_hold_named_param(sql: &str) -> bool {
+    sql.as_bytes()
+        .windows(2)
+        .any(|w| w[0] == b':' && (w[1].is_ascii_lowercase() || w[1] == b'_'))
+}
+
+/// SHOW WARNINGS / SHOW ERRORS / SHOW COUNT(*) … / GET DIAGNOSTICS, by the text's first
+/// words after whitespace and comments.
+fn mysql_diagnostic_head(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    let mut words: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < b.len() && words.len() < 2 {
+        match b[i] {
+            c if c.is_ascii_whitespace() => i += 1,
+            b'#' => {
+                i = b[i..]
+                    .iter()
+                    .position(|&c| c == b'\n')
+                    .map_or(b.len(), |n| i + n)
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                i = b[i..]
+                    .iter()
+                    .position(|&c| c == b'\n')
+                    .map_or(b.len(), |n| i + n)
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') && b.get(i + 2) != Some(&b'!') => {
+                match sql[i + 2..].find("*/") {
+                    Some(end) => i += 2 + end + 2,
+                    None => return false,
+                }
+            }
+            c if c.is_ascii_alphabetic() => {
+                let start = i;
+                while i < b.len() && b[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                words.push(sql[start..i].to_ascii_lowercase());
+            }
+            _ => break,
+        }
+    }
+    match words.as_slice() {
+        [first, ..] if first == "get" => true,
+        [first, second] if first == "show" => {
+            matches!(second.as_str(), "warnings" | "errors" | "count")
+        }
+        _ => false,
+    }
 }
 
 /// Every `;` in `sql` sits inside quotes, in a text the server cannot lex differently
-/// whatever its `sql_mode` or client character set: no backslash (so `NO_BACKSLASH_ESCAPES`
-/// cannot matter), no comment marker outside quotes, and balanced `'`/`"`/`` ` `` quotes
-/// with doubled-quote escapes. Non-ASCII text is fine with one exception: in a multi-byte
-/// client charset (sjis, gbk, big5, gb18030, …) a byte can only be swallowed into a
-/// character when it directly follows a byte ≥ 0x80, and of the bytes this scan steers by
-/// only `` ` `` (0x60) is ever a valid trail byte — `'`, `"`, `;`, `#`, `-`, `/` and `*` all
-/// sit below 0x40 and outside gb18030's digit range — so a backtick right after a
-/// non-ASCII byte refuses. Anything else is left to the server's check.
-fn mysql_semicolons_only_quoted(sql: &str) -> bool {
+/// whatever its version, `sql_mode` or client character set: no backslash (so
+/// `NO_BACKSLASH_ESCAPES` cannot matter), no `$` (MySQL 9 lexes `$$…$$` / `$tag$…$tag$`
+/// dollar-quoted strings, which can hold a `'`), no `[` (MariaDB's `sql_mode=MSSQL`
+/// bracket identifiers), no NUL, no comment marker outside quotes, and balanced
+/// `'`/`"`/`` ` `` quotes with doubled-quote escapes. Non-ASCII text is fine with one
+/// exception: in a multi-byte client charset (sjis, gbk, big5, gb18030, …) a byte can only
+/// be swallowed into a character when it directly follows a byte ≥ 0x80, and of the bytes
+/// this scan steers by only `` ` `` (0x60) is ever a valid trail byte — `'`, `"`, `;`, `#`,
+/// `-`, `/` and `*` all sit below 0x40 and outside gb18030's digit range — so a backtick
+/// right after a non-ASCII byte refuses. Anything else is left to the server's check.
+pub(crate) fn mysql_semicolons_only_quoted(sql: &str) -> bool {
     let b = sql.as_bytes();
-    if b.contains(&b'\\') || b.windows(2).any(|w| w[0] >= 0x80 && w[1] == b'`') {
+    if b.iter().any(|&c| matches!(c, b'\\' | b'$' | b'[' | 0))
+        || b.windows(2).any(|w| w[0] >= 0x80 && w[1] == b'`')
+    {
         return false;
     }
     let mut i = 0;
@@ -3504,43 +3697,6 @@ fn mysql_semicolons_only_quoted(sql: &str) -> bool {
         i += 1;
     }
     true
-}
-
-/// What the one-statement check needs to know about the server it is about to ask.
-struct MySqlCheckProbe {
-    /// Vitess (PlanetScale) is in front.
-    vitess: bool,
-    /// The session's `max_allowed_packet`, when the server reported it.
-    max_packet: Option<usize>,
-}
-
-/// Vitess is recognised by its version strings or — since Vitess 23 advertises a plain MySQL
-/// version by default — by a system variable only vtgate has.
-async fn mysql_check_probe(conn: &mut mysql_async::Conn) -> MySqlCheckProbe {
-    use mysql_async::prelude::Queryable;
-    let mut probe = MySqlCheckProbe {
-        vitess: false,
-        max_packet: None,
-    };
-    if let Ok(Some((version, comment, max_packet))) = conn
-        .query_first::<(Option<String>, Option<String>, Option<u64>), _>(
-            "SELECT @@version, @@version_comment, @@max_allowed_packet",
-        )
-        .await
-    {
-        let both = format!(
-            "{} {}",
-            version.unwrap_or_default(),
-            comment.unwrap_or_default()
-        )
-        .to_ascii_lowercase();
-        probe.vitess = both.contains("vitess") || both.contains("planetscale");
-        probe.max_packet = max_packet.and_then(|p| usize::try_from(p).ok());
-    }
-    if !probe.vitess {
-        probe.vitess = conn.query_drop("SELECT @@ddl_strategy").await.is_ok();
-    }
-    probe
 }
 
 async fn mysql_page_conn(
@@ -6522,9 +6678,95 @@ mod tests {
             "SELECT 1 -- ;\n",
             "SELECT 1 # ;\n",
             "SELECT 'unterminated;",
+            // MySQL 9 dollar quoting: the server closes `$$` first, so this `;` is live.
+            "SELECT $$ it's $$; DELETE FROM t; SELECT 'x'",
+            "SELECT $js$ ';' $js$",
+            // MariaDB's MSSQL mode reads `[a'b]` as an identifier.
+            "SELECT 1 AS [a'b]; SELECT 2 AS [c'd]",
+            "SELECT 'a;\0'",
         ] {
             assert!(!mysql_semicolons_only_quoted(sql), "{sql}");
         }
+    }
+
+    /// Every `:name` mysql_async's parser would rewrite sends the text down the SQL
+    /// PREPARE path; anything else goes through COM_STMT_PREPARE unchanged.
+    #[test]
+    fn mysql_named_params_pick_the_sql_prepare_path() {
+        for sql in [
+            "CREATE PROCEDURE p() lbl:begin SELECT 1; end lbl",
+            "SELECT ':a;' -- quoted, but still conservative",
+            "SELECT x:_y; SELECT 2",
+            // mysql_common reads the second `:` of `::` as a parameter's start too.
+            "SELECT a::text; SELECT 2",
+        ] {
+            assert!(mysql_may_hold_named_param(sql), "{sql}");
+        }
+        for sql in [
+            "CREATE PROCEDURE p() lbl:BEGIN SELECT 1; END lbl",
+            "SELECT '10:30;', '9:'",
+            "SELECT 1; SELECT ?",
+        ] {
+            assert!(!mysql_may_hold_named_param(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn mysql_diagnostics_are_recognised_by_their_head() {
+        for sql in [
+            "SHOW WARNINGS /* ; */",
+            "  -- note;\nshow errors limit 1",
+            "# x\n/* ; */ SHOW COUNT(*) WARNINGS",
+            "GET DIAGNOSTICS @n = NUMBER /* ; */",
+            "get current diagnostics condition 1 @m = MESSAGE_TEXT",
+        ] {
+            assert!(mysql_diagnostic_head(sql), "{sql}");
+        }
+        for sql in [
+            "SHOW TABLES /* ; */",
+            "SELECT 'SHOW WARNINGS;'",
+            "/*! SHOW WARNINGS */",
+            "/* unterminated SHOW WARNINGS",
+        ] {
+            assert!(!mysql_diagnostic_head(sql), "{sql}");
+        }
+    }
+
+    /// Only MySQL's parse error makes a connection's answers count; a proxy that prepares
+    /// the canary, or answers anything else (Vitess: 1105), is refused, and 1461 keeps its
+    /// hint. A prepared statement or 1295 is one statement; anything else refuses.
+    #[test]
+    fn mysql_canary_and_verdict_answers() {
+        let server = |code: u16, message: &str| {
+            Err(mysql_async::Error::Server(mysql_async::ServerError {
+                code,
+                message: message.into(),
+                state: "HY000".into(),
+            }))
+        };
+        assert!(mysql_canary(server(1064, "syntax")).is_ok());
+        let prepared = mysql_canary(Ok(())).unwrap_err().message;
+        assert!(
+            prepared.contains("prepared it") && prepared.contains("Vitess"),
+            "{prepared}"
+        );
+        let vitess = mysql_canary(server(1105, "unknown error: <nil>"))
+            .unwrap_err()
+            .message;
+        assert!(vitess.contains("answered 1105"), "{vitess}");
+        let full = mysql_canary(server(1461, "Can't create more"))
+            .unwrap_err()
+            .message;
+        assert!(full.contains("max_prepared_stmt_count"), "{full}");
+        assert!(mysql_check_verdict(Ok(())).is_ok());
+        assert!(mysql_check_verdict(server(1295, "not supported")).is_ok());
+        let refused = mysql_check_verdict(server(1064, "syntax"))
+            .unwrap_err()
+            .message;
+        assert!(
+            refused.starts_with("the server could not confirm this is one statement: "),
+            "{refused}"
+        );
     }
 
     #[test]
