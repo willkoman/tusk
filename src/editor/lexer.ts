@@ -1,7 +1,9 @@
 // Byte-faithful TS port of the backend lexer in `src-tauri/src/script.rs`
 // (`split_impl` / `dollar_tag_end`), including its per-engine branches: MySQL
 // `#` comments and whitespace-required `--`, MySQL backslash escapes inside
-// quotes, and MySQL/SQLite backtick identifiers. One O(n) pass classifies every
+// quotes, MySQL/SQLite backtick identifiers, and the statement blocks that keep a
+// T-SQL batch, a SQLite trigger or a MySQL stored program whole across its own `;`
+// terminators (`block_depth` there, `blockDepth` here). One O(n) pass classifies every
 // region of the doc as code / string / quoted-identifier / comment / dollar body
 // and yields semicolon-delimited statement spans. Everything downstream
 // (auto-fold, the heuristic + schema linters, the statement gutter, param
@@ -163,6 +165,114 @@ function sqliteTriggerHead(words: string[]): boolean {
   return false;
 }
 
+const MYSQL_PROGRAM_KINDS = new Set(["procedure", "function", "trigger", "event"]);
+
+/**
+ * The head words spell `CREATE [OR REPLACE] [DEFINER = user] [AGGREGATE]
+ * {PROCEDURE|FUNCTION|TRIGGER|EVENT}`: a MySQL stored program. `null` while the words
+ * seen so far could still become that head. Mirrors `script.rs::mysql_program_head`.
+ */
+function mysqlProgramHead(words: string[]): boolean | null {
+  let i = 0;
+  if (i >= words.length) return null;
+  if (words[i] !== "create") return false;
+  i = 1;
+  if (i >= words.length) return null;
+  if (words[i] === "or") {
+    if (i + 1 >= words.length) return null;
+    if (words[i + 1] !== "replace") return false;
+    i += 2;
+  }
+  if (i >= words.length) return null;
+  if (words[i] === "definer") {
+    i++;
+    // `CURRENT_USER` or an unquoted `user@host`: at most two bare words.
+    for (let k = 0; k < 2; k++) {
+      if (i >= words.length) return null;
+      if (MYSQL_PROGRAM_KINDS.has(words[i]) || words[i] === "aggregate") break;
+      i++;
+    }
+  }
+  if (i >= words.length) return null;
+  if (words[i] === "aggregate") i++;
+  if (i >= words.length) return null;
+  return MYSQL_PROGRAM_KINDS.has(words[i]);
+}
+
+// Same word lists as script.rs (`MYSQL_IDENT_PREV`, `MYSQL_END_IDENT_PREV`,
+// `MYSQL_EXPR_FOLLOW`, `MYSQL_IDENT_PUNCT`). MySQL does not reserve BEGIN/END, so a
+// stored-program body reads each one from the token before it (and, for BEGIN, after).
+const MYSQL_IDENT_PREV = new Set([
+  "select", "set", "where", "and", "or", "xor", "not", "on", "by", "when", "in", "out", "inout",
+  "declare", "into", "return", "is", "like", "between", "having", "distinct", "as", "using", "div",
+  "mod", "interval", "case", "if", "elseif", "while", "until", "from", "join", "update", "table",
+  "call", "procedure", "function", "trigger", "event", "all", "any", "some", "regexp", "rlike",
+  "exists",
+]);
+const MYSQL_END_IDENT_PREV = new Set(["then", "else", "do", "loop", "repeat"]);
+const MYSQL_EXPR_FOLLOW = new Set([
+  "from", "as", "is", "in", "and", "or", "xor", "div", "mod", "like", "between", "regexp", "rlike",
+  "sounds", "collate", "desc", "asc", "then", "else", "when", "where", "into", "order", "group",
+  "limit", "having", "union", "on", "using", "join", "inner", "left", "right", "cross",
+]);
+// END IF / END LOOP / END WHILE / END REPEAT, and MariaDB's END FOR: never counted.
+const MYSQL_NEUTRAL_END = new Set(["if", "loop", "while", "repeat", "for"]);
+const MYSQL_IDENT_PUNCT = "(,.=<>!+-*/%|&^~@";
+
+/** MySQL unquoted-identifier character: may lead with a digit or a non-ASCII char. */
+function isMyWord(cc: number): boolean {
+  return isWord(cc) || cc >= 0x80;
+}
+/** Rust's `u8::is_ascii_whitespace` (no vertical tab, unlike `\s`). */
+function isAsciiWs(cc: number): boolean {
+  return cc === SPACE || cc === TAB || cc === NL || cc === 12 || cc === CR;
+}
+/** ASCII-only lowercase, like Rust's `to_ascii_lowercase`. */
+function asciiLower(s: string): string {
+  return s.replace(/[A-Z]+/g, (m) => m.toLowerCase());
+}
+
+/**
+ * The first char code of the next code token at or after `i` (-1 at the end) and, when
+ * that token is a word, the word (ASCII-lowercased) — skipping whitespace and MySQL
+ * comments. Mirrors `script.rs::mysql_peek`.
+ */
+function mysqlPeek(doc: string, i: number): { next: number; word: string } {
+  const n = doc.length;
+  for (;;) {
+    while (i < n && isAsciiWs(doc.charCodeAt(i))) i++;
+    const dash =
+      i + 1 < n && doc.charCodeAt(i) === DASH && doc.charCodeAt(i + 1) === DASH &&
+      (i + 2 === n || isSpaceOrControl(doc.charCodeAt(i + 2)));
+    if (dash || (i < n && doc.charCodeAt(i) === HASH)) {
+      while (i < n && doc.charCodeAt(i) !== NL) i++;
+      continue;
+    }
+    if (i + 1 < n && doc.charCodeAt(i) === SLASH && doc.charCodeAt(i + 1) === STAR) {
+      const end = blockCommentEnd(doc, i, false);
+      if (end < 0) return { next: -1, word: "" };
+      i = end;
+      continue;
+    }
+    break;
+  }
+  if (i >= n) return { next: -1, word: "" };
+  const start = i;
+  while (i < n && isMyWord(doc.charCodeAt(i))) i++;
+  return { next: doc.charCodeAt(start), word: asciiLower(doc.slice(start, i)) };
+}
+
+/**
+ * Whether the previous token makes a following BEGIN/END an operand or a name. `prev`
+ * is "" for a value (string, quoted name, BEGIN/END read as a name), a single non-word
+ * character for punctuation, or a lowercased word.
+ */
+function mysqlIdentContext(prev: string, end: boolean): boolean {
+  if (prev === "") return false;
+  if (prev.length === 1 && !isMyWord(prev.charCodeAt(0))) return MYSQL_IDENT_PUNCT.includes(prev);
+  return MYSQL_IDENT_PREV.has(prev) || (end && MYSQL_END_IDENT_PREV.has(prev));
+}
+
 export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine): LexResult {
   const n = doc.length;
   const spans: Span[] = [];
@@ -178,12 +288,40 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
   // `CASE … END`). A `;` inside a block is not a statement boundary — T-SQL has no
   // dollar quoting, so without this a procedure body is shredded into fragments.
   // `BEGIN TRAN[SACTION]` / `BEGIN DISTRIBUTED TRAN` open a transaction, not a block.
-  // SQLite shares the counter for `CREATE TRIGGER … BEGIN … END` bodies.
+  // SQLite shares the counter for `CREATE TRIGGER … BEGIN … END` bodies, and MySQL
+  // for stored-program bodies (`CREATE PROCEDURE|FUNCTION|TRIGGER|EVENT`).
   let blockDepth = 0;
-  // First code words of the statement being scanned (SQLite only, capped) and
-  // whether they opened a trigger body.
+  // First code words of the statement being scanned (SQLite/MySQL only, capped) and
+  // whether they opened a trigger body (SQLite) or a stored program (MySQL; `null`
+  // while undecided).
   let head: string[] = [];
   let inTrigger = false;
+  let mysqlHead: boolean | null = null;
+  // The token before the current one in a MySQL stored-program body (see
+  // `mysqlIdentContext` for the encoding).
+  let myPrev = "";
+
+  // One word of a MySQL stored-program body. Mirrors `script.rs::mysql_body_word`:
+  // BEGIN … END and CASE … END [CASE] are counted; IF/LOOP/WHILE/REPEAT/FOR are not,
+  // so their END IF/END LOOP/… closers leave the depth alone.
+  const mysqlBodyWord = (word: string, end: number): string => {
+    if (word === "begin") {
+      const { next, word: nextWord } = mysqlPeek(doc, end);
+      const opens =
+        !mysqlIdentContext(myPrev, false) &&
+        (next < 0 ||
+          ((isAlphaOrUnderscore(next) || next === BTICK || next >= 0x80) && !MYSQL_EXPR_FOLLOW.has(nextWord)));
+      if (!opens) return "";
+      blockDepth++;
+    } else if (word === "end") {
+      if (mysqlIdentContext(myPrev, true)) return "";
+      if (!MYSQL_NEUTRAL_END.has(mysqlPeek(doc, end).word)) blockDepth = Math.max(0, blockDepth - 1);
+    } else if (word === "case") {
+      // CASE is reserved: always the keyword, except as the tail of `END CASE`.
+      if (myPrev !== "end") blockDepth++;
+    }
+    return word;
+  };
 
   const pushCode = (to: number) => {
     if (to > codeStart) spans.push({ from: codeStart, to, kind: "code" });
@@ -216,6 +354,7 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
     }
     spans.push({ from: start, to: i, kind });
     codeStart = i;
+    myPrev = "";
   };
 
   while (i < n) {
@@ -334,9 +473,11 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
         }
         spans.push({ from: start, to: i, kind: "dollar" });
         codeStart = i;
+        myPrev = "";
         continue;
       }
       i++;
+      myPrev = "$";
       continue;
     }
     // T-SQL statement blocks. Consumed as whole words so `BEGIN`/`END`/`CASE` inside
@@ -369,6 +510,22 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
       }
       continue;
     }
+    // MySQL stored-program bodies. Whole words, so END inside an identifier, a string,
+    // a backtick name or a comment never counts; a word may lead with a digit or a
+    // non-ASCII char there.
+    if (mysql && isMyWord(cc)) {
+      const start = i;
+      while (i < n && isMyWord(doc.charCodeAt(i))) i++;
+      const word = asciiLower(doc.slice(start, i));
+      if (mysqlHead === null) {
+        head.push(word);
+        mysqlHead = mysqlProgramHead(head);
+        myPrev = word;
+      } else if (mysqlHead) {
+        myPrev = mysqlBodyWord(word, i);
+      }
+      continue;
+    }
     // statement terminator (inside a T-SQL block it is part of the statement)
     if (cc === SEMI && blockDepth === 0) {
       i++;
@@ -378,9 +535,11 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
       stmtStart = i;
       head = [];
       inTrigger = false;
+      mysqlHead = null;
       continue;
     }
 
+    if (mysql && !isAsciiWs(cc)) myPrev = doc[i];
     i++;
   }
 

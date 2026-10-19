@@ -15,6 +15,7 @@
 //! CREATE SEQUENCE
 //! CREATE TABLE (+ indexes, comments)   -- PG/MySQL/SQL Server: FOREIGN KEYs held back
 //! <data>                       -- PG: COPY … FROM stdin blocks; others: INSERTs
+//! CREATE PROCEDURE / FUNCTION  -- MySQL: SHOW CREATE text, before the views that call it
 //! CREATE VIEW / MATERIALIZED VIEW
 //! CREATE FUNCTION / CREATE TRIGGER        -- PostgreSQL only
 //! ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY  -- PG/MySQL/SQL Server, after all data
@@ -643,6 +644,9 @@ async fn backup_inner(
     let mut tables: Vec<Rel> = Vec::new();
     let mut views: Vec<Rel> = Vec::new();
     let mut functions: Vec<(String, String)> = Vec::new();
+    // MySQL keeps procedures and functions in separate namespaces (one name can be
+    // both), so the drops need each routine's own type: (schema, name, returns).
+    let mut routine_types: Vec<(String, String, String)> = Vec::new();
     let mut schema_names: Vec<String> = Vec::new();
     for schema in &tree.schemas {
         if !wanted_schema(&schema.name) {
@@ -672,6 +676,9 @@ async fn backup_inner(
         for f in &schema.functions {
             if seen_fn.insert(f.name.as_str()) {
                 functions.push((schema.name.clone(), f.name.clone()));
+            }
+            if is_mysql {
+                routine_types.push((schema.name.clone(), f.name.clone(), f.returns.clone()));
             }
         }
     }
@@ -860,6 +867,18 @@ async fn backup_inner(
                     "DROP {kw} IF EXISTS {}{}",
                     qual(&v.schema, &v.name, dialect, caps.schemas),
                     if is_pg { " CASCADE" } else { "" }
+                ))
+                .await?;
+            }
+            for (schema, name, returns) in &routine_types {
+                let kw = if returns == "procedure" {
+                    "PROCEDURE"
+                } else {
+                    "FUNCTION"
+                };
+                out.stmt(&format!(
+                    "DROP {kw} IF EXISTS {}",
+                    qual(schema, name, dialect, caps.schemas)
                 ))
                 .await?;
             }
@@ -1059,6 +1078,26 @@ async fn backup_inner(
     }
 
     if opts.wants_schema() {
+        // MySQL routines go BEFORE the views: creating a view that calls a stored
+        // function fails while the function is missing, whereas creating a routine never
+        // resolves the objects its body names. `SHOW CREATE` returns each body as one
+        // statement with its own `;` inside — `script` keeps it whole on restore.
+        if is_mysql && !functions.is_empty() {
+            out.put("-- routines\n").await?;
+            for (schema, name) in &functions {
+                cancelled(cancel)?;
+                match backend.relation_ddl("function", schema, name).await {
+                    Ok(ddl) => {
+                        out.stmt(&ddl).await?;
+                        objects += 1;
+                    }
+                    Err(e) => warnings.push(format!(
+                        "routine {schema}.{name}: {}",
+                        comment_safe(&e.message)
+                    )),
+                }
+            }
+        }
         if !views.is_empty() {
             out.put("-- views\n").await?;
             for v in &views {
@@ -1077,10 +1116,10 @@ async fn backup_inner(
                 }
             }
         }
-        // Routine and trigger reconstruction is PostgreSQL-only (`ddl.rs` /
-        // `tree.rs`). Say so in the dump rather than letting a silently partial file
-        // look complete.
-        if !is_pg && !functions.is_empty() {
+        // Routines are reconstructed on PostgreSQL (`ddl.rs`) and MySQL (`SHOW CREATE`,
+        // above); triggers on PostgreSQL only. Say so in the dump rather than letting a
+        // silently partial file look complete.
+        if !is_pg && !is_mysql && !functions.is_empty() {
             warnings.push(format!(
                 "{} functions/procedures are not reconstructed — {} routine(s) in this \
                  selection are NOT in the dump; recreate them by hand",
@@ -1090,8 +1129,12 @@ async fn backup_inner(
         }
         if !is_pg {
             warnings.push(format!(
-                "triggers are not reconstructed on {} — any trigger in this selection is \
-                 NOT in the dump",
+                "{} are not reconstructed on {} — any in this selection are NOT in the dump",
+                if is_mysql {
+                    "triggers and events"
+                } else {
+                    "triggers"
+                },
                 caps.kind
             ));
         }

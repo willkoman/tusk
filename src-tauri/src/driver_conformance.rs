@@ -4109,7 +4109,8 @@ async fn mysql_routines_listed_and_defined() {
         .relation_ddl("function", "test", "tusk_p")
         .await
         .expect("procedure ddl");
-    assert!(p.contains("PROCEDURE `tusk_p`"), "{p}");
+    // Qualified with the schema it came from, so it replays from any default database.
+    assert!(p.contains("PROCEDURE `test`.`tusk_p`"), "{p}");
     assert!(p.contains("SELECT n + 1"), "{p}");
     assert!(!p.contains("FUNCTION"), "{p}");
     let f = b
@@ -4117,7 +4118,7 @@ async fn mysql_routines_listed_and_defined() {
         .await
         .expect("function ddl");
     assert!(
-        f.contains("FUNCTION `tusk_f`") && f.contains("RETURN x * 2"),
+        f.contains("FUNCTION `test`.`tusk_f`") && f.contains("RETURN x * 2"),
         "{f}"
     );
     let both = b
@@ -4125,8 +4126,10 @@ async fn mysql_routines_listed_and_defined() {
         .await
         .expect("both ddl");
     let (pi, fi) = (
-        both.find("PROCEDURE `tusk_both`").expect("procedure part"),
-        both.find("FUNCTION `tusk_both`").expect("function part"),
+        both.find("PROCEDURE `test`.`tusk_both`")
+            .expect("procedure part"),
+        both.find("FUNCTION `test`.`tusk_both`")
+            .expect("function part"),
     );
     assert!(pi < fi, "procedure first: {both}");
     let only_proc = b
@@ -4155,4 +4158,186 @@ async fn mysql_routines_listed_and_defined() {
     ] {
         exec(&mut b, sql).await;
     }
+}
+
+/// Compound stored programs — `BEGIN … END` bodies with their own `;` — run as ONE
+/// statement through the command path (planner + `run_script` for a script,
+/// `run_single` for one statement), come back from `relation_ddl` as one statement, and
+/// replay after a drop. A backup carries them and restores them into their own
+/// database. The body also uses a column named `end`: BEGIN/END are not reserved in
+/// MySQL, and the lexer has to agree with the server about which END closes the body.
+#[tokio::test]
+async fn mysql_compound_routines_run_replay_and_restore() {
+    let Some(cfg) = mysql_cfg() else {
+        eprintln!("SKIP mysql_compound_routines_run_replay_and_restore (set TUSK_TEST_MYSQL_PORT)");
+        return;
+    };
+    let mysql = TransactionEngine::MySql;
+    let items = |sql: &str| crate::script::parse_for_engine(sql, mysql).unwrap();
+    let mut c = state(&cfg, false).await;
+
+    // One script: drops, a table, a procedure, a function and a trigger, all compound.
+    let setup = "DROP TRIGGER IF EXISTS `test`.`tusk_cmp_t`;
+DROP PROCEDURE IF EXISTS `test`.`tusk_cmp_p`;
+DROP FUNCTION IF EXISTS `test`.`tusk_cmp_f`;
+DROP TABLE IF EXISTS `test`.`tusk_cmp_log`;
+CREATE TABLE `test`.`tusk_cmp_log` (id INT AUTO_INCREMENT PRIMARY KEY, n INT, `end` INT);
+CREATE PROCEDURE `test`.`tusk_cmp_p`(IN cnt INT)
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  fill: LOOP
+    SET i = i + 1;
+    IF i > cnt THEN LEAVE fill; END IF;
+    INSERT INTO tusk_cmp_log (n) VALUES (CASE WHEN i % 2 = 0 THEN -i ELSE i END);
+  END LOOP fill;
+  UPDATE tusk_cmp_log SET end = n WHERE end IS NULL;
+END;
+CREATE FUNCTION `test`.`tusk_cmp_f`(x INT) RETURNS INT DETERMINISTIC
+BEGIN
+  DECLARE acc INT DEFAULT 0;
+  WHILE x > 0 DO SET acc = acc + x; SET x = x - 1; END WHILE;
+  RETURN CASE WHEN acc > 100 THEN 100 ELSE acc END;
+END;
+CREATE TRIGGER `test`.`tusk_cmp_t` BEFORE INSERT ON `test`.`tusk_cmp_log` FOR EACH ROW
+BEGIN
+  IF NEW.n < 0 THEN SET NEW.n = 0; END IF;
+END;";
+    let script = items(setup);
+    assert_eq!(script.len(), 8, "one item per statement");
+    command_exec(&mut c, &script)
+        .await
+        .unwrap_or_else(|e| panic!("compound script: {}", e.message));
+
+    // A single compound statement takes the run_single path.
+    command_exec(&mut c, &items("CALL `test`.`tusk_cmp_p`(4)"))
+        .await
+        .unwrap_or_else(|e| panic!("call: {}", e.message));
+    let b = &mut c.backend;
+    let rows = all(b, "SELECT n, `end` FROM `test`.`tusk_cmp_log` ORDER BY id").await;
+    let got: Vec<(Option<String>, Option<String>)> =
+        rows.iter().map(|r| (cell(r, 0), cell(r, 1))).collect();
+    let want = |n: &str| (Some(n.to_string()), Some(n.to_string()));
+    assert_eq!(got, vec![want("1"), want("0"), want("3"), want("0")]);
+    let rows = all(b, "SELECT `test`.`tusk_cmp_f`(4), `test`.`tusk_cmp_f`(20)").await;
+    assert_eq!(
+        (cell(&rows[0], 0), cell(&rows[0], 1)),
+        (Some("10".into()), Some("100".into()))
+    );
+
+    // Read back as one statement and replay after a drop, through the planner again.
+    let p = b
+        .relation_ddl("function", "test", "tusk_cmp_p")
+        .await
+        .expect("procedure ddl");
+    assert!(
+        p.contains("PROCEDURE `test`.`tusk_cmp_p`") && p.contains("END LOOP fill"),
+        "{p}"
+    );
+    assert_eq!(items(&p).len(), 1, "{p}");
+    let f = b
+        .relation_ddl("function", "test", "tusk_cmp_f")
+        .await
+        .expect("function ddl");
+    assert_eq!(items(&f).len(), 1, "{f}");
+    exec(b, "DROP PROCEDURE `test`.`tusk_cmp_p`").await;
+    exec(b, "DROP FUNCTION `test`.`tusk_cmp_f`").await;
+    command_exec(&mut c, &items(&p))
+        .await
+        .unwrap_or_else(|e| panic!("replay procedure: {}", e.message));
+    let b = &mut c.backend;
+    exec(b, &f).await;
+    exec(b, "CALL `test`.`tusk_cmp_p`(2)").await;
+    let rows = all(b, "SELECT COUNT(*), SUM(n) FROM `test`.`tusk_cmp_log`").await;
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("6"));
+    let rows = all(b, "SELECT `test`.`tusk_cmp_f`(3)").await;
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("6"));
+    for sql in [
+        "DROP TRIGGER `test`.`tusk_cmp_t`",
+        "DROP PROCEDURE `test`.`tusk_cmp_p`",
+        "DROP FUNCTION `test`.`tusk_cmp_f`",
+        "DROP TABLE `test`.`tusk_cmp_log`",
+    ] {
+        exec(b, sql).await;
+    }
+
+    // A schema backup carries compound routines (before any view that might call them)
+    // and restores them into THEIR database, not the session's default one.
+    for sql in [
+        "DROP DATABASE IF EXISTS `tusk_bk_routines`",
+        "CREATE DATABASE `tusk_bk_routines`",
+        "CREATE FUNCTION `tusk_bk_routines`.`tusk_bk_f`(x INT) RETURNS INT DETERMINISTIC BEGIN DECLARE y INT DEFAULT 0; SET y = x * 3; RETURN y; END",
+        "CREATE PROCEDURE `tusk_bk_routines`.`tusk_bk_p`() BEGIN DECLARE z INT; SET z = 1; SELECT z; END",
+    ] {
+        exec(b, sql).await;
+    }
+    let options = crate::backup::BackupOptions {
+        scope: "schemas".into(),
+        schemas: vec!["tusk_bk_routines".into()],
+        tables: Vec::new(),
+        content: "all".into(),
+        include_drop: true,
+        single_transaction: false,
+    };
+    let path =
+        std::env::temp_dir().join(format!("tusk_backup_routines_{}.sql", std::process::id()));
+    let pth = path.to_string_lossy().to_string();
+    let flag = std::sync::atomic::AtomicBool::new(false);
+    let summary = crate::backup::run_backup(b, "conformance", &options, &pth, &flag, &mut |_| {})
+        .await
+        .unwrap_or_else(|e| panic!("backup: {}", e.message));
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !summary
+            .warnings
+            .iter()
+            .any(|w| w.contains("functions/procedures")),
+        "{:?}",
+        summary.warnings
+    );
+    assert!(
+        text.contains("DROP FUNCTION IF EXISTS `tusk_bk_routines`.`tusk_bk_f`")
+            && text.contains("FUNCTION `tusk_bk_routines`.`tusk_bk_f`(")
+            && text.contains("PROCEDURE `tusk_bk_routines`.`tusk_bk_p`()"),
+        "{text}"
+    );
+    exec(b, "DROP FUNCTION `tusk_bk_routines`.`tusk_bk_f`").await;
+    exec(b, "DROP PROCEDURE `tusk_bk_routines`.`tusk_bk_p`").await;
+    let restored = crate::backup::run_restore(
+        b,
+        mysql,
+        &pth,
+        &crate::backup::RestoreOptions {
+            stop_on_error: true,
+            single_transaction: false,
+        },
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut |_| {},
+    )
+    .await
+    .unwrap_or_else(|e| panic!("restore: {}", e.message));
+    assert_eq!(
+        restored.statements_failed, 0,
+        "restore errors: {:?}\n{text}",
+        restored.first_error
+    );
+    let rows = all(b, "SELECT `tusk_bk_routines`.`tusk_bk_f`(5)").await;
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("15"));
+    let rows = all(
+        b,
+        "SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema = 'tusk_bk_routines'",
+    )
+    .await;
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("2"));
+    let rows = all(
+        b,
+        "SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema = 'test' AND routine_name LIKE 'tusk_bk_%'",
+    )
+    .await;
+    assert_eq!(
+        cell(&rows[0], 0).as_deref(),
+        Some("0"),
+        "nothing restored into the default database"
+    );
+    exec(b, "DROP DATABASE `tusk_bk_routines`").await;
+    let _ = std::fs::remove_file(&path);
 }

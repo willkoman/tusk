@@ -191,6 +191,224 @@ fn sqlite_trigger_head(words: &[String]) -> bool {
     false
 }
 
+const MYSQL_PROGRAM_KINDS: [&str; 4] = ["procedure", "function", "trigger", "event"];
+
+/// The head words of a statement spell
+/// `CREATE [OR REPLACE] [DEFINER = user] [AGGREGATE] {PROCEDURE|FUNCTION|TRIGGER|EVENT}`:
+/// a MySQL stored program, whose `BEGIN … END` body carries its own `;` terminators.
+/// `None` while the words seen so far could still become that head, so the caller
+/// keeps collecting; `Some(_)` once it is decided. Only this shape counts blocks —
+/// everywhere else MySQL `BEGIN` starts a transaction.
+fn mysql_program_head(words: &[String]) -> Option<bool> {
+    let at = |i: usize| words.get(i).map(String::as_str);
+    if at(0)? != "create" {
+        return Some(false);
+    }
+    let mut i = 1;
+    if at(i)? == "or" {
+        if at(i + 1)? != "replace" {
+            return Some(false);
+        }
+        i += 2;
+    }
+    if at(i)? == "definer" {
+        i += 1;
+        // `CURRENT_USER` or an unquoted `user@host`: at most two bare words. Quoted
+        // parts are strings or identifiers and never reach the word list.
+        for _ in 0..2 {
+            let w = at(i)?;
+            if MYSQL_PROGRAM_KINDS.contains(&w) || w == "aggregate" {
+                break;
+            }
+            i += 1;
+        }
+    }
+    if at(i)? == "aggregate" {
+        i += 1;
+    }
+    Some(MYSQL_PROGRAM_KINDS.contains(&at(i)?))
+}
+
+/// The last code token before the current one inside a MySQL stored-program body.
+/// `BEGIN` and `END` are NOT reserved in MySQL — a column, variable or parameter may be
+/// called `end` — so whether one is a block keyword depends on what precedes it.
+#[derive(Clone, Copy)]
+enum MyPrev {
+    /// A string, a quoted identifier, or a `BEGIN`/`END` read as an identifier.
+    Value,
+    Punct(u8),
+    /// A bare word, as a byte range of the script.
+    Word(usize, usize),
+}
+
+/// Words after which a `BEGIN`/`END` is an operand or a name, not a block keyword.
+const MYSQL_IDENT_PREV: [&str; 46] = [
+    "select",
+    "set",
+    "where",
+    "and",
+    "or",
+    "xor",
+    "not",
+    "on",
+    "by",
+    "when",
+    "in",
+    "out",
+    "inout",
+    "declare",
+    "into",
+    "return",
+    "is",
+    "like",
+    "between",
+    "having",
+    "distinct",
+    "as",
+    "using",
+    "div",
+    "mod",
+    "interval",
+    "case",
+    "if",
+    "elseif",
+    "while",
+    "until",
+    "from",
+    "join",
+    "update",
+    "table",
+    "call",
+    "procedure",
+    "function",
+    "trigger",
+    "event",
+    "all",
+    "any",
+    "some",
+    "regexp",
+    "rlike",
+    "exists",
+];
+/// `THEN END` / `ELSE END` / `DO END` / `LOOP END` / `REPEAT END` are never closers (a
+/// statement list cannot be empty), while `THEN BEGIN` / `DO BEGIN` do open blocks.
+const MYSQL_END_IDENT_PREV: [&str; 5] = ["then", "else", "do", "loop", "repeat"];
+/// Words that continue an expression: a `BEGIN` followed by one is a name.
+const MYSQL_EXPR_FOLLOW: [&str; 34] = [
+    "from", "as", "is", "in", "and", "or", "xor", "div", "mod", "like", "between", "regexp",
+    "rlike", "sounds", "collate", "desc", "asc", "then", "else", "when", "where", "into", "order",
+    "group", "limit", "having", "union", "on", "using", "join", "inner", "left", "right", "cross",
+];
+/// Punctuation after which a `BEGIN`/`END` is an operand (`t.end`, `@end`, `= end`).
+const MYSQL_IDENT_PUNCT: &[u8] = b"(,.=<>!+-*/%|&^~@";
+
+fn mysql_word_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80
+}
+
+fn word_is(word: &[u8], keywords: &[&str]) -> bool {
+    keywords
+        .iter()
+        .any(|k| word.eq_ignore_ascii_case(k.as_bytes()))
+}
+
+/// The first byte of the next code token at or after `i` and, when that token is a word,
+/// the word — skipping whitespace and MySQL comments (`-- `, `#`, `/* */`).
+fn mysql_peek(b: &[u8], mut i: usize) -> (Option<u8>, &[u8]) {
+    let n = b.len();
+    loop {
+        while i < n && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let dash_comment = i + 1 < n
+            && b[i] == b'-'
+            && b[i + 1] == b'-'
+            && (i + 2 == n || b[i + 2].is_ascii_whitespace() || b[i + 2].is_ascii_control());
+        if dash_comment || (i < n && b[i] == b'#') {
+            while i < n && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if i + 1 < n && b[i] == b'/' && b[i + 1] == b'*' {
+            match block_comment_end_at(b, i, false) {
+                Some(end) => {
+                    i = end;
+                    continue;
+                }
+                None => return (None, &[]),
+            }
+        }
+        break;
+    }
+    if i >= n {
+        return (None, &[]);
+    }
+    let start = i;
+    while i < n && mysql_word_byte(b[i]) {
+        i += 1;
+    }
+    (Some(b[start]), &b[start..i])
+}
+
+/// Whether `prev` makes a following `BEGIN`/`END` an operand or a name.
+fn mysql_ident_context(b: &[u8], prev: MyPrev, end: bool) -> bool {
+    match prev {
+        MyPrev::Value => false,
+        MyPrev::Punct(c) => MYSQL_IDENT_PUNCT.contains(&c),
+        MyPrev::Word(s, e) => {
+            word_is(&b[s..e], &MYSQL_IDENT_PREV)
+                || (end && word_is(&b[s..e], &MYSQL_END_IDENT_PREV))
+        }
+    }
+}
+
+/// Closers of the blocks that are never counted: `END IF`, `END LOOP`, `END WHILE`,
+/// `END REPEAT`, and MariaDB's `END FOR`.
+const MYSQL_NEUTRAL_END: [&str; 5] = ["if", "loop", "while", "repeat", "for"];
+
+/// One word of a MySQL stored-program body: adjusts the block depth and returns the
+/// token it leaves behind. `BEGIN … END` and `CASE … END [CASE]` are counted;
+/// `IF`/`LOOP`/`WHILE`/`REPEAT`/`FOR` are not (`IF(` is also a function and `IF EXISTS`
+/// a DDL clause), so their `END IF`/`END LOOP`/… closers leave the depth alone.
+fn mysql_body_word(b: &[u8], start: usize, end: usize, prev: MyPrev, depth: &mut usize) -> MyPrev {
+    let word = &b[start..end];
+    if word.eq_ignore_ascii_case(b"begin") {
+        // A block BEGIN is followed by a statement, a label or END.
+        let (next, next_word) = mysql_peek(b, end);
+        let opens = !mysql_ident_context(b, prev, false)
+            && match next {
+                None => true,
+                Some(c) => {
+                    (c.is_ascii_alphabetic() || c == b'_' || c == b'`' || c >= 0x80)
+                        && !word_is(next_word, &MYSQL_EXPR_FOLLOW)
+                }
+            };
+        if !opens {
+            return MyPrev::Value;
+        }
+        *depth += 1;
+    } else if word.eq_ignore_ascii_case(b"end") {
+        // A block's END follows the `;` of its last statement (or its own BEGIN); a
+        // CASE expression's follows a value. After an operator or a clause keyword it
+        // is a name.
+        if mysql_ident_context(b, prev, true) {
+            return MyPrev::Value;
+        }
+        let (_, next_word) = mysql_peek(b, end);
+        if !word_is(next_word, &MYSQL_NEUTRAL_END) {
+            *depth = depth.saturating_sub(1);
+        }
+    } else if word.eq_ignore_ascii_case(b"case") {
+        // CASE is reserved, so it is always the keyword — except as `END CASE`.
+        let closing = matches!(prev, MyPrev::Word(s, e) if b[s..e].eq_ignore_ascii_case(b"end"));
+        if !closing {
+            *depth += 1;
+        }
+    }
+    MyPrev::Word(start, end)
+}
+
 fn split_core(
     script: &str,
     checked: bool,
@@ -211,11 +429,18 @@ fn split_core(
     // otherwise shred a replayed trigger and leave a bare `END` that
     // `transaction_action` reads as COMMIT — which is exactly how the table-rebuild
     // path failed on any table carrying a trigger.
+    //
+    // MySQL uses it for stored programs (`CREATE PROCEDURE|FUNCTION|TRIGGER|EVENT`),
+    // whose compound bodies are just as unquoted. There `BEGIN`/`END` are not reserved,
+    // so `mysql_body_word` decides each one from the token before it.
     let mut block_depth = 0usize;
-    // First code words of the statement being accumulated (SQLite only, capped),
-    // and whether they opened a trigger.
+    // First code words of the statement being accumulated (SQLite: up to five; MySQL:
+    // until the head is decided), and whether they opened a trigger (SQLite) or a
+    // stored program (MySQL; `None` while undecided).
     let mut head: Vec<String> = Vec::new();
     let mut in_trigger = false;
+    let mut mysql_head: Option<bool> = None;
+    let mut my_prev = MyPrev::Value;
     let mut items: Vec<Item> = Vec::new();
     let mut starts: Vec<usize> = Vec::new();
     // Byte offset where the statement currently accumulating in `cur` began.
@@ -370,6 +595,7 @@ fn split_core(
                 cur.push(b[i]);
                 i += 1;
             }
+            my_prev = MyPrev::Value;
             continue;
         }
         // double-quoted identifier
@@ -406,6 +632,7 @@ fn split_core(
                 cur.push(b[i]);
                 i += 1;
             }
+            my_prev = MyPrev::Value;
             continue;
         }
         // MySQL and SQLite accept backtick-quoted identifiers. Keep delimiters inside
@@ -442,6 +669,7 @@ fn split_core(
                 cur.push(b[i]);
                 i += 1;
             }
+            my_prev = MyPrev::Value;
             continue;
         }
         // SQL Server `[bracket]` identifiers (`]]` escapes a literal `]`). A `;` or
@@ -483,11 +711,13 @@ fn split_core(
                         cur.push(b[i]);
                         i += 1;
                     }
+                    my_prev = MyPrev::Value;
                     continue;
                 }
             }
             cur.push(b'$');
             i += 1;
+            my_prev = MyPrev::Punct(b'$');
             continue;
         }
         // T-SQL statement blocks. Consumed as whole words so `BEGIN`/`END`/`CASE`
@@ -537,10 +767,32 @@ fn split_core(
             cur.extend_from_slice(&b[start..i]);
             continue;
         }
+        // MySQL stored-program bodies. Whole words, so `END` inside an identifier
+        // (`backend`), a string, a backtick name or a comment never counts. A word may
+        // start with a digit or a non-ASCII byte there (`1end`, `fïnend` are names).
+        if engine == TransactionEngine::MySql && mysql_word_byte(c) {
+            let start = i;
+            while i < n && mysql_word_byte(b[i]) {
+                i += 1;
+            }
+            match mysql_head {
+                None => {
+                    head.push(String::from_utf8_lossy(&b[start..i]).to_ascii_lowercase());
+                    mysql_head = mysql_program_head(&head);
+                    my_prev = MyPrev::Word(start, i);
+                }
+                Some(true) => my_prev = mysql_body_word(b, start, i, my_prev, &mut block_depth),
+                // Not a stored program: nothing in it can open a block.
+                Some(false) => {}
+            }
+            cur.extend_from_slice(&b[start..i]);
+            continue;
+        }
         // statement terminator
         if c == b';' && block_depth > 0 {
             cur.push(c);
             i += 1;
+            my_prev = MyPrev::Punct(b';');
             continue;
         }
         if c == b';' {
@@ -549,6 +801,7 @@ fn split_core(
             stmt_start = i;
             head.clear();
             in_trigger = false;
+            mysql_head = None;
             let stmt = flush(std::mem::take(&mut cur)).trim().to_string();
             if stmt.is_empty() {
                 continue;
@@ -617,6 +870,9 @@ fn split_core(
             continue;
         }
 
+        if !c.is_ascii_whitespace() {
+            my_prev = MyPrev::Punct(c);
+        }
         cur.push(c);
         i += 1;
     }
@@ -633,6 +889,14 @@ fn split_core(
         if checked && is_copy_from_stdin(&last) {
             return Err(AppError::new(
                 "COPY FROM stdin requires `;`, data rows, and a terminating `\\.` line",
+            ));
+        }
+        // An unclosed MySQL stored program swallowed everything after it into one
+        // statement. Refuse it rather than send the rest of the script to the server
+        // hidden inside that statement.
+        if checked && mysql_head == Some(true) && block_depth > 0 {
+            return Err(AppError::new(
+                "this stored program's BEGIN … END blocks do not balance, so Tusk cannot tell where it ends. Close every block with END, and quote a column or variable named BEGIN or END with backticks.",
             ));
         }
         items.push(Item::Sql(last));
@@ -2758,6 +3022,123 @@ mod tests {
         // Other engines are untouched: a SQLite-shaped trigger on Postgres still splits.
         let pg = parse_for_engine(
             "CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;",
+            TransactionEngine::Postgres,
+        )
+        .unwrap();
+        assert_eq!(pg.len(), 2);
+    }
+
+    /// Identical fixtures live in `src/editor/lexer.test.ts` — the two lexers must
+    /// agree on where a MySQL stored program ends.
+    #[test]
+    fn mysql_stored_program_bodies_are_not_split_at_their_own_semicolons() {
+        let mysql = TransactionEngine::MySql;
+        let sql_of = |items: &[Item]| {
+            items
+                .iter()
+                .map(|item| match item {
+                    Item::Sql(sql) => sql.clone(),
+                    Item::Copy { stmt, .. } => stmt.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let count = |sql: &str| parse_for_engine(sql, mysql).unwrap().len();
+
+        // A compound procedure is ONE statement, and it is not transaction control.
+        let proc = parse_for_engine(
+            "CREATE PROCEDURE p()\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND;\nSELECT 3;",
+            mysql,
+        )
+        .unwrap();
+        assert_eq!(
+            sql_of(&proc),
+            vec![
+                "CREATE PROCEDURE p()\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND",
+                "SELECT 3"
+            ]
+        );
+        assert_eq!(
+            transaction_action_for(&sql_of(&proc)[0], mysql).unwrap(),
+            None
+        );
+
+        // SHOW CREATE output: DEFINER, labels, every compound construct, nested blocks.
+        let show_create = "CREATE DEFINER=`root`@`%` PROCEDURE `tusk_loop`(IN n INT)\nBEGIN\n  DECLARE i INT DEFAULT 0;\n  lbl: LOOP\n    SET i = i + 1;\n    IF i >= n THEN LEAVE lbl; END IF;\n  END LOOP lbl;\n  WHILE i > 0 DO SET i = i - 1; END WHILE;\n  REPEAT SET i = i + 1; UNTIL i >= 2 END REPEAT;\n  CASE i WHEN 2 THEN SELECT 'two'; ELSE BEGIN SELECT 'other'; END; END CASE;\n  SELECT CASE WHEN i = 2 THEN 'x' ELSE 'y' END AS c;\nEND";
+        let items = parse_for_engine(&format!("{show_create};\nSELECT 9;"), mysql).unwrap();
+        assert_eq!(sql_of(&items), vec![show_create, "SELECT 9"]);
+
+        // Functions, triggers (with and without a block body), events, and the MariaDB
+        // OR REPLACE / unquoted-definer heads.
+        for sql in [
+            "CREATE FUNCTION f(x INT) RETURNS INT DETERMINISTIC BEGIN DECLARE y INT; SET y = x * 2; RETURN y; END; SELECT f(2);",
+            "CREATE DEFINER = CURRENT_USER TRIGGER t BEFORE INSERT ON x FOR EACH ROW BEGIN IF NEW.a < 0 THEN SET NEW.a = 0; END IF; END; SELECT 9;",
+            "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW SET NEW.a = 1; SELECT 9;",
+            "CREATE EVENT e ON SCHEDULE EVERY 1 DAY DO BEGIN DELETE FROM x; INSERT INTO y VALUES (1); END; SELECT 9;",
+            "CREATE OR REPLACE DEFINER=root@localhost PROCEDURE p() BEGIN SELECT 1; END; SELECT 9;",
+            "create procedure p() begin end; select 9;",
+            "CREATE PROCEDURE p() `outer`: BEGIN SELECT 1; END `outer`; SELECT 9;",
+            "CREATE PROCEDURE p() BEGIN DECLARE done INT DEFAULT 0; DECLARE c CURSOR FOR SELECT a FROM t; DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1; DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; RESIGNAL; END; OPEN c; rd: LOOP FETCH c INTO x; IF done THEN LEAVE rd; END IF; END LOOP; CLOSE c; END; SELECT 9;",
+            "CREATE PROCEDURE p() BEGIN FOR i IN 1..3 DO INSERT INTO t VALUES (i); END FOR; END; SELECT 9;",
+        ] {
+            assert_eq!(count(sql), 2, "{sql}: {:?}", sql_of(&parse_for_engine(sql, mysql).unwrap()));
+        }
+
+        // BEGIN and END are not reserved in MySQL: as names they never move the depth.
+        let names = "CREATE PROCEDURE p(IN begin INT) BEGIN DECLARE end INT DEFAULT begin; UPDATE t SET end = begin WHERE t.end > @end; SELECT begin, end FROM t ORDER BY end; SELECT x FROM t begin WHERE begin.x > 0; SELECT CASE WHEN end > 1 THEN end ELSE 0 END FROM t; END; SELECT 9;";
+        assert_eq!(
+            count(names),
+            2,
+            "{:?}",
+            sql_of(&parse_for_engine(names, mysql).unwrap())
+        );
+
+        // BEGIN/END inside a string, a backtick name or a comment never counts.
+        let quoted = "CREATE PROCEDURE p() BEGIN SELECT 'end;'; -- end;\n # end;\n SELECT `end`; /* END */ END; SELECT 9;";
+        assert_eq!(
+            count(quoted),
+            2,
+            "{:?}",
+            sql_of(&parse_for_engine(quoted, mysql).unwrap())
+        );
+
+        // An unclosed body would swallow the rest of the script: execution refuses it.
+        let open = parse_for_engine("CREATE PROCEDURE p() BEGIN SELECT 1; DROP TABLE t;", mysql)
+            .err()
+            .expect("an unbalanced stored program is refused");
+        assert!(open.message.contains("do not balance"), "{}", open.message);
+
+        // Outside a stored-program head nothing changes: BEGIN is transaction control,
+        // and a CASE, a view or a table named for the keywords still splits at `;`.
+        let txn = parse_for_engine("BEGIN; SELECT 1; COMMIT;", mysql).unwrap();
+        assert_eq!(sql_of(&txn), vec!["BEGIN", "SELECT 1", "COMMIT"]);
+        assert_eq!(
+            preflight_transactions(&txn, mysql, &TransactionStatus::default()).unwrap(),
+            vec![
+                Some(TransactionAction::Begin),
+                None,
+                Some(TransactionAction::Commit)
+            ]
+        );
+        for (sql, n) in [
+            ("START TRANSACTION; SELECT 1; COMMIT;", 3),
+            ("CREATE TABLE begin_end (begin INT, end INT); SELECT begin, end FROM begin_end;", 2),
+            ("CREATE VIEW v AS SELECT CASE WHEN 1 THEN 2 END AS c; SELECT 1;", 2),
+            ("CREATE DEFINER = root@localhost SQL SECURITY DEFINER VIEW v AS SELECT 1 AS event; SELECT 2;", 2),
+            ("SELECT CASE WHEN 1 THEN 2 END; SELECT 1;", 2),
+        ] {
+            assert_eq!(count(sql), n, "{sql}: {:?}", sql_of(&parse_for_engine(sql, mysql).unwrap()));
+        }
+
+        // A restore chunk that ends inside a body hands the whole program back as the
+        // tail rather than emitting its first half.
+        let chunk =
+            parse_stream_chunk("SELECT 1; CREATE PROCEDURE p() BEGIN SELECT 1;", mysql).unwrap();
+        assert_eq!(chunk.items.len(), 1);
+        assert_eq!(chunk.tail_start, "SELECT 1;".len());
+
+        // Other engines are untouched: a MySQL-shaped procedure on PostgreSQL still splits.
+        let pg = parse_for_engine(
+            "CREATE PROCEDURE p() BEGIN SELECT 1; END;",
             TransactionEngine::Postgres,
         )
         .unwrap();

@@ -366,6 +366,22 @@ mod tests {
         assert!(!is_read_only_stmt_pg("frombulate"));
     }
 
+    /// The MySQL splitter keeps a body's `;` inside one item only under a
+    /// `CREATE … PROCEDURE|FUNCTION|TRIGGER|EVENT` head, so every such item is a write:
+    /// a stored-program body cannot carry statements past the read-only guard.
+    #[test]
+    fn mysql_stored_program_bodies_never_pass_as_reads() {
+        let mysql = TransactionEngine::MySql;
+        let body = "CREATE PROCEDURE p() BEGIN SELECT 1; DELETE FROM t; END";
+        assert_eq!(script::parse_for_engine(body, mysql).unwrap().len(), 1);
+        assert!(!is_read_only_stmt(body, mysql));
+        assert!(!is_cursorable(body, mysql));
+        assert!(!is_wrappable_read(body, mysql));
+        // A read never opens a block, even when it names BEGIN, END or CASE.
+        let read = "SELECT begin, CASE WHEN end THEN 1 END FROM t BEGIN; DELETE FROM t";
+        assert_eq!(script::parse_for_engine(read, mysql).unwrap().len(), 2);
+    }
+
     #[test]
     fn readonly_guard_rejects_writable_ctes_and_row_locks() {
         assert!(!is_read_only_stmt_pg(

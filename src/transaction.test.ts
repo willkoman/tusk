@@ -123,6 +123,12 @@ describe("engine-aware classification", () => {
     // T-SQL brackets do the same job on SQL Server.
     expect(transactionEvent("SELECT [a;ROLLBACK] FROM t", "mssql")).toBe("statement");
     expect(transactionEvent("BEGIN TRANSACTION", "mssql")).toBe("begin");
+    // A MySQL stored program is one statement: the COMMIT inside its body runs when the
+    // routine is called, not when it is created.
+    expect(
+      transactionEvent("CREATE PROCEDURE p() BEGIN START TRANSACTION; UPDATE t SET n = 1; COMMIT; END", "mysql"),
+    ).toBe("statement");
+    expect(transactionEvent("BEGIN; UPDATE t SET n = 1; COMMIT", "mysql")).toBe("commit");
     // Recovery gating reads the same lexer, so it must take the engine too.
     const failed: TransactionStatus = { ...active(3), state: "failed", health: "recovery_required" };
     expect(transactionRecoveryAllowed(failed, "# note\nROLLBACK", "mysql")).toBe(true);

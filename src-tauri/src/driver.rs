@@ -3400,7 +3400,10 @@ async fn mysql_routine_ddl(
         // not an error, when the role may run the routine but not read its body.
         let body = rows.first().and_then(|r| r.get(2).cloned().flatten());
         match body {
-            Some(text) => parts.push(format!("{};\n", text.trim_end().trim_end_matches(';'))),
+            Some(text) => parts.push(format!(
+                "{};\n",
+                mysql_qualify_routine(text.trim_end().trim_end_matches(';'), schema)
+            )),
             None => {
                 return Err(AppError::new(format!(
                     "MySQL hid this {}'s definition: reading it needs the SHOW_ROUTINE privilege, ownership (DEFINER), or SELECT on mysql.proc on older servers",
@@ -3410,6 +3413,98 @@ async fn mysql_routine_ddl(
         }
     }
     Ok(parts.join("\n"))
+}
+
+/// `SHOW CREATE PROCEDURE|FUNCTION` names the routine bare, so replaying it creates the
+/// routine in whatever database the session has selected. Qualify the name with the
+/// schema it was read from (as DuckDB's stored sequence text is re-qualified), so Copy
+/// DDL and a backup put it back where it came from from any default database. The body
+/// needs nothing: a routine runs with its own database selected. Text whose head is not
+/// `CREATE [DEFINER = user] [AGGREGATE] PROCEDURE|FUNCTION name` comes back unchanged.
+fn mysql_qualify_routine(sql: &str, schema: &str) -> String {
+    let b = sql.as_bytes();
+    let n = b.len();
+    let ws = |mut i: usize| {
+        while i < n && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    // The bare word at `i` (ASCII letters, digits, `_`), and the index past it.
+    let word = |i: usize| {
+        let mut j = i;
+        while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+            j += 1;
+        }
+        (&sql[i..j], j)
+    };
+    // One `user` or `host` part of a definer: quoted with a doubled-quote escape, or a
+    // bare run up to whitespace or `@`.
+    let part = |mut i: usize| {
+        if i < n && matches!(b[i], b'`' | b'\'' | b'"') {
+            let q = b[i];
+            i += 1;
+            while i < n {
+                if b[i] == q {
+                    if i + 1 < n && b[i + 1] == q {
+                        i += 2;
+                        continue;
+                    }
+                    return Some(i + 1);
+                }
+                i += 1;
+            }
+            return None;
+        }
+        while i < n && !b[i].is_ascii_whitespace() && b[i] != b'@' {
+            i += 1;
+        }
+        Some(i)
+    };
+    let qualify = || -> Option<String> {
+        let (w, mut i) = word(ws(0));
+        if !w.eq_ignore_ascii_case("create") {
+            return None;
+        }
+        i = ws(i);
+        let (w, j) = word(i);
+        if w.eq_ignore_ascii_case("definer") {
+            i = ws(j);
+            if b.get(i) != Some(&b'=') {
+                return None;
+            }
+            i = part(ws(i + 1))?;
+            if b.get(i) == Some(&b'@') {
+                i = part(i + 1)?;
+            }
+            i = ws(i);
+        }
+        let (w, j) = word(i);
+        if w.eq_ignore_ascii_case("aggregate") {
+            i = ws(j);
+        }
+        let (w, j) = word(i);
+        if !(w.eq_ignore_ascii_case("procedure") || w.eq_ignore_ascii_case("function")) {
+            return None;
+        }
+        let name = ws(j);
+        // Already qualified (`db`.`name` / db.name): leave it alone.
+        let after = if b.get(name) == Some(&b'`') {
+            part(name)?
+        } else {
+            word(name).1
+        };
+        if after == name || b.get(after) == Some(&b'.') {
+            return None;
+        }
+        Some(format!(
+            "{}`{}`.{}",
+            &sql[..name],
+            schema.replace('`', "``"),
+            &sql[name..]
+        ))
+    };
+    qualify().unwrap_or_else(|| sql.to_string())
 }
 
 async fn mysql_table_detail(
@@ -5822,12 +5917,76 @@ mod tests {
     }
 
     #[test]
+    fn mysql_routine_text_is_qualified_with_its_schema() {
+        assert_eq!(
+            mysql_qualify_routine(
+                "CREATE DEFINER=`root`@`%` PROCEDURE `p`(IN n INT)\nBEGIN SELECT 1; END",
+                "test"
+            ),
+            "CREATE DEFINER=`root`@`%` PROCEDURE `test`.`p`(IN n INT)\nBEGIN SELECT 1; END"
+        );
+        // Quote characters inside the definer, the name and the schema are escaped.
+        assert_eq!(
+            mysql_qualify_routine(
+                "CREATE DEFINER=`we``ird`@`h@st` FUNCTION `a``b`() RETURNS INT RETURN 1",
+                "s`x"
+            ),
+            "CREATE DEFINER=`we``ird`@`h@st` FUNCTION `s``x`.`a``b`() RETURNS INT RETURN 1"
+        );
+        // sql_quote_show_create=OFF prints everything bare; MariaDB AGGREGATE heads.
+        assert_eq!(
+            mysql_qualify_routine(
+                "CREATE DEFINER=root@% FUNCTION f() RETURNS INT RETURN 1",
+                "db"
+            ),
+            "CREATE DEFINER=root@% FUNCTION `db`.f() RETURNS INT RETURN 1"
+        );
+        assert_eq!(
+            mysql_qualify_routine(
+                "CREATE DEFINER=CURRENT_USER AGGREGATE FUNCTION g(x INT) RETURNS INT BEGIN RETURN 1; END",
+                "db"
+            ),
+            "CREATE DEFINER=CURRENT_USER AGGREGATE FUNCTION `db`.g(x INT) RETURNS INT BEGIN RETURN 1; END"
+        );
+        // Already qualified, or not a routine head: unchanged.
+        for sql in [
+            "CREATE PROCEDURE `db`.`p`() SELECT 1",
+            "CREATE PROCEDURE db.p() SELECT 1",
+            "CREATE TABLE t (a INT)",
+            "SELECT 1",
+        ] {
+            assert_eq!(mysql_qualify_routine(sql, "other"), sql);
+        }
+    }
+
+    #[test]
     fn mysql_query_boundary_refuses_multiple_statements() {
         assert!(mysql_single_statement("SELECT 1").is_ok());
         assert!(mysql_single_statement("SELECT ';' AS value").is_ok());
         assert!(mysql_single_statement("SELECT 1; DROP TABLE t").is_err());
         assert!(mysql_single_statement("SELECT 1 /*! COMMIT */").is_err());
         assert!(mysql_single_statement("COPY t FROM stdin;\n1\n\\.\n").is_err());
+        // A stored program's body `;` are part of the one statement the server parses…
+        assert!(mysql_single_statement(
+            "CREATE PROCEDURE p() BEGIN SELECT 1; IF 1 THEN SELECT 2; END IF; END"
+        )
+        .is_ok());
+        // …but text after its END is still a second statement, an unclosed body is
+        // refused rather than sent with the rest glued on, and an executable comment
+        // inside a body is still refused.
+        assert!(
+            mysql_single_statement("CREATE PROCEDURE p() BEGIN SELECT 1; END; DROP TABLE t")
+                .is_err()
+        );
+        assert!(
+            mysql_single_statement("CREATE PROCEDURE p() BEGIN SELECT 1; DROP TABLE t").is_err()
+        );
+        assert!(
+            mysql_single_statement("CREATE PROCEDURE p() BEGIN /*! COMMIT */ SELECT 1; END")
+                .is_err()
+        );
+        // Outside a stored-program head, BEGIN is still a transaction statement.
+        assert!(mysql_single_statement("BEGIN; SELECT 1").is_err());
     }
 
     #[test]
