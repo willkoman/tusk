@@ -3342,8 +3342,11 @@ async fn mysql_build_tree(pool: &mysql_async::Pool) -> Result<tree::DbTree, AppE
     .await?;
     // Stored procedures and functions. Both land in the Explorer's one "function" node
     // kind with the routine type in `returns`, like SQL Server's; `relation_ddl` looks
-    // the type up again because the Explorer sends "function" for either.
-    let (_c4, routine_rows, _a4) = mysql_run(
+    // the type up again because the Explorer sends "function" for either. Best-effort,
+    // like DuckDB's macro listing: a MySQL-compatible server without stored routines
+    // (Vitess, TiDB, …) may reject the view, and that must not take the whole tree down.
+    // A server that rejects it has no routines for a backup to miss.
+    let routine_rows = mysql_run(
         pool,
         &format!(
             "SELECT routine_schema, routine_name, LOWER(routine_type) \
@@ -3352,7 +3355,9 @@ async fn mysql_build_tree(pool: &mysql_async::Pool) -> Result<tree::DbTree, AppE
              ORDER BY routine_schema, routine_name, routine_type"
         ),
     )
-    .await?;
+    .await
+    .map(|(_c, rows, _a)| rows)
+    .unwrap_or_default();
     let (_c3, dbrow, _a3) = mysql_run(pool, "SELECT database()").await?;
     let database = dbrow
         .first()
@@ -5532,7 +5537,13 @@ fn duck_settle_exhausted_sequence(sql: &str, schema: &str, name: &str) -> String
     if !no_cycle || (min..=max).contains(&start) {
         return sql.to_string();
     }
-    let bound = if start > max { max } else { min };
+    // The counter overshoots in the increment's direction; follow the sign rather than
+    // the side START landed on, which is wrong once it wraps past the i64 limit.
+    let ascending = at(&tokens, "INCREMENT")
+        .and_then(|i| tokens.get(i + 2))
+        .and_then(|v| v.parse::<i64>().ok())
+        .map_or(start > max, |step| step > 0);
+    let bound = if ascending { max } else { min };
     tokens[start_at + 1] = bound.to_string();
     let create = format!("{prefix}{};", tokens.join(" "));
     // `nextval('…')` splits its argument on `.` and `"` without undoubling a `""`, so
@@ -5707,6 +5718,13 @@ mod tests {
         let down = "CREATE SEQUENCE \"main\".\"d\" INCREMENT BY -1 MINVALUE 1 MAXVALUE 2 START 0 NO CYCLE;";
         assert!(duck_settle_exhausted_sequence(down, "main", "d")
             .contains("MAXVALUE 2 START 1 NO CYCLE;"));
+        // A counter that wrapped past i64::MAX still clamps toward its increment.
+        let wrapped = format!(
+            "CREATE SEQUENCE \"main\".\"w\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 3 START {} NO CYCLE;",
+            i64::MIN
+        );
+        assert!(duck_settle_exhausted_sequence(&wrapped, "main", "w")
+            .contains("MAXVALUE 3 START 3 NO CYCLE;"));
         let quoted = "CREATE SEQUENCE \"x\".\"q\"\"s\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 3 START 4 NO CYCLE;";
         let settled = duck_settle_exhausted_sequence(quoted, "x", "q\"s");
         assert!(

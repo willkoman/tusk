@@ -457,6 +457,34 @@ fn qual(schema: &str, name: &str, dialect: SqlDialect, schemas: bool) -> String 
 /// separates parts, `"` toggles quoting and is never undoubled, nothing is
 /// case-folded. String literals and quoted identifiers elsewhere in the expression are
 /// skipped, and a call whose argument is not a plain string literal names nothing.
+/// A DuckDB dump without drops must not fail on a sequence that is already there:
+/// unlike a PostgreSQL `serial`, a DuckDB sequence outlives the table numbering from
+/// it, so restoring a dropped table's backup into its own database meets the sequence
+/// still in place. `IF NOT EXISTS` keeps the live one (and its position). The trailing
+/// `SELECT nextval` an exhausted sequence carries is left out too: run against the
+/// live sequence it would consume a value, or fail on an exhausted one. A fresh
+/// restore of an exhausted sequence then has its last value once more.
+fn duck_sequence_if_missing(ddl: &str) -> String {
+    let exhausted = ddl.lines().any(|line| line.starts_with("--"));
+    let create = ddl
+        .lines()
+        .filter(|line| !line.starts_with("--") && !line.starts_with("SELECT nextval("))
+        .map(|line| match line.strip_prefix("CREATE SEQUENCE ") {
+            Some(rest) => format!("CREATE SEQUENCE IF NOT EXISTS {rest}"),
+            None => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if exhausted {
+        format!(
+            "-- Exhausted on the source. START is clamped to the bound so DuckDB accepts\n\
+             -- the statement; an existing sequence of this name is kept as it is.\n{create}"
+        )
+    } else {
+        create
+    }
+}
+
 fn duck_sequence_calls(default: &str) -> Vec<Vec<String>> {
     let chars: Vec<char> = default.chars().collect();
     let mut calls = Vec::new();
@@ -926,8 +954,23 @@ async fn backup_inner(
             .collect();
         for t in &tables {
             cancelled(cancel)?;
-            let Ok(detail) = backend.table_detail(&t.schema, &t.name).await else {
-                continue;
+            let detail = match backend.table_detail(&t.schema, &t.name).await {
+                Ok(detail) => detail,
+                Err(e) => {
+                    // Without its column defaults, a sequence this table numbers from
+                    // cannot be found, and the restore would fail at its CREATE TABLE
+                    // with nothing in the dump saying why.
+                    if opts.wants_schema() {
+                        warnings.push(format!(
+                            "table {}.{}: its column defaults could not be read ({}), so \
+                             any sequence it numbers from is not carried",
+                            t.schema,
+                            t.name,
+                            comment_safe(&e.message)
+                        ));
+                    }
+                    continue;
+                }
             };
             for column in &detail.columns {
                 let Some(default) = column.default.as_deref() else {
@@ -1133,6 +1176,11 @@ async fn backup_inner(
                 cancelled(cancel)?;
                 match backend.relation_ddl("sequence", schema, name).await {
                     Ok(ddl) => {
+                        let ddl = if is_duck && !opts.include_drop {
+                            duck_sequence_if_missing(&ddl)
+                        } else {
+                            ddl
+                        };
                         out.stmt(&ddl).await?;
                         objects += 1;
                     }
@@ -2248,6 +2296,27 @@ mod tests {
             fks[0],
             "ALTER TABLE `test`.`bk_a` ADD CONSTRAINT `bk_a_b_fk` FOREIGN KEY (`b_id`) REFERENCES `bk_b` (`id`)"
         );
+    }
+
+    /// Without drops, a DuckDB sequence is created only if missing and never consumed.
+    #[test]
+    fn duck_sequences_without_drops_keep_an_existing_one() {
+        let plain =
+            "CREATE SEQUENCE \"main\".\"s\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 9 START 4 NO CYCLE;";
+        assert_eq!(
+            duck_sequence_if_missing(plain),
+            "CREATE SEQUENCE IF NOT EXISTS \"main\".\"s\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 9 START 4 NO CYCLE;"
+        );
+        let exhausted = "-- Exhausted on the source. START is clamped to the bound so DuckDB accepts\n\
+                         -- the statement, and the nextval below consumes it again.\n\
+                         CREATE SEQUENCE \"main\".\"d\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 1 START 1 NO CYCLE;\n\
+                         SELECT nextval('\"main\".\"d\"')";
+        let kept = duck_sequence_if_missing(exhausted);
+        assert!(kept.ends_with(
+            "\nCREATE SEQUENCE IF NOT EXISTS \"main\".\"d\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 1 START 1 NO CYCLE;"
+        ), "{kept}");
+        assert!(!kept.contains("nextval"), "{kept}");
+        assert!(kept.starts_with("-- Exhausted on the source."), "{kept}");
     }
 
     /// The defaults below are DuckDB's own `duckdb_columns().column_default` renderings.

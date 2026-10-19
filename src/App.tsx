@@ -5183,7 +5183,7 @@ function App() {
           ...copyDdl,
           copyName,
           { sep: "danger" },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop sequence", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop sequence", facts: { kind: "Sequence", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: true, build: (o) => ddl.dropSequence(s!, n.name, o.cascade) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: "Drop sequence", subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: "Drop sequence", facts: { kind: "Sequence", name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: !dcaps().cascadeDropsTables, build: (o) => ddl.dropSequence(s!, n.name, o.cascade) }) },
         );
         break;
       case "function": {
@@ -5195,7 +5195,7 @@ function App() {
           ...copyDdl,
           copyName,
           { sep: "danger" },
-          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop ${what}`, subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: `Drop ${what}`, facts: { kind: what.charAt(0).toUpperCase() + what.slice(1), name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: dcaps().cascade, build: (o) => ddl.dropFunction(s!, n.name, o.cascade, n.returns) }) },
+          { label: "Drop…", icon: "trash", danger: true, ...gate(true, ""), onClick: () => setActiveDialog({ kind: "confirm", title: `Drop ${what}`, subtitle: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}`, primaryLabel: `Drop ${what}`, facts: { kind: what.charAt(0).toUpperCase() + what.slice(1), name: n.table ? `${s}.${n.table}.${n.name}` : `${s}.${n.name}` }, showCascade: dcaps().cascade && !dcaps().cascadeDropsTables, build: (o) => ddl.dropFunction(s!, n.name, o.cascade, n.returns) }) },
         );
         break;
       }

@@ -4572,6 +4572,70 @@ async fn duckdb_backup_restores_sequences() {
     reset(&mut b, &teardown).await;
 }
 
+/// A dump WITHOUT drops restores beside a sequence that is still there. A DuckDB
+/// sequence outlives the table numbering from it, so dropping only the table and
+/// restoring its backup into the same database used to stop at `CREATE SEQUENCE`
+/// ("already exists"). The dump now says `IF NOT EXISTS`, leaves out the consuming
+/// `nextval` of an exhausted sequence, and the live sequence keeps its position. The
+/// backup runs wrapped in one transaction, the UI's default.
+#[tokio::test]
+async fn duckdb_backup_without_drops_restores_beside_a_live_sequence() {
+    let (mut b, _v) = connect(&duck_cfg()).await.unwrap();
+    let teardown: Vec<String> = [
+        r#"DROP TABLE IF EXISTS "main"."nd_t""#,
+        r#"DROP SEQUENCE IF EXISTS "main"."nd_seq""#,
+        r#"DROP SEQUENCE IF EXISTS "main"."nd_done""#,
+    ]
+    .map(String::from)
+    .to_vec();
+    for sql in [
+        r#"CREATE SEQUENCE "main"."nd_seq""#,
+        r#"CREATE SEQUENCE "main"."nd_done" MAXVALUE 2"#,
+        r#"CREATE TABLE "main"."nd_t" (id INTEGER DEFAULT nextval('nd_seq') PRIMARY KEY, d INTEGER DEFAULT nextval('nd_done'))"#,
+        // ids 1, 2 and d 1, 2: nd_done is now exhausted.
+        r#"INSERT INTO "main"."nd_t" DEFAULT VALUES"#,
+        r#"INSERT INTO "main"."nd_t" DEFAULT VALUES"#,
+    ] {
+        exec(&mut b, sql).await;
+    }
+    let opts = crate::backup::BackupOptions {
+        scope: "tables".into(),
+        schemas: Vec::new(),
+        tables: vec![crate::backup::QualifiedName {
+            schema: "main".into(),
+            name: "nd_t".into(),
+        }],
+        content: "all".into(),
+        include_drop: false,
+        single_transaction: true,
+    };
+    let (_summary, text, path) = duck_backup(&mut b, "no drops", &opts).await;
+    for seq in [
+        r#"CREATE SEQUENCE IF NOT EXISTS "main"."nd_seq" "#,
+        r#"CREATE SEQUENCE IF NOT EXISTS "main"."nd_done" "#,
+    ] {
+        assert!(text.contains(seq), "{seq}:\n{text}");
+    }
+    assert!(
+        !text.contains("SELECT nextval("),
+        "no consuming nextval in a dump without drops:\n{text}"
+    );
+    // Drop only the table: DuckDB leaves both sequences in place.
+    exec(&mut b, r#"DROP TABLE "main"."nd_t""#).await;
+    duck_restore(&mut b, "no drops", &path).await;
+    let rows = all(&mut b, r#"SELECT id, d FROM "main"."nd_t" ORDER BY id"#).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(cell(&rows[1], 0).as_deref(), Some("2"));
+    let next = all(&mut b, "SELECT nextval('main.nd_seq')").await;
+    assert_eq!(
+        cell(&next[0], 0).as_deref(),
+        Some("3"),
+        "the live position is kept"
+    );
+    reset(&mut b, &teardown).await;
+    let _ = std::fs::remove_file(&path);
+}
+
 /// MySQL lists stored procedures and functions in the Explorer (routine type in
 /// `returns`), and "View definition" shows `SHOW CREATE PROCEDURE|FUNCTION`. The
 /// Explorer sends kind "function" for both, so the driver looks the type up; one name

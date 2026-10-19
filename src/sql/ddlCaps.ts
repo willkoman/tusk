@@ -111,6 +111,10 @@ export type DdlCaps = {
   indexMethod: boolean; // USING btree/hash/gin/…
   partialIndex: boolean; // WHERE on CREATE INDEX
   cascade: boolean; // CASCADE on DROP
+  /** CASCADE on a sequence or routine drop takes the dependent TABLES with it (DuckDB),
+   *  not just the defaults that use it (PostgreSQL). The Explorer offers no Cascade box
+   *  there: dropping a table must go through the table's own typed confirmation. */
+  cascadeDropsTables: boolean;
   truncate: boolean;
   truncateOptions: boolean; // RESTART IDENTITY / CASCADE
   duplicate: "like" | "ctas"; // CREATE TABLE … (LIKE …) vs CTAS
@@ -171,6 +175,7 @@ const POSTGRES: DdlCaps = {
   indexMethod: true,
   partialIndex: true,
   cascade: true,
+  cascadeDropsTables: false,
   truncate: true,
   truncateOptions: true,
   duplicate: "like",
@@ -183,6 +188,7 @@ const POSTGRES: DdlCaps = {
 // ALTERs, no roles/identity clauses, no LIKE, and a single (ART) index type.
 const DUCKDB: DdlCaps = {
   ...POSTGRES,
+  cascadeDropsTables: true,
   dialect: "duckdb",
   label: "DuckDB",
   // DuckDB identifiers are case-INSENSITIVE even when quoted.
@@ -264,6 +270,7 @@ const MYSQL: DdlCaps = {
   indexMethod: false, // the index_type goes before ON — not worth a second shape
   partialIndex: false,
   cascade: false,
+  cascadeDropsTables: false,
   truncate: true,
   truncateOptions: false,
   duplicate: "like",
@@ -325,6 +332,7 @@ const SQLITE: DdlCaps = {
   indexMethod: false,
   partialIndex: true, // SQLite has had partial indexes since 3.8
   cascade: false,
+  cascadeDropsTables: false,
   truncate: false, // no TRUNCATE statement — DELETE FROM is the equivalent
   truncateOptions: false,
   duplicate: "ctas",
