@@ -825,6 +825,8 @@ impl Backend {
         if let Backend::MySql(m) = self {
             m.ddl_batch = false;
             m.view_reader.lock().await.take();
+            m.view_reader_refused
+                .store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -2687,6 +2689,8 @@ pub struct MySqlConn {
     /// fresh one per view (a new TLS + auth handshake, through the tunnel when there is
     /// one). Outside a batch it is never kept.
     view_reader: tokio::sync::Mutex<Option<mysql_async::Conn>>,
+    /// The server refused that `change_user` once in this batch; later views skip it.
+    view_reader_refused: std::sync::atomic::AtomicBool,
     ddl_batch: bool,
 }
 
@@ -2768,6 +2772,7 @@ impl MySqlConn {
                 autocommit_off: false,
                 no_backslash_escapes,
                 view_reader: tokio::sync::Mutex::new(None),
+                view_reader_refused: std::sync::atomic::AtomicBool::new(false),
                 ddl_batch: false,
             }),
             format!("MySQL {version}"),
@@ -3154,7 +3159,11 @@ impl MySqlConn {
         conn.query_drop("START TRANSACTION").await.map_err(de)?;
         for it in items {
             if let script::Item::Sql(s) = it {
-                if let Err(e) = conn.query_drop(s.trim()).await.map_err(de) {
+                let ran = match mysql_server_single_statement(&mut conn, s.trim()).await {
+                    Ok(()) => conn.query_drop(s.trim()).await.map_err(de),
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = ran {
                     let _ = conn.query_drop("ROLLBACK").await;
                     return Err(e);
                 }
@@ -3316,6 +3325,7 @@ async fn mysql_run_conn_limited(
     limits: db::TextLimits,
 ) -> Result<(Vec<String>, Vec<Vec<Option<String>>>, u64), AppError> {
     mysql_single_statement(sql)?;
+    mysql_server_single_statement(conn, sql).await?;
     use mysql_async::prelude::Queryable;
     let mut result = conn.query_iter(sql).await.map_err(de)?;
     let (columns, metadata) = mysql_metadata(result.columns().as_ref());
@@ -3328,6 +3338,37 @@ async fn mysql_run_conn_limited(
         data.push(row);
     }
     Ok((columns, data, affected))
+}
+
+/// The SERVER's verdict that `sql` is one statement, asked on the same session right before
+/// COM_QUERY runs it. mysql_async always negotiates `CLIENT_MULTI_STATEMENTS` (and exposes no
+/// `COM_SET_OPTION` to turn it off), so a text the client-side splitter kept together but the
+/// server reads as several statements would run every one of them — a hidden
+/// `START TRANSACTION` past preflight, say. That can only happen when the text holds a `;`
+/// before its end (a stored program's `BEGIN … END` body, or any lexical disagreement), so
+/// only such a text is checked: COM_STMT_PREPARE parses exactly ONE statement and executes
+/// nothing. Anything after the first statement fails the parse with ER_PARSE_ERROR (1064)
+/// before a single statement runs; one statement either prepares (and is closed again) or is
+/// refused with ER_UNSUPPORTED_PS (1295), which is what every `CREATE PROCEDURE|FUNCTION|
+/// TRIGGER|EVENT` gets. Any other server error is the one running the text would have hit,
+/// so it is reported instead of running anything.
+pub(crate) async fn mysql_server_single_statement(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+) -> Result<(), AppError> {
+    use mysql_async::prelude::Queryable;
+    let mut body = sql.trim_end();
+    while let Some(rest) = body.strip_suffix(';') {
+        body = rest.trim_end();
+    }
+    if !body.contains(';') {
+        return Ok(());
+    }
+    match conn.prep(body).await {
+        Ok(stmt) => conn.close(stmt).await.map_err(de),
+        Err(mysql_async::Error::Server(e)) if e.code == 1295 => Ok(()),
+        Err(e) => Err(de(e)),
+    }
 }
 
 async fn mysql_page_conn(
@@ -3553,16 +3594,33 @@ async fn mysql_show_create_view(
     m: &MySqlConn,
     sql: &str,
 ) -> Result<(Vec<Vec<Option<String>>>, bool), AppError> {
+    use std::sync::atomic::Ordering;
     let mut reader = m.view_reader.lock().await;
     let mut conn = match reader.take() {
         Some(conn) => conn,
+        // The server already refused once in this batch: do not ask again per view.
+        None if m.ddl_batch && m.view_reader_refused.load(Ordering::Relaxed) => {
+            return Ok((
+                mysql_run_limited(&m.pool, sql, db::DDL_TEXT_LIMITS)
+                    .await?
+                    .1,
+                false,
+            ));
+        }
         None => {
             let mut conn = m.pool.get_conn().await.map_err(de)?;
             let unscoped = mysql_async::ChangeUserOpts::default().with_db_name(None);
             if conn.change_user(unscoped).await.is_err() {
                 drop(conn);
-                let (_c, rows, _a) = mysql_run_limited(&m.pool, sql, db::DDL_TEXT_LIMITS).await?;
-                return Ok((rows, false));
+                if m.ddl_batch {
+                    m.view_reader_refused.store(true, Ordering::Relaxed);
+                }
+                return Ok((
+                    mysql_run_limited(&m.pool, sql, db::DDL_TEXT_LIMITS)
+                        .await?
+                        .1,
+                    false,
+                ));
             }
             conn
         }

@@ -687,7 +687,15 @@ fn mysql_routine_dump(def: &crate::driver::MySqlRoutineDef) -> Result<String, St
     if !token(&def.sql_mode, true) {
         return Err(format!("unexpected sql_mode `{}`", def.sql_mode));
     }
-    let mut session = vec![format!("sql_mode = '{}'", def.sql_mode)];
+    // NO_AUTO_CREATE_USER only ever affected GRANT, and MySQL 8 refuses to set it: a
+    // routine created on 5.7 would otherwise stop the restore on a newer server.
+    let sql_mode = def
+        .sql_mode
+        .split(',')
+        .filter(|m| !m.is_empty() && !m.eq_ignore_ascii_case("NO_AUTO_CREATE_USER"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut session = vec![format!("sql_mode = '{sql_mode}'")];
     let cs = &def.character_set_client;
     if !cs.is_empty() && token(cs, false) && cs.to_ascii_lowercase().starts_with("utf8") {
         session.push(format!("character_set_client = {cs}"));
@@ -1154,9 +1162,11 @@ async fn backup_inner(
             "-- note: MySQL routines keep their DEFINER. Restoring them as another account\n\
              -- needs SET_USER_ID (or SUPER), and with binary logging on, a function not\n\
              -- declared DETERMINISTIC, NO SQL or READS SQL DATA needs\n\
-             -- log_bin_trust_function_creators = 1. Tables, data and foreign keys come\n\
-             -- first; a routine that fails stops the views after it unless the restore\n\
-             -- continues past errors.\n\n",
+             -- log_bin_trust_function_creators = 1. Each routine is created under its own\n\
+             -- sql_mode and collation (a SET SESSION before it), so a server without that\n\
+             -- collation (MariaDB has no utf8mb4_0900_ai_ci) refuses the SET. Tables, data\n\
+             -- and foreign keys come first; a routine that fails stops the views after it\n\
+             -- unless the restore continues past errors.\n\n",
         )
         .await?;
     }

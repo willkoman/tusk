@@ -220,6 +220,94 @@ function sqlExportString(s: string, dialect: string): string {
   return `'${s.replace(/'/g, "''")}'`;
 }
 
+/**
+ * Where the created object's name starts in a MySQL `SHOW CREATE` head and where its
+ * first part ends. Mirrors `driver.rs::mysql_create_name_span`: CREATE, then a view's
+ * `ALGORITHM = x` / `SQL SECURITY x`, a `DEFINER = user@host`, MariaDB's `AGGREGATE`,
+ * then TABLE|VIEW|PROCEDURE|FUNCTION|SEQUENCE and the name.
+ */
+function mysqlCreateNameSpan(sql: string): [number, number] | null {
+  const n = sql.length;
+  const isWs = (c: string | undefined) => c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f";
+  const ws = (i: number) => {
+    while (i < n && isWs(sql[i])) i++;
+    return i;
+  };
+  const word = (i: number): [string, number] => {
+    let j = i;
+    while (j < n && /[A-Za-z0-9_]/.test(sql[j])) j++;
+    return [sql.slice(i, j).toLowerCase(), j];
+  };
+  // One quoted part (doubled-quote escape) or a bare run up to whitespace or `@`.
+  const part = (i: number): number | null => {
+    const q = sql[i];
+    if (q === "`" || q === "'" || q === '"') {
+      for (i++; i < n; i++) {
+        if (sql[i] !== q) continue;
+        if (sql[i + 1] === q) {
+          i++;
+          continue;
+        }
+        return i + 1;
+      }
+      return null;
+    }
+    while (i < n && !isWs(sql[i]) && sql[i] !== "@") i++;
+    return i;
+  };
+  let [w, i] = word(ws(0));
+  if (w !== "create") return null;
+  i = ws(i);
+  for (;;) {
+    const [w2, j] = word(i);
+    if (w2 === "algorithm") {
+      i = ws(j);
+      if (sql[i] !== "=") return null;
+      const [v, j2] = word(ws(i + 1));
+      if (!v) return null;
+      i = ws(j2);
+    } else if (w2 === "definer") {
+      i = ws(j);
+      if (sql[i] !== "=") return null;
+      const user = part(ws(i + 1));
+      if (user === null) return null;
+      i = user;
+      if (sql[i] === "@") {
+        const host = part(i + 1);
+        if (host === null) return null;
+        i = host;
+      }
+      i = ws(i);
+    } else if (w2 === "sql") {
+      const [security, j2] = word(ws(j));
+      const [v, j3] = word(ws(j2));
+      if (security !== "security" || !v) return null;
+      i = ws(j3);
+    } else if (w2 === "aggregate") i = ws(j);
+    else break;
+  }
+  const [kind, j] = word(i);
+  if (!["table", "view", "procedure", "function", "sequence"].includes(kind)) return null;
+  const name = ws(j);
+  let after: number;
+  if (sql[name] === "`" || sql[name] === '"') {
+    const end = part(name);
+    if (end === null) return null;
+    after = end;
+  } else {
+    after = name;
+    while (after < n && (/[A-Za-z0-9_$]/.test(sql[after]) || sql.charCodeAt(after) >= 0x80)) after++;
+  }
+  return after === name ? null : [name, after];
+}
+
+/** Drop the database qualifier from a MySQL CREATE head (`driver.rs::mysql_unqualify_create`). */
+export function mysqlUnqualifyCreate(sql: string): string {
+  const span = mysqlCreateNameSpan(sql);
+  if (!span || sql[span[1]] !== ".") return sql;
+  return sql.slice(0, span[0]) + sql.slice(span[1] + 1);
+}
+
 export function formatWithOptions(d: Dataset, o: ExportOptions, sourceDialect = activeSqlDialect()): string {
   validateDataset(d);
   if (!["csv", "tsv", "json", "sql", "markdown", "xlsx"].includes(o.format))
@@ -311,7 +399,10 @@ export function formatWithOptions(d: Dataset, o: ExportOptions, sourceDialect = 
       if (o.sql.includeCreate && o.sql.createSql) {
         // Engine-reconstructed DDL wins over the synthetic all-text CREATE (parity with
         // `header_text` in src-tauri/src/export.rs).
-        const ddl = o.sql.createSql.replace(/\s+$/, "").replace(/;$/, "");
+        const trimmed = o.sql.createSql.replace(/\s+$/, "").replace(/;$/, "");
+        // MySQL's DDL comes back qualified with its database; the INSERTs below name
+        // the table bare, so the CREATE must too (parity with export.rs).
+        const ddl = dialect === "mysql" ? mysqlUnqualifyCreate(trimmed) : trimmed;
         out += `${ddl};${nl}`;
       } else if (o.sql.includeCreate) {
         out += `CREATE TABLE ${sqlIdent(table)} (${cols.map((c, k) => `${sqlIdent(c)} ${sqlExportColumnType(dialect, pbool[k])}`).join(", ")});${nl}`;

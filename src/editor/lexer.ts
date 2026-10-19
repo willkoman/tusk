@@ -72,6 +72,10 @@ const BACKSLASH = 92; // \
 const BTICK = 96; // `
 const LBRACK = 91; // [
 const LPAREN = 40; // (
+const RPAREN = 41; // )
+const COMMA = 44; // ,
+const COLON = 58; // :
+const EQUALS = 61; // =
 const RBRACK = 93; // ]
 const SPACE = 32;
 const TAB = 9;
@@ -200,37 +204,52 @@ function mysqlProgramHead(words: string[]): boolean | null {
   return MYSQL_PROGRAM_KINDS.has(words[i]);
 }
 
-// Same word lists as script.rs (`MYSQL_IDENT_PREV`, `MYSQL_STMT_PREV`,
-// `MYSQL_EXPR_NAME_PREV`, `MYSQL_EXPR_FOLLOW`, `MYSQL_IDENT_PUNCT`). MySQL does not
-// reserve BEGIN/END, so a stored-program body reads each one from where it stands.
-const MYSQL_IDENT_PREV = new Set([
-  "select", "set", "where", "and", "or", "xor", "not", "on", "by", "when", "in", "out", "inout",
-  "declare", "into", "return", "is", "like", "between", "having", "distinct", "as", "using", "div",
-  "mod", "interval", "case", "if", "elseif", "while", "until", "from", "join", "update", "table",
-  "call", "procedure", "function", "trigger", "event", "all", "any", "some", "regexp", "rlike",
-  "exists",
+// MySQL stored programs. Mirrors script.rs (`MyFrame`, `MyPhase`, `MyHandler`,
+// `MyBody`, `mysql_body_word` / `mysql_compound_word` / `mysql_end` / `mysql_body_value`
+// / `mysql_body_punct`, and the `MYSQL_*` word lists, copied verbatim). The head is read
+// by its grammar so the body's first token is found exactly: a compound statement there
+// opens a frame, anything else makes the body one plain statement that cannot hold a `;`.
+// Inside a compound body, MySQL does not reserve BEGIN/END, so a compound statement opens
+// only where a statement starts and every frame but a CASE expression closes only with
+// its own `END …` right after the `;` of its last statement.
+type MyFrame = "block" | "caseStmt" | "caseExpr" | "if" | "loop" | "while" | "repeat" | "for";
+// Maps, not object literals: `word in obj` / `obj[word]` would also see `constructor`.
+const OPENED_BY = new Map<string, MyFrame>([
+  ["begin", "block"],
+  ["case", "caseStmt"],
+  ["if", "if"],
+  ["loop", "loop"],
+  ["while", "while"],
+  ["repeat", "repeat"],
+  ["for", "for"],
 ]);
-const MYSQL_STMT_PREV = new Set(["then", "else", "do", "loop", "repeat"]);
+const listsAtOnce = (f: MyFrame): boolean => f === "block" || f === "loop" || f === "repeat";
+const END_TAILS = new Set(["case", "if", "loop", "while", "repeat", "for"]);
 const MYSQL_EXPR_NAME_PREV = new Set([
   "then", "else", "when", "and", "or", "xor", "not", "is", "like", "between", "in", "div",
   "mod", "regexp", "rlike", "interval", "case", "select", "from", "where", "by", "as", "on",
   "distinct", "exists", "having", "using", "join", "binary",
 ]);
-const MYSQL_EXPR_FOLLOW = new Set([
-  "from", "as", "is", "in", "and", "or", "xor", "div", "mod", "like", "between", "regexp", "rlike",
-  "sounds", "collate", "desc", "asc", "then", "else", "when", "where", "into", "order", "group",
-  "limit", "having", "union", "on", "using", "join", "inner", "left", "right", "cross",
-  "straight_join", "natural", "force", "use", "ignore", "lock", "window", "except", "intersect",
-  "partition",
-]);
-type MyFrame = "block" | "caseStmt" | "caseExpr";
-// END IF / END LOOP / END WHILE / END REPEAT, and MariaDB's END FOR: never counted.
-const MYSQL_NEUTRAL_END = new Set(["if", "loop", "while", "repeat", "for"]);
 const MYSQL_IDENT_PUNCT = "(,.=<>!+-*/%|&^~@";
+const MYSQL_CHARACTERISTICS = new Map<string, number>([
+  ["comment", 1],
+  ["language", 1],
+  ["not", 1],
+  ["deterministic", 0],
+  ["contains", 1],
+  ["no", 1],
+  ["reads", 2],
+  ["modifies", 2],
+  ["sql", 2],
+]);
+const MYSQL_FUNCTION_BODY = new Set(["return", "begin", "case", "if", "loop", "while", "repeat", "for"]);
+type MyPhase =
+  | "name" | "params" | "chars" | "returns" | "trigger" | "triggerOrder" | "event" | "bodyStart" | "compound" | "simple";
+type MyHandler = "none" | "awaitFor" | "conditions" | "conditionsDone";
 
-/** MySQL unquoted-identifier character: may lead with a digit or a non-ASCII char. */
+/** MySQL unquoted-identifier character: letters, digits, `_`, `$` and non-ASCII. */
 function isMyWord(cc: number): boolean {
-  return isWord(cc) || cc >= 0x80;
+  return isWord(cc) || cc === DOLLAR || cc >= 0x80;
 }
 /** Rust's `u8::is_ascii_whitespace` (no vertical tab, unlike `\s`). */
 function isAsciiWs(cc: number): boolean {
@@ -271,21 +290,229 @@ function mysqlPeek(doc: string, i: number): { next: number; word: string; after:
   return { next: doc.charCodeAt(start), word: asciiLower(doc.slice(start, i)), after: i };
 }
 
-// `prev` encodes the previous code token of a MySQL body: "" for a value (string,
-// quoted name, BEGIN/END read as a name), a single non-word character for punctuation,
-// or a lowercased word.
-const isPunct = (prev: string): boolean => prev.length === 1 && !isMyWord(prev.charCodeAt(0));
-
-/** At depth 0: whether `prev` makes a following BEGIN/CASE an operand or a name. */
-function mysqlIdentContext(prev: string): boolean {
-  if (prev === "") return false;
-  if (isPunct(prev)) return MYSQL_IDENT_PUNCT.includes(prev);
-  return MYSQL_IDENT_PREV.has(prev);
+/** The token ending at `i` is a label: a `:` follows (`:=` is an assignment). */
+function mysqlLabelFollows(doc: string, i: number): boolean {
+  const { next, word, after } = mysqlPeek(doc, i);
+  return next === COLON && word === "" && doc.charCodeAt(after + 1) !== EQUALS;
 }
 
-/** Inside a body: the next word starts a statement. Mirrors `mysql_stmt_position`. */
-function mysqlStmtPosition(prev: string): boolean {
-  return prev === ";" || prev === ":" || prev === "begin" || MYSQL_STMT_PREV.has(prev);
+// `prev` encodes the previous code token: "" for a value (string, quoted name, BEGIN/END
+// read as a name), a single non-word character for punctuation, or a lowercased word.
+const isPunct = (prev: string): boolean => prev.length === 1 && !isMyWord(prev.charCodeAt(0));
+
+/** Lexer state for one MySQL statement; inert until its head proves it a stored program. */
+class MyProgram {
+  active = false;
+  fn = false;
+  phase: MyPhase = "name";
+  /** Parenthesis depth (params/returns/event) or words still due (chars/triggerOrder). */
+  n = 0;
+  frames: MyFrame[] = [];
+  stmt = false;
+  label = false;
+  tail = false;
+  handler: MyHandler = "none";
+  done = false;
+
+  start(kind: string): void {
+    this.active = true;
+    this.fn = kind === "function";
+    this.phase = kind === "trigger" ? "trigger" : kind === "event" ? "event" : "name";
+    this.n = 0;
+  }
+
+  /** The body's first token (`script.rs::mysql_body_start`). */
+  private bodyStart(doc: string, word: string, end: number): void {
+    if (mysqlLabelFollows(doc, end)) {
+      this.phase = "bodyStart";
+      return;
+    }
+    const frame = OPENED_BY.get(word);
+    if (frame) {
+      this.phase = "compound";
+      this.stmt = listsAtOnce(frame);
+      this.frames.push(frame);
+    } else this.phase = "simple";
+  }
+
+  /** One word (`script.rs::mysql_body_word`); returns the token it leaves behind. */
+  word(doc: string, word: string, end: number, prev: string): string {
+    switch (this.phase) {
+      case "chars":
+        if (this.n > 0) this.n--;
+        else if (MYSQL_CHARACTERISTICS.has(word)) this.n = MYSQL_CHARACTERISTICS.get(word)!;
+        else this.bodyStart(doc, word, end);
+        break;
+      case "returns":
+        if (this.n === 0 && (MYSQL_FUNCTION_BODY.has(word) || mysqlLabelFollows(doc, end))) this.bodyStart(doc, word, end);
+        break;
+      case "trigger":
+        if (word === "row" && prev === "each") {
+          this.phase = "triggerOrder";
+          this.n = 0;
+        }
+        break;
+      case "triggerOrder":
+        if (this.n === 1) this.phase = "bodyStart";
+        else if (word === "follows" || word === "precedes") this.n = 1;
+        else this.bodyStart(doc, word, end);
+        break;
+      case "event":
+        if (this.n === 0 && word === "do") this.phase = "bodyStart";
+        break;
+      case "bodyStart":
+        this.bodyStart(doc, word, end);
+        break;
+      case "compound":
+        return this.compoundWord(doc, word, end, prev);
+    }
+    return word;
+  }
+
+  /** `script.rs::mysql_compound_word` (with `mysql_end`); Rust's errors are not raised here. */
+  private compoundWord(doc: string, word: string, end: number, prev: string): string {
+    if (this.tail) {
+      this.tail = false;
+      this.stmt = false;
+      this.label = false;
+      return word;
+    }
+    if (this.done) return word;
+    let atStmt = this.stmt;
+    if (this.handler === "conditionsDone") {
+      atStmt = true;
+      this.handler = "none";
+    }
+    this.stmt = false;
+    this.label = false;
+    const top = this.frames.length ? this.frames[this.frames.length - 1] : null;
+    if (word === "end") {
+      if (top === null) return "";
+      const next = mysqlPeek(doc, end).word;
+      let closes: boolean;
+      if (top === "caseExpr") {
+        if (prev === "") closes = true;
+        else if (isPunct(prev)) closes = !MYSQL_IDENT_PUNCT.includes(prev);
+        else closes = !MYSQL_EXPR_NAME_PREV.has(prev);
+      } else if (top === "repeat") closes = next === "repeat" || atStmt;
+      else closes = atStmt;
+      if (!closes) return "";
+      if (top !== "caseExpr") this.tail = END_TAILS.has(next);
+      this.frames.pop();
+      if (this.frames.length === 0) this.done = true;
+      return word;
+    }
+    if (word === "then" || word === "else") {
+      this.stmt = top === "if" || top === "caseStmt";
+      return word;
+    }
+    if (word === "do") {
+      this.stmt = !atStmt && (top === "while" || top === "for");
+      return word;
+    }
+    if (this.handler === "awaitFor" && word === "for") {
+      this.handler = "conditions";
+      return word;
+    }
+    if (this.handler === "conditions") {
+      this.handler = word === "not" || word === "sqlstate" || word === "value" ? "conditions" : "conditionsDone";
+      return word;
+    }
+    if (word === "handler" && (prev === "continue" || prev === "exit" || prev === "undo")) {
+      this.handler = "awaitFor";
+      return word;
+    }
+    if (atStmt) {
+      const frame = OPENED_BY.get(word);
+      if (frame) {
+        this.stmt = listsAtOnce(frame);
+        this.frames.push(frame);
+      } else this.label = true;
+    } else if (word === "case") this.frames.push("caseExpr");
+    return word;
+  }
+
+  /** A string or quoted identifier ending at `end` (`script.rs::mysql_body_value`). */
+  value(doc: string, end: number): void {
+    if (!this.active) return;
+    switch (this.phase) {
+      case "chars":
+        if (this.n > 0) this.n--;
+        else this.phase = mysqlLabelFollows(doc, end) ? "bodyStart" : "simple";
+        break;
+      case "bodyStart":
+        this.phase = mysqlLabelFollows(doc, end) ? "bodyStart" : "simple";
+        break;
+      case "triggerOrder":
+        if (this.n === 1) this.phase = "bodyStart";
+        else this.phase = mysqlLabelFollows(doc, end) ? "bodyStart" : "simple";
+        break;
+      case "returns":
+        if (this.n === 0 && mysqlLabelFollows(doc, end)) this.phase = "bodyStart";
+        break;
+      case "compound":
+        if (this.done) return;
+        if (this.handler === "conditions" || this.handler === "conditionsDone") this.handler = "conditionsDone";
+        this.label = this.stmt;
+        this.stmt = false;
+        this.tail = false;
+        break;
+    }
+  }
+
+  /** A punctuation char other than `;` (`script.rs::mysql_body_punct`). */
+  punct(cc: number): void {
+    if (!this.active) return;
+    switch (this.phase) {
+      case "name":
+        if (cc === LPAREN) {
+          this.phase = "params";
+          this.n = 1;
+        }
+        break;
+      case "params":
+        if (cc === LPAREN) this.n++;
+        else if (cc === RPAREN) {
+          if (this.n > 1) this.n--;
+          else {
+            this.phase = this.fn ? "returns" : "chars";
+            this.n = 0;
+          }
+        }
+        break;
+      case "returns":
+        if (cc === LPAREN) this.n++;
+        else if (cc === RPAREN) this.n = Math.max(0, this.n - 1);
+        else if (cc === COLON && this.n === 0) this.phase = "bodyStart";
+        break;
+      case "event":
+        if (cc === LPAREN) this.n++;
+        else if (cc === RPAREN) this.n = Math.max(0, this.n - 1);
+        break;
+      case "bodyStart":
+        if (cc !== COLON) this.phase = "simple";
+        break;
+      case "chars":
+      case "triggerOrder":
+        this.phase = "simple";
+        break;
+      case "compound":
+        if (this.done) return;
+        if (cc === COMMA && (this.handler === "conditions" || this.handler === "conditionsDone")) this.handler = "conditions";
+        this.stmt = cc === COLON && this.label;
+        this.label = false;
+        this.tail = false;
+        break;
+    }
+  }
+
+  /** A `;` inside the body. */
+  semi(): void {
+    this.stmt = true;
+    this.label = false;
+    this.tail = false;
+    this.handler = "none";
+  }
 }
 
 export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine): LexResult {
@@ -313,68 +540,9 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
   let inTrigger = false;
   let mysqlHead: boolean | null = null;
   // MySQL stored-program state (mirrors `script.rs::MyBody`): the token before the
-  // current one (see `isPunct` for the encoding), the open BEGIN/CASE frames, whether a
-  // handler's condition list is being read, and whether the outermost block closed.
+  // current one (see `isPunct` for the encoding) and the program being read.
   let myPrev = "";
-  let myFrames: MyFrame[] = [];
-  let myHandler = false;
-  let myDone = false;
-
-  // One word of a MySQL stored-program body. Mirrors `script.rs::mysql_body_word`:
-  // BEGIN … END and CASE … END [CASE] are frames; IF/LOOP/WHILE/REPEAT/FOR are not, so
-  // their END IF/END LOOP/… closers leave the stack alone. Inside a block a block opens
-  // only at a statement position and closes only right after `;` (or its own BEGIN);
-  // inside a CASE expression nothing opens and END closes unless something wants an
-  // operand before it; only at depth 0 does BEGIN fall back to the surrounding words.
-  const mysqlBodyWord = (word: string, end: number): string => {
-    const top = myFrames.length ? myFrames[myFrames.length - 1] : null;
-    if (word === "begin") {
-      let opens: boolean;
-      if (top === "caseExpr") opens = false;
-      else if (top !== null) opens = mysqlStmtPosition(myPrev) || (myHandler && !mysqlIdentContext(myPrev));
-      else {
-        const { next, word: nextWord, after } = mysqlPeek(doc, end);
-        const forUpdate = nextWord === "for" && ["update", "share"].includes(mysqlPeek(doc, after).word);
-        opens =
-          !mysqlIdentContext(myPrev) &&
-          (next < 0 ||
-            ((isAlphaOrUnderscore(next) || next === BTICK || next === LPAREN || next >= 0x80) &&
-              !MYSQL_EXPR_FOLLOW.has(nextWord) &&
-              !forUpdate));
-      }
-      if (!opens) return "";
-      myHandler = false;
-      myFrames.push("block");
-    } else if (word === "end") {
-      let closes: boolean;
-      if (top === null) closes = false;
-      else if (top === "block") closes = myPrev === ";" || myPrev === "begin";
-      else if (top === "caseStmt") closes = myPrev === ";";
-      else if (myPrev === "") closes = true;
-      else if (isPunct(myPrev)) closes = !MYSQL_IDENT_PUNCT.includes(myPrev);
-      else closes = !MYSQL_EXPR_NAME_PREV.has(myPrev);
-      if (!closes) return "";
-      const nextWord = mysqlPeek(doc, end).word;
-      const pops = !MYSQL_NEUTRAL_END.has(nextWord) && !(top === "block" && nextWord === "case");
-      if (pops) {
-        myFrames.pop();
-        if (top === "block" && myFrames.length === 0) myDone = true;
-      }
-    } else if (word === "case") {
-      // CASE is reserved: always the keyword, except as the tail of `END CASE`.
-      if (myPrev !== "end") {
-        const statement =
-          top === "caseExpr" ? false : top !== null ? mysqlStmtPosition(myPrev) || myHandler : !mysqlIdentContext(myPrev);
-        if (statement) {
-          myHandler = false;
-          myFrames.push("caseStmt");
-        } else myFrames.push("caseExpr");
-      }
-    } else if (word === "handler" && (myPrev === "continue" || myPrev === "exit" || myPrev === "undo")) {
-      myHandler = true;
-    }
-    return word;
-  };
+  let my = new MyProgram();
 
   const pushCode = (to: number) => {
     if (to > codeStart) spans.push({ from: codeStart, to, kind: "code" });
@@ -408,6 +576,7 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
     spans.push({ from: start, to: i, kind });
     codeStart = i;
     myPrev = "";
+    if (mysql) my.value(doc, i);
   };
 
   while (i < n) {
@@ -509,7 +678,8 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
     }
     // dollar-quoted body  $tag$ … $tag$  (not a T-SQL construct: `$` is an identifier
     // and money-literal character there)
-    if (cc === DOLLAR && !mssql) {
+    // (not MySQL either: `$` is an identifier char there, read by the word branch)
+    if (cc === DOLLAR && !mssql && !mysql) {
       const end = dollarTagEnd(doc, i);
       if (end >= 0) {
         pushCode(i);
@@ -574,11 +744,10 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
         head.push(word);
         mysqlHead = mysqlProgramHead(head);
         myPrev = word;
-      } else if (mysqlHead && !myDone) {
-        // (After the program's closing END only a label may follow; Rust refuses
-        // anything else at execution, so nothing there moves a boundary.)
-        myPrev = mysqlBodyWord(word, i);
-        blockDepth = myFrames.length;
+        if (mysqlHead) my.start(word);
+      } else if (mysqlHead) {
+        myPrev = my.word(doc, word, i, myPrev);
+        blockDepth = my.frames.length;
       }
       continue;
     }
@@ -592,16 +761,14 @@ export function lex(doc: string, engine: SqlEngine = sqlDialect() as SqlEngine):
       head = [];
       inTrigger = false;
       mysqlHead = null;
-      myFrames = [];
-      myHandler = false;
-      myDone = false;
+      my = new MyProgram();
       continue;
     }
 
     if (mysql && !isAsciiWs(cc)) {
       myPrev = doc[i];
-      // A handler's condition list ends with its (single-statement) body.
-      if (cc === SEMI) myHandler = false;
+      if (cc === SEMI) my.semi();
+      else my.punct(cc);
     }
     i++;
   }

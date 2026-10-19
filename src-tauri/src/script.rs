@@ -229,104 +229,161 @@ fn mysql_program_head(words: &[String]) -> Option<bool> {
     Some(MYSQL_PROGRAM_KINDS.contains(&at(i)?))
 }
 
-/// The last code token before the current one inside a MySQL stored-program body.
-/// `BEGIN` and `END` are NOT reserved in MySQL — a column, variable or parameter may be
-/// called `end` — so whether one is a block keyword depends on what precedes it.
+/// The last code token before the current one inside a MySQL stored program: what a
+/// CASE expression's `END` and a trigger's `ROW` are read against.
 #[derive(Clone, Copy)]
 enum MyPrev {
-    /// A string, a quoted identifier, or a `BEGIN`/`END` read as an identifier.
+    /// A string, a quoted identifier, or a `BEGIN`/`END` read as a name.
     Value,
     Punct(u8),
     /// A bare word, as a byte range of the script.
     Word(usize, usize),
 }
 
-/// One open construct of a MySQL stored-program body. A `CASE` is a statement (its
-/// branches are statement lists ending in `;`, closed by `END CASE`) or an expression
-/// (closed by a bare `END` after a value), and the two close by different rules.
+/// One open construct of a MySQL stored-program body. All but a CASE expression hold
+/// statements (each ended by `;`) and close with their own `END …`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MyFrame {
     Block,
     CaseStmt,
     CaseExpr,
+    If,
+    Loop,
+    While,
+    Repeat,
+    /// MariaDB's `FOR … DO … END FOR`.
+    For,
 }
 
-/// Lexer state for one MySQL stored program.
+impl MyFrame {
+    /// The word after the `END` that closes this frame; `None` for a bare `END`.
+    fn tail(self) -> Option<&'static str> {
+        match self {
+            MyFrame::Block | MyFrame::CaseExpr => None,
+            MyFrame::CaseStmt => Some("case"),
+            MyFrame::If => Some("if"),
+            MyFrame::Loop => Some("loop"),
+            MyFrame::While => Some("while"),
+            MyFrame::Repeat => Some("repeat"),
+            MyFrame::For => Some("for"),
+        }
+    }
+
+    /// The compound statement a word opens at the start of a statement.
+    fn opened_by(word: &[u8]) -> Option<MyFrame> {
+        let is = |k: &str| word.eq_ignore_ascii_case(k.as_bytes());
+        if is("begin") {
+            Some(MyFrame::Block)
+        } else if is("case") {
+            Some(MyFrame::CaseStmt)
+        } else if is("if") {
+            Some(MyFrame::If)
+        } else if is("loop") {
+            Some(MyFrame::Loop)
+        } else if is("while") {
+            Some(MyFrame::While)
+        } else if is("repeat") {
+            Some(MyFrame::Repeat)
+        } else if is("for") {
+            Some(MyFrame::For)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the statement list starts right after the opening word (`BEGIN`, `LOOP`,
+    /// `REPEAT`); the others read a condition or an operand first.
+    fn lists_at_once(self) -> bool {
+        matches!(self, MyFrame::Block | MyFrame::Loop | MyFrame::Repeat)
+    }
+}
+
+/// Where a stored program's lexer stands: reading its head, or in its body. The head is
+/// read by its grammar so the body's first token is found exactly — that token alone
+/// decides whether the body is compound (it can hold `;`) or one plain statement (it
+/// cannot).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MyPhase {
+    /// Procedure / function: the name, up to the parameter list.
+    Name,
+    /// Inside the parameter list, at this parenthesis depth.
+    Params(u32),
+    /// Procedure: its characteristics; this many words still belong to the current one.
+    Chars(u8),
+    /// Function: `RETURNS type` and characteristics, at this parenthesis depth.
+    Returns(u32),
+    /// Trigger: up to `FOR EACH ROW`.
+    Trigger,
+    /// Trigger: after `ROW`; 1 while a FOLLOWS/PRECEDES trigger name is due.
+    TriggerOrder(u8),
+    /// Event: up to `DO`, at this parenthesis depth.
+    Event(u32),
+    /// The next token starts the body, or is its label.
+    BodyStart,
+    /// A compound body: frames are open (or the outermost has just closed).
+    Compound,
+    /// A one-statement body: it cannot hold a `;`, so nothing in it suppresses one.
+    Simple,
+}
+
+/// `DECLARE … HANDLER FOR <conditions> <statement>`: the handler's statement starts
+/// right after its condition list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MyHandler {
+    None,
+    /// After `HANDLER`, before `FOR`.
+    AwaitFor,
+    /// Reading conditions; `true` once the current one is complete.
+    Conditions(bool),
+}
+
+/// Lexer state for one MySQL statement; inert until its head proves it a stored program.
 struct MyBody {
+    active: bool,
+    function: bool,
+    phase: MyPhase,
     frames: Vec<MyFrame>,
-    /// Inside `DECLARE {CONTINUE|EXIT|UNDO} HANDLER FOR …`, whose condition list is
-    /// followed by the handler's statement — the one place a block opens after a value.
-    handler: bool,
-    /// The outermost block has closed: only a label and the `;` may follow.
+    /// The next code token starts a statement.
+    stmt: bool,
+    /// The previous token started a statement, so a `:` after it ends a label.
+    label: bool,
+    /// The next word is the `IF`/`LOOP`/… of the `END …` just read.
+    tail: bool,
+    handler: MyHandler,
+    /// The outermost frame has closed: only a label and the `;` may follow.
     done: bool,
-    /// Code tokens seen since the outermost block closed.
+    /// Code tokens seen since then.
     after: usize,
 }
 
 impl MyBody {
     fn new() -> Self {
         MyBody {
+            active: false,
+            function: false,
+            phase: MyPhase::Name,
             frames: Vec::new(),
-            handler: false,
+            stmt: false,
+            label: false,
+            tail: false,
+            handler: MyHandler::None,
             done: false,
             after: 0,
         }
     }
+
+    /// The head just named the program's kind.
+    fn start(&mut self, kind: &str) {
+        self.active = true;
+        self.function = kind == "function";
+        self.phase = match kind {
+            "trigger" => MyPhase::Trigger,
+            "event" => MyPhase::Event(0),
+            _ => MyPhase::Name,
+        };
+    }
 }
 
-/// Words at depth 0 (the routine head, or a body that is one plain statement) after
-/// which a `BEGIN`/`END` is an operand or a name, not a block keyword.
-const MYSQL_IDENT_PREV: [&str; 46] = [
-    "select",
-    "set",
-    "where",
-    "and",
-    "or",
-    "xor",
-    "not",
-    "on",
-    "by",
-    "when",
-    "in",
-    "out",
-    "inout",
-    "declare",
-    "into",
-    "return",
-    "is",
-    "like",
-    "between",
-    "having",
-    "distinct",
-    "as",
-    "using",
-    "div",
-    "mod",
-    "interval",
-    "case",
-    "if",
-    "elseif",
-    "while",
-    "until",
-    "from",
-    "join",
-    "update",
-    "table",
-    "call",
-    "procedure",
-    "function",
-    "trigger",
-    "event",
-    "all",
-    "any",
-    "some",
-    "regexp",
-    "rlike",
-    "exists",
-];
-/// Words after which a statement starts inside a body (besides `;`, a label's `:` and a
-/// block's own `BEGIN`): only there can a `BEGIN` open a block or a `CASE` be a statement.
-const MYSQL_STMT_PREV: [&str; 5] = ["then", "else", "do", "loop", "repeat"];
 /// Inside a CASE expression, the RESERVED words after which `END` is an operand or a
 /// name. Reserved only: a non-reserved word there (`ELSE event END`) is itself a
 /// column, so the `END` after it closes the CASE.
@@ -335,60 +392,30 @@ const MYSQL_EXPR_NAME_PREV: [&str; 29] = [
     "regexp", "rlike", "interval", "case", "select", "from", "where", "by", "as", "on", "distinct",
     "exists", "having", "using", "join", "binary",
 ];
-/// Words that continue a statement: at depth 0 a `BEGIN` followed by one is a name
-/// (`FROM t begin WHERE …`). `FOR` only as `FOR UPDATE` / `FOR SHARE`: MariaDB's
-/// `BEGIN FOR i IN …` loop is a block.
-const MYSQL_EXPR_FOLLOW: [&str; 44] = [
-    "from",
-    "as",
-    "is",
-    "in",
-    "and",
-    "or",
-    "xor",
-    "div",
-    "mod",
-    "like",
-    "between",
-    "regexp",
-    "rlike",
-    "sounds",
-    "collate",
-    "desc",
-    "asc",
-    "then",
-    "else",
-    "when",
-    "where",
-    "into",
-    "order",
-    "group",
-    "limit",
-    "having",
-    "union",
-    "on",
-    "using",
-    "join",
-    "inner",
-    "left",
-    "right",
-    "cross",
-    "straight_join",
-    "natural",
-    "force",
-    "use",
-    "ignore",
-    "lock",
-    "window",
-    "except",
-    "intersect",
-    "partition",
-];
-/// Punctuation after which a `BEGIN`/`END` is an operand (`t.end`, `@end`, `= end`).
+/// Punctuation after which `END` is an operand (`t.end`, `@end`, `= end`).
 const MYSQL_IDENT_PUNCT: &[u8] = b"(,.=<>!+-*/%|&^~@";
+/// A procedure's characteristics, and how many fixed words follow each
+/// (`COMMENT 'x'`, `LANGUAGE SQL`, `NOT DETERMINISTIC`, `READS SQL DATA`, `SQL SECURITY x`).
+const MYSQL_CHARACTERISTICS: [(&str, u8); 9] = [
+    ("comment", 1),
+    ("language", 1),
+    ("not", 1),
+    ("deterministic", 0),
+    ("contains", 1),
+    ("no", 1),
+    ("reads", 2),
+    ("modifies", 2),
+    ("sql", 2),
+];
+/// A function body is `RETURN …` or a compound statement: its first word is one of these.
+const MYSQL_FUNCTION_BODY: [&str; 8] = [
+    "return", "begin", "case", "if", "loop", "while", "repeat", "for",
+];
 
+/// A MySQL unquoted-identifier byte: letters, digits, `_`, `$` and any non-ASCII byte.
+/// (MySQL has no dollar quoting, so `a$$b` is one name.)
 fn mysql_word_byte(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80
 }
 
 fn word_is(word: &[u8], keywords: &[&str]) -> bool {
@@ -437,34 +464,29 @@ fn mysql_peek(b: &[u8], mut i: usize) -> (Option<u8>, &[u8], usize) {
     (Some(b[start]), &b[start..i], i)
 }
 
+/// The token ending at `i` is a label: a `:` follows it (`:=` is an assignment).
+fn mysql_label_follows(b: &[u8], i: usize) -> bool {
+    let (next, word, at) = mysql_peek(b, i);
+    next == Some(b':') && word.is_empty() && b.get(at + 1) != Some(&b'=')
+}
+
 fn prev_word_is(b: &[u8], prev: MyPrev, keywords: &[&str]) -> bool {
     matches!(prev, MyPrev::Word(s, e) if word_is(&b[s..e], keywords))
 }
 
-/// At depth 0: whether `prev` makes a following `BEGIN`/`CASE` an operand or a name.
-fn mysql_ident_context(b: &[u8], prev: MyPrev) -> bool {
-    match prev {
-        MyPrev::Value => false,
-        MyPrev::Punct(c) => MYSQL_IDENT_PUNCT.contains(&c),
-        MyPrev::Word(..) => prev_word_is(b, prev, &MYSQL_IDENT_PREV),
+fn mysql_mismatch(checked: bool, what: &str) -> Result<(), AppError> {
+    if checked {
+        return Err(AppError::new(format!(
+            "this stored program's blocks do not match ({what}), so Tusk cannot tell where it ends. Close each block with its own END (END IF, END LOOP, …), and quote a column or variable named BEGIN or END with backticks."
+        )));
     }
+    Ok(())
 }
 
-/// Inside a body: `prev` ends a statement or opens a statement list, so the next word
-/// starts a statement. A `BEGIN` read as a name leaves `Value`, never `Word("begin")`.
-fn mysql_stmt_position(b: &[u8], prev: MyPrev) -> bool {
-    matches!(prev, MyPrev::Punct(b';' | b':'))
-        || prev_word_is(b, prev, &["begin"])
-        || prev_word_is(b, prev, &MYSQL_STMT_PREV)
-}
-
-/// One code token after a stored program's outermost block closed. Only a label may
-/// follow that `END` before the `;`; anything else means the body closed early, and
-/// execution refuses the statement rather than send the rest of it along.
+/// One code token after the program's outermost block closed. Only a label may follow
+/// that `END` before the `;`; anything else means the body closed early, and execution
+/// refuses the statement rather than send the rest of it along.
 fn mysql_after_body(my: &mut MyBody, label: bool, checked: bool) -> Result<(), AppError> {
-    if !my.done {
-        return Ok(());
-    }
     my.after += 1;
     if checked && !(label && my.after == 1) {
         return Err(AppError::new(
@@ -474,101 +496,298 @@ fn mysql_after_body(my: &mut MyBody, label: bool, checked: bool) -> Result<(), A
     Ok(())
 }
 
-/// Closers of the blocks that are never counted: `END IF`, `END LOOP`, `END WHILE`,
-/// `END REPEAT`, and MariaDB's `END FOR`.
-const MYSQL_NEUTRAL_END: [&str; 5] = ["if", "loop", "while", "repeat", "for"];
-
-/// One word of a MySQL stored-program body: maintains the frame stack and returns the
-/// token it leaves behind. `BEGIN … END` and `CASE … END [CASE]` are frames;
-/// `IF`/`LOOP`/`WHILE`/`REPEAT`/`FOR` are not (`IF(` is also a function and `IF EXISTS`
-/// a DDL clause), so their `END IF`/`END LOOP`/… closers leave the stack alone.
-///
-/// MySQL does not reserve `BEGIN` or `END`, so a word is a keyword only where the
-/// grammar allows one. Inside a block, a block opens only at a statement position and
-/// closes only right after a `;` (or its own `BEGIN`). Inside a CASE expression nothing
-/// opens a block, and `END` closes unless an operator or a reserved keyword wants an
-/// operand before it. Only at depth 0, where the body's own `BEGIN` follows a head of
-/// arbitrary characteristics, does a `BEGIN` fall back to the surrounding words.
-fn mysql_body_word(b: &[u8], start: usize, end: usize, prev: MyPrev, st: &mut MyBody) -> MyPrev {
-    let word = &b[start..end];
-    let top = st.frames.last().copied();
-    if word.eq_ignore_ascii_case(b"begin") {
-        let opens = match top {
-            Some(MyFrame::CaseExpr) => false,
-            Some(_) => {
-                mysql_stmt_position(b, prev) || (st.handler && !mysql_ident_context(b, prev))
-            }
-            None => {
-                // The body's own block: followed by a statement, a label, END or `(`.
-                let (next, next_word, after) = mysql_peek(b, end);
-                let for_update = next_word.eq_ignore_ascii_case(b"for")
-                    && word_is(mysql_peek(b, after).1, &["update", "share"]);
-                !mysql_ident_context(b, prev)
-                    && match next {
-                        None => true,
-                        Some(c) => {
-                            (c.is_ascii_alphabetic()
-                                || matches!(c, b'_' | b'`' | b'(')
-                                || c >= 0x80)
-                                && !word_is(next_word, &MYSQL_EXPR_FOLLOW)
-                                && !for_update
-                        }
-                    }
-            }
-        };
-        if !opens {
-            return MyPrev::Value;
-        }
-        st.handler = false;
-        st.frames.push(MyFrame::Block);
-    } else if word.eq_ignore_ascii_case(b"end") {
-        let closes = match top {
-            None => false,
-            Some(MyFrame::Block) => {
-                matches!(prev, MyPrev::Punct(b';')) || prev_word_is(b, prev, &["begin"])
-            }
-            Some(MyFrame::CaseStmt) => matches!(prev, MyPrev::Punct(b';')),
-            Some(MyFrame::CaseExpr) => match prev {
-                MyPrev::Value => true,
-                MyPrev::Punct(c) => !MYSQL_IDENT_PUNCT.contains(&c),
-                MyPrev::Word(..) => !prev_word_is(b, prev, &MYSQL_EXPR_NAME_PREV),
-            },
-        };
-        if !closes {
-            return MyPrev::Value;
-        }
-        let (_, next_word, _) = mysql_peek(b, end);
-        // `END IF`/`END LOOP`/… close what was never pushed; `END CASE` must not close
-        // a block (input that unbalanced is refused at the end instead).
-        let keeps = word_is(next_word, &MYSQL_NEUTRAL_END)
-            || (top == Some(MyFrame::Block) && next_word.eq_ignore_ascii_case(b"case"));
-        if !keeps {
-            st.frames.pop();
-            if top == Some(MyFrame::Block) && st.frames.is_empty() {
-                st.done = true;
-            }
-        }
-    } else if word.eq_ignore_ascii_case(b"case") {
-        // CASE is reserved, so it is always the keyword — the tail of `END CASE` aside.
-        if !prev_word_is(b, prev, &["end"]) {
-            let statement = match top {
-                Some(MyFrame::CaseExpr) => false,
-                Some(_) => mysql_stmt_position(b, prev) || st.handler,
-                None => !mysql_ident_context(b, prev),
-            };
-            if statement {
-                st.handler = false;
-                st.frames.push(MyFrame::CaseStmt);
-            } else {
-                st.frames.push(MyFrame::CaseExpr);
-            }
-        }
-    } else if word.eq_ignore_ascii_case(b"handler")
-        && prev_word_is(b, prev, &["continue", "exit", "undo"])
-    {
-        st.handler = true;
+/// The body's first token: a compound statement opens its frame, anything else makes
+/// the body one plain statement. A label first leaves the start where it is.
+fn mysql_body_start(b: &[u8], start: usize, end: usize, my: &mut MyBody) {
+    if mysql_label_follows(b, end) {
+        my.phase = MyPhase::BodyStart;
+        return;
     }
-    MyPrev::Word(start, end)
+    match MyFrame::opened_by(&b[start..end]) {
+        Some(frame) => {
+            my.phase = MyPhase::Compound;
+            my.stmt = frame.lists_at_once();
+            my.frames.push(frame);
+        }
+        None => my.phase = MyPhase::Simple,
+    }
+}
+
+/// One word of a MySQL stored program (after its head named the kind).
+fn mysql_body_word(
+    b: &[u8],
+    start: usize,
+    end: usize,
+    prev: MyPrev,
+    my: &mut MyBody,
+    checked: bool,
+) -> Result<MyPrev, AppError> {
+    let word = &b[start..end];
+    let me = MyPrev::Word(start, end);
+    let is = |k: &str| word.eq_ignore_ascii_case(k.as_bytes());
+    match my.phase {
+        MyPhase::Name | MyPhase::Params(_) | MyPhase::Simple => {}
+        MyPhase::Chars(skip) if skip > 0 => my.phase = MyPhase::Chars(skip - 1),
+        MyPhase::Chars(_) => match MYSQL_CHARACTERISTICS.iter().find(|(k, _)| is(k)) {
+            Some((_, more)) => my.phase = MyPhase::Chars(*more),
+            None => mysql_body_start(b, start, end, my),
+        },
+        MyPhase::Returns(depth) => {
+            if depth == 0 && (word_is(word, &MYSQL_FUNCTION_BODY) || mysql_label_follows(b, end)) {
+                mysql_body_start(b, start, end, my);
+            }
+        }
+        MyPhase::Trigger => {
+            if is("row") && prev_word_is(b, prev, &["each"]) {
+                my.phase = MyPhase::TriggerOrder(0);
+            }
+        }
+        MyPhase::TriggerOrder(1) => my.phase = MyPhase::BodyStart,
+        MyPhase::TriggerOrder(_) => {
+            if is("follows") || is("precedes") {
+                my.phase = MyPhase::TriggerOrder(1);
+            } else {
+                mysql_body_start(b, start, end, my);
+            }
+        }
+        MyPhase::Event(depth) => {
+            if depth == 0 && is("do") {
+                my.phase = MyPhase::BodyStart;
+            }
+        }
+        MyPhase::BodyStart => mysql_body_start(b, start, end, my),
+        MyPhase::Compound => return mysql_compound_word(b, start, end, prev, my, checked),
+    }
+    Ok(me)
+}
+
+/// One word of a compound body. MySQL does not reserve `BEGIN` or `END`, so a word is a
+/// keyword only where the grammar allows one: a compound statement opens only where a
+/// statement starts, and every frame but a CASE expression closes only with its own
+/// `END …` right after the `;` of its last statement.
+fn mysql_compound_word(
+    b: &[u8],
+    start: usize,
+    end: usize,
+    prev: MyPrev,
+    my: &mut MyBody,
+    checked: bool,
+) -> Result<MyPrev, AppError> {
+    let word = &b[start..end];
+    let me = MyPrev::Word(start, end);
+    let is = |k: &str| word.eq_ignore_ascii_case(k.as_bytes());
+    if my.tail {
+        my.tail = false;
+        my.stmt = false;
+        my.label = false;
+        return Ok(me);
+    }
+    if my.done {
+        mysql_after_body(my, true, checked)?;
+        return Ok(me);
+    }
+    let mut at_stmt = my.stmt;
+    if my.handler == MyHandler::Conditions(true) {
+        // The handler's statement starts after its last condition.
+        at_stmt = true;
+        my.handler = MyHandler::None;
+    }
+    my.stmt = false;
+    my.label = false;
+    let top = my.frames.last().copied();
+    if is("end") {
+        return mysql_end(b, start, end, prev, my, at_stmt, checked);
+    }
+    if is("then") || is("else") {
+        my.stmt = matches!(top, Some(MyFrame::If | MyFrame::CaseStmt));
+        return Ok(me);
+    }
+    if is("do") {
+        // `WHILE … DO` / `FOR … DO` open a statement list; a DO at the start of a
+        // statement is the DO statement, whose operand is an expression.
+        my.stmt = !at_stmt && matches!(top, Some(MyFrame::While | MyFrame::For));
+        return Ok(me);
+    }
+    match my.handler {
+        MyHandler::AwaitFor if is("for") => {
+            my.handler = MyHandler::Conditions(false);
+            return Ok(me);
+        }
+        MyHandler::Conditions(_) => {
+            my.handler = MyHandler::Conditions(!word_is(word, &["not", "sqlstate", "value"]));
+            return Ok(me);
+        }
+        _ => {}
+    }
+    if is("handler") && prev_word_is(b, prev, &["continue", "exit", "undo"]) {
+        my.handler = MyHandler::AwaitFor;
+        return Ok(me);
+    }
+    if at_stmt {
+        match MyFrame::opened_by(word) {
+            Some(frame) => {
+                my.stmt = frame.lists_at_once();
+                my.frames.push(frame);
+            }
+            // A statement may start with its label.
+            None => my.label = true,
+        }
+    } else if is("case") {
+        // CASE is reserved: anywhere but the start of a statement it is an expression.
+        my.frames.push(MyFrame::CaseExpr);
+    }
+    Ok(me)
+}
+
+/// `END` in a compound body: a closer, or a name.
+fn mysql_end(
+    b: &[u8],
+    start: usize,
+    end: usize,
+    prev: MyPrev,
+    my: &mut MyBody,
+    at_stmt: bool,
+    checked: bool,
+) -> Result<MyPrev, AppError> {
+    let Some(top) = my.frames.last().copied() else {
+        return Ok(MyPrev::Value);
+    };
+    let (_, next, _) = mysql_peek(b, end);
+    let closes = match top {
+        // A CASE expression's END follows a complete operand; after an operator or a
+        // reserved word that still wants one, it IS the operand.
+        MyFrame::CaseExpr => match prev {
+            MyPrev::Value => true,
+            MyPrev::Punct(c) => !MYSQL_IDENT_PUNCT.contains(&c),
+            MyPrev::Word(..) => !prev_word_is(b, prev, &MYSQL_EXPR_NAME_PREV),
+        },
+        // `REPEAT … UNTIL cond END REPEAT`: the END follows the condition.
+        MyFrame::Repeat => next.eq_ignore_ascii_case(b"repeat") || at_stmt,
+        // Every other frame's END follows the `;` of its last statement (or an empty
+        // block's own BEGIN); anywhere else END is a name.
+        _ => at_stmt,
+    };
+    if !closes {
+        return Ok(MyPrev::Value);
+    }
+    if top != MyFrame::CaseExpr {
+        let tail = ["case", "if", "loop", "while", "repeat", "for"]
+            .into_iter()
+            .find(|t| next.eq_ignore_ascii_case(t.as_bytes()));
+        if tail != top.tail() {
+            mysql_mismatch(
+                checked,
+                &format!(
+                    "END{} closes {}",
+                    tail.map(|t| format!(" {}", t.to_ascii_uppercase()))
+                        .unwrap_or_default(),
+                    match top.tail() {
+                        Some(t) => format!("a {} block", t.to_ascii_uppercase()),
+                        None => "a BEGIN block".to_string(),
+                    }
+                ),
+            )?;
+        }
+        my.tail = tail.is_some();
+    }
+    my.frames.pop();
+    if my.frames.is_empty() {
+        my.done = true;
+    }
+    Ok(MyPrev::Word(start, end))
+}
+
+/// A string or a quoted identifier in a MySQL stored program.
+fn mysql_body_value(b: &[u8], end: usize, my: &mut MyBody, checked: bool) -> Result<(), AppError> {
+    if !my.active {
+        return Ok(());
+    }
+    match my.phase {
+        MyPhase::Chars(skip) if skip > 0 => my.phase = MyPhase::Chars(skip - 1),
+        MyPhase::Chars(_) | MyPhase::BodyStart | MyPhase::TriggerOrder(0) => {
+            my.phase = if mysql_label_follows(b, end) {
+                MyPhase::BodyStart
+            } else {
+                MyPhase::Simple
+            };
+        }
+        MyPhase::TriggerOrder(_) => my.phase = MyPhase::BodyStart,
+        MyPhase::Returns(0) if mysql_label_follows(b, end) => my.phase = MyPhase::BodyStart,
+        MyPhase::Compound => {
+            if my.done {
+                return mysql_after_body(my, true, checked);
+            }
+            if let MyHandler::Conditions(_) = my.handler {
+                my.handler = MyHandler::Conditions(true);
+            }
+            my.label = my.stmt;
+            my.stmt = false;
+            my.tail = false;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// A punctuation byte in a MySQL stored program (`;` aside: `split_core` handles it).
+fn mysql_body_punct(c: u8, my: &mut MyBody, checked: bool) -> Result<(), AppError> {
+    if !my.active {
+        return Ok(());
+    }
+    match my.phase {
+        MyPhase::Name if c == b'(' => my.phase = MyPhase::Params(1),
+        MyPhase::Params(depth) => {
+            if c == b'(' {
+                my.phase = MyPhase::Params(depth + 1);
+            } else if c == b')' {
+                my.phase = if depth > 1 {
+                    MyPhase::Params(depth - 1)
+                } else if my.function {
+                    MyPhase::Returns(0)
+                } else {
+                    MyPhase::Chars(0)
+                };
+            }
+        }
+        MyPhase::Returns(depth) => {
+            if c == b'(' {
+                my.phase = MyPhase::Returns(depth + 1);
+            } else if c == b')' {
+                my.phase = MyPhase::Returns(depth.saturating_sub(1));
+            } else if c == b':' && depth == 0 {
+                my.phase = MyPhase::BodyStart;
+            }
+        }
+        MyPhase::Event(depth) => {
+            if c == b'(' {
+                my.phase = MyPhase::Event(depth + 1);
+            } else if c == b')' {
+                my.phase = MyPhase::Event(depth.saturating_sub(1));
+            }
+        }
+        // A label's colon keeps the start where it is; anything else starts a plain
+        // statement (a parenthesized query, say).
+        MyPhase::BodyStart if c == b':' => {}
+        MyPhase::Chars(_) | MyPhase::BodyStart | MyPhase::TriggerOrder(_) => {
+            my.phase = MyPhase::Simple
+        }
+        MyPhase::Compound => {
+            if my.done {
+                return mysql_after_body(my, false, checked);
+            }
+            if c == b',' {
+                if let MyHandler::Conditions(_) = my.handler {
+                    my.handler = MyHandler::Conditions(false);
+                }
+            }
+            // `lbl:` — the statement the label belongs to starts next.
+            my.stmt = c == b':' && my.label;
+            my.label = false;
+            my.tail = false;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn split_core(
@@ -760,7 +979,7 @@ fn split_core(
                 i += 1;
             }
             my_prev = MyPrev::Value;
-            mysql_after_body(&mut my, false, checked)?;
+            mysql_body_value(b, i, &mut my, checked)?;
             continue;
         }
         // double-quoted identifier
@@ -798,7 +1017,7 @@ fn split_core(
                 i += 1;
             }
             my_prev = MyPrev::Value;
-            mysql_after_body(&mut my, false, checked)?;
+            mysql_body_value(b, i, &mut my, checked)?;
             continue;
         }
         // MySQL and SQLite accept backtick-quoted identifiers. Keep delimiters inside
@@ -836,8 +1055,7 @@ fn split_core(
                 i += 1;
             }
             my_prev = MyPrev::Value;
-            // A backtick-quoted label may follow the program's closing END.
-            mysql_after_body(&mut my, true, checked)?;
+            mysql_body_value(b, i, &mut my, checked)?;
             continue;
         }
         // SQL Server `[bracket]` identifiers (`]]` escapes a literal `]`). A `;` or
@@ -862,8 +1080,10 @@ fn split_core(
             continue;
         }
         // dollar-quoted body. T-SQL has no dollar quoting (`$` is an identifier and
-        // money-literal character), so it must stay an ordinary code byte there.
-        if c == b'$' {
+        // money-literal character), so it must stay an ordinary code byte there. MySQL has
+        // none either: `$` is an identifier byte (`a$$b` is one name), read by the word
+        // branch below — treating `$$` as a quote merged `SELECT a$$b; …; SELECT x$$y`.
+        if c == b'$' && engine != TransactionEngine::MySql {
             if engine != TransactionEngine::MsSql {
                 if let Some(end) = dollar_tag_end(b, i) {
                     let delim = &b[i..=end];
@@ -880,14 +1100,11 @@ fn split_core(
                         i += 1;
                     }
                     my_prev = MyPrev::Value;
-                    mysql_after_body(&mut my, false, checked)?;
                     continue;
                 }
             }
             cur.push(b'$');
             i += 1;
-            my_prev = MyPrev::Punct(b'$');
-            mysql_after_body(&mut my, false, checked)?;
             continue;
         }
         // T-SQL statement blocks. Consumed as whole words so `BEGIN`/`END`/`CASE`
@@ -963,11 +1180,12 @@ fn split_core(
                     head.push(String::from_utf8_lossy(&b[start..i]).to_ascii_lowercase());
                     mysql_head = mysql_program_head(&head);
                     my_prev = MyPrev::Word(start, i);
+                    if mysql_head == Some(true) {
+                        my.start(head.last().map(String::as_str).unwrap_or_default());
+                    }
                 }
-                // After the program's closing END: at most a label.
-                Some(true) if my.done => mysql_after_body(&mut my, true, checked)?,
                 Some(true) => {
-                    my_prev = mysql_body_word(b, start, i, my_prev, &mut my);
+                    my_prev = mysql_body_word(b, start, i, my_prev, &mut my, checked)?;
                     block_depth = my.frames.len();
                 }
                 // Not a stored program: nothing in it can open a block.
@@ -978,11 +1196,21 @@ fn split_core(
         }
         // statement terminator
         if c == b';' && block_depth > 0 {
+            // A CASE expression never holds a `;`: reading one there means a CASE
+            // statement was taken for an expression (or the text is invalid), and going
+            // on could glue the following statements onto this one.
+            if checked && my.frames.last() == Some(&MyFrame::CaseExpr) {
+                return Err(AppError::new(
+                    "this stored program has a `;` inside a CASE expression, so Tusk cannot tell where it ends. Check that every CASE is closed with END (END CASE for a CASE statement).",
+                ));
+            }
             cur.push(c);
             i += 1;
             my_prev = MyPrev::Punct(b';');
-            // A handler's condition list ends with its (single-statement) body.
-            my.handler = false;
+            my.stmt = true;
+            my.label = false;
+            my.tail = false;
+            my.handler = MyHandler::None;
             continue;
         }
         if c == b';' {
@@ -1063,7 +1291,7 @@ fn split_core(
 
         if !c.is_ascii_whitespace() {
             my_prev = MyPrev::Punct(c);
-            mysql_after_body(&mut my, false, checked)?;
+            mysql_body_punct(c, &mut my, checked)?;
         }
         cur.push(c);
         i += 1;
@@ -3315,6 +3543,75 @@ mod tests {
                 vec![None, Some(TransactionAction::Begin), None, None]
             );
         }
+        // More statements that must never merge into the routine before them: a CASE
+        // expression before FOR UPDATE, a DO statement's CASE, a handler statement's CASE
+        // or alias, and plain bodies that use `begin` as a name (a plain body cannot hold
+        // a `;`, so nothing in it suppresses one).
+        let rest = "START TRANSACTION; DELETE FROM log; CREATE PROCEDURE q() BEGIN SELECT 1; END;";
+        for routine in [
+            "CREATE PROCEDURE p() BEGIN SELECT id FROM t WHERE a = CASE WHEN b THEN 1 END FOR UPDATE; END;",
+            "CREATE PROCEDURE p() SELECT id FROM t WHERE a = CASE WHEN b THEN 1 END FOR UPDATE;",
+            "CREATE PROCEDURE p() BEGIN DO CASE WHEN @a THEN 1 ELSE 2 END; END;",
+            "CREATE PROCEDURE p() BEGIN DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET @e = CASE WHEN @x THEN 1 ELSE 0 END; SELECT 1; END;",
+            "CREATE PROCEDURE p() UPDATE t begin SET a = 1;",
+            "CREATE PROCEDURE p() INSERT begin VALUES (1);",
+            "CREATE PROCEDURE p() SELECT * FROM (SELECT 1) begin (a);",
+            "CREATE PROCEDURE p() WITH begin (x) AS (SELECT 1) SELECT x FROM begin;",
+            "CREATE PROCEDURE p() DO begin(1);",
+            "CREATE PROCEDURE p() BEGIN DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SELECT a FROM t begin; SELECT 1; END;",
+        ] {
+            let sql = format!("{routine} {rest}");
+            let items = parse_for_engine(&sql, mysql).unwrap();
+            assert_eq!(items.len(), 4, "{sql}: {:?}", sql_of(&items));
+            assert_eq!(sql_of(&items)[0], routine.trim_end_matches(';'));
+            // Preflight sees the hidden statements: START TRANSACTION, and the CREATE
+            // that would implicitly commit inside it.
+            assert_eq!(
+                transaction_action_for(&sql_of(&items)[1], mysql).unwrap(),
+                Some(TransactionAction::Begin)
+            );
+            let refused = preflight_transactions(&items, mysql, &TransactionStatus::default())
+                .unwrap_err();
+            assert!(refused.message.contains("statement 4"), "{}", refused.message);
+        }
+        // MySQL has no dollar quoting: `$` is an identifier character.
+        let dollar =
+            parse_for_engine("SELECT a$$b FROM t; START TRANSACTION; SELECT x$$y;", mysql).unwrap();
+        assert_eq!(
+            sql_of(&dollar),
+            vec!["SELECT a$$b FROM t", "START TRANSACTION", "SELECT x$$y"]
+        );
+        // A body that is one IF / WHILE / LOOP / REPEAT / CASE statement is compound too.
+        for sql in [
+            "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW IF NEW.a THEN SET NEW.b = 1; END IF; SELECT 9;",
+            "CREATE PROCEDURE p() WHILE x DO SET x = x - 1; END WHILE; SELECT 9;",
+            "CREATE PROCEDURE p() lbl: LOOP LEAVE lbl; END LOOP lbl; SELECT 9;",
+            "CREATE PROCEDURE p() REPEAT SET x = x + 1; UNTIL x > 3 END REPEAT; SELECT 9;",
+            "CREATE FUNCTION f() RETURNS INT DETERMINISTIC CASE WHEN 1 THEN RETURN 1; ELSE RETURN 2; END CASE; SELECT 9;",
+        ] {
+            assert_eq!(count(sql), 2, "{sql}: {:?}", sql_of(&parse_for_engine(sql, mysql).unwrap()));
+        }
+        // Execution refuses closers that do not match their block, and a `;` inside a
+        // CASE expression: either means the blocks were misread.
+        let mismatch = parse_for_engine(
+            "CREATE PROCEDURE p() BEGIN IF x THEN SELECT 1; END; END; SELECT 9;",
+            mysql,
+        )
+        .err()
+        .expect("END closing an IF block is refused");
+        assert!(
+            mismatch.message.contains("do not match"),
+            "{}",
+            mismatch.message
+        );
+        let semi = parse_for_engine(
+            "CREATE PROCEDURE p() BEGIN SELECT CASE WHEN a THEN 1; END; END;",
+            mysql,
+        )
+        .err()
+        .expect("a `;` inside a CASE expression is refused");
+        assert!(semi.message.contains("CASE expression"), "{}", semi.message);
+
         // CASE statements and CASE expressions nest inside each other.
         for (sql, n) in [
             ("CREATE PROCEDURE p() BEGIN CASE WHEN a THEN SELECT CASE WHEN b THEN 1 ELSE CASE WHEN c THEN 2 END END; ELSE BEGIN SELECT 3; END; END CASE; END; SELECT 9;", 2),

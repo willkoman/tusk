@@ -1,5 +1,5 @@
 import { afterEach, describe, it, expect } from "vitest";
-import { formatForCopy, formatWithOptions, toJSON, toMarkdown, toSQL, toTSV, type Dataset } from "./formats";
+import { formatForCopy, formatWithOptions, mysqlUnqualifyCreate, toJSON, toMarkdown, toSQL, toTSV, type Dataset } from "./formats";
 import { defaultExportOptions, type ExportOptions } from "./export";
 import { boolWord } from "./grid/bool";
 import { setSqlDialect } from "./sql/ident";
@@ -165,5 +165,33 @@ describe("formatWithOptions boolean mapping", () => {
     expect(mssql).toContain("CREATE TABLE [ta]]ble] ([co]]l] nvarchar(max), [flag] bit);");
     expect(mssql).toContain("VALUES (N'path\\name''s', 1);");
     expect(mssql).toContain("VALUES (NULL, 0);");
+  });
+});
+
+// PARITY PAIR with export.rs `mysql_sql_export_creates_the_table_its_inserts_fill` and
+// driver.rs `mysql_create_heads_unqualify_for_export`.
+describe("MySQL CREATE heads in SQL export", () => {
+  it("drops the database qualifier its bare INSERTs do not carry", () => {
+    const d: Dataset = { columns: ["id"], rows: [["1"]] };
+    const sql = (createSql: string) => ({ table: "t", multiRow: false, includeCreate: true, createSql });
+    const mysql = formatWithOptions(
+      d,
+      opts({ format: "sql", boolCols: [], sql: sql("CREATE TABLE `shop`.`t` (\n  `id` int NOT NULL\n);\n") }),
+      "mysql",
+    );
+    expect(mysql.startsWith("CREATE TABLE `t` (")).toBe(true);
+    expect(mysql).toContain("INSERT INTO `t` (`id`)");
+    // Other engines keep the reconstruction as it came.
+    const pg = formatWithOptions(d, opts({ format: "sql", boolCols: [], sql: sql('CREATE TABLE "public"."t" (id integer);') }), "postgres");
+    expect(pg.startsWith('CREATE TABLE "public"."t"')).toBe(true);
+  });
+
+  it("unqualifies the heads driver.rs does", () => {
+    expect(mysqlUnqualifyCreate("CREATE TABLE `shop`.`t` (`id` int)")).toBe("CREATE TABLE `t` (`id` int)");
+    expect(
+      mysqlUnqualifyCreate("CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `s``x`.`v` AS select 1"),
+    ).toBe("CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `v` AS select 1");
+    expect(mysqlUnqualifyCreate("CREATE TABLE `t` (`id` int)")).toBe("CREATE TABLE `t` (`id` int)");
+    expect(mysqlUnqualifyCreate("SELECT 1")).toBe("SELECT 1");
   });
 });

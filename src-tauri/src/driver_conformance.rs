@@ -4986,6 +4986,58 @@ END;";
     let _ = std::fs::remove_file(&path);
 }
 
+/// The server-side belt under the MySQL splitter: before COM_QUERY runs a text that holds
+/// a `;` before its end, COM_STMT_PREPARE must accept it as ONE statement. A text the
+/// client kept together but the server reads as several (as a lexer misread would) is
+/// refused without running anything; one stored program passes and then runs.
+#[tokio::test]
+async fn mysql_server_refuses_text_it_reads_as_several_statements() {
+    let Some(cfg) = mysql_cfg() else {
+        eprintln!(
+            "SKIP mysql_server_refuses_text_it_reads_as_several_statements (set TUSK_TEST_MYSQL_PORT)"
+        );
+        return;
+    };
+    let (mut b, _v) = connect(&cfg).await.expect("connect mysql");
+    for sql in [
+        "DROP PROCEDURE IF EXISTS `test`.`tusk_belt_p`",
+        "DROP TABLE IF EXISTS `test`.`tusk_belt_t`",
+        "CREATE TABLE `test`.`tusk_belt_t` (id INT)",
+        "INSERT INTO `test`.`tusk_belt_t` VALUES (1)",
+    ] {
+        exec(&mut b, sql).await;
+    }
+    let Backend::MySql(m) = &b else {
+        panic!("expected a MySQL backend")
+    };
+    let mut conn = m.pool.get_conn().await.expect("mysql connection");
+    let glued = "CREATE PROCEDURE `test`.`tusk_belt_p`() BEGIN SELECT 1; END; DELETE FROM `test`.`tusk_belt_t`; START TRANSACTION";
+    let refused = crate::driver::mysql_server_single_statement(&mut conn, glued)
+        .await
+        .expect_err("several statements are refused");
+    assert!(refused.message.contains("syntax"), "{}", refused.message);
+    // One stored program, and a statement whose `;` sits in a string, pass.
+    for one in [
+        "CREATE PROCEDURE `test`.`tusk_belt_p`() BEGIN SELECT 1; SELECT 2; END",
+        "INSERT INTO `test`.`tusk_belt_t` VALUES (LENGTH('a;b'))",
+    ] {
+        crate::driver::mysql_server_single_statement(&mut conn, one)
+            .await
+            .unwrap_or_else(|e| panic!("[{one}] {}", e.message));
+    }
+    drop(conn);
+    // Nothing of the refused text ran: no procedure, and the row is still there.
+    let rows = all(
+        &mut b,
+        "SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema = 'test' AND routine_name = 'tusk_belt_p'",
+    )
+    .await;
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("0"));
+    let rows = all(&mut b, "SELECT COUNT(*) FROM `test`.`tusk_belt_t`").await;
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("1"));
+    exec(&mut b, "DROP TABLE `test`.`tusk_belt_t`").await;
+}
+
 /// A MySQL backup of a database that is NOT the session's default one restores into
 /// THAT database. `SHOW CREATE TABLE` names a table bare and the dump never selects a
 /// database (a `USE` would outlive the restore on the pooled connection), so before

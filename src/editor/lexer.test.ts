@@ -219,6 +219,41 @@ describe("engine-aware lexing (parity with script.rs split_impl)", () => {
         "SELECT 1 end;",
       ]);
     }
+    // More statements that must never merge into the routine before them.
+    const rest = "START TRANSACTION; DELETE FROM log; CREATE PROCEDURE q() BEGIN SELECT 1; END;";
+    for (const routine of [
+      "CREATE PROCEDURE p() BEGIN SELECT id FROM t WHERE a = CASE WHEN b THEN 1 END FOR UPDATE; END;",
+      "CREATE PROCEDURE p() SELECT id FROM t WHERE a = CASE WHEN b THEN 1 END FOR UPDATE;",
+      "CREATE PROCEDURE p() BEGIN DO CASE WHEN @a THEN 1 ELSE 2 END; END;",
+      "CREATE PROCEDURE p() BEGIN DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET @e = CASE WHEN @x THEN 1 ELSE 0 END; SELECT 1; END;",
+      "CREATE PROCEDURE p() UPDATE t begin SET a = 1;",
+      "CREATE PROCEDURE p() INSERT begin VALUES (1);",
+      "CREATE PROCEDURE p() SELECT * FROM (SELECT 1) begin (a);",
+      "CREATE PROCEDURE p() WITH begin (x) AS (SELECT 1) SELECT x FROM begin;",
+      "CREATE PROCEDURE p() DO begin(1);",
+      "CREATE PROCEDURE p() BEGIN DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SELECT a FROM t begin; SELECT 1; END;",
+    ]) {
+      const texts = stmtTexts(`${routine} ${rest}`, "mysql");
+      expect(texts, routine).toHaveLength(4);
+      expect(texts[0]).toBe(routine);
+      expect(texts[1]).toBe("START TRANSACTION;");
+    }
+    // MySQL has no dollar quoting: `$` is an identifier character.
+    expect(stmtTexts("SELECT a$$b FROM t; START TRANSACTION; SELECT x$$y;", "mysql")).toEqual([
+      "SELECT a$$b FROM t;",
+      "START TRANSACTION;",
+      "SELECT x$$y;",
+    ]);
+    // A body that is one IF / WHILE / LOOP / REPEAT / CASE statement is compound too.
+    for (const sql of [
+      "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW IF NEW.a THEN SET NEW.b = 1; END IF; SELECT 9;",
+      "CREATE PROCEDURE p() WHILE x DO SET x = x - 1; END WHILE; SELECT 9;",
+      "CREATE PROCEDURE p() lbl: LOOP LEAVE lbl; END LOOP lbl; SELECT 9;",
+      "CREATE PROCEDURE p() REPEAT SET x = x + 1; UNTIL x > 3 END REPEAT; SELECT 9;",
+      "CREATE FUNCTION f() RETURNS INT DETERMINISTIC CASE WHEN 1 THEN RETURN 1; ELSE RETURN 2; END CASE; SELECT 9;",
+    ]) {
+      expect(stmtTexts(sql, "mysql"), sql).toHaveLength(2);
+    }
     // CASE statements and expressions nest; depth-0 aliases; statement-position BEGIN.
     for (const [sql, count] of [
       ["CREATE PROCEDURE p() BEGIN CASE WHEN a THEN SELECT CASE WHEN b THEN 1 ELSE CASE WHEN c THEN 2 END END; ELSE BEGIN SELECT 3; END; END CASE; END; SELECT 9;", 2],
