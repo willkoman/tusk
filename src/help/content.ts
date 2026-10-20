@@ -3591,6 +3591,21 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
+        "text": "v0.11.4 — MySQL stored programs",
+        "id": "v0-11-4"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**MySQL stored programs run as one statement** — a `CREATE PROCEDURE`, `FUNCTION`, `TRIGGER` or `EVENT` with a `BEGIN … END` body (and `IF`/`WHILE`/`LOOP`/`REPEAT`/`CASE` bodies) runs and replays as written.",
+          "**MySQL backups carry procedures and functions**, each with the `sql_mode` it was created under, and a backup of another database restores into that database.",
+          "**MySQL definitions name their database**, so a copied procedure, function, table or view recreates itself where it came from; an SQL export's `CREATE TABLE` stays unqualified, like its INSERTs.",
+          "**The server confirms one statement** — before MySQL or MariaDB text with an inner `;` runs, the server is asked to parse it as a single statement, so a misread can only be refused, never run as two. Vitess and TiDB, which cannot confirm it, refuse such text.",
+          "**A `$` in a MySQL name** no longer swallows the statements after it."
+        ]
+      },
+      {
+        "k": "h",
         "text": "v0.11.3 — definitions, steadier tabs, DuckDB on Windows",
         "id": "v0-11-3"
       },

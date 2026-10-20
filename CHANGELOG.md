@@ -2,7 +2,7 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
-## [Unreleased]
+## [0.11.4] - 2026-10-20
 
 ### Added
 - **MySQL backups carry stored procedures and functions.** A whole-database or schema backup writes each routine from `SHOW CREATE`, qualified by its database and wrapped in the `sql_mode` and collation it was created with (as `mysqldump` does), so a body that relies on, say, `PIPES_AS_CONCAT` means the same after a restore. With *Drop existing objects* it drops each one first. A routine Tusk could not replay as one statement (a body with a backslash-escaped quote like `'can\'t'`, or a `/*! … */` comment) is left out, and left alone by the restore, with a warning naming it, instead of stopping the restore halfway. Routines come after the tables, data and foreign keys and before the views that might call them. The dump's header notes that a routine keeps its `DEFINER`, so restoring it as another account needs `SET_USER_ID`, and that a server without the routine's collation refuses it. Until now a MySQL dump only listed the routines it left out. Triggers and events are still not carried, and the dump says so.
