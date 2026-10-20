@@ -2031,6 +2031,8 @@ button.btn-keep { background: var(--panel-2); color: var(--text); border: 1px so
 .subform { display: contents; }
 .settings-note { font-size: var(--fs-sm); color: var(--muted); padding: var(--s2) 0; line-height: var(--lh-body); }
 .settings-hint { font-size: var(--fs-xs); color: var(--muted); }
+/* Settings → Monitor: units share one column, so every number input ends at one x. */
+.settings-unit { flex: none; width: 2.4em; font-size: var(--fs-xs); color: var(--muted); }
 .settings-actions { display: flex; align-items: center; gap: 6px; padding: 6px 0 2px; }
 .settings-actions .spacer { flex: 1; }
 
@@ -2397,11 +2399,17 @@ label.slack-switch { display: inline-flex; flex-direction: row; align-items: cen
   display: flex; align-items: center; flex-wrap: wrap; gap: var(--s2) var(--s3);
   padding: var(--s2) var(--s3); background: var(--panel); border-bottom: 1px solid var(--border);
 }
-.mh-title { display: flex; align-items: center; gap: var(--s2); min-width: 0; }
+/* The title takes the slack and shrinks first (the server line ellipsizes), so the
+   controls wrap only when the title is down to its minimum. */
+.mh-title { display: flex; align-items: center; gap: var(--s2); flex: 1 1 0; min-width: 220px; }
 .mh-title svg { width: 15px; height: 15px; color: var(--accent-2); flex: none; }
 .mh-title strong { font-size: var(--fs-md); }
+.mh-title .mh-gear { flex: none; }
+.mh-title .mh-gear svg { width: 14px; height: 14px; color: var(--muted); }
 .mh-conn { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
-.mh-meta { color: var(--muted); font-size: var(--fs-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mh-meta { color: var(--muted); font-size: var(--fs-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; min-width: 0; }
+/* The connection name keeps its width; the server line gives way first. */
+.mh-title .mh-conn { flex: 0 0 auto; }
 .mh-status { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-sm); color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .mh-led { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
 /* Live is an on-state, so it is the accent — never green. And it does not pulse:

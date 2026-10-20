@@ -796,7 +796,7 @@ function App() {
     // connection's state (its run timer ticks 5x a second), stay untracked.
     untrack(() => {
       for (const [tabId, session] of monitorSessions) {
-        session.setVisible(shown && tabId === active && entryOf(session.connectionId)?.conn.driver === "postgres");
+        session.setVisible(shown && tabId === active && isMonitorEngine(kindOf(session.connectionId)));
       }
     });
   });
@@ -1337,7 +1337,7 @@ function App() {
    */
   function openMonitor(view?: MonitorView) {
     const id = activeConnectionId();
-    if (!id || kindOf(id) !== "postgres") return;
+    if (!id || !isMonitorEngine(kindOf(id))) return;
     const existing = monitorTabOf(id);
     if (existing) {
       const session = monitorSessions.get(existing.id);

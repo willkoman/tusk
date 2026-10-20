@@ -6776,7 +6776,11 @@ mod monitor_engines_battery {
         assert_eq!(victim.backend_start, victim.pid.to_string());
         assert!(victim.query_start_ms.is_some());
         assert_eq!(victim.wait_event.as_deref(), Some("User sleep"));
-        assert_eq!(victim.wait_type.as_deref(), Some("Timeout"));
+        assert_eq!(
+            victim.wait_type.as_deref(),
+            Some("Sleep"),
+            "the engine's own word"
+        );
 
         // The monitor's own connection and a mismatched identity are refused.
         let err = monitor::signal(
@@ -6972,7 +6976,7 @@ mod monitor_engines_battery {
         );
         let victim = row_where(&e, is_victim).unwrap().clone();
         assert_eq!(victim.state.as_deref(), Some("active"));
-        assert_eq!(victim.wait_type.as_deref(), Some("Timeout"));
+        assert_eq!(victim.wait_type.as_deref(), Some("WAITFOR"));
         assert!(victim.query.as_deref().unwrap_or("").contains("WAITFOR"));
         assert!(victim.backend_start_ms.is_some() && victim.query_start_ms.is_some());
         let err = monitor::signal(

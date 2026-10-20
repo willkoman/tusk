@@ -83,11 +83,21 @@ const WAIT_EXPR: &str = "CASE WHEN r.session_id IS NULL THEN 'Client' \
      WHEN r.wait_type LIKE 'LCK[_]%' THEN 'Lock' \
      WHEN r.wait_type LIKE 'PAGELATCH[_]%' OR r.wait_type LIKE 'LATCH[_]%' THEN 'LWLock' \
      WHEN r.wait_type LIKE 'PAGEIOLATCH[_]%' OR r.wait_type IN ('WRITELOG', 'IO_COMPLETION', \
-          'ASYNC_IO_COMPLETION', 'BACKUPIO', 'LOGBUFFER') THEN 'IO' \
+          'ASYNC_IO_COMPLETION', 'BACKUPIO', 'LOGBUFFER', 'WRITE_COMPLETION', 'IO_RETRY') \
+          OR r.wait_type LIKE 'PREEMPTIVE_OS_%FILE%' THEN 'IO' \
      WHEN r.wait_type LIKE 'CX%' OR r.wait_type = 'EXCHANGE' THEN 'IPC' \
      WHEN r.wait_type = 'ASYNC_NETWORK_IO' THEN 'Client' \
      WHEN r.wait_type = 'WAITFOR' THEN 'Timeout' \
      ELSE 'Other' END";
+
+/// The wait buckets as the Activity list names them on SQL Server (`engines.ts`
+/// mirrors these for the load chart).
+const WAIT_LABELS: [(&str, &str); 4] = [
+    ("LWLock", "Latch"),
+    ("IO", "I/O"),
+    ("IPC", "Parallelism"),
+    ("Timeout", "WAITFOR"),
+];
 
 /// User sessions other than the monitor's own, with their running request if any.
 const SESSIONS_FROM: &str = "sys.dm_exec_sessions s \
@@ -287,7 +297,9 @@ impl MsSqlSession {
 
     pub(crate) async fn activity(&mut self) -> Result<Activity, AppError> {
         let (c, rows) = self.query(&self.activity).await?;
-        pg::parse_activity(&c, &rows)
+        let mut activity = pg::parse_activity(&c, &rows)?;
+        pg::relabel_waits(&mut activity, &WAIT_LABELS);
+        Ok(activity)
     }
 
     /// `KILL`, re-identified by login time. `Ok(false)` when the session had gone.

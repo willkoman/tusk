@@ -822,6 +822,18 @@ pub(super) fn bucket_rows(columns: &[String], rows: &[Row]) -> Result<Vec<Bucket
         .collect()
 }
 
+/// Rename the wait buckets the activity rows carry (PostgreSQL's `WAIT_TYPES` names,
+/// which the histogram needs) to what this engine calls them. Display only.
+pub(super) fn relabel_waits(activity: &mut Activity, labels: &[(&str, &str)]) {
+    for row in &mut activity.rows {
+        if let Some(w) = row.wait_type.as_deref() {
+            if let Some((_, to)) = labels.iter().find(|(from, _)| *from == w) {
+                row.wait_type = Some((*to).to_string());
+            }
+        }
+    }
+}
+
 /// `{1,2}` (an int[] as text) → pids. Anything unreadable is dropped, never guessed.
 pub(super) fn pid_array(text: Option<&str>) -> Vec<i32> {
     let Some(t) = text else { return Vec::new() };

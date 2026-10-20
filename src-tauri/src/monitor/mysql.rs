@@ -137,6 +137,14 @@ const WAIT_EXPR: &str = "CASE WHEN p.COMMAND = 'Sleep' THEN 'Client' \
      WHEN p.STATE LIKE 'Waiting%' THEN 'Other' \
      ELSE NULL END";
 
+/// The wait buckets as the Activity list names them on MySQL (`engines.ts` mirrors
+/// these for the load chart).
+const WAIT_LABELS: [(&str, &str); 3] = [
+    ("Timeout", "Sleep"),
+    ("IO", "I/O"),
+    ("Other", "Other waits"),
+];
+
 /// Client connections: not the server's own threads.
 const CLIENT_EXPR: &str = "IF(p.USER IN ('system user', 'event_scheduler') \
      OR p.COMMAND IN ('Daemon', 'Binlog Dump', 'Binlog Dump GTID'), 'f', 't')";
@@ -441,7 +449,9 @@ impl MySqlSession {
     pub(crate) async fn activity(&mut self) -> Result<Activity, AppError> {
         let sql = self.activity.clone();
         let (c, rows) = self.query(&sql).await?;
-        pg::parse_activity(&c, &rows)
+        let mut activity = pg::parse_activity(&c, &rows)?;
+        pg::relabel_waits(&mut activity, &WAIT_LABELS);
+        Ok(activity)
     }
 
     /// `KILL QUERY` or `KILL CONNECTION`. A connection id is never reused while the

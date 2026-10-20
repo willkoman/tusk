@@ -253,6 +253,7 @@ function csvColumns(s: MonitorSession, def: ChartDef): CsvColumn[] {
 function ChartCard(props: { session: MonitorSession; def: ChartDef; onExport: (e: MouseEvent, chart: ChartExport) => void }) {
   let card!: HTMLElement;
   const [hidden, setHidden] = createSignal<ReadonlySet<string>>(new Set());
+  const panes = () => props.def.panes.filter((p) => !p.when || p.when(props.session));
   // Per pane, the series the legend switched off and those the engine has no counter
   // for (read by the canvas every frame).
   const hiddenByPane = createMemo(() => {
@@ -263,14 +264,17 @@ function ChartCard(props: { session: MonitorSession; def: ChartDef; onExport: (e
     }
     return out;
   });
-  const panes = () => props.def.panes.filter((p) => !p.when || p.when(props.session));
   const chartExport = (): ChartExport => ({
     title: props.def.title,
     csv: () => {
       const r = exportRange(props.session);
       return chartCsv(csvColumns(props.session, props.def), r.t0, r.t1, toWall);
     },
-    png: () => {
+    png: async () => {
+      // A canvas scrolled out of view is not drawn: bring the card in and give the
+      // frame loop a moment, so the image is never a blank plot.
+      card.scrollIntoView({ block: "nearest" });
+      await new Promise((r) => setTimeout(r, 250));
       const s = props.session;
       const r = s.range();
       const cs = getComputedStyle(card);
@@ -573,7 +577,7 @@ export default function MonitorTab(props: {
         if (!r) return "";
         void s.tick();
         const avg = latestValue(s.data.tps, 2);
-        const share = r.tps > 0 ? ` · ${formatPercent(r.rollbacks / r.tps)} rollback` : "";
+        const share = profile.rollbacks && r.tps > 0 ? ` · ${formatPercent(r.rollbacks / r.tps)} rollback` : "";
         return `avg ${formatCompact(avg)}${share}`;
       },
       tone: () => "",
@@ -679,6 +683,7 @@ export default function MonitorTab(props: {
                 </span>
               )}
             </Show>
+            <button class="icon mh-gear" title="Monitor thresholds (Settings → Monitor)" aria-label="Monitor thresholds" onClick={() => props.onOpenSettings()}><Icon name="gear" /></button>
           </div>
           <span class="spacer" />
           <Show when={s.range()}>
@@ -717,7 +722,6 @@ export default function MonitorTab(props: {
           >
             <button class="run" title="Start sampling the server" onClick={() => s.resume()}><Icon name="play" /> Resume</button>
           </Show>
-          <button class="icon" title="Monitor thresholds (Settings → Monitor)" aria-label="Monitor thresholds" onClick={() => props.onOpenSettings()}><Icon name="gear" /></button>
         </header>
 
         <div class="monitor-tiles">

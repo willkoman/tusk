@@ -46,7 +46,7 @@ export function MonitorPane() {
                 value={t()[f.key]}
                 onChange={(e) => set(f.key, e.currentTarget)}
               />
-              <Show when={f.unit}><span class="settings-hint">{f.unit}</span></Show>
+              <span class="settings-unit">{f.unit}</span>
             </span>
           </label>
         )}

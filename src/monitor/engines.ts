@@ -41,6 +41,8 @@ export type EngineProfile = {
   eventsSource: string;
   /** The engine can stop a running query without ending the session. */
   canCancel: boolean;
+  /** The engine counts rollbacks (SQL Server keeps no such counter). */
+  rollbacks: boolean;
   /** The statement Cancel/Terminate runs, as history records it. */
   signalSql: (action: SignalWord, pid: number) => string;
   /** What the confirmation says each action does. */
@@ -60,6 +62,7 @@ const PG: EngineProfile = {
   eventsSource:
     "Discrete events per sample, from pg_stat_database (deadlocks, recovery conflicts, temp files), the checkpoint counters, and counter resets. A larger dot is more in one interval.",
   canCancel: true,
+  rollbacks: true,
   signalSql: (action, pid) => `SELECT ${action === "cancel" ? "pg_cancel_backend" : "pg_terminate_backend"}(${pid})`,
   signalEffect: {
     cancel: "Sends pg_cancel_backend: the running statement stops with an error, and a transaction it was part of can only roll back. The session stays connected.",
@@ -125,6 +128,7 @@ const MYSQL: EngineProfile = {
   eventsSource:
     "Discrete events per sample: InnoDB deadlocks (INNODB_METRICS lock_deadlocks, or Innodb_deadlocks on MariaDB), internal temporary tables that went to disk (Created_tmp_disk_tables), and counter resets such as a server restart.",
   canCancel: true,
+  rollbacks: true,
   signalSql: (action, pid) => (action === "cancel" ? `KILL QUERY ${pid}` : `KILL CONNECTION ${pid}`),
   signalEffect: {
     cancel: "Runs KILL QUERY: the running statement stops with an error. The connection stays, and so does a transaction it was part of.",
@@ -186,6 +190,7 @@ const MSSQL: EngineProfile = {
   eventsSource:
     "Discrete events per sample: deadlocks (Number of Deadlocks/sec), hash and sort spills to tempdb workfiles (Workfiles Created/sec), and counter resets such as a server restart.",
   canCancel: false,
+  rollbacks: false,
   signalSql: (_action, pid) => `KILL ${pid}`,
   signalEffect: {
     cancel: "SQL Server cannot cancel only a session's running query.",
