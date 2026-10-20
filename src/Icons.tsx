@@ -91,7 +91,10 @@ export type IconName =
   | "fit"
   | "chevronDown"
   | "chevronRight"
-  | "chevronLeft";
+  | "chevronLeft"
+  // Database monitor: the tab, the topbar button, pause.
+  | "activity"
+  | "pause";
 
 export function Icon(props: { name: IconName }): JSX.Element {
   switch (props.name) {
@@ -145,6 +148,10 @@ export function Icon(props: { name: IconName }): JSX.Element {
       return svg("currentColor", <><path d="M3 6h18" /><path d="M3 12h15a3 3 0 0 1 0 6h-4" /><path d="m16 16-2 2 2 2" /><path d="M3 18h6" /></>);
     case "lock":
       return svg("currentColor", <><rect x="4" y="11" width="16" height="10" rx="2" /><path d="M8 11V7a4 4 0 0 1 8 0v4" /></>);
+    case "activity":
+      return svg("currentColor", <path d="M22 12h-4l-3 9L9 3l-3 9H2" />);
+    case "pause":
+      return svg("currentColor", <><rect x="6" y="4" width="4" height="16" rx="1" /><rect x="14" y="4" width="4" height="16" rx="1" /></>);
     case "clock":
       return svg("currentColor", <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>);
     case "copy":

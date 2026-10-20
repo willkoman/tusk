@@ -17,6 +17,7 @@
     13  Panels (history, AI)
     14  Menus and overlays (context menu, palette, pickers)
     15  Visualisation (pan/zoom, plan, ERD)
+    15b Database monitor
     16  Manual
     17  Updater, what's-new, crash
 
@@ -103,6 +104,22 @@
   --tag-teal: var(--accent-2);
   --tag-violet: #a78bfa;
   --tag-pink: #f472b6;
+
+  /* --- chart series (database monitor). Aliases onto roles EVERY theme block
+         already retunes (--conn-N, --tag-*), so each palette, light or dark,
+         gets its own chart colours with no literal here to drift: a theme that
+         defines --conn-3 defines --chart-1. Categorical only — a series colour
+         says "which", never "good" or "bad"; tiles carry the amber/red meaning. --- */
+  --chart-1: var(--conn-3);
+  --chart-2: var(--conn-2);
+  --chart-3: var(--conn-4);
+  --chart-4: var(--conn-1);
+  --chart-5: var(--conn-8);
+  --chart-6: var(--conn-7);
+  --chart-7: var(--conn-6);
+  --chart-8: var(--tag-pink);
+  --chart-9: var(--conn-5);
+  --chart-10: var(--tag-violet);
 
   /* --- syntax tokens for the non-CodeMirror highlighters (DDL pane, history, AI) --- */
   --tok-kw: #c792ea;
@@ -2362,6 +2379,169 @@ label.slack-switch { display: inline-flex; flex-direction: row; align-items: cen
 .mmp-chip-star { color: var(--accent); }
 .mmp-chip.off { opacity: 0.55; }
 .mmp-chip.off span { text-decoration: line-through; }
+
+/* ==========================================================================
+   15b  DATABASE MONITOR (src/monitor) — the Monitor tab
+   ========================================================================== */
+
+.tab-kind { display: inline-flex; color: var(--accent-2); flex: none; }
+.tab-kind svg { width: 12px; height: 12px; display: block; }
+/* A Monitor tab owns the pane: the SQL toolbar and editor stay mounted (each SQL
+   tab keeps its editor state) but out of sight. */
+.editor-pane.monitor-active > :not(.tab-bar):not(.monitor) { display: none; }
+
+.monitor { flex: 1; min-height: 0; display: flex; flex-direction: column; background: var(--bg); }
+.monitor-empty { padding: var(--s5); color: var(--muted); }
+
+.monitor-head {
+  display: flex; align-items: center; flex-wrap: wrap; gap: var(--s2) var(--s3);
+  padding: var(--s2) var(--s3); background: var(--panel); border-bottom: 1px solid var(--border);
+}
+.mh-title { display: flex; align-items: center; gap: var(--s2); min-width: 0; }
+.mh-title svg { width: 15px; height: 15px; color: var(--accent-2); flex: none; }
+.mh-title strong { font-size: var(--fs-md); }
+.mh-conn { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+.mh-meta { color: var(--muted); font-size: var(--fs-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mh-status { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-sm); color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.mh-led { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+/* Live is an on-state, so it is the accent — never green. And it does not pulse:
+   an endless CSS animation makes WebView2 composite every vsync, which alone cost
+   more CPU than all the charts together (the charts' gliding already says "live"). */
+.mh-status.st-live { color: var(--text); }
+.mh-status.st-live .mh-led { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.mh-status.st-starting .mh-led { background: var(--accent); }
+.mh-status.st-reconnecting { color: var(--warn); }
+.mh-status.st-reconnecting .mh-led { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
+.mh-status.st-error { color: var(--danger); }
+.mh-status.st-error .mh-led { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); }
+.mh-field { display: inline-flex; flex-direction: row; align-items: center; gap: 6px; color: var(--muted); font-size: var(--fs-sm); }
+.mh-field select { height: var(--control-h-sm); padding-top: 0; padding-bottom: 0; }
+.mh-keep { font-size: var(--fs-sm); color: var(--muted); }
+.monitor-head button svg { width: 12px; height: 12px; }
+.monitor-head button { height: var(--control-h-sm); padding-top: 0; padding-bottom: 0; }
+
+.monitor-tiles {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: var(--s2);
+  padding: var(--s3) var(--s3) var(--s2);
+}
+.monitor-tile {
+  display: grid; grid-template-rows: auto auto auto 26px; gap: 1px; min-width: 0; text-align: left;
+  justify-content: stretch; align-items: start;
+  padding: var(--s2) var(--s3) var(--s1); background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--r-md); font-weight: 400;
+}
+button.monitor-tile { cursor: pointer; }
+button.monitor-tile:hover:not(:disabled) { border-color: var(--border-hover); }
+.monitor-tile.warn { border-color: var(--warn); background: var(--warn-soft); }
+.monitor-tile.danger { border-color: var(--danger); background: var(--danger-soft); }
+.mt-label { font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mt-value { font-size: var(--fs-lg); font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: var(--lh-tight); }
+.monitor-tile.warn .mt-value { color: var(--warn); }
+.monitor-tile.danger .mt-value { color: var(--danger); }
+.mt-sub { font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 1em; font-variant-numeric: tabular-nums; }
+
+.monitor-views { display: flex; align-items: center; gap: var(--s3); padding: 0 var(--s3) var(--s2); }
+.monitor-views .seg { display: inline-flex; }
+.mv-count { margin-left: 4px; padding: 0 5px; border-radius: var(--r-pill); background: var(--panel-2); color: var(--muted); font-variant-numeric: tabular-nums; }
+.mv-note { font-size: var(--fs-sm); color: var(--muted); }
+
+.monitor-body { flex: 1; min-height: 0; overflow: auto; padding: 0 var(--s3) var(--s3); display: flex; flex-direction: column; gap: var(--s3); }
+.monitor-grid { display: grid; gap: var(--s3); }
+.monitor-card {
+  display: flex; flex-direction: column; gap: var(--s1); min-width: 0;
+  padding: var(--s2) var(--s3); background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-md);
+}
+.mc-head { display: flex; align-items: center; gap: var(--s2); min-width: 0; }
+.mc-head h3 { margin: 0; font-size: var(--fs-sm); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mc-sub { font-size: var(--fs-xs); color: var(--muted); }
+.mc-info { display: inline-flex; color: var(--muted); cursor: help; }
+.mc-info svg { width: 13px; height: 13px; }
+.mc-head button { height: var(--control-h-sm); padding-top: 0; padding-bottom: 0; font-size: var(--fs-xs); }
+.monitor-canvas { display: block; width: 100%; touch-action: none; }
+.monitor-canvas.spark { pointer-events: none; }
+.mc-legend { display: flex; flex-wrap: wrap; gap: 2px var(--s1); }
+.mc-key {
+  display: inline-flex; align-items: center; gap: 5px; padding: 1px var(--s1); border: 1px solid transparent;
+  background: transparent; color: var(--muted); font-size: var(--fs-xs); font-weight: 400; border-radius: var(--r-xs);
+}
+.mc-key:hover:not(:disabled) { border-color: var(--border); color: var(--text); }
+.mc-key i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; flex: none; }
+.mc-key i.dashed { height: 2px; border-radius: 0; }
+.mc-key-value { color: var(--text); font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.mc-key.off { opacity: 0.45; }
+.mc-key.off .mc-key-label { text-decoration: line-through; }
+
+.mn-list { display: flex; flex-direction: column; }
+.mn-row {
+  display: grid; grid-template-columns: 64px minmax(60px, 120px) minmax(90px, 200px) 72px minmax(0, 1fr) 24px;
+  align-items: center; gap: var(--s2); min-height: var(--row-h); border-top: 1px solid var(--border); font-size: var(--fs-sm);
+}
+.mn-row:first-child { border-top: none; }
+.mn-row > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mn-pid, .mn-age { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.mn-age { text-align: right; }
+.mn-query { font-family: var(--mono); color: var(--muted); }
+.mn-wait { display: inline-flex; align-items: center; gap: 6px; }
+.mn-row .icon svg, .ma-row .icon svg { width: 13px; height: 13px; }
+
+.monitor-activity { flex: 1; min-height: 320px; display: flex; flex-direction: column; gap: var(--s2); }
+.ma-filters { display: flex; align-items: center; flex-wrap: wrap; gap: var(--s1) var(--s3); font-size: var(--fs-sm); }
+.ma-search { flex: 0 1 260px; min-width: 160px; }
+.ma-count { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.monitor-banner { padding: var(--s1) var(--s3); border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--panel); color: var(--muted); font-size: var(--fs-sm); }
+.monitor-banner.warn { border-color: var(--warn); background: var(--warn-soft); color: var(--text); }
+.ma-table { flex: 1; min-height: 0; display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--panel); overflow: hidden; }
+.ma-body { flex: 1; min-height: 160px; overflow: auto; }
+.ma-spacer { position: relative; }
+.ma-row { display: flex; align-items: center; height: 26px; font-size: var(--fs-sm); }
+.ma-spacer > .ma-row { position: absolute; left: 0; right: 0; top: 0; border-top: 1px solid var(--border); cursor: default; }
+.ma-spacer > .ma-row:hover { background: var(--zebra); }
+.ma-row.selected { background: var(--accent-soft) !important; }
+.ma-row.root-blocker { box-shadow: inset 3px 0 0 var(--warn); }
+.ma-row.root-blocker .ma-pid { color: var(--warn); font-weight: 600; }
+.ma-row.context { opacity: 0.72; }
+.ma-row.cycle { box-shadow: inset 3px 0 0 var(--danger); }
+.ma-head { background: var(--panel-2); border-bottom: 1px solid var(--border); flex: none; }
+.ma-cell { padding: 0 var(--s2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+button.ma-cell {
+  display: inline-flex; justify-content: flex-start; gap: 4px; height: 100%; border: none; border-radius: 0;
+  background: transparent; color: var(--muted); font-size: var(--fs-xs); font-weight: 600;
+}
+button.ma-cell:hover:not(:disabled) { color: var(--text); }
+button.ma-cell.sorted { color: var(--accent); }
+button.ma-cell svg { width: 11px; height: 11px; }
+.ma-col-pid { flex: 0 0 72px; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.ma-col-user, .ma-col-database { flex: 0 0 96px; }
+.ma-col-application { flex: 0 0 110px; }
+.ma-col-client { flex: 0 0 104px; font-family: var(--mono); }
+.ma-col-backendType { flex: 0 0 110px; }
+.ma-col-state { flex: 0 0 120px; }
+.ma-col-wait { flex: 0 0 140px; }
+.ma-col-xact, .ma-col-query { flex: 0 0 85px; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.ma-col-blockedBy { flex: 0 0 90px; font-family: var(--mono); color: var(--warn); }
+.ma-col-text { flex: 1 1 200px; font-family: var(--mono); color: var(--muted); }
+.ma-col-actions { flex: 0 0 30px; padding: 0 2px; }
+.ma-pid { display: inline-flex; align-items: center; gap: 4px; }
+.ma-nest { color: var(--muted); }
+.ma-state, .mn-wait { display: inline-flex; align-items: center; gap: 6px; }
+.ma-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--muted); }
+.ma-dot.st-active { background: var(--accent); }
+.ma-dot.st-idle-tx { background: var(--warn); }
+.ma-dot.st-aborted { background: var(--danger); }
+.ma-dot.st-idle { background: var(--border-hover); }
+
+.sb-sessions {
+  display: inline-flex; align-items: center; gap: 5px; height: 18px; padding: 0 var(--s2);
+  border: 1px solid transparent; background: transparent; color: var(--muted); font-size: var(--fs-sm); font-weight: 400;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.sb-sessions:hover:not(:disabled) { border-color: var(--border); color: var(--text); }
+.sb-sessions svg { width: 12px; height: 12px; }
+
+.monitor-signal-facts { display: grid; grid-template-columns: max-content 1fr; gap: 2px var(--s3); margin: var(--s2) var(--s4); font-size: var(--fs-sm); }
+.monitor-signal-facts dt { color: var(--muted); }
+.monitor-signal-facts dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+.monitor-signal-query { margin: var(--s2) var(--s4); max-height: 160px; overflow: auto; white-space: pre-wrap; }
 
 /* ==========================================================================
    15  VISUALISATION — pan/zoom canvas, plan tree, ERD

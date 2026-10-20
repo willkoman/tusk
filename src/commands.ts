@@ -21,6 +21,7 @@ import type { ExportOptions } from "./export";
 import type { BackupFileInfo } from "./forms/RestoreDialog";
 import type { SshMeta } from "./forms/SshSection";
 import type { ImportOptions, ImportPreview, ImportSummary, ImportTarget } from "./import";
+import type { MonitorStarted } from "./monitor/model";
 import type { SlackConfig, SlackConfigInfo, SlackStatus } from "./slack/bind";
 import type { FkEdge } from "./sql/fk";
 import type { TransactionStatus } from "./transaction";
@@ -52,6 +53,9 @@ export type Profile = {
   /** "dev" | "staging" | "prod"; null/absent = untagged. See src/environment.ts. */
   environment?: string | null;
 };
+
+/** Monitor cadence as `monitor_start` / `monitor_configure` take it. */
+export type MonitorOptions = { intervalMs: number; paused: boolean; activity: boolean };
 
 export type QueryOutcome =
   | { kind: "rows"; columns: string[]; rows: (string | null)[][]; done: boolean; note?: string }
@@ -192,6 +196,15 @@ export const commands = {
   slackSetConnection: (connectionId: string) => invoke<void>("slack_set_connection", { connectionId }),
   slackStatus: () => invoke<SlackStatus>("slack_status"),
   slackTest: () => invoke<string>("slack_test"),
+
+  // database monitor (samples arrive as `monitor-sample` events; see src/monitor)
+  monitorStart: (connectionId: string, options: MonitorOptions) => invoke<MonitorStarted>("monitor_start", { connectionId, options }),
+  monitorConfigure: (connectionId: string, generation: number, options: MonitorOptions) =>
+    invoke<void>("monitor_configure", { connectionId, generation, options }),
+  monitorStop: (connectionId: string, generation: number | null) => invoke<void>("monitor_stop", { connectionId, generation }),
+  monitorStopAll: () => invoke<number>("monitor_stop_all"),
+  monitorSignal: (connectionId: string, generation: number, pid: number, backendStart: string, action: "cancel" | "terminate") =>
+    invoke<boolean>("monitor_signal", { connectionId, generation, pid, backendStart, action }),
 
   // app
   crashReportGet: () => invoke<string | null>("crash_report_get"),
