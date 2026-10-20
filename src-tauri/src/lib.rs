@@ -8,6 +8,7 @@ mod driver;
 mod driver_conformance;
 mod export;
 mod import;
+mod monitor;
 mod perms;
 mod profiles;
 mod query_plan;
@@ -41,6 +42,11 @@ use profiles::Profile;
 pub(crate) struct RegisteredConn {
     inner: AsyncMutex<ConnState>,
     closed: AtomicBool,
+    /// Immutable copy of the connection's config, taken at registration (a reconnect
+    /// re-dials this same config). Readers that only need the destination — the
+    /// database monitor's sidecar — take it here instead of through `inner`, which
+    /// waits behind whatever query the user is running.
+    config: Arc<ConnectionConfig>,
 }
 
 type Conn = Arc<RegisteredConn>;
@@ -119,6 +125,8 @@ pub(crate) struct AppState {
     cancels: Mutex<HashMap<String, CancelEntry>>,
     next_id: AtomicU64,
     next_cancel_generation: AtomicU64,
+    /// Database-monitor sidecars, at most one per connection (see `monitor`).
+    monitors: monitor::Monitors,
 }
 
 impl AppState {
@@ -263,9 +271,11 @@ impl AppState {
 
     fn register(&self, backend: Backend, read_only: bool) -> Result<String, AppError> {
         let id = format!("conn-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let config = Arc::new(backend.config().clone());
         let conn = Arc::new(RegisteredConn {
             inner: AsyncMutex::new(ConnState::new(backend, read_only)),
             closed: AtomicBool::new(false),
+            config,
         });
         {
             let mut conns = lock_sync(&self.conns);
@@ -278,6 +288,32 @@ impl AppState {
         }
         *lock_sync(&self.active_conn_id) = Some(id.clone());
         Ok(id)
+    }
+
+    /// The connection's config without taking its session lock (see
+    /// `RegisteredConn::config`).
+    pub(crate) fn config_snapshot(&self, id: &str) -> Result<Arc<ConnectionConfig>, AppError> {
+        let conns = lock_sync(&self.conns);
+        match conns.get(id) {
+            Some(conn) if !conn.closed.load(Ordering::Acquire) => Ok(conn.config.clone()),
+            _ => Err(AppError::new("no such connection")),
+        }
+    }
+
+    /// Run `f` while holding the registry lock, only if `id` is still registered and
+    /// open. Work that must be visible to `disconnect` (a monitor sidecar it has to
+    /// stop) is installed inside `f`, so it either lands before the disconnect sees
+    /// the registry or is refused.
+    pub(crate) fn while_registered<R>(
+        &self,
+        id: &str,
+        f: impl FnOnce() -> R,
+    ) -> Result<R, AppError> {
+        let conns = lock_sync(&self.conns);
+        match conns.get(id) {
+            Some(conn) if !conn.closed.load(Ordering::Acquire) => Ok(f()),
+            _ => Err(AppError::new("connection is disconnected")),
+        }
     }
 
     /// Point `active()` at the connection the workbench has focused. Unknown ids are
@@ -558,6 +594,9 @@ async fn disconnect_registered(state: &AppState, connection_id: &str) -> Result<
         }
     }
     let removed = lock_sync(&state.conns).remove(connection_id);
+    // The monitor sidecar goes with its connection. Stopped after the registry
+    // removal so a racing `monitor_start` cannot install one behind us.
+    state.monitors.stop(connection_id, None);
     if let Some(conn) = removed {
         conn.closed.store(true, Ordering::Release);
         // Remove registry visibility first, then best-effort cancel any operation that
@@ -2510,7 +2549,12 @@ pub fn run() {
             slack_test,
             crash::crash_report_get,
             crash::crash_report_write,
-            crash::crash_report_clear
+            crash::crash_report_clear,
+            monitor::monitor_start,
+            monitor::monitor_configure,
+            monitor::monitor_stop,
+            monitor::monitor_stop_all,
+            monitor::monitor_signal
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

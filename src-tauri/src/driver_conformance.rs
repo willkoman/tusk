@@ -5734,3 +5734,489 @@ async fn mysql_backup_restores_a_non_default_database() {
     exec(b, "DROP DATABASE `tusk_bk_tables`").await;
     let _ = std::fs::remove_file(&path);
 }
+
+// --- database monitor (PostgreSQL) ---
+//
+// Drives the monitor through the same state-level functions its Tauri commands call:
+// start on a registered connection, ticks with every fast-tier field present and
+// finite, a process list that shows a sleeping session and a lock wait (blocking
+// pids), cancel/terminate with their refusals, pause/resume, and a disconnect that
+// leaves no `Tusk monitor` backend behind.
+
+mod monitor_battery {
+    use super::{connect, duck_cfg};
+    use crate::db::ConnectionConfig;
+    use crate::driver::Backend;
+    use crate::monitor::{self, MonitorEvent, MonitorOptions, SignalAction};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    type Events = Arc<Mutex<Vec<MonitorEvent>>>;
+
+    fn sink(events: &Events) -> monitor::Sink {
+        let events = events.clone();
+        Arc::new(move |e: &MonitorEvent| {
+            events
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(e.clone());
+        })
+    }
+
+    fn snapshot(events: &Events) -> Vec<MonitorEvent> {
+        events.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Poll until an event at or after index `from` satisfies `pred`; returns it and
+    /// the index just past it.
+    async fn wait_event(
+        events: &Events,
+        from: usize,
+        what: &str,
+        pred: impl Fn(&MonitorEvent) -> bool,
+    ) -> (MonitorEvent, usize) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let all = snapshot(events);
+            if let Some((i, e)) = all.iter().enumerate().skip(from).find(|(_, e)| pred(e)) {
+                return (e.clone(), i + 1);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}: {:#?}",
+                all.last()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn scalar(b: &Backend, sql: &str) -> Option<String> {
+        let messages = b.pg().unwrap().simple_query(sql).await.expect(sql);
+        let (_, rows) = crate::db::collect_rows(&messages).unwrap();
+        rows.first().and_then(|r| r.first().cloned().flatten())
+    }
+
+    async fn monitor_backends(observer: &Backend) -> i64 {
+        scalar(
+            observer,
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'Tusk monitor'",
+        )
+        .await
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(-1)
+    }
+
+    async fn wait_no_monitor_backend(observer: &Backend, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while monitor_backends(observer).await != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "{what}: a Tusk monitor backend is still connected"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    fn finite(v: f64, what: &str) {
+        assert!(v.is_finite() && v >= 0.0, "{what} = {v}");
+    }
+
+    fn assert_fast_tier(e: &MonitorEvent, version_num: i32) {
+        assert_eq!(e.status, "live", "{e:#?}");
+        assert!(e.error.is_none());
+        assert!(
+            e.server_ms.is_some_and(|ms| ms > 1_600_000_000_000),
+            "server clock"
+        );
+        finite(e.latency_ms, "latency");
+        finite(e.mono_ms, "mono");
+        let r = e.rates.expect("rates after the baseline");
+        for (name, v) in [
+            ("tps", r.tps),
+            ("commits", r.commits),
+            ("rollbacks", r.rollbacks),
+            ("blks_read", r.blks_read),
+            ("blks_hit", r.blks_hit),
+            ("tup_returned", r.tup_returned),
+            ("tup_fetched", r.tup_fetched),
+            ("tup_inserted", r.tup_inserted),
+            ("tup_updated", r.tup_updated),
+            ("tup_deleted", r.tup_deleted),
+            ("temp_bytes", r.temp_bytes),
+        ] {
+            finite(v, name);
+        }
+        if let Some(hit) = r.cache_hit {
+            assert!((0.0..=1.0).contains(&hit), "cache hit {hit}");
+        }
+        finite(
+            r.wal_bytes.expect("a primary reports its WAL position"),
+            "wal_bytes",
+        );
+        assert_eq!(
+            r.wal_fpi.is_some(),
+            version_num >= 140_000,
+            "pg_stat_wal is PostgreSQL 14+"
+        );
+        if let Some(fpi) = r.wal_fpi {
+            finite(fpi, "wal_fpi");
+        }
+        let s = e.sessions.as_ref().expect("sessions");
+        assert!(s.max_connections > 0);
+        assert!(s.total >= 1, "the registered session is a client backend");
+        assert_eq!(
+            s.total,
+            s.active
+                + s.idle
+                + s.idle_in_transaction
+                + s.idle_in_transaction_aborted
+                + s.other
+                + s.hidden
+        );
+        assert!(e.load.is_some());
+        assert!(e.blocked.is_some());
+    }
+
+    fn app_row<'a>(e: &'a MonitorEvent, app: &str) -> Option<&'a crate::monitor::ActivityRow> {
+        e.activity
+            .as_ref()?
+            .rows
+            .iter()
+            .find(|r| r.application.as_deref() == Some(app))
+    }
+
+    pub(super) async fn run(cfg: &ConnectionConfig) {
+        let state = crate::AppState::default();
+        let (user, _) = connect(cfg).await.expect("connect user session");
+        let id = state.register(user, false).expect("register");
+        let (observer, _) = connect(cfg).await.expect("connect observer");
+        wait_no_monitor_backend(&observer, "before the battery").await;
+
+        // Embedded engines get no monitor.
+        let (duck, _) = connect(&duck_cfg()).await.unwrap();
+        let duck_id = state.register(duck, false).unwrap();
+        let events: Events = Arc::default();
+        let err = monitor::start(&state, &duck_id, MonitorOptions::default(), sink(&events))
+            .await
+            .err()
+            .expect("DuckDB has no monitor");
+        assert!(err.message.contains("PostgreSQL-only"), "{}", err.message);
+
+        // A session to watch: sleeping, findable by application_name.
+        let (victim, _) = connect(cfg).await.unwrap();
+        let sleeper = tokio::spawn(async move {
+            let c = victim.pg().unwrap();
+            c.batch_execute("SET application_name = 'tusk-monitor-victim'")
+                .await
+                .unwrap();
+            c.simple_query("SELECT pg_sleep(60)")
+                .await
+                .map(|_| ())
+                .map_err(|e| crate::db::AppError::from(e).message)
+        });
+
+        let options = MonitorOptions {
+            interval_ms: Some(250),
+            paused: None,
+            activity: Some(true),
+        };
+        let started = monitor::start(&state, &id, options, sink(&events))
+            .await
+            .expect("monitor start");
+        let generation = started.generation;
+        let server = started.server.clone();
+        assert!(server.version_num >= 100_000);
+        assert!(server.pid > 0);
+        assert!(!started.read_only);
+        assert_eq!(server.wal_stats, server.version_num >= 140_000);
+        assert!(server.superuser, "the conformance role is postgres");
+        assert_eq!(started.interval_ms, 250);
+        assert_eq!(started.wait_types[0], "CPU");
+        assert_eq!(
+            monitor_backends(&observer).await,
+            1,
+            "one sidecar, identifiable by name"
+        );
+
+        // Three ticks with every fast-tier field present and finite.
+        let mut from = 0;
+        for _ in 0..3 {
+            let (e, next) = wait_event(&events, from, "a tick with rates", |e| {
+                e.generation == generation && e.rates.is_some()
+            })
+            .await;
+            assert_fast_tier(&e, server.version_num);
+            from = next;
+        }
+
+        // The process list shows the sleeper, never the monitor itself.
+        let (e, _) = wait_event(
+            &events,
+            0,
+            "the sleeping session in the process list",
+            |e| {
+                e.generation == generation
+                    && app_row(e, "tusk-monitor-victim")
+                        .is_some_and(|r| r.state.as_deref() == Some("active"))
+            },
+        )
+        .await;
+        let activity = e.activity.clone().unwrap();
+        assert!(
+            activity.rows.iter().all(|r| r.pid != server.pid),
+            "the monitor excludes itself"
+        );
+        assert!(activity.total as usize >= activity.rows.len());
+        let victim = app_row(&e, "tusk-monitor-victim").unwrap().clone();
+        assert!(victim.query.as_deref().unwrap_or("").contains("pg_sleep"));
+        assert!(victim.query_start_ms.is_some() && victim.backend_start_ms.is_some());
+        assert_eq!(victim.backend_type.as_deref(), Some("client backend"));
+        assert!(!victim.backend_start.is_empty());
+        assert!(
+            e.load.unwrap().iter().sum::<u32>() >= 1,
+            "the sleeper is load"
+        );
+
+        // Refusals: the monitor's own pid, a pid whose backend start no longer matches,
+        // a stale generation, and anything on a read-only connection.
+        let err = monitor::signal(
+            &state,
+            &id,
+            generation,
+            server.pid,
+            victim.backend_start.clone(),
+            SignalAction::Cancel,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("monitor's own"), "{}", err.message);
+        let err = monitor::signal(
+            &state,
+            &id,
+            generation,
+            victim.pid,
+            "1999-01-01 00:00:00+00".into(),
+            SignalAction::Cancel,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("already ended"), "{}", err.message);
+        let err = monitor::signal(
+            &state,
+            &id,
+            generation + 100,
+            victim.pid,
+            victim.backend_start.clone(),
+            SignalAction::Cancel,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.message.contains("stopped"),
+            "a stale generation reaches nothing: {}",
+            err.message
+        );
+        let (ro_backend, _) = connect(&ConnectionConfig {
+            read_only: true,
+            ..cfg.clone()
+        })
+        .await
+        .unwrap();
+        let ro_id = state.register(ro_backend, true).unwrap();
+        let err = monitor::signal(
+            &state,
+            &ro_id,
+            generation,
+            victim.pid,
+            victim.backend_start.clone(),
+            SignalAction::Terminate,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("read-only"), "{}", err.message);
+
+        // Cancel the sleeper's query: the server says yes and the query ends.
+        let cancelled = monitor::signal(
+            &state,
+            &id,
+            generation,
+            victim.pid,
+            victim.backend_start.clone(),
+            SignalAction::Cancel,
+        )
+        .await
+        .expect("cancel");
+        assert!(cancelled);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), sleeper)
+            .await
+            .expect("sleeper ended")
+            .unwrap();
+        assert!(
+            outcome.unwrap_err().contains("cancel"),
+            "the sleep was cancelled"
+        );
+
+        // A lock wait: the holder keeps an exclusive lock idle in transaction, the
+        // waiter queues behind it.
+        let (setup, _) = connect(cfg).await.unwrap();
+        setup
+            .pg()
+            .unwrap()
+            .batch_execute(
+                "DROP TABLE IF EXISTS tusk_monitor_lock; CREATE TABLE tusk_monitor_lock (id int)",
+            )
+            .await
+            .unwrap();
+        let (holder, _) = connect(cfg).await.unwrap();
+        holder
+            .pg()
+            .unwrap()
+            .batch_execute("SET application_name = 'tusk-monitor-holder'; BEGIN; LOCK TABLE tusk_monitor_lock IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let (waiter, _) = connect(cfg).await.unwrap();
+        let waiting = tokio::spawn(async move {
+            let c = waiter.pg().unwrap();
+            c.batch_execute("SET application_name = 'tusk-monitor-waiter'")
+                .await
+                .unwrap();
+            c.simple_query("SELECT count(*) FROM tusk_monitor_lock")
+                .await
+                .map(|_| ())
+                .map_err(|e| crate::db::AppError::from(e).message)
+        });
+        let mark = snapshot(&events).len();
+        let (e, _) = wait_event(&events, mark, "the waiter blocked by the holder", |e| {
+            e.generation == generation
+                && matches!(
+                    (app_row(e, "tusk-monitor-holder"), app_row(e, "tusk-monitor-waiter")),
+                    (Some(h), Some(w)) if w.blocked_by.contains(&h.pid)
+                )
+        })
+        .await;
+        let holder_row = app_row(&e, "tusk-monitor-holder").unwrap().clone();
+        assert_eq!(holder_row.state.as_deref(), Some("idle in transaction"));
+        assert!(holder_row.xact_start_ms.is_some());
+        assert!(
+            holder_row.blocked_by.is_empty(),
+            "the root blocker waits on nothing"
+        );
+        assert_eq!(
+            app_row(&e, "tusk-monitor-waiter")
+                .unwrap()
+                .wait_type
+                .as_deref(),
+            Some("Lock")
+        );
+        let (blocked_tick, _) =
+            wait_event(&events, mark, "the blocked count on the fast tier", |e| {
+                e.generation == generation && e.blocked.is_some_and(|b| b >= 1)
+            })
+            .await;
+        let s = blocked_tick.sessions.as_ref().unwrap();
+        assert!(s.idle_in_transaction >= 1, "{s:?}");
+        assert!(
+            blocked_tick.oldest_xact_ms.is_some(),
+            "the holder's transaction is the oldest"
+        );
+
+        // Terminate the holder: the waiter gets its lock and finishes.
+        let terminated = monitor::signal(
+            &state,
+            &id,
+            generation,
+            holder_row.pid,
+            holder_row.backend_start.clone(),
+            SignalAction::Terminate,
+        )
+        .await
+        .expect("terminate");
+        assert!(terminated);
+        tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("waiter finished")
+            .unwrap()
+            .expect("the waiter's read succeeded once the lock was gone");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !holder.is_closed() {
+            assert!(
+                Instant::now() < deadline,
+                "the terminated session is still open"
+            );
+            let _ = holder.pg().unwrap().simple_query("SELECT 1").await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        setup
+            .pg()
+            .unwrap()
+            .batch_execute("DROP TABLE IF EXISTS tusk_monitor_lock")
+            .await
+            .unwrap();
+
+        // Pause stops the queries; resume re-baselines (no rate across the gap).
+        monitor::configure(
+            &state,
+            &id,
+            generation,
+            MonitorOptions {
+                paused: Some(true),
+                ..options
+            },
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await; // let an in-flight tick land
+        let paused_at = snapshot(&events).len();
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert_eq!(
+            snapshot(&events).len(),
+            paused_at,
+            "a paused monitor sends nothing"
+        );
+        monitor::configure(&state, &id, generation, options).unwrap();
+        let (first, _) = wait_event(&events, paused_at, "the first tick after resume", |e| {
+            e.generation == generation
+        })
+        .await;
+        assert_eq!(first.status, "live");
+        assert!(
+            first.rates.is_none(),
+            "the first reading after a pause is a baseline"
+        );
+        assert!(first.sessions.is_some());
+        wait_event(&events, paused_at, "rates again after resume", |e| {
+            e.generation == generation && e.rates.is_some()
+        })
+        .await;
+        assert!(
+            monitor::configure(&state, &id, generation + 100, options).is_err(),
+            "stale generation"
+        );
+
+        // Disconnect takes the sidecar with it.
+        crate::disconnect_registered(&state, &id).await.unwrap();
+        assert_eq!(state.monitors.len(), 0);
+        wait_no_monitor_backend(&observer, "after disconnect").await;
+        assert!(monitor::configure(&state, &id, generation, options).is_err());
+
+        // stop_all (the frontend's on-mount sweep) stops whatever is left.
+        let ro_started = monitor::start(&state, &ro_id, options, sink(&events))
+            .await
+            .expect("read-only start");
+        assert!(
+            ro_started.read_only,
+            "the USER's read-only flag is reported"
+        );
+        assert_eq!(monitor_backends(&observer).await, 1);
+        assert_eq!(state.monitors.stop_all(), 1);
+        wait_no_monitor_backend(&observer, "after stop_all").await;
+    }
+}
+
+#[tokio::test]
+async fn monitor_battery_postgres() {
+    let Some(cfg) = pg_cfg() else {
+        eprintln!("SKIP monitor_battery_postgres (set TUSK_TEST_PG_PORT)");
+        return;
+    };
+    monitor_battery::run(&cfg).await;
+}

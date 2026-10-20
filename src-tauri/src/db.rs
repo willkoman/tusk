@@ -434,6 +434,18 @@ pub(crate) const CATALOG_TEXT_LIMITS: TextLimits = TextLimits {
     ..USER_TEXT_LIMITS
 };
 
+/// The database monitor's own fixed statements (`monitor/pg.rs`): one row per fast
+/// tick and a process list of at most 500 rows every activity tick. The widest cell
+/// is the fast tier's state × wait histogram as JSON (a few dozen buckets); query
+/// text is cut to 1,024 characters in SQL, so a row stays a few KiB even when the
+/// server's `track_activity_query_size` is raised.
+pub(crate) const MONITOR_TEXT_LIMITS: TextLimits = TextLimits {
+    max_rows: 500,
+    max_cell_bytes: 16 * 1024,
+    max_total_bytes: 4 * 1024 * 1024,
+    ..CATALOG_TEXT_LIMITS
+};
+
 pub(crate) const DDL_TEXT_LIMITS: TextLimits = TextLimits {
     max_rows: 100_000,
     max_cell_bytes: 8 * 1024 * 1024,
