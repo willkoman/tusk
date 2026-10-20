@@ -1,4 +1,5 @@
-//! Live database monitor (docs/db-monitor-plan.md), PostgreSQL first.
+//! Live database monitor (docs/db-monitor-plan.md): PostgreSQL, MySQL / MariaDB and
+//! SQL Server (`pg.rs`, `mysql.rs`, `mssql.rs` behind one `Source`).
 //!
 //! The monitor never touches the user's session: there is one result cursor per
 //! connection, every metadata read rolls it back, and a manual transaction freezes
@@ -8,11 +9,13 @@
 //! tunnel and TLS through the usual driver path), and runs Tusk's fixed SQL from one
 //! tokio task per monitored connection:
 //!
-//! - the fast tier every tick (ONE statement, one row),
+//! - the fast tier every tick (ONE statement, one row, on PostgreSQL; a status row
+//!   plus a grouped session histogram on MySQL and SQL Server),
 //! - the activity tier (the bounded process list) every two seconds while a view
 //!   that shows it is open,
 //! - the view tiers (`views.rs`: locks, replication, progress, maintenance, I/O,
-//!   statements), each on its own cadence and only while its view is open.
+//!   statements), each on its own cadence and only while its view is open
+//!   (PostgreSQL only).
 //!
 //! Rates are computed here, so the frontend receives one `monitor-sample` event per
 //! tick and only draws. `MissedTickBehavior::Skip` drops a slow tick instead of
@@ -22,6 +25,8 @@
 //! run on the sidecar, are refused for read-only connections and for the monitor's
 //! own pid, and re-identify their target by backend start before signalling.
 
+mod mssql;
+mod mysql;
 mod pg;
 mod rates;
 mod views;
@@ -38,10 +43,12 @@ use tokio::time::MissedTickBehavior;
 
 use crate::db::{AppError, ConnectionConfig};
 use crate::{lock_sync, AppState};
+use mssql::MsSqlSession;
+use mysql::MySqlSession;
 #[cfg(test)]
 pub(crate) use pg::ActivityRow;
 pub(crate) use pg::SignalAction;
-use pg::{Activity, PgSession, Probe, Sessions};
+use pg::{Activity, FastSample, PgSession, Probe, Sessions};
 use rates::{Ingest, RateTracker, Rates};
 pub(crate) use views::ViewSet;
 use views::{
@@ -320,21 +327,94 @@ impl MonitorEvent {
     }
 }
 
-/// Open a sidecar on a read-only clone of `config`. Network PostgreSQL only.
-pub(crate) async fn open_sidecar(config: &ConnectionConfig) -> Result<PgSession, AppError> {
-    if config.driver.as_deref().unwrap_or("postgres") != "postgres" {
-        return Err(AppError::new(
-            "the database monitor is PostgreSQL-only for now",
-        ));
+/// One engine's sidecar session. Every source fills the same sample model; only
+/// PostgreSQL has the view tiers.
+pub(crate) enum Source {
+    Pg(Box<PgSession>),
+    MySql(Box<MySqlSession>),
+    MsSql(Box<MsSqlSession>),
+}
+
+impl Source {
+    pub(crate) fn probe(&self) -> &Probe {
+        match self {
+            Source::Pg(s) => &s.probe,
+            Source::MySql(s) => &s.probe,
+            Source::MsSql(s) => &s.probe,
+        }
     }
+
+    fn is_closed(&self) -> bool {
+        match self {
+            Source::Pg(s) => s.is_closed(),
+            Source::MySql(s) => s.is_closed(),
+            Source::MsSql(s) => s.is_closed(),
+        }
+    }
+
+    async fn reopen(&mut self) -> Result<(), AppError> {
+        match self {
+            Source::Pg(s) => s.reopen().await,
+            Source::MySql(s) => s.reopen().await,
+            Source::MsSql(s) => s.reopen().await,
+        }
+    }
+
+    async fn sample(&mut self) -> Result<FastSample, AppError> {
+        match self {
+            Source::Pg(s) => s.sample().await,
+            Source::MySql(s) => s.sample().await,
+            Source::MsSql(s) => s.sample().await,
+        }
+    }
+
+    async fn activity(&mut self) -> Result<Activity, AppError> {
+        match self {
+            Source::Pg(s) => s.activity().await,
+            Source::MySql(s) => s.activity().await,
+            Source::MsSql(s) => s.activity().await,
+        }
+    }
+
+    async fn signal(
+        &mut self,
+        pid: i32,
+        backend_start: &str,
+        action: SignalAction,
+    ) -> Result<bool, AppError> {
+        match self {
+            Source::Pg(s) => s.signal(pid, backend_start, action).await,
+            Source::MySql(s) => s.signal(pid, backend_start, action).await,
+            Source::MsSql(s) => s.signal(pid, backend_start, action).await,
+        }
+    }
+
+    fn pg(&mut self) -> Option<&mut PgSession> {
+        match self {
+            Source::Pg(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+/// Open a sidecar on a read-only clone of `config` (network engines only).
+pub(crate) async fn open_sidecar(config: &ConnectionConfig) -> Result<Source, AppError> {
     let mut sidecar = config.clone();
     sidecar.read_only = true;
-    PgSession::open(&sidecar).await
+    match config.driver.as_deref().unwrap_or("postgres") {
+        "postgres" => Ok(Source::Pg(Box::new(PgSession::open(&sidecar).await?))),
+        "mysql" => Ok(Source::MySql(Box::new(MySqlSession::open(&sidecar).await?))),
+        "mssql" => Ok(Source::MsSql(Box::new(MsSqlSession::open(&sidecar).await?))),
+        _ => Err(AppError::new(
+            "the database monitor watches PostgreSQL, MySQL / MariaDB and SQL Server; \
+             an embedded database has no server to watch",
+        )),
+    }
 }
 
 /// Spawn the sampler for an open sidecar.
 pub(crate) fn spawn(
-    session: PgSession,
+    session: Source,
     connection_id: String,
     generation: u64,
     settings: Settings,
@@ -366,7 +446,7 @@ pub(crate) fn spawn(
 }
 
 struct Sampler {
-    session: PgSession,
+    session: Source,
     connection_id: String,
     generation: u64,
     settings: Settings,
@@ -448,7 +528,7 @@ impl Sampler {
         backend_start: &str,
         action: SignalAction,
     ) -> Result<bool, AppError> {
-        if let Some(reason) = signal_refusal(false, self.session.probe.pid, pid) {
+        if let Some(reason) = signal_refusal(false, self.session.probe().pid, pid) {
             return Err(AppError::new(reason));
         }
         if self.session.is_closed() {
@@ -489,7 +569,10 @@ impl Sampler {
     /// A tier the server cannot answer is never queried; the frontend explains why
     /// from the probe (version, extension).
     fn tier_supported(&self, tier: Tier) -> bool {
-        let probe = &self.session.probe;
+        let probe = self.session.probe();
+        if probe.engine != "postgres" {
+            return false;
+        }
         match tier {
             Tier::Io => probe.version_num >= views::IO_VERSION_NUM,
             Tier::Statements => probe.statements_available,
@@ -506,52 +589,30 @@ impl Sampler {
             }
             self.last_tier.insert(tier, now);
             let at = now.duration_since(self.started);
+            let Some(session) = self.session.pg() else {
+                return;
+            };
             let outcome = match tier {
-                Tier::Locks => self.session.locks().await.map(|v| event.locks = Some(v)),
-                Tier::Replication => self
-                    .session
+                Tier::Locks => session.locks().await.map(|v| event.locks = Some(v)),
+                Tier::Replication => session
                     .replication()
                     .await
                     .map(|v| event.replication = Some(v)),
-                Tier::Progress => self
-                    .session
-                    .progress()
-                    .await
-                    .map(|v| event.progress = Some(v)),
-                Tier::Maintenance => self
-                    .session
+                Tier::Progress => session.progress().await.map(|v| event.progress = Some(v)),
+                Tier::Maintenance => session
                     .maintenance()
                     .await
                     .map(|v| event.maintenance = Some(v)),
-                Tier::Io => match self.session.io_rows().await {
+                Tier::Io => match session.io_rows().await {
                     Ok((c, rows)) => self.io.ingest(&c, &rows, at).map(|v| event.io = v),
                     Err(e) => Err(e),
                 },
-                Tier::Statements => self.statement_tier(event, at).await,
+                Tier::Statements => statement_tier(session, &mut self.statements, event, at).await,
             };
             if let Err(e) = outcome {
                 event.view_error(tier, e.message);
             }
         }
-    }
-
-    async fn statement_tier(
-        &mut self,
-        event: &mut MonitorEvent,
-        at: Duration,
-    ) -> Result<(), AppError> {
-        let (c, rows) = self.session.statement_rows().await?;
-        let Some((mut stmts, missing)) = self.statements.ingest(&c, &rows, at)? else {
-            return Ok(());
-        };
-        if !missing.is_empty() {
-            // Texts are a nicety: a failure here still shows the numbers.
-            if let Ok((tc, tr)) = self.session.statement_texts(&missing).await {
-                self.statements.fill_texts(&tc, &tr, &mut stmts);
-            }
-        }
-        event.statements = Some(stmts);
-        Ok(())
     }
 
     fn elapsed_ms(&self) -> f64 {
@@ -637,6 +698,26 @@ impl Sampler {
     }
 }
 
+async fn statement_tier(
+    session: &mut PgSession,
+    tracker: &mut StatementTracker,
+    event: &mut MonitorEvent,
+    at: Duration,
+) -> Result<(), AppError> {
+    let (c, rows) = session.statement_rows().await?;
+    let Some((mut stmts, missing)) = tracker.ingest(&c, &rows, at)? else {
+        return Ok(());
+    };
+    if !missing.is_empty() {
+        // Texts are a nicety: a failure here still shows the numbers.
+        if let Ok((tc, tr)) = session.statement_texts(&missing).await {
+            tracker.fill_texts(&tc, &tr, &mut stmts);
+        }
+    }
+    event.statements = Some(stmts);
+    Ok(())
+}
+
 fn app_sink(app: AppHandle) -> Sink {
     Arc::new(move |event: &MonitorEvent| {
         let _ = app.emit(EVENT, event);
@@ -655,7 +736,7 @@ pub(crate) async fn start(
     let config = state.config_snapshot(connection_id)?;
     let read_only = config.read_only;
     let session = open_sidecar(&config).await?;
-    let server = session.probe.clone();
+    let server = session.probe().clone();
     let generation = state.monitors.next_generation();
     // Spawn and install while the connection is still registered: a disconnect racing
     // this start either removed it first (refused here, and the sidecar drops with the

@@ -5900,7 +5900,7 @@ mod monitor_battery {
             .await
             .err()
             .expect("DuckDB has no monitor");
-        assert!(err.message.contains("PostgreSQL-only"), "{}", err.message);
+        assert!(err.message.contains("embedded database"), "{}", err.message);
 
         // A session to watch: sleeping, findable by application_name.
         let (victim, _) = connect(cfg).await.unwrap();
@@ -6607,4 +6607,514 @@ async fn monitor_views_postgres() {
         return;
     };
     monitor_views_battery::run(&cfg).await;
+}
+
+// --- database monitor on MySQL and SQL Server ---
+//
+// The same sidecar contract as PostgreSQL's battery, per engine: start, three ticks
+// with every fast-tier field present and finite, the process list shows the watched
+// sessions (and never the monitor), a row-lock wait names its blocker, Cancel and
+// Terminate do what the engine can (MySQL KILL QUERY / KILL CONNECTION; SQL Server
+// KILL only), a session that has gone reports false, and stop leaves no monitor
+// connection behind.
+
+mod monitor_engines_battery {
+    use super::monitor_battery::{sink, wait_event, Events};
+    use super::{all, connect};
+    use crate::db::ConnectionConfig;
+    use crate::driver::Backend;
+    use crate::monitor::{self, MonitorEvent, MonitorOptions, SignalAction};
+    use mysql_async::prelude::Queryable;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn options() -> MonitorOptions {
+        MonitorOptions {
+            interval_ms: Some(250),
+            paused: None,
+            activity: Some(true),
+            views: None,
+        }
+    }
+
+    fn finite(v: f64, what: &str) {
+        assert!(v.is_finite() && v >= 0.0, "{what} = {v}");
+    }
+
+    fn assert_fast_tier(e: &MonitorEvent) {
+        assert_eq!(e.status, "live", "{e:#?}");
+        assert!(
+            e.server_ms.is_some_and(|ms| ms > 1_600_000_000_000),
+            "server clock"
+        );
+        let r = e.rates.expect("rates after the baseline");
+        for (name, v) in [
+            ("tps", r.tps),
+            ("blks_read", r.blks_read),
+            ("blks_hit", r.blks_hit),
+            ("tup_returned", r.tup_returned),
+            ("buffers_checkpoint", r.buffers_checkpoint),
+        ] {
+            finite(v, name);
+        }
+        if let Some(hit) = r.cache_hit {
+            assert!((0.0..=1.0).contains(&hit), "cache hit {hit}");
+        }
+        finite(r.wal_bytes.expect("redo / log bytes"), "wal_bytes");
+        assert!(r.wal_fpi.is_none());
+        let s = e.sessions.as_ref().expect("sessions");
+        assert!(s.max_connections > 0);
+        assert!(s.total >= 1, "the registered session is a client");
+        assert_eq!(
+            s.total,
+            s.active
+                + s.idle
+                + s.idle_in_transaction
+                + s.idle_in_transaction_aborted
+                + s.other
+                + s.hidden
+        );
+        assert!(e.load.is_some() && e.blocked.is_some());
+        assert!(e.replication_lag_ms.is_none());
+        assert!(
+            e.locks.is_none() && e.statements.is_none(),
+            "no view tiers off PostgreSQL"
+        );
+    }
+
+    fn row_where(
+        e: &MonitorEvent,
+        pred: impl Fn(&crate::monitor::ActivityRow) -> bool,
+    ) -> Option<&crate::monitor::ActivityRow> {
+        e.activity.as_ref()?.rows.iter().find(|r| pred(r))
+    }
+
+    async fn count(observer: &mut Backend, sql: &str) -> i64 {
+        all(observer, sql)
+            .await
+            .first()
+            .and_then(|r| r.first().cloned().flatten())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(-1)
+    }
+
+    async fn wait_gone(observer: &mut Backend, sql: &str, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while count(observer, sql).await != 0 {
+            assert!(Instant::now() < deadline, "{what}: still connected");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn ticks(events: &Events, generation: u64) {
+        let mut from = 0;
+        for _ in 0..3 {
+            let (e, next) = wait_event(events, from, "a tick with rates", |e| {
+                e.generation == generation && e.rates.is_some()
+            })
+            .await;
+            assert_fast_tier(&e);
+            from = next;
+        }
+    }
+
+    pub(super) async fn mysql(cfg: &ConnectionConfig) {
+        let state = crate::AppState::default();
+        let (user, _) = connect(cfg).await.expect("connect user session");
+        let id = state.register(user, false).expect("register");
+        let (mut observer, _) = connect(cfg).await.expect("connect observer");
+        let events: Events = Arc::default();
+
+        let started = monitor::start(&state, &id, options(), sink(&events))
+            .await
+            .expect("monitor start");
+        let generation = started.generation;
+        let server = started.server.clone();
+        assert_eq!(server.engine, "mysql");
+        assert!(server.version_num >= 80_000, "{}", server.version);
+        assert!(server.pid > 0);
+        assert!(server.read_all_stats, "root reads every thread and InnoDB");
+        assert!(server.signal_backend, "root may KILL any connection");
+        assert!(server.started_ms.is_some());
+        let mine = format!(
+            "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE ID = {}",
+            server.pid
+        );
+        assert_eq!(
+            count(&mut observer, &mine).await,
+            1,
+            "the sidecar holds one connection"
+        );
+        ticks(&events, generation).await;
+
+        // A sleeping query, found by a marker in its text.
+        let (victim, _) = connect(cfg).await.unwrap();
+        let sleeper = tokio::spawn(async move {
+            let mut victim = victim;
+            victim
+                .run_single("SELECT SLEEP(60) AS tusk_monitor_victim", 1000, false)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.message)
+        });
+        let is_victim = |r: &crate::monitor::ActivityRow| {
+            r.query
+                .as_deref()
+                .is_some_and(|q| q.contains("tusk_monitor_victim"))
+                && r.state.as_deref() == Some("active")
+        };
+        let (e, _) = wait_event(&events, 0, "the sleeping query", |e| {
+            e.generation == generation && row_where(e, is_victim).is_some()
+        })
+        .await;
+        let activity = e.activity.clone().unwrap();
+        assert!(
+            activity.rows.iter().all(|r| r.pid != server.pid),
+            "the monitor excludes itself"
+        );
+        let victim = row_where(&e, is_victim).unwrap().clone();
+        assert_eq!(victim.backend_start, victim.pid.to_string());
+        assert!(victim.query_start_ms.is_some());
+        assert_eq!(victim.wait_event.as_deref(), Some("User sleep"));
+        assert_eq!(victim.wait_type.as_deref(), Some("Timeout"));
+
+        // The monitor's own connection and a mismatched identity are refused.
+        let err = monitor::signal(
+            &state,
+            &id,
+            generation,
+            server.pid,
+            server.pid.to_string(),
+            SignalAction::Cancel,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("monitor"), "{}", err.message);
+        let err = monitor::signal(
+            &state,
+            &id,
+            generation,
+            victim.pid,
+            "elsewhere".into(),
+            SignalAction::Cancel,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("identified"), "{}", err.message);
+
+        // KILL QUERY ends the sleep (SLEEP returns early, without an error).
+        let cancelled = monitor::signal(
+            &state,
+            &id,
+            generation,
+            victim.pid,
+            victim.backend_start.clone(),
+            SignalAction::Cancel,
+        )
+        .await
+        .expect("KILL QUERY");
+        assert!(cancelled);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), sleeper)
+            .await
+            .expect("the sleep ended early")
+            .unwrap();
+        // SLEEP returns 1 when killed; some versions report the interruption instead.
+        if let Err(message) = &outcome {
+            assert!(message.to_lowercase().contains("interrupt"), "{message}");
+        }
+
+        // A row-lock wait names its blocker; the holder is idle in transaction.
+        exec_mysql(
+            &mut observer,
+            "CREATE TABLE IF NOT EXISTS tusk_mon_lock (id INT PRIMARY KEY, v INT)",
+        )
+        .await;
+        exec_mysql(&mut observer, "REPLACE INTO tusk_mon_lock VALUES (1, 0)").await;
+        let mut holder = observer
+            .mysql_conn()
+            .unwrap()
+            .monitor_checkout()
+            .await
+            .unwrap();
+        let holder_id = holder.id() as i32;
+        holder.query_drop("START TRANSACTION").await.unwrap();
+        holder
+            .query_drop("UPDATE tusk_mon_lock SET v = 1 WHERE id = 1")
+            .await
+            .unwrap();
+        let mut waiter_conn = observer
+            .mysql_conn()
+            .unwrap()
+            .monitor_checkout()
+            .await
+            .unwrap();
+        let waiter = tokio::spawn(async move {
+            waiter_conn
+                .query_drop("UPDATE tusk_mon_lock SET v = 2 WHERE id = 1")
+                .await
+                .map_err(|e| e.to_string())
+        });
+        let is_waiter = |r: &crate::monitor::ActivityRow| {
+            r.query.as_deref().is_some_and(|q| q.contains("SET v = 2"))
+        };
+        let (e, _) = wait_event(&events, 0, "a lock wait naming its blocker", |e| {
+            e.generation == generation
+                && e.blocked.unwrap_or(0) >= 1
+                && row_where(e, is_waiter).is_some_and(|r| r.blocked_by == vec![holder_id])
+        })
+        .await;
+        let waiting = row_where(&e, is_waiter).unwrap();
+        assert_eq!(waiting.wait_type.as_deref(), Some("Lock"));
+        assert!(waiting.xact_start_ms.is_some());
+        let held = row_where(&e, |r| r.pid == holder_id)
+            .expect("the holder is listed")
+            .clone();
+        assert_eq!(held.state.as_deref(), Some("idle in transaction"));
+        assert!(e.oldest_xact_ms.is_some_and(|ms| ms >= 0));
+        let sessions = e.sessions.as_ref().unwrap();
+        assert!(sessions.idle_in_transaction >= 1);
+        assert!(e.load.unwrap()[1] >= 1, "the waiter is Lock load");
+
+        // KILL CONNECTION frees the waiter; killing it again finds nobody.
+        let terminated = monitor::signal(
+            &state,
+            &id,
+            generation,
+            holder_id,
+            held.backend_start.clone(),
+            SignalAction::Terminate,
+        )
+        .await
+        .expect("KILL CONNECTION");
+        assert!(terminated);
+        let freed = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("the waiter got its lock")
+            .unwrap();
+        assert!(freed.is_ok(), "{freed:?}");
+        assert!(
+            holder.query_drop("SELECT 1").await.is_err(),
+            "the holder's connection is gone"
+        );
+        drop(holder);
+        let again = monitor::signal(
+            &state,
+            &id,
+            generation,
+            holder_id,
+            held.backend_start,
+            SignalAction::Terminate,
+        )
+        .await
+        .expect("a gone session is not an error");
+        assert!(!again);
+        exec_mysql(&mut observer, "DROP TABLE tusk_mon_lock").await;
+
+        assert_eq!(state.monitors.stop_all(), 1);
+        wait_gone(&mut observer, &mine, "after stop_all").await;
+    }
+
+    async fn exec_mysql(b: &mut Backend, sql: &str) {
+        b.run_single(sql, 1000, false)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+    }
+
+    async fn tsql(b: &Backend, sql: &str) -> Vec<Vec<Option<String>>> {
+        b.mssql_conn()
+            .unwrap()
+            .monitor_query(sql, crate::db::MONITOR_TEXT_LIMITS)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {}", e.message))
+            .1
+    }
+
+    pub(super) async fn mssql(cfg: &ConnectionConfig) {
+        let state = crate::AppState::default();
+        let (user, _) = connect(cfg).await.expect("connect user session");
+        let id = state.register(user, false).expect("register");
+        let (mut observer, _) = connect(cfg).await.expect("connect observer");
+        let events: Events = Arc::default();
+
+        let started = monitor::start(&state, &id, options(), sink(&events))
+            .await
+            .expect("monitor start");
+        let generation = started.generation;
+        let server = started.server.clone();
+        assert_eq!(server.engine, "mssql");
+        assert!(server.version_num >= 130_000, "{}", server.version);
+        assert!(
+            server.superuser && server.read_all_stats && server.signal_backend,
+            "sa"
+        );
+        assert!(server.started_ms.is_some());
+        let mine = format!(
+            "SELECT COUNT(*) FROM sys.dm_exec_sessions WHERE session_id = {}",
+            server.pid
+        );
+        assert_eq!(count(&mut observer, &mine).await, 1);
+        ticks(&events, generation).await;
+
+        // A WAITFOR session: SQL Server cannot cancel just its query, but can KILL it.
+        let (victim, _) = connect(cfg).await.unwrap();
+        let sleeper =
+            tokio::spawn(async move { tsql_owned(victim, "WAITFOR DELAY '00:01:00'").await });
+        let is_victim =
+            |r: &crate::monitor::ActivityRow| r.wait_event.as_deref() == Some("WAITFOR");
+        let (e, _) = wait_event(&events, 0, "the WAITFOR session", |e| {
+            e.generation == generation && row_where(e, is_victim).is_some()
+        })
+        .await;
+        let activity = e.activity.clone().unwrap();
+        assert!(
+            activity.rows.iter().all(|r| r.pid != server.pid),
+            "the monitor excludes itself"
+        );
+        let victim = row_where(&e, is_victim).unwrap().clone();
+        assert_eq!(victim.state.as_deref(), Some("active"));
+        assert_eq!(victim.wait_type.as_deref(), Some("Timeout"));
+        assert!(victim.query.as_deref().unwrap_or("").contains("WAITFOR"));
+        assert!(victim.backend_start_ms.is_some() && victim.query_start_ms.is_some());
+        let err = monitor::signal(
+            &state,
+            &id,
+            generation,
+            victim.pid,
+            victim.backend_start.clone(),
+            SignalAction::Cancel,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("cannot cancel"), "{}", err.message);
+        let killed = monitor::signal(
+            &state,
+            &id,
+            generation,
+            victim.pid,
+            victim.backend_start.clone(),
+            SignalAction::Terminate,
+        )
+        .await
+        .expect("KILL");
+        assert!(killed);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), sleeper)
+            .await
+            .expect("the killed session's batch ended")
+            .unwrap();
+        assert!(outcome.is_err(), "the WAITFOR was killed");
+
+        // A row-lock wait names its blocker; the holder is idle in transaction.
+        tsql(
+            &observer,
+            "IF OBJECT_ID('dbo.tusk_mon_lock') IS NOT NULL DROP TABLE dbo.tusk_mon_lock",
+        )
+        .await;
+        tsql(
+            &observer,
+            "CREATE TABLE dbo.tusk_mon_lock (id int PRIMARY KEY, v int)",
+        )
+        .await;
+        tsql(&observer, "INSERT INTO dbo.tusk_mon_lock VALUES (1, 0)").await;
+        let (holder, _) = connect(cfg).await.unwrap();
+        let holder_spid: i32 = tsql(&holder, "SELECT @@SPID AS spid").await[0][0]
+            .as_deref()
+            .unwrap()
+            .parse()
+            .unwrap();
+        tsql(
+            &holder,
+            "BEGIN TRANSACTION; UPDATE dbo.tusk_mon_lock SET v = 1 WHERE id = 1",
+        )
+        .await;
+        let (waiter_conn, _) = connect(cfg).await.unwrap();
+        let waiter = tokio::spawn(async move {
+            tsql_owned(
+                waiter_conn,
+                "UPDATE dbo.tusk_mon_lock SET v = 2 WHERE id = 1",
+            )
+            .await
+        });
+        let (e, _) = wait_event(&events, 0, "a lock wait naming its blocker", |e| {
+            e.generation == generation
+                && e.blocked.unwrap_or(0) >= 1
+                && row_where(e, |r| r.blocked_by == vec![holder_spid]).is_some()
+        })
+        .await;
+        let waiting = row_where(&e, |r| r.blocked_by == vec![holder_spid]).unwrap();
+        assert_eq!(waiting.wait_type.as_deref(), Some("Lock"));
+        assert!(waiting
+            .wait_event
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("LCK_M_"));
+        let held = row_where(&e, |r| r.pid == holder_spid)
+            .expect("the holder is listed")
+            .clone();
+        assert_eq!(held.state.as_deref(), Some("idle in transaction"));
+        assert!(held.xact_start_ms.is_some());
+        assert!(e.oldest_xact_ms.is_some_and(|ms| ms >= 0));
+        assert!(e.load.unwrap()[1] >= 1, "the waiter is Lock load");
+
+        let terminated = monitor::signal(
+            &state,
+            &id,
+            generation,
+            holder_spid,
+            held.backend_start.clone(),
+            SignalAction::Terminate,
+        )
+        .await
+        .expect("KILL the holder");
+        assert!(terminated);
+        let freed = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("the waiter got its lock")
+            .unwrap();
+        assert!(freed.is_ok(), "{freed:?}");
+        drop(holder);
+        let again = monitor::signal(
+            &state,
+            &id,
+            generation,
+            holder_spid,
+            held.backend_start,
+            SignalAction::Terminate,
+        )
+        .await
+        .expect("a gone session is not an error");
+        assert!(!again);
+        tsql(&observer, "DROP TABLE dbo.tusk_mon_lock").await;
+
+        assert_eq!(state.monitors.stop_all(), 1);
+        wait_gone(&mut observer, &mine, "after stop_all").await;
+    }
+
+    async fn tsql_owned(b: Backend, sql: &str) -> Result<(), String> {
+        b.mssql_conn()
+            .unwrap()
+            .monitor_query(sql, crate::db::MONITOR_TEXT_LIMITS)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.message)
+    }
+}
+
+#[tokio::test]
+async fn monitor_battery_mysql() {
+    let Some(cfg) = mysql_cfg() else {
+        eprintln!("SKIP monitor_battery_mysql (set TUSK_TEST_MYSQL_PORT)");
+        return;
+    };
+    monitor_engines_battery::mysql(&cfg).await;
+}
+
+#[tokio::test]
+async fn monitor_battery_mssql() {
+    let Some(cfg) = mssql_cfg() else {
+        eprintln!(
+            "SKIP monitor_battery_mssql (set TUSK_TEST_MSSQL_PORT + TUSK_TEST_MSSQL_PASSWORD)"
+        );
+        return;
+    };
+    monitor_engines_battery::mssql(&cfg).await;
 }

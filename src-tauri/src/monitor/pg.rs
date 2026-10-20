@@ -74,6 +74,10 @@ pub(crate) const WAIT_TYPES: [&str; 11] = [
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Probe {
+    /// `postgres`, `mysql` or `mssql`: which tiles, charts and views the tab shows.
+    pub engine: &'static str,
+    /// What the header calls the server: PostgreSQL, MySQL, MariaDB, SQL Server.
+    pub product: &'static str,
     pub version_num: i32,
     pub version: String,
     /// The sidecar's own backend pid: excluded from every count and never signalled.
@@ -596,7 +600,14 @@ async fn probe_statements(client: &Client, probe: &mut Probe) {
 }
 
 fn placeholder_probe() -> Probe {
+    base_probe("postgres", "PostgreSQL")
+}
+
+/// A probe with every fact unknown, for a source to fill in.
+pub(super) fn base_probe(engine: &'static str, product: &'static str) -> Probe {
     Probe {
+        engine,
+        product,
         version_num: 0,
         version: String::new(),
         pid: 0,
@@ -677,6 +688,8 @@ fn parse_probe(
     row: &[Option<String>],
 ) -> Result<Probe, AppError> {
     Ok(Probe {
+        engine: "postgres",
+        product: "PostgreSQL",
         version_num,
         version: text(columns, row, "version").unwrap_or_default(),
         pid: int(columns, row, "pid")?.clamp(0, i64::from(i32::MAX)) as i32,
@@ -745,9 +758,21 @@ pub(crate) fn histogram(
     json: &str,
     max_connections: u32,
 ) -> Result<(Sessions, [u32; 11]), AppError> {
-    type Bucket = (Option<String>, Option<String>, Option<bool>, i64);
     let buckets: Vec<Bucket> = serde_json::from_str(json)
         .map_err(|e| AppError::new(format!("monitor: unreadable session histogram: {e}")))?;
+    Ok(fold_histogram(buckets, max_connections))
+}
+
+/// One histogram cell: state (PostgreSQL's words), wait type (a `WAIT_TYPES` name;
+/// NULL = CPU), client backend, sessions.
+pub(super) type Bucket = (Option<String>, Option<String>, Option<bool>, i64);
+
+/// Fold histogram cells into client-session counts by state and active-session load
+/// by wait type. Every source speaks this one vocabulary.
+pub(super) fn fold_histogram(
+    buckets: impl IntoIterator<Item = Bucket>,
+    max_connections: u32,
+) -> (Sessions, [u32; 11]) {
     let mut sessions = Sessions {
         max_connections,
         ..Sessions::default()
@@ -779,7 +804,22 @@ pub(crate) fn histogram(
         };
         *slot = slot.saturating_add(n);
     }
-    Ok((sessions, load))
+    (sessions, load)
+}
+
+/// Histogram cells from rows of `state, wait, client ('t'/'f'), n` (the MySQL and SQL
+/// Server sources group in SQL and return rows rather than JSON).
+pub(super) fn bucket_rows(columns: &[String], rows: &[Row]) -> Result<Vec<Bucket>, AppError> {
+    rows.iter()
+        .map(|row| {
+            Ok((
+                text(columns, row, "state"),
+                text(columns, row, "wait"),
+                cell(columns, row, "client").map(|c| c == "t"),
+                int(columns, row, "n")?,
+            ))
+        })
+        .collect()
 }
 
 /// `{1,2}` (an int[] as text) → pids. Anything unreadable is dropped, never guessed.

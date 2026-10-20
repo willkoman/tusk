@@ -4374,6 +4374,94 @@ async fn mysql_table_detail(
     })
 }
 
+// --- Database monitor sidecar access (src/monitor/mysql.rs, mssql.rs) ---
+//
+// The monitor runs only Tusk's own fixed SQL on a sidecar it owns, so these bypass the
+// statement guards the user's session goes through; they still collect under the
+// caller's `TextLimits`.
+
+impl Backend {
+    /// The MySQL connection behind a monitor sidecar.
+    pub(crate) fn mysql_conn(&self) -> Result<&MySqlConn, AppError> {
+        match self {
+            Backend::MySql(m) => Ok(m),
+            _ => Err(AppError::new("not a MySQL connection")),
+        }
+    }
+
+    /// The SQL Server connection behind a monitor sidecar.
+    pub(crate) fn mssql_conn(&self) -> Result<&MsSqlConn, AppError> {
+        match self {
+            Backend::MsSql(m) => Ok(m),
+            _ => Err(AppError::new("not a SQL Server connection")),
+        }
+    }
+}
+
+impl MySqlConn {
+    /// A connection the monitor holds for its whole session: never returned between
+    /// ticks, so the session settings it applies (timeouts) stay with it.
+    pub(crate) async fn monitor_checkout(&self) -> Result<mysql_async::Conn, AppError> {
+        self.pool.get_conn().await.map_err(de)
+    }
+}
+
+/// Why a monitor statement failed on MySQL. `lost` means the connection itself is
+/// gone (I/O, protocol): drop it and redial. A server error leaves it usable.
+pub(crate) struct MySqlMonitorError {
+    pub error: AppError,
+    pub lost: bool,
+    /// The server's error number, when the server answered.
+    pub code: Option<u16>,
+}
+
+/// Run one of the monitor's statements on its held connection, collecting text rows
+/// under `limits`.
+pub(crate) async fn mysql_monitor_query(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+    limits: db::TextLimits,
+) -> Result<TextRows, MySqlMonitorError> {
+    use mysql_async::prelude::Queryable;
+    let classify = |e: mysql_async::Error| {
+        let code = match &e {
+            mysql_async::Error::Server(server) => Some(server.code),
+            _ => None,
+        };
+        MySqlMonitorError {
+            lost: code.is_none(),
+            code,
+            error: de(e),
+        }
+    };
+    let local = |error: AppError| MySqlMonitorError {
+        error,
+        lost: false,
+        code: None,
+    };
+    let mut result = conn.query_iter(sql).await.map_err(classify)?;
+    let (columns, metadata) = mysql_metadata(result.columns().as_ref());
+    let mut budget = db::TextBudget::new(&columns, limits).map_err(local)?;
+    let mut rows = Vec::new();
+    while let Some(row) = result.next().await.map_err(classify)? {
+        let row = mysql_text_row(&row, &metadata).map_err(local)?;
+        budget.add_row(&row).map_err(local)?;
+        rows.push(row);
+    }
+    Ok((columns, rows))
+}
+
+impl MsSqlConn {
+    /// Run one of the monitor's statements (or a short fixed batch) on the sidecar.
+    pub(crate) async fn monitor_query(
+        &self,
+        sql: &str,
+        limits: db::TextLimits,
+    ) -> Result<TextRows, AppError> {
+        self.run_text(sql, limits).await
+    }
+}
+
 // --- SQL Server (tiberius / TDS) ---
 
 type MsSqlStream = tokio_util::compat::Compat<tokio::net::TcpStream>;
