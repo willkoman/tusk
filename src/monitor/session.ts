@@ -162,11 +162,22 @@ export class MonitorSession {
     wake();
   }
 
-  /** Try again after a failed start or a stopped sampler. */
+  /**
+   * Start over: after a failed start or a stopped sampler, or when ticks keep
+   * failing. A sampler that is still running is stopped first, so a retry never
+   * leaves two sidecars behind.
+   */
   retry(): void {
+    const generation = this.generation;
     this.generation = null;
     this.applied = null;
+    if (generation !== null) void commands.monitorStop(this.connectionId, generation).catch(() => {});
     this.sync();
+  }
+
+  /** A backend sampler exists for this session (running or paused). */
+  hasSampler(): boolean {
+    return this.generation !== null;
   }
 
   setHover(t: number | null): void {

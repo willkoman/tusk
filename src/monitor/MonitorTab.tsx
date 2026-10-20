@@ -412,7 +412,9 @@ export default function MonitorTab(props: {
       case "hidden": return "Paused while hidden";
       case "idle": return "Not started";
       case "reconnecting": return "Reconnecting…";
-      case "error": return "Stopped";
+      // A failing tick leaves the sampler running (the next tick retries); a failed
+      // start or a vanished sampler does not.
+      case "error": return s.hasSampler() ? "Sampling failed" : "Stopped";
     }
   };
   const statusTitle = () => {

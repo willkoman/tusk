@@ -1380,7 +1380,7 @@ function App() {
     const truncated = row.queryTruncated ? "The query text was truncated, so it may not run as shown" : undefined;
     const refusal = signalRefusal(row, {
       readOnly: !!entryOf(session.connectionId)?.conn.readOnly,
-      running: session.status().kind === "live" || session.status().kind === "paused" || session.status().kind === "hidden",
+      running: session.hasSampler(),
       server: session.started()?.server ?? null,
     });
     const ask = (action: "cancel" | "terminate") => () => {
