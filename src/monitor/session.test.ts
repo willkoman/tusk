@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { MonitorSample, MonitorStarted } from "./model";
-import { MonitorSession, sweepStaleMonitors } from "./session";
+import { MonitorSession, NO_VIEWS, sweepStaleMonitors, tiersFor } from "./session";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 // The session never touches a window here; keep the Tauri window API out of node.
@@ -26,6 +26,8 @@ const started = (generation: number): MonitorStarted => ({
     inRecovery: false,
     querySize: 1024,
     walStats: true,
+    statementsAvailable: false,
+    statementsNote: null,
   },
   waitTypes: [],
 });
@@ -49,6 +51,13 @@ const sample = (generation: number, over: Partial<MonitorSample> = {}): MonitorS
   replicationLagMs: null,
   activity: null,
   activityError: null,
+  locks: null,
+  replication: null,
+  progress: null,
+  maintenance: null,
+  io: null,
+  statements: null,
+  viewErrors: null,
   ...over,
 });
 
@@ -83,7 +92,7 @@ describe("MonitorSession", () => {
     s.setVisible(true);
     await settle(s);
     expect(calls("monitor_start")).toHaveLength(1);
-    expect(calls("monitor_start")[0][1]).toEqual({ connectionId: "conn-1", options: { intervalMs: 1000, paused: false, activity: true } });
+    expect(calls("monitor_start")[0][1]).toEqual({ connectionId: "conn-1", options: { intervalMs: 1000, paused: false, activity: true, views: NO_VIEWS } });
     expect(s.status()).toEqual({ kind: "live" });
     expect(s.hasSampler()).toBe(true);
   });
@@ -94,7 +103,7 @@ describe("MonitorSession", () => {
     await settle(s);
     s.setVisible(false);
     await settle(s);
-    expect(last("monitor_configure")).toEqual({ connectionId: "conn-1", generation: 7, options: { intervalMs: 1000, paused: true, activity: true } });
+    expect(last("monitor_configure")).toEqual({ connectionId: "conn-1", generation: 7, options: { intervalMs: 1000, paused: true, activity: true, views: NO_VIEWS } });
     expect(s.status()).toEqual({ kind: "hidden" });
     s.setKeepSampling(true);
     await settle(s);
@@ -161,5 +170,59 @@ describe("MonitorSession", () => {
     expect(s.isDisposed).toBe(true);
     s.ingest(sample(7));
     expect(s.data.load.size).toBe(0);
+  });
+
+  it("runs only the tiers the open view needs", async () => {
+    const s = new MonitorSession("conn-1");
+    s.setVisible(true);
+    await settle(s);
+    s.setView("statements");
+    await settle(s);
+    expect(last("monitor_configure")).toMatchObject({ options: { activity: false, views: { ...NO_VIEWS, statements: true } } });
+    s.setView("locks");
+    await settle(s);
+    expect(last("monitor_configure")).toMatchObject({ options: { activity: true, views: { ...NO_VIEWS, locks: true } } });
+    s.setVisible(false);
+    s.setKeepSampling(true);
+    await settle(s);
+    expect(last("monitor_configure")).toMatchObject({ options: { paused: false, activity: true, views: NO_VIEWS } });
+  });
+
+  it("freezes on a dragged range and returns to live", () => {
+    const s = new MonitorSession("conn-1");
+    s.beginScrub(5000);
+    s.moveScrub(1000);
+    s.endScrub(500);
+    expect(s.range()).toEqual({ t0: 1000, t1: 5000 });
+    expect(s.frozen()).toBe(true);
+    s.backToLive();
+    expect(s.range()).toBeNull();
+    s.beginScrub(5000);
+    s.moveScrub(5100);
+    s.endScrub(500);
+    expect(s.range(), "a click is not a range").toBeNull();
+  });
+
+  it("keeps per-view data, statement snapshots and tier errors", async () => {
+    const s = new MonitorSession("conn-1");
+    s.setVisible(true);
+    await settle(s);
+    const statements = { seconds: 10, rows: [], totalCalls: 5, totalExecMs: 2, tracked: 3 };
+    s.ingest(sample(7, { statements, viewErrors: { locks: "permission denied" } }));
+    expect(s.statements()).toHaveLength(1);
+    expect(s.viewErrors()).toEqual({ locks: "permission denied" });
+    const locks = { waiting: [], waitingTotal: 0, held: [], heldTotal: 0, heldGroups: 0 };
+    s.ingest(sample(7, { seq: 2, monoMs: 1010, locks }));
+    expect(s.locks()).toEqual(locks);
+    expect(s.viewErrors(), "an answer clears the tier's error").toEqual({});
+  });
+});
+
+describe("tiersFor", () => {
+  it("maps each view to its tiers", () => {
+    expect(tiersFor("overview", true)).toEqual({ activity: true, views: NO_VIEWS });
+    expect(tiersFor("io", true)).toEqual({ activity: false, views: { ...NO_VIEWS, io: true } });
+    expect(tiersFor("tables", true).views.tables).toBe(true);
+    expect(tiersFor("tables", false), "hidden: fast tier and process list only").toEqual({ activity: true, views: NO_VIEWS });
   });
 });

@@ -15,12 +15,63 @@
  */
 
 import { createSignal, type Accessor } from "solid-js";
-import { commands, errorMessage, type MonitorOptions } from "../commands";
+import { commands, errorMessage, type MonitorOptions, type MonitorViewSet } from "../commands";
 import { wake } from "./frameLoop";
-import { ClockMap, MonitorData, ServerClock, type MonitorActivity, type MonitorSample, type MonitorStarted } from "./model";
+import {
+  ClockMap,
+  MOMENT_CAPACITY,
+  MonitorData,
+  ServerClock,
+  activityMoment,
+  type ActivityMoment,
+  type MonitorActivity,
+  type MonitorIo,
+  type MonitorLocks,
+  type MonitorMaintenance,
+  type MonitorReplication,
+  type MonitorSample,
+  type MonitorStarted,
+  type ProgressRow,
+  type StatementSnapshot,
+} from "./model";
 import { prefersReducedMotion } from "./visibility";
 
-export type MonitorView = "overview" | "activity";
+export type MonitorView = "overview" | "activity" | "locks" | "statements" | "replication" | "tables" | "io";
+
+export const NO_VIEWS: MonitorViewSet = { locks: false, statements: false, replication: false, tables: false, io: false };
+
+/**
+ * Which tiers a view needs. The process list feeds Overview's "Active now", the
+ * Activity table and the Locks view's blocking tree; every other tier belongs to
+ * exactly one view. A hidden monitor that keeps sampling runs only the fast tier
+ * and the process list: enough to look back at an incident.
+ */
+export function tiersFor(view: MonitorView, visible: boolean): { activity: boolean; views: MonitorViewSet } {
+  const activity = view === "overview" || view === "activity" || view === "locks" || !visible;
+  if (!visible) return { activity, views: NO_VIEWS };
+  return {
+    activity,
+    views: {
+      locks: view === "locks",
+      statements: view === "statements",
+      replication: view === "replication",
+      tables: view === "tables",
+      io: view === "io",
+    },
+  };
+}
+
+const sameOptions = (a: MonitorOptions, b: MonitorOptions) =>
+  a.intervalMs === b.intervalMs &&
+  a.paused === b.paused &&
+  a.activity === b.activity &&
+  (Object.keys(NO_VIEWS) as (keyof MonitorViewSet)[]).every((k) => a.views[k] === b.views[k]);
+
+/** A scrubbed time range, in local time. */
+export type TimeRange = { t0: number; t1: number };
+
+/** Statement snapshots kept: an hour at the 10 s cadence. */
+const STATEMENT_SNAPSHOTS = 400;
 
 export const INTERVALS = [1000, 2000, 5000, 10_000] as const;
 export const WINDOWS = [60_000, 300_000, 900_000, 3_600_000] as const;
@@ -94,7 +145,32 @@ export class MonitorSession {
   readonly windowMs: Accessor<number>;
   private readonly setWindowSig: (v: number) => void;
   readonly view: Accessor<MonitorView>;
-  readonly setView: (v: MonitorView) => void;
+  private readonly setViewSig: (v: MonitorView) => void;
+  // Per-view data, each the newest the backend sent for an open view.
+  readonly locks: Accessor<MonitorLocks | null>;
+  private readonly setLocks: (v: MonitorLocks | null) => void;
+  readonly replication: Accessor<MonitorReplication | null>;
+  private readonly setReplication: (v: MonitorReplication | null) => void;
+  readonly progress: Accessor<{ rows: ProgressRow[]; at: number } | null>;
+  private readonly setProgress: (v: { rows: ProgressRow[]; at: number } | null) => void;
+  readonly maintenance: Accessor<MonitorMaintenance | null>;
+  private readonly setMaintenance: (v: MonitorMaintenance | null) => void;
+  readonly io: Accessor<MonitorIo | null>;
+  private readonly setIo: (v: MonitorIo | null) => void;
+  /** Interval snapshots of statement work, oldest first (bounded). */
+  readonly statements: Accessor<readonly StatementSnapshot[]>;
+  private readonly setStatements: (v: readonly StatementSnapshot[]) => void;
+  /** The newest failure of each view tier, by tier name. */
+  readonly viewErrors: Accessor<Record<string, string>>;
+  private readonly setViewErrors: (v: Record<string, string>) => void;
+  /** A frozen time range (drag on a chart); null = live. */
+  readonly range: Accessor<TimeRange | null>;
+  private readonly setRange: (v: TimeRange | null) => void;
+  /** A drag in progress: where it started and where the pointer is. */
+  readonly scrub: Accessor<{ a: number; b: number } | null>;
+  private readonly setScrub: (v: { a: number; b: number } | null) => void;
+  /** What each activity sample said about the longest-running sessions (for a scrub). */
+  readonly moments: ActivityMoment[] = [];
   /** The shared crosshair, in local time; null = live readouts. */
   readonly hoverT: Accessor<number | null>;
   private readonly setHoverSig: (v: number | null) => void;
@@ -114,7 +190,16 @@ export class MonitorSession {
     [this.keepSampling, this.setKeepSamplingSig] = createSignal(false);
     [this.intervalMs, this.setIntervalSig] = createSignal<number>(INTERVALS[0]);
     [this.windowMs, this.setWindowSig] = createSignal<number>(DEFAULT_WINDOW_MS);
-    [this.view, this.setView] = createSignal<MonitorView>(opts.view ?? "overview");
+    [this.view, this.setViewSig] = createSignal<MonitorView>(opts.view ?? "overview");
+    [this.locks, this.setLocks] = createSignal<MonitorLocks | null>(null);
+    [this.replication, this.setReplication] = createSignal<MonitorReplication | null>(null);
+    [this.progress, this.setProgress] = createSignal<{ rows: ProgressRow[]; at: number } | null>(null);
+    [this.maintenance, this.setMaintenance] = createSignal<MonitorMaintenance | null>(null);
+    [this.io, this.setIo] = createSignal<MonitorIo | null>(null);
+    [this.statements, this.setStatements] = createSignal<readonly StatementSnapshot[]>([]);
+    [this.viewErrors, this.setViewErrors] = createSignal<Record<string, string>>({});
+    [this.range, this.setRange] = createSignal<TimeRange | null>(null);
+    [this.scrub, this.setScrub] = createSignal<{ a: number; b: number } | null>(null);
     [this.hoverT, this.setHoverSig] = createSignal<number | null>(null);
     [this.visible, this.setVisibleSig] = createSignal(false);
   }
@@ -123,9 +208,46 @@ export class MonitorSession {
     return { userPaused: this.userPaused(), visible: this.visible(), keepSampling: this.keepSampling() };
   }
 
-  /** The renderer freezes on the last sample while the user has paused. */
+  /** The charts stop scrolling: paused by the user, or showing a scrubbed range. */
   frozen(): boolean {
-    return this.userPaused();
+    return this.userPaused() || this.range() !== null;
+  }
+
+  /** Open a view; its tier starts on the next tick and the others stop. */
+  setView(view: MonitorView): void {
+    if (view === this.view()) return;
+    this.setViewSig(view);
+    this.sync();
+  }
+
+  // --- scrub and freeze -------------------------------------------------------
+
+  beginScrub(t: number): void {
+    this.setScrub({ a: t, b: t });
+    wake();
+  }
+
+  moveScrub(t: number): void {
+    const s = this.scrub();
+    if (!s) return;
+    this.setScrub({ a: s.a, b: t });
+    wake();
+  }
+
+  /** Finish a drag: wider than `minMs` freezes every chart on it, else it was a click. */
+  endScrub(minMs: number): void {
+    const s = this.scrub();
+    this.setScrub(null);
+    if (s && Math.abs(s.b - s.a) >= minMs) {
+      this.setRange({ t0: Math.min(s.a, s.b), t1: Math.max(s.a, s.b) });
+    }
+    wake();
+  }
+
+  backToLive(): void {
+    this.setScrub(null);
+    this.setRange(null);
+    wake();
   }
 
   setVisible(on: boolean): void {
@@ -203,7 +325,7 @@ export class MonitorSession {
       }
       this.setStatus({ kind: "starting" });
       await sweep;
-      const options: MonitorOptions = { intervalMs: this.intervalMs(), paused: false, activity: true };
+      const options: MonitorOptions = { intervalMs: this.intervalMs(), paused: false, ...tiersFor(this.view(), inputs.visible) };
       let started: MonitorStarted;
       try {
         started = await commands.monitorStart(this.connectionId, options);
@@ -224,13 +346,8 @@ export class MonitorSession {
       // Inputs may have moved while the start was in flight: settle them now.
       return this.apply();
     }
-    const options: MonitorOptions = { intervalMs: this.intervalMs(), paused: !want, activity: true };
-    if (
-      !this.applied ||
-      this.applied.paused !== options.paused ||
-      this.applied.intervalMs !== options.intervalMs ||
-      this.applied.activity !== options.activity
-    ) {
+    const options: MonitorOptions = { intervalMs: this.intervalMs(), paused: !want, ...tiersFor(this.view(), inputs.visible) };
+    if (!this.applied || !sameOptions(this.applied, options)) {
       try {
         await commands.monitorConfigure(this.connectionId, this.generation, options);
         this.applied = options;
@@ -262,14 +379,47 @@ export class MonitorSession {
     } else {
       this.setStatus({ kind: sample.status === "reconnecting" ? "reconnecting" : "error", message: sample.error ?? "" });
     }
-    if (sample.activity) this.setActivity({ ...sample.activity, at: Date.now(), error: null });
-    else if (sample.activityError) {
+    if (sample.activity) {
+      this.setActivity({ ...sample.activity, at: Date.now(), error: null });
+      this.moments.push(activityMoment(sample.activity.rows, t, sample.serverMs));
+      if (this.moments.length > MOMENT_CAPACITY) this.moments.splice(0, this.moments.length - MOMENT_CAPACITY);
+    } else if (sample.activityError) {
       const prev = this.activity();
       this.setActivity(prev ? { ...prev, error: sample.activityError } : { rows: [], total: 0, at: Date.now(), error: sample.activityError });
     }
+    this.ingestViews(sample, t);
     this.setTick(this.tick() + 1);
     // A stepping chart only moves when a sample lands; a gliding one is on its own pace.
     if (prefersReducedMotion() || this.frozen()) wake();
+  }
+
+  private ingestViews(sample: MonitorSample, t: number): void {
+    if (sample.locks) this.setLocks(sample.locks);
+    if (sample.replication) this.setReplication(sample.replication);
+    if (sample.progress) this.setProgress({ rows: sample.progress, at: Date.now() });
+    if (sample.maintenance) this.setMaintenance(sample.maintenance);
+    if (sample.io) this.setIo(sample.io);
+    if (sample.statements) {
+      const next = [...this.statements(), { ...sample.statements, t }];
+      this.setStatements(next.length > STATEMENT_SNAPSHOTS ? next.slice(next.length - STATEMENT_SNAPSHOTS) : next);
+    }
+    // A tier that answered this tick clears its old error; a failing one records it.
+    const answered = { locks: sample.locks, replication: sample.replication, progress: sample.progress, maintenance: sample.maintenance, io: sample.io, statements: sample.statements };
+    const errors = { ...this.viewErrors() };
+    let changed = false;
+    for (const [tier, value] of Object.entries(answered)) {
+      if (value && tier in errors) {
+        delete errors[tier];
+        changed = true;
+      }
+    }
+    for (const [tier, message] of Object.entries(sample.viewErrors ?? {})) {
+      if (errors[tier] !== message) {
+        errors[tier] = message;
+        changed = true;
+      }
+    }
+    if (changed) this.setViewErrors(errors);
   }
 
   /** Cancel or terminate a backend through this session's sidecar. */

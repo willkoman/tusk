@@ -55,6 +55,10 @@ function sample(over: Partial<MonitorSample> = {}): MonitorSample {
       tempBytes: 0,
       walBytes: 4096,
       walFpi: 1,
+      buffersCheckpoint: 10,
+      buffersClean: 2,
+      buffersBackend: null,
+      events: { checkpointsTimed: 0, checkpointsRequested: 0, deadlocks: 0, conflicts: 0, tempFiles: 0 },
     },
     sessions: { active: 3, idle: 10, idleInTransaction: 1, idleInTransactionAborted: 0, other: 0, hidden: 2, total: 16, maxConnections: 100 },
     load: [2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -63,6 +67,13 @@ function sample(over: Partial<MonitorSample> = {}): MonitorSample {
     replicationLagMs: null,
     activity: null,
     activityError: null,
+    locks: null,
+    replication: null,
+    progress: null,
+    maintenance: null,
+    io: null,
+    statements: null,
+    viewErrors: null,
     ...over,
   };
 }
@@ -260,13 +271,24 @@ describe("formatting", () => {
     expect(niceCeil(Number.NaN)).toBe(1);
   });
 
-  it("formats counts, bytes, percentages and durations", () => {
+  it("formats counts, bytes, percentages and durations", async () => {
     expect(formatCompact(950)).toBe("950");
     expect(formatCompact(1234)).toBe("1.2k");
     expect(formatCompact(3_400_000)).toBe("3.4M");
     expect(formatCompact(0.25)).toBe("0.25");
     expect(formatCompact(Number.NaN)).toBe("–");
     expect(formatBytes(512)).toBe("512 B");
+    const { formatBytesAxis } = await import("./model");
+    expect(formatBytesAxis(5 * 1024 ** 2)).toBe("5M");
+    expect(formatBytesAxis(2.5 * 1024 ** 3)).toBe("2.5G");
+    expect(formatBytesAxis(512 * 1024)).toBe("512K");
+    expect(formatBytesAxis(0)).toBe("0");
+    const { formatAgo } = await import("./model");
+    expect(formatAgo(47_900)).toBe("47 s ago");
+    expect(formatAgo(13 * 60_000 + 5)).toBe("13 min ago");
+    expect(formatAgo(2 * 3_600_000)).toBe("2 h ago");
+    expect(formatAgo(3 * 86_400_000)).toBe("3 d ago");
+    expect(formatAgo(null)).toBe("never");
     expect(formatBytes(4.1 * 1024 * 1024)).toBe("4.10 MiB");
     expect(formatBytes(150 * 1024)).toBe("150 KiB");
     expect(formatPercent(0.9961)).toBe("99.6%");
@@ -437,5 +459,90 @@ describe("readouts and permissions", () => {
     expect(restingStatus({ userPaused: false, visible: false, keepSampling: false }, true)).toEqual({ kind: "hidden" });
     expect(restingStatus({ userPaused: false, visible: true, keepSampling: false }, true)).toEqual({ kind: "live" });
     expect(restingStatus({ userPaused: false, visible: true, keepSampling: false }, false)).toEqual({ kind: "idle" });
+  });
+});
+
+describe("phase-2 model", () => {
+  it("records events and write rates from the fast tier", async () => {
+    const { eventTotals, WRITES_SERIES } = await import("./model");
+    const d = new MonitorData(64);
+    const base = sample();
+    d.ingest(sample({ rates: { ...base.rates!, buffersBackend: 3, events: { checkpointsTimed: 1, checkpointsRequested: 0, deadlocks: 2, conflicts: 0, tempFiles: 1 } } }), 1000, 8192);
+    expect(WRITES_SERIES).toHaveLength(3);
+    expect(d.writes.value(0, 0)).toBe(10 * 8192);
+    expect(d.writes.value(0, 2)).toBe(3 * 8192);
+    const ev = d.events.between(0, 2000);
+    expect(ev.map((e) => e.kind)).toEqual(["checkpoint", "deadlock", "temp-file"]);
+    expect(eventTotals(ev).deadlock).toBe(2);
+    d.ingest(sample({ reset: true }), 2000, 8192);
+    expect(d.events.between(1500, 2500).map((e) => e.kind)).toEqual(["reset"]);
+    expect(Number.isNaN(d.writes.value(1, 0))).toBe(true);
+    // PostgreSQL 17 has no backend writes: a gap cell, never a zero.
+    d.ingest(sample(), 3000, 8192);
+    expect(Number.isNaN(d.writes.value(2, 2))).toBe(true);
+  });
+
+  it("keeps a bounded ring of events", async () => {
+    const { EventRing } = await import("./model");
+    const r = new EventRing(3);
+    for (let i = 0; i < 5; i++) r.push(i, "deadlock", 1);
+    expect(r.size).toBe(3);
+    expect(r.between(-1, 10).map((e) => e.t)).toEqual([2, 3, 4]);
+    r.clear();
+    expect(r.size).toBe(0);
+  });
+
+  it("sums statement work over the window, newest text winning", async () => {
+    const { aggregateStatements } = await import("./model");
+    const row = (key: string, calls: number, execMs: number, query: string | null) => ({ key, queryid: key, user: null, database: null, calls, execMs, rows: calls, sharedHits: 0, sharedReads: 0, query });
+    const snaps = [
+      { t: 0, seconds: 10, totalCalls: 100, totalExecMs: 50, tracked: 2, rows: [row("a", 100, 50, null)] },
+      { t: 10_000, seconds: 10, totalCalls: 30, totalExecMs: 400, tracked: 2, rows: [row("a", 20, 10, "SELECT a"), row("b", 10, 390, "SELECT b")] },
+      { t: 20_000, seconds: 10, totalCalls: 5, totalExecMs: 5, tracked: 2, rows: [row("a", 5, 5, null)] },
+    ];
+    const all = aggregateStatements(snaps, 0);
+    expect(all.seconds).toBe(30);
+    expect(all.totalCalls).toBe(135);
+    expect(all.rows.map((r) => r.key)).toEqual(["b", "a"]);
+    expect(all.rows[1]).toMatchObject({ calls: 125, execMs: 65, query: "SELECT a" });
+    const recent = aggregateStatements(snaps, 15_000);
+    expect(recent.rows.map((r) => r.key)).toEqual(["a"]);
+    expect(recent.seconds).toBe(10);
+    expect(aggregateStatements(snaps, 5_000, 15_000).rows.map((r) => r.key)).toEqual(["b", "a"]);
+  });
+
+  it("remembers the longest-running active sessions per sample and summarizes a range", async () => {
+    const { activityMoment, summarizeRange, MOMENT_TOP } = await import("./model");
+    const rows = [
+      row(1, { queryStartMs: 1_000 }),
+      row(2, { queryStartMs: 5_000, waitType: "Lock", waitEvent: "transactionid" }),
+      row(3, { state: "idle" }),
+      row(4, { backendType: "autovacuum worker" }),
+    ];
+    const m1 = activityMoment(rows, 100, 9_000);
+    expect(m1.rows.map((r) => r.pid)).toEqual([1, 2]);
+    expect(m1.rows[0].ageMs).toBe(8_000);
+    const m2 = activityMoment([row(2, { queryStartMs: 5_000 })], 200, 12_000);
+    const sum = summarizeRange([m1, m2, { t: 999, rows: [] }], 50, 250);
+    expect(sum.samples).toBe(2);
+    expect(sum.sessions.map((s) => s.pid)).toEqual([1, 2]);
+    const two = sum.sessions.find((s) => s.pid === 2)!;
+    expect(two.seen).toBe(2);
+    expect(two.longestMs).toBe(7_000);
+    expect(two.waits).toEqual(expect.arrayContaining(["Lock: transactionid", "CPU"]));
+    expect(MOMENT_TOP).toBe(10);
+    const long = activityMoment([row(9, { query: "x".repeat(400) })], 0, 2_000);
+    expect(long.rows[0].query!.length).toBe(301);
+  });
+
+  it("colours wraparound and slots by what needs attention", async () => {
+    const { wraparoundTone, slotTone } = await import("./model");
+    expect(wraparoundTone(100_000_000, 200_000_000)).toBe("");
+    expect(wraparoundTone(250_000_000, 200_000_000)).toBe("warn");
+    expect(wraparoundTone(1_700_000_000, 200_000_000)).toBe("danger");
+    expect(slotTone({ active: true, walStatus: "reserved", retainedBytes: 10 })).toBe("");
+    expect(slotTone({ active: false, walStatus: null, retainedBytes: 2 * 1024 ** 3 })).toBe("warn");
+    expect(slotTone({ active: true, walStatus: "extended", retainedBytes: 0 })).toBe("warn");
+    expect(slotTone({ active: false, walStatus: "lost", retainedBytes: null })).toBe("danger");
   });
 });

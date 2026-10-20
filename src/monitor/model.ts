@@ -28,6 +28,10 @@ export type ServerInfo = {
   inRecovery: boolean;
   querySize: number;
   walStats: boolean;
+  /** `pg_stat_statements` is installed and readable here. */
+  statementsAvailable: boolean;
+  /** Why it is not (shown on the Statements view). */
+  statementsNote: string | null;
 };
 
 export type MonitorStarted = {
@@ -54,7 +58,135 @@ export type MonitorRates = {
   tempBytes: number;
   walBytes: number | null;
   walFpi: number | null;
+  buffersCheckpoint: number;
+  buffersClean: number;
+  buffersBackend: number | null;
+  /** Counts of discrete events in the interval. */
+  events: MonitorEventCounts;
 };
+
+export type MonitorEventCounts = {
+  checkpointsTimed: number;
+  checkpointsRequested: number;
+  deadlocks: number;
+  conflicts: number;
+  tempFiles: number;
+};
+
+// --- view tiers (src-tauri/src/monitor/views.rs) ------------------------------
+
+export type LockWait = {
+  pid: number;
+  backendStart: string;
+  locktype: string;
+  mode: string;
+  target: string;
+  user: string | null;
+  database: string | null;
+  application: string | null;
+  state: string | null;
+  /** How long it had waited when sampled (PostgreSQL 14+). */
+  waitedMs: number | null;
+  xactStartMs: number | null;
+  blockedBy: number[];
+  query: string | null;
+};
+export type LockHold = { locktype: string; mode: string; target: string; count: number; pids: number[] };
+export type MonitorLocks = { waiting: LockWait[]; waitingTotal: number; held: LockHold[]; heldTotal: number; heldGroups: number };
+
+export type Replica = {
+  pid: number;
+  application: string | null;
+  client: string | null;
+  state: string | null;
+  syncState: string | null;
+  sentBytes: number | null;
+  writeBytes: number | null;
+  flushBytes: number | null;
+  replayBytes: number | null;
+  writeLagMs: number | null;
+  flushLagMs: number | null;
+  replayLagMs: number | null;
+};
+export type ReplicationSlot = {
+  name: string;
+  slotType: string | null;
+  plugin: string | null;
+  database: string | null;
+  active: boolean;
+  activePid: number | null;
+  retainedBytes: number | null;
+  walStatus: string | null;
+  safeWalSize: number | null;
+};
+export type WalReceiver = {
+  status: string | null;
+  sender: string | null;
+  replayBacklogBytes: number | null;
+  lastMessageMs: number | null;
+  replayPaused: boolean;
+  replayAgeMs: number | null;
+};
+export type MonitorReplication = { standby: boolean; replicas: Replica[]; slots: ReplicationSlot[]; receiver: WalReceiver | null };
+
+export type ProgressRow = {
+  kind: string;
+  pid: number;
+  backendStart: string | null;
+  database: string | null;
+  relation: string | null;
+  phase: string | null;
+  done: number | null;
+  total: number | null;
+  unit: string;
+  startedMs: number | null;
+  query: string | null;
+};
+
+export type TableStat = {
+  schema: string;
+  name: string;
+  live: number | null;
+  dead: number | null;
+  modified: number | null;
+  lastVacuumMs: number | null;
+  lastAutovacuumMs: number | null;
+  lastAnalyzeMs: number | null;
+  lastAutoanalyzeMs: number | null;
+  vacuumCount: number | null;
+  autovacuumCount: number | null;
+  sizeBytes: number | null;
+};
+export type DatabaseAge = { database: string; xidAge: number; mxidAge: number | null };
+export type MonitorMaintenance = { tables: TableStat[]; tablesTotal: number; wraparound: DatabaseAge[]; freezeMaxAge: number | null };
+
+export type IoRow = {
+  backendType: string;
+  object: string;
+  context: string;
+  reads: number;
+  writes: number;
+  extends: number;
+  hits: number;
+  evictions: number;
+  reuses: number;
+  fsyncs: number;
+};
+export type MonitorIo = { seconds: number; rows: IoRow[] };
+
+export type StatementDelta = {
+  key: string;
+  queryid: string;
+  user: string | null;
+  database: string | null;
+  calls: number;
+  execMs: number;
+  rows: number;
+  sharedHits: number;
+  sharedReads: number;
+  query: string | null;
+};
+export type MonitorStatements = { seconds: number; rows: StatementDelta[]; totalCalls: number; totalExecMs: number; tracked: number };
 
 export type MonitorSessions = {
   active: number;
@@ -109,6 +241,14 @@ export type MonitorSample = {
   replicationLagMs: number | null;
   activity: MonitorActivity | null;
   activityError: string | null;
+  locks: MonitorLocks | null;
+  replication: MonitorReplication | null;
+  progress: ProgressRow[] | null;
+  maintenance: MonitorMaintenance | null;
+  io: MonitorIo | null;
+  statements: MonitorStatements | null;
+  /** A view tier that failed this tick, by tier name. */
+  viewErrors: Record<string, string> | null;
 };
 
 /**
@@ -256,6 +396,7 @@ export const TUP_READ_SERIES = ["Fetched", "Returned"] as const;
 export const IO_SERIES = ["Hit", "Read", "Temp files"] as const;
 export const WAL_SERIES = ["WAL"] as const;
 export const FPI_SERIES = ["Full-page images"] as const;
+export const WRITES_SERIES = ["Checkpointer", "Background writer", "Backends"] as const;
 /** Tile sparkline sources, one column each. */
 export const TILE_KEYS = ["load", "sessions", "tps", "cacheHit", "wal", "oldestXact", "blocked", "lag"] as const;
 export type TileKey = (typeof TILE_KEYS)[number];
@@ -279,6 +420,9 @@ export class MonitorData {
   readonly io: SeriesBuffer;
   readonly wal: SeriesBuffer;
   readonly fpi: SeriesBuffer;
+  /** Buffers written per second by the checkpointer, the bgwriter and backends, as bytes. */
+  readonly writes: SeriesBuffer;
+  readonly events = new EventRing(EVENT_CAPACITY);
   readonly tiles: SeriesBuffer;
   private lastT: number | null = null;
   private readonly avg: { t: number; tps: number }[] = [];
@@ -292,15 +436,16 @@ export class MonitorData {
     this.io = new SeriesBuffer(capacity, IO_SERIES.length);
     this.wal = new SeriesBuffer(capacity, WAL_SERIES.length);
     this.fpi = new SeriesBuffer(capacity, FPI_SERIES.length);
+    this.writes = new SeriesBuffer(capacity, WRITES_SERIES.length);
     this.tiles = new SeriesBuffer(capacity, TILE_KEYS.length);
   }
 
   private all(): SeriesBuffer[] {
-    return [this.load, this.sessions, this.tps, this.tupWrite, this.tupRead, this.io, this.wal, this.fpi, this.tiles];
+    return [this.load, this.sessions, this.tps, this.tupWrite, this.tupRead, this.io, this.wal, this.fpi, this.writes, this.tiles];
   }
 
   private rateBuffers(): SeriesBuffer[] {
-    return [this.tps, this.tupWrite, this.tupRead, this.io, this.wal, this.fpi];
+    return [this.tps, this.tupWrite, this.tupRead, this.io, this.wal, this.fpi, this.writes];
   }
 
   /** The newest sample's local time, or null before the first. */
@@ -310,6 +455,7 @@ export class MonitorData {
 
   clear(): void {
     for (const b of this.all()) b.clear();
+    this.events.clear();
     this.lastT = null;
     this.avg.length = 0;
   }
@@ -343,6 +489,7 @@ export class MonitorData {
     s
       ? this.sessions.push(t, [s.active, s.idleInTransaction, s.idleInTransactionAborted, s.idle, s.other + s.hidden, s.maxConnections])
       : this.sessions.gap(t);
+    if (sample.reset) this.events.push(t, "reset", 1);
     const r = sample.reset ? null : sample.rates;
     if (r) {
       this.avg.push({ t, tps: r.tps });
@@ -354,6 +501,13 @@ export class MonitorData {
       this.io.push(t, [r.blksHit * blockSize, r.blksRead * blockSize, r.tempBytes]);
       this.wal.push(t, [r.walBytes ?? NaN]);
       this.fpi.push(t, [r.walFpi ?? NaN]);
+      this.writes.push(t, [r.buffersCheckpoint * blockSize, r.buffersClean * blockSize, r.buffersBackend === null ? NaN : r.buffersBackend * blockSize]);
+      const ev = r.events;
+      if (ev.checkpointsTimed) this.events.push(t, "checkpoint", ev.checkpointsTimed);
+      if (ev.checkpointsRequested) this.events.push(t, "checkpoint-requested", ev.checkpointsRequested);
+      if (ev.deadlocks) this.events.push(t, "deadlock", ev.deadlocks);
+      if (ev.conflicts) this.events.push(t, "conflict", ev.conflicts);
+      if (ev.tempFiles) this.events.push(t, "temp-file", ev.tempFiles);
     } else {
       for (const b of this.rateBuffers()) b.gap(t);
       this.avg.length = 0;
@@ -370,6 +524,239 @@ export class MonitorData {
       sample.replicationLagMs ?? NaN,
     ]);
   }
+}
+
+// --- events ----------------------------------------------------------------------
+
+/** Discrete things that happened, drawn as markers on the shared time axis. */
+export const EVENT_KINDS = ["checkpoint", "checkpoint-requested", "deadlock", "conflict", "temp-file", "reset"] as const;
+export type EventKind = (typeof EVENT_KINDS)[number];
+export const EVENT_LABELS: Record<EventKind, string> = {
+  checkpoint: "Checkpoint",
+  "checkpoint-requested": "Requested checkpoint",
+  deadlock: "Deadlock",
+  conflict: "Recovery conflict",
+  "temp-file": "Temp files",
+  reset: "Statistics reset",
+};
+export const EVENT_CAPACITY = 2048;
+
+/** A ring of (time, kind, count) markers, oldest first. */
+export class EventRing {
+  private readonly t: Float64Array;
+  private readonly kind: Uint8Array;
+  private readonly count: Uint32Array;
+  private head = 0;
+  private n = 0;
+
+  constructor(readonly capacity: number) {
+    this.t = new Float64Array(capacity);
+    this.kind = new Uint8Array(capacity);
+    this.count = new Uint32Array(capacity);
+  }
+
+  get size(): number {
+    return this.n;
+  }
+
+  push(t: number, kind: EventKind, count: number): void {
+    this.t[this.head] = t;
+    this.kind[this.head] = EVENT_KINDS.indexOf(kind);
+    this.count[this.head] = Math.max(1, Math.min(count, 0xffffffff));
+    this.head = (this.head + 1) % this.capacity;
+    if (this.n < this.capacity) this.n++;
+  }
+
+  clear(): void {
+    this.head = 0;
+    this.n = 0;
+  }
+
+  /** Every marker in [from, to], oldest first. */
+  between(from: number, to: number): { t: number; kind: EventKind; count: number }[] {
+    const out: { t: number; kind: EventKind; count: number }[] = [];
+    for (let i = 0; i < this.n; i++) {
+      const r = (this.head - this.n + i + this.capacity) % this.capacity;
+      const t = this.t[r];
+      if (t < from || t > to) continue;
+      out.push({ t, kind: EVENT_KINDS[this.kind[r]], count: this.count[r] });
+    }
+    return out;
+  }
+}
+
+/** Marker totals per kind over a list of events. */
+export function eventTotals(events: { kind: EventKind; count: number }[]): Record<EventKind, number> {
+  const out = Object.fromEntries(EVENT_KINDS.map((k) => [k, 0])) as Record<EventKind, number>;
+  for (const e of events) out[e.kind] += e.count;
+  return out;
+}
+
+// --- statements over a window ---------------------------------------------------
+
+export type StatementSnapshot = MonitorStatements & { t: number };
+
+export type StatementTotal = {
+  key: string;
+  queryid: string;
+  query: string | null;
+  user: string | null;
+  database: string | null;
+  calls: number;
+  execMs: number;
+  rows: number;
+  sharedHits: number;
+  sharedReads: number;
+};
+
+export type StatementWindow = {
+  rows: StatementTotal[];
+  /** Seconds the snapshots in the window cover. */
+  seconds: number;
+  totalCalls: number;
+  totalExecMs: number;
+};
+
+/**
+ * Sum every interval snapshot at or after `fromT` per statement, newest text
+ * winning, ordered by total time. A statement outside one interval's top list
+ * contributes nothing for that interval, so this ranks what dominated, not every
+ * call.
+ */
+export function aggregateStatements(snapshots: readonly StatementSnapshot[], fromT: number, toT = Infinity): StatementWindow {
+  const by = new Map<string, StatementTotal>();
+  let seconds = 0;
+  let totalCalls = 0;
+  let totalExecMs = 0;
+  for (const snap of snapshots) {
+    if (snap.t < fromT || snap.t > toT) continue;
+    seconds += snap.seconds;
+    totalCalls += snap.totalCalls;
+    totalExecMs += snap.totalExecMs;
+    for (const r of snap.rows) {
+      const cur = by.get(r.key);
+      if (!cur) {
+        by.set(r.key, {
+          key: r.key,
+          queryid: r.queryid,
+          query: r.query,
+          user: r.user,
+          database: r.database,
+          calls: r.calls,
+          execMs: r.execMs,
+          rows: r.rows,
+          sharedHits: r.sharedHits,
+          sharedReads: r.sharedReads,
+        });
+        continue;
+      }
+      cur.calls += r.calls;
+      cur.execMs += r.execMs;
+      cur.rows += r.rows;
+      cur.sharedHits += r.sharedHits;
+      cur.sharedReads += r.sharedReads;
+      if (r.query) cur.query = r.query;
+      if (r.user) cur.user = r.user;
+      if (r.database) cur.database = r.database;
+    }
+  }
+  const rows = [...by.values()].sort((a, b) => b.execMs - a.execMs || b.calls - a.calls);
+  return { rows, seconds, totalCalls, totalExecMs };
+}
+
+// --- activity at a past instant (scrub-and-freeze) -------------------------------
+
+/** What one activity sample said about one active session, kept for scrubbing. */
+export type ActiveSighting = {
+  key: string;
+  pid: number;
+  user: string | null;
+  database: string | null;
+  waitType: string | null;
+  waitEvent: string | null;
+  /** Query age when sampled. */
+  ageMs: number | null;
+  query: string | null;
+};
+export type ActivityMoment = { t: number; rows: ActiveSighting[] };
+
+/** Sessions kept per activity sample: the longest-running active client queries. */
+export const MOMENT_TOP = 10;
+export const MOMENT_CAPACITY = 1800;
+
+/** The compact record a scrub can look back at, from one activity sample. */
+export function activityMoment(rows: readonly ActivityRow[], t: number, serverMs: number | null): ActivityMoment {
+  const active = rows
+    .filter((r) => r.state === "active" && isClientBackend(r))
+    .sort((a, b) => (a.queryStartMs ?? Infinity) - (b.queryStartMs ?? Infinity))
+    .slice(0, MOMENT_TOP)
+    .map((r) => ({
+      key: rowKey(r),
+      pid: r.pid,
+      user: r.user,
+      database: r.database,
+      waitType: r.waitType,
+      waitEvent: r.waitEvent,
+      ageMs: serverMs !== null && r.queryStartMs !== null ? Math.max(0, serverMs - r.queryStartMs) : null,
+      query: r.query && r.query.length > 300 ? `${r.query.slice(0, 300)}…` : r.query,
+    }));
+  return { t, rows: active };
+}
+
+export type RangeSession = {
+  key: string;
+  pid: number;
+  user: string | null;
+  database: string | null;
+  query: string | null;
+  /** Activity samples it was active in. */
+  seen: number;
+  /** The longest query age observed. */
+  longestMs: number | null;
+  /** Wait labels observed, most frequent first. */
+  waits: string[];
+};
+
+/** The sessions that were active during [from, to], longest-running first. */
+export function summarizeRange(moments: readonly ActivityMoment[], from: number, to: number): { sessions: RangeSession[]; samples: number } {
+  const by = new Map<string, RangeSession & { waitCounts: Map<string, number> }>();
+  let samples = 0;
+  for (const m of moments) {
+    if (m.t < from || m.t > to) continue;
+    samples++;
+    for (const r of m.rows) {
+      let cur = by.get(r.key);
+      if (!cur) {
+        cur = { key: r.key, pid: r.pid, user: r.user, database: r.database, query: r.query, seen: 0, longestMs: null, waits: [], waitCounts: new Map() };
+        by.set(r.key, cur);
+      }
+      cur.seen++;
+      if (r.ageMs !== null) cur.longestMs = Math.max(cur.longestMs ?? 0, r.ageMs);
+      if (r.query) cur.query = r.query;
+      const w = waitLabel(r) || "CPU";
+      cur.waitCounts.set(w, (cur.waitCounts.get(w) ?? 0) + 1);
+    }
+  }
+  const sessions = [...by.values()]
+    .map(({ waitCounts, ...rest }) => ({ ...rest, waits: [...waitCounts.entries()].sort((a, b) => b[1] - a[1]).map(([w]) => w) }))
+    .sort((a, b) => (b.longestMs ?? -1) - (a.longestMs ?? -1) || b.seen - a.seen);
+  return { sessions, samples };
+}
+
+/** Transaction-ID wraparound: the server stops at 2^31 - 3,000,000; warn well before. */
+export const XID_WRAP_LIMIT = 2 ** 31;
+export function wraparoundTone(xidAge: number, freezeMaxAge: number | null): Tone {
+  if (XID_WRAP_LIMIT - xidAge < 500_000_000) return "danger";
+  if (freezeMaxAge !== null && xidAge > freezeMaxAge) return "warn";
+  return "";
+}
+
+/** A replication slot that holds WAL nobody consumes, or has lost it. */
+export function slotTone(slot: Pick<ReplicationSlot, "active" | "walStatus" | "retainedBytes">): Tone {
+  if (slot.walStatus === "lost") return "danger";
+  if (slot.walStatus === "unreserved" || slot.walStatus === "extended") return "warn";
+  if (!slot.active && (slot.retainedBytes ?? 0) > 1024 ** 3) return "warn";
+  return "";
 }
 
 // --- formatting ----------------------------------------------------------------
@@ -411,6 +798,20 @@ export function formatBytes(v: number): string {
   return `${v < 0 ? "-" : ""}${n} ${units[u]}`;
 }
 
+/** Bytes for an axis label: short enough for the gutter, units in the title. 5M, 512K, 1.5G. */
+export function formatBytesAxis(v: number): string {
+  if (!Number.isFinite(v)) return "–";
+  const units = ["", "K", "M", "G", "T"];
+  let x = Math.abs(v);
+  let u = 0;
+  while (x >= 1024 && u < units.length - 1) {
+    x /= 1024;
+    u++;
+  }
+  const n = x >= 10 || Number.isInteger(x) ? x.toFixed(0) : x.toFixed(1);
+  return `${v < 0 ? "-" : ""}${n}${units[u]}`;
+}
+
 export const formatRate = (v: number) => (Number.isFinite(v) ? `${formatCompact(v)}/s` : "–");
 export const formatByteRate = (v: number) => (Number.isFinite(v) ? `${formatBytes(v)}/s` : "–");
 
@@ -431,6 +832,21 @@ export function formatDuration(ms: number | null): string {
   const sec = s % 60;
   const p = (n: number) => String(n).padStart(2, "0");
   return h > 0 ? `${h}:${p(m)}:${p(sec)}` : `${m}:${p(sec)}`;
+}
+
+/** How long ago, in words: "47 s ago", "13 min ago", "2 h ago", "3 d ago". */
+export function formatAgo(ms: number | null): string {
+  if (ms === null || !Number.isFinite(ms)) return "never";
+  const s = Math.max(0, ms) / 1000;
+  if (s < 60) return `${Math.floor(s)} s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86_400) return `${Math.floor(s / 3600)} h ago`;
+  return `${Math.floor(s / 86_400)} d ago`;
+}
+
+/** A window length for labels: "1 min", "5 min", "1 h". */
+export function formatWindow(ms: number): string {
+  return ms >= 3_600_000 ? `${ms / 3_600_000} h` : `${Math.round(ms / 60_000)} min`;
 }
 
 /** Uptime for the header: "up 41 d", "up 3 h", "up 12 min". */

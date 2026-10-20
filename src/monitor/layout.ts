@@ -35,10 +35,12 @@ export function plotRect(cssW: number, cssH: number, pad: Pad = CHART_PAD): Rect
  * gridlines, and the smallest multiple of it that holds the peak. `integer` keeps the
  * step whole (session counts: a 0.5-session gridline means nothing).
  */
-export function niceScale(peak: number, ticks = 4, integer = false): { max: number; step: number } {
+export function niceScale(peak: number, ticks = 4, integer = false, binary = false): { max: number; step: number } {
   const p = Number.isFinite(peak) && peak > 0 ? peak : 0;
-  let step = niceCeil(p > 0 ? p / ticks : integer ? 1 : 1 / ticks);
-  if (integer) step = Math.max(1, Math.ceil(step));
+  // Bytes step in whole KiB/MiB/GiB (5 MiB, not 4.77): nice in the unit, scaled back.
+  const unit = binary && p >= 1024 ? 1024 ** Math.min(4, Math.floor(Math.log(p) / Math.log(1024))) : 1;
+  let step = niceCeil(p > 0 ? p / unit / ticks : integer ? 1 : 1 / ticks) * unit;
+  if (integer || binary) step = Math.max(1, Math.ceil(step));
   const max = Math.max(step, Math.ceil(p / step - 1e-9) * step);
   return { max, step };
 }

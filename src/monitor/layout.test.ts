@@ -43,6 +43,9 @@ describe("chart geometry", () => {
     expect(niceScale(0, 4, true)).toEqual({ max: 1, step: 1 });
     expect(niceScale(2, 4, true), "no half-session gridlines").toEqual({ max: 2, step: 1 });
     expect(niceScale(Number.NaN).max).toBeGreaterThan(0);
+    // Bytes step in whole binary units.
+    expect(niceScale(19 * 1024 ** 2, 4, false, true)).toEqual({ max: 20 * 1024 ** 2, step: 5 * 1024 ** 2 });
+    expect(niceScale(700, 4, false, true).step, "below a KiB: plain bytes, whole").toBe(200);
     const s = niceScale(987_654);
     expect(s.max).toBeGreaterThanOrEqual(987_654);
     expect(s.max / s.step).toBeLessThanOrEqual(4);

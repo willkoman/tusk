@@ -14,7 +14,7 @@ import {
   xOf,
   type Rect,
 } from "./layout";
-import { formatCompact, type SeriesBuffer } from "./model";
+import { EVENT_KINDS, formatCompact, type EventKind, type SeriesBuffer } from "./model";
 import type { MonitorSession } from "./session";
 import { prefersReducedMotion } from "./visibility";
 
@@ -34,6 +34,19 @@ export type SeriesSpec = {
 };
 
 const SPARK_WINDOW_MS = 60_000;
+
+/** One colour role per event kind, for markers and the events lane. */
+export const EVENT_COLORS: Record<EventKind, string> = {
+  checkpoint: "--chart-7",
+  "checkpoint-requested": "--warn",
+  deadlock: "--danger",
+  conflict: "--chart-2",
+  "temp-file": "--chart-3",
+  reset: "--muted",
+};
+
+/** A drag narrower than this many pixels is a click, not a range. */
+const SCRUB_MIN_PX = 6;
 const GROW_TAU_MS = 70;
 const SHRINK_TAU_MS = 120;
 const SHRINK_HOLD_MS = 1500;
@@ -60,9 +73,17 @@ export function TimeSeries(props: {
   format?: (v: number) => string;
   /** Whole-number axis (session counts). */
   integer?: boolean;
+  /** Byte values: steps in whole KiB/MiB/GiB. */
+  binary?: boolean;
+  /** Axis labels, when the legend's format is too wide for the gutter. */
+  axisFormat?: (v: number) => string;
   height: number;
   /** A tile sparkline: no axes, a fixed 60 s window, one series filled. */
   spark?: { series: number; color: () => string };
+  /** Event kinds drawn as vertical markers over the series (checkpoints on WAL). */
+  markers?: readonly EventKind[];
+  /** The events lane: one row per event kind, no series and no y axis. */
+  lane?: boolean;
   label: string;
 }) {
   let canvas!: HTMLCanvasElement;
@@ -76,6 +97,7 @@ export function TimeSeries(props: {
   let labelColor = "";
   let crossColor = "";
   let panelColor = "";
+  let eventPalette: Record<string, string> = {};
   let font = "";
   let yMax = 0;
   let shrinkSince = 0;
@@ -100,6 +122,7 @@ export function TimeSeries(props: {
     labelColor = token("--muted", "gray");
     crossColor = token("--text", "gray");
     panelColor = token("--panel", "black");
+    eventPalette = Object.fromEntries(EVENT_KINDS.map((k) => [k, token(EVENT_COLORS[k], "gray")]));
     font = `10px ${token("--mono", "monospace")}`;
     wake();
   };
@@ -137,16 +160,21 @@ export function TimeSeries(props: {
     const s = props.session;
     const buf = props.buffer;
     const spark = props.spark;
-    const win = windowMs();
+    // A scrubbed range freezes the charts on it; a tile's sparkline stays live.
+    const frozenRange = spark ? null : s.range();
+    const paused = spark ? s.userPaused() : s.frozen();
+    const win = frozenRange ? Math.max(1, frozenRange.t1 - frozenRange.t0) : windowMs();
     const r = plotRect(cssW, cssH, spark ? SPARK_PAD : CHART_PAD);
-    const tEnd = renderEnd(now, s.data.last, s.intervalMs(), mode(), s.frozen());
+    const tEnd = frozenRange ? frozenRange.t1 : renderEnd(now, s.data.last, s.intervalMs(), mode(), paused);
     const tStart = tEnd - win;
     geo = { r, tStart, windowMs: win };
     const msPerPx = win / r.w;
+    if (props.lane) return drawLane(r, tStart, tEnd, win);
 
     // ---- choose rows: everything in view, or decimated past ~1 row per pixel ----
+    // One row either side of the window so lines run to the edges.
     const i0 = Math.max(0, buf.lowerBound(tStart) - 1);
-    const i1 = buf.size;
+    const i1 = Math.min(buf.size, buf.lowerBound(tEnd) + 1);
     const areaIdx: number[] = [];
     const lineIdx: number[] = [];
     let ceilingIdx = -1;
@@ -210,7 +238,7 @@ export function TimeSeries(props: {
     if (ceiling === ceiling && peak >= ceiling * 0.5) peak = Math.max(peak, ceiling);
 
     // ---- y axis: ease toward a nice maximum, shrink only after a hold -----------
-    const scale = niceScale(peak * 1.05, spark ? 1 : 4, props.integer);
+    const scale = niceScale(peak * 1.05, spark ? 1 : 4, props.integer, props.binary);
     const target = scale.max;
     let animating = false;
     // Sparklines snap: a tiny axis easing on every sample would cost a composite a
@@ -245,7 +273,7 @@ export function TimeSeries(props: {
         if (y < r.yTop - 0.5) break;
         c.moveTo(r.x0, y);
         c.lineTo(r.x1, y);
-        c.fillText(fmt(v), r.x0 - 5, y);
+        c.fillText((props.axisFormat ?? fmt)(v), r.x0 - 5, y);
       }
       // Vertical gridlines on wall-clock time, so they scroll with the data.
       const wallOffset = Date.now() - performance.now();
@@ -336,7 +364,32 @@ export function TimeSeries(props: {
       c.stroke();
       c.setLineDash([]);
     }
+    if (!spark && props.markers?.length) {
+      const kinds = new Set<EventKind>(props.markers);
+      for (const ev of s.data.events.between(tStart, tEnd)) {
+        if (!kinds.has(ev.kind)) continue;
+        const xx = Math.round(x(ev.t)) + 0.5;
+        c.strokeStyle = eventPalette[ev.kind];
+        c.globalAlpha = 0.5;
+        c.setLineDash([2, 3]);
+        c.beginPath();
+        c.moveTo(xx, r.yTop);
+        c.lineTo(xx, r.yBot);
+        c.stroke();
+        c.setLineDash([]);
+        c.globalAlpha = 1;
+        c.fillStyle = eventPalette[ev.kind];
+        c.beginPath();
+        c.moveTo(xx - 4, r.yTop);
+        c.lineTo(xx + 4, r.yTop);
+        c.lineTo(xx, r.yTop + 5);
+        c.closePath();
+        c.fill();
+      }
+    }
     c.restore();
+
+    if (!spark) drawScrub(r, tStart, win);
 
     // The shared crosshair.
     const hover = s.hoverT();
@@ -363,22 +416,102 @@ export function TimeSeries(props: {
     return animating;
   };
 
+  /** The drag selection in progress, shaded on every chart. */
+  const drawScrub = (r: Rect, tStart: number, win: number) => {
+    const sc = props.session.scrub();
+    if (!sc || !ctx) return;
+    const a = Math.max(r.x0, Math.min(r.x1, xOf(Math.min(sc.a, sc.b), tStart, win, r)));
+    const b = Math.max(r.x0, Math.min(r.x1, xOf(Math.max(sc.a, sc.b), tStart, win, r)));
+    ctx.fillStyle = crossColor;
+    ctx.globalAlpha = 0.12;
+    ctx.fillRect(a, r.yTop, Math.max(1, b - a), r.h);
+    ctx.globalAlpha = 0.6;
+    ctx.fillRect(a, r.yTop, 1, r.h);
+    ctx.fillRect(b, r.yTop, 1, r.h);
+    ctx.globalAlpha = 1;
+  };
+
+  /** The events lane: a row per kind, a mark per interval it happened in. */
+  const drawLane = (r: Rect, tStart: number, tEnd: number, win: number): boolean => {
+    const c = ctx!;
+    c.setTransform(dpr, 0, 0, dpr, 0, 0);
+    c.clearRect(0, 0, cssW, cssH);
+    const rows = EVENT_KINDS.length;
+    // Rows follow EVENT_KINDS; the legend under the lane names them.
+    const rowH = r.h / rows;
+    c.lineWidth = 1;
+    for (let k = 0; k < rows; k++) {
+      const y = Math.round(r.yTop + rowH * (k + 1)) + 0.5;
+      c.strokeStyle = gridColor;
+      c.beginPath();
+      c.moveTo(r.x0, y);
+      c.lineTo(r.x1, y);
+      c.stroke();
+    }
+    for (const ev of props.session.data.events.between(tStart, tEnd)) {
+      const k = EVENT_KINDS.indexOf(ev.kind);
+      const xx = xOf(ev.t, tStart, win, r);
+      const radius = Math.min(rowH / 2 - 1, 2.5 + Math.log2(ev.count));
+      c.fillStyle = eventPalette[ev.kind];
+      c.beginPath();
+      c.arc(xx, r.yTop + rowH * (k + 0.5), Math.max(2, radius), 0, Math.PI * 2);
+      c.fill();
+    }
+    drawScrub(r, tStart, win);
+    const hover = props.session.hoverT();
+    if (hover !== null && hover >= tStart && hover <= tEnd) {
+      const xx = Math.round(xOf(hover, tStart, win, r)) + 0.5;
+      c.strokeStyle = crossColor;
+      c.globalAlpha = 0.45;
+      c.beginPath();
+      c.moveTo(xx, r.yTop);
+      c.lineTo(xx, r.yBot);
+      c.stroke();
+      c.globalAlpha = 1;
+    }
+    return false;
+  };
+
   const drawer = {
     draw,
     stepMs: () => {
       const s = props.session;
-      if (!onScreen || s.frozen() || prefersReducedMotion() || !geo) return Infinity;
+      const paused = props.spark ? s.userPaused() : s.frozen();
+      if (!onScreen || paused || prefersReducedMotion() || !geo) return Infinity;
       return stepMs(windowMs(), geo.r.w);
     },
   };
 
+  /** The time under the pointer, clamped to the plot (a drag may leave it). */
+  const pointerTime = (e: PointerEvent, clamp: boolean): number | null => {
+    if (!geo) return null;
+    const rect = canvas.getBoundingClientRect();
+    let x = e.clientX - rect.left;
+    if (clamp) x = Math.max(geo.r.x0, Math.min(geo.r.x1, x));
+    return timeAt(x, geo.tStart, geo.windowMs, geo.r);
+  };
   const onPointerMove = (e: PointerEvent) => {
     if (props.spark || !geo) return;
-    const rect = canvas.getBoundingClientRect();
-    props.session.setHover(timeAt(e.clientX - rect.left, geo.tStart, geo.windowMs, geo.r));
+    const dragging = props.session.scrub() !== null;
+    const t = pointerTime(e, dragging);
+    if (dragging && t !== null) props.session.moveScrub(t);
+    props.session.setHover(t);
   };
   const onPointerLeave = () => {
-    if (!props.spark) props.session.setHover(null);
+    if (!props.spark && props.session.scrub() === null) props.session.setHover(null);
+  };
+  // Drag across any chart to freeze every chart on that range.
+  const onPointerDown = (e: PointerEvent) => {
+    if (props.spark || e.button !== 0 || !geo) return;
+    const t = pointerTime(e, false);
+    if (t === null) return;
+    canvas.setPointerCapture(e.pointerId);
+    props.session.beginScrub(t);
+  };
+  const onPointerUp = (e: PointerEvent) => {
+    if (props.spark || props.session.scrub() === null || !geo) return;
+    if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+    props.session.endScrub((geo.windowMs / geo.r.w) * SCRUB_MIN_PX);
   };
 
   // A tile's tone (amber/red) changes its sparkline colour. Memoized: the tone is
@@ -426,6 +559,9 @@ export function TimeSeries(props: {
       aria-label={props.label}
       onPointerMove={onPointerMove}
       onPointerLeave={onPointerLeave}
+      onPointerDown={onPointerDown}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
     />
   );
 }

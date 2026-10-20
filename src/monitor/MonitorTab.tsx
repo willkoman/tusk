@@ -1,9 +1,16 @@
-import { For, Show, createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js";
+import { For, Match, Show, Switch, createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js";
 import { Icon } from "../Icons";
 import { ActivityTable, stateClass, useServerNow } from "./ActivityTable";
 import { chartColumns } from "./layout";
 import {
+  EVENT_KINDS,
+  EVENT_LABELS,
   FPI_SERIES,
+  WRITES_SERIES,
+  eventTotals,
+  formatWindow,
+  summarizeRange,
+  type EventKind,
   IO_SERIES,
   SESSION_SERIES,
   TPS_SERIES,
@@ -13,6 +20,7 @@ import {
   WAL_SERIES,
   blockedTone,
   formatByteRate,
+  formatBytesAxis,
   formatCompact,
   formatDuration,
   formatPercent,
@@ -30,8 +38,9 @@ import {
   type TileKey,
   type Tone,
 } from "./model";
-import { INTERVALS, WINDOWS, type MonitorSession } from "./session";
-import { TimeSeries, type SeriesSpec } from "./TimeSeries";
+import { INTERVALS, WINDOWS, type MonitorSession, type MonitorView } from "./session";
+import { EVENT_COLORS, TimeSeries, type SeriesSpec } from "./TimeSeries";
+import { IoView, LocksView, ReplicationView, StatementsView, TablesView } from "./Views";
 
 const WAIT_COLORS = ["--chart-1", "--chart-2", "--chart-3", "--chart-4", "--chart-5", "--chart-6", "--chart-7", "--chart-8", "--chart-9", "--chart-10", "--muted"];
 
@@ -65,9 +74,25 @@ const IO_SPECS: SeriesSpec[] = [
 ];
 const WAL_SPECS: SeriesSpec[] = [{ label: WAL_SERIES[0], color: "--chart-5", kind: "line" }];
 const FPI_SPECS: SeriesSpec[] = [{ label: FPI_SERIES[0], color: "--chart-3", kind: "line" }];
+const WRITES_SPECS: SeriesSpec[] = [
+  { label: WRITES_SERIES[0], color: "--chart-7", kind: "line" },
+  { label: WRITES_SERIES[1], color: "--chart-5", kind: "line" },
+  { label: WRITES_SERIES[2], color: "--chart-9", kind: "line" },
+];
+const CHECKPOINTS: EventKind[] = ["checkpoint", "checkpoint-requested"];
+
+const VIEWS: { id: MonitorView; label: string }[] = [
+  { id: "overview", label: "Overview" },
+  { id: "activity", label: "Activity" },
+  { id: "locks", label: "Locks" },
+  { id: "statements", label: "Statements" },
+  { id: "replication", label: "Replication" },
+  { id: "tables", label: "Tables" },
+  { id: "io", label: "I/O" },
+];
 
 const intervalLabel = (ms: number) => `${ms / 1000} s`;
-const windowLabel = (ms: number) => (ms >= 3_600_000 ? `${ms / 3_600_000} h` : `${ms / 60_000} min`);
+const windowLabel = formatWindow;
 
 type Pane = {
   buffer: (s: MonitorSession) => SeriesBuffer;
@@ -78,6 +103,10 @@ type Pane = {
   height: number;
   /** Shown only when the server has the view behind it. */
   when?: (s: MonitorSession) => boolean;
+  /** Event kinds marked over the series. */
+  markers?: EventKind[];
+  /** Byte series: binary steps and short axis labels. */
+  bytes?: boolean;
 };
 
 type ChartDef = { id: string; title: string; source: string; panes: Pane[] };
@@ -114,16 +143,22 @@ const CHARTS: ChartDef[] = [
     id: "io",
     title: "Block I/O",
     source: "pg_stat_database: shared-buffer hits and reads (Δ blks_hit, blks_read × block_size) and temporary-file bytes (Δ temp_bytes), per second.",
-    panes: [{ buffer: (s) => s.data.io, series: IO_SPECS, format: formatByteRate, height: 170 }],
+    panes: [{ buffer: (s) => s.data.io, series: IO_SPECS, format: formatByteRate, height: 170, bytes: true }],
   },
   {
     id: "wal",
     title: "WAL",
     source: "Δ pg_current_wal_lsn() per second (the replay position on a standby). Below: full-page images per second from pg_stat_wal (PostgreSQL 14+), which jump after a checkpoint.",
     panes: [
-      { buffer: (s) => s.data.wal, series: WAL_SPECS, format: formatByteRate, height: 110 },
+      { buffer: (s) => s.data.wal, series: WAL_SPECS, format: formatByteRate, height: 110, markers: CHECKPOINTS, bytes: true },
       { buffer: (s) => s.data.fpi, series: FPI_SPECS, format: formatCompact, height: 58, when: (s) => !!s.started()?.server.walStats },
     ],
+  },
+  {
+    id: "writes",
+    title: "Checkpoints and background writes",
+    source: "Buffers written per second, as bytes: by checkpoints (pg_stat_checkpointer on PostgreSQL 17+, pg_stat_bgwriter before), by the background writer, and by backends themselves (16 and earlier). Markers: checkpoints, dashed amber when requested rather than timed — frequent requested checkpoints mean max_wal_size is too small.",
+    panes: [{ buffer: (s) => s.data.writes, series: WRITES_SPECS, format: formatByteRate, height: 170, markers: CHECKPOINTS, bytes: true }],
   },
 ];
 
@@ -209,11 +244,50 @@ function ChartCard(props: { session: MonitorSession; def: ChartDef }) {
             format={pane.format}
             height={pane.height}
             hidden={() => hiddenByPane()[p()] ?? NONE}
+            markers={pane.markers}
+            binary={pane.bytes}
+            axisFormat={pane.bytes ? formatBytesAxis : undefined}
             label={`${props.def.title}${panes().length > 1 ? ` (${p() + 1} of ${panes().length})` : ""}`}
           />
         )}
       </For>
       <Legend session={props.session} panes={panes()} hidden={hidden} onToggle={toggle} />
+    </section>
+  );
+}
+
+/** Chart 8: checkpoints, deadlocks, conflicts, temp files and resets on the shared axis. */
+function EventsCard(props: { session: MonitorSession }) {
+  const s = props.session;
+  const totals = createMemo(() => {
+    void s.tick();
+    const range = s.range();
+    const last = s.data.last ?? performance.now();
+    return eventTotals(range ? s.data.events.between(range.t0, range.t1) : s.data.events.between(last - s.windowMs(), Infinity));
+  });
+  return (
+    <section class="monitor-card monitor-events">
+      <header class="mc-head">
+        <h3>Events</h3>
+        <span
+          class="mc-info"
+          title="Discrete events per sample, from pg_stat_database (deadlocks, recovery conflicts, temp files), the checkpoint counters, and counter resets. A larger dot is more in one interval."
+        >
+          <Icon name="help" />
+        </span>
+      </header>
+      <TimeSeries session={s} buffer={s.data.writes} series={[]} lane height={64} label="Events on the shared time axis" />
+      <div class="mc-legend">
+        <For each={[...EVENT_KINDS]}>
+          {(kind) => (
+            <span class="mc-key static">
+              <i style={{ background: `var(${EVENT_COLORS[kind]})` }} />
+              <span class="mc-key-label">{EVENT_LABELS[kind]}</span>
+              <span class="mc-key-value">{totals()[kind]}</span>
+            </span>
+          )}
+        </For>
+      </div>
     </section>
   );
 }
@@ -257,6 +331,40 @@ function Tile(props: { session: MonitorSession; def: TileDef }) {
 }
 
 /** The Overview's "Active now": the eight longest-running active queries. */
+/** While a range is frozen: who was active then, from the per-sample summaries. */
+function ActiveInRange(props: { session: MonitorSession }) {
+  const s = props.session;
+  const sum = createMemo(() => {
+    const r = s.range()!;
+    void s.tick();
+    return summarizeRange(s.moments, r.t0, r.t1);
+  });
+  return (
+    <section class="monitor-card monitor-active">
+      <header class="mc-head">
+        <h3>Active in the selected range</h3>
+        <span class="mc-sub">{sum().samples} process-list samples · longest-running first</span>
+      </header>
+      <Show when={sum().sessions.length} fallback={<div class="empty-hint">{sum().samples ? "No client session was active then." : "No process list was sampled in this range."}</div>}>
+        <div class="mn-list">
+          <For each={sum().sessions.slice(0, 15)}>
+            {(r) => (
+              <div class="mn-row">
+                <span class="mn-pid">{r.pid}</span>
+                <span class="mn-user">{r.user ?? "–"}</span>
+                <span class="mn-wait" title={r.waits.join(", ")}>{r.waits[0] ?? "CPU"}{r.waits.length > 1 ? ` +${r.waits.length - 1}` : ""}</span>
+                <span class="mn-age" title={`seen in ${r.seen} sample${r.seen === 1 ? "" : "s"}`}>{formatDuration(r.longestMs)}</span>
+                <span class="mn-query" title={r.query ?? ""}>{r.query ?? ""}</span>
+                <span />
+              </div>
+            )}
+          </For>
+        </div>
+      </Show>
+    </section>
+  );
+}
+
 function ActiveNow(props: { session: MonitorSession; onRowMenu: (e: MouseEvent, row: ActivityRow) => void }) {
   const s = props.session;
   const serverNow = useServerNow(s);
@@ -305,6 +413,7 @@ export default function MonitorTab(props: {
   isPostgres: boolean;
   production: JSX.Element | undefined;
   onRowMenu: (e: MouseEvent, row: ActivityRow) => void;
+  onQueryMenu: (e: MouseEvent, query: string) => void;
 }) {
   const s = props.session;
   let host: HTMLDivElement | undefined;
@@ -313,8 +422,22 @@ export default function MonitorTab(props: {
   onMount(() => {
     const ro = new ResizeObserver(() => host && setWidth(host.clientWidth));
     if (host) ro.observe(host);
-    onCleanup(() => ro.disconnect());
+    // Escape leaves a frozen range (or abandons a drag) and returns to live.
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (!s.range() && !s.scrub()) return;
+      if (document.querySelector("[data-blocking-dialog='true'], .modal-overlay, .ctx-menu")) return;
+      e.preventDefault();
+      s.backToLive();
+    };
+    window.addEventListener("keydown", onKey);
+    onCleanup(() => {
+      ro.disconnect();
+      window.removeEventListener("keydown", onKey);
+    });
   });
+  const wallTime = (t: number) =>
+    new Date(Date.now() - performance.now() + t).toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
 
   const server = () => s.started()?.server ?? null;
   const latest = () => s.latest();
@@ -385,11 +508,11 @@ export default function MonitorTab(props: {
     {
       key: "blocked",
       label: "Blocked",
-      source: "Sessions waiting on a heavyweight lock held by another (pg_blocking_pids is non-empty). Click for the blocking tree.",
+      source: "Sessions waiting on a heavyweight lock held by another (pg_blocking_pids is non-empty). Click for Locks.",
       value: () => (latest()?.blocked != null ? String(latest()!.blocked) : "–"),
       sub: () => "waiting on locks",
       tone: () => blockedTone(latest()?.blocked ?? null),
-      onClick: () => s.setView("activity"),
+      onClick: () => s.setView("locks"),
     },
     {
       key: "lag",
@@ -451,6 +574,13 @@ export default function MonitorTab(props: {
             </Show>
           </div>
           <span class="spacer" />
+          <Show when={s.range()}>
+            {(r) => (
+              <button class="mh-live" title="Return every chart to live (Esc)" onClick={() => s.backToLive()}>
+                <Icon name="close" /> {wallTime(r().t0)}–{wallTime(r().t1)} · Live
+              </button>
+            )}
+          </Show>
           <span class={`mh-status st-${status().kind}`} title={statusTitle()}>
             <span class="mh-led" aria-hidden="true" />
             {statusText()}
@@ -493,24 +623,43 @@ export default function MonitorTab(props: {
         </div>
 
         <div class="monitor-views">
-          <div class="seg" role="tablist" aria-label="Monitor views">
-            <button role="tab" aria-selected={s.view() === "overview"} classList={{ active: s.view() === "overview" }} onClick={() => s.setView("overview")}>Overview</button>
-            <button role="tab" aria-selected={s.view() === "activity"} classList={{ active: s.view() === "activity" }} onClick={() => s.setView("activity")}>
-              Activity <Show when={s.activity()}><span class="mv-count">{activeSessions()}</span></Show>
-            </button>
+          <div class="seg mv-views" role="tablist" aria-label="Monitor views">
+            <For each={VIEWS}>
+              {(v) => (
+                <button role="tab" aria-selected={s.view() === v.id} classList={{ active: s.view() === v.id }} onClick={() => s.setView(v.id)}>
+                  {v.label}
+                  <Show when={v.id === "activity" && s.activity()}><span class="mv-count">{activeSessions()}</span></Show>
+                  <Show when={v.id === "locks" && (latest()?.blocked ?? 0) > 0}><span class="mv-count warn">{latest()!.blocked}</span></Show>
+                </button>
+              )}
+            </For>
           </div>
+          <Show when={!s.range() && s.view() === "overview"}>
+            <span class="mv-note">Drag across a chart to freeze every chart on that range.</span>
+          </Show>
           <Show when={s.userPaused() && !s.started()}>
             <span class="mv-note">Paused. Resume to start sampling; the monitor opens one extra read-only connection.</span>
           </Show>
         </div>
 
         <div class="monitor-body">
-          <Show when={s.view() === "overview"} fallback={<ActivityTable session={s} onRowMenu={props.onRowMenu} />}>
-            <div class="monitor-grid" style={{ "grid-template-columns": `repeat(${chartColumns(width())}, minmax(0, 1fr))` }}>
-              <For each={CHARTS}>{(def) => <ChartCard session={s} def={def} />}</For>
-            </div>
-            <ActiveNow session={s} onRowMenu={props.onRowMenu} />
-          </Show>
+          <Switch>
+            <Match when={s.view() === "overview"}>
+              <div class="monitor-grid" style={{ "grid-template-columns": `repeat(${chartColumns(width())}, minmax(0, 1fr))` }}>
+                <For each={CHARTS}>{(def) => <ChartCard session={s} def={def} />}</For>
+              </div>
+              <EventsCard session={s} />
+              <Show when={s.range()} fallback={<ActiveNow session={s} onRowMenu={props.onRowMenu} />}>
+                <ActiveInRange session={s} />
+              </Show>
+            </Match>
+            <Match when={s.view() === "activity"}><ActivityTable session={s} onRowMenu={props.onRowMenu} /></Match>
+            <Match when={s.view() === "locks"}><LocksView session={s} onRowMenu={props.onRowMenu} /></Match>
+            <Match when={s.view() === "statements"}><StatementsView session={s} onQueryMenu={props.onQueryMenu} /></Match>
+            <Match when={s.view() === "replication"}><ReplicationView session={s} /></Match>
+            <Match when={s.view() === "tables"}><TablesView session={s} onRowMenu={props.onRowMenu} /></Match>
+            <Match when={s.view() === "io"}><IoView session={s} /></Match>
+          </Switch>
         </div>
       </Show>
     </div>

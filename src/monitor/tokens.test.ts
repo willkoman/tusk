@@ -13,7 +13,7 @@ const { readFileSync } = await import("node:fs");
 const read = (rel: string): string =>
   readFileSync(decodeURIComponent(new URL(rel, import.meta.url).pathname).replace(/^\/(\w:)/, "$1"), "utf8");
 const CSS = read("../App.css");
-const TAB = read("./MonitorTab.tsx");
+const TAB = read("./MonitorTab.tsx") + read("./TimeSeries.tsx");
 
 const rootBlock = () => {
   const at = CSS.indexOf(":root {");

@@ -55,7 +55,8 @@ export type Profile = {
 };
 
 /** Monitor cadence as `monitor_start` / `monitor_configure` take it. */
-export type MonitorOptions = { intervalMs: number; paused: boolean; activity: boolean };
+export type MonitorViewSet = { locks: boolean; statements: boolean; replication: boolean; tables: boolean; io: boolean };
+export type MonitorOptions = { intervalMs: number; paused: boolean; activity: boolean; views: MonitorViewSet };
 
 export type QueryOutcome =
   | { kind: "rows"; columns: string[]; rows: (string | null)[][]; done: boolean; note?: string }

@@ -1403,6 +1403,21 @@ function App() {
     });
   }
 
+  /** A statement from the monitor's Statements view: copy, open or explain it. */
+  function openMonitorQueryMenu(e: MouseEvent, query: string) {
+    e.preventDefault();
+    const text = query.trim();
+    setMenu({
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        { label: "Copy query", icon: "copy", onClick: () => copyText(text, "copied query") },
+        { label: "Open query in new tab", icon: "fileCode", onClick: () => openGeneratedTab(text.endsWith(";") ? text : `${text};`, null, "Statement") },
+        { label: "Explain in new tab", icon: "code", disabled: !activeDatabaseAllowed(), onClick: () => explainInNewTab(text) },
+      ],
+    });
+  }
+
   async function confirmMonitorSignal() {
     const ask = monitorSignalAsk();
     if (!ask || monitorSignalBusy()) return;
@@ -6349,6 +6364,7 @@ function App() {
                     isPostgres={kindOf(session.connectionId) === "postgres"}
                     production={prodBadge()}
                     onRowMenu={(e, row) => openMonitorRowMenu(e, row, session)}
+                    onQueryMenu={openMonitorQueryMenu}
                   />
                 )}
               </Show>
