@@ -22,6 +22,25 @@ ignore = [
   # user chose and whose key they already trusted. Revisit when `rsa` ships a
   # mitigated release.
   "RUSTSEC-2023-0071",
+
+  # RUSTSEC-2026-0367 / -0368 / -0369 — `zip` < 9.0: `ZipArchive::extract` follows
+  # attacker-controlled symlinks out of the destination, applies permissions through
+  # them, and keeps SUID/SGID bits. The fix is a major version (9.0) that none of the
+  # four crates pulling `zip` in accepts yet (checked 2026-10-20 against zip 4.6.1,
+  # 6.0.0 and 8.6.0), so `cargo update` cannot clear it.
+  #
+  # Every advisory is about EXTRACTING an archive to disk. Where Tusk's tree does that:
+  #   - calamine 0.36 (xlsx import) and rust_xlsxwriter 0.99 (xlsx export) read and
+  #     write entries in memory only; neither calls `extract`.
+  #   - libduckdb-sys 1.4 extracts its own bundled DuckDB source at BUILD time.
+  #   - tauri-plugin-updater 2.11 extracts a downloaded update only when it is a zip,
+  #     and only after `download()` has verified its minisign signature against the
+  #     pubkey in tauri.conf.json. Tusk ships signed `.exe`/`.msi` updates, not zips.
+  # None of these reaches attacker-controlled archive contents. Revisit when the
+  # dependents move to zip >= 9.
+  "RUSTSEC-2026-0367",
+  "RUSTSEC-2026-0368",
+  "RUSTSEC-2026-0369",
 ]
 
 [licenses]

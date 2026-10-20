@@ -1966,15 +1966,29 @@ impl DuckConn {
         // potentially once per command. `INSTALL` is a blocking network download, so on a
         // cold + offline machine an un-memoized fallback would stall every single query on
         // a connect timeout. Once it has failed, don't reach for the network again.
+        //
+        // Serialized: DuckDB's INSTALL is not safe to race. Two connections installing
+        // into the same extension directory at once (two DuckDB profiles restored at
+        // startup, a backup beside the UI connection, parallel tests) leave all but one
+        // failing: on Windows with "Failed to create directory … already exists", and
+        // their LOAD then misses a file the winner has not finished writing. The memo
+        // above then turned ICU off for every later connection of the process, so
+        // TIMESTAMPTZ casts kept failing until restart. Under the lock a waiting
+        // connection first retries LOAD, so it uses what the winner installed and only a
+        // genuinely unavailable extension sets the memo.
         static ICU_UNAVAILABLE: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
+        static ICU_INSTALL: std::sync::Mutex<()> = std::sync::Mutex::new(());
         if conn.execute("LOAD icu", []).is_err() && !ICU_UNAVAILABLE.load(Ordering::Relaxed) {
-            let _ = conn.execute("INSTALL icu", []);
-            if let Err(e) = conn.execute("LOAD icu", []) {
-                ICU_UNAVAILABLE.store(true, Ordering::Relaxed);
-                eprintln!(
-                    "[tusk] DuckDB ICU extension unavailable ({e}); TIMESTAMPTZ casts will fail"
-                );
+            let _install = ICU_INSTALL.lock().unwrap_or_else(|p| p.into_inner());
+            if conn.execute("LOAD icu", []).is_err() && !ICU_UNAVAILABLE.load(Ordering::Relaxed) {
+                let _ = conn.execute("INSTALL icu", []);
+                if let Err(e) = conn.execute("LOAD icu", []) {
+                    ICU_UNAVAILABLE.store(true, Ordering::Relaxed);
+                    eprintln!(
+                        "[tusk] DuckDB ICU extension unavailable ({e}); TIMESTAMPTZ casts will fail"
+                    );
+                }
             }
         }
         Ok(conn)

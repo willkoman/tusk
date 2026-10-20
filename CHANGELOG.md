@@ -2,6 +2,14 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
+## [Unreleased]
+
+### Fixed
+- **DuckDB timezone casts keep working when several DuckDB connections open at once on a new machine.** DuckDB needs its ICU extension for `TIMESTAMP WITH TIME ZONE` casts, and Tusk downloads it the first time a connection opens. When two DuckDB connections opened together before it was there (two saved DuckDB connections reopened at startup, or a backup beside the editor's connection), both started the download; on Windows the second failed, and Tusk then gave up on ICU for every DuckDB connection until it restarted, so a cast like `CAST(created_at AS DATE)` on a `TIMESTAMPTZ` column failed with *Unimplemented type for cast*. The download now happens once, and the other connections wait for it. A machine that had already downloaded ICU was never affected.
+
+### Changed
+- **rustls updated to 0.23.46.** Closes RUSTSEC-2026-0346, -0347 and -0348 in the TLS stack behind MySQL connections, the AI proxy, the Slack socket and the update check. (PostgreSQL and SQL Server use the operating system's TLS and were not affected.)
+
 ## [0.11.4] - 2026-10-20
 
 ### Added
