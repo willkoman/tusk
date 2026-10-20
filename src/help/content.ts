@@ -2922,6 +2922,10 @@ export const TOPICS: Topic[] = [
           {
             "action": "newConnection",
             "does": "Open another connection over the workspace"
+          },
+          {
+            "action": "openMonitor",
+            "does": "Open or focus the database monitor (PostgreSQL)"
           }
         ]
       },
@@ -3404,11 +3408,208 @@ export const TOPICS: Topic[] = [
           {
             "action": "newConnection",
             "does": "Open another connection"
+          },
+          {
+            "action": "openMonitor",
+            "does": "Open or focus the database monitor (PostgreSQL)"
           }
         ]
       }
     ],
     "icon": "columns"
+  },
+  {
+    "blurb": "Live PostgreSQL dashboard: load by wait type, sessions, throughput, the process list with blocking chains, Cancel and Terminate.",
+    "id": "monitor",
+    "title": "Database monitor",
+    "blocks": [
+      {
+        "k": "p",
+        "md": "A **Monitor** tab shows how loaded a PostgreSQL server is and why, live: headline tiles, six charts on one shared time axis, and the process list. It samples through its **own read-only session** named `Tusk monitor`, so it never touches your session, your result stream or a manual transaction."
+      },
+      {
+        "k": "h",
+        "text": "Opening it",
+        "id": "open"
+      },
+      {
+        "k": "list",
+        "items": [
+          "The **Monitor** button in the topbar, beside **AI**.",
+          "The Explorer: right-click the connected database → **Open monitor**.",
+          "The command palette, or the shortcut below.",
+          "The status bar's session count (`17 / 100 sessions`), which opens the **Activity** view.",
+          "Each connection gets one Monitor tab; opening it again focuses the existing one. It lives in the tab strip with that connection's colour rail and closes with the connection."
+        ]
+      },
+      {
+        "k": "keys",
+        "rows": [
+          {
+            "action": "openMonitor",
+            "does": "Open or focus the focused connection's Monitor tab"
+          }
+        ]
+      },
+      {
+        "k": "h",
+        "text": "Sampling, pausing and the window",
+        "id": "sampling"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Interval** — 1, 2, 5 or 10 seconds between samples. The process list refreshes every 2 seconds, or every sample at a longer interval.",
+          "**Window** — 1 min, 5 min (the default), 15 min or 1 h of history. It is kept in memory while the tab is open and is gone when the tab closes; nothing is written to disk.",
+          "**Pause** stops querying the server, not just the drawing; the charts freeze on the last sample. **Resume** starts again, leaving a gap where nothing was sampled.",
+          "Sampling also pauses on its own whenever nobody can see it: the Monitor tab is not the active tab, the window is minimized, or the page is hidden. **Keep sampling** keeps querying in the background to capture an incident; drawing still stops.",
+          "A Monitor tab reopened from the last session starts **paused**, so opening a workspace never starts querying a server by itself. Resume it, or open it again from any entry point.",
+          "The status beside the controls reads **Live**, **Paused**, **Paused while hidden**, **Reconnecting** (a dropped monitor session is redialled with a 1 s → 30 s backoff; no statement is ever re-run) or **Stopped**, with **Retry**."
+        ]
+      },
+      {
+        "k": "h",
+        "text": "Tiles",
+        "id": "tiles"
+      },
+      {
+        "k": "p",
+        "md": "Each tile carries a one-minute sparkline, and its tooltip names the view and the formula behind the number. Amber means *needs attention*, red means *trouble*."
+      },
+      {
+        "k": "table",
+        "head": [
+          "Tile",
+          "What it is",
+          "Colours"
+        ],
+        "rows": [
+          [
+            "Load",
+            "Average active sessions over the last minute (`pg_stat_activity`, `state = 'active'`, every backend type, never the monitor), with the count right now",
+            "—"
+          ],
+          [
+            "Sessions",
+            "Active / total client backends, and `max_connections`. Click for Activity",
+            "Amber at 80% of max, red at 95%"
+          ],
+          [
+            "Transactions/s",
+            "Δ(`xact_commit` + `xact_rollback`) per second over every database, with the 10-second average and the rollback share",
+            "—"
+          ],
+          [
+            "Cache hit",
+            "Δ`blks_hit` / Δ(`blks_hit` + `blks_read`) over the last tick, not the lifetime ratio",
+            "—"
+          ],
+          [
+            "WAL",
+            "Bytes of WAL written per second (replayed, on a standby)",
+            "—"
+          ],
+          [
+            "Oldest transaction",
+            "Age of the oldest open transaction. Click for Activity",
+            "Amber past 5 min, red past 1 h"
+          ],
+          [
+            "Blocked",
+            "Sessions waiting on a lock another session holds (`pg_blocking_pids`). Click for the blocking tree",
+            "Amber above 0"
+          ],
+          [
+            "Replication lag",
+            "Primary: the slowest replica's replay lag. Standby: time since the last replayed transaction. Shown only when there is replication",
+            "Amber past 1 min"
+          ]
+        ]
+      },
+      {
+        "k": "h",
+        "text": "Charts",
+        "id": "charts"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Database load by wait type** — active sessions stacked by `wait_event_type`; **CPU** is active with no wait event. The height is load, the colours say why.",
+          "**Sessions by state** — active, idle in transaction, idle in transaction (aborted), idle, other. The dashed `max_connections` line appears once the sessions reach half of it.",
+          "**Transactions per second** — commits and rollbacks, plus a dashed 10-second average: one-second TPS swings widely because backends flush their statistics about once a second.",
+          "**Tuples per second** — writes (inserted, updated, deleted) above, reads (fetched, returned) below.",
+          "**Block I/O** — shared-buffer hits and reads and temporary-file bytes, in bytes per second.",
+          "**WAL** — WAL bytes per second, and below it full-page images per second (PostgreSQL 14+), which jump after a checkpoint."
+        ]
+      },
+      {
+        "k": "p",
+        "md": "Hover any chart and the same time cursor appears on all of them; each legend then reads out the values at that instant, and moving off returns to the newest values. Click a legend entry to hide or show a series; double-click to show only that one. A missed sample, a pause or a statistics reset is drawn as a **gap**, never interpolated. Charts glide as time passes; with *reduce motion* set in the OS they step once per sample instead."
+      },
+      {
+        "k": "h",
+        "text": "Activity",
+        "id": "activity"
+      },
+      {
+        "k": "p",
+        "md": "The process list: pid, user, database, application, client, backend type, state, wait, transaction age, query age, blocked by, and the query. Narrow windows drop client, backend type and application first."
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Filters** — *Hide idle* and *Hide background workers* are on by default; *This database only*, *My user only*, and a search over pid, query, application, user, database and client.",
+          "**Durations tick live** between refreshes, counted against the server's clock, so a server whose clock differs from yours still reads right.",
+          "**Sort** by clicking a header; clicking through returns to the default order, active sessions first and the longest-running query first.",
+          "**Blocking tree** — a session waiting on a lock nests under the session blocking it, and the session at the head of a chain gets an amber rail. A blocker your filters would hide is kept, dimmed, because hiding the cause of a wait would make the tree lie.",
+          "At most 500 sessions are listed (`first 500 of 742`), active ones first. Query text is cut at 1,024 characters, and the server itself keeps only `track_activity_query_size` bytes; the tooltip says when a query was cut."
+        ]
+      },
+      {
+        "k": "tip",
+        "kind": "tip",
+        "md": "Without `pg_read_all_stats` (or superuser), PostgreSQL hides other roles' query text and state, and a banner says so. Grant `pg_monitor` to see them."
+      },
+      {
+        "k": "h",
+        "text": "Cancel and Terminate",
+        "id": "signal"
+      },
+      {
+        "k": "p",
+        "md": "Right-click a session, or use its **⋯** button: **Copy query**, **Open query in new tab**, **Explain in new tab** (a fresh tab runs a plain `EXPLAIN`, asking for any `$1` parameters), **Copy pid**, **Cancel query…** and **Terminate session…**."
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Cancel** (`pg_cancel_backend`) stops the running statement; the session stays connected. Only an active query can be cancelled.",
+          "**Terminate** (`pg_terminate_backend`) disconnects the session; its open transaction rolls back.",
+          "Both confirm first, naming the pid, user, database, state and query, with the production badge on a production connection.",
+          "Both are refused on a **read-only** connection — read-only means Tusk changes nothing on the server — and for the monitor's own session. Another role's session needs superuser or membership in `pg_signal_backend`; the server checks again.",
+          "The signal re-identifies its target by pid **and** backend start time in the same statement, so a pid the server has reused for a new session is never signalled.",
+          "Each one lands in [[topic:history|query history]] as `-- [Monitor] SELECT pg_cancel_backend(1234)`."
+        ]
+      },
+      {
+        "k": "tip",
+        "kind": "warn",
+        "md": "The monitor holds **one extra connection** while its tab is open (`application_name = 'Tusk monitor'`, read-only, `statement_timeout` 2 s), and it counts toward `max_connections`. Closing the tab or disconnecting closes it."
+      },
+      {
+        "k": "h",
+        "text": "Requirements",
+        "id": "requirements"
+      },
+      {
+        "k": "list",
+        "items": [
+          "PostgreSQL 10 or later; full-page images need 14 or later.",
+          "PostgreSQL only for now: DuckDB, SQLite, MySQL and SQL Server connections show no Monitor entry at all.",
+          "Each tick is one statement against shared-memory statistics views, about half a millisecond of server time."
+        ]
+      }
+    ],
+    "icon": "activity"
   },
   {
     "blurb": "Read-only layers, permission gating, real query cancellation, secret storage.",

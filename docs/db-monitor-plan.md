@@ -1,6 +1,6 @@
 # Database monitor — plan
 
-Status: **phase 0 spike done** (results in §11); **decisions settled 2026-10-20** (§10); phase 1 next. A live, first-class server dashboard in the spirit of pgAdmin's Dashboard (and AWS Performance Insights' "database load"), built to Tusk's standards: one cheap round trip per tick, a fluid canvas renderer, zero interference with the user's own session, and bounded everything.
+Status: **phase 1 (PostgreSQL MVP) implemented 2026-10-20** (results in §12); phase 0 spike done (§11); decisions settled 2026-10-20 (§10); phase 2 next. A live, first-class server dashboard in the spirit of pgAdmin's Dashboard (and AWS Performance Insights' "database load"), built to Tusk's standards: one cheap round trip per tick, a fluid canvas renderer, zero interference with the user's own session, and bounded everything.
 
 PostgreSQL is the target for v1. MySQL and SQL Server follow through the same seams; DuckDB and SQLite are embedded and get no monitor.
 
@@ -318,3 +318,33 @@ Throwaway quality, hidden: palette action *Database monitor (experimental)*, dev
 - **HiDPI:** not measured. Only devicePixelRatio 1 was tested, and a ratio of 2 rasterizes four times the pixels; phase 1 should measure it on a laptop panel.
 - **macOS and Linux:** WKWebView and WebKitGTK were not tested.
 - **Left out of the spike:** crosshair, reduced motion, per-series min/max decimation for line charts, and `monitor_configure`.
+
+---
+
+## 12. Phase 1 results (2026-10-20)
+
+Built as planned in §4, on current master rather than the spike branch: the sidecar, the lock-free config snapshot, Rust-side rates, the paced frame loop and the rings carried over; everything else was rewritten to production quality. Locks, Statements and the other phase-2 views are not in it.
+
+### Measured (live smoke)
+
+`npm run tauri dev` (debug), WebView2, devicePixelRatio 1, a 1200 × 820 window with the Overview in one column, `postgres:16-alpine` under `pgbench -c 16 -j 4`.
+
+| Configuration | Redraws/s | Script per frame (p50 / p99) | App CPU, % of one core |
+|---|---|---|---|
+| Overview, 5-min window (the default) | 2.9 | 0.2 / 1.0 ms | ~2.1 |
+| Overview, 1-min window | 7.1 | 0.2 / 0.9 ms | ~3.1 |
+| Overview, 1-hour window | 1.3 | 0.1 / 3.2 ms | — |
+| Activity view | — | — | ~2.3 |
+| Emulated devicePixelRatio 2, 1-min window | 7.6 | 0.4 / 0.8 ms | — |
+| Minimized (sampler paused server-side) | 0 | — | 0.08 |
+| Minimized with Keep sampling | 0 | — | 1.4 |
+
+- Three changes were needed to get there, all about compositing, not drawing: an endless CSS pulse on the *Live* dot cost ~10% of a core by itself (removed); a tile's tone effect re-read the theme and forced a full redraw on every sample (memoized); and charts scrolled out of view were still redrawn (now skipped, which halved the 1-minute cost). Axis easing animates at 40 ms frames instead of every vsync, and sparklines snap.
+- With every chart on screen at once (a tall or two-column window) the 1-minute window costs more, in proportion to the canvas area composited; the 5-minute default stays near 2%.
+- Lifecycle: a webview reload's `monitor_stop_all` sweep left no `Tusk monitor` backend; closing the tab, disconnecting, and pausing all stopped the queries (the sidecar reported idle on the server).
+- The conformance monitor battery passed on PostgreSQL 10, 13, 16 and 17.
+
+### Not covered
+
+- Release build, a physical HiDPI panel (only emulated DPR 2), macOS and Linux.
+

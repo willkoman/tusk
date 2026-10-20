@@ -6,6 +6,7 @@ export const GROUPS: { label: string; ids: string[] }[] = [
   { label: "Writing SQL", ids: ["editor", "editor-intel", "shortcuts"] },
   { label: "Results & data", ids: ["results", "grid-editing", "import-export", "backup"] },
   { label: "Schema tools", ids: ["sidebar", "erd", "plans"] },
+  { label: "Monitoring", ids: ["monitor"] },
   { label: "Assistants", ids: ["ai", "slack"] },
   { label: "Trust & history", ids: ["history", "safety"] },
 ];
