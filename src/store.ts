@@ -199,6 +199,8 @@ export const keymapStore = {
 // survives reloads. `dirty` is optional for source compatibility with callers and old
 // documents; normalized loads always return an explicit value.
 export type PersistedTab = {
+  /** "monitor" for a Monitor tab; absent (every document before it shipped) = a SQL tab. */
+  kind?: "sql" | "monitor";
   sql: string;
   filePath: string | null;
   title: string;
@@ -211,7 +213,8 @@ export type PersistedTab = {
   color?: string;
 };
 export type PersistedTabs = { tabs: PersistedTab[]; activeIndex: number };
-export type RestoredPersistedTab = Omit<PersistedTab, "dirty" | "customTitle" | "pinned" | "color"> & {
+export type RestoredPersistedTab = Omit<PersistedTab, "dirty" | "customTitle" | "pinned" | "color" | "kind"> & {
+  kind: "sql" | "monitor";
   dirty: boolean;
   customTitle: string;
   pinned: boolean;
@@ -267,8 +270,10 @@ function normalizeTabs(value: unknown): RestoredPersistedTabs | null {
     const dirty = typeof v.dirty === "boolean" ? v.dirty : false;
     const customTitle = typeof v.customTitle === "string" ? v.customTitle.slice(0, MAX_TAB_TITLE) : "";
     const pinned = v.pinned === true;
+    const kind = v.kind === "monitor" ? "monitor" : "sql";
     return [{
-      sql: v.sql,
+      kind,
+      sql: kind === "monitor" ? "" : v.sql,
       title: v.title.slice(0, MAX_TAB_TITLE),
       filePath,
       searchSchema,

@@ -164,6 +164,10 @@ import { KeyedSerialQueue } from "./asyncQueue";
 import { StaleGuard } from "./staleGuard";
 import { createOperationRunner, refusal } from "./operation";
 import { closeSurfaces, type Surface } from "./surfaces";
+import { isMonitorTab } from "./tabs";
+import { MonitorSession, sweepStaleMonitors, type MonitorView } from "./monitor/session";
+import { appVisible, watchAppVisibility } from "./monitor/visibility";
+import { HIDDEN_QUERY, signalRefusal, waitLabel, type ActivityRow, type MonitorSample } from "./monitor/model";
 import {
   IDLE_TRANSACTION,
   INTERRUPTED_TRANSACTION_KEY,
@@ -215,6 +219,8 @@ const ShortcutsPane = lazy(() => import("./settings/ShortcutsPane").then((m) => 
 const HistoryPanel = lazy(() => import("./history/HistoryPanel").then((m) => ({ default: m.HistoryPanel })));
 const CommandPalette = lazy(() => import("./CommandPalette").then((m) => ({ default: m.CommandPalette })));
 const PlanView = lazy(() => import("./plan/PlanView").then((m) => ({ default: m.PlanView })));
+// The database monitor's tab body (charts, tiles, process list): its own chunk.
+const MonitorTab = lazy(() => import("./monitor/MonitorTab"));
 const DefinitionDialog = lazy(() => import("./forms/DefinitionDialog").then((m) => ({ default: m.DefinitionDialog })));
 
 /** "View definition" dialog titles per Explorer node kind. */
@@ -620,6 +626,22 @@ function App() {
   const activeTab = createMemo(() => tabs().find((t) => t.id === activeTabId()) ?? NO_TAB);
   const tabsOf = (connectionId: string) => tabs().filter((t) => t.connectionId === connectionId);
   const aiFkSchemas = () => new Set([activeTab().searchSchema ?? "public", "public"]);
+  // --- database monitor: one session per Monitor tab (src/monitor/session.ts) ---
+  // A session outlives its tab's VIEW (an inactive Monitor tab renders nothing but
+  // keeps its rolling window) and dies with the tab, however the tab goes.
+  const monitorSessions = new Map<string, MonitorSession>();
+  const [monitorVersion, setMonitorVersion] = createSignal(0);
+  /** How a freshly opened Monitor tab starts; a restored one has no entry and starts paused. */
+  const monitorIntent = new Map<string, { view: MonitorView }>();
+  const sessionFor = (tabId: string) => {
+    void monitorVersion();
+    return monitorSessions.get(tabId) ?? null;
+  };
+  const activeIsMonitor = createMemo(() => isMonitorTab(activeTab()));
+  const monitorTabOf = (connectionId: string | null) =>
+    connectionId ? tabs().find((t) => t.connectionId === connectionId && isMonitorTab(t)) ?? null : null;
+  /** PostgreSQL only until phase 3 (plan decision 4); other engines show no Monitor entry at all. */
+  const canMonitor = () => !!conn() && connectionKind() === "postgres";
   const [persistenceWarning, setPersistenceWarning] = createSignal("");
 
   const patchTab = (id: string, patch: Partial<Tab>) =>
@@ -738,6 +760,44 @@ function App() {
     connectionLabelMap().get(connectionId) ?? entryOf(connectionId)?.conn.target ?? "";
   const kindOf = (connectionId: string) => connectionKindOf(stateOf(connectionId));
   const envOf = (connectionId: string): Environment => parseEnvironment(entryOf(connectionId)?.conn.environment);
+
+  // Keep one session per Monitor tab: create for a new tab, dispose for a gone one.
+  // Reconciling from `tabs()` covers every way a tab leaves (close, close-many,
+  // disconnect), so no removal path has to remember the monitor.
+  createEffect(on(tabs, (ts) => {
+    let changed = false;
+    const live = new Set<string>();
+    for (const t of ts) {
+      if (!isMonitorTab(t)) continue;
+      live.add(t.id);
+      if (monitorSessions.has(t.id)) continue;
+      const intent = monitorIntent.get(t.id);
+      monitorIntent.delete(t.id);
+      monitorSessions.set(t.id, new MonitorSession(t.connectionId, { paused: !intent, view: intent?.view }));
+      changed = true;
+    }
+    for (const [id, session] of monitorSessions) {
+      if (live.has(id)) continue;
+      session.dispose();
+      monitorSessions.delete(id);
+      changed = true;
+    }
+    if (changed) setMonitorVersion((v) => v + 1);
+  }));
+  // Sample only what someone can see: the active tab, in a shown window (plan
+  // decision 3). Each session decides itself, with its keep-sampling toggle.
+  createEffect(() => {
+    void monitorVersion();
+    const active = activeTabId();
+    const shown = appVisible();
+    // Only those three inputs drive this: the sessions' own signals, and a
+    // connection's state (its run timer ticks 5x a second), stay untracked.
+    untrack(() => {
+      for (const [tabId, session] of monitorSessions) {
+        session.setVisible(shown && tabId === active && entryOf(session.connectionId)?.conn.driver === "postgres");
+      }
+    });
+  });
   /** Environment of the connection in front of the user; drives the prod markers. */
   const activeEnvironment = (): Environment => parseEnvironment(conn()?.environment);
   /** Production marker rendered in the title of every confirmation dialog. */
@@ -1126,6 +1186,8 @@ function App() {
     canRollbackTransaction: transactionControls().rollback,
     canFilter: canFilter(),
     connectionCount: connections().length,
+    sqlTab: !activeIsMonitor(),
+    canMonitor: canMonitor(),
   });
 
   // Validate the buffer against Postgres for parser-grade diagnostics (PREPARE-only,
@@ -1190,7 +1252,7 @@ function App() {
   const openExport = () => {
     const tab = activeTab();
     const c = conn();
-    if (!c) return;
+    if (!c || isMonitorTab(tab)) return;
     const order = localRowOrder();
     let query = lastQuery();
     if (order && tab.gridView.sorts.length && canServerSortFilter()) {
@@ -1264,6 +1326,113 @@ function App() {
     const t = makeTab({ connectionId: id, sql: sqlText, searchSchema: schema, title });
     setTabs((ts) => [...ts, t]);
     switchTab(t.id);
+  }
+
+  /**
+   * Open (or focus) the focused connection's Monitor tab — one per connection. An
+   * explicit open starts sampling; a tab restored from the last session stays paused
+   * until it is opened like this or resumed by hand.
+   */
+  function openMonitor(view?: MonitorView) {
+    const id = activeConnectionId();
+    if (!id || kindOf(id) !== "postgres") return;
+    const existing = monitorTabOf(id);
+    if (existing) {
+      const session = monitorSessions.get(existing.id);
+      if (view) session?.setView(view);
+      if (session && !session.started() && session.userPaused()) session.resume();
+      switchTab(existing.id);
+      return;
+    }
+    const t = makeTab({ kind: "monitor", connectionId: id });
+    monitorIntent.set(t.id, { view: view ?? "overview" });
+    setTabs((ts) => [...ts, t]);
+    switchTab(t.id);
+  }
+
+  /** Explain a query from the process list in a fresh tab (its text, not the editor's). */
+  function explainInNewTab(sqlText: string) {
+    const text = sqlText.trim();
+    openGeneratedTab(text.endsWith(";") ? text : `${text};`, null, "Explain");
+    runExplain(false, text.replace(/;\s*$/, ""));
+  }
+
+  // Cancel / Terminate from the monitor: a confirmation bound to the connection.
+  const [monitorSignalAsk, setMonitorSignalAsk] = createSignal<{
+    tabId: string;
+    connectionId: string;
+    row: ActivityRow;
+    action: "cancel" | "terminate";
+  } | null>(null);
+  const [monitorSignalBusy, setMonitorSignalBusy] = createSignal(false);
+  const [monitorSignalError, setMonitorSignalError] = createSignal("");
+  const closeMonitorSignal = () => {
+    setMonitorSignalAsk(null);
+    setMonitorSignalError("");
+  };
+
+  function openMonitorRowMenu(e: MouseEvent, row: ActivityRow, session: MonitorSession) {
+    e.preventDefault();
+    const tabId = [...monitorSessions].find(([, s]) => s === session)?.[0];
+    if (!tabId) return;
+    const query = row.query && row.query !== HIDDEN_QUERY ? row.query : "";
+    const noQuery = query ? undefined : row.query === HIDDEN_QUERY ? "Another role's query is hidden from this role" : "No query text";
+    const truncated = row.queryTruncated ? "The query text was truncated, so it may not run as shown" : undefined;
+    const refusal = signalRefusal(row, {
+      readOnly: !!entryOf(session.connectionId)?.conn.readOnly,
+      running: session.status().kind === "live" || session.status().kind === "paused" || session.status().kind === "hidden",
+      server: session.started()?.server ?? null,
+    });
+    const ask = (action: "cancel" | "terminate") => () => {
+      setMonitorSignalError("");
+      setMonitorSignalAsk({ tabId, connectionId: session.connectionId, row, action });
+    };
+    setMenu({
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        { head: `Session ${row.pid}`, sub: [row.user, row.database, row.state, waitLabel(row)].filter(Boolean).join(" · ") },
+        { label: "Copy query", icon: "copy", disabled: !query, title: noQuery, onClick: () => copyText(query, "copied query") },
+        { label: "Open query in new tab", icon: "fileCode", disabled: !query, title: noQuery ?? truncated, onClick: () => openGeneratedTab(query.trim().endsWith(";") ? query.trim() : `${query.trim()};`, null, `pid ${row.pid}`) },
+        { label: "Explain in new tab", icon: "code", disabled: !query || !activeDatabaseAllowed(), title: noQuery ?? truncated, onClick: () => explainInNewTab(query) },
+        { label: "Copy pid", icon: "copy", onClick: () => copyText(String(row.pid), "copied pid") },
+        { sep: "danger" },
+        { label: "Cancel query…", icon: "close", danger: true, disabled: !!refusal || row.state !== "active", title: refusal || (row.state !== "active" ? "Only a running query can be cancelled" : undefined), onClick: ask("cancel") },
+        { label: "Terminate session…", icon: "trash", danger: true, disabled: !!refusal, title: refusal || undefined, onClick: ask("terminate") },
+      ],
+    });
+  }
+
+  async function confirmMonitorSignal() {
+    const ask = monitorSignalAsk();
+    if (!ask || monitorSignalBusy()) return;
+    const session = monitorSessions.get(ask.tabId);
+    const entry = entryOf(ask.connectionId);
+    if (!session || !entry) {
+      closeMonitorSignal();
+      return;
+    }
+    const fn = ask.action === "cancel" ? "pg_cancel_backend" : "pg_terminate_backend";
+    const sqlText = `-- [Monitor] SELECT ${fn}(${ask.row.pid})`;
+    const started = performance.now();
+    setMonitorSignalBusy(true);
+    try {
+      const done = await session.signal(ask.row.pid, ask.row.backendStart, ask.action);
+      const message = done ? null : "the server reported no such session";
+      recordHistory({ sql: sqlText, durationMs: Math.round(performance.now() - started), status: done ? "ok" : "error", rows: null, error: message, schema: null }, entry.conn.key);
+      if (monitorSignalAsk() === ask) closeMonitorSignal();
+      if (activeTabId() === ask.tabId) {
+        setStatus(done
+          ? `${ask.action === "cancel" ? "Cancelled the query of" : "Terminated"} session ${ask.row.pid}`
+          : `Session ${ask.row.pid} was already gone`);
+      }
+    } catch (e) {
+      const message = errMsg(e);
+      recordHistory({ sql: sqlText, durationMs: Math.round(performance.now() - started), status: "error", rows: null, error: message.split("\n")[0], schema: null }, entry.conn.key);
+      if (monitorSignalAsk() === ask) setMonitorSignalError(message);
+    } finally {
+      setMonitorSignalBusy(false);
+    }
   }
 
   // --- tab QoL: rename / close-many / drag-reorder ---
@@ -1569,7 +1738,8 @@ function App() {
   const fileWrites = new KeyedSerialQueue<string>();
   async function saveTab(tabId: string, saveAs: boolean): Promise<boolean> {
     let t = tabs().find((x) => x.id === tabId);
-    if (!t) return false;
+    // A Monitor tab has nothing to save.
+    if (!t || isMonitorTab(t)) return false;
     try {
       let filePath = t.filePath;
       if (saveAs || !filePath) {
@@ -1678,7 +1848,8 @@ function App() {
   // it is a per-connection fact, not a module flag: two DuckDB builds can differ.
   const duckJsonExplain = () => activeState()?.duckJsonExplain ?? false;
 
-  function runExplain(analyze: boolean) {
+  function runExplain(analyze: boolean, statement?: string) {
+    if (statement === undefined && activeIsMonitor()) return;
     if (!activeDatabaseAllowed()) {
       setStatus(`Switch to ${ownerTab()?.title ?? "the transaction owner"} to run database actions`);
       return;
@@ -1689,8 +1860,8 @@ function App() {
       return;
     }
     const api = editorApi();
-    if (!api) return;
-    const stmt = api.getSelection().trim() || api.getCurrentStatement();
+    if (statement === undefined && !api) return;
+    const stmt = statement ?? (api!.getSelection().trim() || api!.getCurrentStatement());
     if (!stmt.trim()) return;
     if (!isSingleExplainStatement(stmt, connectionKind())) {
       setStatus("Explain needs one statement. Select a single statement and run again.");
@@ -2383,7 +2554,12 @@ function App() {
   };
   let appMounted = true;
   let nativeResizeUnlisten: UnlistenFn | null = null;
+  let stopMonitorVisibility: (() => void) | null = null;
   onMount(async () => {
+    // A webview reload leaves the previous page's monitor sidecars sampling; sweep
+    // them before anything here can start one (each start waits for this).
+    void sweepStaleMonitors();
+    stopMonitorVisibility = watchAppVisibility();
     transactionTimer = setInterval(() => {
       if (transactionOpen(transaction())) setTransactionNow(Date.now());
     }, 1000);
@@ -2439,6 +2615,18 @@ function App() {
       if (!appMounted) tablesUnlisten(); else slackUnlisten.push(tablesUnlisten);
     } catch {
       /* progress events unavailable; the dialogs still report their result */
+    }
+    // Database monitor samples: one event per tick, routed to the session of that
+    // connection (a sample from a superseded generation is inert there).
+    try {
+      const monitorUnlisten = await listen<MonitorSample>("monitor-sample", (e) => {
+        for (const session of monitorSessions.values()) {
+          if (session.connectionId === e.payload.connectionId) session.ingest(e.payload);
+        }
+      });
+      if (!appMounted) monitorUnlisten(); else slackUnlisten.push(monitorUnlisten);
+    } catch {
+      /* monitor events unavailable; the Monitor tab shows no samples */
     }
     // Suppress the WebView's native right-click menu app-wide; the sidebar shows
     // its own context menu, and the editor uses keyboard shortcuts for copy/paste.
@@ -2524,6 +2712,9 @@ function App() {
   });
   onCleanup(() => {
     appMounted = false;
+    for (const session of monitorSessions.values()) session.dispose();
+    monitorSessions.clear();
+    stopMonitorVisibility?.();
     skillsGuard.dispose();
     slackStatusGuard.dispose();
     tabDrag?.cancel();
@@ -2599,6 +2790,7 @@ function App() {
         break;
       }
       case "newConnection": openConnectScreen(); break;
+      case "openMonitor": openMonitor(); break;
     }
   }
 
@@ -2870,8 +3062,15 @@ function App() {
       if (saved && saved.tabs.length) {
         // The active tab is restored BY ID below, so re-sorting pinned tabs to the
         // head of the group cannot select the wrong buffer.
-        const mapped = saved.tabs.map((pt) =>
+        let monitorSeen = false;
+        const mapped = saved.tabs.filter((pt) => {
+          if (pt.kind !== "monitor") return true;
+          if (monitorSeen) return false;
+          monitorSeen = true;
+          return true;
+        }).map((pt) =>
           makeTab({
+            kind: pt.kind,
             connectionId: connected.id,
             sql: pt.sql,
             filePath: pt.filePath,
@@ -3484,7 +3683,7 @@ function App() {
   ): Promise<boolean> {
     const runTabId = activeTabId();
     const runTab = tabs().find((t) => t.id === runTabId);
-    if (!runTab) return false;
+    if (!runTab || isMonitorTab(runTab)) return false;
     // The RUN TAB decides the connection, not "whichever is active": a run must
     // execute (and be quoted) against the connection its tab belongs to.
     const entry = entryOf(runTab.connectionId);
@@ -3661,7 +3860,8 @@ function App() {
   }
 
   function openTransactionStartMenu(e: MouseEvent) {
-    if (running() || transactionOpen(transaction())) return;
+    // The transaction would be owned by the active tab; a Monitor tab runs no SQL.
+    if (running() || transactionOpen(transaction()) || activeIsMonitor()) return;
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const items: MenuItem[] = [
       { label: "Begin transaction", icon: "play", onClick: () => void runTransactionControl(connectionKind() === "mssql" ? "BEGIN TRANSACTION" : "BEGIN") },
@@ -3839,6 +4039,7 @@ function App() {
   }
 
   function runText(t: string) {
+    if (activeIsMonitor()) return;
     runParameterized(t, (substituted) => runTextNow(substituted, t));
   }
 
@@ -3868,6 +4069,7 @@ function App() {
   }
 
   function doRun(override?: string) {
+    if (activeIsMonitor()) return;
     // Explicit text (statement-gutter / run-current-statement) runs as-is, no prompt.
     if (override !== undefined) {
       runText(override);
@@ -3987,6 +4189,7 @@ function App() {
   async function loadMore() {
     const id = activeTabId();
     const tab = tabs().find((t) => t.id === id);
+    if (tab && isMonitorTab(tab)) return;
     const entry = entryOf(tab?.connectionId);
     const c = entry?.conn ?? null;
     const rt = entry?.runtime ?? null;
@@ -4236,6 +4439,9 @@ function App() {
     // clear the binding with the dialog and refuse while a run is in flight.
     { name: "backup", scope: () => (backupTarget() || backupConnection ? bound(backupConnection?.id, backupBusy()) : null), session: true, close: closeBackup },
     { name: "restore", scope: () => (restoreOpen() || restoreConnection ? bound(restoreConnection?.id, restoreBusy()) : null), session: true, close: closeRestore },
+    // Signals through the monitor's own sidecar, never the user's session, so it is
+    // not `session`; a signal in flight survives a switch until the server answers.
+    { name: "monitorSignal", scope: () => { const a = monitorSignalAsk(); return a ? bound(a.connectionId, monitorSignalBusy()) : null; }, close: closeMonitorSignal },
   ];
 
   const pickBackupPath = (suggested: string) =>
@@ -4680,6 +4886,11 @@ function App() {
   // Insert text into the editor at the cursor (never clobbers the buffer).
   function scaffoldEditor(text: string, tabId = activeTabId()) {
     const body = text.endsWith("\n") ? text : text + "\n";
+    // A Monitor tab has no buffer: the scaffold gets a SQL tab of its own.
+    if (tabs().find((x) => x.id === tabId)?.kind === "monitor") {
+      openGeneratedTab(body, null);
+      return;
+    }
     const api = editorApi();
     if (api && tabId === activeTabId()) api.insertAtCursor(body);
     else {
@@ -5133,6 +5344,7 @@ function App() {
       }
       case "database": {
         const cur = tree()?.database === n.name;
+        if (cur && canMonitor()) items.push({ label: "Open monitor", icon: "activity", onClick: () => openMonitor() }, { sep: true });
         items.push(
           { label: "Create schema…", icon: "plus", ...gate(canCreateSchema(), "Requires CREATE on the database"), ...engineCan(dcaps().createSchema, "create a schema"), onClick: () => setActiveDialog({ kind: "createSchema" }) },
           {
@@ -5705,12 +5917,25 @@ function App() {
             <span class="badge badge-ro" title="Writes & DDL are blocked"><Icon name="lock" /> Read-only</span>
           </Show>
           <Show when={caps()?.manualTransactions !== false && !transactionOpen(transaction())}>
-            <button class="ghost tx-start" disabled={running()} onClick={openTransactionStartMenu} title="Begin or configure a manual transaction">Transaction <Icon name="chevronDown" /></button>
+            <button
+              class="ghost tx-start"
+              disabled={running() || activeIsMonitor()}
+              onClick={openTransactionStartMenu}
+              title={activeIsMonitor() ? "Switch to a SQL tab to run a transaction" : "Begin or configure a manual transaction"}
+            >Transaction <Icon name="chevronDown" /></button>
           </Show>
           <span class="spacer" />
           <button class="icon" classList={{ active: sidebarOpen() }} title={`${sidebarOpen() ? "Hide" : "Show"} explorer (${displayKey(effectiveKey("toggleSidebar", keys()))})`} onClick={toggleSidebar}><Icon name="panelLeft" /></button>
           <button class="icon" classList={{ active: resultsOpen() }} title={`${resultsOpen() ? "Hide" : "Show"} results (${displayKey(effectiveKey("toggleResults", keys()))})`} onClick={toggleResults}><Icon name="panelBottom" /></button>
           <span class="topbar-sep" />
+          <Show when={canMonitor()}>
+            <button
+              class="ghost"
+              classList={{ active: activeIsMonitor() }}
+              onClick={() => openMonitor()}
+              title={`Database monitor (${displayKey(effectiveKey("openMonitor", keys())) || "unbound"})`}
+            ><Icon name="activity" /> Monitor</button>
+          </Show>
           <button class="ghost" classList={{ active: aiOpen() }} onClick={() => setAiOpen((v) => !v)} title="AI assistant"><Icon name="sparkle" /> AI</button>
           <button class="icon" classList={{ active: historyOpen() }} title="Query history" onClick={() => setHistoryOpen((v) => !v)}><Icon name="clock" /></button>
           <button class="icon" classList={{ active: helpOpen() }} title="Manual" onClick={() => setHelpOpen(true)}><Icon name="help" /></button>
@@ -5844,7 +6069,11 @@ function App() {
           </Show>
 
           <main class="main">
-            <div class="editor-pane" classList={{ full: !resultsOpen() }} style={resultsOpen() ? { height: `${editorH()}px` } : undefined}>
+            <div
+              class="editor-pane"
+              classList={{ full: !resultsOpen() || activeIsMonitor(), "monitor-active": activeIsMonitor() }}
+              style={resultsOpen() && !activeIsMonitor() ? { height: `${editorH()}px` } : undefined}
+            >
               {/* ui/customize: the strip scrolls; the ⌄ button beside it does not. */}
               <div class="tab-bar">
               <div
@@ -5965,6 +6194,7 @@ function App() {
                       }}
                     >
                       <Show when={t.color}><span class="tab-tag" data-color={t.color} title={`Colour: ${TAB_COLOR_LABELS[t.color as Exclude<TabColor, "">]}`} /></Show>
+                      <Show when={isMonitorTab(t)}><span class="tab-kind" aria-label="Database monitor"><Icon name="activity" /></span></Show>
                       <Show
                         when={inlineRename()?.id === t.id}
                         fallback={<span class="tab-title">{t.pinned ? shortTabLabel(tabLabel(t)) : tabLabel(t)}</span>}
@@ -6111,9 +6341,20 @@ function App() {
                 onReady={setEditorApi}
                 onContextMenu={openEditorMenu}
               />
+              <Show when={activeIsMonitor() ? sessionFor(activeTabId()) : null} keyed>
+                {(session) => (
+                  <MonitorTab
+                    session={session}
+                    connectionLabel={labelOf(session.connectionId)}
+                    isPostgres={kindOf(session.connectionId) === "postgres"}
+                    production={prodBadge()}
+                    onRowMenu={(e, row) => openMonitorRowMenu(e, row, session)}
+                  />
+                )}
+              </Show>
             </div>
 
-            <Show when={resultsOpen()}>
+            <Show when={resultsOpen() && !activeIsMonitor()}>
             <div class="splitter" onMouseDown={startResize} />
 
             <div class="result" classList={{ "is-running": running() }}>
@@ -6341,6 +6582,8 @@ function App() {
                   : (persistenceWarning()
                     || transactionWarning()
                     // A plan arrives as one row; the row count says nothing about it.
+                    // A Monitor tab has no result panel: an Explorer action's error lands here.
+                    || (activeIsMonitor() ? activeTab().result.runErr || status() : "")
                     || (resultsOpen() && planMemo() && resultView() === "plan" ? planSummary(planMemo()!) : status()))}
               </span>
               <Show when={slackNotice()}>
@@ -6385,6 +6628,24 @@ function App() {
                   <span class="slack-led" aria-hidden="true" />Slack
                 </button>
               </Show>
+              <Show when={canMonitor()}>
+                {(() => {
+                  const sessions = () => {
+                    const t = monitorTabOf(activeConnectionId());
+                    return t ? sessionFor(t.id)?.latest()?.sessions ?? null : null;
+                  };
+                  return (
+                    <button
+                      class="sb-sessions"
+                      title="Open the database monitor's process list"
+                      onClick={() => openMonitor("activity")}
+                    >
+                      <Icon name="activity" />
+                      {sessions() ? `${sessions()!.total} / ${sessions()!.maxConnections} sessions` : "Sessions"}
+                    </button>
+                  );
+                })()}
+              </Show>
               <span class="spacer" />
               {/* ui/grid-qol: grid position + aggregates over LOADED rows only */}
               <Show when={resultsOpen() && gridInfo()}>
@@ -6411,7 +6672,7 @@ function App() {
               <Show when={!resultsOpen() && elapsed() > 0}>
                 <span class="grid-info"><span class="gi-agg">Last run {elapsed()} ms</span></span>
               </Show>
-              <Show when={cursorInfo()}>
+              <Show when={!activeIsMonitor() && cursorInfo()}>
                 {(ci) => (
                   <span class="cursor-info">
                     Ln {ci().line}, Col {ci().col}
@@ -6443,11 +6704,12 @@ function App() {
             <HistoryPanel
               entries={history}
               width={historyW()}
-              onInsert={(sql) => editorApi()?.insertAtCursor(sql)}
+              onInsert={(sql) => (activeIsMonitor() ? openGeneratedTab(sql, null, "History") : editorApi()?.insertAtCursor(sql))}
               onOpenTab={(sql, schema) => openGeneratedTab(sql, schema, "History")}
               onRerun={(sql, recordedSchema) => {
-                const tabId = activeTabId();
-                patchTab(tabId, { searchSchema: recordedSchema });
+                // From a Monitor tab, the re-run gets a SQL tab of its own.
+                if (activeIsMonitor()) openGeneratedTab(sql, recordedSchema, "History");
+                else patchTab(activeTabId(), { searchSchema: recordedSchema });
                 runText(sql);
               }}
               onClear={() => {
@@ -6730,6 +6992,42 @@ function App() {
                     {cc().pending ? "Save file, discard grid & close" : "Save & close"}
                   </button>
                 </Show>
+              </div>
+            </Dialog>
+          )}
+        </Show>
+        <Show when={monitorSignalAsk()}>
+          {(ask) => (
+            <Dialog
+              title={ask().action === "cancel" ? "Cancel this query?" : "Terminate this session?"}
+              titleBadge={isProduction(envOf(ask().connectionId)) ? prodBadge() : undefined}
+              subtitle={`Session ${ask().row.pid} on ${labelOf(ask().connectionId)}`}
+              size="md"
+              noAutoFocus
+              dismissable={!monitorSignalBusy()}
+              onClose={closeMonitorSignal}
+            >
+              <p class="confirm-text">
+                {ask().action === "cancel"
+                  ? "Sends pg_cancel_backend: the running statement stops with an error, and a transaction it was part of can only roll back. The session stays connected."
+                  : "Sends pg_terminate_backend: the session disconnects and its open transaction rolls back."}
+              </p>
+              <dl class="monitor-signal-facts">
+                <dt>PID</dt><dd>{ask().row.pid}</dd>
+                <dt>User</dt><dd>{ask().row.user ?? "unknown"}</dd>
+                <dt>Database</dt><dd>{ask().row.database ?? "unknown"}</dd>
+                <Show when={ask().row.application}><dt>Application</dt><dd>{ask().row.application}</dd></Show>
+                <dt>State</dt><dd>{ask().row.state ?? "unknown"}{waitLabel(ask().row) ? ` · ${waitLabel(ask().row)}` : ""}</dd>
+              </dl>
+              <Show when={ask().row.query}>
+                <pre class="sql-preview monitor-signal-query">{ask().row.query}</pre>
+              </Show>
+              <Show when={monitorSignalError()}><div class="error">{monitorSignalError()}</div></Show>
+              <div class="form-actions">
+                <button class="ghost" disabled={monitorSignalBusy()} onClick={closeMonitorSignal}>Keep it</button>
+                <button class="btn-danger" disabled={monitorSignalBusy()} onClick={() => void confirmMonitorSignal()}>
+                  {monitorSignalBusy() ? <><span class="spinner-sm" />Sending…</> : ask().action === "cancel" ? "Cancel query" : "Terminate session"}
+                </button>
               </div>
             </Dialog>
           )}

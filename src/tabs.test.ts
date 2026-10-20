@@ -10,6 +10,7 @@ import {
   gridViewFor,
   interruptedResult,
   isDirtyText,
+  isMonitorTab,
   makeTab,
   pendingCount,
   pinnedCount,
@@ -200,5 +201,28 @@ describe("carryViewPrefs", () => {
       recordOpen: EMPTY_GRID_VIEW.recordOpen,
       findOpen: EMPTY_GRID_VIEW.findOpen,
     });
+  });
+});
+
+describe("monitor tabs", () => {
+  it("is a tab kind that is never dirty and carries no buffer", () => {
+    const m = makeTab({ kind: "monitor", connectionId: "conn-1", sql: "SELECT 1", dirty: true });
+    expect(m.kind).toBe("monitor");
+    expect(isMonitorTab(m)).toBe(true);
+    expect(m.title).toBe("Monitor");
+    expect(m.sql).toBe("");
+    expect(m.dirty).toBe(false);
+    expect(m.filePath).toBeNull();
+    expect(makeTab().kind, "the default is a SQL tab").toBe("sql");
+    expect(isMonitorTab(makeTab())).toBe(false);
+  });
+
+  it("persists as a monitor tab, never with the editor's live document", () => {
+    const sqlTab = makeTab({ sql: "SELECT 1" });
+    const m = makeTab({ kind: "monitor", pinned: true });
+    const snap = snapshotTabs([sqlTab, m], m.id, "SELECT live");
+    expect(snap.tabs[1]).toMatchObject({ kind: "monitor", sql: "", dirty: false, pinned: true });
+    expect(snap.tabs[0].kind).toBeUndefined();
+    expect(snap.activeIndex).toBe(1);
   });
 });

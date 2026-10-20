@@ -41,7 +41,8 @@ export type ActionId =
   | "exportResult"
   | "openFilterBuilder"
   | "findInResults"
-  | "toggleRecordView";
+  | "toggleRecordView"
+  | "openMonitor";
 
 /** What an `enabled` predicate can see (kept tiny on purpose). */
 export type ActionCtx = {
@@ -58,6 +59,10 @@ export type ActionCtx = {
   canFilter: boolean;
   /** How many database connections are open (0 = the connect screen). */
   connectionCount: number;
+  /** The active tab is a SQL tab (editor + results), not a Monitor tab. */
+  sqlTab: boolean;
+  /** The focused connection can be monitored (PostgreSQL). */
+  canMonitor: boolean;
 };
 
 export type ActionDef = {
@@ -76,10 +81,10 @@ export type ActionDef = {
 };
 
 export const ACTIONS: readonly ActionDef[] = [
-  { id: "run", title: "Run selection or all", category: "Query", defaultKey: "Mod-Enter", scope: "editor", enabled: (c) => c.connected && c.canRunDatabase },
-  { id: "runStatement", title: "Run selection or current statement", category: "Query", defaultKey: "Mod-Shift-Enter", scope: "editor", enabled: (c) => c.connected && c.canRunDatabase },
-  { id: "explain", title: "Explain plan", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.connected && !c.running && c.canRunDatabase },
-  { id: "explainAnalyze", title: "Explain Analyze", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.connected && !c.running && c.canExplainAnalyze && c.canRunDatabase },
+  { id: "run", title: "Run selection or all", category: "Query", defaultKey: "Mod-Enter", scope: "editor", enabled: (c) => c.connected && c.sqlTab && c.canRunDatabase },
+  { id: "runStatement", title: "Run selection or current statement", category: "Query", defaultKey: "Mod-Shift-Enter", scope: "editor", enabled: (c) => c.connected && c.sqlTab && c.canRunDatabase },
+  { id: "explain", title: "Explain plan", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.connected && c.sqlTab && !c.running && c.canRunDatabase },
+  { id: "explainAnalyze", title: "Explain Analyze", category: "Query", defaultKey: null, scope: "global", enabled: (c) => c.connected && c.sqlTab && !c.running && c.canExplainAnalyze && c.canRunDatabase },
   // Bound by default: this is the one action that must stay reachable while dialogs
   // are up (see onWindowKey's allowlist) — shipping it mouse-only undercut that.
   // Mod-based so it fires even while typing in the editor (bare chords are
@@ -98,9 +103,9 @@ export const ACTIONS: readonly ActionDef[] = [
   // everywhere else.
   { id: "findInResults", title: "Find in loaded rows", category: "Query", defaultKey: "Mod-f", scope: "global", enabled: (c) => c.hasResult },
   { id: "toggleRecordView", title: "Toggle record view", category: "View", defaultKey: "Mod-Alt-v", scope: "global", enabled: (c) => c.hasResult },
-  { id: "format", title: "Format SQL", category: "Editor", defaultKey: "Shift-Alt-f", scope: "editor" },
-  { id: "find", title: "Find & replace", category: "Editor", defaultKey: null, scope: "editor" },
-  { id: "toggleComment", title: "Toggle comment", category: "Editor", defaultKey: "Mod-/", scope: "editor" },
+  { id: "format", title: "Format SQL", category: "Editor", defaultKey: "Shift-Alt-f", scope: "editor", enabled: (c) => c.sqlTab },
+  { id: "find", title: "Find & replace", category: "Editor", defaultKey: null, scope: "editor", enabled: (c) => c.sqlTab },
+  { id: "toggleComment", title: "Toggle comment", category: "Editor", defaultKey: "Mod-/", scope: "editor", enabled: (c) => c.sqlTab },
   { id: "toggleWrap", title: "Toggle word wrap", category: "Editor", defaultKey: null, scope: "global" },
   { id: "toggleSidebar", title: "Toggle Explorer sidebar", category: "View", defaultKey: "Mod-b", scope: "global", enabled: (c) => c.connected },
   { id: "toggleResults", title: "Toggle results panel", category: "View", defaultKey: "Mod-j", scope: "global", enabled: (c) => c.connected },
@@ -118,8 +123,8 @@ export const ACTIONS: readonly ActionDef[] = [
   // and next to Mod-o "Open file…" for the same reason DataGrip puts it there.
   { id: "showAllTabs", title: "Show all tabs", category: "Tabs", defaultKey: "Mod-Shift-o", scope: "global", enabled: (c) => c.connected },
   { id: "openFile", title: "Open file…", category: "File", defaultKey: "Mod-o", scope: "global", enabled: (c) => c.connected },
-  { id: "saveFile", title: "Save", category: "File", defaultKey: "Mod-s", scope: "global", enabled: (c) => c.connected },
-  { id: "saveFileAs", title: "Save as…", category: "File", defaultKey: "Mod-Shift-s", scope: "global", enabled: (c) => c.connected },
+  { id: "saveFile", title: "Save", category: "File", defaultKey: "Mod-s", scope: "global", enabled: (c) => c.connected && c.sqlTab },
+  { id: "saveFileAs", title: "Save as…", category: "File", defaultKey: "Mod-Shift-s", scope: "global", enabled: (c) => c.connected && c.sqlTab },
   { id: "openSettings", title: "Open settings", category: "View", defaultKey: "Mod-,", scope: "global" },
   { id: "openShortcuts", title: "Show keyboard shortcuts", category: "View", defaultKey: null, scope: "global" },
   { id: "openHelp", title: "Open manual", category: "View", defaultKey: "F1", scope: "global" },
@@ -137,6 +142,9 @@ export const ACTIONS: readonly ActionDef[] = [
   { id: "nextConnection", title: "Next connection", category: "View", defaultKey: "Mod-Alt-ArrowRight", scope: "global", enabled: (c) => c.connectionCount > 1 },
   { id: "prevConnection", title: "Previous connection", category: "View", defaultKey: "Mod-Alt-ArrowLeft", scope: "global", enabled: (c) => c.connectionCount > 1 },
   { id: "newConnection", title: "Open another connection…", category: "View", defaultKey: "Mod-Shift-n", scope: "global", enabled: (c) => c.connected },
+  // Mod-Shift-m: free in the default map; one Monitor tab per connection, so a second
+  // press focuses the existing one.
+  { id: "openMonitor", title: "Open database monitor", category: "View", defaultKey: "Mod-Shift-m", scope: "global", enabled: (c) => c.canMonitor },
 ];
 
 /** Saved overrides: absent = default binding, null = explicitly unbound. */

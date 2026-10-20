@@ -186,8 +186,19 @@ export function normalizeTabColor(v: unknown): TabColor {
 /** Longest custom title accepted (matches the persisted-title bound in store.ts). */
 export const MAX_TAB_TITLE = 200;
 
+/**
+ * What a tab is. A "sql" tab is an editor + result grid; a "monitor" tab is the live
+ * database monitor for its connection (one per connection, src/monitor). Every
+ * SQL-tab path — run, Explain, save, format, the editor, close prompts — checks
+ * this, and a monitor tab is never dirty.
+ */
+export type TabKind = "sql" | "monitor";
+
+export const isMonitorTab = (t: Pick<Tab, "kind">) => t.kind === "monitor";
+
 export type Tab = {
   id: string;
+  kind: TabKind;
   /**
    * The connection this tab runs against. Several connections are open at once and
    * one strip shows every tab, so the tab — not a global "current connection" — is
@@ -263,8 +274,30 @@ function initialCleanSql(init: Partial<Tab> | undefined): string | null {
 export function makeTab(init?: Partial<Tab>): Tab {
   counter += 1;
   const cleanSql = initialCleanSql(init);
+  const kind: TabKind = init?.kind === "monitor" ? "monitor" : "sql";
+  if (kind === "monitor") {
+    // Nothing to save, nothing to lose: a monitor tab is never dirty.
+    return {
+      id: `tab-${counter}`,
+      kind,
+      connectionId: init?.connectionId ?? "",
+      title: init?.title ?? "Monitor",
+      customTitle: init?.customTitle ?? "",
+      pinned: init?.pinned ?? false,
+      color: normalizeTabColor(init?.color),
+      sql: "",
+      filePath: null,
+      dirty: false,
+      cleanSql: "",
+      revision: 0,
+      searchSchema: null,
+      result: { ...EMPTY_RESULT },
+      gridView: { ...EMPTY_GRID_VIEW },
+    };
+  }
   return {
     id: `tab-${counter}`,
+    kind,
     connectionId: init?.connectionId ?? "",
     title: init?.title ?? `Untitled ${counter}`,
     customTitle: init?.customTitle ?? "",
@@ -377,6 +410,10 @@ export function filterTabs<T extends { label: string; detail: string; connection
 export function snapshotTabs(tabs: Tab[], activeTabId: string, activeDoc?: string): PersistedTabs {
   return {
     tabs: tabs.map((tab) => {
+      if (tab.kind === "monitor") {
+        // Restored paused: reopening a workspace must not start querying a server.
+        return { kind: "monitor", sql: "", filePath: null, title: tab.title, customTitle: tab.customTitle, pinned: tab.pinned, color: tab.color, searchSchema: null, dirty: false };
+      }
       const live = tab.id === activeTabId && activeDoc != null ? activeDoc : tab.sql;
       return {
         sql: live,

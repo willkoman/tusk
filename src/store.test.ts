@@ -40,9 +40,22 @@ describe("persisted state normalization", () => {
       activeIndex: -99,
     }));
     expect(tabsStore.load("db")).toEqual({
-      tabs: [{ sql: "SELECT 1", title: "ok", filePath: null, searchSchema: null, dirty: false, customTitle: "", pinned: false, color: "" }],
+      tabs: [{ kind: "sql", sql: "SELECT 1", title: "ok", filePath: null, searchSchema: null, dirty: false, customTitle: "", pinned: false, color: "" }],
       activeIndex: 0,
     });
+  });
+
+  it("keeps a Monitor tab's kind and nothing else of a buffer", () => {
+    storage.setItem("tusk.tabs.mon", JSON.stringify({
+      tabs: [
+        { kind: "monitor", sql: "SELECT smuggled", title: "Monitor", filePath: null, searchSchema: null, pinned: true },
+        { kind: "bogus", sql: "SELECT 1", title: "q", filePath: null, searchSchema: null },
+      ],
+      activeIndex: 0,
+    }));
+    const loaded = tabsStore.load("mon")!;
+    expect(loaded.tabs[0]).toMatchObject({ kind: "monitor", sql: "", title: "Monitor", pinned: true, dirty: false });
+    expect(loaded.tabs[1].kind, "an unknown kind is a SQL tab").toBe("sql");
   });
 
   it("restores dirty state and defaults old documents to clean", () => {
