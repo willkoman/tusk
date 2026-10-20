@@ -1,6 +1,6 @@
 # Database monitor — plan
 
-Status: **proposal, not implemented.** A live, first-class server dashboard in the spirit of pgAdmin's Dashboard (and AWS Performance Insights' "database load"), built to Tusk's standards: one cheap round trip per tick, a fluid canvas renderer, zero interference with the user's own session, and bounded everything.
+Status: **phase 0 spike done** (results in §11); **decisions settled 2026-10-20** (§10); phase 1 next. A live, first-class server dashboard in the spirit of pgAdmin's Dashboard (and AWS Performance Insights' "database load"), built to Tusk's standards: one cheap round trip per tick, a fluid canvas renderer, zero interference with the user's own session, and bounded everything.
 
 PostgreSQL is the target for v1. MySQL and SQL Server follow through the same seams; DuckDB and SQLite are embedded and get no monitor.
 
@@ -254,10 +254,67 @@ Embedded engines get no Monitor entry; the button is hidden with a tooltip-free 
 
 ---
 
-## 10. Decisions to confirm
+## 10. Decisions (settled 2026-10-20)
 
-1. **Placement** — Monitor as a tab kind in the strip (recommended) vs a full-window view.
-2. **Cancel/Terminate on read-only connections** — refuse (recommended: "read-only" should mean Tusk changes nothing) vs allow cancel only.
-3. **Background sampling** — pause when hidden (recommended default) with an opt-in "keep sampling" for incident capture.
-4. **Engines after PostgreSQL** — MySQL and SQL Server in phase 3, or sooner if you use them day to day.
-5. **Retention** — in-memory rolling window only (recommended for v1) vs persisting sessions of samples for later review.
+All six were taken as recommended:
+
+1. **Placement: a Monitor tab** — a second tab kind in the existing strip, one per connection, following its focus and colour rail and closing with it (§3.1).
+2. **Cancel/Terminate on read-only connections: refused, both.** Read-only means Tusk changes nothing on the server; the actions are disabled with an explanation (§6).
+3. **Background sampling: pause when hidden, opt-in "keep sampling".** Hidden means the Monitor tab is not active, the window is minimized, or the page is hidden. The spike showed WebView2 keeps `visibilityState: "visible"` while minimized, so all three are checked, and the sampler itself pauses (`monitor_configure`), not just the drawing (§11 finding 3).
+4. **Engines: PostgreSQL only until phase 3**, then MySQL and SQL Server (§7).
+5. **Retention: in-memory rolling window only** for v1 (5 min default, up to 1 h), gone when the tab closes.
+6. **Scroll redraw rate: about 6 per second for the 1-minute window** (2 px steps, ~2% of one core measured under load). Longer windows redraw less often on their own.
+
+---
+
+## 11. Spike results (phase 0, 2026-10-19)
+
+**Verdict: GO on the in-house canvas renderer; uPlot is not needed.** Drawing is 5 to 20 times under its script budget. What costs CPU is WebView2 compositing each redraw, and uPlot would pay that the same way. The 3% CPU budget holds only if a 1-minute window redraws about 6 times a second or less (decision 6 above). The fast-tier query costs about 0.4 ms of server time per tick, under its 1 ms budget.
+
+### What was built
+
+Throwaway quality, hidden: palette action *Database monitor (experimental)*, dev builds only, or `localStorage["tusk.experimental"] = "monitor"`.
+
+- `src-tauri/src/monitor/`: a read-only sidecar `Backend` cloned from a new lock-free `Arc<ConnectionConfig>` snapshot on the registry entry (`RegisteredConn::config`), so `monitor_start` never waits behind a running user query. The session runs `application_name 'Tusk monitor'`, `statement_timeout 2s`, `lock_timeout 250ms` and `idle_in_transaction_session_timeout 10s`. A tokio sampler (`MissedTickBehavior::Skip`, 1 s) runs one fast-tier statement per tick. Rates are computed in Rust, and a counter that goes backwards re-baselines. The sampler emits one `monitor-sample` event per tick and reconnects with 1 s to 30 s backoff without retrying statements. `monitor_start` and `monitor_stop` are registered commands, and `disconnect` stops the sidecar. The fast-tier row is bounded by `db::MONITOR_TEXT_LIMITS`.
+- `src/monitor/`: `model.ts` (Float64Array rings, gap rows, monotonic clock mapping, nice ceilings; vitest), `frameLoop.ts` (one shared loop), `TimeSeries.tsx` (canvas, devicePixelRatio, colours from tokens, absolute-time decimation, eased y-axis), and the `MonitorSpike.tsx` panel (stacked *Database load by wait type* and a TPS line).
+
+### Method
+
+- **Machine and build:** Windows 11 with WebView2 155, `npm run tauri dev` (debug Rust, Vite dev frontend) at devicePixelRatio 1. The panel is 760 px wide with two canvases (160 px and 110 px, plot area about 700 px).
+- **Server:** `postgres:16-alpine` (16.14) under Docker Desktop on host port 55499, `pgbench -i -s 20`, then `pgbench -c 16 -j 4 -T 120`, run five times. pgbench reached 74 to 96 tps with 16 active sessions, mostly Lock, LWLock and IO waits (Docker-on-Windows I/O bound).
+- **App CPU:** the change in `TotalProcessorTime` across `tusk.exe` and its WebView2 child processes over 26 to 30 s, as a percentage of one core. Other containers were running on the machine, so identical runs differ by about ±1.5 points.
+- **Frame time:** `performance.now()` around every chart's draw in a frame. WebView2 rounds this clock to 0.1 ms.
+- **Server time:** `pg_stat_statements` with `track_planning = on`.
+
+### Numbers (under pgbench unless marked idle)
+
+| Configuration | Redraws/s | Script per frame (p50 / p95 / max) | App CPU, % of one core |
+|---|---|---|---|
+| 1 m window, every vsync (no pacing) | 60 | 0.1 / 0.2 / 0.4 ms | 12.4 (11.5 idle) |
+| 1 m window, 0.5 px steps | 20–21 | 0.1 / 0.2 / 0.5 ms | 4.6–7.9 (7.1 idle) |
+| 1 m window, 1 px steps (committed spike default) | 10–13 | 0.1 / 0.2 / 1.9 ms | 3.2–5.4 (3.5 idle) |
+| 1 m window, 2 px steps | 6 | 0.1 / 0.2 / 0.5 ms | 2.3 (1.8 idle) |
+| 5 m window, 1 px steps | 3 | 0.1 / 0.2 / 0.2 ms | 1.7 |
+| 1 h window, 3,600 synthetic rows × 11 series, decimated | 1 (one per sample) | 0.4 / 0.5 / 0.6 ms | 1.5 |
+| Window minimized (drawing suspended, sampler still running) | 0 | — | 0.5 |
+| Monitor closed | 0 | — | 0.06 |
+
+- **Fast tier, server side:** across 121–122 calls per 120 s run, execution averaged 0.141–0.148 ms (max 0.35–0.99) and planning 0.25–0.28 ms (max 2.4 ms, the cold first plan). That makes about 0.4 ms per tick, with no shared-buffer reads.
+- **Round trip seen by the app** (debug build, through Docker's NAT): p50 1.7–1.9 ms, p95 2.1–3.6 ms, max 5 ms. All of about 460 measured ticks succeeded.
+- **Lifecycle:** closing the panel, a frontend Disconnect, and a raw backend `disconnect` all left no `Tusk monitor` backend on the server. A remount after a hot reload replaced the old sidecar with a new one.
+
+### Findings that change phase 1
+
+1. **Redraw rate drives CPU; drawing does not.** Each redraw costs about 0.3% of a core in WebView2's renderer and GPU processes. One canvas or two at the same rate measured the same within noise (4.3% and 3.8%). Pace by distance scrolled, as `frameLoop.ts` does, rather than by vsync: a chart returns when it next needs a frame, and the loop sleeps on a timer in between. Longer windows then cost almost nothing.
+2. **Draw all charts on one clock.** Two charts that drifted a few milliseconds apart made 25 redraws/s where one made 20. The spike draws everything due within 20 ms in the same frame. Phase 1 should give all charts one shared schedule.
+3. **A minimized window does not hide the page.** Under Tauri, WebView2 kept `visibilityState: "visible"` and kept drawing at 20 fps while the window was minimized. The spike suspends drawing from Tauri `onResized` plus `isMinimized()`, which brought CPU to 0.5%. Phase 1 must combine window state, page visibility and whether the Monitor tab is active, and should also pause the sampler (`monitor_configure`).
+4. **A page reload leaks monitor sidecars.** A webview reload, such as a full HMR reload in dev, leaves earlier backend connections registered (existing behaviour), and their sidecars kept sampling. Phase 1 needs a `monitor_stop_all` on mount, or a lease the frontend must renew.
+5. **Planning costs twice what execution does.** Under the simple query protocol the fast tier is re-planned every tick. A prepared statement on the sidecar would save about 0.25 ms per tick; the budget does not require it.
+6. **TPS at 1 s swings about ±40% around pgbench's average.** Part of that is real, since pgbench's latency standard deviation was 108 ms on a 190 ms mean. Part may come from PostgreSQL 15+ backends flushing their stats at most once a second. Consider showing a short moving average beside the raw line.
+
+### Not covered
+
+- **Release build:** not measured. `tusk.exe` itself stayed at or below 0.2% even in debug, and the cost that matters sits in WebView2, so the conclusions should hold.
+- **HiDPI:** not measured. Only devicePixelRatio 1 was tested, and a ratio of 2 rasterizes four times the pixels; phase 1 should measure it on a laptop panel.
+- **macOS and Linux:** WKWebView and WebKitGTK were not tested.
+- **Left out of the spike:** crosshair, reduced motion, per-series min/max decimation for line charts, and `monitor_configure`.
