@@ -1,6 +1,6 @@
 # Database monitor — plan
 
-Status: **phases 1 and 2 implemented 2026-10-20** (results in §12 and §13); phase 0 spike done (§11); decisions settled 2026-10-20 (§10); phase 3 (other engines) next. A live, first-class server dashboard in the spirit of pgAdmin's Dashboard (and AWS Performance Insights' "database load"), built to Tusk's standards: one cheap round trip per tick, a fluid canvas renderer, zero interference with the user's own session, and bounded everything.
+Status: **phases 1, 2 and 3 implemented 2026-10-20** (results in §12, §13 and §14); phase 0 spike done (§11); decisions settled 2026-10-20 (§10). Left over: `system_stats` host metrics and the PostgreSQL-only views on the other engines (§14). A live, first-class server dashboard in the spirit of pgAdmin's Dashboard (and AWS Performance Insights' "database load"), built to Tusk's standards: one cheap round trip per tick, a fluid canvas renderer, zero interference with the user's own session, and bounded everything.
 
 PostgreSQL is the target for v1. MySQL and SQL Server follow through the same seams; DuckDB and SQLite are embedded and get no monitor.
 
@@ -363,3 +363,24 @@ Cadences: Locks and progress 2 s, Replication 5 s, I/O and Statements 10 s, tabl
 
 Live smoke on `postgres:16-alpine` with `pg_stat_statements` preloaded, under `pgbench -c 12`: every view populated (lock waits on tuples and transaction IDs with nested blocking chains; statements ranked with pgbench's updates on top; an inactive slot retaining 421 MiB; a throttled `VACUUM` showing live progress; `pg_stat_io` rates by backend type), checkpoint markers and the events lane recorded a requested checkpoint and temporary files, and a drag froze every chart with the range summary below. App CPU on the Overview, now seven charts plus the events lane: about 1.8% of a core on the 5-minute window and 3.75% on the 1-minute window (±1.5 points of noise; off-screen charts are not drawn). The views battery passed on PostgreSQL 10, 13, 16 and 17.
 
+## 14. Phase 3 results (2026-10-20)
+
+Built: MySQL / MariaDB and SQL Server sources, chart export as CSV and PNG, and configurable thresholds. Choices that differ from §4 and §7:
+
+- **One sample model, not a capability list.** The `MonitorSource` trait became a `Source` enum in `mod.rs`, and every source fills the PostgreSQL-shaped sample: the session histogram is `state × wait bucket × client × n` in PostgreSQL's words, and the activity statements emit PostgreSQL's column names, so one parser reads all three. What differs on screen lives in one frontend table (`src/monitor/engines.ts`): views, chart titles and sources, series an engine has no counter for (never drawn, listed or exported), wait-bucket labels, events, and how Cancel/Terminate are spelled.
+- **Two statements per tick off PostgreSQL** (the counters, then the grouped histogram), because neither MySQL's status tables nor SQL Server's DMVs fold a session histogram into one row cheaply.
+- **Overview and Activity only** on MySQL and SQL Server. Locks, Statements, Replication, Tables and I/O stay PostgreSQL views; a lock wait still shows in Activity's blocking tree (MySQL `data_lock_waits` / MariaDB `INNODB_LOCK_WAITS`; SQL Server `blocking_session_id`).
+- **Throughput is the closest honest counter.** MySQL: `Handler_commit` / `Handler_rollback`, which count every autocommit statement as PostgreSQL's `xact_commit` does (`Com_commit` would read zero under autocommit). SQL Server: `Transactions/sec`; it keeps no rollback counter, so that series and the tile's rollback share are omitted.
+- **Signals:** MySQL `KILL QUERY` / `KILL CONNECTION` (a connection id is never reused while the server runs, so it alone identifies the session); SQL Server has no query-only cancel, so only Terminate is offered and it re-identifies the session by login time inside the `KILL` batch.
+- **SQL Server requires `VIEW SERVER STATE`** (2022: `VIEW SERVER PERFORMANCE STATE`) and refuses to start without it; MySQL degrades without `PROCESS` (only the monitor's own account, no InnoDB view) and says so.
+- **Thresholds** are per machine (`tusk.monitor.thresholds`), shared by every Monitor tab, edited in Settings → Monitor; amber is never allowed above red, and 0 switches an optional one off.
+- **Export** composes the card's own canvases (title, legend, theme) into a PNG for the clipboard or a file (`write_image_file`, PNG signature + 8 MiB checked in Rust) and writes CSV joined on sample time; both cover the frozen range or the window.
+
+### Not built
+
+- **`system_stats` host metrics.** The extension is EDB's, absent from the `postgres` images the conformance suite and smoke tests use, so it could not be verified; a probe-and-tile without a server to test it against would ship untested code. Left for when a test image carries it.
+- **Replication lag, Locks and the other views on MySQL / SQL Server**, and a `Tusk monitor` application name on SQL Server (tiberius sets the program name at login, and the driver's login path is shared with the user's session).
+
+### Measured
+
+Live smoke against `mysql:8` (8.4) and `mcr.microsoft.com/mssql/server:2022`, under client-side insert/update loops: tiles, charts and the process list populated on both; MySQL showed a row-lock wait nested under its `SLEEP`-holding blocker, `KILL QUERY` ended the sleep and `KILL CONNECTION` closed a load connection (history `-- [Monitor] KILL QUERY 29`, `KILL CONNECTION 33`); SQL Server showed a `WAITFOR` holder with an `LCK_M_X` waiter beneath it, offered only Terminate, and `KILL 60` freed the waiter. The SQL Server container's log flushes waited on `PREEMPTIVE_OS_FLUSHFILEBUFFERS` (Docker Desktop's slow fsync), which first landed in Other and now counts as I/O. Thresholds recoloured the tiles as soon as they changed; a copied chart image was checked by capturing the blob handed to the clipboard, including a chart that had been scrolled out of view (which first came out blank and is now brought into view and redrawn before composing). `monitor_battery_mysql` and `monitor_battery_mssql` pass in `scripts/conformance.sh`.

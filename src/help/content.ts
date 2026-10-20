@@ -2925,7 +2925,7 @@ export const TOPICS: Topic[] = [
           },
           {
             "action": "openMonitor",
-            "does": "Open or focus the database monitor (PostgreSQL)"
+            "does": "Open or focus the database monitor (PostgreSQL, MySQL, SQL Server)"
           }
         ]
       },
@@ -3411,7 +3411,7 @@ export const TOPICS: Topic[] = [
           },
           {
             "action": "openMonitor",
-            "does": "Open or focus the database monitor (PostgreSQL)"
+            "does": "Open or focus the database monitor (PostgreSQL, MySQL, SQL Server)"
           }
         ]
       }
@@ -3419,13 +3419,13 @@ export const TOPICS: Topic[] = [
     "icon": "columns"
   },
   {
-    "blurb": "Live PostgreSQL dashboard: load, sessions, throughput, process list, locks, statements, replication, maintenance, I/O, Cancel and Terminate.",
+    "blurb": "Live server dashboard for PostgreSQL, MySQL / MariaDB and SQL Server: load, sessions, throughput, process list, Cancel and Terminate, chart export; locks, statements, replication, maintenance and I/O on PostgreSQL.",
     "id": "monitor",
     "title": "Database monitor",
     "blocks": [
       {
         "k": "p",
-        "md": "A **Monitor** tab shows how loaded a PostgreSQL server is and why, live: headline tiles, six charts on one shared time axis, and the process list. It samples through its **own read-only session** named `Tusk monitor`, so it never touches your session, your result stream or a manual transaction."
+        "md": "A **Monitor** tab shows how loaded a database server is and why, live: headline tiles, charts on one shared time axis, and the process list. It watches PostgreSQL, MySQL / MariaDB and SQL Server; *MySQL, MariaDB and SQL Server* below says what differs. It samples through its **own session** (read-only on PostgreSQL and MySQL; on PostgreSQL named `Tusk monitor`), so it never touches your session, your result stream or a manual transaction."
       },
       {
         "k": "h",
@@ -3474,7 +3474,7 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "Each tile carries a one-minute sparkline, and its tooltip names the view and the formula behind the number. Amber means *needs attention*, red means *trouble*."
+        "md": "Each tile carries a one-minute sparkline, and its tooltip names the view and the formula behind the number. Amber means *needs attention*, red means *trouble*; the levels below are the defaults, changed in **Settings → Monitor**. The table describes PostgreSQL; the other engines read the nearest equivalent, named in each tooltip."
       },
       {
         "k": "table",
@@ -3502,7 +3502,7 @@ export const TOPICS: Topic[] = [
           [
             "Cache hit",
             "Δ`blks_hit` / Δ(`blks_hit` + `blks_read`) over the last tick, not the lifetime ratio",
-            "—"
+            "Optional amber level, off by default"
           ],
           [
             "WAL",
@@ -3517,7 +3517,7 @@ export const TOPICS: Topic[] = [
           [
             "Blocked",
             "Sessions waiting on a lock another session holds (`pg_blocking_pids`). Click for Locks",
-            "Amber above 0"
+            "Amber at 1 or more"
           ],
           [
             "Replication lag",
@@ -3525,6 +3525,15 @@ export const TOPICS: Topic[] = [
             "Amber past 1 min"
           ]
         ]
+      },
+      {
+        "k": "h",
+        "text": "Thresholds",
+        "id": "thresholds"
+      },
+      {
+        "k": "p",
+        "md": "**Settings → Monitor** (or the gear in the Monitor header) sets where tiles and lists turn amber or red, for every Monitor tab at once: the share of max connections in use (amber and red), the age of the oldest transaction (amber and red), blocked sessions, replication lag, an optional cache-hit floor, the WAL an inactive replication slot may hold, and the transaction-ID headroom before wraparound. 0 switches an optional one off, an amber level is never allowed above its red one, and **Reset to defaults** restores the table above. Nothing is ever drawn green."
       },
       {
         "k": "h",
@@ -3547,6 +3556,10 @@ export const TOPICS: Topic[] = [
       {
         "k": "p",
         "md": "Hover any chart and the same time cursor appears on all of them; each legend then reads out the values at that instant, and moving off returns to the newest values. Click a legend entry to hide or show a series; double-click to show only that one. A missed sample, a pause or a statistics reset is drawn as a **gap**, never interpolated. Charts glide as time passes; with *reduce motion* set in the OS they step once per sample instead."
+      },
+      {
+        "k": "p",
+        "md": "Each chart's **⋯** button exports it: **Copy image** and **Save image…** (a PNG of the chart as drawn, with its title and legend, in the current theme), **Save CSV…** (one row per sample, ISO 8601 UTC times, byte series in bytes per second, a skipped sample kept as an empty row), and **Save every chart as CSV…** (every Overview chart in one file). An export covers the frozen range when one is set, otherwise the whole window."
       },
       {
         "k": "h",
@@ -3617,13 +3630,32 @@ export const TOPICS: Topic[] = [
           "Both confirm first, naming the pid, user, database, state and query, with the production badge on a production connection.",
           "Both are refused on a **read-only** connection — read-only means Tusk changes nothing on the server — and for the monitor's own session. Another role's session needs superuser or membership in `pg_signal_backend`; the server checks again.",
           "The signal re-identifies its target by pid **and** backend start time in the same statement, so a pid the server has reused for a new session is never signalled.",
-          "Each one lands in [[topic:history|query history]] as `-- [Monitor] SELECT pg_cancel_backend(1234)`."
+          "Each one lands in [[topic:history|query history]] as `-- [Monitor] SELECT pg_cancel_backend(1234)` (on MySQL `-- [Monitor] KILL QUERY 1234`, on SQL Server `-- [Monitor] KILL 57`).",
+          "**MySQL / MariaDB**: Cancel runs `KILL QUERY` (the connection and its transaction stay), Terminate runs `KILL CONNECTION`. A connection id is never reused while the server runs, so the id alone names the session. Another account's session needs `CONNECTION_ADMIN` or `SUPER`.",
+          "**SQL Server** has no query-only cancel, so only **Terminate session…** is offered: it runs `KILL`, which disconnects the session and rolls back its open transaction. It re-identifies the session by its login time, and needs `ALTER ANY CONNECTION` even for your own sessions."
         ]
       },
       {
         "k": "tip",
         "kind": "warn",
-        "md": "The monitor holds **one extra connection** while its tab is open (`application_name = 'Tusk monitor'`, read-only, `statement_timeout` 2 s), and it counts toward `max_connections`. Closing the tab or disconnecting closes it."
+        "md": "The monitor holds **one extra connection** while its tab is open, and it counts toward the server's connection limit: on PostgreSQL `application_name = 'Tusk monitor'`, read-only, `statement_timeout` 2 s; on MySQL read-only with a 2-second statement limit; on SQL Server a session with a 250 ms lock timeout that a deadlock always picks. Closing the tab or disconnecting closes it."
+      },
+      {
+        "k": "h",
+        "text": "MySQL, MariaDB and SQL Server",
+        "id": "engines"
+      },
+      {
+        "k": "p",
+        "md": "The same tab, tiles, charts, process list, thresholds and exports, with the numbers each engine keeps. Locks, Statements, Replication, Tables and I/O are PostgreSQL-only for now; a series an engine has no counter for is left out rather than drawn as zero."
+      },
+      {
+        "k": "list",
+        "items": [
+          "**MySQL / MariaDB** — throughput is storage-engine commits and rollbacks (`Handler_commit`, `Handler_rollback`), which count every autocommit statement as PostgreSQL does; rows read and written (`Innodb_rows_*`); buffer-pool hits and disk reads; the redo log (`Innodb_os_log_written`); pages flushed. Sessions come from the process list joined to InnoDB's transactions: a sleeping connection with an open transaction is *idle in transaction*. Load buckets are Running, Lock (row, metadata, table or global locks), I/O, Client, Sleep and Other waits. Events: deadlocks and on-disk temporary tables. A session waiting on a row lock nests under its blocker (MySQL 8 `data_lock_waits`, MariaDB `INNODB_LOCK_WAITS`).",
+          "**SQL Server** — throughput is `Transactions/sec` (SQL Server keeps no rollback counter); buffer-pool page lookups and reads; the transaction log flushed per second; checkpoint and lazy-writer pages. Sessions are user sessions: a running request is active, an open transaction without one is idle in transaction. Load buckets are CPU, Lock, Latch, I/O, Parallelism, Client, WAITFOR and Other, from each request's wait type. Events: deadlocks and tempdb workfiles. A blocked request nests under its `blocking_session_id`.",
+          "Neither has a Replication lag tile yet."
+        ]
       },
       {
         "k": "h",
@@ -3634,8 +3666,10 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "PostgreSQL 10 or later. Full-page images, `COPY` progress and lock wait times need 14 or later; the I/O view needs 16.",
-          "PostgreSQL only for now: DuckDB, SQLite, MySQL and SQL Server connections show no Monitor entry at all.",
-          "Each tick is one statement against shared-memory statistics views, about half a millisecond of server time; a view's own queries run only while that view is open."
+          "MySQL 8.0 or MariaDB 10.5 or later, with `performance_schema` (MySQL) or `information_schema.GLOBAL_STATUS` (MariaDB). Without `PROCESS` the server lists only the monitor's own account and InnoDB's transactions stay hidden, so the oldest-transaction tile and lock waits go blank; a banner says so.",
+          "SQL Server 2016 or later, with `VIEW SERVER STATE` (SQL Server 2022: `VIEW SERVER PERFORMANCE STATE`); without it the monitor refuses to start and says why.",
+          "DuckDB and SQLite are embedded, have no server to watch, and show no Monitor entry at all.",
+          "Each PostgreSQL tick is one statement against shared-memory statistics views, about half a millisecond of server time; MySQL and SQL Server take two small statements (the counters, then the session histogram). A view's own queries run only while that view is open."
         ]
       }
     ],
