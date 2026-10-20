@@ -1,6 +1,6 @@
 # Database monitor — plan
 
-Status: **phase 1 (PostgreSQL MVP) implemented 2026-10-20** (results in §12); phase 0 spike done (§11); decisions settled 2026-10-20 (§10); phase 2 next. A live, first-class server dashboard in the spirit of pgAdmin's Dashboard (and AWS Performance Insights' "database load"), built to Tusk's standards: one cheap round trip per tick, a fluid canvas renderer, zero interference with the user's own session, and bounded everything.
+Status: **phases 1 and 2 implemented 2026-10-20** (results in §12 and §13); phase 0 spike done (§11); decisions settled 2026-10-20 (§10); phase 3 (other engines) next. A live, first-class server dashboard in the spirit of pgAdmin's Dashboard (and AWS Performance Insights' "database load"), built to Tusk's standards: one cheap round trip per tick, a fluid canvas renderer, zero interference with the user's own session, and bounded everything.
 
 PostgreSQL is the target for v1. MySQL and SQL Server follow through the same seams; DuckDB and SQLite are embedded and get no monitor.
 
@@ -347,4 +347,19 @@ Built as planned in §4, on current master rather than the spike branch: the sid
 ### Not covered
 
 - Release build, a physical HiDPI panel (only emulated DPR 2), macOS and Linux.
+
+---
+
+## 13. Phase 2 results (2026-10-20)
+
+Built as planned in §2.4–2.5 and §3.3: Locks, Statements, Replication, Tables & maintenance and I/O views, charts 7 and 8 (writes with checkpoint markers; an events lane), and scrub-and-freeze. Two choices differ from the plan's wording:
+
+- **No separate `monitor_detail` command.** Opening a view sends its tier in `monitor_configure`, and the sampler runs a newly opened tier on its next tick, which is what the one-shot fetch was for.
+- **Statements are ranked from interval snapshots.** The backend reads `pg_stat_statements` numbers-only every 10 s, diffs each statement, and sends the interval's top 50 by time with their text (fetched once per statement). The view sums those snapshots over the chart window or a frozen range. A statement outside an interval's top 50 contributes nothing for that interval, so the ranking is of what dominated, which is what the view is for.
+
+Cadences: Locks and progress 2 s, Replication 5 s, I/O and Statements 10 s, table statistics and wraparound 30 s, each only while its view is open. "Active in the selected range" reads compact summaries (the ten longest-running active client sessions per process-list sample, an hour's worth) rather than re-querying.
+
+### Measured
+
+Live smoke on `postgres:16-alpine` with `pg_stat_statements` preloaded, under `pgbench -c 12`: every view populated (lock waits on tuples and transaction IDs with nested blocking chains; statements ranked with pgbench's updates on top; an inactive slot retaining 421 MiB; a throttled `VACUUM` showing live progress; `pg_stat_io` rates by backend type), checkpoint markers and the events lane recorded a requested checkpoint and temporary files, and a drag froze every chart with the range summary below. App CPU on the Overview, now seven charts plus the events lane: about 1.8% of a core on the 5-minute window and 3.75% on the 1-minute window (±1.5 points of noise; off-screen charts are not drawn). The views battery passed on PostgreSQL 10, 13, 16 and 17.
 

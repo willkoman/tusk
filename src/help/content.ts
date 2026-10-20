@@ -3419,7 +3419,7 @@ export const TOPICS: Topic[] = [
     "icon": "columns"
   },
   {
-    "blurb": "Live PostgreSQL dashboard: load by wait type, sessions, throughput, the process list with blocking chains, Cancel and Terminate.",
+    "blurb": "Live PostgreSQL dashboard: load, sessions, throughput, process list, locks, statements, replication, maintenance, I/O, Cancel and Terminate.",
     "id": "monitor",
     "title": "Database monitor",
     "blocks": [
@@ -3516,7 +3516,7 @@ export const TOPICS: Topic[] = [
           ],
           [
             "Blocked",
-            "Sessions waiting on a lock another session holds (`pg_blocking_pids`). Click for the blocking tree",
+            "Sessions waiting on a lock another session holds (`pg_blocking_pids`). Click for Locks",
             "Amber above 0"
           ],
           [
@@ -3539,12 +3539,23 @@ export const TOPICS: Topic[] = [
           "**Transactions per second** — commits and rollbacks, plus a dashed 10-second average: one-second TPS swings widely because backends flush their statistics about once a second.",
           "**Tuples per second** — writes (inserted, updated, deleted) above, reads (fetched, returned) below.",
           "**Block I/O** — shared-buffer hits and reads and temporary-file bytes, in bytes per second.",
-          "**WAL** — WAL bytes per second, and below it full-page images per second (PostgreSQL 14+), which jump after a checkpoint."
+          "**WAL** — WAL bytes per second, and below it full-page images per second (PostgreSQL 14+), which jump after a checkpoint.",
+          "**Checkpoints and background writes** — buffers written per second by checkpoints, by the background writer, and (16 and earlier) by backends themselves. Frequent *requested* checkpoints mean `max_wal_size` is too small.",
+          "**Events** — a lane of markers for checkpoints (amber when requested rather than timed), deadlocks, recovery conflicts, temporary files and statistics resets; a bigger dot is more in one sample. Checkpoints are also marked on the WAL and writes charts."
         ]
       },
       {
         "k": "p",
         "md": "Hover any chart and the same time cursor appears on all of them; each legend then reads out the values at that instant, and moving off returns to the newest values. Click a legend entry to hide or show a series; double-click to show only that one. A missed sample, a pause or a statistics reset is drawn as a **gap**, never interpolated. Charts glide as time passes; with *reduce motion* set in the OS they step once per sample instead."
+      },
+      {
+        "k": "h",
+        "text": "Freezing a time range",
+        "id": "freeze"
+      },
+      {
+        "k": "p",
+        "md": "Drag across any chart to select a stretch of time: every chart freezes on it, sampling carries on underneath, and a pill in the header shows the range. Overview's **Active now** card becomes **Active in the selected range**: the longest-running sessions seen in that stretch, from the process list sampled every 2 seconds, with the waits they were in. The **Statements** view then ranks statements over the same range. Click the pill or press **Esc** to return to live."
       },
       {
         "k": "h",
@@ -3569,6 +3580,25 @@ export const TOPICS: Topic[] = [
         "k": "tip",
         "kind": "tip",
         "md": "Without `pg_read_all_stats` (or superuser), PostgreSQL hides other roles' query text and state, and a banner says so. Grant `pg_monitor` to see them."
+      },
+      {
+        "k": "h",
+        "text": "Locks, Statements, Replication, Tables, I/O",
+        "id": "views"
+      },
+      {
+        "k": "p",
+        "md": "Each view queries the server only while it is open, on its own cadence, and says so plainly when the server cannot answer (a version, an extension, a privilege)."
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Locks** (every 2 s) — locks waiting to be granted, with what they wait on (a table, a row, a transaction), for how long (PostgreSQL 14+) and which sessions block them; the blocking chains; and the granted locks grouped by target and mode. Every transaction's own transaction-ID locks are not counted. Right-click a waiting session for the same actions as in Activity.",
+          "**Statements** (every 10 s) — the statements that took the most time over the chart window: total time, share, calls, calls per second, mean time, rows per call and cache hit, from `pg_stat_statements`. Needs the extension installed in this database and listed in `shared_preload_libraries`; the view says which is missing. Right-click a statement to copy, open or explain it. Each 10-second interval keeps its top 50 statements by time.",
+          "**Replication** (every 5 s) — on a primary, each connected replica's state, sync mode and write, flush and replay lag; on a standby, its WAL receiver, replay backlog, and whether replay is paused. Replication slots show the WAL they retain: amber when an inactive slot holds more than 1 GiB or its WAL status is `extended`/`unreserved`, red once its WAL is lost.",
+          "**Tables** — vacuum, analyze, index builds, `CLUSTER`, `COPY` and base backups in progress, with a live progress bar (every 2 s; right-click to cancel one); the tables with the most dead tuples and when each was last vacuumed and analyzed; and each database's transaction-ID age, amber past `autovacuum_freeze_max_age`, red within 500 million of the 2³¹ limit (every 30 s).",
+          "**I/O** (every 10 s, PostgreSQL 16+) — reads, hits, writes, extends, evictions and fsyncs per second from `pg_stat_io`, by backend type, object and context."
+        ]
       },
       {
         "k": "h",
@@ -3603,9 +3633,9 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "PostgreSQL 10 or later; full-page images need 14 or later.",
+          "PostgreSQL 10 or later. Full-page images, `COPY` progress and lock wait times need 14 or later; the I/O view needs 16.",
           "PostgreSQL only for now: DuckDB, SQLite, MySQL and SQL Server connections show no Monitor entry at all.",
-          "Each tick is one statement against shared-memory statistics views, about half a millisecond of server time."
+          "Each tick is one statement against shared-memory statistics views, about half a millisecond of server time; a view's own queries run only while that view is open."
         ]
       }
     ],
