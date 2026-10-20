@@ -6365,6 +6365,7 @@ function App() {
                     production={prodBadge()}
                     onRowMenu={(e, row) => openMonitorRowMenu(e, row, session)}
                     onQueryMenu={openMonitorQueryMenu}
+                    onOpenSettings={() => setSettingsOpen("monitor")}
                   />
                 )}
               </Show>

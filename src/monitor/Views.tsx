@@ -22,6 +22,7 @@ import {
   type StatementTotal,
 } from "./model";
 import type { MonitorSession } from "./session";
+import { monitorThresholds } from "./thresholds";
 
 /**
  * The phase-2 views of the Monitor tab: Locks, Statements, Replication, Tables &
@@ -377,7 +378,7 @@ export function ReplicationView(props: { session: MonitorSession }) {
               <tbody>
                 <For each={rep()!.slots}>
                   {(sl) => (
-                    <tr class={`tone-${slotTone(sl) || "none"}`}>
+                    <tr class={`tone-${slotTone(sl, monitorThresholds()) || "none"}`}>
                       <td class="mono">{sl.name}</td>
                       <td>{sl.slotType ?? "–"}{sl.plugin ? ` (${sl.plugin})` : ""}</td>
                       <td>{sl.database ?? "–"}</td>
@@ -481,7 +482,7 @@ export function TablesView(props: { session: MonitorSession; onRowMenu: RowMenu 
           <div class="mv-progress">
             <For each={m()!.wraparound}>
               {(d) => {
-                const tone = () => wraparoundTone(d.xidAge, m()!.freezeMaxAge);
+                const tone = () => wraparoundTone(d.xidAge, m()!.freezeMaxAge, monitorThresholds());
                 return (
                   <div class={`mv-progress-row tone-${tone() || "none"}`}>
                     <span class="mono">{d.database}</span>
@@ -497,8 +498,8 @@ export function TablesView(props: { session: MonitorSession; onRowMenu: RowMenu 
             </For>
           </div>
           <div class="mc-sub">
-            Autovacuum forces a freeze past autovacuum_freeze_max_age ({formatCompact(m()!.freezeMaxAge ?? NaN)}): amber beyond it, red within 500M of the
-            2^31 limit.
+            Autovacuum forces a freeze past autovacuum_freeze_max_age ({formatCompact(m()!.freezeMaxAge ?? NaN)}): amber beyond it, red within{" "}
+            {formatCompact(monitorThresholds().wraparoundDangerHeadroomM * 1_000_000)} of the 2^31 limit.
           </div>
         </Waiting>
       </Section>

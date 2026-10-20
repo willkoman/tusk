@@ -545,4 +545,33 @@ describe("phase-2 model", () => {
     expect(slotTone({ active: true, walStatus: "extended", retainedBytes: 0 })).toBe("warn");
     expect(slotTone({ active: false, walStatus: "lost", retainedBytes: null })).toBe("danger");
   });
+
+  it("thresholds: normalize, clamp, order, and drive every tone", async () => {
+    const m = await import("./model");
+    const d = m.DEFAULT_THRESHOLDS;
+    expect(m.normalizeThresholds(null)).toEqual(d);
+    expect(m.normalizeThresholds({ sessionsWarnPct: "80", lagWarnSec: Number.NaN, blockedWarn: Infinity })).toEqual(d);
+    // Out of range clamps; a warning never sits above its danger level.
+    const n = m.normalizeThresholds({ sessionsWarnPct: 99, sessionsDangerPct: 120, oldestXactWarnMin: 90, oldestXactDangerMin: 30, blockedWarn: 2.6 });
+    expect(n.sessionsDangerPct).toBe(100);
+    expect(n.sessionsWarnPct).toBe(99);
+    expect(n.oldestXactWarnMin).toBe(30);
+    expect(n.blockedWarn).toBe(3);
+    const t = { ...d, sessionsWarnPct: 50, sessionsDangerPct: 70, oldestXactWarnMin: 1, oldestXactDangerMin: 2, blockedWarn: 3, lagWarnSec: 0, cacheHitWarnPct: 90, slotRetainedWarnGiB: 0, wraparoundDangerHeadroomM: 1000 };
+    expect(m.sessionsTone(50, 100, t)).toBe("warn");
+    expect(m.sessionsTone(70, 100, t)).toBe("danger");
+    expect(m.oldestTransactionTone(61_000, t)).toBe("warn");
+    expect(m.oldestTransactionTone(121_000, t)).toBe("danger");
+    expect(m.blockedTone(2, t)).toBe("");
+    expect(m.blockedTone(3, t)).toBe("warn");
+    expect(m.blockedTone(5, { ...t, blockedWarn: 0 })).toBe("");
+    expect(m.replicationLagTone(10 ** 9, t)).toBe("");
+    expect(m.cacheHitTone(0.89, t)).toBe("warn");
+    expect(m.cacheHitTone(0.95, t)).toBe("");
+    expect(m.cacheHitTone(0.1, d)).toBe("");
+    expect(m.cacheHitTone(null, t)).toBe("");
+    expect(m.slotTone({ active: false, walStatus: null, retainedBytes: 10 * 1024 ** 3 }, t)).toBe("");
+    expect(m.wraparoundTone(1_200_000_000, 200_000_000, t)).toBe("danger");
+    expect(m.wraparoundTone(1_200_000_000, 200_000_000, d)).toBe("warn");
+  });
 });

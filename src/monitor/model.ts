@@ -745,17 +745,17 @@ export function summarizeRange(moments: readonly ActivityMoment[], from: number,
 
 /** Transaction-ID wraparound: the server stops at 2^31 - 3,000,000; warn well before. */
 export const XID_WRAP_LIMIT = 2 ** 31;
-export function wraparoundTone(xidAge: number, freezeMaxAge: number | null): Tone {
-  if (XID_WRAP_LIMIT - xidAge < 500_000_000) return "danger";
+export function wraparoundTone(xidAge: number, freezeMaxAge: number | null, t: MonitorThresholds = DEFAULT_THRESHOLDS): Tone {
+  if (XID_WRAP_LIMIT - xidAge < t.wraparoundDangerHeadroomM * 1_000_000) return "danger";
   if (freezeMaxAge !== null && xidAge > freezeMaxAge) return "warn";
   return "";
 }
 
 /** A replication slot that holds WAL nobody consumes, or has lost it. */
-export function slotTone(slot: Pick<ReplicationSlot, "active" | "walStatus" | "retainedBytes">): Tone {
+export function slotTone(slot: Pick<ReplicationSlot, "active" | "walStatus" | "retainedBytes">, t: MonitorThresholds = DEFAULT_THRESHOLDS): Tone {
   if (slot.walStatus === "lost") return "danger";
   if (slot.walStatus === "unreserved" || slot.walStatus === "extended") return "warn";
-  if (!slot.active && (slot.retainedBytes ?? 0) > 1024 ** 3) return "warn";
+  if (!slot.active && t.slotRetainedWarnGiB > 0 && (slot.retainedBytes ?? 0) > t.slotRetainedWarnGiB * 1024 ** 3) return "warn";
   return "";
 }
 
@@ -863,23 +863,85 @@ export function formatUptime(startedMs: number | null, serverNowMs: number): str
 /** Amber = needs attention, red = trouble. Green is never "healthy" in this app. */
 export type Tone = "" | "warn" | "danger";
 
-export function sessionsTone(total: number, max: number): Tone {
+/**
+ * Where the tiles and lists turn amber or red. Set in Settings → Monitor and shared
+ * by every Monitor tab; 0 switches an optional one off.
+ */
+export type MonitorThresholds = {
+  /** Share of max_connections in use. */
+  sessionsWarnPct: number;
+  sessionsDangerPct: number;
+  /** Age of the oldest open transaction, minutes. */
+  oldestXactWarnMin: number;
+  oldestXactDangerMin: number;
+  /** Blocked sessions at or above this count (0 = off). */
+  blockedWarn: number;
+  /** Replication lag, seconds (0 = off). */
+  lagWarnSec: number;
+  /** Cache hit below this percentage (0 = off). */
+  cacheHitWarnPct: number;
+  /** WAL an inactive replication slot retains, GiB (0 = off). */
+  slotRetainedWarnGiB: number;
+  /** Transaction-ID headroom left before wraparound, millions of transactions. */
+  wraparoundDangerHeadroomM: number;
+};
+
+export const DEFAULT_THRESHOLDS: MonitorThresholds = {
+  sessionsWarnPct: 80,
+  sessionsDangerPct: 95,
+  oldestXactWarnMin: 5,
+  oldestXactDangerMin: 60,
+  blockedWarn: 1,
+  lagWarnSec: 60,
+  cacheHitWarnPct: 0,
+  slotRetainedWarnGiB: 1,
+  wraparoundDangerHeadroomM: 500,
+};
+
+/** Accept only sane numbers (persisted or typed); a warning never sits above its danger level. */
+export function normalizeThresholds(v: unknown): MonitorThresholds {
+  const src = v && typeof v === "object" ? (v as Record<string, unknown>) : {};
+  const pick = (key: keyof MonitorThresholds, min: number, max: number) => {
+    const x = src[key];
+    return typeof x === "number" && Number.isFinite(x) ? Math.min(max, Math.max(min, x)) : DEFAULT_THRESHOLDS[key];
+  };
+  const out: MonitorThresholds = {
+    sessionsWarnPct: pick("sessionsWarnPct", 1, 100),
+    sessionsDangerPct: pick("sessionsDangerPct", 1, 100),
+    oldestXactWarnMin: pick("oldestXactWarnMin", 0.1, 10_080),
+    oldestXactDangerMin: pick("oldestXactDangerMin", 0.1, 10_080),
+    blockedWarn: Math.round(pick("blockedWarn", 0, 100_000)),
+    lagWarnSec: pick("lagWarnSec", 0, 86_400),
+    cacheHitWarnPct: pick("cacheHitWarnPct", 0, 100),
+    slotRetainedWarnGiB: pick("slotRetainedWarnGiB", 0, 100_000),
+    wraparoundDangerHeadroomM: pick("wraparoundDangerHeadroomM", 1, 2_000),
+  };
+  if (out.sessionsWarnPct > out.sessionsDangerPct) out.sessionsWarnPct = out.sessionsDangerPct;
+  if (out.oldestXactWarnMin > out.oldestXactDangerMin) out.oldestXactWarnMin = out.oldestXactDangerMin;
+  return out;
+}
+
+export function sessionsTone(total: number, max: number, t: MonitorThresholds = DEFAULT_THRESHOLDS): Tone {
   if (!(max > 0)) return "";
-  const share = total / max;
-  return share >= 0.95 ? "danger" : share >= 0.8 ? "warn" : "";
+  const share = (total / max) * 100;
+  return share >= t.sessionsDangerPct ? "danger" : share >= t.sessionsWarnPct ? "warn" : "";
 }
 
-export function oldestTransactionTone(ms: number | null): Tone {
+export function oldestTransactionTone(ms: number | null, t: MonitorThresholds = DEFAULT_THRESHOLDS): Tone {
   if (ms === null) return "";
-  return ms > 3_600_000 ? "danger" : ms > 300_000 ? "warn" : "";
+  return ms > t.oldestXactDangerMin * 60_000 ? "danger" : ms > t.oldestXactWarnMin * 60_000 ? "warn" : "";
 }
 
-export function blockedTone(n: number | null): Tone {
-  return n !== null && n > 0 ? "warn" : "";
+export function blockedTone(n: number | null, t: MonitorThresholds = DEFAULT_THRESHOLDS): Tone {
+  return n !== null && t.blockedWarn > 0 && n >= t.blockedWarn ? "warn" : "";
 }
 
-export function replicationLagTone(ms: number | null): Tone {
-  return ms !== null && ms > 60_000 ? "warn" : "";
+export function replicationLagTone(ms: number | null, t: MonitorThresholds = DEFAULT_THRESHOLDS): Tone {
+  return ms !== null && t.lagWarnSec > 0 && ms > t.lagWarnSec * 1000 ? "warn" : "";
+}
+
+export function cacheHitTone(ratio: number | null, t: MonitorThresholds = DEFAULT_THRESHOLDS): Tone {
+  return ratio !== null && t.cacheHitWarnPct > 0 && ratio * 100 < t.cacheHitWarnPct ? "warn" : "";
 }
 
 // --- the process list -------------------------------------------------------------

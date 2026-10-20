@@ -19,6 +19,7 @@ import {
   WAIT_TYPES,
   WAL_SERIES,
   blockedTone,
+  cacheHitTone,
   formatByteRate,
   formatBytesAxis,
   formatCompact,
@@ -41,6 +42,7 @@ import {
 import { INTERVALS, WINDOWS, type MonitorSession, type MonitorView } from "./session";
 import { EVENT_COLORS, TimeSeries, type SeriesSpec } from "./TimeSeries";
 import { IoView, LocksView, ReplicationView, StatementsView, TablesView } from "./Views";
+import { monitorThresholds } from "./thresholds";
 
 const WAIT_COLORS = ["--chart-1", "--chart-2", "--chart-3", "--chart-4", "--chart-5", "--chart-6", "--chart-7", "--chart-8", "--chart-9", "--chart-10", "--muted"];
 
@@ -414,6 +416,7 @@ export default function MonitorTab(props: {
   production: JSX.Element | undefined;
   onRowMenu: (e: MouseEvent, row: ActivityRow) => void;
   onQueryMenu: (e: MouseEvent, query: string) => void;
+  onOpenSettings: () => void;
 }) {
   const s = props.session;
   let host: HTMLDivElement | undefined;
@@ -459,10 +462,10 @@ export default function MonitorTab(props: {
     {
       key: "sessions",
       label: "Sessions",
-      source: "Client backends: active / total, and max_connections (pg_stat_activity, current_setting). Amber at 80% of max_connections, red at 95%.",
+      source: "Client backends: active / total, and max_connections (pg_stat_activity, current_setting). Amber and red at the shares of max_connections set in Settings → Monitor.",
       value: () => (latest()?.sessions ? `${latest()!.sessions!.active} / ${latest()!.sessions!.total}` : "–"),
       sub: () => (latest()?.sessions ? `of ${latest()!.sessions!.maxConnections} max` : ""),
-      tone: () => (latest()?.sessions ? sessionsTone(latest()!.sessions!.total, latest()!.sessions!.maxConnections) : ""),
+      tone: () => (latest()?.sessions ? sessionsTone(latest()!.sessions!.total, latest()!.sessions!.maxConnections, monitorThresholds()) : ""),
       onClick: () => s.setView("activity"),
     },
     {
@@ -486,7 +489,7 @@ export default function MonitorTab(props: {
       source: "Δ blks_hit / Δ(blks_hit + blks_read) over the last tick (pg_stat_database) — not the lifetime ratio, which hides incidents.",
       value: () => formatPercent(latest()?.rates?.cacheHit ?? null),
       sub: () => "last tick",
-      tone: () => "",
+      tone: () => cacheHitTone(latest()?.rates?.cacheHit ?? null, monitorThresholds()),
     },
     {
       key: "wal",
@@ -499,10 +502,10 @@ export default function MonitorTab(props: {
     {
       key: "oldestXact",
       label: "Oldest transaction",
-      source: "now() − min(xact_start) over every session (pg_stat_activity). Amber past 5 minutes, red past an hour: a long transaction holds back vacuum.",
+      source: "now() − min(xact_start) over every session (pg_stat_activity). A long transaction holds back vacuum; amber and red ages are set in Settings → Monitor.",
       value: () => formatDuration(latest()?.oldestXactMs ?? null),
       sub: () => (latest() && latest()!.oldestXactMs === null ? "none open" : ""),
-      tone: () => oldestTransactionTone(latest()?.oldestXactMs ?? null),
+      tone: () => oldestTransactionTone(latest()?.oldestXactMs ?? null, monitorThresholds()),
       onClick: () => s.setView("activity"),
     },
     {
@@ -511,7 +514,7 @@ export default function MonitorTab(props: {
       source: "Sessions waiting on a heavyweight lock held by another (pg_blocking_pids is non-empty). Click for Locks.",
       value: () => (latest()?.blocked != null ? String(latest()!.blocked) : "–"),
       sub: () => "waiting on locks",
-      tone: () => blockedTone(latest()?.blocked ?? null),
+      tone: () => blockedTone(latest()?.blocked ?? null, monitorThresholds()),
       onClick: () => s.setView("locks"),
     },
     {
@@ -520,7 +523,7 @@ export default function MonitorTab(props: {
       source: "Primary: max(replay_lag) over pg_stat_replication. Standby: now() − pg_last_xact_replay_timestamp(), which also grows while the primary is idle.",
       value: () => formatDuration(latest()?.replicationLagMs ?? null),
       sub: () => (server()?.inRecovery ? "since last replay" : "slowest replica"),
-      tone: () => replicationLagTone(latest()?.replicationLagMs ?? null),
+      tone: () => replicationLagTone(latest()?.replicationLagMs ?? null, monitorThresholds()),
       when: () => latest()?.replicationLagMs != null,
     },
   ];
@@ -610,6 +613,7 @@ export default function MonitorTab(props: {
           >
             <button class="run" title="Start sampling the server" onClick={() => s.resume()}><Icon name="play" /> Resume</button>
           </Show>
+          <button class="icon" title="Monitor thresholds (Settings → Monitor)" aria-label="Monitor thresholds" onClick={() => props.onOpenSettings()}><Icon name="gear" /></button>
         </header>
 
         <div class="monitor-tiles">

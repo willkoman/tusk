@@ -5,15 +5,17 @@ import { type DialectId } from "../sql/dialects";
 import { SlackPane, type SlackConnectionOption } from "./SlackPane";
 import { AiPane } from "./AiPane";
 import { AppearancePane } from "./AppearancePane";
+import { MonitorPane } from "./MonitorPane";
 import { crashConsent, setCrashConsent } from "../store";
 
-export type SettingsTab = "editor" | "appearance" | "grid" | "plans" | "ai" | "slack" | "shortcuts" | "privacy";
+export type SettingsTab = "editor" | "appearance" | "grid" | "plans" | "monitor" | "ai" | "slack" | "shortcuts" | "privacy";
 
 const TABS: { id: SettingsTab; label: string }[] = [
   { id: "editor", label: "Editor" },
   { id: "appearance", label: "Appearance" },
   { id: "grid", label: "Grid" },
   { id: "plans", label: "Plans" },
+  { id: "monitor", label: "Monitor" },
   { id: "ai", label: "AI" },
   { id: "slack", label: "Slack" },
   { id: "shortcuts", label: "Shortcuts" },
@@ -189,6 +191,10 @@ export function SettingsDialog(props: {
               <div class="settings-note">
                 The plan view opens for EXPLAIN results and from the Explain toolbar action. Raw engine output stays under the Grid toggle.
               </div>
+            </Match>
+
+            <Match when={tab() === "monitor"}>
+              <MonitorPane />
             </Match>
 
             <Match when={tab() === "ai"}>
