@@ -24,6 +24,19 @@ pub(crate) struct Counters {
     pub tup_updated: i64,
     pub tup_deleted: i64,
     pub temp_bytes: i64,
+    pub temp_files: i64,
+    pub deadlocks: i64,
+    /// Queries cancelled on a standby by recovery conflicts.
+    pub conflicts: i64,
+    /// Checkpoints started on schedule and on request (`pg_stat_checkpointer` on
+    /// PostgreSQL 17+, `pg_stat_bgwriter` before).
+    pub checkpoints_timed: i64,
+    pub checkpoints_requested: i64,
+    /// Buffers written by checkpoints, by the background writer, and (16 and
+    /// earlier) by backends themselves.
+    pub buffers_checkpoint: i64,
+    pub buffers_clean: i64,
+    pub buffers_backend: Option<i64>,
     /// Bytes since `0/0`: the write position on a primary, the replay position on a
     /// standby. `None` when the server reports no position (a standby before replay).
     pub wal_bytes: Option<i64>,
@@ -34,8 +47,16 @@ pub(crate) struct Counters {
 }
 
 impl Counters {
-    fn fields(&self) -> [i64; 10] {
+    fn fields(&self) -> [i64; 18] {
         [
+            self.temp_files,
+            self.deadlocks,
+            self.conflicts,
+            self.checkpoints_timed,
+            self.checkpoints_requested,
+            self.buffers_checkpoint,
+            self.buffers_clean,
+            self.buffers_backend.unwrap_or(0),
             self.xact_commit,
             self.xact_rollback,
             self.blks_read,
@@ -84,6 +105,22 @@ pub(crate) struct Rates {
     pub temp_bytes: f64,
     pub wal_bytes: Option<f64>,
     pub wal_fpi: Option<f64>,
+    pub buffers_checkpoint: f64,
+    pub buffers_clean: f64,
+    pub buffers_backend: Option<f64>,
+    /// What happened in this interval, as counts: drawn as event markers.
+    pub events: Events,
+}
+
+/// Counts of discrete events over one interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Events {
+    pub checkpoints_timed: u32,
+    pub checkpoints_requested: u32,
+    pub deadlocks: u32,
+    pub conflicts: u32,
+    pub temp_files: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -122,6 +159,8 @@ impl RateTracker {
             (Some(n), Some(b)) => Some((n - b) as f64 / dt),
             _ => None,
         };
+        // Never negative here: a counter that went backwards was a reset above.
+        let count = |now: i64, before: i64| (now - before).clamp(0, i64::from(u32::MAX)) as u32;
         let commits = per(counters.xact_commit, then.xact_commit);
         let rollbacks = per(counters.xact_rollback, then.xact_rollback);
         let d_hit = counters.blks_hit - then.blks_hit;
@@ -142,6 +181,19 @@ impl RateTracker {
             temp_bytes: per(counters.temp_bytes, then.temp_bytes),
             wal_bytes: per_opt(counters.wal_bytes, then.wal_bytes),
             wal_fpi: per_opt(counters.wal_fpi, then.wal_fpi),
+            buffers_checkpoint: per(counters.buffers_checkpoint, then.buffers_checkpoint),
+            buffers_clean: per(counters.buffers_clean, then.buffers_clean),
+            buffers_backend: per_opt(counters.buffers_backend, then.buffers_backend),
+            events: Events {
+                checkpoints_timed: count(counters.checkpoints_timed, then.checkpoints_timed),
+                checkpoints_requested: count(
+                    counters.checkpoints_requested,
+                    then.checkpoints_requested,
+                ),
+                deadlocks: count(counters.deadlocks, then.deadlocks),
+                conflicts: count(counters.conflicts, then.conflicts),
+                temp_files: count(counters.temp_files, then.temp_files),
+            },
         })
     }
 
@@ -236,6 +288,91 @@ mod tests {
         assert_eq!(r.tup_deleted, 20.0);
         assert_eq!(r.temp_bytes, 16_000.0);
         assert_eq!(r.wal_fpi, Some(20.0));
+    }
+
+    #[test]
+    fn events_are_counts_and_writes_are_rates() {
+        let mut t = RateTracker::default();
+        let base = Counters {
+            checkpoints_timed: 10,
+            checkpoints_requested: 2,
+            deadlocks: 1,
+            conflicts: 0,
+            temp_files: 5,
+            buffers_checkpoint: 1_000,
+            buffers_clean: 50,
+            buffers_backend: Some(7),
+            ..Counters::default()
+        };
+        t.ingest(base, at(0));
+        let next = Counters {
+            checkpoints_timed: 11,
+            deadlocks: 3,
+            temp_files: 9,
+            buffers_checkpoint: 3_000,
+            buffers_clean: 150,
+            buffers_backend: Some(17),
+            ..base
+        };
+        let r = rates(t.ingest(next, at(2_000)));
+        assert_eq!(
+            r.events,
+            Events {
+                checkpoints_timed: 1,
+                checkpoints_requested: 0,
+                deadlocks: 2,
+                conflicts: 0,
+                temp_files: 4
+            },
+            "counts per interval, not per second"
+        );
+        assert_eq!(r.buffers_checkpoint, 1_000.0);
+        assert_eq!(r.buffers_clean, 50.0);
+        assert_eq!(r.buffers_backend, Some(5.0));
+        // PostgreSQL 17 dropped buffers_backend: no rate, never a zero that lies.
+        let mut t = RateTracker::default();
+        t.ingest(
+            Counters {
+                buffers_backend: None,
+                ..Counters::default()
+            },
+            at(0),
+        );
+        assert_eq!(
+            rates(t.ingest(
+                Counters {
+                    buffers_backend: None,
+                    ..Counters::default()
+                },
+                at(1_000)
+            ))
+            .buffers_backend,
+            None
+        );
+    }
+
+    #[test]
+    fn a_checkpointer_stats_reset_rebaselines() {
+        let mut t = RateTracker::default();
+        t.ingest(
+            Counters {
+                checkpoints_timed: 40,
+                buffers_checkpoint: 9_000,
+                ..Counters::default()
+            },
+            at(0),
+        );
+        assert_eq!(
+            t.ingest(
+                Counters {
+                    checkpoints_timed: 0,
+                    buffers_checkpoint: 0,
+                    ..Counters::default()
+                },
+                at(1_000)
+            ),
+            Ingest::Reset
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, SimpleQueryMessage};
 
 use super::rates::Counters;
+use super::views::{self, Locks, Maintenance, Progress, Replication, StatementsSource};
 use crate::db::{self, AppError, ConnectionConfig};
 use crate::driver::Backend;
 
@@ -19,6 +20,9 @@ use crate::driver::Backend;
 pub(crate) const MIN_VERSION_NUM: i32 = 100_000;
 /// `pg_stat_wal` (full-page images) arrived in PostgreSQL 14.
 const WAL_STATS_VERSION_NUM: i32 = 140_000;
+/// PostgreSQL 17 moved the checkpoint counters to `pg_stat_checkpointer` and dropped
+/// `pg_stat_bgwriter.buffers_backend`.
+const CHECKPOINTER_VERSION_NUM: i32 = 170_000;
 /// Query text is cut here in SQL, in characters, so the process list stays small
 /// however high the server's `track_activity_query_size` is set.
 pub(crate) const QUERY_TEXT_CHARS: usize = 1024;
@@ -88,6 +92,12 @@ pub(crate) struct Probe {
     /// `track_activity_query_size` in bytes: query text at that length was cut by the server.
     pub query_size: i64,
     pub wal_stats: bool,
+    /// `pg_stat_statements` is installed here and readable.
+    pub statements_available: bool,
+    /// Why it is not, in words the Statements view shows.
+    pub statements_note: Option<String>,
+    #[serde(skip)]
+    pub statements_source: Option<StatementsSource>,
 }
 
 /// The fast tier: ONE statement, one row, shared-memory stats views only. Built per
@@ -104,12 +114,23 @@ pub(crate) fn fast_tier_sql(version_num: i32) -> String {
     } else {
         "NULL::bigint"
     };
+    let checkpoints = if version_num >= CHECKPOINTER_VERSION_NUM {
+        "SELECT c.num_timed AS ckpt_timed, c.num_requested AS ckpt_req, \
+                c.buffers_written AS buffers_checkpoint, b.buffers_clean, \
+                NULL::bigint AS buffers_backend \
+           FROM pg_stat_checkpointer c CROSS JOIN pg_stat_bgwriter b"
+    } else {
+        "SELECT checkpoints_timed AS ckpt_timed, checkpoints_req AS ckpt_req, \
+                buffers_checkpoint, buffers_clean, buffers_backend \
+           FROM pg_stat_bgwriter"
+    };
     format!(
         "SELECT \
     floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint AS server_ms, \
     d.xact_commit, d.xact_rollback, d.blks_read, d.blks_hit, \
     d.tup_returned, d.tup_fetched, d.tup_inserted, d.tup_updated, d.tup_deleted, \
-    d.temp_bytes, d.stats_reset_ms, \
+    d.temp_bytes, d.temp_files, d.deadlocks, d.conflicts, d.stats_reset_ms, \
+    ck.ckpt_timed, ck.ckpt_req, ck.buffers_checkpoint, ck.buffers_clean, ck.buffers_backend, \
     (CASE WHEN pg_is_in_recovery() \
           THEN pg_wal_lsn_diff(pg_last_wal_replay_lsn(), '0/0') \
           ELSE pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0') END)::bigint AS wal_bytes, \
@@ -130,8 +151,12 @@ pub(crate) fn fast_tier_sql(version_num: i32) -> String {
                sum(tup_updated)::bigint AS tup_updated, \
                sum(tup_deleted)::bigint AS tup_deleted, \
                sum(temp_bytes)::bigint AS temp_bytes, \
+               sum(temp_files)::bigint AS temp_files, \
+               sum(deadlocks)::bigint AS deadlocks, \
+               sum(conflicts)::bigint AS conflicts, \
                floor(extract(epoch FROM max(stats_reset)) * 1000)::bigint AS stats_reset_ms \
           FROM pg_stat_database) d \
+  CROSS JOIN ({checkpoints}) ck \
   CROSS JOIN (SELECT coalesce(json_agg(json_build_array(state, wait_event_type, client, n)), '[]') AS hist, \
                      floor(extract(epoch FROM clock_timestamp() - min(oldest_xact)) * 1000)::bigint AS oldest_xact_ms, \
                      coalesce(sum(blocked), 0)::bigint AS blocked \
@@ -276,6 +301,8 @@ struct Statement {
     name: &'static str,
     sql: String,
     prepared: bool,
+    /// Prepared on first use, so a view nobody opens costs no round trip.
+    tried: bool,
 }
 
 impl Statement {
@@ -284,6 +311,7 @@ impl Statement {
             name,
             sql,
             prepared: false,
+            tried: false,
         }
     }
 
@@ -303,6 +331,10 @@ impl Statement {
     }
 
     async fn run(&mut self, client: &Client) -> Result<Vec<SimpleQueryMessage>, AppError> {
+        if !self.tried {
+            self.tried = true;
+            self.prepare(client).await;
+        }
         match client.simple_query(&self.text()).await {
             Ok(messages) => Ok(messages),
             Err(e) => {
@@ -321,6 +353,16 @@ pub(crate) struct PgSession {
     pub probe: Probe,
     fast: Statement,
     activity: Statement,
+    lock_waits: Statement,
+    lock_holds: Statement,
+    replicas: Statement,
+    slots: Statement,
+    receiver: Statement,
+    progress: Statement,
+    tables: Statement,
+    wraparound: Statement,
+    io: Statement,
+    statements: Statement,
 }
 
 impl PgSession {
@@ -328,11 +370,22 @@ impl PgSession {
     /// set it up and read its facts. `config` is already the read-only clone.
     pub(crate) async fn open(config: &ConnectionConfig) -> Result<Self, AppError> {
         let (backend, _version) = crate::driver::connect(config).await?;
+        let blank = |name| Statement::new(name, String::new());
         let mut session = Self {
             backend,
             probe: placeholder_probe(),
-            fast: Statement::new("tusk_monitor_fast", String::new()),
-            activity: Statement::new("tusk_monitor_activity", String::new()),
+            fast: blank("tusk_monitor_fast"),
+            activity: blank("tusk_monitor_activity"),
+            lock_waits: blank("tusk_monitor_lock_waits"),
+            lock_holds: blank("tusk_monitor_lock_holds"),
+            replicas: blank("tusk_monitor_replicas"),
+            slots: blank("tusk_monitor_slots"),
+            receiver: blank("tusk_monitor_receiver"),
+            progress: blank("tusk_monitor_progress"),
+            tables: blank("tusk_monitor_tables"),
+            wraparound: blank("tusk_monitor_wraparound"),
+            io: blank("tusk_monitor_io"),
+            statements: blank("tusk_monitor_statements"),
         };
         session.setup().await?;
         Ok(session)
@@ -362,14 +415,96 @@ impl PgSession {
             )));
         }
         let (columns, row) = one_row(client, PROBE_SQL).await?;
-        let probe = parse_probe(version_num as i32, &columns, &row)?;
-        self.fast = Statement::new("tusk_monitor_fast", fast_tier_sql(probe.version_num));
+        let mut probe = parse_probe(version_num as i32, &columns, &row)?;
+        probe_statements(client, &mut probe).await;
+        let v = probe.version_num;
+        // A fresh or reopened session has no prepared statements: every one starts
+        // unprepared and prepares itself on first use.
+        self.fast = Statement::new("tusk_monitor_fast", fast_tier_sql(v));
         self.activity = Statement::new("tusk_monitor_activity", activity_sql(probe.query_size));
-        // DEALLOCATE ALL is not needed: a fresh or reopened session has none.
-        self.fast.prepare(client).await;
-        self.activity.prepare(client).await;
+        self.lock_waits = Statement::new("tusk_monitor_lock_waits", views::lock_waits_sql(v));
+        self.lock_holds = Statement::new("tusk_monitor_lock_holds", views::lock_holds_sql());
+        self.replicas = Statement::new("tusk_monitor_replicas", views::replicas_sql());
+        self.slots = Statement::new("tusk_monitor_slots", views::slots_sql(v));
+        self.receiver = Statement::new("tusk_monitor_receiver", views::receiver_sql(v));
+        self.progress = Statement::new("tusk_monitor_progress", views::progress_sql(v));
+        self.tables = Statement::new("tusk_monitor_tables", views::TABLES_SQL.to_string());
+        self.wraparound =
+            Statement::new("tusk_monitor_wraparound", views::WRAPAROUND_SQL.to_string());
+        self.io = Statement::new("tusk_monitor_io", views::IO_SQL.to_string());
+        self.statements = Statement::new(
+            "tusk_monitor_statements",
+            probe
+                .statements_source
+                .as_ref()
+                .map(views::statements_sql)
+                .unwrap_or_default(),
+        );
         self.probe = probe;
         Ok(())
+    }
+
+    async fn rows(
+        statement: &mut Statement,
+        client: &Client,
+        limits: db::TextLimits,
+    ) -> Result<(Vec<String>, Vec<Row>), AppError> {
+        let messages = statement.run(client).await?;
+        db::collect_rows_limited(&messages, limits)
+    }
+
+    pub(crate) async fn locks(&mut self) -> Result<Locks, AppError> {
+        let client = self.backend.pg()?;
+        let (wc, wr) = Self::rows(&mut self.lock_waits, client, db::MONITOR_TEXT_LIMITS).await?;
+        let (hc, hr) = Self::rows(&mut self.lock_holds, client, db::MONITOR_TEXT_LIMITS).await?;
+        views::parse_locks(&wc, &wr, &hc, &hr)
+    }
+
+    pub(crate) async fn replication(&mut self) -> Result<Replication, AppError> {
+        let client = self.backend.pg()?;
+        let rep = Self::rows(&mut self.replicas, client, db::MONITOR_TEXT_LIMITS).await?;
+        let slots = Self::rows(&mut self.slots, client, db::MONITOR_TEXT_LIMITS).await?;
+        let recv = Self::rows(&mut self.receiver, client, db::MONITOR_TEXT_LIMITS).await?;
+        views::parse_replication((&rep.0, &rep.1), (&slots.0, &slots.1), (&recv.0, &recv.1))
+    }
+
+    pub(crate) async fn progress(&mut self) -> Result<Vec<Progress>, AppError> {
+        let client = self.backend.pg()?;
+        let (c, r) = Self::rows(&mut self.progress, client, db::MONITOR_TEXT_LIMITS).await?;
+        views::parse_progress(&c, &r)
+    }
+
+    pub(crate) async fn maintenance(&mut self) -> Result<Maintenance, AppError> {
+        let client = self.backend.pg()?;
+        let tables = Self::rows(&mut self.tables, client, db::MONITOR_TEXT_LIMITS).await?;
+        let ages = Self::rows(&mut self.wraparound, client, db::MONITOR_TEXT_LIMITS).await?;
+        views::parse_maintenance((&tables.0, &tables.1), (&ages.0, &ages.1))
+    }
+
+    /// `pg_stat_io` rows (PostgreSQL 16+); the caller's tracker turns them into rates.
+    pub(crate) async fn io_rows(&mut self) -> Result<(Vec<String>, Vec<Row>), AppError> {
+        let client = self.backend.pg()?;
+        Self::rows(&mut self.io, client, db::MONITOR_TEXT_LIMITS).await
+    }
+
+    /// Cumulative `pg_stat_statements` numbers, without text.
+    pub(crate) async fn statement_rows(&mut self) -> Result<(Vec<String>, Vec<Row>), AppError> {
+        let client = self.backend.pg()?;
+        Self::rows(&mut self.statements, client, db::MONITOR_STATEMENT_LIMITS).await
+    }
+
+    /// Texts (with role and database) for the given statements.
+    pub(crate) async fn statement_texts(
+        &mut self,
+        queryids: &[i64],
+    ) -> Result<(Vec<String>, Vec<Row>), AppError> {
+        let Some(src) = self.probe.statements_source.as_ref() else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let sql = views::statement_texts_sql(src, queryids);
+        let client = self.backend.pg()?;
+        let messages = client.simple_query(&sql).await?;
+        db::collect_rows_limited(&messages, db::MONITOR_TEXT_LIMITS)
     }
 
     pub(crate) async fn sample(&mut self) -> Result<FastSample, AppError> {
@@ -412,6 +547,54 @@ impl PgSession {
     }
 }
 
+/// Is `pg_stat_statements` usable here? Installed in this database, with a readable
+/// view (it must also be in `shared_preload_libraries`, which only a trial read
+/// can tell). Never fails the session: the answer is a note on the Statements view.
+async fn probe_statements(client: &Client, probe: &mut Probe) {
+    let found = match client.simple_query(views::STATEMENTS_PROBE_SQL).await {
+        Ok(messages) => db::collect_rows_limited(&messages, db::MONITOR_TEXT_LIMITS),
+        Err(e) => Err(AppError::from(e)),
+    };
+    let source = match found {
+        Err(e) => {
+            probe.statements_note = Some(format!(
+                "pg_stat_statements could not be checked: {}",
+                e.message
+            ));
+            return;
+        }
+        Ok((c, rows)) => match rows.first() {
+            None => {
+                probe.statements_note = Some(
+                    "pg_stat_statements is not installed in this database. Run CREATE EXTENSION pg_stat_statements; \
+                     the server also needs it in shared_preload_libraries."
+                        .to_string(),
+                );
+                return;
+            }
+            Some(r) => StatementsSource {
+                schema: db::ident(&text(&c, r, "schema").unwrap_or_default()),
+                time_column: if boolean(&c, r, "exec_time") {
+                    "total_exec_time"
+                } else {
+                    "total_time"
+                },
+            },
+        },
+    };
+    let trial = format!(
+        "SELECT 1 FROM {}.pg_stat_statements(false) LIMIT 1",
+        source.schema
+    );
+    match client.simple_query(&trial).await {
+        Ok(_) => {
+            probe.statements_available = true;
+            probe.statements_source = Some(source);
+        }
+        Err(e) => probe.statements_note = Some(AppError::from(e).message),
+    }
+}
+
 fn placeholder_probe() -> Probe {
     Probe {
         version_num: 0,
@@ -428,10 +611,13 @@ fn placeholder_probe() -> Probe {
         in_recovery: false,
         query_size: 1024,
         wal_stats: false,
+        statements_available: false,
+        statements_note: None,
+        statements_source: None,
     }
 }
 
-type Row = Vec<Option<String>>;
+pub(super) type Row = Vec<Option<String>>;
 
 async fn one_row(client: &Client, sql: &str) -> Result<(Vec<String>, Row), AppError> {
     let messages = client.simple_query(sql).await?;
@@ -442,7 +628,11 @@ async fn one_row(client: &Client, sql: &str) -> Result<(Vec<String>, Row), AppEr
     }
 }
 
-fn cell<'a>(columns: &[String], row: &'a [Option<String>], name: &str) -> Option<&'a str> {
+pub(super) fn cell<'a>(
+    columns: &[String],
+    row: &'a [Option<String>],
+    name: &str,
+) -> Option<&'a str> {
     columns
         .iter()
         .position(|c| c == name)
@@ -451,11 +641,11 @@ fn cell<'a>(columns: &[String], row: &'a [Option<String>], name: &str) -> Option
 }
 
 /// An integer column; NULL reads as zero (a sum over an empty view is NULL).
-fn int(columns: &[String], row: &[Option<String>], name: &str) -> Result<i64, AppError> {
+pub(super) fn int(columns: &[String], row: &[Option<String>], name: &str) -> Result<i64, AppError> {
     opt_int(columns, row, name).map(|v| v.unwrap_or(0))
 }
 
-fn opt_int(
+pub(super) fn opt_int(
     columns: &[String],
     row: &[Option<String>],
     name: &str,
@@ -469,15 +659,15 @@ fn opt_int(
     }
 }
 
-fn boolean(columns: &[String], row: &[Option<String>], name: &str) -> bool {
+pub(super) fn boolean(columns: &[String], row: &[Option<String>], name: &str) -> bool {
     cell(columns, row, name) == Some("t")
 }
 
-fn text(columns: &[String], row: &[Option<String>], name: &str) -> Option<String> {
+pub(super) fn text(columns: &[String], row: &[Option<String>], name: &str) -> Option<String> {
     cell(columns, row, name).map(str::to_string)
 }
 
-fn clamp_u32(v: i64) -> u32 {
+pub(super) fn clamp_u32(v: i64) -> u32 {
     v.clamp(0, i64::from(u32::MAX)) as u32
 }
 
@@ -501,6 +691,9 @@ fn parse_probe(
         in_recovery: boolean(columns, row, "in_recovery"),
         query_size: int(columns, row, "query_size")?.max(1),
         wal_stats: version_num >= WAL_STATS_VERSION_NUM,
+        statements_available: false,
+        statements_note: None,
+        statements_source: None,
     })
 }
 
@@ -520,6 +713,14 @@ pub(crate) fn parse_fast(
         tup_updated: i("tup_updated")?,
         tup_deleted: i("tup_deleted")?,
         temp_bytes: i("temp_bytes")?,
+        temp_files: i("temp_files")?,
+        deadlocks: i("deadlocks")?,
+        conflicts: i("conflicts")?,
+        checkpoints_timed: i("ckpt_timed")?,
+        checkpoints_requested: i("ckpt_req")?,
+        buffers_checkpoint: i("buffers_checkpoint")?,
+        buffers_clean: i("buffers_clean")?,
+        buffers_backend: opt_int(columns, row, "buffers_backend")?,
         wal_bytes: opt_int(columns, row, "wal_bytes")?,
         wal_fpi: opt_int(columns, row, "wal_fpi")?,
         stats_reset_ms: opt_int(columns, row, "stats_reset_ms")?,
@@ -582,7 +783,7 @@ pub(crate) fn histogram(
 }
 
 /// `{1,2}` (an int[] as text) → pids. Anything unreadable is dropped, never guessed.
-fn pid_array(text: Option<&str>) -> Vec<i32> {
+pub(super) fn pid_array(text: Option<&str>) -> Vec<i32> {
     let Some(t) = text else { return Vec::new() };
     t.trim_matches(|c| c == '{' || c == '}')
         .split(',')
@@ -816,6 +1017,10 @@ mod tests {
 
     #[test]
     fn fast_tier_is_version_gated() {
+        assert!(fast_tier_sql(160_000).contains("checkpoints_timed AS ckpt_timed"));
+        assert!(!fast_tier_sql(160_000).contains("pg_stat_checkpointer"));
+        assert!(fast_tier_sql(170_000).contains("FROM pg_stat_checkpointer c"));
+        assert!(fast_tier_sql(170_000).contains("NULL::bigint AS buffers_backend"));
         assert!(fast_tier_sql(130_000).contains("NULL::bigint AS wal_fpi"));
         assert!(!fast_tier_sql(130_000).contains("pg_stat_wal"));
         assert!(fast_tier_sql(140_000).contains("FROM pg_stat_wal"));

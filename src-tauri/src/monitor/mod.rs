@@ -10,7 +10,9 @@
 //!
 //! - the fast tier every tick (ONE statement, one row),
 //! - the activity tier (the bounded process list) every two seconds while a view
-//!   that shows it is open.
+//!   that shows it is open,
+//! - the view tiers (`views.rs`: locks, replication, progress, maintenance, I/O,
+//!   statements), each on its own cadence and only while its view is open.
 //!
 //! Rates are computed here, so the frontend receives one `monitor-sample` event per
 //! tick and only draws. `MissedTickBehavior::Skip` drops a slow tick instead of
@@ -22,8 +24,9 @@
 
 mod pg;
 mod rates;
+mod views;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -40,6 +43,10 @@ pub(crate) use pg::ActivityRow;
 pub(crate) use pg::SignalAction;
 use pg::{Activity, PgSession, Probe, Sessions};
 use rates::{Ingest, RateTracker, Rates};
+pub(crate) use views::ViewSet;
+use views::{
+    Io, IoTracker, Locks, Maintenance, Progress, Replication, StatementTracker, Statements, Tier,
+};
 
 pub(crate) const EVENT: &str = "monitor-sample";
 const MIN_INTERVAL_MS: u64 = 250;
@@ -58,6 +65,8 @@ pub(crate) struct Settings {
     pub paused: bool,
     /// Run the activity tier (a view showing the process list is open).
     pub activity: bool,
+    /// Which view tiers run.
+    pub views: ViewSet,
 }
 
 /// Settings as the frontend sends them.
@@ -67,6 +76,7 @@ pub(crate) struct MonitorOptions {
     pub interval_ms: Option<u64>,
     pub paused: Option<bool>,
     pub activity: Option<bool>,
+    pub views: Option<ViewSet>,
 }
 
 impl MonitorOptions {
@@ -79,6 +89,7 @@ impl MonitorOptions {
             ),
             paused: self.paused.unwrap_or(false),
             activity: self.activity.unwrap_or(true),
+            views: self.views.unwrap_or_default(),
         }
     }
 }
@@ -261,6 +272,14 @@ pub(crate) struct MonitorEvent {
     pub replication_lag_ms: Option<i64>,
     pub activity: Option<Activity>,
     pub activity_error: Option<String>,
+    pub locks: Option<Locks>,
+    pub replication: Option<Replication>,
+    pub progress: Option<Vec<Progress>>,
+    pub maintenance: Option<Maintenance>,
+    pub io: Option<Io>,
+    pub statements: Option<Statements>,
+    /// A view tier that failed this tick, by tier name, with the server's reason.
+    pub view_errors: Option<BTreeMap<&'static str, String>>,
 }
 
 impl MonitorEvent {
@@ -284,7 +303,20 @@ impl MonitorEvent {
             replication_lag_ms: None,
             activity: None,
             activity_error: None,
+            locks: None,
+            replication: None,
+            progress: None,
+            maintenance: None,
+            io: None,
+            statements: None,
+            view_errors: None,
         }
+    }
+
+    fn view_error(&mut self, tier: Tier, message: String) {
+        self.view_errors
+            .get_or_insert_with(BTreeMap::new)
+            .insert(tier.name(), message);
     }
 }
 
@@ -321,6 +353,9 @@ pub(crate) fn spawn(
         backoff: RECONNECT_BACKOFF_MIN,
         retry_at: None,
         last_activity: None,
+        last_tier: HashMap::new(),
+        io: IoTracker::default(),
+        statements: StatementTracker::default(),
     };
     let task = tauri::async_runtime::spawn(sampler.run(inbox));
     MonitorHandle {
@@ -342,6 +377,9 @@ struct Sampler {
     backoff: Duration,
     retry_at: Option<Instant>,
     last_activity: Option<Instant>,
+    last_tier: HashMap<Tier, Instant>,
+    io: IoTracker,
+    statements: StatementTracker,
 }
 
 fn ticker(interval: Duration) -> tokio::time::Interval {
@@ -363,11 +401,23 @@ impl Sampler {
                         let resumed = self.settings.paused && !next.paused;
                         let retimed = next.interval != self.settings.interval;
                         let activity_on = next.activity && !self.settings.activity;
+                        let before = self.settings.views;
                         self.settings = next;
+                        for tier in Tier::ALL {
+                            let (was, is) = (tier.enabled(before), tier.enabled(next.views));
+                            if is && !was {
+                                // A view just opened: fetch its tier on the next tick.
+                                self.last_tier.remove(&tier);
+                            }
+                            if was && !is {
+                                self.forget_tier(tier);
+                            }
+                        }
                         if resumed {
                             // Nothing was sampled while paused: diffing across the pause
                             // would show its average as one point.
                             self.tracker.clear();
+                            self.forget_views();
                         }
                         if resumed || activity_on {
                             self.last_activity = None;
@@ -409,6 +459,101 @@ impl Sampler {
         self.session.signal(pid, backend_start, action).await
     }
 
+    /// A tier's baseline no longer describes the server's recent past.
+    fn forget_tier(&mut self, tier: Tier) {
+        self.last_tier.remove(&tier);
+        match tier {
+            Tier::Io => self.io.clear(),
+            Tier::Statements => self.statements.clear(),
+            _ => {}
+        }
+    }
+
+    fn forget_views(&mut self) {
+        for tier in Tier::ALL {
+            self.forget_tier(tier);
+        }
+    }
+
+    fn tier_due(&self, tier: Tier, now: Instant) -> bool {
+        if !tier.enabled(self.settings.views) || !self.tier_supported(tier) {
+            return false;
+        }
+        let every = tier.every().max(self.settings.interval);
+        let slack = Duration::from_millis(100);
+        self.last_tier
+            .get(&tier)
+            .is_none_or(|last| now.duration_since(*last) + slack >= every)
+    }
+
+    /// A tier the server cannot answer is never queried; the frontend explains why
+    /// from the probe (version, extension).
+    fn tier_supported(&self, tier: Tier) -> bool {
+        let probe = &self.session.probe;
+        match tier {
+            Tier::Io => probe.version_num >= views::IO_VERSION_NUM,
+            Tier::Statements => probe.statements_available,
+            _ => true,
+        }
+    }
+
+    /// Run every view tier that is due, filling `event`. A failing tier is reported
+    /// by name and never fails the tick.
+    async fn view_tiers(&mut self, event: &mut MonitorEvent, now: Instant) {
+        for tier in Tier::ALL {
+            if !self.tier_due(tier, now) {
+                continue;
+            }
+            self.last_tier.insert(tier, now);
+            let at = now.duration_since(self.started);
+            let outcome = match tier {
+                Tier::Locks => self.session.locks().await.map(|v| event.locks = Some(v)),
+                Tier::Replication => self
+                    .session
+                    .replication()
+                    .await
+                    .map(|v| event.replication = Some(v)),
+                Tier::Progress => self
+                    .session
+                    .progress()
+                    .await
+                    .map(|v| event.progress = Some(v)),
+                Tier::Maintenance => self
+                    .session
+                    .maintenance()
+                    .await
+                    .map(|v| event.maintenance = Some(v)),
+                Tier::Io => match self.session.io_rows().await {
+                    Ok((c, rows)) => self.io.ingest(&c, &rows, at).map(|v| event.io = v),
+                    Err(e) => Err(e),
+                },
+                Tier::Statements => self.statement_tier(event, at).await,
+            };
+            if let Err(e) = outcome {
+                event.view_error(tier, e.message);
+            }
+        }
+    }
+
+    async fn statement_tier(
+        &mut self,
+        event: &mut MonitorEvent,
+        at: Duration,
+    ) -> Result<(), AppError> {
+        let (c, rows) = self.session.statement_rows().await?;
+        let Some((mut stmts, missing)) = self.statements.ingest(&c, &rows, at)? else {
+            return Ok(());
+        };
+        if !missing.is_empty() {
+            // Texts are a nicety: a failure here still shows the numbers.
+            if let Ok((tc, tr)) = self.session.statement_texts(&missing).await {
+                self.statements.fill_texts(&tc, &tr, &mut stmts);
+            }
+        }
+        event.statements = Some(stmts);
+        Ok(())
+    }
+
     fn elapsed_ms(&self) -> f64 {
         self.started.elapsed().as_secs_f64() * 1000.0
     }
@@ -438,6 +583,7 @@ impl Sampler {
             }
             // The new session has no history with us.
             self.tracker.clear();
+            self.forget_views();
             self.retry_at = None;
             self.backoff = RECONNECT_BACKOFF_MIN;
             self.last_activity = None;
@@ -475,6 +621,7 @@ impl Sampler {
                 Err(e) => event.activity_error = Some(e.message),
             }
         }
+        self.view_tiers(&mut event, done).await;
         Some(event)
     }
 
@@ -650,6 +797,7 @@ mod tests {
             interval_ms: Some(u64::MAX),
             paused: Some(true),
             activity: Some(false),
+            views: None,
         }
         .settings();
         assert_eq!(slow.interval, Duration::from_millis(MAX_INTERVAL_MS));

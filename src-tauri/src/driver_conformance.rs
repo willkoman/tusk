@@ -5751,9 +5751,9 @@ mod monitor_battery {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    type Events = Arc<Mutex<Vec<MonitorEvent>>>;
+    pub(super) type Events = Arc<Mutex<Vec<MonitorEvent>>>;
 
-    fn sink(events: &Events) -> monitor::Sink {
+    pub(super) fn sink(events: &Events) -> monitor::Sink {
         let events = events.clone();
         Arc::new(move |e: &MonitorEvent| {
             events
@@ -5763,13 +5763,13 @@ mod monitor_battery {
         })
     }
 
-    fn snapshot(events: &Events) -> Vec<MonitorEvent> {
+    pub(super) fn snapshot(events: &Events) -> Vec<MonitorEvent> {
         events.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Poll until an event at or after index `from` satisfies `pred`; returns it and
     /// the index just past it.
-    async fn wait_event(
+    pub(super) async fn wait_event(
         events: &Events,
         from: usize,
         what: &str,
@@ -5790,7 +5790,7 @@ mod monitor_battery {
         }
     }
 
-    async fn scalar(b: &Backend, sql: &str) -> Option<String> {
+    pub(super) async fn scalar(b: &Backend, sql: &str) -> Option<String> {
         let messages = b.pg().unwrap().simple_query(sql).await.expect(sql);
         let (_, rows) = crate::db::collect_rows(&messages).unwrap();
         rows.first().and_then(|r| r.first().cloned().flatten())
@@ -5919,6 +5919,7 @@ mod monitor_battery {
             interval_ms: Some(250),
             paused: None,
             activity: Some(true),
+            views: None,
         };
         let started = monitor::start(&state, &id, options, sink(&events))
             .await
@@ -6237,4 +6238,373 @@ async fn monitor_battery_postgres() {
         return;
     };
     monitor_battery::run(&cfg).await;
+}
+
+// --- database monitor views (PostgreSQL) ---
+//
+// The phase-2 view tiers against a live server: maintenance (dead tuples,
+// wraparound), replication slots, the lock-wait list and granted groups, COPY
+// progress, the checkpoint / temp-file / deadlock event counts, pg_stat_io rates and
+// pg_stat_statements deltas with their text, and that closing every view stops them.
+
+mod monitor_views_battery {
+    use super::connect;
+    use super::monitor_battery::{scalar, sink, snapshot, wait_event, Events};
+    use crate::db::ConnectionConfig;
+    use crate::driver::Backend;
+    use crate::monitor::{self, MonitorOptions, ViewSet};
+    use futures_util::StreamExt;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    async fn exec(b: &Backend, sql: &str) {
+        b.pg()
+            .unwrap()
+            .batch_execute(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {}", crate::db::AppError::from(e).message));
+    }
+
+    pub(super) async fn run(cfg: &ConnectionConfig) {
+        let state = crate::AppState::default();
+        let (user, _) = connect(cfg).await.expect("connect user session");
+        let id = state.register(user, false).expect("register");
+        let (setup, _) = connect(cfg).await.unwrap();
+        let version: i32 = scalar(&setup, "SHOW server_version_num")
+            .await
+            .unwrap()
+            .parse()
+            .unwrap();
+        let preload = scalar(&setup, "SHOW shared_preload_libraries")
+            .await
+            .unwrap_or_default()
+            .contains("pg_stat_statements");
+        if preload {
+            exec(&setup, "CREATE EXTENSION IF NOT EXISTS pg_stat_statements").await;
+        }
+        // Made on a short-lived session: PostgreSQL 15+ backends defer their
+        // statistics flush (up to 10 s while idle), but a backend that exits flushes.
+        let (maker, _) = connect(cfg).await.unwrap();
+        exec(
+            &maker,
+            "DROP TABLE IF EXISTS tusk_monitor_views; \
+             CREATE TABLE tusk_monitor_views (id int PRIMARY KEY, v int); \
+             INSERT INTO tusk_monitor_views SELECT g, g FROM generate_series(1, 2000) g; \
+             DELETE FROM tusk_monitor_views WHERE id > 1000",
+        )
+        .await;
+        drop(maker);
+        exec(
+            &setup,
+            "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'tusk_monitor_slot'; \
+             SELECT pg_create_physical_replication_slot('tusk_monitor_slot', true)",
+        )
+        .await;
+        // Table statistics reach pg_stat_user_tables once that backend has exited.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+        let events: Events = Arc::default();
+        let every_view = ViewSet {
+            locks: true,
+            statements: true,
+            replication: true,
+            tables: true,
+            io: true,
+        };
+        let options = MonitorOptions {
+            interval_ms: Some(250),
+            paused: None,
+            activity: Some(true),
+            views: Some(every_view),
+        };
+        let started = monitor::start(&state, &id, options, sink(&events))
+            .await
+            .expect("monitor start");
+        let generation = started.generation;
+        assert_eq!(
+            started.server.statements_available, preload,
+            "{:?}",
+            started.server.statements_note
+        );
+        if !preload {
+            assert!(
+                started.server.statements_note.is_some(),
+                "an unusable pg_stat_statements says why"
+            );
+        }
+
+        // Maintenance: the dead tuples just made, and every database's XID age.
+        let (e, _) = wait_event(&events, 0, "maintenance", |e| {
+            e.generation == generation && e.maintenance.is_some()
+        })
+        .await;
+        let m = e.maintenance.unwrap();
+        let t = m
+            .tables
+            .iter()
+            .find(|t| t.name == "tusk_monitor_views")
+            .expect("the table with dead tuples");
+        assert!(t.dead.unwrap_or(0) >= 1000, "{t:?}");
+        assert!(t.size_bytes.unwrap_or(0) > 0);
+        assert!(m
+            .wraparound
+            .iter()
+            .any(|d| d.database == "postgres" && d.xid_age > 0));
+        assert!(m.freeze_max_age.is_some_and(|v| v > 0));
+
+        // Replication: a primary with no replicas and the slot just created.
+        let (e, _) = wait_event(&events, 0, "replication", |e| {
+            e.generation == generation && e.replication.is_some()
+        })
+        .await;
+        let r = e.replication.unwrap();
+        assert!(!r.standby && r.receiver.is_none());
+        assert!(r.replicas.is_empty());
+        let slot = r
+            .slots
+            .iter()
+            .find(|s| s.name == "tusk_monitor_slot")
+            .expect("the slot");
+        assert!(!slot.active);
+        assert!(slot.retained_bytes.is_some_and(|b| b >= 0));
+        assert_eq!(slot.wal_status.is_some(), version >= 130_000);
+
+        // Locks: a holder idle in transaction and a waiter queued behind it.
+        let (holder, _) = connect(cfg).await.unwrap();
+        let holder_pid: i32 = scalar(&holder, "SELECT pg_backend_pid()")
+            .await
+            .unwrap()
+            .parse()
+            .unwrap();
+        exec(
+            &holder,
+            "BEGIN; LOCK TABLE tusk_monitor_views IN ACCESS EXCLUSIVE MODE",
+        )
+        .await;
+        let (waiter, _) = connect(cfg).await.unwrap();
+        let waiting = tokio::spawn(async move {
+            waiter
+                .pg()
+                .unwrap()
+                .simple_query("SELECT count(*) FROM tusk_monitor_views")
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+        let mark = snapshot(&events).len();
+        let (e, _) = wait_event(&events, mark, "the lock wait", |e| {
+            e.generation == generation
+                && e.locks
+                    .as_ref()
+                    .is_some_and(|l| l.waiting.iter().any(|w| w.blocked_by.contains(&holder_pid)))
+        })
+        .await;
+        let locks = e.locks.unwrap();
+        let w = locks
+            .waiting
+            .iter()
+            .find(|w| w.blocked_by.contains(&holder_pid))
+            .unwrap();
+        assert_eq!(w.locktype, "relation");
+        assert_eq!(w.mode, "AccessShareLock");
+        assert!(w.target.contains("tusk_monitor_views"), "{}", w.target);
+        assert_eq!(
+            w.waited_ms.is_some(),
+            version >= 140_000,
+            "waitstart is PostgreSQL 14+"
+        );
+        assert!(!w.backend_start.is_empty());
+        assert!(locks.waiting_total >= 1);
+        let held = locks
+            .held
+            .iter()
+            .find(|h| h.mode == "AccessExclusiveLock" && h.target.contains("tusk_monitor_views"))
+            .expect("the holder's lock among the granted groups");
+        assert!(held.pids.contains(&holder_pid));
+        assert!(locks
+            .held
+            .iter()
+            .all(|h| h.locktype != "virtualxid" && h.locktype != "transactionid"));
+        exec(&holder, "ROLLBACK").await;
+        tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        // Progress: a COPY that takes a few seconds (PostgreSQL 14+ reports COPY).
+        if version >= 140_000 {
+            let (copier, _) = connect(cfg).await.unwrap();
+            let copying = tokio::spawn(async move {
+                let stream = copier
+                    .pg()
+                    .unwrap()
+                    .copy_out("COPY (SELECT pg_sleep(3)) TO STDOUT")
+                    .await
+                    .unwrap();
+                let chunks: Vec<_> = stream.collect().await;
+                chunks.len()
+            });
+            let mark = snapshot(&events).len();
+            let (e, _) = wait_event(&events, mark, "COPY progress", |e| {
+                e.generation == generation
+                    && e.progress
+                        .as_ref()
+                        .is_some_and(|p| p.iter().any(|p| p.kind == "copy to"))
+            })
+            .await;
+            let p = e
+                .progress
+                .unwrap()
+                .into_iter()
+                .find(|p| p.kind == "copy to")
+                .unwrap();
+            assert_eq!(p.total, None, "a query COPY has no known total");
+            assert!(p.query.unwrap_or_default().contains("pg_sleep"));
+            tokio::time::timeout(Duration::from_secs(10), copying)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        // Events: a requested checkpoint, a temporary file, a deadlock.
+        let mark = snapshot(&events).len();
+        exec(&setup, "CHECKPOINT").await;
+        wait_event(&events, mark, "a checkpoint event", |e| {
+            e.generation == generation
+                && e.rates.is_some_and(|r| r.events.checkpoints_requested >= 1)
+        })
+        .await;
+        let mark = snapshot(&events).len();
+        exec(
+            &setup,
+            "SET work_mem = '64kB'; \
+             SELECT count(*) FROM (SELECT g FROM generate_series(1, 300000) g ORDER BY g DESC) s; \
+             RESET work_mem",
+        )
+        .await;
+        wait_event(&events, mark, "a temp-file event", |e| {
+            e.generation == generation && e.rates.is_some_and(|r| r.events.temp_files >= 1)
+        })
+        .await;
+        let (a, _) = connect(cfg).await.unwrap();
+        let (b, _) = connect(cfg).await.unwrap();
+        exec(
+            &a,
+            "BEGIN; UPDATE tusk_monitor_views SET v = v + 1 WHERE id = 1",
+        )
+        .await;
+        exec(
+            &b,
+            "BEGIN; UPDATE tusk_monitor_views SET v = v + 1 WHERE id = 2",
+        )
+        .await;
+        let mark = snapshot(&events).len();
+        let first = tokio::spawn(async move {
+            let r = a
+                .pg()
+                .unwrap()
+                .batch_execute("UPDATE tusk_monitor_views SET v = v + 1 WHERE id = 2")
+                .await
+                .map_err(|e| crate::db::AppError::from(e).message);
+            (a, r)
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let second = b
+            .pg()
+            .unwrap()
+            .batch_execute("UPDATE tusk_monitor_views SET v = v + 1 WHERE id = 1")
+            .await
+            .map_err(|e| crate::db::AppError::from(e).message);
+        let (a, first) = tokio::time::timeout(Duration::from_secs(10), first)
+            .await
+            .unwrap()
+            .unwrap();
+        let victim = first
+            .err()
+            .or(second.err())
+            .expect("one side is the deadlock victim");
+        assert!(victim.contains("deadlock"), "{victim}");
+        let _ = a.pg().unwrap().batch_execute("ROLLBACK").await;
+        let _ = b.pg().unwrap().batch_execute("ROLLBACK").await;
+        wait_event(&events, mark, "a deadlock event", |e| {
+            e.generation == generation && e.rates.is_some_and(|r| r.events.deadlocks >= 1)
+        })
+        .await;
+
+        // I/O (PostgreSQL 16+) and statements: rates need a second reading, 10 s on.
+        if version >= 160_000 {
+            let (e, _) = wait_event(&events, 0, "I/O rates", |e| {
+                e.generation == generation && e.io.is_some()
+            })
+            .await;
+            let io = e.io.unwrap();
+            assert!(io.seconds > 0.0);
+            assert!(
+                io.rows.iter().any(|r| r.backend_type == "client backend"),
+                "{:?}",
+                io.rows.first()
+            );
+        }
+        if preload {
+            let (e, _) = wait_event(&events, 0, "statement deltas", |e| {
+                e.generation == generation && e.statements.is_some()
+            })
+            .await;
+            let s = e.statements.unwrap();
+            assert!(s.seconds > 0.0);
+            assert!(s.total_calls > 0.0);
+            assert!(!s.rows.is_empty());
+            assert!(
+                s.rows.iter().any(|r| r.query.is_some()),
+                "texts are fetched for the top statements"
+            );
+            assert!(s.tracked >= s.rows.len() as u32);
+        }
+
+        let all = snapshot(&events);
+        let errors: Vec<_> = all.iter().filter_map(|e| e.view_errors.clone()).collect();
+        assert!(errors.is_empty(), "no view tier failed: {errors:?}");
+
+        // Closing every view stops every view tier.
+        monitor::configure(
+            &state,
+            &id,
+            generation,
+            MonitorOptions {
+                views: None,
+                ..options
+            },
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let mark = snapshot(&events).len();
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let after = snapshot(&events);
+        assert!(after.len() > mark, "the fast tier keeps ticking");
+        assert!(
+            after[mark..].iter().all(|e| e.locks.is_none()
+                && e.replication.is_none()
+                && e.progress.is_none()
+                && e.maintenance.is_none()
+                && e.io.is_none()
+                && e.statements.is_none()),
+            "no view tier runs once its view closed"
+        );
+
+        state.monitors.stop_all();
+        exec(&setup, "SELECT pg_drop_replication_slot('tusk_monitor_slot'); DROP TABLE IF EXISTS tusk_monitor_views").await;
+        if preload {
+            exec(&setup, "DROP EXTENSION IF EXISTS pg_stat_statements").await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn monitor_views_postgres() {
+    let Some(cfg) = pg_cfg() else {
+        eprintln!("SKIP monitor_views_postgres (set TUSK_TEST_PG_PORT)");
+        return;
+    };
+    monitor_views_battery::run(&cfg).await;
 }

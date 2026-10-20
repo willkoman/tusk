@@ -57,7 +57,9 @@ echo "Starting Postgres + MySQL + SQL Server + OpenSSH containers…"
 # A user-defined network gives the SSH container DNS for `tusk-it-pg`, which is the
 # database address the tunnel test forwards to.
 docker network create "$NETWORK" >/dev/null
-docker run -d --rm --name tusk-it-pg --network "$NETWORK" -e POSTGRES_PASSWORD=test -p "127.0.0.1:${PG_PORT}:5432" "$PG_IMAGE" >/dev/null
+# pg_stat_statements is preloaded so the monitor battery can read its Statements view.
+docker run -d --rm --name tusk-it-pg --network "$NETWORK" -e POSTGRES_PASSWORD=test -p "127.0.0.1:${PG_PORT}:5432" "$PG_IMAGE" \
+  postgres -c shared_preload_libraries=pg_stat_statements >/dev/null
 docker run -d --rm --name tusk-it-mysql --network "$NETWORK" -e MYSQL_ROOT_PASSWORD=test -e MYSQL_DATABASE=test -p "127.0.0.1:${MY_PORT}:3306" "$MY_IMAGE" >/dev/null
 docker run -d --rm --name tusk-it-mssql --network "$NETWORK" \
   -e ACCEPT_EULA=Y -e MSSQL_PID=Developer -e "MSSQL_SA_PASSWORD=${MS_PASSWORD}" \

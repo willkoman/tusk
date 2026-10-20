@@ -446,6 +446,15 @@ pub(crate) const MONITOR_TEXT_LIMITS: TextLimits = TextLimits {
     ..CATALOG_TEXT_LIMITS
 };
 
+/// The monitor's `pg_stat_statements` read: one numbers-only row per tracked
+/// statement (no query text), so more rows than any other monitor list, each tiny.
+pub(crate) const MONITOR_STATEMENT_LIMITS: TextLimits = TextLimits {
+    max_rows: 10_000,
+    max_cell_bytes: 1024,
+    max_total_bytes: 8 * 1024 * 1024,
+    ..MONITOR_TEXT_LIMITS
+};
+
 pub(crate) const DDL_TEXT_LIMITS: TextLimits = TextLimits {
     max_rows: 100_000,
     max_cell_bytes: 8 * 1024 * 1024,
