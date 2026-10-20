@@ -167,6 +167,7 @@ import { closeSurfaces, type Surface } from "./surfaces";
 import { isMonitorTab } from "./tabs";
 import { MonitorSession, sweepStaleMonitors, type MonitorView } from "./monitor/session";
 import { appVisible, watchAppVisibility } from "./monitor/visibility";
+import { csvSampleCount, exportStem, toHex, type ChartExport } from "./monitor/export";
 import { HIDDEN_QUERY, signalRefusal, waitLabel, type ActivityRow, type MonitorSample } from "./monitor/model";
 import {
   IDLE_TRANSACTION,
@@ -1414,6 +1415,61 @@ function App() {
         { label: "Copy query", icon: "copy", onClick: () => copyText(text, "copied query") },
         { label: "Open query in new tab", icon: "fileCode", onClick: () => openGeneratedTab(text.endsWith(";") ? text : `${text};`, null, "Statement") },
         { label: "Explain in new tab", icon: "code", disabled: !activeDatabaseAllowed(), onClick: () => explainInNewTab(text) },
+      ],
+    });
+  }
+
+  /** A Monitor chart's export menu: copy or save it as an image, or save its samples as CSV. */
+  function openMonitorChartMenu(e: MouseEvent, chart: ChartExport, session: MonitorSession) {
+    e.preventDefault();
+    const origin = captureOrigin();
+    const note = (status: string) => {
+      if (origin.tabId && originAlive(origin)) patchResult(origin.tabId, { status });
+    };
+    const stem = () => exportStem(labelOf(session.connectionId), chart.title, new Date());
+    const copyImage = async () => {
+      try {
+        const blob = await chart.png();
+        await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+        note(`Copied ${chart.title} as an image`);
+      } catch (err) {
+        note(`Could not copy the image: ${errMsg(err)}`);
+      }
+    };
+    const saveImage = async () => {
+      try {
+        const blob = await chart.png();
+        const path = await chooseSavePath({ defaultPath: `${stem()}.png`, filters: [{ name: "PNG image", extensions: ["png"] }] });
+        if (!path) return;
+        await commands.writeImageFile(path, toHex(new Uint8Array(await blob.arrayBuffer())));
+        note(`Saved ${chart.title} to ${path}`);
+      } catch (err) {
+        note(`Could not save the image: ${errMsg(err)}`);
+      }
+    };
+    const saveCsv = async (csv: () => string, name: string) => {
+      try {
+        const text = csv();
+        const path = await chooseSavePath({ defaultPath: `${name}.csv`, filters: [{ name: "CSV", extensions: ["csv"] }] });
+        if (!path) return;
+        await commands.writeTextFile(path, text);
+        note(`Saved ${csvSampleCount(text).toLocaleString()} samples to ${path}`);
+      } catch (err) {
+        note(`Could not save the CSV: ${errMsg(err)}`);
+      }
+    };
+    const range = session.range() ? "the frozen range" : "the window";
+    setMenu({
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        { head: chart.title, sub: `Exports ${range}` },
+        { label: "Copy image", icon: "copy", onClick: () => void copyImage() },
+        { label: "Save image…", icon: "download", onClick: () => void saveImage() },
+        { label: "Save CSV…", icon: "download", onClick: () => void saveCsv(chart.csv, stem()) },
+        ...(chart.allCsv
+          ? [{ label: "Save every chart as CSV…", icon: "download" as const, onClick: () => void saveCsv(chart.allCsv!, exportStem(labelOf(session.connectionId), "overview", new Date())) }]
+          : []),
       ],
     });
   }
@@ -6366,6 +6422,7 @@ function App() {
                     onRowMenu={(e, row) => openMonitorRowMenu(e, row, session)}
                     onQueryMenu={openMonitorQueryMenu}
                     onOpenSettings={() => setSettingsOpen("monitor")}
+                    onChartExport={(e, chart) => openMonitorChartMenu(e, chart, session)}
                   />
                 )}
               </Show>

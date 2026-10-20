@@ -2087,6 +2087,74 @@ async fn write_text_file(path: String, contents: String) -> Result<(), AppError>
     atomic_write(std::path::PathBuf::from(path), contents.into_bytes()).await
 }
 
+/// The largest PNG `write_image_file` accepts (a Monitor chart is ~100 KiB).
+const MAX_IMAGE_FILE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Decode the lowercase/uppercase hex form a PNG crosses IPC in, or `None`.
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    let digit = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    let bytes = text.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    bytes
+        .chunks_exact(2)
+        .map(|pair| Some(digit(pair[0])? << 4 | digit(pair[1])?))
+        .collect()
+}
+
+/// Bytes of a PNG sent as hex, after the size and signature checks.
+fn png_from_hex(hex: &str) -> Result<Vec<u8>, AppError> {
+    if hex.len() > MAX_IMAGE_FILE_BYTES * 2 {
+        return Err(AppError::new(format!(
+            "image exceeds the {MAX_IMAGE_FILE_BYTES}-byte limit"
+        )));
+    }
+    let bytes = decode_hex(hex).ok_or_else(|| AppError::new("image data is not valid hex"))?;
+    const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if !bytes.starts_with(&PNG_SIGNATURE) {
+        return Err(AppError::new("image data is not a PNG"));
+    }
+    Ok(bytes)
+}
+
+/// Write a PNG by absolute path (from a native save dialog): a Monitor chart image.
+#[tauri::command]
+async fn write_image_file(path: String, png_hex: String) -> Result<(), AppError> {
+    let bytes = png_from_hex(&png_hex)?;
+    atomic_write(std::path::PathBuf::from(path), bytes).await
+}
+
+#[cfg(test)]
+mod image_file_tests {
+    use super::{decode_hex, png_from_hex, MAX_IMAGE_FILE_BYTES};
+
+    #[test]
+    fn hex_decodes_both_cases_and_rejects_anything_else() {
+        assert_eq!(decode_hex("00ffA0"), Some(vec![0x00, 0xff, 0xa0]));
+        assert_eq!(decode_hex(""), Some(vec![]));
+        assert_eq!(decode_hex("abc"), None);
+        assert_eq!(decode_hex("zz"), None);
+        assert_eq!(decode_hex("0x"), None);
+    }
+
+    #[test]
+    fn only_a_bounded_png_is_accepted() {
+        assert!(png_from_hex("89504e470d0a1a0a0000").is_ok());
+        let not_png = png_from_hex("474946383961").unwrap_err().message;
+        assert!(not_png.contains("not a PNG"), "{not_png}");
+        assert!(png_from_hex("89504e470d0a1a").is_err());
+        let huge = "0".repeat(MAX_IMAGE_FILE_BYTES * 2 + 2);
+        let too_big = png_from_hex(&huge).unwrap_err().message;
+        assert!(too_big.contains("limit"), "{too_big}");
+    }
+}
+
 async fn atomic_write(path: std::path::PathBuf, bytes: Vec<u8>) -> Result<(), AppError> {
     tokio::task::spawn_blocking(move || {
         use std::io::Write;
@@ -2525,6 +2593,7 @@ pub fn run() {
             export::export_tables,
             read_text_file,
             write_text_file,
+            write_image_file,
             load_history,
             save_history,
             migrate_history,

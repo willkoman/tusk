@@ -167,6 +167,8 @@ export const commands = {
   // files + history
   readTextFile: (path: string) => invoke<string>("read_text_file", { path }),
   writeTextFile: (path: string, contents: string) => invoke<void>("write_text_file", { path, contents }),
+  /** A PNG (Monitor chart image) as lowercase hex; ≤ 8 MiB, checked in Rust. */
+  writeImageFile: (path: string, pngHex: string) => invoke<void>("write_image_file", { path, pngHex }),
   loadHistory: (connKey: string) => invoke<string>("load_history", { connKey }),
   saveHistory: (connKey: string, json: string) => invoke<void>("save_history", { connKey, json }),
   migrateHistory: (fromKey: string, toKey: string) => invoke<string>("migrate_history", { fromKey, toKey }),

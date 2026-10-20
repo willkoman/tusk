@@ -43,6 +43,7 @@ import { INTERVALS, WINDOWS, type MonitorSession, type MonitorView } from "./ses
 import { EVENT_COLORS, TimeSeries, type SeriesSpec } from "./TimeSeries";
 import { IoView, LocksView, ReplicationView, StatementsView, TablesView } from "./Views";
 import { monitorThresholds } from "./thresholds";
+import { chartCsv, composeChartPng, type ChartExport, type CsvColumn } from "./export";
 
 const WAIT_COLORS = ["--chart-1", "--chart-2", "--chart-3", "--chart-4", "--chart-5", "--chart-6", "--chart-7", "--chart-8", "--chart-9", "--chart-10", "--muted"];
 
@@ -204,7 +205,32 @@ function Legend(props: { session: MonitorSession; panes: Pane[]; hidden: () => R
 
 const NONE: ReadonlySet<number> = new Set();
 
-function ChartCard(props: { session: MonitorSession; def: ChartDef }) {
+/** The range a chart export covers: the frozen range, else the whole visible window. */
+function exportRange(s: MonitorSession): { t0: number; t1: number } {
+  const r = s.range();
+  if (r) return r;
+  const now = performance.now();
+  return { t0: now - s.windowMs(), t1: now };
+}
+
+const toWall = (t: number) => Date.now() - performance.now() + t;
+
+function csvColumns(s: MonitorSession, def: ChartDef): CsvColumn[] {
+  const out: CsvColumn[] = [];
+  for (const pane of def.panes) {
+    if (pane.when && !pane.when(s)) continue;
+    const buffer = pane.buffer(s);
+    pane.series.forEach((spec, k) => {
+      const unit = pane.bytes ? " (B/s)" : "";
+      const prefix = def.panes.length > 1 || def.id === "load" || def.id === "sessions" ? `${def.title}: ` : "";
+      out.push({ buffer, series: k, label: `${prefix}${spec.label}${unit}` });
+    });
+  }
+  return out;
+}
+
+function ChartCard(props: { session: MonitorSession; def: ChartDef; onExport: (e: MouseEvent, chart: ChartExport) => void }) {
+  let card!: HTMLElement;
   const [hidden, setHidden] = createSignal<ReadonlySet<string>>(new Set());
   // Per pane, the series the legend switched off (read by the canvas every frame).
   const hiddenByPane = createMemo(() => {
@@ -216,6 +242,30 @@ function ChartCard(props: { session: MonitorSession; def: ChartDef }) {
     return out;
   });
   const panes = () => props.def.panes.filter((p) => !p.when || p.when(props.session));
+  const chartExport = (): ChartExport => ({
+    title: props.def.title,
+    csv: () => {
+      const r = exportRange(props.session);
+      return chartCsv(csvColumns(props.session, props.def), r.t0, r.t1, toWall);
+    },
+    png: () => {
+      const s = props.session;
+      const r = s.range();
+      const cs = getComputedStyle(card);
+      const legend = panes().flatMap((pane, p) =>
+        pane.series
+          .map((spec, k) => ({ spec, k }))
+          .filter(({ k }) => !hidden().has(`${p}:${k}`))
+          .map(({ spec, k }) => {
+            const buf = pane.buffer(s);
+            const v = r ? NaN : latestValue(buf, k);
+            return { label: spec.label, color: cs.getPropertyValue(spec.color).trim() || "#888", value: Number.isFinite(v) ? pane.format(v) : "" };
+          }),
+      );
+      const when = r ? `${new Date(toWall(r.t0)).toLocaleString()} – ${new Date(toWall(r.t1)).toLocaleTimeString()}` : new Date().toLocaleString();
+      return composeChartPng(card, props.def.title, when, legend);
+    },
+  });
   const toggle = (key: string, isolate: boolean) => {
     const all = panes().flatMap((pane, p) => pane.series.map((_, k) => `${p}:${k}`));
     if (isolate) {
@@ -230,10 +280,18 @@ function ChartCard(props: { session: MonitorSession; def: ChartDef }) {
     setHidden(next);
   };
   return (
-    <section class="monitor-card">
+    <section class="monitor-card" ref={card}>
       <header class="mc-head">
         <h3>{props.def.title}</h3>
         <span class="mc-info" title={props.def.source} aria-label={`About: ${props.def.source}`}><Icon name="help" /></span>
+        <button
+          class="icon mc-export"
+          title="Export this chart"
+          aria-label={`Export ${props.def.title}`}
+          onClick={(e) => props.onExport(e, chartExport())}
+        >
+          <Icon name="more" />
+        </button>
       </header>
       <For each={panes()}>
         {(pane, p) => (
@@ -417,6 +475,7 @@ export default function MonitorTab(props: {
   onRowMenu: (e: MouseEvent, row: ActivityRow) => void;
   onQueryMenu: (e: MouseEvent, query: string) => void;
   onOpenSettings: () => void;
+  onChartExport: (e: MouseEvent, chart: ChartExport) => void;
 }) {
   const s = props.session;
   let host: HTMLDivElement | undefined;
@@ -444,6 +503,11 @@ export default function MonitorTab(props: {
 
   const server = () => s.started()?.server ?? null;
   const latest = () => s.latest();
+  /** Every Overview chart's samples in the export range, joined on time. */
+  const allCsv = () => {
+    const r = exportRange(s);
+    return chartCsv(CHARTS.flatMap((def) => csvColumns(s, def).map((c) => ({ ...c, label: c.label.startsWith(`${def.title}: `) ? c.label : `${def.title}: ${c.label}` }))), r.t0, r.t1, toWall);
+  };
   const tileMean = (key: TileKey) => {
     void s.tick();
     return windowMean(s.data.tiles, tileIndex(key), (s.data.last ?? 0) - 60_000);
@@ -650,7 +714,7 @@ export default function MonitorTab(props: {
           <Switch>
             <Match when={s.view() === "overview"}>
               <div class="monitor-grid" style={{ "grid-template-columns": `repeat(${chartColumns(width())}, minmax(0, 1fr))` }}>
-                <For each={CHARTS}>{(def) => <ChartCard session={s} def={def} />}</For>
+                <For each={CHARTS}>{(def) => <ChartCard session={s} def={def} onExport={(e, chart) => props.onChartExport(e, { ...chart, allCsv })} />}</For>
               </div>
               <EventsCard session={s} />
               <Show when={s.range()} fallback={<ActiveNow session={s} onRowMenu={props.onRowMenu} />}>
