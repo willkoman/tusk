@@ -168,6 +168,7 @@ import { isMonitorTab } from "./tabs";
 import { MonitorSession, sweepStaleMonitors, type MonitorView } from "./monitor/session";
 import { appVisible, watchAppVisibility } from "./monitor/visibility";
 import { csvSampleCount, exportStem, toHex, type ChartExport } from "./monitor/export";
+import { engineProfile, isMonitorEngine } from "./monitor/engines";
 import { HIDDEN_QUERY, signalRefusal, waitLabel, type ActivityRow, type MonitorSample } from "./monitor/model";
 import {
   IDLE_TRANSACTION,
@@ -642,7 +643,7 @@ function App() {
   const monitorTabOf = (connectionId: string | null) =>
     connectionId ? tabs().find((t) => t.connectionId === connectionId && isMonitorTab(t)) ?? null : null;
   /** PostgreSQL only until phase 3 (plan decision 4); other engines show no Monitor entry at all. */
-  const canMonitor = () => !!conn() && connectionKind() === "postgres";
+  const canMonitor = () => !!conn() && isMonitorEngine(connectionKind());
   const [persistenceWarning, setPersistenceWarning] = createSignal("");
 
   const patchTab = (id: string, patch: Partial<Tab>) =>
@@ -1377,6 +1378,8 @@ function App() {
     const tabId = [...monitorSessions].find(([, s]) => s === session)?.[0];
     if (!tabId) return;
     const query = row.query && row.query !== HIDDEN_QUERY ? row.query : "";
+    const kind = kindOf(session.connectionId);
+    const profile = engineProfile(isMonitorEngine(kind) ? kind : "postgres");
     const noQuery = query ? undefined : row.query === HIDDEN_QUERY ? "Another role's query is hidden from this role" : "No query text";
     const truncated = row.queryTruncated ? "The query text was truncated, so it may not run as shown" : undefined;
     const refusal = signalRefusal(row, {
@@ -1398,7 +1401,9 @@ function App() {
         { label: "Explain in new tab", icon: "code", disabled: !query || !activeDatabaseAllowed(), title: noQuery ?? truncated, onClick: () => explainInNewTab(query) },
         { label: "Copy pid", icon: "copy", onClick: () => copyText(String(row.pid), "copied pid") },
         { sep: "danger" },
-        { label: "Cancel query…", icon: "close", danger: true, disabled: !!refusal || row.state !== "active", title: refusal || (row.state !== "active" ? "Only a running query can be cancelled" : undefined), onClick: ask("cancel") },
+        ...(profile.canCancel
+          ? [{ label: "Cancel query…", icon: "close" as const, danger: true, disabled: !!refusal || row.state !== "active", title: refusal || (row.state !== "active" ? "Only a running query can be cancelled" : undefined), onClick: ask("cancel") }]
+          : []),
         { label: "Terminate session…", icon: "trash", danger: true, disabled: !!refusal, title: refusal || undefined, onClick: ask("terminate") },
       ],
     });
@@ -1483,8 +1488,8 @@ function App() {
       closeMonitorSignal();
       return;
     }
-    const fn = ask.action === "cancel" ? "pg_cancel_backend" : "pg_terminate_backend";
-    const sqlText = `-- [Monitor] SELECT ${fn}(${ask.row.pid})`;
+    const kind = kindOf(ask.connectionId);
+    const sqlText = `-- [Monitor] ${engineProfile(isMonitorEngine(kind) ? kind : "postgres").signalSql(ask.action, ask.row.pid)}`;
     const started = performance.now();
     setMonitorSignalBusy(true);
     try {
@@ -6417,7 +6422,7 @@ function App() {
                   <MonitorTab
                     session={session}
                     connectionLabel={labelOf(session.connectionId)}
-                    isPostgres={kindOf(session.connectionId) === "postgres"}
+                    engine={kindOf(session.connectionId) ?? ""}
                     production={prodBadge()}
                     onRowMenu={(e, row) => openMonitorRowMenu(e, row, session)}
                     onQueryMenu={openMonitorQueryMenu}
@@ -7082,9 +7087,10 @@ function App() {
               onClose={closeMonitorSignal}
             >
               <p class="confirm-text">
-                {ask().action === "cancel"
-                  ? "Sends pg_cancel_backend: the running statement stops with an error, and a transaction it was part of can only roll back. The session stays connected."
-                  : "Sends pg_terminate_backend: the session disconnects and its open transaction rolls back."}
+                {(() => {
+                  const kind = kindOf(ask().connectionId);
+                  return engineProfile(isMonitorEngine(kind) ? kind : "postgres").signalEffect[ask().action];
+                })()}
               </p>
               <dl class="monitor-signal-facts">
                 <dt>PID</dt><dd>{ask().row.pid}</dd>

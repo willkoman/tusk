@@ -3,7 +3,6 @@ import { Icon } from "../Icons";
 import { ActivityTable, stateClass, useServerNow } from "./ActivityTable";
 import { chartColumns } from "./layout";
 import {
-  EVENT_KINDS,
   EVENT_LABELS,
   FPI_SERIES,
   WRITES_SERIES,
@@ -44,6 +43,7 @@ import { EVENT_COLORS, TimeSeries, type SeriesSpec } from "./TimeSeries";
 import { IoView, LocksView, ReplicationView, StatementsView, TablesView } from "./Views";
 import { monitorThresholds } from "./thresholds";
 import { chartCsv, composeChartPng, type ChartExport, type CsvColumn } from "./export";
+import { engineProfile, isMonitorEngine, omitted, seriesLabel, viewFor, type ChartId, type EngineProfile } from "./engines";
 
 const WAIT_COLORS = ["--chart-1", "--chart-2", "--chart-3", "--chart-4", "--chart-5", "--chart-6", "--chart-7", "--chart-8", "--chart-9", "--chart-10", "--muted"];
 
@@ -110,9 +110,28 @@ type Pane = {
   markers?: EventKind[];
   /** Byte series: binary steps and short axis labels. */
   bytes?: boolean;
+  /** Series this engine has no counter for: never drawn, listed or exported. */
+  omit?: ReadonlySet<number>;
 };
 
-type ChartDef = { id: string; title: string; source: string; panes: Pane[] };
+type ChartDef = { id: ChartId; title: string; source: string; panes: Pane[] };
+
+/** A chart as this engine names it, or null when the engine has nothing to draw. */
+function localize(def: ChartDef, profile: EngineProfile): ChartDef | null {
+  const text = profile.charts[def.id];
+  if (text?.hidden) return null;
+  const relabel = def.id === "load" ? profile.waitLabels : null;
+  return {
+    ...def,
+    title: text?.title ?? def.title,
+    source: text?.source ?? def.source,
+    panes: def.panes.map((pane, p) => ({
+      ...pane,
+      omit: omitted(text, p),
+      series: pane.series.map((spec, k) => ({ ...spec, label: seriesLabel(text, p, k, relabel?.[k] ?? spec.label) })),
+    })),
+  };
+}
 
 const CHARTS: ChartDef[] = [
   {
@@ -183,6 +202,7 @@ function Legend(props: { session: MonitorSession; panes: Pane[]; hidden: () => R
           <For each={pane.series}>
             {(spec, k) => {
               const key = `${p()}:${k()}`;
+              if (pane.omit?.has(k())) return null;
               return (
                 <button
                   class="mc-key"
@@ -221,6 +241,7 @@ function csvColumns(s: MonitorSession, def: ChartDef): CsvColumn[] {
     if (pane.when && !pane.when(s)) continue;
     const buffer = pane.buffer(s);
     pane.series.forEach((spec, k) => {
+      if (pane.omit?.has(k)) return;
       const unit = pane.bytes ? " (B/s)" : "";
       const prefix = def.panes.length > 1 || def.id === "load" || def.id === "sessions" ? `${def.title}: ` : "";
       out.push({ buffer, series: k, label: `${prefix}${spec.label}${unit}` });
@@ -232,9 +253,10 @@ function csvColumns(s: MonitorSession, def: ChartDef): CsvColumn[] {
 function ChartCard(props: { session: MonitorSession; def: ChartDef; onExport: (e: MouseEvent, chart: ChartExport) => void }) {
   let card!: HTMLElement;
   const [hidden, setHidden] = createSignal<ReadonlySet<string>>(new Set());
-  // Per pane, the series the legend switched off (read by the canvas every frame).
+  // Per pane, the series the legend switched off and those the engine has no counter
+  // for (read by the canvas every frame).
   const hiddenByPane = createMemo(() => {
-    const out: Set<number>[] = [];
+    const out: Set<number>[] = panes().map((pane) => new Set(pane.omit ?? []));
     for (const key of hidden()) {
       const [p, k] = key.split(":").map(Number);
       (out[p] ??= new Set<number>()).add(k);
@@ -255,7 +277,7 @@ function ChartCard(props: { session: MonitorSession; def: ChartDef; onExport: (e
       const legend = panes().flatMap((pane, p) =>
         pane.series
           .map((spec, k) => ({ spec, k }))
-          .filter(({ k }) => !hidden().has(`${p}:${k}`))
+          .filter(({ k }) => !hidden().has(`${p}:${k}`) && !pane.omit?.has(k))
           .map(({ spec, k }) => {
             const buf = pane.buffer(s);
             const v = r ? NaN : latestValue(buf, k);
@@ -267,7 +289,7 @@ function ChartCard(props: { session: MonitorSession; def: ChartDef; onExport: (e
     },
   });
   const toggle = (key: string, isolate: boolean) => {
-    const all = panes().flatMap((pane, p) => pane.series.map((_, k) => `${p}:${k}`));
+    const all = panes().flatMap((pane, p) => pane.series.flatMap((_, k) => (pane.omit?.has(k) ? [] : [`${p}:${k}`])));
     if (isolate) {
       const others = all.filter((x) => x !== key);
       const already = others.every((x) => hidden().has(x)) && !hidden().has(key);
@@ -317,7 +339,7 @@ function ChartCard(props: { session: MonitorSession; def: ChartDef; onExport: (e
 }
 
 /** Chart 8: checkpoints, deadlocks, conflicts, temp files and resets on the shared axis. */
-function EventsCard(props: { session: MonitorSession }) {
+function EventsCard(props: { session: MonitorSession; profile: EngineProfile }) {
   const s = props.session;
   const totals = createMemo(() => {
     void s.tick();
@@ -331,18 +353,18 @@ function EventsCard(props: { session: MonitorSession }) {
         <h3>Events</h3>
         <span
           class="mc-info"
-          title="Discrete events per sample, from pg_stat_database (deadlocks, recovery conflicts, temp files), the checkpoint counters, and counter resets. A larger dot is more in one interval."
+          title={props.profile.eventsSource}
         >
           <Icon name="help" />
         </span>
       </header>
       <TimeSeries session={s} buffer={s.data.writes} series={[]} lane height={64} label="Events on the shared time axis" />
       <div class="mc-legend">
-        <For each={[...EVENT_KINDS]}>
+        <For each={[...props.profile.events]}>
           {(kind) => (
             <span class="mc-key static">
               <i style={{ background: `var(${EVENT_COLORS[kind]})` }} />
-              <span class="mc-key-label">{EVENT_LABELS[kind]}</span>
+              <span class="mc-key-label">{props.profile.eventLabels[kind] ?? EVENT_LABELS[kind]}</span>
               <span class="mc-key-value">{totals()[kind]}</span>
             </span>
           )}
@@ -470,7 +492,8 @@ function ActiveNow(props: { session: MonitorSession; onRowMenu: (e: MouseEvent, 
 export default function MonitorTab(props: {
   session: MonitorSession;
   connectionLabel: string;
-  isPostgres: boolean;
+  /** The connection's driver kind; the monitor watches postgres, mysql and mssql. */
+  engine: string;
   production: JSX.Element | undefined;
   onRowMenu: (e: MouseEvent, row: ActivityRow) => void;
   onQueryMenu: (e: MouseEvent, query: string) => void;
@@ -478,6 +501,14 @@ export default function MonitorTab(props: {
   onChartExport: (e: MouseEvent, chart: ChartExport) => void;
 }) {
   const s = props.session;
+  // A tab's connection never changes engine, so the profile is read once.
+  const supported = isMonitorEngine(props.engine);
+  const profile = engineProfile(isMonitorEngine(props.engine) ? props.engine : "postgres");
+  const views = VIEWS.filter((v) => profile.views.includes(v.id));
+  const charts = CHARTS.map((def) => localize(def, profile)).filter((d): d is ChartDef => d !== null);
+  const view = () => viewFor(profile, s.view());
+  // A view this engine lacks (restored from another tab's habit) falls back to Overview.
+  if (view() !== s.view()) s.setView(view());
   let host: HTMLDivElement | undefined;
   const [width, setWidth] = createSignal(1200);
   const serverNow = useServerNow(s);
@@ -506,7 +537,7 @@ export default function MonitorTab(props: {
   /** Every Overview chart's samples in the export range, joined on time. */
   const allCsv = () => {
     const r = exportRange(s);
-    return chartCsv(CHARTS.flatMap((def) => csvColumns(s, def).map((c) => ({ ...c, label: c.label.startsWith(`${def.title}: `) ? c.label : `${def.title}: ${c.label}` }))), r.t0, r.t1, toWall);
+    return chartCsv(charts.flatMap((def) => csvColumns(s, def).map((c) => ({ ...c, label: c.label.startsWith(`${def.title}: `) ? c.label : `${def.title}: ${c.label}` }))), r.t0, r.t1, toWall);
   };
   const tileMean = (key: TileKey) => {
     void s.tick();
@@ -579,7 +610,7 @@ export default function MonitorTab(props: {
       value: () => (latest()?.blocked != null ? String(latest()!.blocked) : "–"),
       sub: () => "waiting on locks",
       tone: () => blockedTone(latest()?.blocked ?? null, monitorThresholds()),
-      onClick: () => s.setView("locks"),
+      onClick: () => s.setView(viewFor(profile, "locks") === "locks" ? "locks" : "activity"),
     },
     {
       key: "lag",
@@ -591,6 +622,14 @@ export default function MonitorTab(props: {
       when: () => latest()?.replicationLagMs != null,
     },
   ];
+
+  for (const tile of tiles) {
+    const o = profile.tiles[tile.key];
+    if (o) {
+      tile.source = o.source;
+      if (o.label) tile.label = o.label;
+    }
+  }
 
   const status = () => s.status();
   const statusText = () => {
@@ -613,7 +652,8 @@ export default function MonitorTab(props: {
     if (st.kind === "hidden") return "Sampling pauses while this tab or the window is hidden. Turn on Keep sampling to capture an incident in the background.";
     if (st.kind === "live") {
       const l = latest();
-      return l ? `Last tick ${l.latencyMs.toFixed(1)} ms round trip. The monitor holds one extra read-only connection named 'Tusk monitor'.` : "";
+      const sidecar = profile.engine === "postgres" ? "one extra read-only connection named 'Tusk monitor'" : "one extra connection of its own";
+      return l ? `Last tick ${l.latencyMs.toFixed(1)} ms round trip. The monitor holds ${sidecar}.` : "";
     }
     return "";
   };
@@ -621,8 +661,8 @@ export default function MonitorTab(props: {
   return (
     <div class="monitor" ref={host}>
       <Show
-        when={props.isPostgres}
-        fallback={<div class="monitor-empty"><p>The database monitor is PostgreSQL-only for now.</p></div>}
+        when={supported}
+        fallback={<div class="monitor-empty"><p>The database monitor watches PostgreSQL, MySQL / MariaDB and SQL Server. An embedded database has no server to watch.</p></div>}
       >
         <header class="monitor-head">
           <div class="mh-title">
@@ -633,7 +673,7 @@ export default function MonitorTab(props: {
             <Show when={server()}>
               {(sv) => (
                 <span class="mh-meta" title={`${sv().user}@${sv().database}`}>
-                  PostgreSQL {sv().version}
+                  {sv().product} {sv().version}
                   <Show when={sv().inRecovery}> · standby</Show>
                   <Show when={sv().startedMs !== null}> · {formatUptime(sv().startedMs, serverNow())}</Show>
                 </span>
@@ -692,9 +732,9 @@ export default function MonitorTab(props: {
 
         <div class="monitor-views">
           <div class="seg mv-views" role="tablist" aria-label="Monitor views">
-            <For each={VIEWS}>
+            <For each={views}>
               {(v) => (
-                <button role="tab" aria-selected={s.view() === v.id} classList={{ active: s.view() === v.id }} onClick={() => s.setView(v.id)}>
+                <button role="tab" aria-selected={view() === v.id} classList={{ active: view() === v.id }} onClick={() => s.setView(v.id)}>
                   {v.label}
                   <Show when={v.id === "activity" && s.activity()}><span class="mv-count">{activeSessions()}</span></Show>
                   <Show when={v.id === "locks" && (latest()?.blocked ?? 0) > 0}><span class="mv-count warn">{latest()!.blocked}</span></Show>
@@ -702,7 +742,7 @@ export default function MonitorTab(props: {
               )}
             </For>
           </div>
-          <Show when={!s.range() && s.view() === "overview"}>
+          <Show when={!s.range() && view() === "overview"}>
             <span class="mv-note">Drag across a chart to freeze every chart on that range.</span>
           </Show>
           <Show when={s.userPaused() && !s.started()}>
@@ -712,21 +752,21 @@ export default function MonitorTab(props: {
 
         <div class="monitor-body">
           <Switch>
-            <Match when={s.view() === "overview"}>
+            <Match when={view() === "overview"}>
               <div class="monitor-grid" style={{ "grid-template-columns": `repeat(${chartColumns(width())}, minmax(0, 1fr))` }}>
-                <For each={CHARTS}>{(def) => <ChartCard session={s} def={def} onExport={(e, chart) => props.onChartExport(e, { ...chart, allCsv })} />}</For>
+                <For each={charts}>{(def) => <ChartCard session={s} def={def} onExport={(e, chart) => props.onChartExport(e, { ...chart, allCsv })} />}</For>
               </div>
-              <EventsCard session={s} />
+              <EventsCard session={s} profile={profile} />
               <Show when={s.range()} fallback={<ActiveNow session={s} onRowMenu={props.onRowMenu} />}>
                 <ActiveInRange session={s} />
               </Show>
             </Match>
-            <Match when={s.view() === "activity"}><ActivityTable session={s} onRowMenu={props.onRowMenu} /></Match>
-            <Match when={s.view() === "locks"}><LocksView session={s} onRowMenu={props.onRowMenu} /></Match>
-            <Match when={s.view() === "statements"}><StatementsView session={s} onQueryMenu={props.onQueryMenu} /></Match>
-            <Match when={s.view() === "replication"}><ReplicationView session={s} /></Match>
-            <Match when={s.view() === "tables"}><TablesView session={s} onRowMenu={props.onRowMenu} /></Match>
-            <Match when={s.view() === "io"}><IoView session={s} /></Match>
+            <Match when={view() === "activity"}><ActivityTable session={s} onRowMenu={props.onRowMenu} /></Match>
+            <Match when={view() === "locks"}><LocksView session={s} onRowMenu={props.onRowMenu} /></Match>
+            <Match when={view() === "statements"}><StatementsView session={s} onQueryMenu={props.onQueryMenu} /></Match>
+            <Match when={view() === "replication"}><ReplicationView session={s} /></Match>
+            <Match when={view() === "tables"}><TablesView session={s} onRowMenu={props.onRowMenu} /></Match>
+            <Match when={view() === "io"}><IoView session={s} /></Match>
           </Switch>
         </div>
       </Show>

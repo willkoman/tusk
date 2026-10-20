@@ -13,6 +13,10 @@
 export const WAIT_TYPES = ["CPU", "Lock", "LWLock", "IO", "IPC", "Client", "Timeout", "BufferPin", "Activity", "Extension", "Other"] as const;
 
 export type ServerInfo = {
+  /** Which source answered: decides the tiles, charts and views (see engines.ts). */
+  engine: "postgres" | "mysql" | "mssql";
+  /** What the header calls the server: PostgreSQL, MySQL, MariaDB, SQL Server. */
+  product: string;
   versionNum: number;
   version: string;
   /** The monitor's own backend pid (excluded from every count, never signalled). */
@@ -1158,11 +1162,16 @@ export function latestValue(buffer: SeriesBuffer, col: number): number {
  */
 export function signalRefusal(
   row: Pick<ActivityRow, "pid" | "user">,
-  ctx: { readOnly: boolean; running: boolean; server: Pick<ServerInfo, "pid" | "user" | "superuser" | "signalBackend"> | null },
+  ctx: { readOnly: boolean; running: boolean; server: Pick<ServerInfo, "pid" | "user" | "superuser" | "signalBackend"> & { engine?: ServerInfo["engine"] } | null },
 ): string {
   if (ctx.readOnly) return "This connection is read-only: Tusk does not cancel or terminate sessions on it.";
   if (!ctx.server || !ctx.running) return "Resume the monitor to cancel or terminate sessions.";
   if (row.pid === ctx.server.pid) return "That is the monitor's own session.";
-  if (ctx.server.superuser || ctx.server.signalBackend || row.user === ctx.server.user) return "";
-  return "Only your own sessions: another role's needs superuser or membership in pg_signal_backend.";
+  if (ctx.server.superuser || ctx.server.signalBackend) return "";
+  // SQL Server's KILL needs ALTER ANY CONNECTION even for the login's own sessions.
+  if (ctx.server.engine === "mssql") return "KILL needs the ALTER ANY CONNECTION permission.";
+  if (row.user === ctx.server.user) return "";
+  return ctx.server.engine === "mysql"
+    ? "Only your own sessions: another account's needs CONNECTION_ADMIN (or SUPER)."
+    : "Only your own sessions: another role's needs superuser or membership in pg_signal_backend.";
 }

@@ -12,7 +12,9 @@ const started = (generation: number): MonitorStarted => ({
   intervalMs: 1000,
   readOnly: false,
   server: {
-    versionNum: 160004,
+    engine: "postgres",
+  product: "PostgreSQL",
+  versionNum: 160004,
     version: "16.4",
     pid: 42,
     user: "me",

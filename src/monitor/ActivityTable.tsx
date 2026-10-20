@@ -1,6 +1,7 @@
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { Icon } from "../Icons";
 import { ACTIVITY_COLUMNS, activityColumns, visibleRange, type ActivityColumn } from "./layout";
+import { engineProfile } from "./engines";
 import {
   DEFAULT_ACTIVITY_FILTER,
   HIDDEN_QUERY,
@@ -74,6 +75,7 @@ export function ActivityTable(props: {
   const range = createMemo(() => visibleRange(scrollTop(), viewport(), ROW_H, nodes().length));
   const windowed = createMemo(() => nodes().slice(range().start, range().end));
   const hiddenText = () => !!s.started() && !s.started()!.server.readAllStats && !s.started()!.server.superuser;
+  const visibilityNote = () => engineProfile(s.started()?.server.engine ?? "postgres").visibilityNote;
 
   onMount(() => {
     const ro = new ResizeObserver(() => {
@@ -157,8 +159,8 @@ export function ActivityTable(props: {
           </Show>
         </span>
       </div>
-      <Show when={hiddenText()}>
-        <div class="monitor-banner">Other users' queries are hidden. Grant <code>pg_monitor</code> to see them.</div>
+      <Show when={hiddenText() && visibilityNote()}>
+        <div class="monitor-banner">{visibilityNote()}</div>
       </Show>
       <Show when={s.activity()?.error}>
         {(err) => <div class="monitor-banner warn">Process list unavailable: {err()}</div>}
