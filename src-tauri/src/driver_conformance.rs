@@ -5937,6 +5937,24 @@ mod monitor_battery {
             1,
             "one sidecar, identifiable by name"
         );
+        // The fixed statements run prepared (planned once per session), not re-planned per tick.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let last = scalar(
+                &observer,
+                "SELECT query FROM pg_stat_activity WHERE application_name = 'Tusk monitor'",
+            )
+            .await
+            .unwrap_or_default();
+            if last.starts_with("EXECUTE tusk_monitor_") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the sidecar's last statement was not prepared: {last}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
 
         // Three ticks with every fast-tier field present and finite.
         let mut from = 0;
