@@ -6352,11 +6352,12 @@ mod monitor_views_battery {
         }
         // Made on a short-lived session: PostgreSQL 15+ backends defer their
         // statistics flush (up to 10 s while idle), but a backend that exits flushes.
+        // Autovacuum is off for it: a run that cleans it first leaves no dead tuples.
         let (maker, _) = connect(cfg).await.unwrap();
         exec(
             &maker,
             "DROP TABLE IF EXISTS tusk_monitor_views; \
-             CREATE TABLE tusk_monitor_views (id int PRIMARY KEY, v int); \
+             CREATE TABLE tusk_monitor_views (id int PRIMARY KEY, v int) WITH (autovacuum_enabled = false); \
              INSERT INTO tusk_monitor_views SELECT g, g FROM generate_series(1, 2000) g; \
              DELETE FROM tusk_monitor_views WHERE id > 1000",
         )

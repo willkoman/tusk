@@ -14,7 +14,7 @@ This file is the source of truth for working in this repo. Keep it, `CHANGELOG.m
 
 ```sh
 npm install                 # once
-npm run tauri dev           # run the app (needs Rust + Node 20)
+npm run tauri dev           # run the app (needs Rust + Node 22.22+ or 24)
 
 # Validate after edits (ALWAYS do this before claiming done):
 cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check

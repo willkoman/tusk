@@ -50,7 +50,7 @@ tempfile = "3"
 # AI provider proxy (streaming HTTP). rustls to avoid an OpenSSL build dep.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 # Slack Socket Mode (desktop-hosted bot — outbound WebSocket only, no HTTP server).
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
 # Pin the process-wide rustls CryptoProvider to ring: reqwest's rustls-tls is
 # ring-flavored while tokio-tungstenite's rustls defaults to aws-lc-rs — with both
