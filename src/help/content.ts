@@ -3869,6 +3869,17 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
+        "text": "v0.12.2 — dependency updates",
+        "id": "v0-12-2"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Tauri 2.12 and updated libraries** underneath: the window shell and its file-dialog, opener, updater and process plugins, the Slack bot's WebSocket client, and CodeMirror and SQL-formatter fixes. Nothing should look or behave differently."
+        ]
+      },
+      {
+        "k": "h",
         "text": "v0.12.1 — host metrics in the monitor",
         "id": "v0-12-1"
       },
