@@ -5,7 +5,7 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 ## [Unreleased]
 
 ### Changed
-- **Dependencies updated.** Tauri 2.12 with its opener, dialog, updater (2.14) and process plugins on both the Rust and JavaScript sides, the Slack socket's WebSocket client (tokio-tungstenite 0.30), CodeMirror and sql-formatter patch releases, plus serde_json, tokio-util and rand. No behaviour change intended. The development toolchain moves to Vitest 5 and jsdom 30, and the build workflows to the latest pinned `setup-node`, `upload-artifact` and `download-artifact` releases; none of these ship in the app.
+- **Dependencies updated.** Tauri 2.12 with its opener, dialog, updater (2.14) and process plugins on both the Rust and JavaScript sides, the Slack socket's WebSocket client (tokio-tungstenite 0.30), CodeMirror and sql-formatter patch releases, plus serde_json, tokio-util and rand. No behaviour change intended. The development toolchain moves to Vitest 5 and jsdom 30, and the build workflows to Node 24 (Node 20 reached end of life, and Vitest 5 and jsdom 30 no longer run on it) and the latest pinned `setup-node`, `upload-artifact` and `download-artifact` releases; none of these ship in the app. Building Tusk from source now needs Node 22.22 or later.
 
 ## [0.12.1] - 2026-10-23
 
