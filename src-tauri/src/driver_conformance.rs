@@ -6623,7 +6623,7 @@ mod monitor_engines_battery {
     use super::{all, connect};
     use crate::db::ConnectionConfig;
     use crate::driver::Backend;
-    use crate::monitor::{self, MonitorEvent, MonitorOptions, SignalAction};
+    use crate::monitor::{self, MonitorEvent, MonitorOptions, SignalAction, ViewSet};
     use mysql_async::prelude::Queryable;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -6634,6 +6634,16 @@ mod monitor_engines_battery {
             paused: None,
             activity: Some(true),
             views: None,
+        }
+    }
+
+    fn locks_view() -> MonitorOptions {
+        MonitorOptions {
+            views: Some(ViewSet {
+                locks: true,
+                ..ViewSet::default()
+            }),
+            ..options()
         }
     }
 
@@ -6828,9 +6838,10 @@ mod monitor_engines_battery {
         }
 
         // A row-lock wait names its blocker; the holder is idle in transaction.
+        exec_mysql(&mut observer, "DROP TABLE IF EXISTS tusk_mon_lock").await;
         exec_mysql(
             &mut observer,
-            "CREATE TABLE IF NOT EXISTS tusk_mon_lock (id INT PRIMARY KEY, v INT)",
+            "CREATE TABLE tusk_mon_lock (id INT PRIMARY KEY, v INT)",
         )
         .await;
         exec_mysql(&mut observer, "REPLACE INTO tusk_mon_lock VALUES (1, 0)").await;
@@ -6879,6 +6890,70 @@ mod monitor_engines_battery {
         assert!(sessions.idle_in_transaction >= 1);
         assert!(e.load.unwrap()[1] >= 1, "the waiter is Lock load");
 
+        // The Locks view: the row wait names its blocker, the holder's locks are
+        // listed, and an ALTER queued behind the open transaction is a metadata wait.
+        let mut alter_conn = observer
+            .mysql_conn()
+            .unwrap()
+            .monitor_checkout()
+            .await
+            .unwrap();
+        let alter = tokio::spawn(async move {
+            alter_conn
+                .query_drop("ALTER TABLE tusk_mon_lock ADD COLUMN c INT")
+                .await
+                .map_err(|e| e.to_string())
+        });
+        let mariadb = server.product == "MariaDB";
+        monitor::configure(&state, &id, generation, locks_view()).unwrap();
+        let (e, _) = wait_event(&events, 0, "row and metadata waits in Locks", |e| {
+            e.generation == generation
+                && e.locks.as_ref().is_some_and(|l| {
+                    let waits = |kind: &str| {
+                        l.waiting
+                            .iter()
+                            .any(|w| w.locktype == kind && w.blocked_by.contains(&holder_id))
+                    };
+                    // MariaDB keeps no metadata-lock table.
+                    waits("record") && (mariadb || waits("metadata"))
+                })
+        })
+        .await;
+        assert!(e.view_errors.is_none(), "{:?}", e.view_errors);
+        let locks = e.locks.unwrap();
+        let row_wait = locks
+            .waiting
+            .iter()
+            .find(|w| w.locktype == "record")
+            .unwrap();
+        assert!(
+            row_wait.target.contains("tusk_mon_lock"),
+            "{}",
+            row_wait.target
+        );
+        assert!(row_wait.waited_ms.is_some());
+        assert!(row_wait
+            .query
+            .as_deref()
+            .unwrap_or("")
+            .contains("SET v = 2"));
+        if let Some(mdl_wait) = locks.waiting.iter().find(|w| w.locktype == "metadata") {
+            assert!(
+                mdl_wait.target.contains("tusk_mon_lock"),
+                "{}",
+                mdl_wait.target
+            );
+        }
+        assert!(
+            locks
+                .held
+                .iter()
+                .any(|h| h.target.contains("tusk_mon_lock") && h.pids.contains(&holder_id)),
+            "{:#?}",
+            locks.held
+        );
+        assert!(locks.waiting_total as usize >= locks.waiting.len());
+
         // KILL CONNECTION frees the waiter; killing it again finds nobody.
         let terminated = monitor::signal(
             &state,
@@ -6896,6 +6971,11 @@ mod monitor_engines_battery {
             .expect("the waiter got its lock")
             .unwrap();
         assert!(freed.is_ok(), "{freed:?}");
+        let altered = tokio::time::timeout(Duration::from_secs(20), alter)
+            .await
+            .expect("the ALTER ran once the holder was gone")
+            .unwrap();
+        assert!(altered.is_ok(), "{altered:?}");
         assert!(
             holder.query_drop("SELECT 1").await.is_err(),
             "the holder's connection is gone"
@@ -6957,6 +7037,16 @@ mod monitor_engines_battery {
             server.pid
         );
         assert_eq!(count(&mut observer, &mine).await, 1);
+        let named = format!(
+            "SELECT COUNT(*) FROM sys.dm_exec_sessions \
+             WHERE session_id = {} AND program_name = 'Tusk monitor'",
+            server.pid
+        );
+        assert_eq!(
+            count(&mut observer, &named).await,
+            1,
+            "the sidecar names itself"
+        );
         ticks(&events, generation).await;
 
         // A WAITFOR session: SQL Server cannot cancel just its query, but can KILL it.
@@ -7059,6 +7149,36 @@ mod monitor_engines_battery {
         assert!(e.oldest_xact_ms.is_some_and(|ms| ms >= 0));
         assert!(e.load.unwrap()[1] >= 1, "the waiter is Lock load");
 
+        monitor::configure(&state, &id, generation, locks_view()).unwrap();
+        let (e, _) = wait_event(&events, 0, "the Locks view naming the blocker", |e| {
+            e.generation == generation
+                && e.locks
+                    .as_ref()
+                    .is_some_and(|l| l.waiting.iter().any(|w| w.blocked_by == vec![holder_spid]))
+        })
+        .await;
+        assert!(e.view_errors.is_none(), "{:?}", e.view_errors);
+        let locks = e.locks.unwrap();
+        let wait = locks
+            .waiting
+            .iter()
+            .find(|w| w.blocked_by == vec![holder_spid])
+            .unwrap();
+        assert!(wait.target.contains("tusk_mon_lock"), "{}", wait.target);
+        assert!(wait.waited_ms.is_some_and(|ms| ms >= 0));
+        assert!(
+            locks
+                .held
+                .iter()
+                .any(|h| h.target.contains("tusk_mon_lock") && h.pids.contains(&holder_spid)),
+            "{:#?}",
+            locks.held
+        );
+        assert!(
+            locks.held.iter().all(|h| h.locktype != "database"),
+            "a session's own database lock is noise"
+        );
+
         let terminated = monitor::signal(
             &state,
             &id,
@@ -7093,6 +7213,65 @@ mod monitor_engines_battery {
         wait_gone(&mut observer, &mine, "after stop_all").await;
     }
 
+    /// A source reports no lag; a running replica reports a small one, which grows
+    /// from the last applied commit once its applier stops, and recovers when it starts.
+    pub(super) async fn mysql_replica(source: &ConnectionConfig, replica: &ConnectionConfig) {
+        let state = crate::AppState::default();
+        let (src, _) = connect(source).await.expect("connect source");
+        let src_id = state.register(src, false).unwrap();
+        let src_events: Events = Arc::default();
+        let started = monitor::start(&state, &src_id, options(), sink(&src_events))
+            .await
+            .expect("monitor the source");
+        let (e, _) = wait_event(&src_events, 0, "a source tick", |e| {
+            e.generation == started.generation && e.rates.is_some()
+        })
+        .await;
+        assert!(e.replication_lag_ms.is_none(), "a source is not a replica");
+        assert_eq!(state.monitors.stop_all(), 1);
+
+        let (mut writer, _) = connect(source).await.unwrap();
+        exec_mysql(
+            &mut writer,
+            "CREATE TABLE IF NOT EXISTS tusk_lag (id INT PRIMARY KEY)",
+        )
+        .await;
+        exec_mysql(&mut writer, "REPLACE INTO tusk_lag VALUES (1)").await;
+        let (rep, _) = connect(replica).await.expect("connect replica");
+        let rep_id = state.register(rep, false).unwrap();
+        let events: Events = Arc::default();
+        let started = monitor::start(&state, &rep_id, options(), sink(&events))
+            .await
+            .expect("monitor the replica");
+        let generation = started.generation;
+        let (e, from) = wait_event(&events, 0, "a caught-up replica", |e| {
+            e.generation == generation && e.replication_lag_ms.is_some_and(|ms| ms < 5_000)
+        })
+        .await;
+        assert_eq!(e.status, "live");
+
+        let (mut admin, _) = connect(replica).await.unwrap();
+        exec_mysql(&mut admin, "STOP REPLICA SQL_THREAD").await;
+        exec_mysql(&mut writer, "REPLACE INTO tusk_lag VALUES (2)").await;
+        let (first, from) = wait_event(&events, from, "the lag growing", |e| {
+            e.generation == generation && e.replication_lag_ms.is_some_and(|ms| ms >= 1_500)
+        })
+        .await;
+        let (later, from) = wait_event(&events, from, "the lag still growing", |e| {
+            e.generation == generation
+                && e.replication_lag_ms.unwrap_or(0) >= first.replication_lag_ms.unwrap() + 1_000
+        })
+        .await;
+        assert!(later.replication_lag_ms.is_some());
+        exec_mysql(&mut admin, "START REPLICA SQL_THREAD").await;
+        wait_event(&events, from, "the replica catching up", |e| {
+            e.generation == generation && e.replication_lag_ms.is_some_and(|ms| ms < 5_000)
+        })
+        .await;
+        exec_mysql(&mut writer, "DROP TABLE tusk_lag").await;
+        assert_eq!(state.monitors.stop_all(), 1);
+    }
+
     async fn tsql_owned(b: Backend, sql: &str) -> Result<(), String> {
         b.mssql_conn()
             .unwrap()
@@ -7110,6 +7289,24 @@ async fn monitor_battery_mysql() {
         return;
     };
     monitor_engines_battery::mysql(&cfg).await;
+}
+
+/// MySQL replica lag needs a source + replica pair, which `scripts/conformance.sh`
+/// does not start: point `TUSK_TEST_MYSQL_SOURCE_PORT` and
+/// `TUSK_TEST_MYSQL_REPLICA_PORT` at one (root / `test`, database `test`).
+#[tokio::test]
+async fn monitor_replica_lag_mysql() {
+    let port = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u16>().ok());
+    let (Some(source), Some(replica)) = (
+        port("TUSK_TEST_MYSQL_SOURCE_PORT"),
+        port("TUSK_TEST_MYSQL_REPLICA_PORT"),
+    ) else {
+        eprintln!(
+            "SKIP monitor_replica_lag_mysql (set TUSK_TEST_MYSQL_SOURCE_PORT + TUSK_TEST_MYSQL_REPLICA_PORT)"
+        );
+        return;
+    };
+    monitor_engines_battery::mysql_replica(&mysql_cfg_at(source), &mysql_cfg_at(replica)).await;
 }
 
 #[tokio::test]

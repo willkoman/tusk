@@ -14,6 +14,7 @@
 
 use super::pg::{self, base_probe, bucket_rows, fold_histogram, Activity, FastSample, Probe, Row};
 use super::rates::Counters;
+use super::views::{self, Locks};
 use super::SignalAction;
 use crate::db::{self, AppError, ConnectionConfig};
 use crate::driver::{self, Backend};
@@ -52,6 +53,9 @@ pub(crate) struct Shape {
     /// `information_schema.INNODB_TRX` is readable (the `PROCESS` privilege).
     pub innodb: bool,
     pub lock_waits: LockWaits,
+    /// MySQL's `performance_schema` replication tables are readable (MariaDB keeps
+    /// replica state only behind `SHOW ALL SLAVES STATUS`).
+    pub replication: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +175,11 @@ pub(crate) fn status_sql(shape: &Shape) -> String {
     };
     // MySQL keeps the deadlock count in INNODB_METRICS (on by default); MariaDB also
     // reports it as a status variable.
+    let lag = if shape.replication {
+        REPLICA_LAG_SQL
+    } else {
+        "NULL"
+    };
     let metric_deadlocks = if shape.innodb && !shape.mariadb {
         "(SELECT `COUNT` FROM information_schema.INNODB_METRICS WHERE NAME = 'lock_deadlocks')"
     } else {
@@ -182,13 +191,141 @@ pub(crate) fn status_sql(shape: &Shape) -> String {
                 {oldest} AS oldest_xact_ms, \
                 {innodb_blocked} + (SELECT COUNT(*) FROM {proc} \
                      WHERE STATE LIKE 'Waiting for%lock' AND ID <> CONNECTION_ID()) AS blocked, \
-                {metric_deadlocks} AS metric_deadlocks \
+                {metric_deadlocks} AS metric_deadlocks, \
+                {lag} AS replication_lag_ms \
          FROM (SELECT {picks} FROM {status} WHERE UPPER(VARIABLE_NAME) IN ({names})) s",
         proc = shape.processlist,
         picks = picks.join(", "),
         status = shape.status,
         names = names.join(", "),
     )
+}
+
+/// How far this replica's applier is behind, in ms; NULL when it is not a replica.
+/// Applying: now − the original commit time of the transaction it is applying.
+/// Running and caught up: 0. Stopped (the receiver or the applier): now − the last
+/// applied transaction's original commit time, so a broken replica keeps falling
+/// behind on the tile instead of reading as caught up.
+const REPLICA_LAG_SQL: &str = "(SELECT CASE \
+       WHEN NOT EXISTS (SELECT 1 FROM performance_schema.replication_connection_status) THEN NULL \
+       WHEN EXISTS (SELECT 1 FROM performance_schema.replication_connection_status \
+                     WHERE SERVICE_STATE <> 'ON') \
+         OR EXISTS (SELECT 1 FROM performance_schema.replication_applier_status \
+                     WHERE SERVICE_STATE <> 'ON') \
+       THEN (SELECT CAST(TIMESTAMPDIFF(MICROSECOND, \
+                         MAX(LAST_APPLIED_TRANSACTION_ORIGINAL_COMMIT_TIMESTAMP), NOW(6)) / 1000 AS SIGNED) \
+               FROM performance_schema.replication_applier_status_by_worker) \
+       ELSE COALESCE((SELECT CAST(MAX(TIMESTAMPDIFF(MICROSECOND, \
+                         APPLYING_TRANSACTION_ORIGINAL_COMMIT_TIMESTAMP, NOW(6))) / 1000 AS SIGNED) \
+               FROM performance_schema.replication_applier_status_by_worker \
+              WHERE APPLYING_TRANSACTION <> ''), 0) END)";
+
+/// (MariaDB truncates `LOWER()` of an `information_schema` column inside a derived
+/// table to two characters, so its lock type is spelled out with a CASE.)
+///
+/// Locks waiting to be granted: InnoDB row and table locks, plus pending metadata
+/// locks (an `ALTER TABLE` queued behind an open transaction) on MySQL 8. A metadata
+/// wait's blockers are the other sessions holding a granted lock on the same object.
+/// MariaDB reports only InnoDB waits. `None` without `PROCESS`.
+pub(crate) fn lock_waits_sql(shape: &Shape) -> Option<String> {
+    let proc = shape.processlist;
+    let chars = pg::QUERY_TEXT_CHARS;
+    let rows = views::VIEW_ROWS;
+    let inner = match shape.lock_waits {
+        LockWaits::None => return None,
+        LockWaits::PerfSchema => format!(
+            "SELECT rt.PROCESSLIST_ID AS `pid`, CAST(rt.PROCESSLIST_ID AS CHAR) AS `backend_start`, \
+                    LOWER(rl.LOCK_TYPE) AS `locktype`, rl.LOCK_MODE AS `mode`, \
+                    CONCAT(rl.OBJECT_SCHEMA, '.', rl.OBJECT_NAME, \
+                           IF(rl.INDEX_NAME IS NULL, '', CONCAT(' (', rl.INDEX_NAME, ')')), \
+                           IF(rl.LOCK_DATA IS NULL, '', CONCAT(' ', LEFT(rl.LOCK_DATA, 200)))) AS `target`, \
+                    p.USER AS `usr`, p.DB AS `db`, NULL AS `app`, 'active' AS `state`, \
+                    CAST(TIMESTAMPDIFF(MICROSECOND, t.trx_wait_started, NOW(6)) / 1000 AS SIGNED) AS `waited_ms`, \
+                    CAST(UNIX_TIMESTAMP(t.trx_started) * 1000 AS SIGNED) AS `xact_ms`, \
+                    (SELECT CONCAT('{{', GROUP_CONCAT(DISTINCT bt.PROCESSLIST_ID ORDER BY bt.PROCESSLIST_ID), '}}') \
+                       FROM performance_schema.data_lock_waits w \
+                       JOIN performance_schema.threads bt ON bt.THREAD_ID = w.BLOCKING_THREAD_ID \
+                      WHERE w.REQUESTING_ENGINE_LOCK_ID = rl.ENGINE_LOCK_ID) AS `blocked_by`, \
+                    LEFT(p.INFO, {chars}) AS `query` \
+               FROM performance_schema.data_locks rl \
+               JOIN performance_schema.threads rt ON rt.THREAD_ID = rl.THREAD_ID \
+               LEFT JOIN {proc} p ON p.ID = rt.PROCESSLIST_ID \
+               LEFT JOIN information_schema.INNODB_TRX t ON t.trx_mysql_thread_id = rt.PROCESSLIST_ID \
+              WHERE rl.LOCK_STATUS = 'WAITING' AND rt.PROCESSLIST_ID <> CONNECTION_ID() \
+             UNION ALL \
+             SELECT mt.PROCESSLIST_ID, CAST(mt.PROCESSLIST_ID AS CHAR), 'metadata', m.LOCK_TYPE, \
+                    CONCAT(LOWER(m.OBJECT_TYPE), ' ', CONCAT_WS('.', m.OBJECT_SCHEMA, m.OBJECT_NAME)), \
+                    p.USER, p.DB, NULL, 'active', mt.PROCESSLIST_TIME * 1000, \
+                    CAST(UNIX_TIMESTAMP(t.trx_started) * 1000 AS SIGNED), \
+                    (SELECT CONCAT('{{', GROUP_CONCAT(DISTINCT gt.PROCESSLIST_ID ORDER BY gt.PROCESSLIST_ID), '}}') \
+                       FROM performance_schema.metadata_locks g \
+                       JOIN performance_schema.threads gt ON gt.THREAD_ID = g.OWNER_THREAD_ID \
+                      WHERE g.LOCK_STATUS = 'GRANTED' AND g.OBJECT_TYPE = m.OBJECT_TYPE \
+                        AND g.OBJECT_SCHEMA <=> m.OBJECT_SCHEMA AND g.OBJECT_NAME <=> m.OBJECT_NAME \
+                        AND g.OWNER_THREAD_ID <> m.OWNER_THREAD_ID AND gt.PROCESSLIST_ID IS NOT NULL), \
+                    LEFT(p.INFO, {chars}) \
+               FROM performance_schema.metadata_locks m \
+               JOIN performance_schema.threads mt ON mt.THREAD_ID = m.OWNER_THREAD_ID \
+               LEFT JOIN {proc} p ON p.ID = mt.PROCESSLIST_ID \
+               LEFT JOIN information_schema.INNODB_TRX t ON t.trx_mysql_thread_id = mt.PROCESSLIST_ID \
+              WHERE m.LOCK_STATUS = 'PENDING' AND mt.PROCESSLIST_ID <> CONNECTION_ID()"
+        ),
+        LockWaits::InfoSchema => format!(
+            "SELECT t.trx_mysql_thread_id AS `pid`, CAST(t.trx_mysql_thread_id AS CHAR) AS `backend_start`, \
+                    CASE l.lock_type WHEN 'RECORD' THEN 'record' WHEN 'TABLE' THEN 'table' ELSE l.lock_type END AS `locktype`, l.lock_mode AS `mode`, \
+                    CONCAT(l.lock_table, IF(l.lock_index IS NULL, '', CONCAT(' (', l.lock_index, ')')), \
+                           IF(l.lock_data IS NULL, '', CONCAT(' ', LEFT(l.lock_data, 200)))) AS `target`, \
+                    p.USER AS `usr`, p.DB AS `db`, NULL AS `app`, 'active' AS `state`, \
+                    CAST(TIMESTAMPDIFF(MICROSECOND, t.trx_wait_started, NOW(6)) / 1000 AS SIGNED) AS `waited_ms`, \
+                    CAST(UNIX_TIMESTAMP(t.trx_started) * 1000 AS SIGNED) AS `xact_ms`, \
+                    (SELECT CONCAT('{{', GROUP_CONCAT(DISTINCT bt.trx_mysql_thread_id ORDER BY bt.trx_mysql_thread_id), '}}') \
+                       FROM information_schema.INNODB_LOCK_WAITS w \
+                       JOIN information_schema.INNODB_TRX bt ON bt.trx_id = w.blocking_trx_id \
+                      WHERE w.requesting_trx_id = t.trx_id) AS `blocked_by`, \
+                    LEFT(p.INFO, {chars}) AS `query` \
+               FROM information_schema.INNODB_TRX t \
+               JOIN information_schema.INNODB_LOCKS l ON l.lock_id = t.trx_requested_lock_id \
+               LEFT JOIN {proc} p ON p.ID = t.trx_mysql_thread_id \
+              WHERE t.trx_state = 'LOCK WAIT' AND t.trx_mysql_thread_id <> CONNECTION_ID()"
+        ),
+    };
+    Some(format!(
+        "SELECT x.*, COUNT(*) OVER () AS `total` FROM ({inner}) x \
+         ORDER BY x.`waited_ms` DESC, x.`pid` LIMIT {rows}"
+    ))
+}
+
+/// Granted InnoDB locks grouped by target and mode (MariaDB: only the locks someone
+/// is waiting on, which is all it lists). Metadata locks are left out: every open
+/// table holds one, and the waiting list already names the holders that matter.
+pub(crate) fn lock_holds_sql(shape: &Shape) -> Option<String> {
+    let rows = views::VIEW_ROWS;
+    let inner = match shape.lock_waits {
+        LockWaits::None => return None,
+        LockWaits::PerfSchema => "SELECT LOWER(l.LOCK_TYPE) AS `locktype`, l.LOCK_MODE AS `mode`, \
+                    CONCAT(l.OBJECT_SCHEMA, '.', l.OBJECT_NAME, \
+                           IF(l.INDEX_NAME IS NULL, '', CONCAT(' (', l.INDEX_NAME, ')'))) AS `target`, \
+                    COUNT(*) AS `n`, \
+                    CONCAT('{', SUBSTRING_INDEX(GROUP_CONCAT(DISTINCT t.PROCESSLIST_ID \
+                           ORDER BY t.PROCESSLIST_ID), ',', 10), '}') AS `pids` \
+               FROM performance_schema.data_locks l \
+               JOIN performance_schema.threads t ON t.THREAD_ID = l.THREAD_ID \
+              WHERE l.LOCK_STATUS = 'GRANTED' AND t.PROCESSLIST_ID <> CONNECTION_ID() \
+              GROUP BY `locktype`, `mode`, `target`",
+        LockWaits::InfoSchema => "SELECT CASE l.lock_type WHEN 'RECORD' THEN 'record' WHEN 'TABLE' THEN 'table' ELSE l.lock_type END AS `locktype`, l.lock_mode AS `mode`, \
+                    CONCAT(l.lock_table, IF(l.lock_index IS NULL, '', CONCAT(' (', l.lock_index, ')'))) AS `target`, \
+                    COUNT(*) AS `n`, \
+                    CONCAT('{', SUBSTRING_INDEX(GROUP_CONCAT(DISTINCT t.trx_mysql_thread_id \
+                           ORDER BY t.trx_mysql_thread_id), ',', 10), '}') AS `pids` \
+               FROM information_schema.INNODB_LOCKS l \
+               JOIN information_schema.INNODB_TRX t ON t.trx_id = l.lock_trx_id \
+              WHERE l.lock_id IN (SELECT blocking_lock_id FROM information_schema.INNODB_LOCK_WAITS) \
+              GROUP BY `locktype`, `mode`, `target`",
+    };
+    Some(format!(
+        "SELECT g.*, SUM(g.`n`) OVER () AS `total`, COUNT(*) OVER () AS `groups` FROM ({inner}) g \
+         ORDER BY g.`n` DESC, g.`locktype`, g.`mode` LIMIT {rows}"
+    ))
 }
 
 /// The session histogram: rows of state × wait × client.
@@ -254,6 +391,8 @@ pub(crate) struct MySqlSession {
     status: String,
     histogram: String,
     activity: String,
+    lock_waits: Option<String>,
+    lock_holds: Option<String>,
 }
 
 impl MySqlSession {
@@ -268,6 +407,8 @@ impl MySqlSession {
             status: String::new(),
             histogram: String::new(),
             activity: String::new(),
+            lock_waits: None,
+            lock_holds: None,
         };
         session.setup().await?;
         Ok(session)
@@ -310,6 +451,16 @@ impl MySqlSession {
         }
     }
 
+    /// True when `sql` runs here AND returns a row. MariaDB with `performance_schema`
+    /// off still has its tables, empty, so readability alone would pick them.
+    async fn has_rows(&mut self, sql: &str) -> Result<bool, AppError> {
+        match self.query(sql).await {
+            Ok((_, rows)) => Ok(!rows.is_empty()),
+            Err(e) if self.conn.is_none() => Err(e),
+            Err(_) => Ok(false),
+        }
+    }
+
     async fn setup(&mut self) -> Result<(), AppError> {
         let conn = self.backend.mysql_conn()?.monitor_checkout().await?;
         self.conn = Some(conn);
@@ -331,12 +482,12 @@ impl MySqlSession {
             )));
         }
         let status = if self
-            .readable("SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Uptime'")
+            .has_rows("SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Uptime'")
             .await?
         {
             "performance_schema.global_status"
         } else if self
-            .readable("SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME = 'UPTIME'")
+            .has_rows("SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME = 'UPTIME'")
             .await?
         {
             "information_schema.GLOBAL_STATUS"
@@ -376,12 +527,20 @@ impl MySqlSession {
         } else {
             LockWaits::None
         };
+        let replication = !mariadb
+            && self
+                .readable(
+                    "SELECT COUNT(*) FROM performance_schema.replication_connection_status, \
+                     performance_schema.replication_applier_status_by_worker",
+                )
+                .await?;
         let shape = Shape {
             mariadb,
             status,
             processlist,
             innodb,
             lock_waits,
+            replication,
         };
         let grants = self.grants().await;
         let has = |p: &str| grants.iter().any(|g| g == p || g == "ALL PRIVILEGES");
@@ -403,6 +562,8 @@ impl MySqlSession {
         self.status = status_sql(&shape);
         self.histogram = histogram_sql(&shape);
         self.activity = activity_sql(&shape);
+        self.lock_waits = lock_waits_sql(&shape);
+        self.lock_holds = lock_holds_sql(&shape);
         let (sc, srows) = self.query(&self.status.clone()).await?;
         if let (Some(now), Some(srow)) = (now_ms, srows.first()) {
             if let Some(uptime) = pg::opt_int(&sc, srow, "uptime")? {
@@ -452,6 +613,18 @@ impl MySqlSession {
         let mut activity = pg::parse_activity(&c, &rows)?;
         pg::relabel_waits(&mut activity, &WAIT_LABELS);
         Ok(activity)
+    }
+
+    /// The Locks view: waiting and granted locks, shaped like PostgreSQL's.
+    pub(crate) async fn locks(&mut self) -> Result<Locks, AppError> {
+        let (Some(waits), Some(holds)) = (self.lock_waits.clone(), self.lock_holds.clone()) else {
+            return Err(AppError::new(
+                "the Locks view reads InnoDB's lock tables, which need the PROCESS privilege",
+            ));
+        };
+        let (wc, wr) = self.query(&waits).await?;
+        let (hc, hr) = self.query(&holds).await?;
+        views::parse_locks(&wc, &wr, &hc, &hr)
     }
 
     /// `KILL QUERY` or `KILL CONNECTION`. A connection id is never reused while the
@@ -537,7 +710,7 @@ pub(crate) fn parse_sample(
         load,
         oldest_xact_ms: pg::opt_int(columns, row, "oldest_xact_ms")?.map(|v| v.max(0)),
         blocked: pg::clamp_u32(i("blocked")?),
-        replication_lag_ms: None,
+        replication_lag_ms: pg::opt_int(columns, row, "replication_lag_ms")?.map(|v| v.max(0)),
     })
 }
 
@@ -569,6 +742,7 @@ mod tests {
                         processlist: "information_schema.PROCESSLIST",
                         innodb,
                         lock_waits,
+                        replication: !mariadb,
                     });
                 }
             }
@@ -591,11 +765,18 @@ mod tests {
     #[test]
     fn every_statement_is_one_mysql_statement_for_every_shape() {
         for shape in shapes() {
-            for sql in [
+            let mut all = vec![
                 status_sql(&shape),
                 histogram_sql(&shape),
                 activity_sql(&shape),
-            ] {
+            ];
+            all.extend(lock_waits_sql(&shape));
+            all.extend(lock_holds_sql(&shape));
+            assert_eq!(
+                lock_waits_sql(&shape).is_some(),
+                shape.lock_waits != LockWaits::None
+            );
+            for sql in all {
                 let items = parse_for_engine(&sql, TransactionEngine::MySql)
                     .unwrap_or_else(|e| panic!("{sql}: {}", e.message));
                 assert!(

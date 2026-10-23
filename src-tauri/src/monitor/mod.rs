@@ -389,6 +389,14 @@ impl Source {
         }
     }
 
+    async fn locks(&mut self) -> Result<Locks, AppError> {
+        match self {
+            Source::Pg(s) => s.locks().await,
+            Source::MySql(s) => s.locks().await,
+            Source::MsSql(s) => s.locks().await,
+        }
+    }
+
     fn pg(&mut self) -> Option<&mut PgSession> {
         match self {
             Source::Pg(s) => Some(s),
@@ -571,7 +579,8 @@ impl Sampler {
     fn tier_supported(&self, tier: Tier) -> bool {
         let probe = self.session.probe();
         if probe.engine != "postgres" {
-            return false;
+            // Every engine has a Locks view; the rest read PostgreSQL's catalog.
+            return tier == Tier::Locks;
         }
         match tier {
             Tier::Io => probe.version_num >= views::IO_VERSION_NUM,
@@ -589,11 +598,17 @@ impl Sampler {
             }
             self.last_tier.insert(tier, now);
             let at = now.duration_since(self.started);
+            if tier == Tier::Locks {
+                if let Err(e) = self.session.locks().await.map(|v| event.locks = Some(v)) {
+                    event.view_error(tier, e.message);
+                }
+                continue;
+            }
             let Some(session) = self.session.pg() else {
                 return;
             };
             let outcome = match tier {
-                Tier::Locks => session.locks().await.map(|v| event.locks = Some(v)),
+                Tier::Locks => unreachable!("handled above for every engine"),
                 Tier::Replication => session
                     .replication()
                     .await

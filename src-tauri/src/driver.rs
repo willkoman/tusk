@@ -598,7 +598,7 @@ pub async fn connect(config: &ConnectionConfig) -> Result<(Backend, String), App
         "duckdb" => DuckConn::open(config),
         "sqlite" => SqliteConn::open(config),
         "mysql" => MySqlConn::open(config, None).await,
-        "mssql" => MsSqlConn::open(config, None).await,
+        "mssql" => MsSqlConn::open(config, None, "Tusk").await,
         other => Err(AppError::new(format!("unknown driver: {other}"))),
     }
 }
@@ -779,7 +779,7 @@ impl Backend {
             Backend::MsSql(m) => {
                 // Same as MySQL: keep the SSH session across the reconnect.
                 let tunnel = crate::ssh::ensure(m.tunnel.take(), &m.config).await?;
-                let (backend, _v) = MsSqlConn::open(&m.config, tunnel).await?;
+                let (backend, _v) = MsSqlConn::open(&m.config, tunnel, m.app_name).await?;
                 if let Backend::MsSql(nm) = backend {
                     *m = nm;
                 }
@@ -4398,6 +4398,18 @@ impl Backend {
     }
 }
 
+/// A SQL Server connection that names itself `app_name` (`program_name` in
+/// `sys.dm_exec_sessions`) instead of `Tusk`; reconnects keep the name.
+pub(crate) async fn connect_mssql_as(
+    config: &ConnectionConfig,
+    app_name: &'static str,
+) -> Result<Backend, AppError> {
+    config.validate()?;
+    MsSqlConn::open(config, None, app_name)
+        .await
+        .map(|(backend, _version)| backend)
+}
+
 impl MySqlConn {
     /// A connection the monitor holds for its whole session: never returned between
     /// ticks, so the session settings it applies (timeouts) stay with it.
@@ -4496,6 +4508,9 @@ pub struct MsSqlConn {
     string_agg: bool,
     /// Owns the SSH session for this connection; dropping it closes the tunnel.
     tunnel: Option<crate::ssh::Tunnel>,
+    /// The `program_name` this session logs in with (`Tusk`, or `Tusk monitor` for the
+    /// database monitor's sidecar); a reconnect logs in with the same one.
+    app_name: &'static str,
 }
 
 fn mssql_err(error: tiberius::error::Error) -> AppError {
@@ -4667,6 +4682,7 @@ impl MsSqlConn {
     async fn open(
         config: &ConnectionConfig,
         tunnel: Option<crate::ssh::Tunnel>,
+        app_name: &'static str,
     ) -> Result<(Backend, String), AppError> {
         if config.user.trim().is_empty() {
             return Err(AppError::new(
@@ -4677,7 +4693,7 @@ impl MsSqlConn {
         let tunnel = crate::ssh::ensure(tunnel, config).await?;
         let dial = crate::ssh::dial_config(config, tunnel.as_ref());
         let tls_host = crate::ssh::tls_host(config, tunnel.as_ref());
-        let client = Self::open_client(&dial, tls_host.as_deref())
+        let client = Self::open_client(&dial, tls_host.as_deref(), app_name)
             .await
             .map_err(|e| crate::ssh::explain_db_failure(tunnel.as_ref(), e))?;
         let mut conn = MsSqlConn {
@@ -4691,6 +4707,7 @@ impl MsSqlConn {
             doomed: false,
             string_agg: true,
             tunnel,
+            app_name,
         };
         let version = conn
             .query_text(
@@ -4724,6 +4741,7 @@ impl MsSqlConn {
     async fn open_client(
         config: &ConnectionConfig,
         tls_host: Option<&str>,
+        app_name: &str,
     ) -> Result<MsSqlClient, AppError> {
         use tokio_util::compat::TokioAsyncWriteCompatExt;
 
@@ -4736,7 +4754,7 @@ impl MsSqlConn {
         if !config.dbname.is_empty() {
             cfg.database(&config.dbname);
         }
-        cfg.application_name("Tusk");
+        cfg.application_name(app_name);
         cfg.authentication(tiberius::AuthMethod::sql_server(
             &config.user,
             &config.password,

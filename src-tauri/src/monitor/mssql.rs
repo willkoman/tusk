@@ -10,9 +10,13 @@
 
 use super::pg::{self, base_probe, bucket_rows, fold_histogram, Activity, FastSample, Probe, Row};
 use super::rates::Counters;
+use super::views::{self, Locks};
 use super::SignalAction;
 use crate::db::{self, AppError, ConnectionConfig};
 use crate::driver::{self, Backend};
+
+/// The sidecar's `program_name`, as Activity Monitor and `sp_who2` show it.
+const APP_NAME: &str = "Tusk monitor";
 
 /// SQL Server 2016 (`DATEDIFF_BIG`, `dm_exec_sessions.open_transaction_count`).
 const MIN_VERSION_NUM: i32 = 130_000;
@@ -185,6 +189,80 @@ pub(crate) fn activity_sql() -> String {
     )
 }
 
+/// A lock's object: a table by name, a database, or the table a key/page/row belongs
+/// to (resolved in this database only; `sys.partitions` is per database).
+const LOCK_OBJECT: &str = "CASE l.resource_type \
+       WHEN 'OBJECT' THEN CONCAT(DB_NAME(l.resource_database_id), '.', \
+            OBJECT_SCHEMA_NAME(l.resource_associated_entity_id, l.resource_database_id), '.', \
+            OBJECT_NAME(l.resource_associated_entity_id, l.resource_database_id)) \
+       WHEN 'DATABASE' THEN DB_NAME(l.resource_database_id) \
+       ELSE COALESCE((SELECT TOP (1) CONCAT(DB_NAME(), '.', OBJECT_SCHEMA_NAME(p.object_id), '.', \
+                             OBJECT_NAME(p.object_id)) \
+                        FROM sys.partitions p \
+                       WHERE l.resource_database_id = DB_ID() \
+                         AND p.hobt_id = l.resource_associated_entity_id), \
+                     CONCAT(DB_NAME(l.resource_database_id), ' ', LOWER(l.resource_type))) END";
+
+/// Locks waiting to be granted, with the session that blocks each (one per waiting
+/// task, from `dm_os_waiting_tasks`).
+pub(crate) fn lock_waits_sql() -> String {
+    let chars = pg::QUERY_TEXT_CHARS;
+    format!(
+        "SELECT TOP ({rows}) x.*, COUNT(*) OVER () AS total FROM (\
+           SELECT DISTINCT l.request_session_id AS pid, \
+                  CONVERT(varchar(23), s.login_time, 121) AS backend_start, \
+                  LOWER(l.resource_type) AS locktype, l.request_mode AS mode, \
+                  CONCAT({LOCK_OBJECT}, CASE WHEN l.resource_type IN ('KEY', 'RID', 'PAGE') \
+                         THEN CONCAT(' ', RTRIM(l.resource_description)) ELSE '' END) AS target, \
+                  s.login_name AS usr, DB_NAME(l.resource_database_id) AS db, s.program_name AS app, \
+                  'active' AS state, wt.wait_duration_ms AS waited_ms, \
+                  xb.begin_ms + o.utc_off AS xact_ms, \
+                  CASE WHEN wt.blocking_session_id > 0 \
+                       THEN CONCAT('{{', wt.blocking_session_id, '}}') END AS blocked_by, \
+                  CAST(LEFT(q.text, {chars}) AS nvarchar({chars})) AS query \
+             FROM sys.dm_tran_locks l \
+             JOIN sys.dm_os_waiting_tasks wt ON wt.resource_address = l.lock_owner_address \
+             JOIN sys.dm_exec_sessions s ON s.session_id = l.request_session_id \
+             CROSS JOIN (SELECT DATEDIFF_BIG(ms, SYSDATETIME(), SYSUTCDATETIME()) AS utc_off) o \
+             LEFT JOIN sys.dm_exec_requests r ON r.session_id = l.request_session_id \
+             OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) q \
+             OUTER APPLY (SELECT DATEDIFF_BIG(ms, '19700101', MIN(at.transaction_begin_time)) AS begin_ms \
+                            FROM sys.dm_tran_session_transactions st \
+                            JOIN sys.dm_tran_active_transactions at \
+                              ON at.transaction_id = st.transaction_id \
+                           WHERE st.session_id = s.session_id) xb \
+            WHERE l.request_status = 'WAIT' AND l.request_session_id <> @@SPID) x \
+         ORDER BY x.waited_ms DESC, x.pid",
+        rows = views::VIEW_ROWS,
+    )
+}
+
+/// Granted locks grouped by object, type and mode. Every session's shared lock on its
+/// own database is left out as noise. The holder list needs `STRING_AGG` (2017+).
+pub(crate) fn lock_holds_sql(string_agg: bool) -> String {
+    let pids = if string_agg {
+        "CONCAT('{', STRING_AGG(CAST(x.sid AS varchar(12)), ',') WITHIN GROUP (ORDER BY x.sid), '}')"
+    } else {
+        "CAST(NULL AS varchar(1))"
+    };
+    format!(
+        "SELECT TOP ({rows}) g.locktype, g.mode, g.target, g.n, g.pids, \
+                SUM(g.n) OVER () AS total, COUNT(*) OVER () AS groups \
+           FROM (SELECT x.locktype, x.mode, x.target, SUM(x.n) AS n, {pids} AS pids \
+                   FROM (SELECT r.locktype, r.mode, r.target, r.sid, COUNT(*) AS n \
+                           FROM (SELECT LOWER(l.resource_type) AS locktype, l.request_mode AS mode, \
+                                        {LOCK_OBJECT} AS target, l.request_session_id AS sid \
+                                   FROM sys.dm_tran_locks l \
+                                  WHERE l.request_status = 'GRANT' AND l.request_session_id > 0 \
+                                    AND l.request_session_id <> @@SPID \
+                                    AND l.resource_type <> 'DATABASE') r \
+                          GROUP BY r.locktype, r.mode, r.target, r.sid) x \
+                  GROUP BY x.locktype, x.mode, x.target) g \
+          ORDER BY g.n DESC, g.locktype, g.mode",
+        rows = views::VIEW_ROWS,
+    )
+}
+
 /// `login_time` as `CONVERT(varchar(23), …, 121)` prints it: digits and `-: .` only,
 /// so it can go into the `KILL` batch as a literal.
 pub(crate) fn login_time_ok(text: &str) -> bool {
@@ -213,17 +291,21 @@ pub(crate) struct MsSqlSession {
     status: String,
     histogram: String,
     activity: String,
+    lock_waits: String,
+    lock_holds: String,
 }
 
 impl MsSqlSession {
     pub(crate) async fn open(config: &ConnectionConfig) -> Result<Self, AppError> {
-        let (backend, _version) = driver::connect(config).await?;
+        let backend = driver::connect_mssql_as(config, APP_NAME).await?;
         let mut session = Self {
             backend,
             probe: base_probe("mssql", "SQL Server"),
             status: status_sql(),
             histogram: histogram_sql(),
             activity: activity_sql(),
+            lock_waits: lock_waits_sql(),
+            lock_holds: lock_holds_sql(true),
         };
         session.setup().await?;
         Ok(session)
@@ -277,6 +359,7 @@ impl MsSqlSession {
         probe.max_connections = pg::clamp_u32(pg::int(&c, row, "max_connections")?);
         probe.query_size = pg::QUERY_TEXT_CHARS as i64;
         probe.statements_note = Some("Statements are PostgreSQL-only for now.".into());
+        self.lock_holds = lock_holds_sql(v >= 140_000);
         if let Ok((sc, srows)) = self.query(STARTED_SQL).await {
             if let Some(srow) = srows.first() {
                 probe.started_ms = pg::opt_int(&sc, srow, "started_ms")?;
@@ -300,6 +383,17 @@ impl MsSqlSession {
         let mut activity = pg::parse_activity(&c, &rows)?;
         pg::relabel_waits(&mut activity, &WAIT_LABELS);
         Ok(activity)
+    }
+
+    /// The Locks view: waiting and granted locks, shaped like PostgreSQL's.
+    pub(crate) async fn locks(&mut self) -> Result<Locks, AppError> {
+        let (wc, wr) = self.query(&self.lock_waits).await?;
+        let (hc, hr) = self.query(&self.lock_holds).await?;
+        let mut locks = views::parse_locks(&wc, &wr, &hc, &hr)?;
+        for hold in &mut locks.held {
+            hold.pids.truncate(10);
+        }
+        Ok(locks)
     }
 
     /// `KILL`, re-identified by login time. `Ok(false)` when the session had gone.
@@ -393,6 +487,9 @@ mod tests {
             status_sql(),
             histogram_sql(),
             activity_sql(),
+            lock_waits_sql(),
+            lock_holds_sql(true),
+            lock_holds_sql(false),
             PROBE_SQL.to_string(),
         ] {
             let items = parse_for_engine(&sql, TransactionEngine::MsSql)
