@@ -3869,6 +3869,17 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
+        "text": "v0.12.1 — host metrics in the monitor",
+        "id": "v0-12-1"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**The PostgreSQL monitor shows the server machine** when EnterpriseDB's `system_stats` extension is installed: Host CPU and Host memory tiles and a Host chart with CPU busy and I/O wait plus disk and network bytes per second, every 5 seconds. Without it the Overview says what is missing. [[topic:monitor|More]]."
+        ]
+      },
+      {
+        "k": "h",
         "text": "v0.12.0 — the database monitor",
         "id": "v0-12-0"
       },
