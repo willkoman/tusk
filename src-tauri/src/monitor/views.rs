@@ -57,22 +57,25 @@ pub(crate) enum Tier {
     Maintenance,
     Io,
     Statements,
+    /// Host CPU/memory/disk/network through `system_stats`; runs whenever sampling.
+    Host,
 }
 
 impl Tier {
-    pub(crate) const ALL: [Tier; 6] = [
+    pub(crate) const ALL: [Tier; 7] = [
         Tier::Locks,
         Tier::Replication,
         Tier::Progress,
         Tier::Maintenance,
         Tier::Io,
         Tier::Statements,
+        Tier::Host,
     ];
 
     pub(crate) fn every(self) -> Duration {
         Duration::from_secs(match self {
             Tier::Locks | Tier::Progress => 2,
-            Tier::Replication => 5,
+            Tier::Replication | Tier::Host => 5,
             Tier::Io | Tier::Statements => 10,
             Tier::Maintenance => 30,
         })
@@ -85,6 +88,7 @@ impl Tier {
             Tier::Progress | Tier::Maintenance => views.tables,
             Tier::Io => views.io,
             Tier::Statements => views.statements,
+            Tier::Host => true,
         }
     }
 
@@ -96,6 +100,7 @@ impl Tier {
             Tier::Maintenance => "maintenance",
             Tier::Io => "io",
             Tier::Statements => "statements",
+            Tier::Host => "host",
         }
     }
 }
@@ -1549,7 +1554,10 @@ mod tests {
     #[test]
     fn tiers_follow_their_views() {
         let none = ViewSet::default();
-        assert!(Tier::ALL.iter().all(|t| !t.enabled(none)));
+        // Host metrics run whenever the monitor samples; every other tier needs its view.
+        assert!(Tier::ALL
+            .iter()
+            .all(|t| t.enabled(none) == (*t == Tier::Host)));
         let tables = ViewSet {
             tables: true,
             ..none

@@ -51,6 +51,9 @@ describe("MonitorTab per engine", () => {
     expect(charts).toContain("Checkpoints and background writes");
     expect(text(".mc-key-label")).toContain("Fetched");
     expect(text(".mc-key-label")).toContain("LWLock");
+    // No system_stats: no Host chart or tiles.
+    expect(charts).not.toContain("Host");
+    expect(text(".mt-label")).not.toContain("Host CPU");
   });
 
   it("MySQL: Overview, Activity and Locks, its own names, no series it cannot count", () => {

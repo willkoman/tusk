@@ -546,6 +546,31 @@ describe("phase-2 model", () => {
     expect(slotTone({ active: false, walStatus: "lost", retainedBytes: null })).toBe("danger");
   });
 
+  it("host readings add points only when they arrive, and tiles hold them while fresh", async () => {
+    const m = await import("./model");
+    const d = new m.MonitorData(64);
+    const base = {
+      connectionId: "c", generation: 1, seq: 1, monoMs: 0, serverMs: null, latencyMs: 1, intervalMs: 1000,
+      status: "live" as const, error: null, reset: false, rates: null, sessions: null, load: null,
+      oldestXactMs: null, blocked: null, replicationLagMs: null, activity: null, activityError: null,
+      locks: null, replication: null, progress: null, maintenance: null, io: null, statements: null, viewErrors: null,
+    };
+    const host = { cpuBusyPct: 40, cpuIowaitPct: 5, memTotal: 1000, memUsed: 250, memCache: 100, swapUsed: 0, load1: 1.5, diskRead: null, diskWrite: null, netRx: 10, netTx: 20 };
+    d.ingest({ ...base, host }, 1000, 8192);
+    d.ingest({ ...base, host: null }, 2000, 8192);
+    expect(d.hostCpu.size).toBe(1);
+    expect(d.hostIo.value(0, 0)).toBeNaN();
+    expect(d.hostIo.value(0, 2)).toBe(10);
+    const cpu = m.tileIndex("hostCpu");
+    const mem = m.tileIndex("hostMem");
+    expect(d.tiles.value(1, cpu)).toBe(40);
+    expect(d.tiles.value(1, mem)).toBe(25);
+    d.ingest({ ...base, host: null }, 1000 + m.HOST_STALE_MS + 1000, 8192);
+    expect(d.tiles.value(d.tiles.size - 1, cpu)).toBeNaN();
+    d.clear();
+    expect(d.lastHost).toBeNull();
+  });
+
   it("thresholds: normalize, clamp, order, and drive every tone", async () => {
     const m = await import("./model");
     const d = m.DEFAULT_THRESHOLDS;

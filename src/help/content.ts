@@ -3523,6 +3523,16 @@ export const TOPICS: Topic[] = [
             "Replication lag",
             "Primary: the slowest replica's replay lag. Standby: time since the last replayed transaction. Shown only when there is replication",
             "Amber past 1 min"
+          ],
+          [
+            "Host CPU",
+            "The database server's CPU busy share, with the 1-minute load average. Shown only with `system_stats` (below)",
+            "—"
+          ],
+          [
+            "Host memory",
+            "Memory in use by processes on the server (total − free − page cache), of the total. Shown only with `system_stats`",
+            "—"
           ]
         ]
       },
@@ -3550,6 +3560,7 @@ export const TOPICS: Topic[] = [
           "**Block I/O** — shared-buffer hits and reads and temporary-file bytes, in bytes per second.",
           "**WAL** — WAL bytes per second, and below it full-page images per second (PostgreSQL 14+), which jump after a checkpoint.",
           "**Checkpoints and background writes** — buffers written per second by checkpoints, by the background writer, and (16 and earlier) by backends themselves. Frequent *requested* checkpoints mean `max_wal_size` is too small.",
+          "**Host** (PostgreSQL with `system_stats`) — the server machine's CPU busy and I/O-wait shares, and bytes per second read and written by its disks and received and sent by its network interfaces, every 5 seconds.",
           "**Events** — a lane of markers for checkpoints (amber when requested rather than timed), deadlocks, recovery conflicts, temporary files and statistics resets; a bigger dot is more in one sample. Checkpoints are also marked on the WAL and writes charts."
         ]
       },
@@ -3667,6 +3678,7 @@ export const TOPICS: Topic[] = [
         "k": "list",
         "items": [
           "PostgreSQL 10 or later. Full-page images, `COPY` progress and lock wait times need 14 or later; the I/O view needs 16.",
+          "Host CPU, memory, disk and network need EnterpriseDB's `system_stats` extension, the one pgAdmin uses: build and install it on the server, `CREATE EXTENSION system_stats` in the database you connect to, and give the role `monitor_system_stats` (or connect as a superuser). Without it the Overview says which part is missing. It reads the machine or container PostgreSQL runs in; its CPU reading takes about 150 ms, so it runs every 5 seconds.",
           "MySQL 8.0 or MariaDB 10.5 or later, with `performance_schema` (MySQL) or `information_schema.GLOBAL_STATUS` (MariaDB). Without `PROCESS` the server lists only the monitor's own account and InnoDB's transactions stay hidden, so the oldest-transaction tile and lock waits go blank; a banner says so.",
           "SQL Server 2016 or later, with `VIEW SERVER STATE` (SQL Server 2022: `VIEW SERVER PERFORMANCE STATE`); without it the monitor refuses to start and says why.",
           "DuckDB and SQLite are embedded, have no server to watch, and show no Monitor entry at all.",

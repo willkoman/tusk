@@ -36,6 +36,10 @@ export type ServerInfo = {
   statementsAvailable: boolean;
   /** Why it is not (shown on the Statements view). */
   statementsNote: string | null;
+  /** EnterpriseDB's `system_stats` is installed and runnable: host metrics arrive. */
+  hostStats?: boolean;
+  /** Why host metrics are missing (PostgreSQL only). */
+  hostStatsNote?: string | null;
 };
 
 export type MonitorStarted = {
@@ -251,9 +255,30 @@ export type MonitorSample = {
   maintenance: MonitorMaintenance | null;
   io: MonitorIo | null;
   statements: MonitorStatements | null;
+  /** `system_stats` host metrics, every 5 s when available. */
+  host?: HostSample | null;
   /** A view tier that failed this tick, by tier name. */
   viewErrors: Record<string, string> | null;
 };
+
+/** The database server's machine, from `system_stats` (src-tauri/src/monitor/host.rs). */
+export type HostSample = {
+  cpuBusyPct: number | null;
+  cpuIowaitPct: number | null;
+  memTotal: number | null;
+  /** In use by processes (excluding the page cache). */
+  memUsed: number | null;
+  memCache: number | null;
+  swapUsed: number | null;
+  load1: number | null;
+  diskRead: number | null;
+  diskWrite: number | null;
+  netRx: number | null;
+  netTx: number | null;
+};
+
+/** A host reading older than this is no longer shown on the tiles. */
+export const HOST_STALE_MS = 15_000;
 
 /**
  * A ring of `capacity` rows, each a timestamp plus `width` values. NaN in a value row
@@ -401,8 +426,10 @@ export const IO_SERIES = ["Hit", "Read", "Temp files"] as const;
 export const WAL_SERIES = ["WAL"] as const;
 export const FPI_SERIES = ["Full-page images"] as const;
 export const WRITES_SERIES = ["Checkpointer", "Background writer", "Backends"] as const;
+export const HOST_CPU_SERIES = ["Busy", "I/O wait"] as const;
+export const HOST_IO_SERIES = ["Disk read", "Disk write", "Network in", "Network out"] as const;
 /** Tile sparkline sources, one column each. */
-export const TILE_KEYS = ["load", "sessions", "tps", "cacheHit", "wal", "oldestXact", "blocked", "lag"] as const;
+export const TILE_KEYS = ["load", "sessions", "tps", "cacheHit", "wal", "oldestXact", "blocked", "lag", "hostCpu", "hostMem"] as const;
 export type TileKey = (typeof TILE_KEYS)[number];
 export const tileIndex = (key: TileKey) => TILE_KEYS.indexOf(key);
 
@@ -426,6 +453,11 @@ export class MonitorData {
   readonly fpi: SeriesBuffer;
   /** Buffers written per second by the checkpointer, the bgwriter and backends, as bytes. */
   readonly writes: SeriesBuffer;
+  /** Host CPU busy / I/O wait (%) and disk / network bytes per second, every 5 s. */
+  readonly hostCpu: SeriesBuffer;
+  readonly hostIo: SeriesBuffer;
+  /** The newest host reading and when it arrived. */
+  lastHost: { t: number; host: HostSample } | null = null;
   readonly events = new EventRing(EVENT_CAPACITY);
   readonly tiles: SeriesBuffer;
   private lastT: number | null = null;
@@ -442,10 +474,12 @@ export class MonitorData {
     this.fpi = new SeriesBuffer(capacity, FPI_SERIES.length);
     this.writes = new SeriesBuffer(capacity, WRITES_SERIES.length);
     this.tiles = new SeriesBuffer(capacity, TILE_KEYS.length);
+    this.hostCpu = new SeriesBuffer(capacity, HOST_CPU_SERIES.length);
+    this.hostIo = new SeriesBuffer(capacity, HOST_IO_SERIES.length);
   }
 
   private all(): SeriesBuffer[] {
-    return [this.load, this.sessions, this.tps, this.tupWrite, this.tupRead, this.io, this.wal, this.fpi, this.writes, this.tiles];
+    return [this.load, this.sessions, this.tps, this.tupWrite, this.tupRead, this.io, this.wal, this.fpi, this.writes, this.tiles, this.hostCpu, this.hostIo];
   }
 
   private rateBuffers(): SeriesBuffer[] {
@@ -461,6 +495,7 @@ export class MonitorData {
     for (const b of this.all()) b.clear();
     this.events.clear();
     this.lastT = null;
+    this.lastHost = null;
     this.avg.length = 0;
   }
 
@@ -516,6 +551,15 @@ export class MonitorData {
       for (const b of this.rateBuffers()) b.gap(t);
       this.avg.length = 0;
     }
+    // Host readings come every few ticks; only those ticks add a point.
+    const h = sample.host;
+    if (h) {
+      const n = (v: number | null) => (v === null ? NaN : v);
+      this.hostCpu.push(t, [n(h.cpuBusyPct), n(h.cpuIowaitPct)]);
+      this.hostIo.push(t, [n(h.diskRead), n(h.diskWrite), n(h.netRx), n(h.netTx)]);
+      this.lastHost = { t, host: h };
+    }
+    const fresh = this.lastHost && t - this.lastHost.t <= HOST_STALE_MS ? this.lastHost.host : null;
     const loadSum = load ? load.reduce((a, x) => a + x, 0) : NaN;
     this.tiles.push(t, [
       loadSum,
@@ -526,6 +570,8 @@ export class MonitorData {
       sample.oldestXactMs ?? NaN,
       sample.blocked ?? NaN,
       sample.replicationLagMs ?? NaN,
+      fresh?.cpuBusyPct ?? NaN,
+      fresh && fresh.memUsed !== null && fresh.memTotal ? (fresh.memUsed / fresh.memTotal) * 100 : NaN,
     ]);
   }
 }

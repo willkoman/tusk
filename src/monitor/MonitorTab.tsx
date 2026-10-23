@@ -20,6 +20,10 @@ import {
   blockedTone,
   cacheHitTone,
   formatByteRate,
+  formatBytes,
+  HOST_CPU_SERIES,
+  HOST_IO_SERIES,
+  HOST_STALE_MS,
   formatBytesAxis,
   formatCompact,
   formatDuration,
@@ -77,6 +81,17 @@ const IO_SPECS: SeriesSpec[] = [
 ];
 const WAL_SPECS: SeriesSpec[] = [{ label: WAL_SERIES[0], color: "--chart-5", kind: "line" }];
 const FPI_SPECS: SeriesSpec[] = [{ label: FPI_SERIES[0], color: "--chart-3", kind: "line" }];
+const HOST_CPU_SPECS: SeriesSpec[] = [
+  { label: HOST_CPU_SERIES[0], color: "--chart-4", kind: "line" },
+  { label: HOST_CPU_SERIES[1], color: "--chart-2", kind: "line" },
+];
+const HOST_IO_SPECS: SeriesSpec[] = [
+  { label: HOST_IO_SERIES[0], color: "--chart-1", kind: "line" },
+  { label: HOST_IO_SERIES[1], color: "--chart-9", kind: "line" },
+  { label: HOST_IO_SERIES[2], color: "--chart-5", kind: "line" },
+  { label: HOST_IO_SERIES[3], color: "--chart-7", kind: "line" },
+];
+const formatPct = (v: number) => (Number.isFinite(v) ? `${v < 10 ? v.toFixed(1) : Math.round(v)}%` : "–");
 const WRITES_SPECS: SeriesSpec[] = [
   { label: WRITES_SERIES[0], color: "--chart-7", kind: "line" },
   { label: WRITES_SERIES[1], color: "--chart-5", kind: "line" },
@@ -114,7 +129,7 @@ type Pane = {
   omit?: ReadonlySet<number>;
 };
 
-type ChartDef = { id: ChartId; title: string; source: string; panes: Pane[] };
+type ChartDef = { id: ChartId; title: string; source: string; panes: Pane[]; when?: (s: MonitorSession) => boolean };
 
 /** A chart as this engine names it, or null when the engine has nothing to draw. */
 function localize(def: ChartDef, profile: EngineProfile): ChartDef | null {
@@ -181,6 +196,16 @@ const CHARTS: ChartDef[] = [
     title: "Checkpoints and background writes",
     source: "Buffers written per second, as bytes: by checkpoints (pg_stat_checkpointer on PostgreSQL 17+, pg_stat_bgwriter before), by the background writer, and by backends themselves (16 and earlier). Markers: checkpoints, dashed amber when requested rather than timed — frequent requested checkpoints mean max_wal_size is too small.",
     panes: [{ buffer: (s) => s.data.writes, series: WRITES_SPECS, format: formatByteRate, height: 170, markers: CHECKPOINTS, bytes: true }],
+  },
+  {
+    id: "host",
+    title: "Host",
+    source: "The database server's machine (or container), from the system_stats extension every 5 seconds: CPU busy and I/O-wait shares above; bytes per second read and written by physical disks and received and sent by network interfaces (loopback excluded) below.",
+    when: (s) => !!s.started()?.server.hostStats,
+    panes: [
+      { buffer: (s) => s.data.hostCpu, series: HOST_CPU_SPECS, format: formatPct, height: 84 },
+      { buffer: (s) => s.data.hostIo, series: HOST_IO_SPECS, format: formatByteRate, height: 84, bytes: true },
+    ],
   },
 ];
 
@@ -538,10 +563,16 @@ export default function MonitorTab(props: {
 
   const server = () => s.started()?.server ?? null;
   const latest = () => s.latest();
+  /** The newest host reading, while it is recent enough to show. */
+  const freshHost = () => {
+    void s.tick();
+    const h = s.data.lastHost;
+    return h && (s.data.last ?? h.t) - h.t <= HOST_STALE_MS ? h.host : null;
+  };
   /** Every Overview chart's samples in the export range, joined on time. */
   const allCsv = () => {
     const r = exportRange(s);
-    return chartCsv(charts.flatMap((def) => csvColumns(s, def).map((c) => ({ ...c, label: c.label.startsWith(`${def.title}: `) ? c.label : `${def.title}: ${c.label}` }))), r.t0, r.t1, toWall);
+    return chartCsv(charts.filter((def) => !def.when || def.when(s)).flatMap((def) => csvColumns(s, def).map((c) => ({ ...c, label: c.label.startsWith(`${def.title}: `) ? c.label : `${def.title}: ${c.label}` }))), r.t0, r.t1, toWall);
   };
   const tileMean = (key: TileKey) => {
     void s.tick();
@@ -624,6 +655,24 @@ export default function MonitorTab(props: {
       sub: () => (server()?.inRecovery ? "since last replay" : "slowest replica"),
       tone: () => replicationLagTone(latest()?.replicationLagMs ?? null, monitorThresholds()),
       when: () => latest()?.replicationLagMs != null,
+    },
+    {
+      key: "hostCpu",
+      label: "Host CPU",
+      source: "Share of the database server's CPU not idle, from the system_stats extension (every 5 seconds); below, the 1-minute load average.",
+      value: () => formatPct(freshHost()?.cpuBusyPct ?? NaN),
+      sub: () => (freshHost()?.load1 != null ? `load ${freshHost()!.load1!.toFixed(2)}` : ""),
+      tone: () => "",
+      when: () => !!server()?.hostStats,
+    },
+    {
+      key: "hostMem",
+      label: "Host memory",
+      source: "Memory in use by processes on the database server (total minus free minus the page cache), from the system_stats extension.",
+      value: () => (freshHost()?.memUsed != null ? formatBytes(freshHost()!.memUsed!) : "–"),
+      sub: () => (freshHost()?.memTotal ? `of ${formatBytes(freshHost()!.memTotal!)}` : ""),
+      tone: () => "",
+      when: () => !!server()?.hostStats,
     },
   ];
 
@@ -758,8 +807,17 @@ export default function MonitorTab(props: {
           <Switch>
             <Match when={view() === "overview"}>
               <div class="monitor-grid" style={{ "grid-template-columns": `repeat(${chartColumns(width())}, minmax(0, 1fr))` }}>
-                <For each={charts}>{(def) => <ChartCard session={s} def={def} onExport={(e, chart) => props.onChartExport(e, { ...chart, allCsv })} />}</For>
+                <For each={charts}>
+                  {(def) => (
+                    <Show when={!def.when || def.when(s)}>
+                      <ChartCard session={s} def={def} onExport={(e, chart) => props.onChartExport(e, { ...chart, allCsv })} />
+                    </Show>
+                  )}
+                </For>
               </div>
+              <Show when={profile.engine === "postgres" && server()?.hostStatsNote}>
+                {(note) => <div class="mv-note mv-host-note">Host CPU, memory, disk and network: {note()}</div>}
+              </Show>
               <EventsCard session={s} profile={profile} />
               <Show when={s.range()} fallback={<ActiveNow session={s} onRowMenu={props.onRowMenu} />}>
                 <ActiveInRange session={s} />

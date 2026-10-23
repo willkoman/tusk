@@ -15,7 +15,7 @@ export type MonitorEngine = "postgres" | "mysql" | "mssql";
 export const isMonitorEngine = (kind: string | null | undefined): kind is MonitorEngine =>
   kind === "postgres" || kind === "mysql" || kind === "mssql";
 
-export type ChartId = "load" | "sessions" | "tps" | "tuples" | "io" | "wal" | "writes";
+export type ChartId = "load" | "sessions" | "tps" | "tuples" | "io" | "wal" | "writes" | "host";
 
 /** An engine's override for one Overview chart. Per pane: series relabelled, series omitted. */
 export type ChartText = {

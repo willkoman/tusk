@@ -2,6 +2,11 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
+## [Unreleased]
+
+### Added
+- **The PostgreSQL monitor shows the server machine too.** With EnterpriseDB's `system_stats` extension installed (the one pgAdmin's dashboard uses), the Monitor adds Host CPU and Host memory tiles and a Host chart: CPU busy and I/O wait, plus disk and network bytes per second, refreshed every 5 seconds. Without the extension the Overview says what is missing: install it, `CREATE EXTENSION system_stats` in the database you connect to, and grant the role `monitor_system_stats`.
+
 ## [0.12.0] - 2026-10-23
 
 ### Added

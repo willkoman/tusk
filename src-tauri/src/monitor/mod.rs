@@ -25,6 +25,7 @@
 //! run on the sidecar, are refused for read-only connections and for the monitor's
 //! own pid, and re-identify their target by backend start before signalling.
 
+mod host;
 mod mssql;
 mod mysql;
 mod pg;
@@ -285,6 +286,8 @@ pub(crate) struct MonitorEvent {
     pub maintenance: Option<Maintenance>,
     pub io: Option<Io>,
     pub statements: Option<Statements>,
+    /// `system_stats` host metrics, every 5 s when the extension is usable.
+    pub host: Option<host::Host>,
     /// A view tier that failed this tick, by tier name, with the server's reason.
     pub view_errors: Option<BTreeMap<&'static str, String>>,
 }
@@ -316,6 +319,7 @@ impl MonitorEvent {
             maintenance: None,
             io: None,
             statements: None,
+            host: None,
             view_errors: None,
         }
     }
@@ -444,6 +448,7 @@ pub(crate) fn spawn(
         last_tier: HashMap::new(),
         io: IoTracker::default(),
         statements: StatementTracker::default(),
+        host: host::HostTracker::default(),
     };
     let task = tauri::async_runtime::spawn(sampler.run(inbox));
     MonitorHandle {
@@ -468,6 +473,7 @@ struct Sampler {
     last_tier: HashMap<Tier, Instant>,
     io: IoTracker,
     statements: StatementTracker,
+    host: host::HostTracker,
 }
 
 fn ticker(interval: Duration) -> tokio::time::Interval {
@@ -552,6 +558,7 @@ impl Sampler {
         self.last_tier.remove(&tier);
         match tier {
             Tier::Io => self.io.clear(),
+            Tier::Host => self.host.clear(),
             Tier::Statements => self.statements.clear(),
             _ => {}
         }
@@ -585,6 +592,7 @@ impl Sampler {
         match tier {
             Tier::Io => probe.version_num >= views::IO_VERSION_NUM,
             Tier::Statements => probe.statements_available,
+            Tier::Host => probe.host_stats,
             _ => true,
         }
     }
@@ -623,6 +631,13 @@ impl Sampler {
                     Err(e) => Err(e),
                 },
                 Tier::Statements => statement_tier(session, &mut self.statements, event, at).await,
+                Tier::Host => match session.host_rows().await {
+                    Ok((c, rows)) => self
+                        .host
+                        .ingest(&c, &rows, at)
+                        .map(|v| event.host = Some(v)),
+                    Err(e) => Err(e),
+                },
             };
             if let Err(e) = outcome {
                 event.view_error(tier, e.message);

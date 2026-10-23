@@ -2464,6 +2464,7 @@ button.monitor-tile:hover:not(:disabled) { border-color: var(--border-hover); }
 .mc-sub { font-size: var(--fs-xs); color: var(--muted); }
 .mc-info { display: inline-flex; color: var(--muted); cursor: help; }
 .mc-info svg { width: 13px; height: 13px; }
+.mv-host-note { display: block; margin: var(--s1) 0 var(--s2); }
 .mc-head .mc-export { margin-left: auto; width: var(--control-h-sm); padding: 0; color: var(--muted); opacity: 0.55; }
 .monitor-card:hover .mc-export, .mc-head .mc-export:focus-visible { opacity: 1; }
 .mc-head button { height: var(--control-h-sm); padding-top: 0; padding-bottom: 0; font-size: var(--fs-xs); }

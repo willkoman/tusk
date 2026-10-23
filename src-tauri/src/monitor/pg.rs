@@ -10,6 +10,7 @@ use serde::Serialize;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, SimpleQueryMessage};
 
+use super::host;
 use super::rates::Counters;
 use super::views::{self, Locks, Maintenance, Progress, Replication, StatementsSource};
 use crate::db::{self, AppError, ConnectionConfig};
@@ -102,6 +103,12 @@ pub(crate) struct Probe {
     pub statements_note: Option<String>,
     #[serde(skip)]
     pub statements_source: Option<StatementsSource>,
+    /// `system_stats` is installed here and this role may run it (host metrics).
+    pub host_stats: bool,
+    /// Why host metrics are missing, in words the Overview shows.
+    pub host_stats_note: Option<String>,
+    #[serde(skip)]
+    pub host_schema: Option<String>,
 }
 
 /// The fast tier: ONE statement, one row, shared-memory stats views only. Built per
@@ -367,6 +374,7 @@ pub(crate) struct PgSession {
     wraparound: Statement,
     io: Statement,
     statements: Statement,
+    host: Statement,
 }
 
 impl PgSession {
@@ -390,6 +398,7 @@ impl PgSession {
             wraparound: blank("tusk_monitor_wraparound"),
             io: blank("tusk_monitor_io"),
             statements: blank("tusk_monitor_statements"),
+            host: blank("tusk_monitor_host"),
         };
         session.setup().await?;
         Ok(session)
@@ -421,6 +430,7 @@ impl PgSession {
         let (columns, row) = one_row(client, PROBE_SQL).await?;
         let mut probe = parse_probe(version_num as i32, &columns, &row)?;
         probe_statements(client, &mut probe).await;
+        probe_host(client, &mut probe).await;
         let v = probe.version_num;
         // A fresh or reopened session has no prepared statements: every one starts
         // unprepared and prepares itself on first use.
@@ -442,6 +452,14 @@ impl PgSession {
                 .statements_source
                 .as_ref()
                 .map(views::statements_sql)
+                .unwrap_or_default(),
+        );
+        self.host = Statement::new(
+            "tusk_monitor_host",
+            probe
+                .host_schema
+                .as_deref()
+                .map(host::host_sql)
                 .unwrap_or_default(),
         );
         self.probe = probe;
@@ -489,6 +507,12 @@ impl PgSession {
     pub(crate) async fn io_rows(&mut self) -> Result<(Vec<String>, Vec<Row>), AppError> {
         let client = self.backend.pg()?;
         Self::rows(&mut self.io, client, db::MONITOR_TEXT_LIMITS).await
+    }
+
+    /// One `system_stats` reading; the caller's tracker turns counters into rates.
+    pub(crate) async fn host_rows(&mut self) -> Result<(Vec<String>, Vec<Row>), AppError> {
+        let client = self.backend.pg()?;
+        Self::rows(&mut self.host, client, db::MONITOR_TEXT_LIMITS).await
     }
 
     /// Cumulative `pg_stat_statements` numbers, without text.
@@ -547,6 +571,31 @@ impl PgSession {
                 "session {pid} has already ended (or its pid now belongs to another session); nothing was signalled"
             ))),
             Err(e) => Err(AppError::new(format!("unexpected signal result: {e}"))),
+        }
+    }
+}
+
+/// Is `system_stats` installed and runnable by this role? Never fails the session:
+/// the answer is a note on the Overview.
+async fn probe_host(client: &Client, probe: &mut Probe) {
+    let found = match client.simple_query(host::PROBE_SQL).await {
+        Ok(messages) => db::collect_rows_limited(&messages, db::MONITOR_TEXT_LIMITS),
+        Err(e) => Err(AppError::from(e)),
+    };
+    match found {
+        Ok((c, rows)) => match rows.first() {
+            None => probe.host_stats_note = Some(host::NOT_INSTALLED.into()),
+            Some(row) if !boolean(&c, row, "can_run") => {
+                probe.host_stats_note = Some(host::NOT_PERMITTED.into())
+            }
+            Some(row) => {
+                probe.host_stats = true;
+                probe.host_schema = text(&c, row, "schema");
+            }
+        },
+        Err(e) => {
+            probe.host_stats_note =
+                Some(format!("system_stats could not be checked: {}", e.message))
         }
     }
 }
@@ -625,6 +674,9 @@ pub(super) fn base_probe(engine: &'static str, product: &'static str) -> Probe {
         statements_available: false,
         statements_note: None,
         statements_source: None,
+        host_stats: false,
+        host_stats_note: None,
+        host_schema: None,
     }
 }
 
@@ -707,6 +759,9 @@ fn parse_probe(
         statements_available: false,
         statements_note: None,
         statements_source: None,
+        host_stats: false,
+        host_stats_note: None,
+        host_schema: None,
     })
 }
 

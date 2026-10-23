@@ -84,7 +84,11 @@ fn sqlite_cfg() -> ConnectionConfig {
 }
 fn pg_cfg() -> Option<ConnectionConfig> {
     let port: u16 = std::env::var("TUSK_TEST_PG_PORT").ok()?.parse().ok()?;
-    Some(ConnectionConfig {
+    Some(pg_cfg_at(port))
+}
+/// A PostgreSQL on localhost (postgres / `test`, database `postgres`).
+fn pg_cfg_at(port: u16) -> ConnectionConfig {
+    ConnectionConfig {
         driver: Some("postgres".into()),
         host: "127.0.0.1".into(),
         port,
@@ -93,7 +97,7 @@ fn pg_cfg() -> Option<ConnectionConfig> {
         dbname: "postgres".into(),
         sslmode: Some("disable".into()),
         ..base()
-    })
+    }
 }
 fn mssql_cfg() -> Option<ConnectionConfig> {
     let port: u16 = std::env::var("TUSK_TEST_MSSQL_PORT").ok()?.parse().ok()?;
@@ -5933,6 +5937,10 @@ mod monitor_battery {
         assert!(server.superuser, "the conformance role is postgres");
         assert_eq!(started.interval_ms, 250);
         assert_eq!(started.wait_types[0], "CPU");
+        assert!(
+            !server.host_stats && server.host_stats_note.is_some(),
+            "the conformance image has no system_stats"
+        );
         assert_eq!(
             monitor_backends(&observer).await,
             1,
@@ -6229,6 +6237,66 @@ mod monitor_battery {
         assert_eq!(state.monitors.stop_all(), 1);
         wait_no_monitor_backend(&observer, "after stop_all").await;
     }
+}
+
+/// Host metrics through EnterpriseDB's `system_stats`, which no stock image carries:
+/// point `TUSK_TEST_PG_SYSTEM_STATS_PORT` at a PostgreSQL (postgres / `test`) with the
+/// extension created in `postgres`. `scripts/conformance.sh` does not start one.
+#[tokio::test]
+async fn monitor_host_stats_postgres() {
+    use monitor_battery::{sink, wait_event, Events};
+    let Some(port) = std::env::var("TUSK_TEST_PG_SYSTEM_STATS_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+    else {
+        eprintln!("SKIP monitor_host_stats_postgres (set TUSK_TEST_PG_SYSTEM_STATS_PORT)");
+        return;
+    };
+    let mut cfg = pg_cfg_at(port);
+    cfg.dbname = "postgres".into();
+    let state = crate::AppState::default();
+    let (user, _) = connect(&cfg).await.expect("connect");
+    let id = state.register(user, false).unwrap();
+    let events: Events = std::sync::Arc::default();
+    let options = crate::monitor::MonitorOptions {
+        interval_ms: Some(1000),
+        ..Default::default()
+    };
+    let started = crate::monitor::start(&state, &id, options, sink(&events))
+        .await
+        .expect("monitor start");
+    assert!(
+        started.server.host_stats,
+        "{:?}",
+        started.server.host_stats_note
+    );
+    assert!(started.server.host_stats_note.is_none());
+    let generation = started.generation;
+    let (first, from) = wait_event(&events, 0, "a host reading", |e| {
+        e.generation == generation && e.host.is_some()
+    })
+    .await;
+    let h = first.host.unwrap();
+    assert!(
+        h.cpu_busy_pct.is_some_and(|v| (0.0..=100.0).contains(&v)),
+        "{h:?}"
+    );
+    assert!(h.mem_total.is_some_and(|v| v > 0));
+    assert!(h
+        .mem_used
+        .is_some_and(|v| v >= 0 && v <= h.mem_total.unwrap()));
+    assert!(h.load1.is_some());
+    assert!(h.net_rx.is_none(), "the first reading is a baseline");
+    let (second, _) = wait_event(&events, from, "a host reading with rates", |e| {
+        e.generation == generation && e.host.as_ref().is_some_and(|h| h.net_rx.is_some())
+    })
+    .await;
+    let h2 = second.host.unwrap();
+    for rate in [h2.disk_read, h2.disk_write, h2.net_rx, h2.net_tx] {
+        assert!(rate.is_some_and(|v| v >= 0.0), "{h2:?}");
+    }
+    assert!(second.view_errors.is_none(), "{:?}", second.view_errors);
+    assert_eq!(state.monitors.stop_all(), 1);
 }
 
 #[tokio::test]
