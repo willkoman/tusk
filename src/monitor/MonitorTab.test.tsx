@@ -53,9 +53,9 @@ describe("MonitorTab per engine", () => {
     expect(text(".mc-key-label")).toContain("LWLock");
   });
 
-  it("MySQL: Overview and Activity, its own names, no series it cannot count", () => {
+  it("MySQL: Overview, Activity and Locks, its own names, no series it cannot count", () => {
     const { text } = mount("mysql");
-    expect(text(".mv-views button")).toEqual(["Overview", "Activity"]);
+    expect(text(".mv-views button")).toEqual(["Overview", "Activity", "Locks"]);
     const charts = text(".monitor-card h3");
     expect(charts).toEqual(expect.arrayContaining(["Rows per second", "Buffer pool I/O", "Redo log", "Buffer pool flushing"]));
     const keys = text(".mc-key-label");
@@ -70,7 +70,7 @@ describe("MonitorTab per engine", () => {
 
   it("SQL Server: no rows chart, no rollback series", () => {
     const { text } = mount("mssql");
-    expect(text(".mv-views button")).toEqual(["Overview", "Activity"]);
+    expect(text(".mv-views button")).toEqual(["Overview", "Activity", "Locks"]);
     const charts = text(".monitor-card h3");
     expect(charts).not.toContain("Tuples per second");
     expect(charts).not.toContain("Rows per second");
@@ -82,7 +82,7 @@ describe("MonitorTab per engine", () => {
   });
 
   it("a view the engine lacks falls back to Overview", () => {
-    const session = new MonitorSession("conn-x", { paused: true, view: "locks" });
+    const session = new MonitorSession("conn-x", { paused: true, view: "statements" });
     render(() => (
       <MonitorTab session={session} connectionLabel="x" engine="mysql" production={undefined}
         onRowMenu={() => {}} onQueryMenu={() => {}} onOpenSettings={() => {}} onChartExport={() => {}} />

@@ -22,6 +22,7 @@ import {
   type StatementTotal,
 } from "./model";
 import type { MonitorSession } from "./session";
+import { engineProfile } from "./engines";
 import { monitorThresholds } from "./thresholds";
 
 /**
@@ -125,6 +126,7 @@ const ActionsCell = (props: { label: string; onMenu: (e: MouseEvent) => void }) 
 export function LocksView(props: { session: MonitorSession; onRowMenu: RowMenu }) {
   const s = props.session;
   const locks = () => s.locks();
+  const text = () => engineProfile(s.started()?.server.engine ?? "postgres").locks;
   // The blocking chains, from the process list (who waits on whom, beyond locks the
   // list is capped at).
   const chains = createMemo(() => {
@@ -140,9 +142,9 @@ export function LocksView(props: { session: MonitorSession; onRowMenu: RowMenu }
         <div class="mv-summary">
           <span classList={{ warn: (locks()?.waitingTotal ?? 0) > 0 }}><b>{num(locks()?.waitingTotal)}</b> waiting</span>
           <span><b>{num(locks()?.heldTotal)}</b> granted locks in {num(locks()?.heldGroups)} groups</span>
-          <span class="mc-sub">Every transaction's own transaction-ID locks are not counted.</span>
+          <span class="mc-sub">{text().summary}</span>
         </div>
-        <Section title="Waiting" note="pg_locks, not granted">
+        <Section title="Waiting" note={text().waiting}>
           <Show when={locks()!.waiting.length} fallback={<div class="empty-hint">No session is waiting on a lock.</div>}>
             <table class="mv-table">
               <thead><tr><th>PID</th><th>User</th><th>Mode</th><th>On</th><th class="num">Waiting</th><th>Blocked by</th><th>Query</th><th /></tr></thead>
@@ -194,7 +196,7 @@ export function LocksView(props: { session: MonitorSession; onRowMenu: RowMenu }
           </Show>
         </Section>
         <Section title="Granted locks by target" note="most locks first">
-          <Show when={locks()!.held.length} fallback={<div class="empty-hint">No granted locks besides transaction IDs.</div>}>
+          <Show when={locks()!.held.length} fallback={<div class="empty-hint">{text().heldEmpty}</div>}>
             <table class="mv-table">
               <thead><tr><th>On</th><th>Mode</th><th>Type</th><th class="num">Locks</th><th>Held by</th></tr></thead>
               <tbody>

@@ -3419,7 +3419,7 @@ export const TOPICS: Topic[] = [
     "icon": "columns"
   },
   {
-    "blurb": "Live server dashboard for PostgreSQL, MySQL / MariaDB and SQL Server: load, sessions, throughput, process list, Cancel and Terminate, chart export; locks, statements, replication, maintenance and I/O on PostgreSQL.",
+    "blurb": "Live server dashboard for PostgreSQL, MySQL / MariaDB and SQL Server: load, sessions, throughput, process list, locks, Cancel and Terminate, chart export; statements, replication, maintenance and I/O on PostgreSQL.",
     "id": "monitor",
     "title": "Database monitor",
     "blocks": [
@@ -3606,7 +3606,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**Locks** (every 2 s) — locks waiting to be granted, with what they wait on (a table, a row, a transaction), for how long (PostgreSQL 14+) and which sessions block them; the blocking chains; and the granted locks grouped by target and mode. Every transaction's own transaction-ID locks are not counted. Right-click a waiting session for the same actions as in Activity.",
+          "**Locks** (every 2 s, every engine) — locks waiting to be granted, with what they wait on (a table, a row, a transaction), for how long (PostgreSQL 14+) and which sessions block them; the blocking chains; and the granted locks grouped by target and mode. Every transaction's own transaction-ID locks are not counted. Right-click a waiting session for the same actions as in Activity. MySQL and SQL Server read their own lock tables; see below.",
           "**Statements** (every 10 s) — the statements that took the most time over the chart window: total time, share, calls, calls per second, mean time, rows per call and cache hit, from `pg_stat_statements`. Needs the extension installed in this database and listed in `shared_preload_libraries`; the view says which is missing. Right-click a statement to copy, open or explain it. Each 10-second interval keeps its top 50 statements by time.",
           "**Replication** (every 5 s) — on a primary, each connected replica's state, sync mode and write, flush and replay lag; on a standby, its WAL receiver, replay backlog, and whether replay is paused. Replication slots show the WAL they retain: amber when an inactive slot holds more than 1 GiB or its WAL status is `extended`/`unreserved`, red once its WAL is lost.",
           "**Tables** — vacuum, analyze, index builds, `CLUSTER`, `COPY` and base backups in progress, with a live progress bar (every 2 s; right-click to cancel one); the tables with the most dead tuples and when each was last vacuumed and analyzed; and each database's transaction-ID age, amber past `autovacuum_freeze_max_age`, red within 500 million of the 2³¹ limit (every 30 s).",
@@ -3638,7 +3638,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "tip",
         "kind": "warn",
-        "md": "The monitor holds **one extra connection** while its tab is open, and it counts toward the server's connection limit: on PostgreSQL `application_name = 'Tusk monitor'`, read-only, `statement_timeout` 2 s; on MySQL read-only with a 2-second statement limit; on SQL Server a session with a 250 ms lock timeout that a deadlock always picks. Closing the tab or disconnecting closes it."
+        "md": "The monitor holds **one extra connection** while its tab is open, and it counts toward the server's connection limit: on PostgreSQL `application_name = 'Tusk monitor'`, read-only, `statement_timeout` 2 s; on MySQL read-only with a 2-second statement limit; on SQL Server a session named `Tusk monitor` (its `program_name`) with a 250 ms lock timeout that a deadlock always picks. Closing the tab or disconnecting closes it."
       },
       {
         "k": "h",
@@ -3647,14 +3647,15 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "p",
-        "md": "The same tab, tiles, charts, process list, thresholds and exports, with the numbers each engine keeps. Locks, Statements, Replication, Tables and I/O are PostgreSQL-only for now; a series an engine has no counter for is left out rather than drawn as zero."
+        "md": "The same tab, tiles, charts, process list, Locks view, thresholds and exports, with the numbers each engine keeps. Statements, Replication, Tables and I/O are PostgreSQL-only for now; a series an engine has no counter for is left out rather than drawn as zero."
       },
       {
         "k": "list",
         "items": [
           "**MySQL / MariaDB** — throughput is storage-engine commits and rollbacks (`Handler_commit`, `Handler_rollback`), which count every autocommit statement as PostgreSQL does; rows read and written (`Innodb_rows_*`); buffer-pool hits and disk reads; the redo log (`Innodb_os_log_written`); pages flushed. Sessions come from the process list joined to InnoDB's transactions: a sleeping connection with an open transaction is *idle in transaction*. Load buckets are Running, Lock (row, metadata, table or global locks), I/O, Client, Sleep and Other waits. Events: deadlocks and on-disk temporary tables. A session waiting on a row lock nests under its blocker (MySQL 8 `data_lock_waits`, MariaDB `INNODB_LOCK_WAITS`).",
           "**SQL Server** — throughput is `Transactions/sec` (SQL Server keeps no rollback counter); buffer-pool page lookups and reads; the transaction log flushed per second; checkpoint and lazy-writer pages. Sessions are user sessions: a running request is active, an open transaction without one is idle in transaction. Load buckets are CPU, Lock, Latch, I/O, Parallelism, Client, WAITFOR and Other, from each request's wait type. Events: deadlocks and tempdb workfiles. A blocked request nests under its `blocking_session_id`.",
-          "Neither has a Replication lag tile yet."
+          "**Locks** — MySQL lists InnoDB row and table locks waiting to be granted (`data_locks`) and pending metadata locks (an `ALTER TABLE` queued behind an open transaction, blocked by every other session holding that table), and groups the granted InnoDB locks by table and index; it needs `PROCESS`. MariaDB lists only the InnoDB locks involved in a wait. SQL Server lists waiting locks (`sys.dm_tran_locks`) with the session blocking each, and groups granted locks by object, leaving out every session's own database lock; the holders are listed on SQL Server 2017 and later.",
+          "**Replication lag** — a MySQL replica shows how far its applier is behind: 0 when caught up, the age of the transaction it is applying, or, once its receiver or applier stops, the time since the last applied commit, so a broken replica keeps falling behind instead of reading as caught up. A source, a MariaDB replica and SQL Server show no lag tile yet."
         ]
       },
       {
@@ -3853,6 +3854,22 @@ export const TOPICS: Topic[] = [
         "k": "tip",
         "kind": "tip",
         "md": "The updater shipped in v0.4.5, so an earlier install needs a fresh installer once."
+      },
+      {
+        "k": "h",
+        "text": "v0.12.0 — the database monitor",
+        "id": "v0-12-0"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**A Monitor tab** for PostgreSQL, MySQL / MariaDB and SQL Server: load by what sessions wait on, sessions against the connection limit, throughput, cache hit, WAL or redo, the oldest transaction, blocked sessions and replication lag, on charts that share one time axis. Open it from the topbar, the Explorer's database node, [[kbd:Mod-Shift-m]] or the status bar's session count. [[topic:monitor|More]].",
+          "**Activity** — the process list with live durations, filters and sessions waiting on a lock nested under the one blocking them; copy, open or explain a query, or Cancel or Terminate a session after a confirmation (refused on read-only connections, recorded in history).",
+          "**Locks** on every engine, and on PostgreSQL also **Statements** (`pg_stat_statements`), **Replication**, **Tables** (vacuum and other progress bars, dead tuples, wraparound) and **I/O** (16+).",
+          "**Freeze a stretch of time** by dragging across any chart; every chart holds it and Overview lists who was active then. Esc returns to live.",
+          "**Export** a chart as an image or CSV, and set where tiles turn amber or red in **Settings → Monitor**.",
+          "The monitor reads through its own connection, never yours, and stops querying while nobody can see it unless you turn on **Keep sampling**."
+        ]
       },
       {
         "k": "h",

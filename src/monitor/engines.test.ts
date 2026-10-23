@@ -38,7 +38,8 @@ describe("monitor engine profiles", () => {
 
   it("MySQL and SQL Server drop what they have no counter for", () => {
     const my = engineProfile("mysql");
-    expect(viewFor(my, "locks")).toBe("overview");
+    expect(viewFor(my, "statements")).toBe("overview");
+    expect(viewFor(my, "locks")).toBe("locks");
     expect(viewFor(my, "activity")).toBe("activity");
     expect(omitted(my.charts.tuples, 1).has(0)).toBe(true);
     expect(seriesLabel(my.charts.tuples, 1, 1, "Returned")).toBe("Read");

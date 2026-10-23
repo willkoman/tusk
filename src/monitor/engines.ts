@@ -49,6 +49,8 @@ export type EngineProfile = {
   signalEffect: Record<SignalWord, string>;
   /** Shown when the monitor's role cannot see other accounts' sessions. */
   visibilityNote: string;
+  /** What the Locks view reads, in this engine's terms. */
+  locks: { waiting: string; summary: string; heldEmpty: string };
 };
 
 const PG: EngineProfile = {
@@ -69,11 +71,16 @@ const PG: EngineProfile = {
     terminate: "Sends pg_terminate_backend: the session disconnects and its open transaction rolls back.",
   },
   visibilityNote: "Other users' queries are hidden. Grant pg_monitor to see them.",
+  locks: {
+    waiting: "pg_locks, not granted",
+    summary: "Every transaction's own transaction-ID locks are not counted.",
+    heldEmpty: "No granted locks besides transaction IDs.",
+  },
 };
 
 const MYSQL: EngineProfile = {
   engine: "mysql",
-  views: ["overview", "activity"],
+  views: ["overview", "activity", "locks"],
   charts: {
     load: {
       source:
@@ -120,7 +127,11 @@ const MYSQL: EngineProfile = {
     cacheHit: { source: "InnoDB buffer pool: reads served from memory / all read requests, over the last tick — not the lifetime ratio, which hides incidents." },
     wal: { label: "Redo log", source: "Δ Innodb_os_log_written per second." },
     oldestXact: { source: "now − min(trx_started) over information_schema.INNODB_TRX (needs PROCESS). Amber and red ages are set in Settings → Monitor." },
-    blocked: { source: "Threads waiting on an InnoDB row lock (INNODB_TRX in LOCK WAIT) plus threads waiting for a metadata, table or global lock. Click for Activity." },
+    blocked: { source: "Threads waiting on an InnoDB row lock (INNODB_TRX in LOCK WAIT) plus threads waiting for a metadata, table or global lock. Click for Locks." },
+    lag: {
+      source:
+        "On a replica: now − the original commit time of the transaction being applied (0 when caught up); with the receiver or applier stopped, now − the last applied transaction's commit, so a broken replica keeps falling behind (performance_schema replication tables). A source reports no lag.",
+    },
   },
   waitLabels: ["Running", "Lock", "Latch", "I/O", "IPC", "Client", "Sleep", "BufferPin", "Activity", "Extension", "Other waits"],
   events: ["deadlock", "temp-file", "reset"],
@@ -135,11 +146,16 @@ const MYSQL: EngineProfile = {
     terminate: "Runs KILL CONNECTION: the connection closes and its open transaction rolls back.",
   },
   visibilityNote: "Only this account's threads are listed. Grant PROCESS to see every account's.",
+  locks: {
+    waiting: "InnoDB data_locks and pending metadata locks (MariaDB: INNODB_LOCKS)",
+    summary: "Granted InnoDB locks; metadata locks appear only when a session waits on one. MariaDB lists only the locks involved in a wait.",
+    heldEmpty: "No granted InnoDB locks.",
+  },
 };
 
 const MSSQL: EngineProfile = {
   engine: "mssql",
-  views: ["overview", "activity"],
+  views: ["overview", "activity", "locks"],
   charts: {
     load: {
       source:
@@ -182,7 +198,7 @@ const MSSQL: EngineProfile = {
     cacheHit: { source: "Page lookups served from memory / all page lookups over the last tick (Buffer Manager) — not the lifetime Buffer cache hit ratio." },
     wal: { label: "Log flush", source: "Δ Log Bytes Flushed/sec (_Total) per second." },
     oldestXact: { source: "now − the earliest transaction_begin_time of any session (sys.dm_tran_active_transactions). Amber and red ages are set in Settings → Monitor." },
-    blocked: { source: "Requests whose blocking_session_id is set (sys.dm_exec_requests). Click for Activity." },
+    blocked: { source: "Requests whose blocking_session_id is set (sys.dm_exec_requests). Click for Locks." },
   },
   waitLabels: ["CPU", "Lock", "Latch", "I/O", "Parallelism", "Client", "WAITFOR", "BufferPin", "Activity", "Extension", "Other"],
   events: ["deadlock", "temp-file", "reset"],
@@ -197,6 +213,11 @@ const MSSQL: EngineProfile = {
     terminate: "Runs KILL: the session disconnects and its open transaction rolls back (a long transaction can take a while to roll back).",
   },
   visibilityNote: "",
+  locks: {
+    waiting: "sys.dm_tran_locks, WAIT, with dm_os_waiting_tasks' blocker",
+    summary: "Every session's shared lock on its own database is not counted.",
+    heldEmpty: "No granted locks besides database locks.",
+  },
 };
 
 export function engineProfile(engine: MonitorEngine): EngineProfile {
