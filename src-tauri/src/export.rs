@@ -827,7 +827,7 @@ impl<'a> XlsxSink<'a> {
         // instead of growing to hundreds of MB. Requires writing rows strictly
         // top-to-bottom (which the streaming export does) and per-row formatting only on
         // the current row (the bold header is row 0, written before any data row).
-        let ws = self.wb.add_worksheet_with_constant_memory();
+        let ws = self.wb.add_worksheet_with_constant_memory().map_err(xerr)?;
         ws.set_name(&name).map_err(xerr)?;
         if self.opts.header {
             for (c, col) in self.pcols.iter().enumerate() {

@@ -2,6 +2,14 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
+## [Unreleased]
+
+### Fixed
+- **SSH tunnel cryptography patched.** crypto-bigint 0.7.10 closes RUSTSEC-2026-0387, under which RSA key operations in the SSH tunnel could take time that depends on secret values, a side channel that might leak key material to an attacker able to measure it.
+
+### Changed
+- **Dependencies updated.** russh 0.64 for SSH tunnels, calamine 0.37 for reading spreadsheets on import, and rust_xlsxwriter 0.101 for Excel export, which now reports a failure to create a sheet's temporary file as an export error. No behaviour change intended otherwise. The Tauri CLI and the CI Rust cache action also moved to their latest patch releases; neither ships in the app.
+
 ## [0.12.3] - 2026-10-26
 
 ### Fixed
