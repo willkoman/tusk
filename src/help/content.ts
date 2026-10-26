@@ -3869,14 +3869,24 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
+        "text": "v0.12.4 — security update",
+        "id": "v0-12-4"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**SSH tunnel cryptography patched** against a timing side channel in RSA key operations (RUSTSEC-2026-0387), with the SSH, spreadsheet import and Excel export libraries updated. Nothing should look or behave differently."
+        ]
+      },
+      {
+        "k": "h",
         "text": "v0.12.3 — large exports of loaded rows",
         "id": "v0-12-3"
       },
       {
         "k": "list",
         "items": [
-          "**Exporting *Loaded rows* or *Selection* works at any size.** It used to fail past 64 MiB with *database result exceeds the 67108864-byte limit*, easy to reach after **Load all** on a large result. The rows now go to the file in chunks.",
-          "**SSH tunnel cryptography patched** against a timing side channel in RSA key operations (RUSTSEC-2026-0387), with SSH, spreadsheet import and Excel export libraries updated."
+          "**Exporting *Loaded rows* or *Selection* works at any size.** It used to fail past 64 MiB with *database result exceeds the 67108864-byte limit*, easy to reach after **Load all** on a large result. The rows now go to the file in chunks."
         ]
       },
       {
