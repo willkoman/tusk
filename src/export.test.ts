@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   applyRememberedExportOptions,
   defaultExportOptions,
+  EXPORT_CHUNK_LIMITS,
+  exportRowsInChunks,
+  rowChunks,
   rememberableExportOptions,
   sanitizeSheetName,
   tablesExportOptions,
@@ -75,5 +78,53 @@ describe("multi-table export options", () => {
     const out = tablesExportOptions("csv", { csv: { delimiter: "custom", customDelimiter: "~" } });
     expect(out.delimiter).toBe("comma");
     expect(out.customDelimiter).toBe("");
+  });
+});
+
+describe("loaded-row export in chunks", () => {
+  const limits = { maxRows: 3, maxCells: 100, maxUnits: 10 };
+
+  it("keeps every row, in order, and bounds each chunk", () => {
+    const rows = Array.from({ length: 8 }, (_, i) => [String(i), null]);
+    const chunks = [...rowChunks(rows, limits)];
+    expect(chunks.map((c) => c.length)).toEqual([3, 3, 2]);
+    expect(chunks.flat()).toEqual(rows);
+  });
+
+  it("splits on text size and cell count, and sends an oversized row alone", () => {
+    const rows = [["aaaa"], ["bbbb"], ["cccc"], ["x".repeat(25)], ["d"]];
+    expect([...rowChunks(rows, limits)].map((c) => c.length)).toEqual([2, 1, 1, 1]);
+    const wide = [Array(60).fill("1"), Array(60).fill("2")];
+    expect([...rowChunks(wide, { ...limits, maxUnits: 1_000 })].map((c) => c.length)).toEqual([1, 1]);
+    expect([...rowChunks([], limits)]).toEqual([]);
+  });
+
+  it("the default limits fit the backend's 64 MiB per message even in the worst UTF-8 case", () => {
+    expect(EXPORT_CHUNK_LIMITS.maxUnits * 3).toBeLessThan(64 * 1024 * 1024);
+    expect(EXPORT_CHUNK_LIMITS.maxRows).toBeLessThanOrEqual(200_000);
+    expect(EXPORT_CHUNK_LIMITS.maxCells).toBeLessThanOrEqual(2_000_000);
+  });
+
+  it("drives begin, one append per chunk, then finish", async () => {
+    const calls: string[] = [];
+    const io = {
+      begin: async () => { calls.push("begin"); return 7; },
+      append: async (s: number, rows: (string | null)[][]) => { calls.push(`append ${s} ${rows.length}`); },
+      finish: async (s: number, abort: boolean) => { calls.push(`finish ${s} ${abort}`); return 8; },
+    };
+    const rows = Array.from({ length: 8 }, (_, i) => [String(i)]);
+    expect(await exportRowsInChunks(io, rows, limits)).toBe(8);
+    expect(calls).toEqual(["begin", "append 7 3", "append 7 3", "append 7 2", "finish 7 false"]);
+  });
+
+  it("abandons the session when a chunk fails", async () => {
+    const calls: string[] = [];
+    const io = {
+      begin: async () => 1,
+      append: async () => { calls.push("append"); throw new Error("an export value exceeds the 1 MiB limit"); },
+      finish: async (_s: number, abort: boolean) => { calls.push(`finish ${abort}`); return 0; },
+    };
+    await expect(exportRowsInChunks(io, [["a"]], limits)).rejects.toThrow("1 MiB");
+    expect(calls).toEqual(["append", "finish true"]);
   });
 });

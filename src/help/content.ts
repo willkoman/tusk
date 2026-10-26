@@ -1575,7 +1575,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**Loaded rows (N)** — formats what the grid holds, in memory.",
+          "**Loaded rows (N)** — writes exactly what the grid holds, with no size limit beyond what the grid can load.",
           "**Selection (N rows)** — offered when rows are selected: those rows at full width. The dialog's column checkboxes still apply.",
           "**All rows (re-run query)** — re-executes server-side, streaming on Postgres and paging elsewhere. Frozen while a manual transaction owns the session.",
           "The re-run honors the producing tab's active schema, so unqualified names resolve as they did in the editor."
@@ -3866,6 +3866,17 @@ export const TOPICS: Topic[] = [
         "k": "tip",
         "kind": "tip",
         "md": "The updater shipped in v0.4.5, so an earlier install needs a fresh installer once."
+      },
+      {
+        "k": "h",
+        "text": "v0.12.3 — large exports of loaded rows",
+        "id": "v0-12-3"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Exporting *Loaded rows* or *Selection* works at any size.** It used to fail past 64 MiB with *database result exceeds the 67108864-byte limit*, easy to reach after **Load all** on a large result. The rows now go to the file in chunks."
+        ]
       },
       {
         "k": "h",

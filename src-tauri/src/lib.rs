@@ -127,6 +127,8 @@ pub(crate) struct AppState {
     next_cancel_generation: AtomicU64,
     /// Database-monitor sidecars, at most one per connection (see `monitor`).
     monitors: monitor::Monitors,
+    /// Loaded-row exports in progress, fed one bounded chunk per call.
+    row_exports: export::RowExports,
 }
 
 impl AppState {
@@ -1813,16 +1815,13 @@ fn persist_export_temp(
     Ok(())
 }
 
-/// Export to a file with a full options payload. Either streams a query
-/// (scope=all, needs a connection) or formats inline rows (scope=loaded).
+/// Export a query's full result to a file (scope=all): the query re-runs server-side
+/// and streams to the file. Loaded rows go through `export_rows_begin` instead.
 #[tauri::command]
-#[allow(clippy::too_many_arguments)] // Tauri deserializes this stable IPC payload by field name.
 async fn export_to_file(
     state: tauri::State<'_, AppState>,
-    connection_id: Option<String>,
-    sql: Option<String>,
-    columns: Option<Vec<String>>,
-    rows: Option<Vec<Vec<Option<String>>>>,
+    connection_id: String,
+    sql: String,
     options: export::ExportOptions,
     path: String,
     search_path: Option<String>,
@@ -1848,9 +1847,9 @@ async fn export_to_file(
         .ok_or_else(|| AppError::new("export temp path is not valid UTF-8"))?
         .to_string();
 
-    let result = if let Some(q) = sql {
-        validate_sql_size(&q)?;
-        let id = connection_id.ok_or_else(|| AppError::new("no connection"))?;
+    let result = {
+        validate_sql_size(&sql)?;
+        let id = connection_id;
         let conn = state.get(&id)?;
         let mut c = lock_conn(&conn).await?;
         ensure_alive(&mut c).await?;
@@ -1858,7 +1857,7 @@ async fn export_to_file(
         // Export streams exactly one query through a cursor. Split (dollar-quote aware)
         // so a multi-statement input can't smuggle extra statements (e.g. a trailing
         // DROP) into the DECLARE … CURSOR FOR.
-        let items = script::parse_for_engine(q.trim(), c.transaction_engine())?;
+        let items = script::parse_for_engine(sql.trim(), c.transaction_engine())?;
         script::preflight_transactions(&items, c.transaction_engine(), &c.transaction)?;
         let export_sql = match items.as_slice() {
             [script::Item::Sql(s)] if !s.trim_end_matches(';').trim().is_empty() => {
@@ -1910,24 +1909,6 @@ async fn export_to_file(
         drop(c);
         drop(cancel_registration);
         result
-    } else if let (Some(cols), Some(rs)) = (columns, rows) {
-        validate_tabular_payload(&cols, &rs)?;
-        // Loaded rows carry no backend handle in their payload. Resolve the source
-        // dialect from the still-active connection; App's frozen-origin check ensures
-        // this is the connection that produced the rows.
-        let conn = match connection_id {
-            Some(id) => state.get(&id)?,
-            None => state.active()?.1,
-        };
-        let dialect = {
-            let c = lock_conn(&conn).await?;
-            c.backend.capabilities().kind
-        };
-        export::run_export_rows_for_dialect(&cols, &rs, &options, dialect, &temp_name).await
-    } else {
-        Err(AppError::new(
-            "export: provide either a query or inline rows",
-        ))
     };
     match result {
         Ok(n) => {
@@ -1938,6 +1919,64 @@ async fn export_to_file(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Start exporting rows the frontend already holds (scope=loaded/selection). The rows
+/// follow in chunks through `export_rows_append`, each bounded like any inline
+/// payload, so the whole export is not limited by one IPC message; `export_rows_finish`
+/// replaces the destination atomically. Returns the session id.
+#[tauri::command]
+async fn export_rows_begin(
+    state: tauri::State<'_, AppState>,
+    connection_id: Option<String>,
+    columns: Vec<String>,
+    options: export::ExportOptions,
+    path: String,
+) -> Result<u64, AppError> {
+    validate_tabular_payload(&columns, &[])?;
+    // Loaded rows carry no backend handle. Resolve the source dialect from the
+    // connection that produced them; App's frozen-origin check ensures it is current.
+    let conn = match connection_id {
+        Some(id) => state.get(&id)?,
+        None => state.active()?.1,
+    };
+    let dialect = {
+        let c = lock_conn(&conn).await?;
+        c.backend.capabilities().kind
+    };
+    state
+        .row_exports
+        .begin(columns, options, dialect, &path)
+        .await
+}
+
+/// One chunk of a loaded-row export, under the inline-payload limits.
+#[tauri::command]
+async fn export_rows_append(
+    state: tauri::State<'_, AppState>,
+    session: u64,
+    rows: Vec<Vec<Option<String>>>,
+) -> Result<(), AppError> {
+    if let Err(error) = db::TextBudget::check_rows(&rows, db::IPC_PAYLOAD_LIMITS) {
+        state.row_exports.abort(session);
+        return Err(error);
+    }
+    state.row_exports.append(session, rows).await
+}
+
+/// Finish a loaded-row export (`abort: false`) or abandon it (`abort: true`, which
+/// leaves the destination untouched). Returns the rows written.
+#[tauri::command]
+async fn export_rows_finish(
+    state: tauri::State<'_, AppState>,
+    session: u64,
+    abort: bool,
+) -> Result<u64, AppError> {
+    if abort {
+        state.row_exports.abort(session);
+        return Ok(0);
+    }
+    state.row_exports.finish(session).await
 }
 
 /// Write a native plain-SQL dump of the selected objects. Read-only connections may
@@ -2580,6 +2619,9 @@ pub fn run() {
             schema_relationships,
             list_functions,
             export_to_file,
+            export_rows_begin,
+            export_rows_append,
+            export_rows_finish,
             capabilities,
             distribution_channel,
             transaction_status,

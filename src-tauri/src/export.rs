@@ -2,11 +2,12 @@ use crate::db::{self, collect_rows_limited, AppError, USER_TEXT_LIMITS};
 use crate::results::{Bound, Mode, ResultStream};
 use rust_xlsxwriter::{Format, Workbook};
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::sync::{mpsc, oneshot};
 use tokio_postgres::Client;
 
 const EXPORT_CURSOR: &str = "tusk_export_cur";
@@ -1352,6 +1353,166 @@ fn validate_export_row(row: &[Option<String>], columns: usize) -> Result<(), App
 }
 
 // ---------------------------------------------------------------------------
+// Chunked loaded-row export: the rows the grid holds reach the backend in bounded
+// chunks, so the size of the whole export is limited by the disk, not by one IPC
+// message. One background task per export owns the temp file and the sink.
+// ---------------------------------------------------------------------------
+
+/// Concurrent loaded-row exports. A dialog runs one at a time; the cap only bounds
+/// sessions a vanished frontend left behind until their idle timeout ends them.
+const MAX_ROW_EXPORT_SESSIONS: usize = 8;
+/// A session that receives nothing for this long is abandoned: its task ends and the
+/// temp file is removed, leaving any previous destination untouched.
+const ROW_EXPORT_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
+
+type ExportRow = Vec<Option<String>>;
+
+enum RowExportMsg {
+    Rows(Vec<ExportRow>, oneshot::Sender<Result<(), AppError>>),
+    Finish(oneshot::Sender<Result<u64, AppError>>),
+}
+
+fn row_export_gone() -> AppError {
+    AppError::new("the export session ended before the export finished. Export again.")
+}
+
+/// Open loaded-row export sessions, keyed by an id the frontend holds between calls.
+#[derive(Default)]
+pub(crate) struct RowExports {
+    next: AtomicU64,
+    sessions: std::sync::Mutex<HashMap<u64, mpsc::Sender<RowExportMsg>>>,
+}
+
+impl RowExports {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, mpsc::Sender<RowExportMsg>>> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn sender(&self, id: u64) -> Result<mpsc::Sender<RowExportMsg>, AppError> {
+        self.lock().get(&id).cloned().ok_or_else(row_export_gone)
+    }
+
+    /// Validate the options and columns, create the sibling temp file next to `path`,
+    /// and start the session's task. Nothing touches `path` until `finish`.
+    pub(crate) async fn begin(
+        &self,
+        columns: Vec<String>,
+        opts: ExportOptions,
+        dialect: &str,
+        path: &str,
+    ) -> Result<u64, AppError> {
+        opts.validate()?;
+        let dialect = SqlDialect::parse(dialect)?;
+        if Path::new(path)
+            .parent()
+            .is_none_or(|parent| parent.as_os_str().is_empty())
+        {
+            return Err(AppError::new(
+                "export destination must include a parent directory",
+            ));
+        }
+        {
+            let mut sessions = self.lock();
+            sessions.retain(|_, tx| !tx.is_closed());
+            if sessions.len() >= MAX_ROW_EXPORT_SESSIONS {
+                return Err(AppError::new(
+                    "too many exports are running. Wait for one to finish.",
+                ));
+            }
+        }
+        let output = AtomicExport::new(path)?;
+        let (tx, rx) = mpsc::channel(1);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        tauri::async_runtime::spawn(row_export_task(
+            columns, opts, dialect, output, ready_tx, rx,
+        ));
+        ready_rx.await.map_err(|_| row_export_gone())??;
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.lock().insert(id, tx);
+        Ok(id)
+    }
+
+    /// Write one chunk. A failed chunk ends the session and removes its temp file.
+    pub(crate) async fn append(&self, id: u64, rows: Vec<ExportRow>) -> Result<(), AppError> {
+        let tx = self.sender(id)?;
+        let (reply, wait) = oneshot::channel();
+        let result = match tx.send(RowExportMsg::Rows(rows, reply)).await {
+            Ok(()) => wait.await.unwrap_or_else(|_| Err(row_export_gone())),
+            Err(_) => Err(row_export_gone()),
+        };
+        if result.is_err() {
+            self.lock().remove(&id);
+        }
+        result
+    }
+
+    /// Finish the file and atomically replace the destination; returns the row count.
+    pub(crate) async fn finish(&self, id: u64) -> Result<u64, AppError> {
+        let tx = self.lock().remove(&id).ok_or_else(row_export_gone)?;
+        let (reply, wait) = oneshot::channel();
+        tx.send(RowExportMsg::Finish(reply))
+            .await
+            .map_err(|_| row_export_gone())?;
+        wait.await.unwrap_or_else(|_| Err(row_export_gone()))
+    }
+
+    /// Drop a session; its task ends and removes the temp file. Unknown ids are fine.
+    pub(crate) fn abort(&self, id: u64) {
+        self.lock().remove(&id);
+    }
+}
+
+async fn row_export_task(
+    columns: Vec<String>,
+    opts: ExportOptions,
+    dialect: SqlDialect,
+    output: AtomicExport,
+    ready: oneshot::Sender<Result<(), AppError>>,
+    mut rx: mpsc::Receiver<RowExportMsg>,
+) {
+    let path = output.path().to_string();
+    let mut feeder = SinkFeeder::new(&opts, dialect, &path);
+    if let Err(error) = feeder.init_cols(&columns) {
+        let _ = ready.send(Err(error));
+        return;
+    }
+    if ready.send(Ok(())).is_err() {
+        return;
+    }
+    loop {
+        // An abort, an idle timeout or a dropped registry all end here; dropping
+        // `output` removes the temp file and the destination stays as it was.
+        let Ok(Some(message)) = tokio::time::timeout(ROW_EXPORT_IDLE, rx.recv()).await else {
+            return;
+        };
+        match message {
+            RowExportMsg::Rows(rows, reply) => {
+                let result = feeder.feed(&rows).await;
+                if result.is_err() {
+                    // Remove the temp file BEFORE answering, so the failure the caller
+                    // sees already has the destination's directory as it was.
+                    drop(feeder);
+                    drop(output);
+                    let _ = reply.send(result);
+                    return;
+                }
+                let _ = reply.send(result);
+            }
+            RowExportMsg::Finish(reply) => {
+                let result = match feeder.finish().await {
+                    Ok(total) => output.persist().map(|()| total),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+                return;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Explorer multi-table export: one configured file per table in a chosen directory.
 // ---------------------------------------------------------------------------
 
@@ -1959,5 +2120,135 @@ mod tests {
         let meta = std::fs::metadata(&path).unwrap();
         assert!(meta.len() > 0);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The loaded-row export used to cross IPC as ONE payload, so a grid holding more
+    /// than 64 MiB (or 200,000 rows) could not be exported at all. In chunks, the
+    /// whole file may exceed every single-message limit.
+    #[tokio::test]
+    async fn chunked_row_export_writes_more_than_one_message_can_carry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.csv");
+        let p = path.to_string_lossy().to_string();
+        let exports = RowExports::default();
+        let cols = vec!["id".to_string(), "v".to_string()];
+        let id = exports
+            .begin(cols, opts(r#"{"format":"csv"}"#), "postgres", &p)
+            .await
+            .unwrap();
+        // 3 chunks of 24 one-megabyte values: 72 MiB in total.
+        let big = "x".repeat(1_000_000);
+        for chunk in 0..3 {
+            let rows: Vec<ExportRow> = (0..24)
+                .map(|i| vec![Some(format!("{}", chunk * 24 + i)), Some(big.clone())])
+                .collect();
+            crate::db::TextBudget::check_rows(&rows, crate::db::IPC_PAYLOAD_LIMITS).unwrap();
+            exports.append(id, rows).await.unwrap();
+        }
+        // 3 chunks of 100,000 small rows: more rows than one payload may carry.
+        for chunk in 0..3 {
+            let rows: Vec<ExportRow> = (0..100_000)
+                .map(|i| vec![Some(format!("s{}", chunk * 100_000 + i)), None])
+                .collect();
+            exports.append(id, rows).await.unwrap();
+        }
+        assert_eq!(exports.finish(id).await.unwrap(), 72 + 300_000);
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(meta.len() > crate::db::IPC_PAYLOAD_LIMITS.max_total_bytes as u64);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1 + 72 + 300_000);
+        assert_eq!(lines[0], "id,v");
+        assert!(lines[1].starts_with("0,xxx"));
+        assert_eq!(lines[73], "s0,");
+        assert_eq!(*lines.last().unwrap(), "s299999,");
+        // The session is gone once finished.
+        assert!(exports.finish(id).await.is_err());
+        assert!(exports.append(id, vec![]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn chunked_row_export_leaves_the_destination_alone_on_abort_or_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keep.csv");
+        std::fs::write(&path, "previous").unwrap();
+        let p = path.to_string_lossy().to_string();
+        let exports = RowExports::default();
+        let cols = || vec!["a".to_string()];
+        let row = |v: &str| vec![Some(v.to_string())];
+
+        let id = exports
+            .begin(cols(), opts(r#"{"format":"csv"}"#), "postgres", &p)
+            .await
+            .unwrap();
+        exports.append(id, vec![row("1")]).await.unwrap();
+        exports.abort(id);
+        assert!(exports.append(id, vec![row("2")]).await.is_err());
+        assert!(exports.finish(id).await.is_err());
+        // The aborted task removes its temp file once it notices; give it a moment.
+        for _ in 0..200 {
+            if std::fs::read_dir(dir.path()).unwrap().count() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        // A ragged chunk fails and ends the session.
+        let id = exports
+            .begin(cols(), opts(r#"{"format":"xlsx"}"#), "postgres", &p)
+            .await
+            .unwrap();
+        let ragged = vec![vec![Some("1".to_string()), None]];
+        assert!(exports.append(id, ragged).await.is_err());
+        assert!(exports.finish(id).await.is_err());
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "previous");
+        // Only the destination remains: every sibling temp file was removed.
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(names.len(), 1);
+
+        // Bad options and columns are refused before a session exists.
+        assert!(exports
+            .begin(cols(), opts(r#"{"format":"nope"}"#), "postgres", &p)
+            .await
+            .is_err());
+        assert!(exports
+            .begin(
+                vec!["a".into(), "a".into()],
+                opts(r#"{"format":"json"}"#),
+                "postgres",
+                &p
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn chunked_row_export_of_zero_rows_still_replaces_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.json");
+        std::fs::write(&path, "stale").unwrap();
+        let p = path.to_string_lossy().to_string();
+        let exports = RowExports::default();
+        let id = exports
+            .begin(vec!["a".into()], opts(r#"{"format":"json"}"#), "mysql", &p)
+            .await
+            .unwrap();
+        assert_eq!(exports.finish(id).await.unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            run_inline_json_empty().await.trim()
+        );
+    }
+
+    async fn run_inline_json_empty() -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.json");
+        let p = path.to_string_lossy().to_string();
+        run_export_rows(&["a".to_string()], &[], &opts(r#"{"format":"json"}"#), &p)
+            .await
+            .unwrap();
+        std::fs::read_to_string(&path).unwrap()
     }
 }
