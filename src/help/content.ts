@@ -3875,7 +3875,8 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**Exporting *Loaded rows* or *Selection* works at any size.** It used to fail past 64 MiB with *database result exceeds the 67108864-byte limit*, easy to reach after **Load all** on a large result. The rows now go to the file in chunks."
+          "**Exporting *Loaded rows* or *Selection* works at any size.** It used to fail past 64 MiB with *database result exceeds the 67108864-byte limit*, easy to reach after **Load all** on a large result. The rows now go to the file in chunks.",
+          "**SSH tunnel cryptography patched** against a timing side channel in RSA key operations (RUSTSEC-2026-0387), with SSH, spreadsheet import and Excel export libraries updated."
         ]
       },
       {

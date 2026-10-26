@@ -24,7 +24,7 @@ jobs:
   verify:
     name: Verify release tag
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     outputs:
       notes: ${{ steps.notes.outputs.notes }}
     steps:
@@ -46,6 +46,27 @@ jobs:
       - name: Require tag commit on default branch
         shell: bash
         run: git merge-base --is-ancestor "${RELEASE_TAG}^{commit}" "origin/${{ github.event.repository.default_branch }}"
+
+      # A release must not ship a dependency with a known vulnerability. This runs
+      # against the advisory databases as they are TODAY, so an advisory published
+      # after the tag commit passed CI still stops the release: update the lock (or
+      # record a reasoned exception in deny.toml), merge, and tag the fixed commit.
+      - name: Install frontend dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Refuse known JavaScript vulnerabilities
+        run: npm audit --audit-level=high
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+
+      - name: Refuse known Rust vulnerabilities
+        run: cargo deny --manifest-path src-tauri/Cargo.toml check advisories
 
       # The release body IS the CHANGELOG section for this version — one story,
       # shown identically on GitHub and by the in-app What's-new popup. A missing

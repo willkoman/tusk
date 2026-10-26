@@ -2,18 +2,14 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
-## [Unreleased]
-
-### Fixed
-- **SSH tunnel cryptography patched.** crypto-bigint 0.7.10 closes RUSTSEC-2026-0387, under which RSA key operations in the SSH tunnel could take time that depends on secret values, a side channel that might leak key material to an attacker able to measure it.
-
-### Changed
-- **Dependencies updated.** russh 0.64 for SSH tunnels, calamine 0.37 for reading spreadsheets on import, and rust_xlsxwriter 0.101 for Excel export, which now reports a failure to create a sheet's temporary file as an export error. No behaviour change intended otherwise. The Tauri CLI and the CI Rust cache action also moved to their latest patch releases; neither ships in the app.
-
 ## [0.12.3] - 2026-10-26
 
 ### Fixed
 - **Exporting loaded rows or a selection works at any size.** Choosing *Loaded rows* or *Selection* in the Export dialog sent everything the grid held to the backend in one message, which was capped at 64 MiB and 200,000 rows, so after *Load all* on a large result the export failed with *database result exceeds the 67108864-byte limit*. The rows now go across in chunks and are written to the file as they arrive, so the export is limited only by what the grid can hold. As before, the previous file is left untouched if the export fails.
+- **SSH tunnel cryptography patched.** crypto-bigint 0.7.10 closes RUSTSEC-2026-0387, under which RSA key operations in the SSH tunnel could take time that depends on secret values, a side channel that might leak key material to an attacker able to measure it.
+
+### Changed
+- **Dependencies updated.** russh 0.64 for SSH tunnels, calamine 0.37 for reading spreadsheets on import, and rust_xlsxwriter 0.101 for Excel export, which now reports a failure to create a sheet's temporary file as an export error. No behaviour change intended otherwise. The Tauri CLI and the CI Rust cache action also moved to their latest patch releases; neither ships in the app.
 
 ## [0.12.2] - 2026-10-23
 
