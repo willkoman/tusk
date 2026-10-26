@@ -82,7 +82,7 @@ rusqlite = { version = "0.40", features = ["bundled", "column_decltype"] }
 # MySQL (network). Pure-Rust async driver; its `Pool` is Send+Sync (avoids the
 # !Sync-connection problem) and its `Value` enum makes all-text extraction easy.
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls"] }
-russh = { version = "0.63.2", default-features = false, features = ["ring", "rsa"] }
+russh = { version = "0.64.1", default-features = false, features = ["ring", "rsa"] }
 # Microsoft SQL Server (network, TDS), driven over tokio-util's futures-io compat.
 # The maintained `-ng` fork, not `tiberius` 0.12: that one pins tokio-rustls 0.24 →
 # rustls-webpki 0.101, which carries unfixable certificate-name-constraint advisories
