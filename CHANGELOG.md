@@ -2,7 +2,7 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
-## [Unreleased]
+## [0.12.3] - 2026-10-26
 
 ### Fixed
 - **Exporting loaded rows or a selection works at any size.** Choosing *Loaded rows* or *Selection* in the Export dialog sent everything the grid held to the backend in one message, which was capped at 64 MiB and 200,000 rows, so after *Load all* on a large result the export failed with *database result exceeds the 67108864-byte limit*. The rows now go across in chunks and are written to the file as they arrive, so the export is limited only by what the grid can hold. As before, the previous file is left untouched if the export fails.

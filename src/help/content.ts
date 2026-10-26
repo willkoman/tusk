@@ -3869,6 +3869,17 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
+        "text": "v0.12.3 — large exports of loaded rows",
+        "id": "v0-12-3"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Exporting *Loaded rows* or *Selection* works at any size.** It used to fail past 64 MiB with *database result exceeds the 67108864-byte limit*, easy to reach after **Load all** on a large result. The rows now go to the file in chunks."
+        ]
+      },
+      {
+        "k": "h",
         "text": "v0.12.2 — dependency updates",
         "id": "v0-12-2"
       },

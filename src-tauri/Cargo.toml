@@ -1,6 +1,6 @@
 [package]
 name = "tusk"
-version = "0.12.2"
+version = "0.12.3"
 description = "Fast, native, lightweight SQL client. Postgres-first."
 authors = ["willkoman <willko@willko.dev>"]
 homepage = "https://github.com/willkoman/tusk"
