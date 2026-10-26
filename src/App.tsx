@@ -71,7 +71,7 @@ import { orderedRows, sortedRowOrder } from "./grid/sort";
 import { interruptedResult } from "./tabs";
 import { makeIndexer } from "./sql/aliases";
 import { formatWithOptions } from "./formats";
-import { FORMAT_EXT, type ExportOptions, type ExportScope } from "./export";
+import { FORMAT_EXT, exportRowsInChunks, type ExportOptions, type ExportScope } from "./export";
 import { backupPayload, type BackupOptions, type BackupSummary, type RestoreOptions, type RestoreSummary } from "./backup";
 import { type BackupTarget } from "./forms/BackupDialog";
 import { type BackupFileInfo } from "./forms/RestoreDialog";
@@ -4381,10 +4381,18 @@ function App() {
     if (!c) return false;
     if (src.origin.tabId) patchResult(src.origin.tabId, { status: "Exporting…" });
     const inline = scope === "selection" ? src.selectionRows : src.rows;
-    const args: ExportToFileArgs =
-      scope === "all"
-        ? { connectionId: src.connectionId, sql: src.query, options: opts, path, searchPath: src.searchSchema }
-        : { connectionId: src.connectionId, columns: src.columns, rows: inline, options: opts, path };
+    const args: ExportToFileArgs = { connectionId: src.connectionId, sql: src.query, options: opts, path, searchPath: src.searchSchema };
+    // Loaded rows cross to the backend in bounded chunks: one message could not carry
+    // more than 64 MiB, which a grid after "Load all" easily holds.
+    const exportLoaded = () =>
+      exportRowsInChunks(
+        {
+          begin: () => commands.exportRowsBegin(src.connectionId, src.columns, opts, path),
+          append: (session, chunk) => commands.exportRowsAppend(session, chunk),
+          finish: (session, abort) => commands.exportRowsFinish(session, abort),
+        },
+        inline,
+      );
     const out = await operations.run({
       connection: c,
       ...freeze,
@@ -4394,7 +4402,7 @@ function App() {
       history: scope === "all"
         ? { sql: `-- [Export] ${opts.format} → ${path}\n${src.query}`, schema: src.searchSchema ?? null, rows: (n) => n as number }
         : null,
-      run: () => commands.exportToFile(args),
+      run: () => (scope === "all" ? commands.exportToFile(args) : exportLoaded()),
     });
     if (out.ok) {
       if (originCurrent(src.origin, true) && src.origin.tabId) patchResult(src.origin.tabId, { status: `Exported ${out.value} rows to ${path}` });

@@ -76,13 +76,11 @@ export type RunQueryArgs = {
   searchPath?: string | null;
 };
 
+/** All rows: re-run this read server-side and stream it to `path`. Loaded rows go
+ *  through `exportRowsBegin`/`exportRowsAppend`/`exportRowsFinish` instead. */
 export type ExportToFileArgs = {
-  connectionId?: string | null;
-  /** Re-run this read server-side (all rows) … */
-  sql?: string;
-  /** … or write these already-loaded rows. */
-  columns?: string[];
-  rows?: (string | null)[][];
+  connectionId: string;
+  sql: string;
   options: ExportOptions;
   path: string;
   searchPath?: string | null;
@@ -153,6 +151,12 @@ export const commands = {
 
   // export / import / backup
   exportToFile: (args: ExportToFileArgs) => invoke<number>("export_to_file", args),
+  /** Loaded-row export, in bounded chunks: begin → append… → finish (or abort). */
+  exportRowsBegin: (connectionId: string, columns: string[], options: ExportOptions, path: string) =>
+    invoke<number>("export_rows_begin", { connectionId, columns, options, path }),
+  exportRowsAppend: (session: number, rows: (string | null)[][]) =>
+    invoke<void>("export_rows_append", { session, rows }),
+  exportRowsFinish: (session: number, abort: boolean) => invoke<number>("export_rows_finish", { session, abort }),
   exportTables: (connectionId: string, tables: { schema: string; name: string }[], options: ExportOptions, directory: string) =>
     invoke<TableExportResult[]>("export_tables", { connectionId, tables, options, directory }),
   importPreview: (path: string, options: ImportOptions) => invoke<ImportPreview>("import_preview", { path, options }),

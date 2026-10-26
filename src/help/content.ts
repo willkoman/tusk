@@ -1575,7 +1575,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "**Loaded rows (N)** — formats what the grid holds, in memory.",
+          "**Loaded rows (N)** — writes exactly what the grid holds, with no size limit beyond what the grid can load.",
           "**Selection (N rows)** — offered when rows are selected: those rows at full width. The dialog's column checkboxes still apply.",
           "**All rows (re-run query)** — re-executes server-side, streaming on Postgres and paging elsewhere. Frozen while a manual transaction owns the session.",
           "The re-run honors the producing tab's active schema, so unqualified names resolve as they did in the editor."

@@ -223,3 +223,81 @@ export function tablesExportOptions(
   out.sql = { ...out.sql, includeCreate: false, createSql: "" };
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// Loaded-row export in chunks
+// ---------------------------------------------------------------------------
+
+export type ExportRow = (string | null)[];
+
+/**
+ * Per-chunk bounds for a loaded-row export. The backend checks each chunk against its
+ * inline-payload limits (200,000 rows, 2,000,000 cells, 64 MiB of UTF-8); these stay
+ * well inside them. Text is measured in UTF-16 code units, and one code unit is at most
+ * three UTF-8 bytes, so 8 Mi units can never exceed 24 MiB on the backend.
+ */
+export type ChunkLimits = { maxRows: number; maxCells: number; maxUnits: number };
+export const EXPORT_CHUNK_LIMITS: ChunkLimits = {
+  maxRows: 50_000,
+  maxCells: 1_000_000,
+  maxUnits: 8 * 1024 * 1024,
+};
+
+/**
+ * Split rows into consecutive chunks under `limits`, in order. A row that alone exceeds
+ * a limit travels in a chunk of its own, and the backend's per-message check decides
+ * whether that one row is acceptable.
+ */
+export function* rowChunks(
+  rows: readonly ExportRow[],
+  limits: ChunkLimits = EXPORT_CHUNK_LIMITS,
+): Generator<ExportRow[]> {
+  let start = 0;
+  let cells = 0;
+  let units = 0;
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    let rowUnits = 0;
+    for (const v of row) if (v !== null) rowUnits += v.length;
+    const count = i - start;
+    if (
+      count > 0 &&
+      (count >= limits.maxRows || cells + row.length > limits.maxCells || units + rowUnits > limits.maxUnits)
+    ) {
+      yield rows.slice(start, i);
+      start = i;
+      cells = 0;
+      units = 0;
+    }
+    cells += row.length;
+    units += rowUnits;
+  }
+  if (start < rows.length) yield rows.slice(start);
+}
+
+/** The three backend calls a chunked loaded-row export makes (see `commands.ts`). */
+export type RowExportIo = {
+  begin: () => Promise<number>;
+  append: (session: number, rows: ExportRow[]) => Promise<void>;
+  finish: (session: number, abort: boolean) => Promise<number>;
+};
+
+/**
+ * Write `rows` through one backend export session, a chunk per call, so the size of
+ * the export is not limited by a single IPC message. On any failure the session is
+ * abandoned and the destination keeps its previous content. Returns the rows written.
+ */
+export async function exportRowsInChunks(
+  io: RowExportIo,
+  rows: readonly ExportRow[],
+  limits: ChunkLimits = EXPORT_CHUNK_LIMITS,
+): Promise<number> {
+  const session = await io.begin();
+  try {
+    for (const chunk of rowChunks(rows, limits)) await io.append(session, chunk);
+  } catch (error) {
+    await io.finish(session, true).catch(() => undefined);
+    throw error;
+  }
+  return io.finish(session, false);
+}
