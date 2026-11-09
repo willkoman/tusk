@@ -41,14 +41,16 @@ native-tls = "0.2"
 postgres-native-tls = "0.5"
 bytes = "1"
 futures-util = "0.3"
-rust_xlsxwriter = { version = "0.101.0", features = ["constant_memory"] }
+rust_xlsxwriter = { version = "0.102.0", features = ["constant_memory"] }
 # xlsx READING for the import path (rust_xlsxwriter only writes). `dates` renders
 # date-formatted cells through chrono instead of leaving raw serial numbers.
-calamine = { version = "0.37", features = ["dates"] }
+calamine = { version = "0.38", features = ["dates"] }
 # Atomic sibling-file writes for exports, profiles, history, and editor saves.
 tempfile = "3"
-# AI provider proxy (streaming HTTP). rustls to avoid an OpenSSL build dep.
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# AI provider proxy + Slack Web API (streaming HTTP). rustls to avoid an OpenSSL
+# build dep; `rustls-no-provider` uses the ring provider lib.rs installs at startup
+# and verifies certificates against the OS trust store (rustls-platform-verifier).
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "stream", "rustls-no-provider"] }
 # Slack Socket Mode (desktop-hosted bot — outbound WebSocket only, no HTTP server).
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
@@ -78,11 +80,11 @@ duckdb = { version = "~1.4", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Embedded SQLite. `bundled` statically compiles SQLite (small, fast) + `column_decltype`
 # for declared column types in introspection.
-rusqlite = { version = "0.40", features = ["bundled", "column_decltype"] }
+rusqlite = { version = "0.41", features = ["bundled", "column_decltype"] }
 # MySQL (network). Pure-Rust async driver; its `Pool` is Send+Sync (avoids the
 # !Sync-connection problem) and its `Value` enum makes all-text extraction easy.
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls"] }
-russh = { version = "0.64.1", default-features = false, features = ["ring", "rsa"] }
+russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"] }
 # Microsoft SQL Server (network, TDS), driven over tokio-util's futures-io compat.
 # The maintained `-ng` fork, not `tiberius` 0.12: that one pins tokio-rustls 0.24 →
 # rustls-webpki 0.101, which carries unfixable certificate-name-constraint advisories

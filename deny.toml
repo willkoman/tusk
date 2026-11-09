@@ -9,37 +9,31 @@ ignore = [
   # RUSTSEC-2023-0071 — the "Marvin Attack" timing sidechannel in the `rsa` crate,
   # reached through `russh`'s optional `rsa` feature (SSH tunnelling).
   #
-  # Re-checked 2026-09-08 against `rsa 0.10.0-rc.18`, the version this lock resolves
-  # (via russh and ssh-key). The advisory still reports "No patch is yet available"
-  # and cargo-deny still reports "No safe upgrade is available!": the 0.10 pre-release
-  # line is affected too, so being ahead of 0.9.x buys nothing here. Dropping the
-  # feature would drop `ssh-rsa` host keys and `id_rsa` client keys, which is still
-  # what most existing bastions and users have.
+  # Re-checked 2026-11-09: the advisory now lists `rsa >= 0.10.0` as patched and
+  # 0.10.0 final is out, but russh 0.65.1 (the latest) pins `rsa = "=0.10.0-rc.18"`,
+  # so the lock cannot take it. Drop this entry once russh releases against 0.10.0.
+  # Dropping the feature would drop `ssh-rsa` host keys and `id_rsa` client keys,
+  # which is still what most existing bastions and users have.
   #
   # The advisory is an adaptive timing oracle over repeated RSA *decryptions*. Tusk
   # never decrypts with RSA: the crate verifies a server host-key signature and signs
   # at most one authentication challenge per connection attempt, against a host the
-  # user chose and whose key they already trusted. Revisit when `rsa` ships a
-  # mitigated release.
+  # user chose and whose key they already trusted.
   "RUSTSEC-2023-0071",
 
-  # RUSTSEC-2026-0367 / -0368 / -0369 — `zip` < 9.0: `ZipArchive::extract` follows
-  # attacker-controlled symlinks out of the destination, applies permissions through
-  # them, and keeps SUID/SGID bits. The fix is a major version (9.0). The xlsx crates
-  # took it (calamine 0.37 and rust_xlsxwriter 0.101 resolve zip 9.1.2, the only zip
-  # that ever sees a user's file); two dependents still pin older majors (re-checked
-  # 2026-10-26: zip 4.6.1 and 6.0.0), so `cargo update` cannot clear it.
-  #
-  # Every advisory is about EXTRACTING an archive to disk. Where the old versions are:
-  #   - libduckdb-sys 1.4 (zip 6) extracts its own bundled DuckDB source at BUILD time.
-  #   - tauri-plugin-updater 2.14 (zip 4) extracts a downloaded update only when it is a zip,
-  #     and only after `download()` has verified its minisign signature against the
-  #     pubkey in tauri.conf.json. Tusk ships signed `.exe`/`.msi` updates, not zips.
-  # None of these reaches attacker-controlled archive contents. Revisit when the
-  # dependents move to zip >= 9.
+  # RUSTSEC-2026-0367 / -0368 / -0369 / -0429 — `zip` < 9.0: `ZipArchive::extract`
+  # follows attacker-controlled symlinks out of the destination, applies permissions
+  # through them, keeps SUID/SGID bits, and aborts the process on a symlink entry
+  # with a huge declared size. The fix is a major version (9.0). Every runtime user
+  # of zip is on it (calamine, rust_xlsxwriter and tauri-plugin-updater 2.14.1 all
+  # resolve zip 9.5); the one older copy left (re-checked 2026-11-09: zip 6.0.0) is a
+  # BUILD dependency of libduckdb-sys 1.4, which extracts its own bundled DuckDB
+  # source archive at compile time. It is not linked into Tusk and never sees a
+  # user's file. Revisit with the next DuckDB engine upgrade.
   "RUSTSEC-2026-0367",
   "RUSTSEC-2026-0368",
   "RUSTSEC-2026-0369",
+  "RUSTSEC-2026-0429",
 ]
 
 [licenses]

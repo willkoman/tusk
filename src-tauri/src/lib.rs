@@ -2563,10 +2563,11 @@ pub fn run() {
     apply_linux_webkit_workarounds();
 
     // Pin the process-wide rustls CryptoProvider: the dep graph carries BOTH ring
-    // (reqwest rustls-tls) and aws-lc-rs (tokio-tungstenite's rustls default) — with
-    // two providers present rustls has no default and panics when a TLS config is
-    // built (the Slack WebSocket). Ring also spares Windows CI the CMake+NASM
-    // toolchain aws-lc-rs needs.
+    // and aws-lc-rs (tokio-tungstenite's rustls default) — with two providers
+    // present rustls has no default and panics when a TLS config is built (the
+    // Slack WebSocket). reqwest (`rustls-no-provider`, used by the AI proxy, Slack
+    // and the updater) brings no provider of its own and uses this one. Ring also
+    // spares Windows CI the CMake+NASM toolchain aws-lc-rs needs.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     tauri::Builder::default()
