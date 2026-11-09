@@ -1199,7 +1199,6 @@ impl Backend {
                 let found = match conn.prepare(sql) {
                     Ok(stmt) => stmt
                         .columns()
-                        .iter()
                         .enumerate()
                         .filter(|(_, c)| {
                             c.decl_type()
@@ -2236,7 +2235,7 @@ fn sqlite_query_limited(
     limits: db::TextLimits,
 ) -> Result<TextRows, AppError> {
     let mut stmt = conn.prepare(sql).map_err(de)?;
-    let columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let columns: Vec<String> = stmt.column_names().map(|s| s.to_string()).collect();
     let ncols = columns.len();
     let mut budget = db::TextBudget::new(&columns, limits)?;
     let mut rows = stmt.query([]).map_err(de)?;

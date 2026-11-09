@@ -2,6 +2,16 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
+## [Unreleased]
+
+### Fixed
+- **Opening an untrusted SQLite file is safe again.** The embedded SQLite moves to 3.54.1 (rusqlite 0.41), closing CVE-2026-119375 (RUSTSEC-2026-0459): a database file opened together with a crafted `-wal` file of a different page size could make ordinary queries return stale bytes from Tusk's memory.
+- **A malformed spreadsheet can no longer crash an import.** calamine 0.38 closes RUSTSEC-2026-0436, under which a crafted legacy `.xls` (or any OLE2 container) chosen for import could panic the parser or make it allocate without bound.
+
+### Changed
+- **AI and Slack requests trust your operating system's certificates.** The HTTP client moves to reqwest 0.13 (the version the updater already used), which verifies HTTPS certificates against the OS trust store instead of a bundled list, so a custom AI endpoint or a corporate proxy whose root certificate is installed on your machine now works without extra setup. Only one copy of the client now ships.
+- **Dependencies updated.** russh 0.65 for SSH tunnels, rust_xlsxwriter 0.102 for Excel export, the updater and dialog plugins (2.14.1 / 2.8.4) on both the Rust and JavaScript sides, solid-js 1.9.18, and about 190 compatible Rust crate updates, which also replace a yanked async-executor release and leave the updater on the patched zip 9. No behaviour change intended. The development toolchain moves to Vite 8.3.7, Vitest 5.1 and jsdom 31; none of these ship in the app.
+
 ## [0.12.4] - 2026-10-26
 
 ### Fixed
