@@ -3869,6 +3869,19 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
+        "text": "v0.12.5 — security update",
+        "id": "v0-12-5"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Embedded SQLite updated to 3.54.1**, so opening a SQLite file alongside a crafted `-wal` file can no longer return stale bytes from memory (CVE-2026-119375).",
+          "**A malformed spreadsheet can no longer crash an import**: the spreadsheet reader is patched against a crafted `.xls` (RUSTSEC-2026-0436).",
+          "**AI and Slack requests trust your operating system's certificates**, so a custom AI endpoint or corporate proxy whose root certificate is installed works without extra setup. Other libraries were updated with no visible change."
+        ]
+      },
+      {
+        "k": "h",
         "text": "v0.12.4 — security update",
         "id": "v0-12-4"
       },

@@ -2,7 +2,7 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
-## [Unreleased]
+## [0.12.5] - 2026-11-10
 
 ### Fixed
 - **Opening an untrusted SQLite file is safe again.** The embedded SQLite moves to 3.54.1 (rusqlite 0.41), closing CVE-2026-119375 (RUSTSEC-2026-0459): a database file opened together with a crafted `-wal` file of a different page size could make ordinary queries return stale bytes from Tusk's memory.
