@@ -6,34 +6,37 @@ yanked = "warn"
 # vulnerabilities and unsound advisories remain denied at every depth.
 unmaintained = "workspace"
 ignore = [
-  # RUSTSEC-2023-0071 — the "Marvin Attack" timing sidechannel in the `rsa` crate,
-  # reached through `russh`'s optional `rsa` feature (SSH tunnelling).
+  # RUSTSEC-2026-0543 — `chrono` is unmaintained (no patched version exists).
   #
-  # Re-checked 2026-11-09: the advisory now lists `rsa >= 0.10.0` as patched and
-  # 0.10.0 final is out, but russh 0.65.1 (the latest) pins `rsa = "=0.10.0-rc.18"`,
-  # so the lock cannot take it. Drop this entry once russh releases against 0.10.0.
-  # Dropping the feature would drop `ssh-rsa` host keys and `id_rsa` client keys,
-  # which is still what most existing bastions and users have.
-  #
-  # The advisory is an adaptive timing oracle over repeated RSA *decryptions*. Tusk
-  # never decrypts with RSA: the crate verifies a server host-key signature and signs
-  # at most one authentication challenge per connection attempt, against a host the
-  # user chose and whose key they already trusted.
-  "RUSTSEC-2023-0071",
+  # Re-checked 2026-11-24: an "unmaintained" notice, not a vulnerability. chrono is a
+  # direct dependency only to format DuckDB temporal values and to validate import
+  # dates/times (driver.rs, import.rs; built without default features), and it stays in
+  # the tree regardless through duckdb's arrow crates, calamine and tiberius-ng. Moving
+  # Tusk's own calls to `jiff`/`time` would not remove it. Revisit when those
+  # dependents move off chrono, or if an actual vulnerability is published against it.
+  "RUSTSEC-2026-0543",
 
-  # RUSTSEC-2026-0367 / -0368 / -0369 / -0429 — `zip` < 9.0: `ZipArchive::extract`
-  # follows attacker-controlled symlinks out of the destination, applies permissions
-  # through them, keeps SUID/SGID bits, and aborts the process on a symlink entry
-  # with a huge declared size. The fix is a major version (9.0). Every runtime user
-  # of zip is on it (calamine, rust_xlsxwriter and tauri-plugin-updater 2.14.1 all
-  # resolve zip 9.5); the one older copy left (re-checked 2026-11-09: zip 6.0.0) is a
-  # BUILD dependency of libduckdb-sys 1.4, which extracts its own bundled DuckDB
-  # source archive at compile time. It is not linked into Tusk and never sees a
-  # user's file. Revisit with the next DuckDB engine upgrade.
+  # RUSTSEC-2026-0367 / -0368 / -0369 / -0429 / -0545 / -0547 / -0548 — `zip` < 9.0:
+  # `ZipArchive::extract` follows attacker-controlled symlinks out of the destination,
+  # applies permissions through them, keeps SUID/SGID bits, and aborts the process on
+  # a symlink entry with a huge declared size; WinZip-AES entries skip their HMAC check
+  # when the data ends early; legacy Shrink/Reduce/Implode decoders preallocate the
+  # declared size; `ZipStreamReader` trusts local-header names. The fix is a major
+  # version (9.0). Every runtime user of zip is on it (calamine, rust_xlsxwriter and
+  # tauri-plugin-updater all resolve zip 9.8); the one older copy left (re-checked
+  # 2026-11-24: zip 6.0.0) is a BUILD dependency of libduckdb-sys 1.4, used only by its
+  # prebuilt-library download path (`extract_libduckdb`, under
+  # `#[cfg(not(feature = "bundled"))]`). Tusk builds with `bundled`, which compiles DuckDB
+  # from the crate's own `duckdb.tar.gz` via tar/flate2, so that code never runs; zip 6
+  # is not linked into Tusk and never sees a user's file.
+  # Revisit with the next DuckDB engine upgrade.
   "RUSTSEC-2026-0367",
   "RUSTSEC-2026-0368",
   "RUSTSEC-2026-0369",
   "RUSTSEC-2026-0429",
+  "RUSTSEC-2026-0545",
+  "RUSTSEC-2026-0547",
+  "RUSTSEC-2026-0548",
 ]
 
 [licenses]
