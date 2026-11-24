@@ -328,15 +328,18 @@ jobs:
             deb-arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    # The image ships the GNOME SDK preinstalled in a lower image layer. When Flathub
-    # publishes a newer SDK than the image holds, flatpak-builder updates it, and the
-    # update renames directories across overlayfs layers and dies with "Invalid
-    # cross-device link" (x86_64 broke this way on 2026-11-24). Re-pin to the current
-    # `gnome-50` digest when that error appears (`docker buildx imagetools inspect
-    # ghcr.io/flathub-infra/flatpak-github-actions:gnome-50`).
+    # The image ships the GNOME SDK preinstalled in one of its own layers. When Flathub
+    # has a newer SDK, flatpak-builder updates it, and that renames directories the
+    # image layer holds: overlayfs refuses such a rename with EXDEV ("Invalid
+    # cross-device link"), so x86_64 failed every build from 2026-11-24 (aarch64's
+    # runners happened to cope). A named volume at /var/lib/flatpak sits outside the
+    # overlay; Docker fills a new volume from the image, so the installed SDK is still
+    # there, and updating it renames within one filesystem.
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50@sha256:1de59efef01a946d9f28f1ec3458bf6f61dcee3507d7fecdd473f8134da4ec77
       options: --privileged
+      volumes:
+        - flatpak-installation:/var/lib/flatpak
     timeout-minutes: 45
     steps:
       - name: Check out release tag
