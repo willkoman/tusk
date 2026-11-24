@@ -2,7 +2,9 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
-## [0.13.0] - 2026-11-24
+## [0.13.1] - 2026-11-24
+
+This is the first published build of 0.13: v0.13.0 stopped at the release gate on the advisories fixed below, so its changes ship here. It also carries the security fixes of 0.12.5, which was never published either.
 
 ### Added
 - **Amazon Bedrock is a built-in AI provider, on both of its inference planes.** One Bedrock API key and one region reach the runtime (the Converse API: every model Bedrock hosts — Claude, Llama, Nova, Mistral, gpt-oss and the rest — through inference profiles such as `us.anthropic.…` and `global.…`, models called directly, and your own application inference profiles) and Mantle, Bedrock's OpenAI- and Anthropic-compatible engine, whose models appear as `mantle/…`. Tusk sends each Mantle model to the route that serves it (chat completions, the partner Responses route for GPT and Grok, or Anthropic Messages) and remembers it. The model list is read from your account for the region, with filters for global profiles, geographic profiles, in-region models and Mantle; speech, rerank, video and legacy models are left out, as are Mantle models your data-retention setting does not allow. Switching regions keeps the saved key, replies stream like every other provider, and throttling or a busy model is retried before any text appears. The Slack bot can use it too.
@@ -10,6 +12,10 @@ All notable changes to **Tusk** (fast native Postgres-first DB client). Format l
 
 ### Changed
 - **A reply cap above the model's own limit no longer fails the request.** When a provider refuses the reply max tokens because the model allows fewer (Bedrock, Anthropic, OpenAI and Mantle all say so up front), Tusk resends once at the model's stated limit. A Bedrock model without a system role gets the instructions in the first message instead.
+
+### Fixed
+- **Two vulnerable libraries are patched.** `url` moves to 2.5.9 (RUSTSEC-2026-0592: a URL nested in thousands of `blob:` prefixes could overflow the stack when its origin was read) and `cookie` to 0.18.3 (RUSTSEC-2026-0594: private-cookie nonces could repeat after a fork). Neither path is reachable from anything a user types into Tusk, but both crates are in the shipped binary.
+- **The SSH tunnel's RSA keys use the released `rsa` 0.10.0** instead of a release candidate (through russh 0.65.4), which closes the Marvin timing advisory (RUSTSEC-2023-0071) Tusk had been carrying an exception for. Other libraries, Tauri included, take their latest compatible versions with no visible change.
 
 ## [0.12.5] - 2026-11-10
 

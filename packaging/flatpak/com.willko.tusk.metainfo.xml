@@ -70,8 +70,8 @@
     <display_length compare="ge">900</display_length>
   </requires>
   <releases>
-    <release version="0.13.0" date="2026-11-24">
-      <url>https://github.com/willkoman/tusk/releases/tag/v0.13.0</url>
+    <release version="0.13.1" date="2026-11-24">
+      <url>https://github.com/willkoman/tusk/releases/tag/v0.13.1</url>
     </release>
     <release version="0.12.5" date="2026-11-10">
       <url>https://github.com/willkoman/tusk/releases/tag/v0.12.5</url>

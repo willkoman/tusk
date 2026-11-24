@@ -3876,15 +3876,16 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
-        "text": "v0.13.0 — Amazon Bedrock, provider grid",
-        "id": "v0-13-0"
+        "text": "v0.13.1 — Amazon Bedrock, provider grid",
+        "id": "v0-13-1"
       },
       {
         "k": "list",
         "items": [
           "**Amazon Bedrock is a built-in AI provider.** One Bedrock API key and a region reach both the runtime (every Bedrock model through Converse and inference profiles) and Mantle, Bedrock's OpenAI- and Anthropic-compatible engine, whose models appear as `mantle/…`.",
           "**Settings → AI shows providers as a grid of tiles** with each provider's mark and status; pick one to open its settings. Bedrock's model list labels each id and can be narrowed to one kind.",
-          "**A reply cap above a model's own limit no longer fails the request**: Tusk resends once at the limit the provider states."
+          "**A reply cap above a model's own limit no longer fails the request**: Tusk resends once at the limit the provider states.",
+          "**Security updates**: the URL and cookie libraries are patched (RUSTSEC-2026-0592, RUSTSEC-2026-0594), and SSH tunnels use the released RSA library, closing the Marvin timing advisory. This is also the first published build with the 0.12.5 fixes."
         ]
       },
       {
