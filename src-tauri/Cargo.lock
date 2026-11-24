@@ -6985,7 +6985,7 @@ dependencies = [
 
 [[package]]
 name = "tusk"
-version = "0.12.5"
+version = "0.13.0"
 dependencies = [
  "bytes",
  "calamine",

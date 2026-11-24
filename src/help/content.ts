@@ -3876,6 +3876,19 @@ export const TOPICS: Topic[] = [
       },
       {
         "k": "h",
+        "text": "v0.13.0 — Amazon Bedrock, provider grid",
+        "id": "v0-13-0"
+      },
+      {
+        "k": "list",
+        "items": [
+          "**Amazon Bedrock is a built-in AI provider.** One Bedrock API key and a region reach both the runtime (every Bedrock model through Converse and inference profiles) and Mantle, Bedrock's OpenAI- and Anthropic-compatible engine, whose models appear as `mantle/…`.",
+          "**Settings → AI shows providers as a grid of tiles** with each provider's mark and status; pick one to open its settings. Bedrock's model list labels each id and can be narrowed to one kind.",
+          "**A reply cap above a model's own limit no longer fails the request**: Tusk resends once at the limit the provider states."
+        ]
+      },
+      {
+        "k": "h",
         "text": "v0.12.5 — security update",
         "id": "v0-12-5"
       },

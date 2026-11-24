@@ -2,7 +2,7 @@
 
 All notable changes to **Tusk** (fast native Postgres-first DB client). Format loosely follows Keep a Changelog. Newest first.
 
-## [Unreleased]
+## [0.13.0] - 2026-11-24
 
 ### Added
 - **Amazon Bedrock is a built-in AI provider, on both of its inference planes.** One Bedrock API key and one region reach the runtime (the Converse API: every model Bedrock hosts — Claude, Llama, Nova, Mistral, gpt-oss and the rest — through inference profiles such as `us.anthropic.…` and `global.…`, models called directly, and your own application inference profiles) and Mantle, Bedrock's OpenAI- and Anthropic-compatible engine, whose models appear as `mantle/…`. Tusk sends each Mantle model to the route that serves it (chat completions, the partner Responses route for GPT and Grok, or Anthropic Messages) and remembers it. The model list is read from your account for the region, with filters for global profiles, geographic profiles, in-region models and Mantle; speech, rerank, video and legacy models are left out, as are Mantle models your data-retention setting does not allow. Switching regions keeps the saved key, replies stream like every other provider, and throttling or a busy model is retried before any text appears. The Slack bot can use it too.
