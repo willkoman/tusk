@@ -81,10 +81,37 @@ jobs:
             echo "TUSK_NOTES_EOF"
           } >> "$GITHUB_OUTPUT"
 
+  # A release commit is pushed to master together with its tag, so master's
+  # release-cache jobs (validate.yml) are compiling the same commit while this
+  # workflow starts. Building before they save restores an older cache (or none)
+  # and recompiles everything the lockfile moved, DuckDB included; it also puts four
+  # macOS jobs on the runner pool at once, which is how macOS builds went unscheduled.
+  # So the builds wait for that run to finish, then restore its exact caches. Best
+  # effort: no run for the commit (an old tag), a failed run, or the time limit all
+  # just let the build go ahead.
+  warm-caches:
+    name: Wait for master's release caches
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    permissions:
+      actions: read
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Wait for the commit's validate run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: bash scripts/wait-for-warm-caches.sh "$RELEASE_TAG"
+
   # macOS (arm64 + x64) and Windows build on the native runners.
   build:
     name: Build ${{ matrix.cache-key }}
-    needs: verify
+    needs: [verify, warm-caches]
     environment:
       name: release
       url: https://github.com/${{ github.repository }}/releases/tag/${{ env.RELEASE_TAG }}
@@ -124,6 +151,9 @@ jobs:
         with:
           workspaces: "./src-tauri -> target"
           shared-key: ${{ matrix.cache-key }}
+          # Restore master's warm cache, never save: a cache written from a tag is
+          # visible to that tag alone, so it could only evict master's.
+          save-if: false
 
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -180,7 +210,7 @@ jobs:
   # workflow artifact for the Flatpak job below.
   build-linux:
     name: Build ${{ matrix.cache-key }}
-    needs: verify
+    needs: [verify, warm-caches]
     environment:
       name: release
       url: https://github.com/${{ github.repository }}/releases/tag/${{ env.RELEASE_TAG }}
@@ -236,6 +266,9 @@ jobs:
         with:
           workspaces: "./src-tauri -> target"
           shared-key: ${{ matrix.cache-key }}
+          # Restore master's warm cache, never save: a cache written from a tag is
+          # visible to that tag alone, so it could only evict master's.
+          save-if: false
 
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -295,8 +328,14 @@ jobs:
             deb-arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    # The image ships the GNOME SDK preinstalled in a lower image layer. When Flathub
+    # publishes a newer SDK than the image holds, flatpak-builder updates it, and the
+    # update renames directories across overlayfs layers and dies with "Invalid
+    # cross-device link" (x86_64 broke this way on 2026-11-24). Re-pin to the current
+    # `gnome-50` digest when that error appears (`docker buildx imagetools inspect
+    # ghcr.io/flathub-infra/flatpak-github-actions:gnome-50`).
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50@sha256:78bf5fcf1faca196ce6cdf34a317560e533e870861bbb752bdd3ad66d22ba0e9
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50@sha256:1de59efef01a946d9f28f1ec3458bf6f61dcee3507d7fecdd473f8134da4ec77
       options: --privileged
     timeout-minutes: 45
     steps:

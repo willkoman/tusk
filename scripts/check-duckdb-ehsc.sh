@@ -14,11 +14,13 @@ profile_dir="${1:?usage: check-duckdb-ehsc.sh <cargo profile dir> [target triple
 target="${2:-x86_64-pc-windows-msvc}"
 expected="CXXFLAGS_${target//[-.]/_} = Some(/EHsc)"
 
-# Cargo has two build-directory layouts: `build/libduckdb-sys-<hash>/output` (the
-# original) and `build/libduckdb-sys/<hash>/.../output` (the newer one stable cargo
-# switched to, first seen with Rust 1.100). Search both rather than pin one.
-mapfile -t outputs < <(find "$profile_dir/build" -type f -name output \
-  \( -path "*/libduckdb-sys-*/output" -o -path "*/libduckdb-sys/*/output" \) 2>/dev/null)
+# Cargo has two build-directory layouts. The original keeps a build script's stdout in
+# `build/libduckdb-sys-<hash>/output`; the one stable cargo uses since Rust 1.100 keeps
+# it in `build/libduckdb-sys/<hash>/run/stdout`. Search both rather than pin one: when
+# only the old glob was searched, this check failed every Windows job, and a failed job
+# saves no Rust cache, so every Windows release compiled from scratch.
+mapfile -t outputs < <(find "$profile_dir/build" -type f \
+  \( -path "*/libduckdb-sys-*/output" -o -path "*/libduckdb-sys/*/run/stdout" \) 2>/dev/null)
 if ((${#outputs[@]} == 0)); then
   echo "::error::no libduckdb-sys build output under $profile_dir/build" >&2
   exit 1
