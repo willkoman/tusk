@@ -96,10 +96,11 @@ jobs:
     permissions:
       actions: read
     steps:
-      - name: Check out release tag
+      # The workflow's own commit, not the tag: a dispatch for an older tag must still
+      # find this script. The tag only names the commit to wait for.
+      - name: Check out workflow
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.RELEASE_TAG }}
           persist-credentials: false
 
       - name: Wait for the commit's validate run
