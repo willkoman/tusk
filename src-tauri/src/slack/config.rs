@@ -160,12 +160,7 @@ impl SlackConfig {
                 "Slack AI configuration contains an oversized field",
             ));
         }
-        if !self.ai_wire.is_empty()
-            && !matches!(
-                self.ai_wire.as_str(),
-                "anthropic" | "gemini" | "openai" | "responses"
-            )
-        {
+        if !self.ai_wire.is_empty() && !crate::ai::known_wire(&self.ai_wire) {
             return Err(AppError::new("invalid Slack AI wire protocol"));
         }
         Ok(())

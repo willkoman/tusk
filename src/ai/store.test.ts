@@ -110,6 +110,16 @@ describe("AI config normalization", () => {
     expect(originApproved(sameOrigin, "openai")).toBe(true);
   });
 
+  it("treats every Bedrock region's AWS endpoint as shipped, but not a VPC endpoint or proxy", () => {
+    const at = (base: string) =>
+      originApproved(normalizeAiConfig({ provider: "bedrock", baseUrls: { bedrock: base } }), "bedrock");
+    expect(at("https://bedrock-runtime.eu-west-1.amazonaws.com")).toBe(true);
+    expect(at("https://bedrock-runtime-fips.us-east-1.amazonaws.com")).toBe(true);
+    expect(at("https://bedrock-mantle.us-west-2.api.aws")).toBe(true);
+    expect(at("https://vpce-0abc.bedrock-runtime.us-east-1.vpce.amazonaws.com")).toBe(false);
+    expect(at("https://bedrock-runtime.us-east-1.amazonaws.com.evil.example")).toBe(false);
+  });
+
   it("persists a changed default as the active provider model", () => {
     const before = normalizeAiConfig({ provider: "openai", model: "old", models: { openai: "old" } });
     const after = withProviderModel(before, "openai", "new");

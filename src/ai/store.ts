@@ -75,7 +75,9 @@ export function endpointOrigin(value: string): string | null {
 export function originNeedsConsent(provider: AiProvider, override: string): boolean {
   if (!override.trim()) return false;
   const requested = endpointOrigin(override);
-  const shipped = endpointOrigin(providerInfo(provider).baseUrl);
+  const spec = providerInfo(provider);
+  if (requested && spec.isShippedOrigin?.(requested)) return false;
+  const shipped = endpointOrigin(spec.baseUrl);
   return !requested || !shipped || requested !== shipped;
 }
 

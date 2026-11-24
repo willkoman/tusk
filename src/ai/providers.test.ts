@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   AI_PROVIDERS,
+  BEDROCK_REGIONS,
+  MANTLE_PREFIX,
+  bedrockHost,
+  bedrockMantleBase,
+  bedrockModelGroup,
+  bedrockRuntimeRegion,
   defaultModel,
   modelSupported,
   providerInfo,
@@ -209,6 +215,84 @@ describe("OpenCode Zen — all four wires, nothing hidden", () => {
 
   it("every curated Zen model exists in the live catalog", () => {
     for (const m of providerInfo("opencode-zen").models) expect(ZEN_CATALOG).toContain(m);
+  });
+});
+
+describe("Amazon Bedrock", () => {
+  it("speaks its own wire for every model id shape Bedrock accepts", () => {
+    for (const m of [
+      "us.anthropic.claude-sonnet-4-6",
+      "global.openai.gpt-5.6-terra",
+      "amazon.nova-pro-v1:0",
+      "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc",
+    ]) expect(resolveWire("bedrock", m)).toBe("bedrock");
+  });
+
+  it("builds each region's runtime endpoint and reads the region back", () => {
+    const spec = providerInfo("bedrock");
+    expect(spec.baseUrl).toBe("https://bedrock-runtime.us-east-1.amazonaws.com");
+    expect(spec.regionBase!("eu-central-1")).toBe("https://bedrock-runtime.eu-central-1.amazonaws.com");
+    for (const r of BEDROCK_REGIONS) expect(bedrockRuntimeRegion(spec.regionBase!(r))).toBe(r);
+    expect(spec.regionOf!(resolveBaseUrl("bedrock", ""))).toBe("us-east-1");
+  });
+
+  it("recognises only AWS's own runtime host (mirrors bedrock_runtime_region in ai.rs)", () => {
+    expect(bedrockRuntimeRegion("https://bedrock-runtime-fips.us-gov-west-1.amazonaws.com/x")).toBe("us-gov-west-1");
+    for (const notAws of [
+      "http://bedrock-runtime.us-east-1.amazonaws.com",
+      "https://bedrock-runtime.us-east-1.amazonaws.com:8443",
+      "https://bedrock-runtime.us-east-1.amazonaws.com.evil.example",
+      "https://bedrock-runtime.evil.amazonaws.com",
+      "https://bedrock.us-east-1.amazonaws.com",
+      "https://vpce-0abc.bedrock-runtime.us-east-1.vpce.amazonaws.com",
+      "https://user@bedrock-runtime.us-east-1.amazonaws.com",
+    ]) expect(bedrockRuntimeRegion(notAws)).toBeNull();
+  });
+
+  it("knows Mantle's host and derives it from the runtime's (mirrors bedrock_host / bedrock_mantle_base)", () => {
+    expect(bedrockHost("https://bedrock-mantle.us-west-2.api.aws/v1")).toEqual({ plane: "mantle", fips: false, region: "us-west-2" });
+    expect(bedrockHost("https://bedrock-runtime-fips.us-east-1.amazonaws.com")).toEqual({ plane: "runtime", fips: true, region: "us-east-1" });
+    expect(bedrockMantleBase("https://bedrock-runtime.us-east-1.amazonaws.com")).toBe("https://bedrock-mantle.us-east-1.api.aws");
+    expect(bedrockMantleBase("https://bedrock-runtime-fips.us-east-1.amazonaws.com")).toBeNull();
+    expect(bedrockMantleBase("https://proxy.example.com")).toBeNull();
+    for (const notAws of [
+      "http://bedrock-mantle.us-east-1.api.aws",
+      "https://bedrock-mantle.us-east-1.api.aws:444",
+      "https://evil.bedrock-mantle.us-east-1.api.aws",
+      "https://bedrock-mantle.us-east-1.api.aws.evil.example",
+      "https://bedrock-mantle.evil.api.aws",
+    ]) expect(bedrockHost(notAws)).toBeNull();
+    const spec = providerInfo("bedrock");
+    expect(spec.isShippedOrigin!("https://bedrock-mantle.us-east-1.api.aws")).toBe(true);
+    expect(spec.isShippedOrigin!("https://bedrock-runtime.eu-west-1.amazonaws.com")).toBe(true);
+    expect(spec.isShippedOrigin!("https://proxy.example.com")).toBe(false);
+    // A Mantle id is still sent on the bedrock wire; the backend picks Mantle's route.
+    expect(resolveWire("bedrock", `${MANTLE_PREFIX}anthropic.claude-opus-5`)).toBe("bedrock");
+  });
+
+  it("labels every id by the plane and profile that serves it", () => {
+    expect(bedrockModelGroup("mantle/anthropic.claude-opus-5")).toBe("Mantle");
+    expect(bedrockModelGroup("global.anthropic.claude-opus-5")).toBe("Global profile");
+    expect(bedrockModelGroup("us.anthropic.claude-haiku-4-5-20251001-v1:0")).toBe("US profile");
+    expect(bedrockModelGroup("eu.amazon.nova-pro-v1:0")).toBe("EU profile");
+    expect(bedrockModelGroup("apac.anthropic.claude-sonnet-4-6")).toBe("APAC profile");
+    expect(bedrockModelGroup("us-gov.anthropic.claude-sonnet-4-6")).toBe("US-GOV profile");
+    expect(bedrockModelGroup("amazon.nova-micro-v1:0")).toBe("In-region");
+    expect(bedrockModelGroup("deepseek.v3.2")).toBe("In-region");
+    expect(bedrockModelGroup("zai.glm-4.7")).toBe("In-region");
+    expect(bedrockModelGroup("xai.grok-4.3")).toBe("In-region");
+    expect(bedrockModelGroup("openai.gpt-oss-120b-1:0")).toBe("In-region");
+    expect(bedrockModelGroup("arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc")).toBe("App profile");
+    expect(bedrockModelGroup("arn:aws:bedrock:us-east-1:123456789012:provisioned-model/abc")).toBe("ARN");
+  });
+
+  it("every provider has a grid name and kind", () => {
+    for (const p of AI_PROVIDERS) {
+      expect(p.short.length).toBeGreaterThan(0);
+      expect(p.short.length).toBeLessThanOrEqual(14);
+      expect(p.kind.length).toBeGreaterThan(0);
+      expect(p.kind.length).toBeLessThanOrEqual(16);
+    }
   });
 });
 

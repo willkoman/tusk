@@ -1,7 +1,8 @@
 // Settings → AI. Three sections, all self-contained (backend calls go through `commands`, like SlackPane):
 //
-//   Providers — one card each, two groups inside: **Connection** (key entry — never echoed
-//   back — API base, origin approval, Test) and **Models** (the ONE model control:
+//   Providers — a grid of tiles (mark, name, kind, status); the selected one opens below
+//   it with two groups: **Connection** (key entry — never echoed back — API base, region,
+//   origin approval, Bedrock's two planes, Test) and **Models** (the ONE model control:
 //   `ModelMultiPicker`, where a checkbox = offered in the pickers and ★ = the provider's
 //   default; fed by the live catalog once the provider is usable, else the shipped
 //   fallback ids). Keys live in the OS keychain, one account per provider id.
@@ -13,7 +14,6 @@
 //   `skills.rs`, so export is a file copy and any .md can be imported.
 
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
-import { Icon } from "../Icons";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { pickOpenPath, pickSavePath, UNVERIFIED_PICKER } from "../filePicker";
 import {
@@ -23,6 +23,8 @@ import {
   type AiConfig, type AiProvider,
 } from "../ai/store";
 import { ModelMultiPicker } from "../ai/ModelMultiPicker";
+import { ProviderMark } from "../ai/providerIcons";
+import { BEDROCK_MANTLE_REGIONS, MANTLE_PREFIX, bedrockHost, bedrockMantleBase } from "../ai/providers";
 import { emptySkill, type Skill } from "../ai/skills";
 import { KeyedSerialQueue } from "../asyncQueue";
 import { KeyedStaleGuard } from "../staleGuard";
@@ -55,7 +57,8 @@ export function AiPane(props: { database: string }) {
     setProbe((m) => ({ ...m, [id]: { ...{ hasKey: false, testing: false, note: "", ok: null }, ...m[id], ...p } }));
 
   const [keyInput, setKeyInput] = createSignal<Record<string, string>>({});
-  const [expanded, setExpanded] = createSignal<AiProvider | null>(null);
+  /** The provider whose settings are open below the grid; starts on the active one. */
+  const [selected, setSelected] = createSignal<AiProvider>(cfg().provider);
   const [liveModels, setLiveModels] = createSignal<Partial<Record<AiProvider, string[]>>>({});
   /** Everything the provider offers right now (live), else the shipped fallback ids. */
   const catalogFor = (pid: AiProvider) => liveModels()[pid] ?? providerModels(pid);
@@ -90,13 +93,60 @@ export function AiPane(props: { database: string }) {
     if (!resolveBaseUrl(pid, approvedBaseOverride(cfg(), pid))) return "set an API base first";
     return "";
   };
-  /** Opening a usable provider's card loads its live catalog once, so the model list is
-   *  real before the user reaches it. */
-  const toggleCard = (pid: AiProvider) => {
-    const opening = expanded() !== pid;
-    setExpanded(opening ? pid : null);
-    if (opening && !liveModels()[pid] && !refreshBlocked(pid)) void fetchCatalog(pid);
+  /** Selecting a usable provider loads its live catalog once, so the model list is real
+   *  before the user reaches it. */
+  const loadCatalogOnce = (pid: AiProvider) => {
+    if (!liveModels()[pid] && !catalogState()[pid]?.loading && !refreshBlocked(pid)) void fetchCatalog(pid);
   };
+  const selectProvider = (pid: AiProvider) => {
+    setSelected(pid);
+    loadCatalogOnce(pid);
+  };
+  /** Arrow keys move through the grid in reading order (Home/End jump to the ends). */
+  const onGridKey = (e: KeyboardEvent, pid: AiProvider) => {
+    const ids = AI_PROVIDERS.map((x) => x.id);
+    const at = ids.indexOf(pid);
+    const cols = (() => {
+      const tiles = [...((e.currentTarget as HTMLElement).parentElement?.children ?? [])] as HTMLElement[];
+      const top = tiles[0]?.offsetTop;
+      const n = tiles.filter((t) => t.offsetTop === top).length;
+      return Math.max(1, n);
+    })();
+    const next =
+      e.key === "ArrowRight" ? at + 1
+      : e.key === "ArrowLeft" ? at - 1
+      : e.key === "ArrowDown" ? at + cols
+      : e.key === "ArrowUp" ? at - cols
+      : e.key === "Home" ? 0
+      : e.key === "End" ? ids.length - 1
+      : null;
+    if (next === null || next < 0 || next >= ids.length) return;
+    e.preventDefault();
+    selectProvider(ids[next]);
+    const tiles = (e.currentTarget as HTMLElement).parentElement?.children;
+    (tiles?.[next] as HTMLElement | undefined)?.focus();
+  };
+  /** Region-scoped providers (Bedrock): the region the configured base points at. */
+  const currentRegion = (pid: AiProvider): string | null =>
+    providerInfo(pid).regionOf?.(resolveBaseUrl(pid, cfg().baseUrls[pid] ?? "")) ?? null;
+  const regionChoices = (pid: AiProvider): string[] => {
+    const list = [...(providerInfo(pid).regions ?? [])];
+    const cur = currentRegion(pid);
+    if (cur && !list.includes(cur)) list.unshift(cur);
+    return list;
+  };
+  /** Point the provider at a region's endpoint. The registry default region is stored as
+   *  "no override". The catalog belongs to the old region, so it is dropped and refetched. */
+  function pickRegion(pid: AiProvider, region: string) {
+    const spec = providerInfo(pid);
+    if (!region || !spec.regionBase) return;
+    const base = spec.regionBase(region);
+    if (!setConfig({ baseUrls: { ...cfg().baseUrls, [pid]: base === spec.baseUrl ? "" : base } })) return;
+    catalogGuard.invalidate(pid);
+    setLiveModels((m) => { const { [pid]: _gone, ...rest } = m; return rest; });
+    patchCatalog(pid, { live: false, error: "", loading: false });
+    if (!refreshBlocked(pid)) void fetchCatalog(pid);
+  }
   const probeGuard = new KeyedStaleGuard<AiProvider>();
   const keyMutations = new KeyedSerialQueue<AiProvider>();
   const nextProbe = (pid: AiProvider) => probeGuard.mint(pid);
@@ -111,6 +161,8 @@ export function AiPane(props: { database: string }) {
       const hasKey = isKeyless(p.id) || (!!baseUrl && await commands.aiHasKey(p.id, baseUrl).catch(() => false));
       if (probeCurrent(p.id, generation)) patchProbe(p.id, { hasKey });
     }));
+    // Keyless providers are usable at once; keyed ones once the probe saw their key.
+    loadCatalogOnce(selected());
   };
   let unsubscribeConfig = () => {};
   onMount(() => {
@@ -205,10 +257,10 @@ export function AiPane(props: { database: string }) {
 
   const status = (pid: AiProvider) => {
     const p = probe()[pid];
-    if (!originApproved(cfg(), pid)) return { label: "Origin approval needed", cls: "off" };
-    if (isKeyless(pid)) return { label: "No key needed", cls: "ok" };
-    if (p?.hasKey) return { label: "Connected", cls: "ok" };
-    return { label: "No key", cls: "off" };
+    if (!originApproved(cfg(), pid)) return { label: "Origin approval needed", short: "Needs approval", cls: "off" };
+    if (isKeyless(pid)) return { label: "No key needed", short: "Local", cls: "ok" };
+    if (p?.hasKey) return { label: "Connected", short: "Ready", cls: "ok" };
+    return { label: "No key", short: "Not set up", cls: "off" };
   };
   const isActive = (pid: AiProvider) => cfg().provider === pid;
   /** How many providers are usable right now — a key saved, or keyless and local. */
@@ -279,152 +331,197 @@ export function AiPane(props: { database: string }) {
           <span class="ai-section-sub">{configured()} set up</span>
         </header>
         <div class="settings-note">
-          Open a provider to connect it and choose its models. Switch providers from the
+          Pick a provider to connect it and choose its models. Switch providers from the
           chat header. Keys live in your OS keychain.
         </div>
         <Show when={configError()}><div class="error">{configError()}</div></Show>
 
-      <div class="ai-cards">
+      <div class="ai-grid" role="listbox" aria-label="AI providers">
         <For each={AI_PROVIDERS}>
           {(p) => {
             const st = () => status(p.id);
-            const open = () => expanded() === p.id;
             return (
-              <div class="ai-card" classList={{ active: isActive(p.id), open: open() }}>
-                <button class="ai-card-head" onClick={() => toggleCard(p.id)}>
-                  <span class="ai-card-name">
-                    {p.label}
-                    <Show when={isActive(p.id)}><span class="ai-chip accent">Active</span></Show>
-                  </span>
-                  <span class="ai-chip" classList={{ ok: st().cls === "ok", off: st().cls === "off" }}>{st().label}</span>
-                  <span class="ai-card-model">{isActive(p.id) ? cfg().model || "—" : cfg().models[p.id] ?? ""}</span>
-                  <span class="ai-card-caret"><Icon name={open() ? "chevronDown" : "chevronRight"} /></span>
-                </button>
-
-                <Show when={open()}>
-                  <div class="ai-card-body">
-                    <Show when={p.note}><div class="ai-note">{p.note}</div></Show>
-
-                    {/* ---- Connection: everything needed to reach the provider ---- */}
-                    <div class="ai-card-group">Connection</div>
-
-                    <Show when={p.needsKey}>
-                      {/* `display: contents` form: a bare password input outside one
-                          makes every Chromium build log a DOM warning. */}
-                      <form class="subform" onSubmit={(e) => e.preventDefault()}>
-                      <label class="settings-row">
-                        <span class="settings-label">
-                          <span>API key</span>
-                          <small>{probe()[p.id]?.hasKey ? "Paste a new key to replace the saved one." : "Stored in your OS keychain."}</small>
-                        </span>
-                        <span class="settings-inline">
-                          <input
-                            type="password"
-                            autocomplete="current-password"
-                            placeholder={probe()[p.id]?.hasKey ? "Type to replace" : "Paste key"}
-                            value={keyInput()[p.id] ?? ""}
-                            onInput={(e) => setKeyInput((m) => ({ ...m, [p.id]: e.currentTarget.value }))}
-                            onKeyDown={(e) => { if (e.key === "Enter" && (keyInput()[p.id] ?? "").trim()) void saveKey(p.id); }}
-                          />
-                          <button class="run" type="button" disabled={!(keyInput()[p.id] ?? "").trim()} onClick={() => void saveKey(p.id)}>Save</button>
-                        </span>
-                      </label>
-                      </form>
-                    </Show>
-
-                    <label class="settings-row">
-                      <span class="settings-label">
-                        <span>API base</span>
-                        <small>{p.id === "custom" ? "Required. The prefix before /v1." : "Leave blank to use the provider's endpoint."}</small>
-                      </span>
-                      <input
-                        placeholder={p.baseHint}
-                        value={cfg().baseUrls[p.id] ?? ""}
-                        onInput={(e) => setConfig({ baseUrls: { ...cfg().baseUrls, [p.id]: e.currentTarget.value } })}
-                      />
-                    </label>
-
-                    <Show when={originNeedsConsent(p.id, cfg().baseUrls[p.id] ?? "")}>
-                      <label class="settings-row">
-                        <span class="settings-label">
-                          <span>Allow custom origin</span>
-                          <small>
-                            Your key, prompts, schema, and any shared sample rows go to <code>{endpointOrigin(cfg().baseUrls[p.id] ?? "") ?? "invalid URL"}</code>.
-                          </small>
-                        </span>
-                        <input
-                          type="checkbox"
-                          checked={originApproved(cfg(), p.id)}
-                          onChange={(e) => {
-                            const next = { ...cfg().approvedOrigins };
-                            const origin = endpointOrigin(cfg().baseUrls[p.id] ?? "");
-                            if (e.currentTarget.checked && origin) next[p.id] = origin;
-                            else delete next[p.id];
-                            if (e.currentTarget.checked && !origin) {
-                              setConfigError("Enter a valid HTTP(S) API base first.");
-                              return;
-                            }
-                            if (!setConfig({ approvedOrigins: next })) {
-                              e.currentTarget.checked = originApproved(cfg(), p.id);
-                              return;
-                            }
-                          }}
-                        />
-                      </label>
-                    </Show>
-                    <Show when={isKeyless(p.id)}>
-                      <div class="ai-note">Keyless endpoints must be on localhost or a loopback IP.</div>
-                    </Show>
-
-                    <div class="ai-card-actions">
-                      <button class="ghost" disabled={probe()[p.id]?.testing} onClick={() => void testProvider(p.id)}>
-                        {probe()[p.id]?.testing ? "Testing…" : "Test connection"}
-                      </button>
-                      <Show when={p.needsKey && p.keyUrl}>
-                        <button class="ghost" onClick={() => void openUrl(p.keyUrl)}>Get a key ↗</button>
-                      </Show>
-                      <span class="spacer" />
-                      <Show when={p.needsKey && probe()[p.id]?.hasKey}>
-                        <button class="ghost danger" onClick={() => void clearKey(p.id)}>Remove key</button>
-                      </Show>
-                    </div>
-                    <Show when={probe()[p.id]?.note}>
-                      <div classList={{ "ai-note": probe()[p.id]?.ok !== false, error: probe()[p.id]?.ok === false }}>
-                        {probe()[p.id]?.note}
-                      </div>
-                    </Show>
-
-                    {/* ---- Models: the one place a model is chosen for this provider ---- */}
-                    <div class="ai-card-group">
-                      Models
-                      <small>Ticked models appear in the pickers; ★ marks the default. Nothing ticked offers all.</small>
-                    </div>
-                    <ModelMultiPicker
-                      catalog={catalogFor(p.id)}
-                      live={!!catalogState()[p.id]?.live}
-                      loading={!!catalogState()[p.id]?.loading}
-                      error={catalogState()[p.id]?.error ?? ""}
-                      refreshBlocked={refreshBlocked(p.id)}
-                      selected={cfg().enabledModels[p.id] ?? []}
-                      defaultModel={cfg().models[p.id] ?? defaultModel(p.id)}
-                      onChange={(list) => setConfig(withEnabledModels(cfg(), p.id, list))}
-                      onDefault={(model) => setConfig(withDefaultModel(cfg(), p.id, model))}
-                      onRefresh={() => void fetchCatalog(p.id)}
-                    />
-
-                    <div class="ai-card-actions">
-                      <span class="spacer" />
-                      <button class="run" disabled={isActive(p.id)} onClick={() => setConfig({ provider: p.id, model: cfg().models[p.id] ?? defaultModel(p.id) })}>
-                        {isActive(p.id) ? "Active provider" : "Use this provider"}
-                      </button>
-                    </div>
-                  </div>
-                </Show>
-              </div>
+              <button
+                type="button"
+                role="option"
+                class="ai-tile"
+                classList={{ sel: selected() === p.id, active: isActive(p.id), ready: st().cls === "ok" }}
+                aria-selected={selected() === p.id}
+                title={`${p.label} — ${isActive(p.id) ? "active provider" : st().label}`}
+                onClick={() => selectProvider(p.id)}
+                onKeyDown={(e) => onGridKey(e, p.id)}
+              >
+                <Show when={isActive(p.id)}><span class="ai-tile-badge">Active</span></Show>
+                <span class="ai-tile-mark"><ProviderMark provider={p.id} size={26} /></span>
+                <span class="ai-tile-name">{p.short}</span>
+                <span class="ai-tile-kind">{p.kind}</span>
+                <span class="ai-tile-state" classList={{ ok: st().cls === "ok" }}>
+                  <span class="ai-tile-dot" aria-hidden="true" />
+                  {st().short}
+                </span>
+              </button>
             );
           }}
         </For>
       </div>
+
+      <Show when={providerInfo(selected())}>
+        {(spec) => {
+          const p = () => spec();
+          const st = () => status(p().id);
+          return (
+            <div class="ai-detail" classList={{ active: isActive(p().id) }}>
+              <header class="ai-detail-head">
+                <span class="ai-detail-mark"><ProviderMark provider={p().id} size={30} /></span>
+                <span class="ai-detail-title">
+                  <span class="ai-detail-name">
+                    {p().label}
+                    <Show when={isActive(p().id)}><span class="ai-chip accent">Active</span></Show>
+                    <span class="ai-chip" classList={{ ok: st().cls === "ok", off: st().cls === "off" }}>{st().label}</span>
+                  </span>
+                  <Show when={p().note}><small>{p().note}</small></Show>
+                </span>
+                <button class="run" disabled={isActive(p().id)} onClick={() => setConfig({ provider: p().id, model: cfg().models[p().id] ?? defaultModel(p().id) })}>
+                  {isActive(p().id) ? "Active provider" : "Use this provider"}
+                </button>
+              </header>
+
+              {/* ---- Connection: everything needed to reach the provider ---- */}
+              <div class="ai-card-group">Connection</div>
+
+              <Show when={p().needsKey}>
+                {/* `display: contents` form: a bare password input outside one
+                    makes every Chromium build log a DOM warning. */}
+                <form class="subform" onSubmit={(e) => e.preventDefault()}>
+                <label class="settings-row">
+                  <span class="settings-label">
+                    <span>{p().id === "bedrock" ? "Bedrock API key" : "API key"}</span>
+                    <small>{probe()[p().id]?.hasKey ? "Paste a new key to replace the saved one." : p().id === "bedrock" ? "A long- or short-term key from the Bedrock console. Stored in your OS keychain." : "Stored in your OS keychain."}</small>
+                  </span>
+                  <span class="settings-inline">
+                    <input
+                      type="password"
+                      autocomplete="current-password"
+                      placeholder={probe()[p().id]?.hasKey ? "Type to replace" : "Paste key"}
+                      value={keyInput()[p().id] ?? ""}
+                      onInput={(e) => setKeyInput((m) => ({ ...m, [p().id]: e.currentTarget.value }))}
+                      onKeyDown={(e) => { if (e.key === "Enter" && (keyInput()[p().id] ?? "").trim()) void saveKey(p().id); }}
+                    />
+                    <button class="run" type="button" disabled={!(keyInput()[p().id] ?? "").trim()} onClick={() => void saveKey(p().id)}>Save</button>
+                  </span>
+                </label>
+                </form>
+              </Show>
+
+              <Show when={p().regions && p().regionBase && p().regionOf}>
+                <label class="settings-row">
+                  <span class="settings-label">
+                    <span>Region</span>
+                    <small>Models, profiles and access differ per region. The key works in every one.</small>
+                  </span>
+                  <select
+                    value={currentRegion(p().id) ?? ""}
+                    onChange={(e) => pickRegion(p().id, e.currentTarget.value)}
+                  >
+                    <Show when={!currentRegion(p().id)}><option value="" disabled>Custom endpoint</option></Show>
+                    <For each={regionChoices(p().id)}>
+                      {(r) => <option value={r}>{p().id === "bedrock" && BEDROCK_MANTLE_REGIONS.includes(r) ? `${r} · runtime + Mantle` : r}</option>}
+                    </For>
+                  </select>
+                </label>
+              </Show>
+
+              <label class="settings-row">
+                <span class="settings-label">
+                  <span>API base</span>
+                  <small>{p().id === "custom" ? "Required. The prefix before /v1." : p().regions ? "Set by the region. Override only for a VPC endpoint or proxy." : "Leave blank to use the provider's endpoint."}</small>
+                </span>
+                <input
+                  placeholder={p().baseHint}
+                  value={cfg().baseUrls[p().id] ?? ""}
+                  onInput={(e) => setConfig({ baseUrls: { ...cfg().baseUrls, [p().id]: e.currentTarget.value } })}
+                />
+              </label>
+
+              <Show when={originNeedsConsent(p().id, cfg().baseUrls[p().id] ?? "")}>
+                <label class="settings-row">
+                  <span class="settings-label">
+                    <span>Allow custom origin</span>
+                    <small>
+                      Your key, prompts, schema, and any shared sample rows go to <code>{endpointOrigin(cfg().baseUrls[p().id] ?? "") ?? "invalid URL"}</code>.
+                    </small>
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={originApproved(cfg(), p().id)}
+                    onChange={(e) => {
+                      const next = { ...cfg().approvedOrigins };
+                      const origin = endpointOrigin(cfg().baseUrls[p().id] ?? "");
+                      if (e.currentTarget.checked && origin) next[p().id] = origin;
+                      else delete next[p().id];
+                      if (e.currentTarget.checked && !origin) {
+                        setConfigError("Enter a valid HTTP(S) API base first.");
+                        return;
+                      }
+                      if (!setConfig({ approvedOrigins: next })) {
+                        e.currentTarget.checked = originApproved(cfg(), p().id);
+                        return;
+                      }
+                    }}
+                  />
+                </label>
+              </Show>
+              <Show when={isKeyless(p().id)}>
+                <div class="ai-note">Keyless endpoints must be on localhost or a loopback IP.</div>
+              </Show>
+
+              <Show when={p().id === "bedrock"}>
+                <BedrockPlanes
+                  base={resolveBaseUrl("bedrock", cfg().baseUrls.bedrock ?? "")}
+                  catalog={liveModels().bedrock}
+                />
+              </Show>
+
+              <div class="ai-card-actions">
+                <button class="ghost" disabled={probe()[p().id]?.testing} onClick={() => void testProvider(p().id)}>
+                  {probe()[p().id]?.testing ? "Testing…" : "Test connection"}
+                </button>
+                <Show when={p().needsKey && p().keyUrl}>
+                  <button class="ghost" onClick={() => void openUrl(p().keyUrl)}>Get a key ↗</button>
+                </Show>
+                <span class="spacer" />
+                <Show when={p().needsKey && probe()[p().id]?.hasKey}>
+                  <button class="ghost danger" onClick={() => void clearKey(p().id)}>Remove key</button>
+                </Show>
+              </div>
+              <Show when={probe()[p().id]?.note}>
+                <div classList={{ "ai-note": probe()[p().id]?.ok !== false, error: probe()[p().id]?.ok === false }}>
+                  {probe()[p().id]?.note}
+                </div>
+              </Show>
+
+              {/* ---- Models: the one place a model is chosen for this provider ---- */}
+              <div class="ai-card-group">
+                Models
+                <small>Ticked models appear in the pickers; ★ marks the default. Nothing ticked offers all.</small>
+              </div>
+              <ModelMultiPicker
+                catalog={catalogFor(p().id)}
+                live={!!catalogState()[p().id]?.live}
+                loading={!!catalogState()[p().id]?.loading}
+                error={catalogState()[p().id]?.error ?? ""}
+                refreshBlocked={refreshBlocked(p().id)}
+                selected={cfg().enabledModels[p().id] ?? []}
+                defaultModel={cfg().models[p().id] ?? defaultModel(p().id)}
+                groupOf={p().modelGroup}
+                onChange={(list) => setConfig(withEnabledModels(cfg(), p().id, list))}
+                onDefault={(model) => setConfig(withDefaultModel(cfg(), p().id, model))}
+                onRefresh={() => void fetchCatalog(p().id)}
+              />
+            </div>
+          );
+        }}
+      </Show>
 
       </section>
 
@@ -595,6 +692,56 @@ export function AiPane(props: { database: string }) {
         )}
       </Show>
       </section>
+    </div>
+  );
+}
+
+/** Bedrock's two inference planes for the configured base: where each lives, what it
+ *  speaks, and (once the catalog is loaded) how many models it serves this account. One
+ *  key and one region cover both; the backend routes each model id to its plane. */
+function BedrockPlanes(props: { base: string; catalog?: string[] }) {
+  const host = () => bedrockHost(props.base);
+  const runtimeHost = () => {
+    try { return new URL(props.base).host; } catch { return props.base; }
+  };
+  const mantle = () => bedrockMantleBase(props.base);
+  const counts = () => {
+    const list = props.catalog;
+    if (!list) return null;
+    const onMantle = list.filter((m) => m.startsWith(MANTLE_PREFIX)).length;
+    return { runtime: list.length - onMantle, mantle: onMantle };
+  };
+  const runtimeNote = () => {
+    const c = counts();
+    return c ? `${c.runtime} model${c.runtime === 1 ? "" : "s"}` : "";
+  };
+  const mantleNote = () => {
+    const c = counts();
+    if (!mantle()) {
+      return host()?.fips ? "No FIPS endpoint: Mantle is off." : "Needs AWS's own regional endpoint.";
+    }
+    if (c) return c.mantle ? `${c.mantle} model${c.mantle === 1 ? "" : "s"}` : "Not offered in this region or to this key.";
+    return host() && BEDROCK_MANTLE_REGIONS.includes(host()!.region) ? "" : "May not be offered in this region.";
+  };
+  return (
+    <div class="ai-planes">
+      <div class="ai-plane">
+        <span class="ai-plane-name">Runtime</span>
+        <code class="ai-plane-host">{runtimeHost()}</code>
+        <span class="ai-plane-what">Converse: inference profiles, models, ARNs</span>
+        <span class="ai-plane-count">{runtimeNote()}</span>
+      </div>
+      <div class="ai-plane" classList={{ off: !mantle() || counts()?.mantle === 0 }}>
+        <span class="ai-plane-name">Mantle</span>
+        <code class="ai-plane-host">{mantle() ? new URL(mantle()!).host : "—"}</code>
+        <span class="ai-plane-what">OpenAI/Anthropic-compatible, listed as <code>mantle/…</code></span>
+        <span class="ai-plane-count">{mantleNote()}</span>
+      </div>
+      <div class="ai-note">
+        The same key and region serve both. Profiles named for a geography (<code>us.</code>, <code>eu.</code>, <code>apac.</code>) keep
+        requests there; <code>global.</code> may route anywhere. Tusk picks the Mantle route
+        (chat completions, Responses or Anthropic Messages) for each model.
+      </div>
     </div>
   );
 }

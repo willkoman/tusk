@@ -2170,7 +2170,7 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "Providers, keys and skills live in **Settings → AI**. Each card holds a key, a default model, an API base override, and **Test connection**.",
+          "Providers, keys and skills live in **Settings → AI**. Providers are a grid of tiles (mark, name, kind, and *Ready* / *Local* / *Not set up*); pick one to open its key, API base override, models and **Test connection** below the grid. Arrow keys move between tiles.",
           "**AI reply max tokens** (256–128,000) caps the reply the panel asks for, sharing one normalization with the [[topic:slack|Slack]] field."
         ]
       },
@@ -2186,6 +2186,11 @@ export const TOPICS: Topic[] = [
             "**Anthropic**, **OpenAI**, **Google Gemini**",
             "The frontier labs, direct",
             "Yours"
+          ],
+          [
+            "**Amazon Bedrock**",
+            "AWS-hosted models (Claude, Llama, Nova, Mistral, GPT, Grok, …) on Bedrock's runtime (Converse) and Mantle, per region",
+            "A Bedrock API key"
           ],
           [
             "**OpenCode Go**",
@@ -2219,7 +2224,8 @@ export const TOPICS: Topic[] = [
         "items": [
           "Keys are stored per provider in the OS keychain under `tusk-ai` and used only by the Rust backend. Several can be set up and switched between mid-conversation.",
           "A custom API base must be approved before anything is sent to it, and a saved key is bound in the keychain to that HTTPS origin.",
-          "Until approval the card shows *Origin approval needed* and Test connection refuses. Slack fails closed on an origin mismatch."
+          "**Amazon Bedrock** has a **Region** picker instead of a base to type. Every region's AWS endpoints count as Bedrock's own, so switching regions needs no approval and keeps the saved key. One key reaches both planes, shown under the region: the **runtime** (`bedrock-runtime.<region>.amazonaws.com`, the Converse API) and **Mantle** (`bedrock-mantle.<region>.api.aws`, Bedrock's OpenAI- and Anthropic-compatible engine, offered in only some regions and not from a FIPS endpoint or a custom base). The model list is read from Bedrock for that region: inference profiles (`us.…`, `eu.…`, `global.…`) and application profiles, then models callable in-region, then Mantle models as `mantle/…`. Tusk picks the Mantle route each model needs. A short-term Bedrock API key expires within 12 hours; paste a new one when it does.",
+          "Until approval the provider shows *Origin approval needed* and Test connection refuses. Slack fails closed on an origin mismatch."
         ]
       },
       {
@@ -2266,8 +2272,9 @@ export const TOPICS: Topic[] = [
       {
         "k": "list",
         "items": [
-          "Each provider card has one **Models** list. A row's checkbox offers that model in the header picker and to the Slack bot; **★** marks the default.",
-          "The list is the provider's live catalog, fetched when the card opens; **Refresh** re-fetches.",
+          "Each provider has one **Models** list. A row's checkbox offers that model in the header picker and to the Slack bot; **★** marks the default.",
+          "The list is the provider's live catalog, fetched when its tile is picked; **Refresh** re-fetches. Bedrock labels each row (Global profile, US profile, In-region, Mantle, App profile) and adds chips that narrow the list to one kind.",
+          "If the reply max tokens is above what a model allows and the provider says so, Tusk resends once at the model's limit.",
           "**Select all** and **Clear** work on the visible rows, and an unlisted id can be added with **Add … as a model id**.",
           "Starring an unticked model ticks it, and a retired model drops out on its own."
         ]

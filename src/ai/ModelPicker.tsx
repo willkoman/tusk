@@ -10,6 +10,7 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
 import { Icon } from "../Icons";
 import { fuzzyRank, highlight } from "./fuzzy";
+import { ProviderMark } from "./providerIcons";
 import { providerInfo, type AiProvider } from "./store";
 
 export type ModelChoice = { provider: AiProvider; model: string };
@@ -132,7 +133,7 @@ export function ModelPicker(props: {
               <For each={groups()}>
                 {(g) => (
                   <>
-                    <div class="mp-group">{g.label}</div>
+                    <div class="mp-group"><ProviderMark provider={g.provider} size={13} />{g.label}</div>
                     <For each={g.models}>
                       {(model) => {
                         const c = { provider: g.provider, model };
@@ -144,6 +145,9 @@ export function ModelPicker(props: {
                             onClick={() => pick(c)}
                           >
                             <span class="mp-model">{model}</span>
+                            <Show when={providerInfo(g.provider).modelGroup}>
+                              {(of) => <span class="mp-prov">{of()(model)}</span>}
+                            </Show>
                           </button>
                         );
                       }}

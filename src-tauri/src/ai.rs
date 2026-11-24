@@ -1,8 +1,9 @@
 //! AI provider proxy. Keeps the API key in the OS keychain (never in the WebView) and
 //! streams completions from the configured provider over a Tauri `Channel`.
 //!
-//! **This module knows four WIRE protocols, not N providers.** `Wire::{Anthropic,
-//! Gemini, Openai, Responses}` selects the request/response shape; the provider is just
+//! **This module knows five WIRE protocols, not N providers.** `Wire::{Anthropic,
+//! Gemini, Openai, Responses, Bedrock}` selects the request/response shape (Bedrock's
+//! Converse stream is AWS's binary event stream, the rest are SSE); the provider is just
 //! a keychain account + a base URL, both supplied by the frontend registry
 //! (`src/ai/providers.ts`). Adding OpenRouter / Groq / DeepSeek / Ollama / any other
 //! OpenAI-compatible service is a registry row, NOT an arm in `build_request`.
@@ -128,8 +129,110 @@ fn provider_default_base(provider: &str) -> Option<&'static str> {
         "groq" => Some("https://api.groq.com/openai"),
         "ollama" => Some("http://localhost:11434"),
         "lmstudio" => Some("http://localhost:1234"),
+        "bedrock" => Some(BEDROCK_DEFAULT_BASE),
         "custom" => None,
         _ => None,
+    }
+}
+
+const BEDROCK_DEFAULT_BASE: &str = "https://bedrock-runtime.us-east-1.amazonaws.com";
+
+/// The two Bedrock inference planes Tusk talks to. One Bedrock API key (a Bearer token)
+/// authenticates both, in the same region:
+///
+/// - **Runtime** `https://bedrock-runtime[-fips].<region>.amazonaws.com`: the Converse API.
+///   Every model Bedrock hosts, addressed by a foundation-model id, a system inference
+///   profile (`us.`/`eu.`/`apac.`/`global.`…), or an application-profile ARN. Its catalog
+///   lives on the CONTROL plane, `bedrock[-fips].<region>.amazonaws.com`.
+/// - **Mantle** `https://bedrock-mantle.<region>.api.aws`: Bedrock's OpenAI- and
+///   Anthropic-compatible engine. Unversioned ids (`anthropic.claude-opus-5`), its own
+///   `/v1/models`, and three routes (see `MantleRoute`). Not in every region.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BedrockPlane {
+    Runtime,
+    Mantle,
+}
+
+/// AWS's own Bedrock inference host for a region, on the default HTTPS port, path
+/// ignored: `(plane, fips, region)`. A VPC endpoint or a proxy does not match: those
+/// stay custom origins that need explicit approval, like any other provider's override.
+/// Mirrors `bedrockHost` in `src/ai/providers.ts`.
+fn bedrock_host(url: &str) -> Option<(BedrockPlane, bool, String)> {
+    let parsed = reqwest::Url::parse(url.trim()).ok()?;
+    if parsed.scheme() != "https"
+        || parsed.port().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let (plane, fips, region) = if let Some(rest) = host.strip_suffix(".amazonaws.com") {
+        let (service, region) = rest.split_once('.')?;
+        match service {
+            "bedrock-runtime" => (BedrockPlane::Runtime, false, region),
+            "bedrock-runtime-fips" => (BedrockPlane::Runtime, true, region),
+            _ => return None,
+        }
+    } else {
+        let region = host
+            .strip_suffix(".api.aws")?
+            .strip_prefix("bedrock-mantle.")?;
+        (BedrockPlane::Mantle, false, region)
+    };
+    valid_aws_region(region).then(|| (plane, fips, region.to_string()))
+}
+
+/// AWS's own Bedrock RUNTIME endpoint for a region: `(fips, region)`.
+fn bedrock_runtime_region(url: &str) -> Option<(bool, String)> {
+    match bedrock_host(url)? {
+        (BedrockPlane::Runtime, fips, region) => Some((fips, region)),
+        _ => None,
+    }
+}
+
+/// `us-east-1`, `eu-central-2`, `us-gov-west-1`, `ap-southeast-7`: lowercase words joined
+/// by `-`, at least three of them, the last a number.
+fn valid_aws_region(region: &str) -> bool {
+    let parts: Vec<&str> = region.split('-').collect();
+    region.len() <= 32
+        && parts.len() >= 3
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
+        && parts
+            .last()
+            .is_some_and(|p| p.bytes().all(|b| b.is_ascii_digit()))
+        && parts[0].bytes().all(|b| b.is_ascii_lowercase())
+}
+
+/// An origin the registry ships for this provider, so a key may be bound to it without
+/// the explicit custom-origin approval. For Bedrock that is EVERY region's AWS runtime
+/// and Mantle endpoint — picking a region is not pointing Tusk at somebody else's server,
+/// and one Bedrock API key serves both planes.
+fn shipped_origin(provider: &str, origin: &str) -> bool {
+    default_origin(provider).as_deref() == Some(origin)
+        || (provider == "bedrock" && bedrock_host(origin).is_some())
+}
+
+/// The Bedrock CONTROL-plane base (`ListFoundationModels`, `ListInferenceProfiles`) for
+/// an AWS runtime base. Only derived from AWS's own runtime host, so a key bound to that
+/// runtime origin can only ever travel to AWS's matching control-plane host.
+fn bedrock_control_base(runtime_base: &str) -> Option<String> {
+    let (fips, region) = bedrock_runtime_region(runtime_base)?;
+    let service = if fips { "bedrock-fips" } else { "bedrock" };
+    Some(format!("https://{service}.{region}.amazonaws.com"))
+}
+
+/// The region's Mantle base for an AWS runtime base (or a Mantle base itself). Like the
+/// control plane it is only derived from AWS's own hosts. A FIPS runtime has no Mantle
+/// counterpart, so it gets none rather than a silent hop off the FIPS endpoint.
+fn bedrock_mantle_base(base: &str) -> Option<String> {
+    match bedrock_host(base)? {
+        (_, true, _) => None,
+        (_, false, region) => Some(format!("https://bedrock-mantle.{region}.api.aws")),
     }
 }
 
@@ -200,7 +303,12 @@ fn get_key_for_origin(provider: &str, endpoint: &str) -> Result<String, AppError
         ))
     })?;
     if let Some(stored) = decode_stored_key(raw.clone())? {
-        if stored.origins.iter().any(|approved| approved == &origin) {
+        // A key saved for one shipped origin serves every shipped origin of the same
+        // provider (Bedrock's regions), but never an approved custom one.
+        if stored.origins.iter().any(|approved| {
+            approved == &origin
+                || (shipped_origin(provider, approved) && shipped_origin(provider, &origin))
+        }) {
             return Ok(stored.key);
         }
         return Err(AppError::new(format!(
@@ -210,7 +318,7 @@ fn get_key_for_origin(provider: &str, endpoint: &str) -> Result<String, AppError
 
     // Legacy entries contain only the raw key. They remain usable at the provider's
     // shipped origin, but never inherit a custom override. Saving once upgrades them.
-    if default_origin(provider).as_deref() == Some(origin.as_str()) {
+    if shipped_origin(provider, &origin) {
         return Ok(raw);
     }
     Err(AppError::new(format!(
@@ -243,7 +351,7 @@ pub fn ai_save_key(
             "refusing to bind an AI API key to a non-HTTPS origin",
         ));
     }
-    if default_origin(&provider).as_deref() != Some(origin.as_str()) && !approve_origin {
+    if !shipped_origin(&provider, &origin) && !approve_origin {
         return Err(AppError::new(format!(
             "explicit origin approval is required before this key can be used at {origin}"
         )));
@@ -287,7 +395,7 @@ pub struct Msg {
 /// the provider name** — the provider is just a keychain account + a base URL, so a
 /// dozen OpenAI-compatible services (routers, local servers, DeepSeek, Groq, …) all
 /// ride the `Openai` arm without a code change. `src/ai/providers.ts` is the registry.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Wire {
     Anthropic,
     Gemini,
@@ -296,6 +404,18 @@ pub enum Wire {
     /// `max_output_tokens`) and different SSE events from chat-completions. Needed for
     /// GPT models on OpenCode Zen, which serves them only on this endpoint.
     Responses,
+    /// Amazon Bedrock's Converse API (`/model/{id}/converse-stream`), authenticated with a
+    /// Bedrock API key as a Bearer token. Not SSE: the reply is AWS's binary event stream
+    /// (`application/vnd.amazon.eventstream`), decoded by `EventBuffer`.
+    Bedrock,
+}
+
+/// Every wire name the frontend may send. The ONE list — `ai_list_models`,
+/// `validate_request` and the Slack config validator all check against it.
+pub(crate) const WIRE_NAMES: [&str; 5] = ["anthropic", "gemini", "openai", "responses", "bedrock"];
+
+pub(crate) fn known_wire(name: &str) -> bool {
+    WIRE_NAMES.contains(&name)
 }
 
 impl Wire {
@@ -304,6 +424,7 @@ impl Wire {
             "anthropic" => Wire::Anthropic,
             "gemini" => Wire::Gemini,
             "responses" => Wire::Responses,
+            "bedrock" => Wire::Bedrock,
             _ => Wire::Openai,
         }
     }
@@ -400,6 +521,8 @@ fn extract_delta(wire: Wire, json: &serde_json::Value) -> Option<String> {
             .then(|| json.get("delta").and_then(|t| t.as_str()))
             .flatten()
             .map(str::to_string),
+        // Bedrock frames are binary events, decoded by `bedrock_frame`, never SSE lines.
+        Wire::Bedrock => None,
     }
 }
 
@@ -478,6 +601,7 @@ fn extract_finish(wire: Wire, json: &serde_json::Value) -> Option<String> {
             })
             .flatten()
             .map(str::to_string),
+        Wire::Bedrock => None,
     }
 }
 
@@ -510,6 +634,13 @@ fn classify_finish(reason: &str) -> Finish {
         }
         "blocklist" | "prohibited_content" | "spii" => {
             Finish::Aborted("the provider blocked the response (content policy)".into())
+        }
+        // Bedrock Converse stop reasons.
+        "guardrail_intervened" => {
+            Finish::Aborted("the provider blocked the response (Bedrock guardrail)".into())
+        }
+        "content_filtered" => {
+            Finish::Aborted("the provider blocked the response (content filter)".into())
         }
         // stop / end_turn / tool_use / eos / OTHER / FINISH_REASON_UNSPECIFIED / anything new.
         _ => Finish::Normal,
@@ -574,14 +705,178 @@ fn endpoint_url(base: &str, path: &[&str], query: &[(&str, &str)]) -> Result<Str
 /// provider is a registry row in `src/ai/providers.ts`, not a new arm here.
 type WireRequest = (String, Vec<(String, String)>, serde_json::Value);
 
+/// Prefix that marks a Bedrock model id as a MANTLE id in Tusk's catalog and config
+/// (`mantle/anthropic.claude-opus-5`). Mantle and the runtime share vendor-dotted ids
+/// (`deepseek.v3.2` is on both) yet are different APIs, so the plane has to be in the id.
+/// Mirrors `MANTLE_PREFIX` in `src/ai/providers.ts`.
+const MANTLE_PREFIX: &str = "mantle/";
+
+/// Mantle's three inference routes, each a shape Tusk already speaks. Which models a
+/// route serves is not published (`/v1/models` carries no endpoint field); the partition,
+/// probed model by model (2026-11, us-east-1):
+///
+/// - `Chat` — `{mantle}/v1/chat/completions`: the open-weight models Mantle runs itself
+///   (gpt-oss, DeepSeek, Qwen, Mistral, Kimi, GLM, MiniMax, Nemotron, Gemma 3, …).
+/// - `Partner` — `{mantle}/openai/v1/responses`: models served through their maker's own
+///   API (OpenAI's GPT line, xAI's Grok, Gemma 4). Responses is their native shape, and
+///   GPT refuses chat-completions' `max_tokens`.
+/// - `Anthropic` — `{mantle}/anthropic/v1/messages`: Claude, on the Messages API.
+///
+/// A wrong route is refused up front with a 400 naming the route, before the model runs,
+/// so `complete_with_retry` moves on to the next one and remembers the one that answered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MantleRoute {
+    Chat,
+    Partner,
+    Anthropic,
+}
+
+impl MantleRoute {
+    fn wire(self) -> Wire {
+        match self {
+            MantleRoute::Chat => Wire::Openai,
+            MantleRoute::Partner => Wire::Responses,
+            MantleRoute::Anthropic => Wire::Anthropic,
+        }
+    }
+
+    /// The base the route's wire appends its own `/v1/…` path to.
+    fn base(self, mantle: &str) -> String {
+        match self {
+            MantleRoute::Chat => mantle.to_string(),
+            MantleRoute::Partner => format!("{mantle}/openai"),
+            MantleRoute::Anthropic => format!("{mantle}/anthropic"),
+        }
+    }
+
+    /// The routes to try for a bare Mantle id: the likely one first, then the others.
+    fn order(model: &str) -> [MantleRoute; 3] {
+        let m = model.to_ascii_lowercase();
+        let first = if m.starts_with("anthropic.") {
+            MantleRoute::Anthropic
+        } else if m.starts_with("openai.gpt-oss") {
+            MantleRoute::Chat
+        } else if m.starts_with("openai.") || m.starts_with("xai.") {
+            MantleRoute::Partner
+        } else {
+            MantleRoute::Chat
+        };
+        let mut out = [first; 3];
+        let mut i = 1;
+        for r in [
+            MantleRoute::Chat,
+            MantleRoute::Partner,
+            MantleRoute::Anthropic,
+        ] {
+            if r != first {
+                out[i] = r;
+                i += 1;
+            }
+        }
+        out
+    }
+}
+
+type RouteCache = std::sync::Mutex<HashMap<String, MantleRoute>>;
+
+/// The route each Mantle model last answered on, per Mantle base, for this process. A
+/// cache only: losing it costs one refused request.
+fn mantle_routes() -> &'static RouteCache {
+    static ROUTES: std::sync::OnceLock<RouteCache> = std::sync::OnceLock::new();
+    ROUTES.get_or_init(Default::default)
+}
+
+fn mantle_route_key(mantle: &str, model: &str) -> String {
+    format!("{mantle} {model}")
+}
+
+fn remember_mantle_route(mantle: &str, model: &str, route: MantleRoute) {
+    if let Ok(mut routes) = mantle_routes().lock() {
+        if routes.len() >= 512 {
+            routes.clear();
+        }
+        routes.insert(mantle_route_key(mantle, model), route);
+    }
+}
+
+/// Where one attempt goes: the wire whose shape it speaks, its base, the model id that
+/// wire is sent, and the output cap. Usually just the request's own fields; a Bedrock
+/// Mantle id lowers onto one of Mantle's routes, and a refused attempt may adjust the
+/// cap or the system prompt (`Adjust`).
+#[derive(Clone, Debug, PartialEq)]
+struct Target {
+    wire: Wire,
+    base: Option<String>,
+    model: String,
+    max_tokens: Option<u32>,
+    /// Send the system prompt inside the first user turn: Converse refuses a system
+    /// block for models without a system role (older Mistral).
+    fold_system: bool,
+    /// The Mantle base and route this target is, so a success can be remembered.
+    mantle: Option<(String, MantleRoute)>,
+}
+
+/// Every target a request may be sent to, in the order to try them. One for every wire
+/// but a Bedrock Mantle id, which gets one per Mantle route (the remembered one first).
+fn targets(req: &AiRequest) -> Result<Vec<Target>, AppError> {
+    let wire = req.wire();
+    let plain = Target {
+        wire,
+        base: req.base_url.clone(),
+        model: req.model.clone(),
+        max_tokens: req.max_tokens,
+        fold_system: false,
+        mantle: None,
+    };
+    let Some(bare) = req.model.strip_prefix(MANTLE_PREFIX) else {
+        return Ok(vec![plain]);
+    };
+    if wire != Wire::Bedrock {
+        return Ok(vec![plain]);
+    }
+    if bare.trim().is_empty() {
+        return Err(AppError::new("the Bedrock Mantle model id is empty"));
+    }
+    let base = req.base_url.as_deref().unwrap_or(BEDROCK_DEFAULT_BASE);
+    let mantle = bedrock_mantle_base(base).ok_or_else(|| {
+        AppError::new(
+            "Bedrock Mantle models need AWS's own regional endpoint (https://bedrock-runtime.<region>.amazonaws.com, not FIPS). Pick a region, or use a runtime model id.",
+        )
+    })?;
+    let mut order = MantleRoute::order(bare).to_vec();
+    let known = mantle_routes()
+        .lock()
+        .ok()
+        .and_then(|r| r.get(&mantle_route_key(&mantle, bare)).copied());
+    if let Some(route) = known {
+        order.retain(|r| *r != route);
+        order.insert(0, route);
+    }
+    Ok(order
+        .into_iter()
+        .map(|route| Target {
+            wire: route.wire(),
+            base: Some(route.base(&mantle)),
+            model: bare.to_string(),
+            max_tokens: req.max_tokens,
+            fold_system: false,
+            mantle: Some((mantle.clone(), route)),
+        })
+        .collect())
+}
+
+/// The request as sent to its first target. The send loop builds each target itself.
+#[cfg(test)]
 fn build_request(req: &AiRequest, key: &str) -> Result<WireRequest, AppError> {
-    let model = &req.model;
-    match req.wire() {
+    let first = targets(req)?.remove(0);
+    build_for(req, &first, key)
+}
+
+fn build_for(req: &AiRequest, t: &Target, key: &str) -> Result<WireRequest, AppError> {
+    let model = &t.model;
+    match t.wire {
         Wire::Anthropic => {
-            let base = req
-                .base_url
-                .as_deref()
-                .unwrap_or("https://api.anthropic.com");
+            let base = t.base.as_deref().unwrap_or("https://api.anthropic.com");
             let url = endpoint_url(base, &["v1", "messages"], &[])?;
             let mut headers = vec![
                 ("anthropic-version".to_string(), "2023-06-01".to_string()),
@@ -597,8 +892,10 @@ fn build_request(req: &AiRequest, key: &str) -> Result<WireRequest, AppError> {
                 // x-api-key — probed on both /zen and /zen/go. So x-api-key above already
                 // covers OpenCode. Other Anthropic-shaped proxies read Bearer instead; send
                 // it too when this isn't Anthropic proper. Unknown auth headers are ignored
-                // (they yield "Missing API key", not a 400), so the extra header is safe.
-                if req.provider != "anthropic" {
+                // (they yield "Missing API key", not a 400), so the extra header is safe —
+                // except on Bedrock Mantle, whose Anthropic route refuses a request that
+                // carries both ("must not include both 'authorization' and 'x-api-key'").
+                if req.provider != "anthropic" && t.mantle.is_none() {
                     headers.push(("authorization".into(), format!("Bearer {key}")));
                 }
             }
@@ -609,7 +906,7 @@ fn build_request(req: &AiRequest, key: &str) -> Result<WireRequest, AppError> {
                 .collect();
             let mut body = serde_json::json!({
                 "model": model,
-                "max_tokens": req.max_tokens.unwrap_or(2048),
+                "max_tokens": t.max_tokens.unwrap_or(2048),
                 "stream": true,
                 "messages": msgs,
             });
@@ -624,7 +921,7 @@ fn build_request(req: &AiRequest, key: &str) -> Result<WireRequest, AppError> {
             // not the `?key=` query param: Google accepts both, OpenCode Zen only the
             // header (probed — `?key=` yields "Missing API key").
             let base = gemini_base(
-                req.base_url
+                t.base
                     .as_deref()
                     .unwrap_or("https://generativelanguage.googleapis.com/v1beta"),
             );
@@ -650,7 +947,7 @@ fn build_request(req: &AiRequest, key: &str) -> Result<WireRequest, AppError> {
             if let Some(sys) = &req.system {
                 body["systemInstruction"] = serde_json::json!({ "parts": [{ "text": sys }] });
             }
-            if let Some(mt) = req.max_tokens {
+            if let Some(mt) = t.max_tokens {
                 body["generationConfig"] = serde_json::json!({ "maxOutputTokens": mt });
             }
             Ok((url, headers, body))
@@ -658,7 +955,7 @@ fn build_request(req: &AiRequest, key: &str) -> Result<WireRequest, AppError> {
         // Every OpenAI-compatible service: OpenAI, OpenCode, OpenRouter, Groq,
         // DeepSeek, Mistral, xAI, Ollama/LM Studio, … — they differ only by base URL.
         Wire::Openai => {
-            let base = req.base_url.as_deref().unwrap_or("https://api.openai.com");
+            let base = t.base.as_deref().unwrap_or("https://api.openai.com");
             let url = endpoint_url(base, &["v1", "chat", "completions"], &[])?;
             let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
             // A local server has no key; sending `Bearer ` (empty) trips some of them.
@@ -673,7 +970,7 @@ fn build_request(req: &AiRequest, key: &str) -> Result<WireRequest, AppError> {
                 msgs.push(serde_json::json!({ "role": m.role, "content": m.content }));
             }
             let mut body = serde_json::json!({ "model": model, "stream": true, "messages": msgs });
-            if let Some(mt) = req.max_tokens {
+            if let Some(mt) = t.max_tokens {
                 body["max_tokens"] = serde_json::json!(mt);
             }
             Ok((url, headers, body))
@@ -682,7 +979,7 @@ fn build_request(req: &AiRequest, key: &str) -> Result<WireRequest, AppError> {
         // the system prompt is `instructions`, turns are `input`, and the output cap is
         // `max_output_tokens` (minimum 16).
         Wire::Responses => {
-            let base = req.base_url.as_deref().unwrap_or("https://api.openai.com");
+            let base = t.base.as_deref().unwrap_or("https://api.openai.com");
             let url = endpoint_url(base, &["v1", "responses"], &[])?;
             let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
             if !key.is_empty() {
@@ -694,7 +991,7 @@ fn build_request(req: &AiRequest, key: &str) -> Result<WireRequest, AppError> {
                 .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
                 .collect();
             let mut body = serde_json::json!({ "model": model, "stream": true, "input": input });
-            if let Some(mt) = req.max_tokens {
+            if let Some(mt) = t.max_tokens {
                 body["max_output_tokens"] = serde_json::json!(mt.max(16));
             }
             if let Some(sys) = &req.system {
@@ -702,47 +999,323 @@ fn build_request(req: &AiRequest, key: &str) -> Result<WireRequest, AppError> {
             }
             Ok((url, headers, body))
         }
+        // Amazon Bedrock Converse. The model id (a foundation model, a system inference
+        // profile such as `us.anthropic.…`, or an application-profile ARN) is a PATH
+        // segment — `push` percent-encodes the ARN's `/`. Auth is a Bedrock API key as a
+        // Bearer token; SigV4 is not spoken here.
+        Wire::Bedrock => {
+            let base = t.base.as_deref().unwrap_or(BEDROCK_DEFAULT_BASE);
+            let url = endpoint_url(base, &["model", model, "converse-stream"], &[])?;
+            let mut headers = vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("accept".into(), "application/vnd.amazon.eventstream".into()),
+            ];
+            if !key.is_empty() {
+                headers.push(("authorization".into(), format!("Bearer {key}")));
+            }
+            let system = req.system.as_deref().filter(|s| !s.trim().is_empty());
+            let folded = system.filter(|_| t.fold_system);
+            let mut body =
+                serde_json::json!({ "messages": bedrock_messages(&req.messages, folded) });
+            if let Some(sys) = system.filter(|_| !t.fold_system) {
+                body["system"] = serde_json::json!([{ "text": sys }]);
+            }
+            if let Some(mt) = t.max_tokens {
+                body["inferenceConfig"] = serde_json::json!({ "maxTokens": mt });
+            }
+            Ok((url, headers, body))
+        }
     }
 }
 
-/// Live model catalog for a provider (ids only), using the saved keychain key.
-/// Per wire: Anthropic `GET {base}/v1/models` (x-api-key), Gemini `GET {base}/models`
-/// (x-goog-api-key; `base` carries the version segment; filtered to generateContent-capable,
-/// `models/` prefix stripped), OpenAI + Responses + compatible `GET {base}/v1/models`
-/// (Bearer; obvious non-chat families dropped, sorted so router ids group by vendor).
-/// Errors surface to the frontend, which falls back to its curated list.
-#[tauri::command]
-pub async fn ai_list_models(
-    provider: String,
-    wire: Option<String>,
-    base_url: Option<String>,
-    allow_no_key: Option<bool>,
-    probe: Option<AiProbe>,
+/// Converse turns. Converse refuses a blank text block, a conversation that opens with
+/// the assistant, and (for most models) two consecutive turns from one role — the chat
+/// panel can produce all three (an empty reply, a cancelled turn), so blank turns are
+/// dropped, consecutive same-role turns are joined, and leading assistant turns go.
+/// `system`, when given, opens the first user turn instead of riding in the request's
+/// `system` block (models without a system role refuse that block).
+fn bedrock_messages(messages: &[Msg], system: Option<&str>) -> Vec<serde_json::Value> {
+    let mut turns: Vec<(&str, String)> = Vec::new();
+    for m in messages {
+        if m.content.trim().is_empty() {
+            continue;
+        }
+        if turns.is_empty() && m.role == "assistant" {
+            continue;
+        }
+        match turns.last_mut() {
+            Some((role, text)) if *role == m.role => {
+                text.push_str("\n\n");
+                text.push_str(&m.content);
+            }
+            _ => turns.push((m.role.as_str(), m.content.clone())),
+        }
+    }
+    if let Some(sys) = system {
+        match turns.first_mut() {
+            Some((_, text)) => *text = format!("{sys}\n\n{text}"),
+            None => turns.push(("user", sys.to_string())),
+        }
+    }
+    turns
+        .into_iter()
+        .map(|(role, text)| serde_json::json!({ "role": role, "content": [{ "text": text }] }))
+        .collect()
+}
+
+/// Amazon Bedrock's model catalog: the RUNTIME's models (read from the control plane)
+/// followed by MANTLE's, each Mantle id prefixed `mantle/`. Both hosts are derived only
+/// from AWS's own runtime host (`bedrock_control_base`, `bedrock_mantle_base`), and the
+/// key is read for that runtime origin, so it cannot travel anywhere a runtime origin
+/// approval did not cover.
+///
+/// Mantle is not in every region; when it cannot be reached the runtime list stands on
+/// its own (and the reverse, so a key scoped to Mantle alone still lists something).
+/// Only when both fail is it an error, reporting the runtime's reason.
+async fn bedrock_catalog(
+    provider: &str,
+    base_url: Option<&str>,
+    allow_no_key: bool,
 ) -> Result<Vec<String>, AppError> {
-    key_entry(&provider)?;
-    if wire
-        .as_deref()
-        .is_some_and(|w| !matches!(w, "anthropic" | "gemini" | "openai" | "responses"))
-    {
-        return Err(AppError::new("unknown AI wire protocol"));
-    }
-    if base_url.as_ref().is_some_and(|s| s.len() > 2_000) {
-        return Err(AppError::new("AI base URL is too long"));
-    }
-    if probe
-        .as_ref()
-        .is_some_and(|p| p.model.len() > 500 || p.base_url.len() > 2_000)
-    {
-        return Err(AppError::new("AI connection probe is too large"));
-    }
-    let wire = match &wire {
-        Some(w) => Wire::parse(w),
-        None => Wire::legacy_for_provider(&provider),
+    let runtime = base_url.unwrap_or(BEDROCK_DEFAULT_BASE);
+    let control = bedrock_control_base(runtime).ok_or_else(|| {
+        AppError::new(
+            "Bedrock can list models only for an AWS endpoint (https://bedrock-runtime.<region>.amazonaws.com). Type model ids by hand for this endpoint.",
+        )
+    })?;
+    let key = match get_key_for_origin(provider, runtime) {
+        Ok(k) => k,
+        Err(_) if allow_no_key => String::new(),
+        Err(e) => return Err(e),
     };
-    let allow_no_key = allow_no_key.unwrap_or(false);
+    bedrock_catalog_with_key(runtime, &control, &key).await
+}
+
+async fn bedrock_catalog_with_key(
+    runtime: &str,
+    control: &str,
+    key: &str,
+) -> Result<Vec<String>, AppError> {
+    let mantle = bedrock_mantle_base(runtime);
+    let client = http_client()?;
+    let mantle_models = async {
+        match &mantle {
+            Some(base) => bedrock_mantle_catalog(&client, base, key).await,
+            None => Ok(Vec::new()),
+        }
+    };
+    let (runtime_models, mantle_models) = tokio::join!(
+        bedrock_runtime_catalog(&client, control, key),
+        mantle_models
+    );
+    match (runtime_models, mantle_models) {
+        (Ok(mut out), Ok(more)) => {
+            out.extend(more);
+            Ok(out)
+        }
+        (Ok(out), Err(_)) => Ok(out),
+        (Err(_), Ok(more)) if !more.is_empty() => Ok(more),
+        (Err(e), _) => Err(e),
+    }
+}
+
+/// Whether a `ListFoundationModels` summary is a model Tusk can chat with over Converse:
+/// text in, text out, Converse streaming, and not speech-to-speech. A model with no
+/// `converse` capability block that needs video (TwelveLabs Pegasus) is refused by
+/// Converse ("doesn't support the model"), so it is left out too.
+fn bedrock_chat_model(m: &serde_json::Value) -> bool {
+    let has = |field: &str, value: &str| {
+        m[field]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|x| x.as_str() == Some(value)))
+    };
+    let modalities_known = m["inputModalities"].is_array() && m["outputModalities"].is_array();
+    if modalities_known
+        && (!has("inputModalities", "TEXT")
+            || !has("outputModalities", "TEXT")
+            || has("outputModalities", "SPEECH"))
+    {
+        return false;
+    }
+    if has("inputModalities", "VIDEO") && m["converse"].is_null() {
+        return false;
+    }
+    if m.pointer("/modelLifecycle/status").and_then(|s| s.as_str()) == Some("LEGACY") {
+        return false;
+    }
+    match m.pointer("/inferenceAPIsSupported/converse/streaming") {
+        Some(v) => v.as_bool() == Some(true),
+        None => m["responseStreamingSupported"].as_bool() != Some(false),
+    }
+}
+
+/// The runtime's Converse-callable models, from the control plane: active inference
+/// profiles over chat models (system-defined ids like `us.anthropic.…`, then the
+/// account's application profiles by ARN), followed by the chat models invocable
+/// ON_DEMAND. Many current models are reachable ONLY through a profile, which is why
+/// both are read.
+async fn bedrock_runtime_catalog(
+    client: &reqwest::Client,
+    control: &str,
+    key: &str,
+) -> Result<Vec<String>, AppError> {
+    let models = bedrock_get(
+        client,
+        &endpoint_url(
+            control,
+            &["foundation-models"],
+            &[("byOutputModality", "TEXT")],
+        )?,
+        key,
+    )
+    .await?;
+    let summaries = models["modelSummaries"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or_default();
+    let chat: std::collections::HashSet<&str> = summaries
+        .iter()
+        .filter(|m| bedrock_chat_model(m))
+        .filter_map(|m| m["modelId"].as_str())
+        .collect();
+    let mut on_demand: Vec<String> = summaries
+        .iter()
+        .filter(|m| {
+            m["inferenceTypesSupported"]
+                .as_array()
+                .is_some_and(|t| t.iter().any(|x| x.as_str() == Some("ON_DEMAND")))
+        })
+        .filter_map(|m| m["modelId"].as_str())
+        .filter(|id| chat.contains(id))
+        .map(str::to_string)
+        .collect();
+    on_demand.sort();
+
+    let mut out = Vec::new();
+    for kind in ["SYSTEM_DEFINED", "APPLICATION"] {
+        let mut profiles = Vec::new();
+        let mut next: Option<String> = None;
+        // Paged; 20 pages of 1,000 is far beyond any real account.
+        for _ in 0..20 {
+            let mut query = vec![("maxResults", "1000"), ("type", kind)];
+            if let Some(token) = next.as_deref() {
+                query.push(("nextToken", token));
+            }
+            let page = bedrock_get(
+                client,
+                &endpoint_url(control, &["inference-profiles"], &query)?,
+                key,
+            )
+            .await?;
+            for p in page["inferenceProfileSummaries"]
+                .as_array()
+                .map(|a| a.as_slice())
+                .unwrap_or_default()
+            {
+                if p["status"].as_str().is_some_and(|s| s != "ACTIVE") {
+                    continue;
+                }
+                let serves_chat = p["models"].as_array().is_some_and(|ms| {
+                    ms.iter().any(|m| {
+                        m["modelArn"]
+                            .as_str()
+                            .and_then(|arn| arn.rsplit_once("foundation-model/"))
+                            .is_some_and(|(_, id)| chat.contains(id))
+                    })
+                });
+                if !serves_chat {
+                    continue;
+                }
+                // Converse takes a system profile by id, an application profile by ARN.
+                let id = if kind == "APPLICATION" {
+                    p["inferenceProfileArn"].as_str()
+                } else {
+                    p["inferenceProfileId"].as_str()
+                };
+                if let Some(id) = id {
+                    profiles.push(id.to_string());
+                }
+            }
+            next = page["nextToken"]
+                .as_str()
+                .filter(|t| !t.is_empty())
+                .map(str::to_string);
+            if next.is_none() {
+                break;
+            }
+        }
+        profiles.sort();
+        out.extend(profiles);
+    }
+    out.extend(on_demand);
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|id| seen.insert(id.clone()));
+    Ok(out)
+}
+
+/// Mantle's own catalog (`GET {mantle}/v1/models`, Bearer), as `mantle/<id>`. A model
+/// the account cannot call is listed with `status: "unavailable"` and a reason (most
+/// often the account's data-retention mode, which some vendors' models refuse); those
+/// are left out, since every request to them fails.
+async fn bedrock_mantle_catalog(
+    client: &reqwest::Client,
+    mantle: &str,
+    key: &str,
+) -> Result<Vec<String>, AppError> {
+    let json = bedrock_get(client, &endpoint_url(mantle, &["v1", "models"], &[])?, key).await?;
+    let mut out: Vec<String> = json["data"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter(|m| m["status"].as_str().is_none_or(|s| s == "available"))
+        .filter_map(|m| m["id"].as_str())
+        .filter(|id| !id.is_empty() && !id.contains('/'))
+        .map(|id| format!("{MANTLE_PREFIX}{id}"))
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// One authenticated Bedrock GET (control plane or Mantle), as JSON.
+async fn bedrock_get(
+    client: &reqwest::Client,
+    url: &str,
+    key: &str,
+) -> Result<serde_json::Value, AppError> {
+    ensure_key_transport(url, key, false)?;
+    let resp = client
+        .get(url)
+        .header("authorization", format!("Bearer {key}"))
+        .header("accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| AppError::new(e.to_string()))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = limited_body(resp, 64 * 1024).await.unwrap_or_default();
+        let detail = String::from_utf8(detail)
+            .unwrap_or_else(|_| "response body is not valid UTF-8".to_string());
+        return Err(AppError::new(format!(
+            "provider error {status}: {}",
+            detail.chars().take(300).collect::<String>()
+        )));
+    }
+    let body = limited_body(resp, MAX_MODEL_BODY).await?;
+    serde_json::from_slice(&body).map_err(|e| AppError::new(e.to_string()))
+}
+
+/// Every other wire's catalog: one GET of the provider's `/models` (see `ai_list_models`).
+async fn wire_catalog(
+    provider: &str,
+    wire: Wire,
+    base_url: Option<&str>,
+    allow_no_key: bool,
+) -> Result<Vec<String>, AppError> {
     let (url, header_kind): (String, Wire) = match wire {
         Wire::Anthropic => {
-            let base = base_url.as_deref().unwrap_or("https://api.anthropic.com");
+            let base = base_url.unwrap_or("https://api.anthropic.com");
             (
                 endpoint_url(base, &["v1", "models"], &[("limit", "1000")])?,
                 wire,
@@ -750,11 +1323,8 @@ pub async fn ai_list_models(
         }
         Wire::Gemini => {
             // `base` carries the version segment; auth is the header (see `build_request`).
-            let base = gemini_base(
-                base_url
-                    .as_deref()
-                    .unwrap_or("https://generativelanguage.googleapis.com/v1beta"),
-            );
+            let base =
+                gemini_base(base_url.unwrap_or("https://generativelanguage.googleapis.com/v1beta"));
             (
                 endpoint_url(&base, &["models"], &[("pageSize", "1000")])?,
                 wire,
@@ -762,11 +1332,12 @@ pub async fn ai_list_models(
         }
         // Responses providers publish the same `/v1/models` catalog as chat-completions.
         Wire::Openai | Wire::Responses => {
-            let base = base_url.as_deref().unwrap_or("https://api.openai.com");
+            let base = base_url.unwrap_or("https://api.openai.com");
             (endpoint_url(base, &["v1", "models"], &[])?, wire)
         }
+        Wire::Bedrock => return bedrock_catalog(provider, base_url, allow_no_key).await,
     };
-    let key = match get_key_for_origin(&provider, &url) {
+    let key = match get_key_for_origin(provider, &url) {
         Ok(k) => k,
         Err(_) if allow_no_key => String::new(),
         Err(e) => return Err(e),
@@ -783,10 +1354,10 @@ pub async fn ai_list_models(
             vec![("x-goog-api-key".to_string(), key.clone())]
         }
         Wire::Gemini => Vec::new(),
-        Wire::Openai | Wire::Responses if !key.is_empty() => {
+        Wire::Openai | Wire::Responses | Wire::Bedrock if !key.is_empty() => {
             vec![("authorization".to_string(), format!("Bearer {key}"))]
         }
-        Wire::Openai | Wire::Responses => Vec::new(),
+        Wire::Openai | Wire::Responses | Wire::Bedrock => Vec::new(),
     };
     ensure_key_transport(&url, &key, allow_no_key)?;
     let client = http_client()?;
@@ -827,7 +1398,7 @@ pub async fn ai_list_models(
             .map(|n| n.trim_start_matches("models/").to_string())
             .collect(),
         // anthropic + openai-compatible + responses all wrap in `data: [{id}]`
-        Wire::Anthropic | Wire::Openai | Wire::Responses => json["data"]
+        Wire::Anthropic | Wire::Openai | Wire::Responses | Wire::Bedrock => json["data"]
             .as_array()
             .map(|a| a.as_slice())
             .unwrap_or_default()
@@ -855,6 +1426,42 @@ pub async fn ai_list_models(
         out.retain(|id| !SKIP.iter().any(|s| id.contains(s)));
         out.sort(); // ascending groups router ids by vendor prefix ("anthropic/…", "openai/…")
     }
+    Ok(out)
+}
+
+/// Live model catalog for a provider (ids only), using the saved keychain key.
+/// Per wire: Anthropic `GET {base}/v1/models` (x-api-key), Gemini `GET {base}/models`
+/// (x-goog-api-key; `base` carries the version segment; filtered to generateContent-capable,
+/// `models/` prefix stripped), OpenAI + Responses + compatible `GET {base}/v1/models`
+/// (Bearer; obvious non-chat families dropped, sorted so router ids group by vendor).
+/// Errors surface to the frontend, which falls back to its curated list.
+#[tauri::command]
+pub async fn ai_list_models(
+    provider: String,
+    wire: Option<String>,
+    base_url: Option<String>,
+    allow_no_key: Option<bool>,
+    probe: Option<AiProbe>,
+) -> Result<Vec<String>, AppError> {
+    key_entry(&provider)?;
+    if wire.as_deref().is_some_and(|w| !known_wire(w)) {
+        return Err(AppError::new("unknown AI wire protocol"));
+    }
+    if base_url.as_ref().is_some_and(|s| s.len() > 2_000) {
+        return Err(AppError::new("AI base URL is too long"));
+    }
+    if probe
+        .as_ref()
+        .is_some_and(|p| p.model.len() > 500 || p.base_url.len() > 2_000)
+    {
+        return Err(AppError::new("AI connection probe is too large"));
+    }
+    let wire = match &wire {
+        Some(w) => Wire::parse(w),
+        None => Wire::legacy_for_provider(&provider),
+    };
+    let allow_no_key = allow_no_key.unwrap_or(false);
+    let mut out = wire_catalog(&provider, wire, base_url.as_deref(), allow_no_key).await?;
     out.retain(|id| {
         !id.is_empty() && id.len() <= 500 && id == id.trim() && !id.chars().any(|c| c.is_control())
     });
@@ -863,11 +1470,12 @@ pub async fn ai_list_models(
     // Some gateways expose an unauthenticated model catalog. Settings can request a
     // tiny streamed completion so Test verifies the saved credential on a real auth
     // endpoint rather than treating a public `/models` response as proof.
+    // Bedrock's catalog is itself authenticated (the control plane refuses an invalid
+    // key), so with no model chosen yet that listing is the proof; the first id of a
+    // fresh account may not even be enabled for it.
+    let probe = probe.filter(|p| !(p.wire == "bedrock" && p.model.trim().is_empty()));
     if let Some(probe) = probe {
-        if !matches!(
-            probe.wire.as_str(),
-            "anthropic" | "gemini" | "openai" | "responses"
-        ) {
+        if !known_wire(&probe.wire) {
             return Err(AppError::new("unknown AI probe wire protocol"));
         }
         let model = if probe.model.trim().is_empty() {
@@ -979,11 +1587,7 @@ fn validate_request(req: &AiRequest) -> Result<(), AppError> {
     {
         return Err(AppError::new("AI model id must be nonempty and contain no surrounding whitespace or control characters"));
     }
-    if req
-        .wire
-        .as_deref()
-        .is_some_and(|w| !matches!(w, "anthropic" | "gemini" | "openai" | "responses"))
-    {
+    if req.wire.as_deref().is_some_and(|w| !known_wire(w)) {
         return Err(AppError::new("unknown AI wire protocol"));
     }
     if req.messages.len() > 1_000
@@ -1127,6 +1731,86 @@ enum Attempt {
     /// Permanent (bad key, bad model, content filter), or we already emitted deltas
     /// and replaying would duplicate them on screen.
     Fatal(String),
+    /// Refused before the model ran, in a way a reshaped request gets past (see
+    /// `Adjust`). Carries the provider's message for when no reshaping is left.
+    Adjust(Adjust, String),
+}
+
+/// A refusal that a different shape of the SAME request can get past. Each arrives as an
+/// HTTP error before the model produced anything, so resending is not a replay.
+#[derive(Debug, PartialEq)]
+enum Adjust {
+    /// Bedrock Mantle serves this model on another of its routes.
+    Route,
+    /// The output cap is above the model's own, which the provider stated.
+    MaxTokens(u32),
+    /// The model has no system role (Converse): send the prompt in the first user turn.
+    FoldSystem,
+}
+
+/// Classify a non-success reply as an `Adjust`, or `None` when it is a plain failure.
+fn adjustment(status: u16, body: &str, t: &Target, has_system: bool) -> Option<Adjust> {
+    let lower = body.to_ascii_lowercase();
+    if t.mantle.is_some()
+        && matches!(status, 400 | 404)
+        && (lower.contains("supported on this route")
+            || (lower.contains("does not support the '") && lower.contains(" api")))
+    {
+        return Some(Adjust::Route);
+    }
+    if status != 400 {
+        return None;
+    }
+    if t.wire == Wire::Bedrock
+        && has_system
+        && !t.fold_system
+        && lower.contains("support system message")
+    {
+        return Some(Adjust::FoldSystem);
+    }
+    // The Anthropic shape always sends a cap (2048 when none was asked for).
+    let requested = t
+        .max_tokens
+        .or((t.wire == Wire::Anthropic).then_some(2048))?;
+    stated_output_limit(&lower, requested).map(Adjust::MaxTokens)
+}
+
+/// The model's output-token ceiling, when a refusal states one below `requested`:
+/// Converse "exceeds the model limit of 10000", Anthropic "128000 > 64000, which is the
+/// maximum allowed", Mantle "exceeds model maximum (4096)", OpenAI "supports at most
+/// 16384 completion tokens". A context-length refusal names no output ceiling and is
+/// left alone: lowering the cap would not fix it.
+fn stated_output_limit(msg: &str, requested: u32) -> Option<u32> {
+    let lower = msg.to_ascii_lowercase();
+    if !lower.contains("token") {
+        return None;
+    }
+    let mut markers = vec![
+        "model limit of ",
+        "model maximum (",
+        "supports at most ",
+        "maximum of ",
+    ];
+    if lower.contains("maximum allowed") {
+        markers.push("> ");
+    }
+    for marker in markers {
+        let mut from = 0;
+        while let Some(i) = lower[from..].find(marker) {
+            let at = from + i + marker.len();
+            let digits: String = lower[at..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = digits.parse::<u32>() {
+                if (1..requested).contains(&n) {
+                    return Some(n);
+                }
+            }
+            from = at;
+        }
+    }
+    None
 }
 
 fn retryable_status(s: u16) -> bool {
@@ -1151,6 +1835,10 @@ fn retryable_msg(m: &str) -> bool {
         "connect",
         "reset by peer",
         "unavailable",
+        // Bedrock event-stream exceptions arrive as `<exceptionType>: <message>`.
+        "throttl",
+        "internalserver",
+        "modelstreamerror",
         "ended before a terminal event",
         "502",
         "503",
@@ -1221,12 +1909,14 @@ fn flush_delta<F: FnMut(String)>(batch: &mut DeltaBatch, on_delta: &mut F, emitt
 async fn stream_attempt<F: FnMut(String) + Send>(
     client: &reqwest::Client,
     req: &AiRequest,
+    target: &Target,
     key: &str,
     on_delta: &mut F,
     cancel: &mut Option<oneshot::Receiver<()>>,
     partial_is_fatal: bool,
 ) -> Result<Option<Completion>, Attempt> {
-    let (url, headers, body) = build_request(req, key).map_err(|e| Attempt::Fatal(e.message))?;
+    let (url, headers, body) =
+        build_for(req, target, key).map_err(|e| Attempt::Fatal(e.message))?;
     ensure_key_transport(&url, key, req.allow_no_key).map_err(|e| Attempt::Fatal(e.message))?;
     let mut builder = client.post(&url).json(&body);
     for (k, v) in headers {
@@ -1255,6 +1945,10 @@ async fn stream_attempt<F: FnMut(String) + Send>(
             "provider error {status}: {}",
             detail.chars().take(500).collect::<String>()
         );
+        let has_system = req.system.as_deref().is_some_and(|s| !s.trim().is_empty());
+        if let Some(adjust) = adjustment(status.as_u16(), &detail, target, has_system) {
+            return Err(Attempt::Adjust(adjust, msg));
+        }
         return Err(if retryable_status(status.as_u16()) {
             Attempt::Retry(msg)
         } else {
@@ -1262,23 +1956,21 @@ async fn stream_attempt<F: FnMut(String) + Send>(
         });
     }
 
-    // Line-based SSE: drain complete lines (multibyte-safe), parse per provider.
-    let mut text = String::new();
-    let mut truncated = false;
-    let mut emitted = false;
-    let mut saw_finish = false;
-    let mut delta_batch = DeltaBatch::new();
+    // SSE lines (multibyte-safe) or Bedrock's binary events, both decoded into the same
+    // `Frame`s, so every wire shares one set of error / finish / truncation rules.
+    let wire = target.wire;
+    let mut decoder = Decoder::for_wire(wire);
+    let mut state = StreamState::new();
     let mut stream = resp.bytes_stream();
-    let mut buf = SseBuffer::default();
     loop {
-        let flush_in = (!delta_batch.pending.is_empty()).then(|| {
+        let flush_in = (!state.batch.pending.is_empty()).then(|| {
             std::time::Duration::from_millis(DELTA_BATCH_MS)
-                .saturating_sub(delta_batch.last_flush.elapsed())
+                .saturating_sub(state.batch.last_flush.elapsed())
         });
         let chunk = tokio::select! {
             biased;
             _ = wait_cancel(cancel) => {
-                flush_delta(&mut delta_batch, on_delta, &mut emitted);
+                state.flush(on_delta);
                 return Ok(None);
             },
             _ = async {
@@ -1287,7 +1979,7 @@ async fn stream_attempt<F: FnMut(String) + Send>(
                     None => std::future::pending::<()>().await,
                 }
             } => {
-                flush_delta(&mut delta_batch, on_delta, &mut emitted);
+                state.flush(on_delta);
                 continue;
             },
             c = stream.next() => c,
@@ -1296,112 +1988,374 @@ async fn stream_attempt<F: FnMut(String) + Send>(
         let bytes = match chunk {
             Ok(b) => b,
             Err(e) => {
-                flush_delta(&mut delta_batch, on_delta, &mut emitted);
-                return Err(soft_fail(e.to_string(), emitted && partial_is_fatal));
+                state.flush(on_delta);
+                return Err(soft_fail(e.to_string(), state.emitted && partial_is_fatal));
             }
         };
-        buf.extend(&bytes);
-        let lines = match drain_sse_lines(&mut buf) {
-            Ok(lines) => lines,
+        let frames = match decoder.push(&bytes, wire) {
+            Ok(frames) => frames,
             Err(e) => {
-                flush_delta(&mut delta_batch, on_delta, &mut emitted);
+                state.flush(on_delta);
                 return Err(Attempt::Fatal(e.message));
             }
         };
-        for line in lines {
-            let f = parse_sse_line(&line, req.wire());
-            if let Some(msg) = f.error {
-                flush_delta(&mut delta_batch, on_delta, &mut emitted);
-                return Err(soft_fail(msg, emitted && partial_is_fatal));
-            }
-            if let Some(t) = f.delta {
-                if text.len().saturating_add(t.len()) > MAX_AI_OUTPUT {
-                    flush_delta(&mut delta_batch, on_delta, &mut emitted);
-                    return Err(Attempt::Fatal(format!(
-                        "AI response exceeds {MAX_AI_OUTPUT} bytes"
-                    )));
-                }
-                text.push_str(&t);
-                if delta_batch.push(&t) {
-                    flush_delta(&mut delta_batch, on_delta, &mut emitted);
-                }
-            }
-            if let Some(r) = f.finish {
-                saw_finish = true;
-                match classify_finish(&r) {
-                    Finish::Normal => {}
-                    Finish::Truncated => truncated = true,
-                    Finish::Aborted(m) => {
-                        flush_delta(&mut delta_batch, on_delta, &mut emitted);
-                        return Err(Attempt::Fatal(m));
-                    }
-                }
-            }
-            if f.done {
-                flush_delta(&mut delta_batch, on_delta, &mut emitted);
-                return Ok(Some(Completion { text, truncated }));
+        for f in frames {
+            if state.apply(f, on_delta, partial_is_fatal)? {
+                return Ok(Some(state.finish(on_delta)));
             }
         }
     }
     // Some compatible servers omit the final newline. Process that complete final
     // frame rather than silently discarding a terminal event or error.
-    if !buf.remaining().is_empty() {
-        if buf.remaining().len() > MAX_SSE_LINE {
-            flush_delta(&mut delta_batch, on_delta, &mut emitted);
-            return Err(Attempt::Fatal(format!(
-                "provider SSE line exceeds {MAX_SSE_LINE} bytes"
-            )));
-        }
-        let line = match std::str::from_utf8(buf.remaining()) {
-            Ok(line) => line.trim_end().to_string(),
-            Err(_) => {
-                flush_delta(&mut delta_batch, on_delta, &mut emitted);
-                return Err(Attempt::Fatal(
-                    "provider SSE stream contains invalid UTF-8".into(),
-                ));
+    match decoder.finish(wire) {
+        Ok(Some(f)) => {
+            if state.apply(f, on_delta, partial_is_fatal)? {
+                return Ok(Some(state.finish(on_delta)));
             }
-        };
-        let f = parse_sse_line(&line, req.wire());
+        }
+        Ok(None) => {}
+        Err(e) => {
+            state.flush(on_delta);
+            return Err(Attempt::Fatal(e.message));
+        }
+    }
+    if state.saw_finish {
+        Ok(Some(state.finish(on_delta)))
+    } else {
+        state.flush(on_delta);
+        Err(soft_fail(
+            "provider stream ended before a terminal event".to_string(),
+            state.emitted && partial_is_fatal,
+        ))
+    }
+}
+
+/// What one streaming attempt has received so far.
+struct StreamState {
+    text: String,
+    truncated: bool,
+    /// Deltas have reached `on_delta` (the screen, on the `ai_chat` path).
+    emitted: bool,
+    saw_finish: bool,
+    batch: DeltaBatch,
+}
+
+impl StreamState {
+    fn new() -> Self {
+        Self {
+            text: String::new(),
+            truncated: false,
+            emitted: false,
+            saw_finish: false,
+            batch: DeltaBatch::new(),
+        }
+    }
+
+    fn flush<F: FnMut(String)>(&mut self, on_delta: &mut F) {
+        flush_delta(&mut self.batch, on_delta, &mut self.emitted);
+    }
+
+    fn finish<F: FnMut(String)>(&mut self, on_delta: &mut F) -> Completion {
+        self.flush(on_delta);
+        Completion {
+            text: std::mem::take(&mut self.text),
+            truncated: self.truncated,
+        }
+    }
+
+    /// Apply one decoded frame. `Ok(true)` = a terminal frame: the reply is complete.
+    fn apply<F: FnMut(String)>(
+        &mut self,
+        f: Frame,
+        on_delta: &mut F,
+        partial_is_fatal: bool,
+    ) -> Result<bool, Attempt> {
         if let Some(msg) = f.error {
-            flush_delta(&mut delta_batch, on_delta, &mut emitted);
-            return Err(soft_fail(msg, emitted && partial_is_fatal));
+            self.flush(on_delta);
+            return Err(soft_fail(msg, self.emitted && partial_is_fatal));
         }
         if let Some(t) = f.delta {
-            if text.len().saturating_add(t.len()) > MAX_AI_OUTPUT {
-                flush_delta(&mut delta_batch, on_delta, &mut emitted);
+            if self.text.len().saturating_add(t.len()) > MAX_AI_OUTPUT {
+                self.flush(on_delta);
                 return Err(Attempt::Fatal(format!(
                     "AI response exceeds {MAX_AI_OUTPUT} bytes"
                 )));
             }
-            text.push_str(&t);
-            delta_batch.push(&t);
+            self.text.push_str(&t);
+            if self.batch.push(&t) {
+                self.flush(on_delta);
+            }
         }
         if let Some(r) = f.finish {
-            saw_finish = true;
+            self.saw_finish = true;
             match classify_finish(&r) {
                 Finish::Normal => {}
-                Finish::Truncated => truncated = true,
+                Finish::Truncated => self.truncated = true,
                 Finish::Aborted(m) => {
-                    flush_delta(&mut delta_batch, on_delta, &mut emitted);
+                    self.flush(on_delta);
                     return Err(Attempt::Fatal(m));
                 }
             }
         }
-        if f.done {
-            flush_delta(&mut delta_batch, on_delta, &mut emitted);
-            return Ok(Some(Completion { text, truncated }));
+        Ok(f.done)
+    }
+}
+
+/// Turns response bytes into `Frame`s for one wire.
+enum Decoder {
+    Sse(SseBuffer),
+    Events(EventBuffer),
+}
+
+impl Decoder {
+    fn for_wire(wire: Wire) -> Self {
+        match wire {
+            Wire::Bedrock => Decoder::Events(EventBuffer::default()),
+            _ => Decoder::Sse(SseBuffer::default()),
         }
     }
-    if saw_finish {
-        flush_delta(&mut delta_batch, on_delta, &mut emitted);
-        Ok(Some(Completion { text, truncated }))
-    } else {
-        flush_delta(&mut delta_batch, on_delta, &mut emitted);
-        Err(soft_fail(
-            "provider stream ended before a terminal event".to_string(),
-            emitted && partial_is_fatal,
-        ))
+
+    fn push(&mut self, bytes: &[u8], wire: Wire) -> Result<Vec<Frame>, AppError> {
+        match self {
+            Decoder::Sse(buf) => {
+                buf.extend(bytes);
+                Ok(drain_sse_lines(buf)?
+                    .iter()
+                    .map(|line| parse_sse_line(line, wire))
+                    .collect())
+            }
+            Decoder::Events(buf) => {
+                buf.bytes.extend_from_slice(bytes);
+                Ok(drain_events(buf)?.iter().map(bedrock_frame).collect())
+            }
+        }
     }
+
+    /// The bytes left when the body ends. An SSE stream may end on a final line with no
+    /// newline; an event stream that stops mid-message has no frame to give, and the
+    /// caller's "ended before a terminal event" covers it.
+    fn finish(&mut self, wire: Wire) -> Result<Option<Frame>, AppError> {
+        let Decoder::Sse(buf) = self else {
+            return Ok(None);
+        };
+        let rest = buf.remaining();
+        if rest.is_empty() {
+            return Ok(None);
+        }
+        if rest.len() > MAX_SSE_LINE {
+            return Err(AppError::new(format!(
+                "provider SSE line exceeds {MAX_SSE_LINE} bytes"
+            )));
+        }
+        let line = std::str::from_utf8(rest)
+            .map_err(|_| AppError::new("provider SSE stream contains invalid UTF-8"))?;
+        Ok(Some(parse_sse_line(line.trim_end(), wire)))
+    }
+}
+
+/// Largest single event-stream message accepted. A text delta is a few bytes; this is
+/// the same ceiling as one SSE line plus room for the headers.
+const MAX_EVENT_BYTES: usize = MAX_SSE_LINE + 64 * 1024;
+
+/// AWS event-stream bytes not yet decoded (`application/vnd.amazon.eventstream`).
+#[derive(Default)]
+struct EventBuffer {
+    bytes: Vec<u8>,
+}
+
+/// One decoded event-stream message: the string headers Bedrock sets, and the payload.
+#[derive(Default, Debug)]
+struct StreamEvent {
+    message_type: String,
+    event_type: String,
+    exception_type: String,
+    error_code: String,
+    error_message: String,
+    payload: Vec<u8>,
+}
+
+/// CRC-32 (IEEE, the zlib/PNG polynomial): what the event-stream prelude and message
+/// checksums use.
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+            k += 1;
+        }
+        table[i] = c;
+        i += 1;
+    }
+    table
+};
+
+fn crc32(bytes: &[u8]) -> u32 {
+    !bytes.iter().fold(!0u32, |c, &b| {
+        CRC32_TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8)
+    })
+}
+
+fn be_u32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+/// Drain every COMPLETE message, leaving a partial one buffered. Layout: total length
+/// (u32), headers length (u32), prelude CRC, headers, payload, message CRC, all
+/// big-endian. Both checksums are verified; a corrupt or oversized frame is an error,
+/// never a silently shortened reply.
+fn drain_events(buf: &mut EventBuffer) -> Result<Vec<StreamEvent>, AppError> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while buf.bytes.len() - at >= 12 {
+        let b = &buf.bytes[at..];
+        let total = be_u32(&b[0..4]) as usize;
+        let headers_len = be_u32(&b[4..8]) as usize;
+        if crc32(&b[0..8]) != be_u32(&b[8..12]) {
+            return Err(AppError::new(
+                "provider event stream has a corrupt frame prelude",
+            ));
+        }
+        if !(16..=MAX_EVENT_BYTES).contains(&total) || headers_len > total - 16 {
+            return Err(AppError::new(format!(
+                "provider event stream frame of {total} bytes is malformed or exceeds {MAX_EVENT_BYTES} bytes"
+            )));
+        }
+        if b.len() < total {
+            break;
+        }
+        if crc32(&b[0..total - 4]) != be_u32(&b[total - 4..total]) {
+            return Err(AppError::new(
+                "provider event stream frame failed its checksum",
+            ));
+        }
+        let mut event = parse_event_headers(&b[12..12 + headers_len])?;
+        event.payload = b[12 + headers_len..total - 4].to_vec();
+        out.push(event);
+        at += total;
+    }
+    if at > 0 {
+        buf.bytes = buf.bytes.split_off(at);
+    }
+    Ok(out)
+}
+
+fn parse_event_headers(mut h: &[u8]) -> Result<StreamEvent, AppError> {
+    let bad = || AppError::new("provider event stream frame has malformed headers");
+    let mut event = StreamEvent::default();
+    while !h.is_empty() {
+        let name_len = h[0] as usize;
+        let name = h.get(1..1 + name_len).ok_or_else(bad)?;
+        let name = std::str::from_utf8(name).map_err(|_| bad())?.to_string();
+        let kind = *h.get(1 + name_len).ok_or_else(bad)?;
+        let rest = &h[2 + name_len..];
+        // Value sizes by type: 0/1 bool (none), 2 byte, 3 short, 4 int, 5 long,
+        // 6 bytes / 7 string (u16 length prefix), 8 timestamp, 9 uuid.
+        let (value, used): (Option<&[u8]>, usize) = match kind {
+            0 | 1 => (None, 0),
+            2 => (None, 1),
+            3 => (None, 2),
+            4 => (None, 4),
+            5 | 8 => (None, 8),
+            9 => (None, 16),
+            6 | 7 => {
+                let len_bytes = rest.get(0..2).ok_or_else(bad)?;
+                let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+                let v = rest.get(2..2 + len).ok_or_else(bad)?;
+                ((kind == 7).then_some(v), 2 + len)
+            }
+            _ => return Err(bad()),
+        };
+        if rest.len() < used {
+            return Err(bad());
+        }
+        if let Some(v) = value {
+            let v = std::str::from_utf8(v).map_err(|_| bad())?.to_string();
+            match name.as_str() {
+                ":message-type" => event.message_type = v,
+                ":event-type" => event.event_type = v,
+                ":exception-type" => event.exception_type = v,
+                ":error-code" => event.error_code = v,
+                ":error-message" => event.error_message = v,
+                _ => {}
+            }
+        }
+        h = &rest[used..];
+    }
+    Ok(event)
+}
+
+/// One Converse stream event as a `Frame`. Text arrives in `contentBlockDelta`
+/// (`delta.text`; reasoning deltas are not shown), the stop reason in `messageStop`,
+/// which also ends the reply (the `metadata` event after it only carries usage). A
+/// mid-stream failure is an `exception` message (`throttlingException`,
+/// `modelStreamErrorException`, `validationException`, ...) or an `error` message.
+fn bedrock_frame(ev: &StreamEvent) -> Frame {
+    let mut f = Frame::default();
+    let json = || serde_json::from_slice::<serde_json::Value>(&ev.payload).ok();
+    match ev.message_type.as_str() {
+        "event" => {
+            let Some(json) = json().filter(|j| j.is_object()) else {
+                f.error = Some("provider sent a malformed Bedrock stream event".into());
+                return f;
+            };
+            match ev.event_type.as_str() {
+                "contentBlockDelta" => {
+                    f.delta = json
+                        .pointer("/delta/text")
+                        .and_then(|t| t.as_str())
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string);
+                }
+                "messageStop" => {
+                    f.finish = json
+                        .get("stopReason")
+                        .and_then(|r| r.as_str())
+                        .filter(|r| !r.is_empty())
+                        .map(str::to_string);
+                    f.done = true;
+                }
+                _ => {}
+            }
+        }
+        "exception" => {
+            let msg = json()
+                .and_then(|j| {
+                    j.get("message")
+                        .or_else(|| j.get("Message"))
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| {
+                    String::from_utf8_lossy(&ev.payload)
+                        .chars()
+                        .take(500)
+                        .collect()
+                });
+            let kind = if ev.exception_type.is_empty() {
+                "exception"
+            } else {
+                ev.exception_type.as_str()
+            };
+            f.error = Some(format!("{kind}: {msg}"));
+        }
+        "error" => {
+            let code = if ev.error_code.is_empty() {
+                "error"
+            } else {
+                ev.error_code.as_str()
+            };
+            f.error = Some(format!("{code}: {}", ev.error_message));
+        }
+        _ => {}
+    }
+    f
 }
 
 /// Retryable unless we've already painted partial output on screen.
@@ -1426,29 +2380,65 @@ async fn retry_delay(
     }
 }
 
+/// Reshapings (`Adjust`) allowed per completion: three Mantle routes, a cap, a fold.
+const MAX_ADJUSTMENTS: u32 = 5;
+
 /// Stream a completion, transparently replaying transient failures (overloaded /
-/// rate-limited / dropped socket) up to `MAX_ATTEMPTS` with backoff. `Ok(None)` = cancelled.
+/// rate-limited / dropped socket) up to `MAX_ATTEMPTS` with backoff, and reshaping a
+/// request the provider refused up front (`Adjust`: another Mantle route, the model's own
+/// output cap, a folded system prompt) without counting it as an attempt. `Ok(None)` =
+/// cancelled.
 async fn complete_with_retry<F: FnMut(String) + Send>(
+    req: &AiRequest,
+    on_delta: F,
+    cancel: Option<oneshot::Receiver<()>>,
+    partial_is_fatal: bool,
+) -> Result<Option<Completion>, AppError> {
+    complete_with_keys(req, on_delta, cancel, partial_is_fatal, &get_key_for_origin).await
+}
+
+/// The credential for an endpoint: `(provider, endpoint) -> key`. The app reads the
+/// origin-bound keychain entry (`get_key_for_origin`); live tests pass a key in.
+type KeySource<'a> = &'a (dyn Fn(&str, &str) -> Result<String, AppError> + Sync);
+
+async fn complete_with_keys<F: FnMut(String) + Send>(
     req: &AiRequest,
     mut on_delta: F,
     mut cancel: Option<oneshot::Receiver<()>>,
     partial_is_fatal: bool,
+    key_for: KeySource<'_>,
 ) -> Result<Option<Completion>, AppError> {
     validate_request(req)?;
-    // Resolve the concrete endpoint before reading the credential. Keychain entries are
-    // origin-bound, so changing a base URL cannot silently redirect an existing key.
-    let (endpoint, _, _) = build_request(req, "")?;
-    let key = match get_key_for_origin(&req.provider, &endpoint) {
-        Ok(k) => k,
-        Err(_) if req.allow_no_key => String::new(),
-        Err(e) => return Err(e),
-    };
+    let routes = targets(req)?;
+    let mut route = 0;
+    let mut target = routes[0].clone();
+    // Keychain entries are origin-bound, so the credential is read for each concrete
+    // endpoint (resolved before any request) — a changed base URL cannot silently
+    // redirect an existing key. Bedrock's planes share one key; read it once per origin.
+    let mut keys: HashMap<String, String> = HashMap::new();
     let client = http_client()?;
     let mut last = String::new();
-    for attempt in 0..MAX_ATTEMPTS {
+    let mut attempt = 0;
+    let mut adjustments = 0;
+    while attempt < MAX_ATTEMPTS {
+        let (endpoint, _, _) = build_for(req, &target, "")?;
+        let origin = endpoint_origin(&endpoint)?;
+        let key = match keys.get(&origin) {
+            Some(k) => k.clone(),
+            None => {
+                let k = match key_for(&req.provider, &endpoint) {
+                    Ok(k) => k,
+                    Err(_) if req.allow_no_key => String::new(),
+                    Err(e) => return Err(e),
+                };
+                keys.insert(origin, k.clone());
+                k
+            }
+        };
         match stream_attempt(
             &client,
             req,
+            &target,
             &key,
             &mut on_delta,
             &mut cancel,
@@ -1456,14 +2446,43 @@ async fn complete_with_retry<F: FnMut(String) + Send>(
         )
         .await
         {
-            Ok(done) => return Ok(done),
+            Ok(done) => {
+                if let (Some(_), Some((mantle, r))) = (&done, &target.mantle) {
+                    remember_mantle_route(mantle, &target.model, *r);
+                }
+                return Ok(done);
+            }
             Err(Attempt::Fatal(m)) => return Err(AppError::new(m)),
+            Err(Attempt::Adjust(adjust, m)) => {
+                adjustments += 1;
+                if adjustments > MAX_ADJUSTMENTS {
+                    return Err(AppError::new(m));
+                }
+                match adjust {
+                    Adjust::Route if route + 1 < routes.len() => {
+                        route += 1;
+                        let (cap, fold) = (target.max_tokens, target.fold_system);
+                        target = routes[route].clone();
+                        target.max_tokens = cap;
+                        target.fold_system = fold;
+                    }
+                    Adjust::Route => {
+                        return Err(AppError::new(format!(
+                            "Bedrock Mantle serves {} on none of its chat routes ({m})",
+                            target.model
+                        )))
+                    }
+                    Adjust::MaxTokens(cap) => target.max_tokens = Some(cap),
+                    Adjust::FoldSystem => target.fold_system = true,
+                }
+            }
             Err(Attempt::Retry(m)) => {
                 last = m;
-                if attempt + 1 < MAX_ATTEMPTS {
+                attempt += 1;
+                if attempt < MAX_ATTEMPTS {
                     // 400ms, 800ms.
                     if !retry_delay(
-                        std::time::Duration::from_millis(400 << attempt),
+                        std::time::Duration::from_millis(400 << (attempt - 1)),
                         &mut cancel,
                     )
                     .await
@@ -1926,6 +2945,593 @@ mod tests {
             soft_fail("Overloaded".into(), false),
             Attempt::Retry(_)
         ));
+    }
+
+    // ---- Amazon Bedrock -------------------------------------------------------------
+
+    /// Encode one AWS event-stream message with string headers (the inverse of
+    /// `drain_events`), so the decoder is tested against the documented byte layout.
+    fn event_message(headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
+        let mut h = Vec::new();
+        for (name, value) in headers {
+            h.push(name.len() as u8);
+            h.extend_from_slice(name.as_bytes());
+            h.push(7);
+            h.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            h.extend_from_slice(value.as_bytes());
+        }
+        let total = 12 + h.len() + payload.len() + 4;
+        let mut m = Vec::new();
+        m.extend_from_slice(&(total as u32).to_be_bytes());
+        m.extend_from_slice(&(h.len() as u32).to_be_bytes());
+        let prelude_crc = crc32(&m);
+        m.extend_from_slice(&prelude_crc.to_be_bytes());
+        m.extend_from_slice(&h);
+        m.extend_from_slice(payload);
+        let crc = crc32(&m);
+        m.extend_from_slice(&crc.to_be_bytes());
+        m
+    }
+
+    fn bedrock_event(event_type: &str, json: &str) -> Vec<u8> {
+        event_message(
+            &[
+                (":event-type", event_type),
+                (":content-type", "application/json"),
+                (":message-type", "event"),
+            ],
+            json.as_bytes(),
+        )
+    }
+
+    #[test]
+    fn crc32_matches_the_ieee_check_value() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
+    }
+
+    #[test]
+    fn event_stream_decodes_across_arbitrary_chunk_splits() {
+        let mut bytes = bedrock_event("messageStart", r#"{"role":"assistant"}"#);
+        bytes.extend(bedrock_event(
+            "contentBlockDelta",
+            r#"{"contentBlockIndex":0,"delta":{"text":"SELECT région"}}"#,
+        ));
+        bytes.extend(bedrock_event(
+            "contentBlockDelta",
+            r#"{"contentBlockIndex":0,"delta":{"text":" FROM t"}}"#,
+        ));
+        bytes.extend(bedrock_event("messageStop", r#"{"stopReason":"end_turn"}"#));
+        // Every split point, including inside the prelude, the headers and the CRC.
+        for split in 0..bytes.len() {
+            let mut d = Decoder::for_wire(Wire::Bedrock);
+            let mut frames = d.push(&bytes[..split], Wire::Bedrock).unwrap();
+            frames.extend(d.push(&bytes[split..], Wire::Bedrock).unwrap());
+            let text: String = frames.iter().filter_map(|f| f.delta.clone()).collect();
+            assert_eq!(text, "SELECT région FROM t", "split at {split}");
+            let last = frames.last().unwrap();
+            assert!(last.done && last.finish.as_deref() == Some("end_turn"));
+            assert!(d.finish(Wire::Bedrock).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn event_stream_rejects_corrupt_and_oversized_frames() {
+        let good = bedrock_event("contentBlockDelta", r#"{"delta":{"text":"x"}}"#);
+        let mut bad_crc = good.clone();
+        let n = bad_crc.len();
+        bad_crc[n - 1] ^= 0xFF;
+        let mut buf = EventBuffer { bytes: bad_crc };
+        assert!(drain_events(&mut buf).is_err());
+
+        let mut bad_prelude = good.clone();
+        bad_prelude[3] ^= 0x01;
+        let mut buf = EventBuffer { bytes: bad_prelude };
+        assert!(drain_events(&mut buf).is_err());
+
+        // A prelude announcing a frame past the ceiling is refused before it is buffered.
+        let mut huge = Vec::new();
+        huge.extend_from_slice(&((MAX_EVENT_BYTES + 1) as u32).to_be_bytes());
+        huge.extend_from_slice(&0u32.to_be_bytes());
+        let c = crc32(&huge);
+        huge.extend_from_slice(&c.to_be_bytes());
+        let mut buf = EventBuffer { bytes: huge };
+        assert!(drain_events(&mut buf).is_err());
+    }
+
+    #[test]
+    fn bedrock_exceptions_and_stop_reasons_map_to_frames() {
+        let mut buf = EventBuffer {
+            bytes: event_message(
+                &[
+                    (":exception-type", "throttlingException"),
+                    (":message-type", "exception"),
+                ],
+                br#"{"message":"Too many requests, please wait before trying again."}"#,
+            ),
+        };
+        let ev = drain_events(&mut buf).unwrap();
+        let f = bedrock_frame(&ev[0]);
+        let msg = f.error.unwrap();
+        assert!(msg.starts_with("throttlingException: Too many requests"));
+        assert!(retryable_msg(&msg));
+        assert!(retryable_msg(
+            "internalServerException: An internal server error occurred."
+        ));
+        assert!(retryable_msg(
+            "modelStreamErrorException: Retry your request."
+        ));
+        assert!(!retryable_msg(
+            "validationException: The provided model identifier is invalid."
+        ));
+
+        let mut buf = EventBuffer {
+            bytes: bedrock_event("messageStop", r#"{"stopReason":"max_tokens"}"#),
+        };
+        let f = bedrock_frame(&drain_events(&mut buf).unwrap()[0]);
+        assert!(f.done);
+        assert!(matches!(
+            classify_finish(f.finish.as_deref().unwrap()),
+            Finish::Truncated
+        ));
+        assert!(matches!(
+            classify_finish("guardrail_intervened"),
+            Finish::Aborted(_)
+        ));
+        assert!(matches!(
+            classify_finish("content_filtered"),
+            Finish::Aborted(_)
+        ));
+        assert!(matches!(classify_finish("end_turn"), Finish::Normal));
+
+        // Reasoning deltas and usage metadata carry no visible text.
+        let mut buf = EventBuffer {
+            bytes: bedrock_event(
+                "contentBlockDelta",
+                r#"{"delta":{"reasoningContent":{"text":"thinking"}}}"#,
+            ),
+        };
+        let f = bedrock_frame(&drain_events(&mut buf).unwrap()[0]);
+        assert!(f.delta.is_none() && f.error.is_none() && !f.done);
+    }
+
+    #[test]
+    fn bedrock_runtime_hosts_are_shipped_origins_and_others_are_not() {
+        assert_eq!(
+            bedrock_runtime_region("https://bedrock-runtime.eu-central-1.amazonaws.com"),
+            Some((false, "eu-central-1".into()))
+        );
+        assert_eq!(
+            bedrock_runtime_region("https://bedrock-runtime-fips.us-gov-west-1.amazonaws.com/x"),
+            Some((true, "us-gov-west-1".into()))
+        );
+        for not_aws in [
+            "http://bedrock-runtime.us-east-1.amazonaws.com",
+            "https://bedrock-runtime.us-east-1.amazonaws.com:8443",
+            "https://bedrock-runtime.us-east-1.amazonaws.com.evil.example",
+            "https://bedrock-runtime.evil.amazonaws.com",
+            "https://bedrock.us-east-1.amazonaws.com",
+            "https://vpce-0abc.bedrock-runtime.us-east-1.vpce.amazonaws.com",
+            "https://user@bedrock-runtime.us-east-1.amazonaws.com",
+        ] {
+            assert_eq!(bedrock_runtime_region(not_aws), None, "{not_aws}");
+        }
+        assert!(shipped_origin(
+            "bedrock",
+            "https://bedrock-runtime.ap-southeast-2.amazonaws.com"
+        ));
+        assert!(!shipped_origin("bedrock", "https://proxy.example.com"));
+        // Only Bedrock trusts a family of origins.
+        assert!(!shipped_origin(
+            "custom",
+            "https://bedrock-runtime.us-east-1.amazonaws.com"
+        ));
+        assert_eq!(
+            bedrock_control_base("https://bedrock-runtime.us-west-2.amazonaws.com").as_deref(),
+            Some("https://bedrock.us-west-2.amazonaws.com")
+        );
+        assert_eq!(
+            bedrock_control_base("https://bedrock-runtime-fips.us-east-1.amazonaws.com").as_deref(),
+            Some("https://bedrock-fips.us-east-1.amazonaws.com")
+        );
+        assert_eq!(bedrock_control_base("https://proxy.example.com"), None);
+    }
+
+    #[test]
+    fn bedrock_request_targets_converse_stream_with_a_converse_body() {
+        let msg = |role: &str, content: &str| Msg {
+            role: role.into(),
+            content: content.into(),
+        };
+        let req = AiRequest {
+            provider: "bedrock".into(),
+            wire: Some("bedrock".into()),
+            model: "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc"
+                .into(),
+            base_url: Some("https://bedrock-runtime.us-east-1.amazonaws.com".into()),
+            system: Some("You write SQL.".into()),
+            messages: vec![
+                msg("assistant", "Hi! How can I help?"),
+                msg("user", "list tables"),
+                msg("user", "in public"),
+                msg("assistant", "   "),
+                msg("assistant", "SELECT 1"),
+            ],
+            max_tokens: Some(512),
+            request_id: None,
+            allow_no_key: false,
+        };
+        let (url, headers, body) = build_request(&req, "k").unwrap();
+        // The ARN's `/` is encoded so it stays ONE path segment.
+        assert_eq!(
+            url,
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/arn:aws:bedrock:us-east-1:123456789012:application-inference-profile%2Fabc/converse-stream"
+        );
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "authorization" && v == "Bearer k"));
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "messages": [
+                    { "role": "user", "content": [{ "text": "list tables\n\nin public" }] },
+                    { "role": "assistant", "content": [{ "text": "SELECT 1" }] },
+                ],
+                "system": [{ "text": "You write SQL." }],
+                "inferenceConfig": { "maxTokens": 512 },
+            })
+        );
+        assert!(known_wire("bedrock") && Wire::parse("bedrock") == Wire::Bedrock);
+    }
+    fn chat_req(model: &str, base: &str) -> AiRequest {
+        AiRequest {
+            provider: "bedrock".into(),
+            wire: Some("bedrock".into()),
+            model: model.into(),
+            base_url: Some(base.into()),
+            system: Some("You write SQL.".into()),
+            messages: vec![Msg {
+                role: "user".into(),
+                content: "list tables".into(),
+            }],
+            max_tokens: Some(512),
+            request_id: None,
+            allow_no_key: false,
+        }
+    }
+
+    #[test]
+    fn bedrock_mantle_hosts_are_shipped_and_derive_only_from_aws_hosts() {
+        assert_eq!(
+            bedrock_host("https://bedrock-mantle.us-west-2.api.aws/v1"),
+            Some((BedrockPlane::Mantle, false, "us-west-2".into()))
+        );
+        assert!(shipped_origin(
+            "bedrock",
+            "https://bedrock-mantle.us-east-1.api.aws"
+        ));
+        for not_aws in [
+            "http://bedrock-mantle.us-east-1.api.aws",
+            "https://bedrock-mantle.us-east-1.api.aws:444",
+            "https://bedrock-mantle.us-east-1.api.aws.evil.example",
+            "https://evil.bedrock-mantle.us-east-1.api.aws",
+            "https://bedrock-mantle.evil.api.aws",
+            "https://bedrock.us-east-1.api.aws",
+        ] {
+            assert_eq!(bedrock_host(not_aws), None, "{not_aws}");
+            assert!(!shipped_origin("bedrock", not_aws), "{not_aws}");
+        }
+        assert_eq!(
+            bedrock_mantle_base("https://bedrock-runtime.us-west-2.amazonaws.com").as_deref(),
+            Some("https://bedrock-mantle.us-west-2.api.aws")
+        );
+        assert_eq!(
+            bedrock_mantle_base("https://bedrock-mantle.us-east-1.api.aws").as_deref(),
+            Some("https://bedrock-mantle.us-east-1.api.aws")
+        );
+        // No silent hop off a FIPS endpoint, and nothing derived from a proxy.
+        assert_eq!(
+            bedrock_mantle_base("https://bedrock-runtime-fips.us-east-1.amazonaws.com"),
+            None
+        );
+        assert_eq!(bedrock_mantle_base("https://proxy.example.com"), None);
+    }
+
+    #[test]
+    fn mantle_ids_lower_onto_their_route_with_the_rest_as_fallbacks() {
+        let base = "https://bedrock-runtime.us-east-1.amazonaws.com";
+        let mantle = "https://bedrock-mantle.us-east-1.api.aws";
+        let routes = |m: &str| -> Vec<(Wire, String)> {
+            targets(&chat_req(m, base))
+                .unwrap()
+                .into_iter()
+                .map(|t| {
+                    assert_eq!(t.model, m.strip_prefix(MANTLE_PREFIX).unwrap());
+                    assert_eq!(t.mantle.as_ref().unwrap().0, mantle);
+                    (t.wire, t.base.unwrap())
+                })
+                .collect()
+        };
+        let chat = (Wire::Openai, mantle.to_string());
+        let partner = (Wire::Responses, format!("{mantle}/openai"));
+        let anthropic = (Wire::Anthropic, format!("{mantle}/anthropic"));
+        assert_eq!(
+            routes("mantle/anthropic.claude-opus-5"),
+            [anthropic.clone(), chat.clone(), partner.clone()]
+        );
+        assert_eq!(
+            routes("mantle/openai.gpt-oss-120b"),
+            [chat.clone(), partner.clone(), anthropic.clone()]
+        );
+        assert_eq!(
+            routes("mantle/openai.gpt-5.5"),
+            [partner.clone(), chat.clone(), anthropic.clone()]
+        );
+        assert_eq!(
+            routes("mantle/xai.grok-4.3"),
+            [partner.clone(), chat.clone(), anthropic.clone()]
+        );
+        assert_eq!(
+            routes("mantle/deepseek.v3.2"),
+            [chat.clone(), partner.clone(), anthropic.clone()]
+        );
+
+        // A route that answered before is tried first next time.
+        remember_mantle_route(mantle, "google.gemma-4-e4b", MantleRoute::Partner);
+        assert_eq!(
+            routes("mantle/google.gemma-4-e4b"),
+            [partner, chat, anthropic]
+        );
+
+        // Runtime ids, other wires and endpoints Mantle cannot be derived from.
+        let runtime = targets(&chat_req("us.anthropic.claude-opus-5", base)).unwrap();
+        assert_eq!(runtime.len(), 1);
+        assert_eq!(runtime[0].wire, Wire::Bedrock);
+        let mut other = chat_req("mantle/x", "https://api.openai.com");
+        other.wire = Some("openai".into());
+        assert_eq!(targets(&other).unwrap()[0].model, "mantle/x");
+        assert!(targets(&chat_req("mantle/x", "https://proxy.example.com")).is_err());
+        assert!(targets(&chat_req("mantle/", base)).is_err());
+    }
+
+    #[test]
+    fn mantle_routes_are_the_shapes_tusk_already_speaks() {
+        let req = chat_req(
+            "mantle/anthropic.claude-haiku-4-5",
+            "https://bedrock-runtime.us-east-1.amazonaws.com",
+        );
+        let (url, headers, body) = build_request(&req, "k").unwrap();
+        assert_eq!(
+            url,
+            "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages"
+        );
+        // x-api-key only: this route refuses a request carrying both credentials.
+        assert!(headers.iter().any(|(k, v)| k == "x-api-key" && v == "k"));
+        assert!(!headers.iter().any(|(k, _)| k == "authorization"));
+        assert_eq!(body["model"], "anthropic.claude-haiku-4-5");
+        assert_eq!(body["max_tokens"], 512);
+        assert_eq!(body["system"], "You write SQL.");
+
+        let req = chat_req(
+            "mantle/zai.glm-5",
+            "https://bedrock-runtime.us-west-2.amazonaws.com",
+        );
+        let (url, _, body) = build_request(&req, "k").unwrap();
+        assert_eq!(
+            url,
+            "https://bedrock-mantle.us-west-2.api.aws/v1/chat/completions"
+        );
+        assert_eq!(body["model"], "zai.glm-5");
+
+        let req = chat_req(
+            "mantle/openai.gpt-5.5",
+            "https://bedrock-runtime.us-west-2.amazonaws.com",
+        );
+        let (url, _, body) = build_request(&req, "k").unwrap();
+        assert_eq!(
+            url,
+            "https://bedrock-mantle.us-west-2.api.aws/openai/v1/responses"
+        );
+        assert_eq!(body["model"], "openai.gpt-5.5");
+        assert_eq!(body["instructions"], "You write SQL.");
+    }
+
+    #[test]
+    fn refusals_that_a_reshaped_request_gets_past_are_recognised() {
+        let base = "https://bedrock-runtime.us-east-1.amazonaws.com";
+        let mantle = targets(&chat_req("mantle/google.gemma-4-31b", base)).unwrap()[0].clone();
+        let converse = targets(&chat_req("us.amazon.nova-micro-v1:0", base)).unwrap()[0].clone();
+        // Real Mantle route refusals (chat, the Anthropic route, a Responses route).
+        for body in [
+            r#"{"error":{"code":"validation_error","message":"model `google.gemma-4-31b` isn't supported on this route","param":null,"type":"invalid_request_error"}}"#,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"The model 'openai.gpt-oss-20b' does not support the '/anthropic/v1/messages' API"}}"#,
+            r#"{"error":{"code":"validation_error","message":"The model 'anthropic.claude-haiku-4-5' does not support the '/v1/responses' API"}}"#,
+        ] {
+            assert_eq!(
+                adjustment(400, body, &mantle, true),
+                Some(Adjust::Route),
+                "{body}"
+            );
+            // Only a Mantle target switches route.
+            assert_ne!(adjustment(400, body, &converse, true), Some(Adjust::Route));
+        }
+        // Not a route problem: the model is there, the account cannot use it.
+        assert_eq!(
+            adjustment(
+                400,
+                r#"{"error":{"code":"validation_error","message":"data retention mode 'none' is not available for this model"}}"#,
+                &mantle,
+                true
+            ),
+            None
+        );
+
+        // Output caps, as each API states them.
+        let mut capped = converse.clone();
+        capped.max_tokens = Some(128_000);
+        let caps = [
+            (
+                r#"{"message":"The maximum tokens you requested exceeds the model limit of 10000. Try again with a maximum tokens value that is lower than 10000."}"#,
+                10000,
+            ),
+            (
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 128000 > 64000, which is the maximum allowed number of output tokens for anthropic.claude-haiku-4-5"}}"#,
+                64000,
+            ),
+            (
+                r#"{"error":{"code":"validation_error","message":"'max_tokens' (128000) exceeds model maximum (4096)"}}"#,
+                4096,
+            ),
+            (
+                r#"{"error":{"message":"max_tokens is too large: 128000. This model supports at most 16384 completion tokens, whereas you provided 128000."}}"#,
+                16384,
+            ),
+        ];
+        for (body, cap) in caps {
+            assert_eq!(
+                adjustment(400, body, &capped, false),
+                Some(Adjust::MaxTokens(cap)),
+                "{body}"
+            );
+        }
+        // A context-length refusal names no output ceiling; lowering the cap cannot help.
+        assert_eq!(
+            adjustment(
+                400,
+                r#"{"error":{"message":"This model's maximum context length is 4096 tokens. However, you requested 4105 tokens (9 in the messages, 4096 in the completion)."}}"#,
+                &capped,
+                false
+            ),
+            None
+        );
+        // Never raised, and only on a 400.
+        assert_eq!(
+            stated_output_limit("model limit of 200000 tokens", 1000),
+            None
+        );
+        assert_eq!(
+            adjustment(
+                500,
+                r#"{"message":"exceeds the model limit of 10000 tokens"}"#,
+                &capped,
+                false
+            ),
+            None
+        );
+
+        // A model without a system role (Converse), once, and only with a system prompt.
+        let nosys = r#"{"message":"This model doesn't support system messages. Try again without a system message or use a model that supports system messages."}"#;
+        assert_eq!(
+            adjustment(400, nosys, &converse, true),
+            Some(Adjust::FoldSystem)
+        );
+        assert_eq!(adjustment(400, nosys, &converse, false), None);
+        let mut folded = converse.clone();
+        folded.fold_system = true;
+        assert_eq!(adjustment(400, nosys, &folded, true), None);
+    }
+
+    #[test]
+    fn a_folded_system_prompt_opens_the_first_user_turn() {
+        let mut req = chat_req("mistral.mistral-7b-instruct-v0:2", BEDROCK_DEFAULT_BASE);
+        let mut t = targets(&req).unwrap().remove(0);
+        t.fold_system = true;
+        let (_, _, body) = build_for(&req, &t, "k").unwrap();
+        assert!(body.get("system").is_none());
+        assert_eq!(
+            body["messages"][0]["content"][0]["text"],
+            "You write SQL.\n\nlist tables"
+        );
+        req.messages.clear();
+        let (_, _, body) = build_for(&req, &t, "k").unwrap();
+        assert_eq!(
+            body["messages"],
+            serde_json::json!([{ "role": "user", "content": [{ "text": "You write SQL." }] }])
+        );
+    }
+
+    #[test]
+    fn the_runtime_catalog_keeps_only_converse_chat_models() {
+        let model = |json: &str| serde_json::from_str::<serde_json::Value>(json).unwrap();
+        assert!(bedrock_chat_model(&model(
+            r#"{"modelId":"amazon.nova-micro-v1:0","inputModalities":["TEXT"],"outputModalities":["TEXT"],
+                "converse":null,"inferenceAPIsSupported":{"converse":{"streaming":true,"sync":true}},
+                "modelLifecycle":{"status":"ACTIVE"}}"#
+        )));
+        // Older summaries without the API block fall back to responseStreamingSupported.
+        assert!(bedrock_chat_model(&model(
+            r#"{"modelId":"x","inputModalities":["TEXT","IMAGE"],"outputModalities":["TEXT"],"responseStreamingSupported":true}"#
+        )));
+        for not_chat in [
+            // A reranker: text in and out, but no Converse streaming.
+            r#"{"modelId":"cohere.rerank-v3-5:0","inputModalities":["TEXT"],"outputModalities":["TEXT"],"responseStreamingSupported":false,
+                "inferenceAPIsSupported":{"converse":{"streaming":false,"sync":false}}}"#,
+            // Speech-to-speech.
+            r#"{"modelId":"amazon.nova-2-5-sonic","inputModalities":["SPEECH","TEXT"],"outputModalities":["SPEECH","TEXT"],
+                "inferenceAPIsSupported":{"converse":{"streaming":true,"sync":false}}}"#,
+            r#"{"modelId":"amazon.nova-2-sonic-v1:0","inputModalities":["SPEECH"],"outputModalities":["SPEECH","TEXT"]}"#,
+            // Video understanding that Converse refuses.
+            r#"{"modelId":"twelvelabs.pegasus-1-5-v1:0","inputModalities":["TEXT","VIDEO"],"outputModalities":["TEXT"],"converse":null,
+                "inferenceAPIsSupported":{"converse":{"streaming":true,"sync":false}}}"#,
+            // On its way out: Bedrock refuses legacy models to accounts not using them.
+            r#"{"modelId":"ai21.jamba-1-5-mini-v1:0","inputModalities":["TEXT"],"outputModalities":["TEXT"],
+                "modelLifecycle":{"status":"LEGACY"},"inferenceAPIsSupported":{"converse":{"streaming":true,"sync":true}}}"#,
+        ] {
+            assert!(!bedrock_chat_model(&model(not_chat)), "{not_chat}");
+        }
+    }
+
+    /// Live Bedrock, both planes, with a real API key:
+    /// `TUSK_TEST_BEDROCK_KEY=… cargo test --lib bedrock_live -- --ignored --nocapture`
+    /// (region: `TUSK_TEST_BEDROCK_REGION`, default us-east-1). Spends a few hundred tokens.
+    #[tokio::test]
+    #[ignore = "needs TUSK_TEST_BEDROCK_KEY and the network"]
+    async fn bedrock_live() {
+        let Ok(key) = std::env::var("TUSK_TEST_BEDROCK_KEY") else {
+            eprintln!("TUSK_TEST_BEDROCK_KEY unset; skipping");
+            return;
+        };
+        // What `run()` installs for the app (see lib.rs).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let region =
+            std::env::var("TUSK_TEST_BEDROCK_REGION").unwrap_or_else(|_| "us-east-1".into());
+        let runtime = format!("https://bedrock-runtime.{region}.amazonaws.com");
+        let control = bedrock_control_base(&runtime).unwrap();
+        let catalog = bedrock_catalog_with_key(&runtime, &control, &key)
+            .await
+            .unwrap();
+        let on_mantle = catalog
+            .iter()
+            .filter(|m| m.starts_with(MANTLE_PREFIX))
+            .count();
+        eprintln!("catalog: {} models, {on_mantle} on Mantle", catalog.len());
+        assert!(catalog.len() > on_mantle, "runtime models listed");
+        assert!(on_mantle > 0, "Mantle models listed");
+
+        let source = |_: &str, _: &str| Ok(key.clone());
+        for (model, max_tokens) in [
+            // Runtime Converse through a cross-region profile.
+            ("us.anthropic.claude-haiku-4-5-20251001-v1:0", 64),
+            // Over the model's 10,000 cap: clamped and resent.
+            ("us.amazon.nova-micro-v1:0", 64_000),
+            // Mantle: chat, Anthropic, and a model the first guess gets wrong (chat →
+            // refused → the partner route).
+            ("mantle/zai.glm-4.7-flash", 64),
+            ("mantle/anthropic.claude-haiku-4-5", 64),
+            ("mantle/google.gemma-4-e2b", 256),
+            ("mantle/xai.grok-4.3", 600),
+        ] {
+            let mut req = chat_req(model, &runtime);
+            req.system = Some("Reply with one short word.".into());
+            req.messages[0].content = "Say hello.".into();
+            req.max_tokens = Some(max_tokens);
+            let out = complete_with_keys(&req, |_| {}, None, false, &source)
+                .await
+                .unwrap_or_else(|e| panic!("{model}: {}", e.message))
+                .unwrap();
+            eprintln!("{model}: {:?} (truncated: {})", out.text, out.truncated);
+            assert!(!out.text.trim().is_empty() || out.truncated, "{model}");
+        }
     }
 }
 

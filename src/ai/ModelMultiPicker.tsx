@@ -28,6 +28,9 @@ export function ModelMultiPicker(props: {
   selected: string[];
   /** The provider's default model (its remembered model); may be blank. */
   defaultModel: string;
+  /** What kind of id a model is (Bedrock: plane / profile scope). When given, each row
+   *  carries the label and the list can be narrowed to one kind. */
+  groupOf?: (model: string) => string;
   onChange: (models: string[]) => void;
   onDefault: (model: string) => void;
   onRefresh: () => void;
@@ -40,13 +43,35 @@ export function ModelMultiPicker(props: {
   const catalogSet = createMemo(() => new Set(props.catalog));
   const searching = () => !!query().trim();
   const typed = () => query().trim();
+  /** The kinds of id in the catalog, in catalog order, with how many of each. */
+  const groups = createMemo(() => {
+    const of = props.groupOf;
+    if (!of) return [];
+    const counts = new Map<string, number>();
+    for (const m of props.catalog) {
+      const g = of(m);
+      counts.set(g, (counts.get(g) ?? 0) + 1);
+    }
+    return counts.size > 1 ? [...counts].map(([name, count]) => ({ name, count })) : [];
+  });
+  const [group, setGroup] = createSignal<string | null>(null);
+  /** A kind no longer in the catalog (region switched) stops narrowing the list. */
+  const activeGroup = () => {
+    const g = group();
+    return g && groups().some((x) => x.name === g) ? g : null;
+  };
+  const inGroup = (m: string) => {
+    const g = activeGroup();
+    return !g || props.groupOf?.(m) === g;
+  };
 
   /** Flat, score-ordered rows while searching; catalog order otherwise. */
   const rows = createMemo<Row[]>(() => {
+    const pool = props.catalog.filter(inGroup);
     if (searching()) {
-      return fuzzyRank(query(), props.catalog, (m) => m).map((r) => ({ model: r.item, indices: r.indices }));
+      return fuzzyRank(query(), pool, (m) => m).map((r) => ({ model: r.item, indices: r.indices }));
     }
-    return props.catalog.map((model) => ({ model, indices: [] }));
+    return pool.map((model) => ({ model, indices: [] }));
   });
   /** A typed id the catalog doesn't list exactly can be added as a model outright. */
   const canAddTyped = () => searching() && !catalogSet().has(typed()) && !selectedSet().has(typed()) && typed().length <= 500;
@@ -152,6 +177,25 @@ export function ModelMultiPicker(props: {
         <span class="spacer" />
         <span>{props.live ? "live catalog" : props.refreshBlocked ? `shipped list; ${props.refreshBlocked}` : "shipped list"}</span>
       </div>
+      <Show when={groups().length}>
+        <div class="mmp-groups" role="group" aria-label="Show models of one kind">
+          <button class="mmp-group-chip" classList={{ on: !activeGroup() }} aria-pressed={!activeGroup()} onClick={() => setGroup(null)}>
+            All <span>{props.catalog.length}</span>
+          </button>
+          <For each={groups()}>
+            {(g) => (
+              <button
+                class="mmp-group-chip"
+                classList={{ on: activeGroup() === g.name }}
+                aria-pressed={activeGroup() === g.name}
+                onClick={() => setGroup(activeGroup() === g.name ? null : g.name)}
+              >
+                {g.name} <span>{g.count}</span>
+              </button>
+            )}
+          </For>
+        </div>
+      </Show>
       <Show when={props.error}><div class="error">{props.error}</div></Show>
       <Show when={stale().length}>
         <div class="ai-note">
@@ -185,6 +229,9 @@ export function ModelMultiPicker(props: {
                     </For>
                   </Show>
                 </span>
+                <Show when={props.groupOf}>
+                  {(of) => <span class="mmp-kind">{of()(r.model)}</span>}
+                </Show>
                 <button
                   class="mmp-star"
                   classList={{ on: isDefault(r.model) }}

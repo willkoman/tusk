@@ -17,6 +17,7 @@
         { "url": "https://opencode.ai/*" },
         { "url": "https://openrouter.ai/*" },
         { "url": "https://console.groq.com/*" },
+        { "url": "https://console.aws.amazon.com/*" },
         { "url": "mailto:willko@willko.dev[?]subject=Tusk%20crash%20report&body=*" }
       ]
     },
